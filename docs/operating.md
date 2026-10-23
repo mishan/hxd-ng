@@ -83,8 +83,8 @@ session line up. `RUST_LOG` wins when set.
 
 | Listener | Default | Key | Opened |
 |---|---|---|---|
-| Classic Hotline, TCP | `0.0.0.0:5500` | `[server] bind` | always |
-| HTXF file transfers, TCP | `[server] bind`'s address, its port + 1 (5501) | `[files] bind` | with `[files]` or a `[banner] file` |
+| Classic Hotline, TCP | `0.0.0.0:5500` | `[server] bind` | unless `[server] classic = false` |
+| HTXF file transfers, TCP | `[server] bind`'s address, its port + 1 (5501) | `[files] bind` | with `[files]` or a `[banner] file`, unless `[server] classic = false` |
 | Classic Hotline over TLS, TCP | `0.0.0.0:5600` | `[tls] bind` | with `[tls]`; linked servers connect here too |
 | HTXF over TLS, TCP | `[tls] bind`'s address, its port + 1 (5601) | `[tls] files_bind` | with `[tls]`, and `[files]` or a `[banner] file` |
 | Hotline-ng, TCP (HTTP and WebSocket) | `127.0.0.1:5700` | `[ng] bind` | with `[ng]` |
@@ -102,6 +102,17 @@ the WebSocket at `/` and `/ng`, discovery, the identity endpoints, the
 `/banner`, the registrar's routes and `/metrics`. The voice port is free
 to move: clients send media to the addresses `[voice] advertise` names
 ([Voice](#voice)).
+
+**Serving ng clients only.** `[server] classic = false` opens none of
+the classic ports: not `[server] bind`, not HTXF, and not the `/trtp`
+and `/htxf` tunnels, which discovery then leaves out. A server used only
+by ng clients and bots never offers the classic login, whose password is
+a plaintext equivalent. `[server] bind` is still the base the voice port
+derives from. Everything that only the classic wire serves is refused at
+startup rather than left configured and unserved: `[tls]`, `[link]`
+(links are made on the TLS port), `[tracker]` (trackers list the classic
+port) and `[files] bind`. ng clients' file transfers and the banner
+still come over the ng port; `hlid tunnel` has nothing to connect to.
 
 ## Behind a reverse proxy
 
@@ -636,6 +647,8 @@ change or leave out, and its comment says what absent means.
 ```toml
 [server]
 bind = "0.0.0.0:5500"
+classic = true          # false: ng clients only, nothing of the classic
+                        # wire listened for (Ports and the network)
 name = "hxd-ng"
 version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10
@@ -939,7 +952,8 @@ min_attestation_age = 0             # seconds an attestation must have existed
 clock_skew = 300                    # tolerated clock difference, seconds
 successors = "identity-successors"  # hotline-ng-identity.md §3.4 commitments;
                                     # "" = memory only, the weaker mode
-trtp = true                         # serve the tunnel at /trtp
+trtp = true                         # serve the tunnel at /trtp; never with
+                                    # [server] classic = false
 trtp_login = "verify"               # verify | trust: how a tunnelled classic
                                     # login meets the socket's identity
 enroll = true                       # serve the enrollment mailbox at
@@ -1202,7 +1216,8 @@ can turn the server into an arbitrary-URL proxy. See
 [files]
 manifest = "files.json"                    # required in this mode
 origin = "https://downloads.example/files/"  # required with manifest
-# bind = "0.0.0.0:5501"       # e.g.; absent: [server] bind's address, port + 1
+# bind = "0.0.0.0:5501"       # e.g.; absent: [server] bind's address, port + 1;
+                              # refused with [server] classic = false
 max_file_size = 68719476736   # per object
 max_entries = 100000
 max_concurrent = 8            # origin responses streamed at once
@@ -1240,7 +1255,8 @@ protocol.
 ```toml
 [files]
 root = "/srv/hxd/files"       # required in this mode; must already exist
-# bind = "0.0.0.0:5501"       # e.g.; absent: [server] bind's address, port + 1
+# bind = "0.0.0.0:5501"       # e.g.; absent: [server] bind's address, port + 1;
+                              # refused with [server] classic = false
 max_file_size = 68719476736   # data and resource forks combined
 max_entries = 100000
 max_folder_items = 100000     # the most one folder transfer holds

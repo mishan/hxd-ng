@@ -88,9 +88,10 @@ readable by 10001.
 | 5504 | UDP | no | Voice and video media, with `HXD_VOICE_ADVERTISE`. |
 | 5700 | TCP | **yes** | The ng WebSocket, the `/trtp` tunnel, discovery, identity, media and file downloads. |
 
-The container listens on these (the ng port on `HXD_NG_BIND`); choose
-the public side with `-p`. Keep the legacy and HTXF ports adjacent on
-the public side too, since a classic client finds the transfer port by
+The container listens on these (the ng port on `HXD_NG_BIND`; with
+`HXD_CLASSIC=off`, on it and the voice port alone); choose the public
+side with `-p`. Keep the legacy and HTXF ports adjacent on the public
+side too, since a classic client finds the transfer port by
 adding one to the port it connected to: `-p 6500-6501:5500-5501` works,
 `-p 6500:5500 -p 5501:5501` does not, and the same holds for 5600 and
 5601. The voice port is free: clients send media to the addresses
@@ -213,6 +214,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | Variable | Default | |
 |---|---|---|
 | `HXD_NAME` | `hxd-ng` | The server name clients show. |
+| `HXD_CLASSIC` | `on` | The classic wire: 5500, 5501, the TLS ports and the `/trtp` and `/htxf` tunnels. Off, the server serves ng clients only and never offers the classic login, whose password is a plaintext equivalent; it needs `HXD_NG`, and refuses `HXD_TLS_CERT`, `HXD_TLS_KEY`, `HXD_TLS_SELF_SIGNED` and `HXD_TRACKERS` ([operating.md](operating.md#ports-and-the-network)). |
 | `HXD_AGREEMENT_FILE` | `/var/lib/hxd-ng/agreement.txt` when it exists | The agreement shown at login (UTF-8). |
 | `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for classic clients to fetch it; ng clients fetch it over 5700. `docker kill -s HUP hxd-ng` re-reads it. |
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |
@@ -491,8 +493,9 @@ Anything that is not a subcommand runs as given, so
 SIGTERM, which hxd handles; there is no need for `--init`.
 
 The image's health check opens a connection to the legacy port from
-inside the container (a relay's, to its own port). A mounted config that
-moves that port needs `--health-cmd` to match, or `--no-healthcheck`.
+inside the container (the ng port with `HXD_CLASSIC=off`; a relay's, to
+its own port). A mounted config that moves that port, or sets `classic =
+false`, needs `--health-cmd` to match, or `--no-healthcheck`.
 
 ## Relay mode
 

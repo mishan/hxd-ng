@@ -78,12 +78,13 @@ EXPOSE 5500/tcp 5501/tcp 5504/udp 5600/tcp 5601/tcp 5700/tcp
 STOPSIGNAL SIGTERM
 
 # The legacy port accepts a connection, which is all this asks: bash's
-# /dev/tcp needs nothing the base image lacks. A mounted config that
-# moves the legacy port wants `--health-cmd` or `--no-healthcheck`. A
+# /dev/tcp needs nothing the base image lacks. With HXD_CLASSIC off it is
+# the ng port. A mounted config that moves the port asked, or sets
+# `classic = false`, wants `--health-cmd` or `--no-healthcheck`. A
 # relay is asked on 127.0.0.1 at the port of the first address it
 # listens on, which must then be a wildcard address or 127.0.0.1.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["bash", "-c", "port=5500; if [ \"${HXD_MODE:-server}\" = relay ]; then l=${HXD_RELAY_LISTEN:-0.0.0.0:5700}; l=${l%%[, \t]*}; port=${l##*:}; fi; exec 3<>/dev/tcp/127.0.0.1/$port"]
+    CMD ["bash", "-c", "port=5500; case ${HXD_CLASSIC:-on} in 0|false|no|off) l=${HXD_NG_BIND:-0.0.0.0:5700}; port=${l##*:};; esac; if [ \"${HXD_MODE:-server}\" = relay ]; then l=${HXD_RELAY_LISTEN:-0.0.0.0:5700}; l=${l%%[, \t]*}; port=${l##*:}; fi; exec 3<>/dev/tcp/127.0.0.1/$port"]
 
 ENTRYPOINT ["hxd-entrypoint"]
 CMD []

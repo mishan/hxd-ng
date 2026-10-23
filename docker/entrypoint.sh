@@ -164,12 +164,16 @@ fingerprints() {
 generate() {
     ng=false
     on HXD_NG on && ng=true
+    classic=true
+    on HXD_CLASSIC on || classic=false
+    $classic || $ng || die "HXD_CLASSIC=off needs HXD_NG: with neither wire nothing listens for clients"
 
     echo "# Written by hxd-entrypoint from HXD_* variables at container start."
     echo "# Edits are lost at the next start: mount a file at $HXD_CONFIG instead."
     echo
     echo "[server]"
     echo 'bind = "0.0.0.0:5500"'
+    $classic || echo "classic = false"
     str HXD_NAME name
     num HXD_BAN_TIME ban_time
     num HXD_LOGIN_TIMEOUT login_timeout
@@ -339,15 +343,15 @@ generate() {
         echo
         echo "[files]"
         kv root "$HXD_FILES_ROOT"
-        echo 'bind = "0.0.0.0:5501"'
+        if $classic; then echo 'bind = "0.0.0.0:5501"'; fi
         num HXD_FILES_MAX_FILE_SIZE max_file_size
         num HXD_FILES_MAX_DEPTH max_depth
         num HXD_FILES_DOWNLOADS_PER_ACCOUNT downloads_per_account
         num HXD_FILES_UPLOADS_PER_ACCOUNT uploads_per_account
     fi
 
-    # A banner file is fetched over HTXF, so it opens 5501 (and 5601 with
-    # TLS) whether or not there is a file area.
+    # A classic client fetches a banner file over HTXF, so it opens 5501
+    # (and 5601 with TLS) whether or not there is a file area.
     if [ -n "${HXD_BANNER_FILE:-}${HXD_BANNER_URL:-}" ]; then
         [ -z "${HXD_BANNER_FILE:-}" ] || [ -r "$HXD_BANNER_FILE" ] ||
             die "HXD_BANNER_FILE $HXD_BANNER_FILE is not readable; mount it there"
@@ -361,6 +365,9 @@ generate() {
     # worth stopping for, not a TLS port quietly left off. A mounted pair
     # wins over a self-signed one, so moving to a CA's certificate is
     # setting the two variables.
+    if [ -n "${HXD_TLS_CERT:-}${HXD_TLS_KEY:-}" ] || on HXD_TLS_SELF_SIGNED off; then
+        $classic || die "HXD_TLS_CERT, HXD_TLS_KEY and HXD_TLS_SELF_SIGNED need HXD_CLASSIC: the TLS port serves the classic wire"
+    fi
     if [ -n "${HXD_TLS_CERT:-}${HXD_TLS_KEY:-}" ]; then
         [ -n "${HXD_TLS_CERT:-}" ] || die "HXD_TLS_KEY needs HXD_TLS_CERT"
         [ -n "${HXD_TLS_KEY:-}" ] || die "HXD_TLS_CERT needs HXD_TLS_KEY"
@@ -425,6 +432,7 @@ generate() {
     fi
 
     if [ -n "${HXD_TRACKERS:-}" ]; then
+        $classic || die "HXD_TRACKERS needs HXD_CLASSIC: trackers list the classic port"
         echo
         echo "[tracker]"
         str HXD_TRACKER_DESCRIPTION description
