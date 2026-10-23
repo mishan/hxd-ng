@@ -1,6 +1,6 @@
 # HOPE: the secure login on the classic wire
 
-Status: partial, 2026-10. Built: the login, ChaCha20-Poly1305 with its
+Status: built, 2026-10: the login, ChaCha20-Poly1305 with its
 sealed file transfers and Blowfish OFB-64, `[hope]`, and
 `DATA_LINK_USER_TRANSPORT` on server links (§6).
 

@@ -16,7 +16,7 @@ hxd-core = { workspace = true }
 # `rcgen` too (the self-signed DTLS certificate), and dimpl's `rcgen`
 # feature implies its `aws-lc-rs` one, so aws-lc-sys is still in the
 # graph and still wants a C/assembly toolchain and cmake to build.
-# Nothing selectable from here changes that — see README's build
+# Nothing selectable from here changes that — see docs/operating.md's build
 # prerequisites, and `cargo tree -i aws-lc-rs` for the path.
 str0m = { version = "0.23", default-features = false, features = ["rust-crypto"] }
 tokio = { workspace = true }

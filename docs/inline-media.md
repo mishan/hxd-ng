@@ -617,7 +617,7 @@ the staging risk it is.
   the uploader's login, which is the audit trail the coarse client code
   deliberately is not.
 - The spec's "plaintext transport" residual risk is the legacy wire's
-  existing condition; the README's line about HOPE and TLS covers it,
+  existing condition; operating.md's line about HOPE and TLS covers it,
   and the ng wire is WSS-by-proxy already.
 
 ## 11. Configuration

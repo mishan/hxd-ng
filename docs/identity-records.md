@@ -7,9 +7,9 @@ staged. §6 stages it.
 does with what the registrar publishes: resolve its key, fetch the
 signed records naming an identity, and refuse or downgrade on a
 revocation, a rotation or a freeze. The registrar half is built (it
-publishes all of it, `crates/hxd-registrar`); the server half mostly is
-not, so a key revoked at its registrar still logs in everywhere but the
-registrar's own server. This document is the plan for building §7: what
+publishes all of it, `crates/hxd-registrar`), and so is the server half
+but for standing and probation (§7.5). Before R1 a key revoked at its
+registrar still logged in everywhere but the registrar's own server. This document is the plan for building §7: what
 exists, the decisions §7 leaves to the implementation, and the order.
 It changes no wire behavior §7 does not already specify.
 

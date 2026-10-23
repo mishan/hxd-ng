@@ -1,6 +1,6 @@
 # Identity registrar — handles, revocation, rotation and key backup
 
-Status: draft; the registrar is built, the verifying server is not.
+Status: draft; the registrar is built, and so is the verifying server but for §7.5.
 hxd-ng is a registrar when `[registrar]` is configured (§11): discovery
 (§3), the objects of §4 in `hl-identity` with their test vectors (§15),
 handles and their lifecycle (§5, with `signup = open`, `proof` by invite,
@@ -9,10 +9,9 @@ freeze, revocation and recovery (§8), the ceilings of §10, and `hlid
 register`, `revoke` and `rotate`. The server-local revocation list of
 §7.3 — `[identity] revoked_identities` and `revoked_devices`, written by
 `hxd identity revoke` and re-read on SIGHUP — is built too, because it
-needs no registrar. Not built: the rest of §7, a server fetching and
-applying a registrar's records (so a server trusts attestations only
-through `[identity.registrar_keys]`, and publishes records nobody reads
-yet); key backup (§9); `proof` by `email`, `oidc` or `vouch`, and vouches
+needs no registrar, and so is a server fetching and applying a
+registrar's records, rotations included (`identity-records.md` R1–R3).
+Not built: standing and probation (§7.5); key backup (§9); `proof` by `email`, `oidc` or `vouch`, and vouches
 in the record lists; and reports (§6.7, deferred by design). This is the
 document `hotline-ng-identity.md`
 calls "the registrar spec" and its §5.2 step 4, §8.5 and §12 wait on. It

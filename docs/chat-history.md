@@ -279,7 +279,7 @@ upstream and stays reserved here until it is defined.
 ### 4.3 Encryption at rest
 
 Not in v1. The file has the inbox's `0600` treatment and the same
-README warning, which is the honest answer for a server whose accounts
+warning ([operating.md](operating.md#the-inbox)), which is the honest answer for a server whose accounts
 directory is already the crown jewels. The spec's suggestions (SQLCipher,
 application-level ChaCha20) are all behind the trait if an operator ever
 needs one.

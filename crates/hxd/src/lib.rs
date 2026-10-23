@@ -3496,8 +3496,8 @@ fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>
         InboxSync::Normal => Synchronous::Normal,
         InboxSync::Full => Synchronous::Full,
     };
-    // Every private message on the server, in the clear. The README says
-    // "the same permissions as accounts/"; make that true rather than
+    // Every private message on the server, in the clear. docs/operating.md
+    // says it is created 0600; make that true rather than
     // leaving it to whatever the process umask happens to be.
     //
     // The empty file is created here rather than chmodded after

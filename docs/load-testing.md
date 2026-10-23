@@ -48,7 +48,7 @@ baseline script does all of that (§7).
 
 Every connection the harness opens comes from one address, and the
 server holds an address to a few connections and a slow reconnect rate
-(`[limits]`, the README). Loopback is exempt by default, so a server on
+(`[limits]`, [operating.md](operating.md#limits)). Loopback is exempt by default, so a server on
 the same host takes the whole load. A server on another host refuses
 nearly all of it as `too_many` or `too_fast`: raise `[limits]` there, or
 better, add the generator's address to `exempt`.
