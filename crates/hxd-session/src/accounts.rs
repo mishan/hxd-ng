@@ -28,12 +28,27 @@ pub(crate) fn handles(ty: u32) -> bool {
         || ty == ClientHdr::AccountModify.as_u32()
 }
 
-/// Answer one request for session `uid`: the reply's fields, or the
-/// task error's text.
+/// The highest access bit the user editor of a client that logged in
+/// with `version` can show, by the tiers of fogWraith's Extended
+/// Privilege extension: 1.2 sends no version, GLoarbLine sends 197, and
+/// anything else is taken for 1.5 or 1.9. A save keeps the bits above it
+/// as the account has them, since an editor that cannot show a bit sends
+/// it clear.
+pub(crate) fn editor_tier(version: Option<u16>) -> u8 {
+    match version {
+        None => 31,
+        Some(197) => 54,
+        Some(_) => 40,
+    }
+}
+
+/// Answer one request for session `uid`, whose editor shows the access
+/// bits up to `tier`: the reply's fields, or the task error's text.
 pub(crate) fn transaction(
     core: &Core,
     uid: Uid,
     enc: TextEncoding,
+    tier: u8,
     ty: u32,
     fields: &[(u16, Vec<u8>)],
 ) -> Result<Vec<(u16, Vec<u8>)>, String> {
@@ -70,8 +85,7 @@ pub(crate) fn transaction(
         access: field(tag::ACCESS)
             .and_then(|a| a.get(..8))
             .map(|a| AccessBits::from_wire(a.try_into().expect("eight bytes"))),
-        // The period editors predate bit 56 and cannot show it.
-        history_unsaid: true,
+        editor_tier: Some(tier),
     };
     let mode = if ty == ACCOUNT_CREATE {
         WriteMode::Create

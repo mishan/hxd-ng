@@ -244,7 +244,7 @@ pub fn add(
         name,
         password: password.read()?,
         access: Some(access),
-        history_unsaid: false,
+        editor_tier: None,
     };
     let mut account = auth
         .write_account(&edit, &|existing, _| match existing {

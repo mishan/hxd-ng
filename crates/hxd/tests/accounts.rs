@@ -978,3 +978,73 @@ async fn a_role_grants_its_holders_and_an_edit_reaches_them_on_reload() {
     assert!(!shown.contains("roles:"), "{shown}");
     assert!(hxd::accounts::set_roles(&config, "rita", &["+staff".into()]).is_err());
 }
+
+#[tokio::test]
+async fn a_classic_save_keeps_the_bits_above_its_editor() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let path = td.path().join("hxd-ng.toml");
+    std::fs::write(
+        &path,
+        format!("[paths]\naccounts = \"{d}/accounts\"\n[roles]\nfile = \"{d}/roles.toml\"\n"),
+    )
+    .unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    let dir = td.path().join("accounts");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(
+        td.path().join("roles.toml"),
+        "[role.staff]\naccess = { send_media = true }\n",
+    )
+    .unwrap();
+    const HELD: &str = "read_chat = true\nsend_chat = true\nsend_msgs = true\n\
+        voice_chat = true\nvideo_chat = true\nscreen_share = true\nraw_bits = [41]\n";
+    write(
+        &dir,
+        "boss",
+        &format!(
+            "password = \"pw\"\nroles = [\"staff\"]\n[access]\n{HELD}\
+             read_users = true\nmodify_users = true\n"
+        ),
+    );
+    let tess = format!("password = \"pw\"\nroles = [\"staff\"]\n[access]\n{HELD}");
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(hxd_session::serve(listener, ctx));
+
+    // 1.2 sends no version and shows bits to 31, 1.5 to 40, GLoarbLine to
+    // 54. Each sends every bit it cannot show clear, and clears send-chat
+    // and 41.
+    for (version, tier) in [(0, 31), (150, 40), (197, 54)] {
+        write(&dir, "tess", &tess);
+        let login = Login {
+            version,
+            ..Login::account("boss", "boss", "pw")
+        };
+        let mut boss = legacy::Client::login_at(addr, &login).await.unwrap();
+        let read = [(tag::LOGIN, b"tess".to_vec())];
+        let opened = boss.call(ACCOUNT_READ, &read).await.unwrap();
+        let opened = AccessBits::from_wire(opened.bytes(tag::ACCESS).unwrap().try_into().unwrap());
+        assert!(opened.has(bit::SEND_MEDIA) && opened.has(bit::CHAT_HISTORY));
+        let shown = AccessBits::from_raw(opened.raw() & u64::MAX << (63 - tier));
+        let sent = shown.without(bit::SEND_CHAT).without(41);
+        boss.call(ACCOUNT_MODIFY, &user("tess", None, "", sent))
+            .await
+            .unwrap();
+        let saved = std::fs::read_to_string(dir.join("tess.toml")).unwrap();
+        let mut expected = tess.replace("send_chat = true", "send_chat = false");
+        let mut access = opened.without(bit::SEND_CHAT);
+        if tier >= 41 {
+            expected = expected.replace("raw_bits = [41]\n", "");
+            access = access.without(41);
+        }
+        assert_eq!(saved, expected, "version {version}");
+        let reread = boss.call(ACCOUNT_READ, &read).await.unwrap();
+        assert_eq!(
+            reread.bytes(tag::ACCESS).unwrap(),
+            access.to_wire(),
+            "version {version}"
+        );
+    }
+}

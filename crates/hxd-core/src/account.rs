@@ -497,10 +497,12 @@ pub struct AccountEdit {
     /// `Some("")` clears the password.
     pub password: Option<String>,
     pub access: Option<AccessBits>,
-    /// Bit 56 (chat history) is not this edit's to say, because the
-    /// editor it came from cannot show it: the account keeps whatever it
-    /// had, which for a new one is to follow read-chat.
-    pub history_unsaid: bool,
+    /// The highest bit of `access` the editor it came from can show (the
+    /// tiers of fogWraith's Extended Privilege extension); `None` for one
+    /// that shows them all. The bits above it are not this edit's to say:
+    /// the account keeps them as its file has them, so a bit it never
+    /// named goes on following its roles, or, for bit 56, `read_chat`.
+    pub editor_tier: Option<u8>,
 }
 
 /// Why an account was not read, written or deleted.

@@ -113,7 +113,7 @@ impl EditParams {
             name: self.name.filter(|n| !n.is_empty()),
             password: self.password,
             access,
-            history_unsaid: false,
+            editor_tier: None,
         })
     }
 }

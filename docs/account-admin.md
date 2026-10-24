@@ -114,9 +114,12 @@ as mhxd answers them:
   GtkHx relies on, but only for a session that also holds
   `create_users`. New User refuses a login that is taken, where mhxd
   overwrote it.
-- The period editors cannot show bit 56, so this wire leaves it as the
-  account had it — following `read_chat` unless the file says otherwise
-  — whatever the bitmap carries.
+- A period editor cannot show every bit, and sends the ones it cannot
+  clear, so this wire changes only the bits up to the editor's tier
+  (access-bits.md §1) and leaves the rest as the account had them: a
+  key stays as written, and a bit with none goes on following its roles,
+  or bit 56 `read_chat`. On a new account the bits past the tier have no
+  key either.
 
 Each refusal is a task error with readable text. The spam table prices
 them as mhxd's does.

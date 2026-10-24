@@ -79,6 +79,15 @@ Rules worth knowing:
   set `false` withholds what a role grants, and `raw_deny = [58]` does
   that for a bit with no name. Without roles, `false` and absent are
   the same.
+- **A classic editor changes only the bits it can show.** The tiers of
+  fogWraith's Extended Privilege extension say how far that is, from
+  the login: no version, as 1.2 sends, shows bits 0–31; GLoarbLine's
+  197 shows 0–54; any other version is taken for 1.5 or 1.9, 0–40. A
+  Set User or New User leaves every bit above that as the file has it,
+  key or no key, since the editor sends what it cannot show clear and
+  that is not a `false`. The extension's 16-byte bitmap (capability
+  bit 5) is not implemented, so no classic session changes a bit past 40 unless
+  it is GLoarbLine. The ng wire and `hxd account` say every bit.
 - **Defaults derive after a session's mask.** A session can be denied
   bits and `[extra]` keys whatever its account says (`DenyMask`, the
   probation mask of §5), and a denied bit takes what derives from it
