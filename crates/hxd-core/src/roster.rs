@@ -344,6 +344,10 @@ pub enum Event {
         /// and strips it for the rest, which is where per-recipient
         /// capability already lives.
         media: Option<crate::media::MediaRef>,
+        /// The client's own id for the line, on the copy its sending
+        /// session is handed and on no other: how that session knows the
+        /// line for its own, and nobody else's business.
+        guid: Option<crate::inbox::MessageGuid>,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -2711,6 +2715,7 @@ mod tests {
             id: None,
             at: SystemTime::now(),
             media: None,
+            guid: None,
         }
         .weight();
         assert_eq!(

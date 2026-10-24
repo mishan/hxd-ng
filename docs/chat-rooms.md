@@ -663,7 +663,7 @@ else, who is admitted is not their business.
 | `room_join` | `room` | `{ "members": [ uid… ], "topic", "topic_by"?, "topic_at"?, "last_id"?, "may_post" }` | `no_such_room`, `too_many_rooms`, `encryption_required` |
 | `room_part` | `room` | `{}` | `no_such_room`, `not_a_member` |
 | `room_topic` | `room`, `topic` | `{}` | `no_such_room`, `access_denied` |
-| `chat` | gains `room?` | `{}` | gains `no_such_room`, `not_a_member`, `read_only` |
+| `chat` | gains `room?` | as now | gains `no_such_room`, `not_a_member`, `read_only` |
 | `history` | gains `room?` | as now | gains `no_such_room`, `encryption_required` |
 | `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
 | `room_edit` | `room`, then any of `room_create`'s fields | `{ "room": {…} }` | `access_denied`, `no_such_room`, `name_taken`, `bad_request` |

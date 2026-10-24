@@ -87,6 +87,32 @@ impl Sender {
     }
 }
 
+/// Who a chat guid is held under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GuidSender {
+    /// The account where one person is behind it, else the identity the
+    /// session proved, as the log keeps it
+    /// ([`crate::history::guid_sender_key`]): a new login retries the
+    /// same line.
+    Kept(String),
+    /// Anyone else, whose guids are its session's alone, since `guest`
+    /// is a login many people share.
+    Session { uid: Uid, serial: u64 },
+}
+
+/// By the fact rather than by `has_inbox`, which an operator may turn on
+/// for `guest` or off for a person.
+fn guid_sender(uid: Uid, sess: &crate::roster::UserSession) -> GuidSender {
+    let login = sess.is_person.then_some(sess.login.as_str());
+    match crate::history::guid_sender_key(login, sess.identity.as_ref()) {
+        Some(key) => GuidSender::Kept(key),
+        None => GuidSender::Session {
+            uid,
+            serial: sess.serial,
+        },
+    }
+}
+
 /// A stored message's image as it stands at delivery: the live handle
 /// where the store still has one, and the row's own metadata with no
 /// handle where it does not. Never `None` for a row that had an image —
@@ -265,6 +291,8 @@ pub(crate) struct Staged {
     style: u16,
     media: Option<(crate::media::Handle, crate::media::MediaRef)>,
     at: SystemTime,
+    /// The client's id for the line, and who it is held under.
+    guid: Option<GuidKey>,
 }
 
 impl Staged {
@@ -279,6 +307,7 @@ impl Staged {
             style,
             media: None,
             at: SystemTime::now(),
+            guid: None,
         }
     }
 }
@@ -308,6 +337,67 @@ const COMMIT_BATCH: usize = 256;
 pub(crate) struct ChatCommit {
     room: u32,
     state: Mutex<CommitState>,
+    /// Kept under the room's serial and asked again there, so a repeat
+    /// that waited in the queue behind its original finds it.
+    recent: Mutex<RecentGuids>,
+}
+
+/// How long a line's guid is remembered, and for how many of a room's
+/// lines at most: long enough for a client to notice a lost reply,
+/// reconnect and send again; and bounded in count, so what a room holds
+/// does not grow with how fast its senders can make up guids.
+const GUID_WINDOW: Duration = Duration::from_secs(10 * 60);
+const GUID_KEEP: usize = 1024;
+
+/// The guids a room's lines were sent under lately, oldest first, each
+/// with the id its line was answered. Shared by the room's senders, so a
+/// busy one can push out another's before its window ends. Expired
+/// entries go only when the room is next sent to, so a room archived or
+/// deleted keeps what it held, which is no more than the bound.
+#[derive(Default)]
+struct RecentGuids {
+    order: std::collections::VecDeque<(Instant, GuidKey)>,
+    ids: HashMap<GuidKey, Option<crate::history::LineId>>,
+}
+
+/// A guid and who it is held under ([`guid_sender`]).
+type GuidKey = (GuidSender, MessageGuid);
+
+impl RecentGuids {
+    /// What the line sent under `key` was answered, if that is still
+    /// remembered.
+    fn find(&mut self, now: Instant, key: &GuidKey) -> Option<Option<crate::history::LineId>> {
+        self.expire(now);
+        self.ids.get(key).copied()
+    }
+
+    fn remember(&mut self, now: Instant, key: GuidKey, id: Option<crate::history::LineId>) {
+        self.expire(now);
+        if self.ids.contains_key(&key) {
+            return;
+        }
+        if self.order.len() >= GUID_KEEP {
+            self.forget_oldest();
+        }
+        self.ids.insert(key.clone(), id);
+        self.order.push_back((now, key));
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .order
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= GUID_WINDOW)
+        {
+            self.forget_oldest();
+        }
+    }
+
+    fn forget_oldest(&mut self) {
+        if let Some((_, key)) = self.order.pop_front() {
+            self.ids.remove(&key);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -342,6 +432,7 @@ impl ChatCommit {
         ChatCommit {
             room,
             state: Mutex::default(),
+            recent: Mutex::default(),
         }
     }
 
@@ -551,12 +642,91 @@ impl Core {
         room: u32,
         lines: Vec<(String, u16, Option<crate::media::Handle>)>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        self.chat_public_lines(from, room, lines.into_iter().map(|l| (l, None)).collect())
+    }
+
+    /// One line into `room`, as [`Core::chat_public_all`] sends one,
+    /// under the client's own `guid` for it: a line its sender already
+    /// sent under that guid, in that room and lately, is answered as it
+    /// was and not sent again, nor, once it is logged, counted against
+    /// the sender's chat lines. The sender is its mailbox where it has
+    /// one, so a retry from a new login of the same account is the same
+    /// line.
+    pub fn chat_public_guid(
+        &self,
+        from: Uid,
+        room: u32,
+        (text, style, media): (String, u16, Option<crate::media::Handle>),
+        guid: Option<MessageGuid>,
+    ) -> Result<Option<crate::history::LineId>, ChatError> {
+        self.chat_public_lines(from, room, vec![((text, style, media), guid)])
+            .pop()
+            .expect("an answer for each line")
+    }
+
+    /// What the line sent under `key` into `room` was answered, if that is
+    /// remembered here or, for a kept sender, the log still keeps the
+    /// line, as after a restart: then it is remembered here too. The
+    /// store is asked without the memory's lock held. A log that will not
+    /// answer is a miss, and the commit's own conflict the backstop.
+    fn guid_answer(
+        &self,
+        recent: &Mutex<RecentGuids>,
+        room: u32,
+        key: &GuidKey,
+    ) -> Option<Option<crate::history::LineId>> {
+        if let Some(id) = recent.lock().unwrap().find(self.clock.now(), key) {
+            return Some(id);
+        }
+        let (GuidSender::Kept(sender), guid) = key else {
+            return None;
+        };
+        match self.history.as_ref()?.find_guid(room, sender, guid) {
+            Ok(Some(id)) => {
+                recent
+                    .lock()
+                    .unwrap()
+                    .remember(self.clock.now(), key.clone(), Some(id));
+                Some(Some(id))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!("chat log would not look up a guid: {e}");
+                None
+            }
+        }
+    }
+
+    /// Does `uid`'s account keep mail of its own? What decides whether a
+    /// queued message's id is its sender's to be told
+    /// (`docs/hotline-ng.md` §7.1).
+    pub fn has_inbox(&self, uid: Uid) -> bool {
+        self.roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&uid)
+            .is_some_and(|s| s.has_inbox)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn chat_public_lines(
+        &self,
+        from: Uid,
+        room: u32,
+        lines: Vec<(
+            (String, u16, Option<crate::media::Handle>),
+            Option<MessageGuid>,
+        )>,
+    ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
         if room != 0 {
             if let Err(e) = self.room_may_send(from, room) {
                 return lines.iter().map(|_| Err(e)).collect();
             }
         }
+        let channel = (room != 0).then(|| self.room_channel(room));
+        let commit = channel.as_ref().map_or(&self.chat_commit, |c| &c.commit);
         let mut results = vec![None; lines.len()];
         let mut staged = Vec::with_capacity(lines.len());
         let mut at = Vec::with_capacity(lines.len());
@@ -564,7 +734,27 @@ impl Core {
         // heard before the room hears of the kick, as they would have
         // been sent one at a time.
         let mut tipped = None;
-        for (i, (mut text, style, media)) in lines.into_iter().enumerate() {
+        for (i, ((mut text, style, media), guid)) in lines.into_iter().enumerate() {
+            // A repeat puts nothing in the room, so it spends no chat
+            // lines. One still in the queue behind its original is not
+            // found here, and is found when its commit comes.
+            let guid = match guid {
+                None => None,
+                Some(guid) => {
+                    let r = self.roster.lock().unwrap();
+                    let Some(sender) = r.users.get(&from).map(|s| guid_sender(from, s)) else {
+                        results[i] = Some(Err(ChatError::NoSuchUser));
+                        continue;
+                    };
+                    drop(r);
+                    let key = (sender, guid);
+                    if let Some(id) = self.guid_answer(&commit.recent, room, &key) {
+                        results[i] = Some(Ok(id));
+                        continue;
+                    }
+                    Some(key)
+                }
+            };
             match self.chat_flood_count(from, &text) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -619,11 +809,10 @@ impl Core {
                 style,
                 media,
                 at: SystemTime::now(),
+                guid,
             });
             at.push(i);
         }
-        let channel = (room != 0).then(|| self.room_channel(room));
-        let commit = channel.as_ref().map_or(&self.chat_commit, |c| &c.commit);
         for (i, result) in at.into_iter().zip(commit.submit_all(self, staged)) {
             results[i] = Some(result);
         }
@@ -664,6 +853,7 @@ impl Core {
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         let channel = (room != 0).then(|| self.room_channel(room));
         let serial = channel.as_ref().map_or(&self.log_serial, |c| &c.serial);
+        let commit = channel.as_ref().map_or(&self.chat_commit, |c| &c.commit);
         let _serial = serial.lock().unwrap();
         let mut results: Vec<Option<Result<Option<crate::history::LineId>, ChatError>>> =
             vec![None; batch.len()];
@@ -702,6 +892,32 @@ impl Core {
                 }
             }
         }
+        // A repeat of a line already logged is answered as that line was,
+        // and one of a line earlier in this batch as that one will be:
+        // neither is logged or heard. Before the image is asked about
+        // again, so a repeat whose handle has gone since is still its
+        // line.
+        let now = self.clock.now();
+        let mut repeats = Vec::new();
+        {
+            let mut recent = commit.recent.lock().unwrap();
+            let mut first_seen = HashMap::new();
+            for (i, s) in batch.iter().enumerate() {
+                let Some(key) = s.guid.as_ref().filter(|_| results[i].is_none()) else {
+                    continue;
+                };
+                if let Some(id) = recent.find(now, key) {
+                    results[i] = Some(Ok(id));
+                } else if let Some(&first) = first_seen.get(key) {
+                    repeats.push((i, first));
+                } else {
+                    first_seen.insert(key, i);
+                }
+            }
+        }
+        for &(i, _) in &repeats {
+            results[i] = Some(Ok(None));
+        }
         for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
             if let (None, Some((handle, _))) = (&result, &s.media) {
                 match self.media_for_send(s.info.uid, handle) {
@@ -711,7 +927,7 @@ impl Core {
             }
         }
         let live: Vec<usize> = (0..batch.len()).filter(|&i| results[i].is_none()).collect();
-        let ids: Vec<Option<crate::history::LineId>> = match self.history.as_ref() {
+        let ids: Vec<crate::history::Appended> = match self.history.as_ref() {
             Some(log) => {
                 let lines: Vec<NewLine> = live
                     .iter()
@@ -737,6 +953,12 @@ impl Core {
                                 LineFlags::default()
                             },
                             at: s.at,
+                            guid: match &s.guid {
+                                Some((GuidSender::Kept(sender), g)) => {
+                                    Some((sender.clone(), g.clone()))
+                                }
+                                _ => None,
+                            },
                         }
                     })
                     .collect();
@@ -745,32 +967,57 @@ impl Core {
                         // One id a line, or the lines past the end would
                         // wait for an answer that never comes.
                         assert_eq!(ids.len(), lines.len(), "one id for each line logged");
-                        ids.into_iter().map(Some).collect()
+                        ids
                     }
                     Err(e) => {
                         let e = history_store_failed(e);
+                        for &(i, _) in &repeats {
+                            results[i] = None;
+                        }
                         return results.into_iter().map(|r| r.unwrap_or(Err(e))).collect();
                     }
                 }
             }
-            None => vec![None; live.len()],
+            None => live
+                .iter()
+                .map(|_| crate::history::Appended { id: 0, new: true })
+                .collect(),
         };
+        let logged = self.history.is_some();
+        // A line the log already held under its guid, as after a restart
+        // the memory missed, is a repeat too: answered, and not heard.
+        let mut heard = Vec::with_capacity(live.len());
+        {
+            let mut recent = commit.recent.lock().unwrap();
+            for (i, done) in live.into_iter().zip(ids) {
+                let id = logged.then_some(done.id);
+                if let Some(guid) = batch[i].guid.clone() {
+                    recent.remember(now, guid, id);
+                }
+                if done.new {
+                    heard.push((i, id));
+                } else {
+                    results[i] = Some(Ok(id));
+                }
+            }
+        }
         // The log keeps the canonical metadata beside the line, so a
         // history entry can still render a placeholder once the bytes are
         // gone (docs/inline-media.md §9, chat-history.md §8). A store
         // write, so before the roster is taken, not under it.
         if let Some(log) = self.history.as_ref() {
-            for (&i, id) in live.iter().zip(&ids) {
+            for &(i, id) in &heard {
                 if let (Some(id), Some((_, reference))) = (id, &batch[i].media) {
-                    if let Err(e) = log.attach_media(*id, &reference.to_meta()) {
+                    if let Err(e) = log.attach_media(id, &reference.to_meta()) {
                         warn!("chat log would not record media: {e}");
                     }
                 }
             }
         }
         let mut batch: Vec<Option<Staged>> = batch.into_iter().map(Some).collect();
-        for (i, id) in live.into_iter().zip(ids) {
+        for (i, id) in heard {
             let s = batch[i].take().expect("each line relayed once");
+            let sender = s.info.uid;
             let ev = Event::Chat {
                 cid: room,
                 from: s.info,
@@ -779,7 +1026,17 @@ impl Core {
                 id,
                 at: s.at,
                 media: s.media.as_ref().map(|(_, r)| r.clone()),
+                guid: None,
             };
+            // The sender's own copy carries its guid; nobody else's does.
+            let mine = s.guid.as_ref().map(|(_, g)| {
+                let mut mine = ev.clone();
+                if let Event::Chat { guid, .. } = &mut mine {
+                    *guid = Some(g.clone());
+                }
+                mine
+            });
+            let skip = mine.as_ref().map(|_| sender);
             // The roster a line at a time, so a long batch does not hold
             // everyone else's roster work for all of it: the log's lock is
             // what keeps the lines in order.
@@ -793,7 +1050,15 @@ impl Core {
             // under the media store's, which is the one order those two
             // are ever taken in.
             let audience = if room == 0 {
-                r.broadcast_where(&ev, None, reads_public_chat);
+                r.broadcast_where(&ev, skip, reads_public_chat);
+                if let Some(mine) = mine {
+                    if r.users
+                        .get(&sender)
+                        .is_some_and(|u| u.visible && reads_public_chat(u))
+                    {
+                        r.send_to(sender, mine);
+                    }
+                }
                 if let Event::Chat {
                     from, text, style, ..
                 } = &ev
@@ -806,7 +1071,10 @@ impl Core {
                     .as_ref()
                     .map(|_| r.media_audience(None, reads_public_chat))
             } else {
-                r.room_send_where(room, ev, |_| true);
+                r.room_send_where(room, ev, |u| Some(u.info.uid) != skip);
+                if let Some(mine) = mine {
+                    r.room_send_where(room, mine, |u| u.info.uid == sender);
+                }
                 let members = r.rooms.get(&room).map(|e| e.members.clone());
                 s.media
                     .as_ref()
@@ -817,6 +1085,9 @@ impl Core {
             }
             drop(r);
             results[i] = Some(Ok(id));
+        }
+        for (i, first) in repeats {
+            results[i] = results[first];
         }
         results
             .into_iter()
@@ -882,6 +1153,7 @@ impl Core {
             id: None,
             at: SystemTime::now(),
             media: media.as_ref().map(|(_, r)| r.clone()),
+            guid: None,
         };
         for uid in &members {
             r.send_to(*uid, ev.clone());
@@ -2598,14 +2870,13 @@ mod tests {
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
             self.inner.lines_by_ghost(channel, ghost, since)
         }
-        fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
-            self.append_all(std::slice::from_ref(line))
-                .map(|ids| ids[0])
-        }
-        fn append_all(&self, lines: &[NewLine]) -> Result<Vec<crate::history::LineId>, StoreError> {
+        fn append_all(
+            &self,
+            lines: &[NewLine],
+        ) -> Result<Vec<crate::history::Appended>, StoreError> {
             std::thread::sleep(Duration::from_millis(5));
             self.commits.lock().unwrap().push(lines.len());
-            lines.iter().map(|l| self.inner.append(l)).collect()
+            self.inner.append_all(lines)
         }
         fn query(&self, q: &HistoryQuery) -> Result<HistoryPage, StoreError> {
             self.inner.query(q)
@@ -2644,6 +2915,14 @@ mod tests {
         }
         fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
             self.inner.delete_channel(channel)
+        }
+        fn find_guid(
+            &self,
+            channel: u32,
+            sender: &str,
+            guid: &MessageGuid,
+        ) -> Result<Option<crate::history::LineId>, StoreError> {
+            self.inner.find_guid(channel, sender, guid)
         }
         fn attach_media(
             &self,
@@ -2821,16 +3100,15 @@ mod tests {
         ) -> Result<Vec<crate::history::LogLine>, StoreError> {
             self.inner.lines_by_ghost(channel, ghost, since)
         }
-        fn append(&self, line: &NewLine) -> Result<crate::history::LineId, StoreError> {
-            self.append_all(std::slice::from_ref(line))
-                .map(|ids| ids[0])
-        }
-        fn append_all(&self, lines: &[NewLine]) -> Result<Vec<crate::history::LineId>, StoreError> {
+        fn append_all(
+            &self,
+            lines: &[NewLine],
+        ) -> Result<Vec<crate::history::Appended>, StoreError> {
             let mut open = self.gate.lock().unwrap();
             while !*open {
                 open = self.opened.wait(open).unwrap();
             }
-            lines.iter().map(|l| self.inner.append(l)).collect()
+            self.inner.append_all(lines)
         }
         fn query(&self, q: &HistoryQuery) -> Result<HistoryPage, StoreError> {
             self.inner.query(q)
@@ -2869,6 +3147,14 @@ mod tests {
         }
         fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
             self.inner.delete_channel(channel)
+        }
+        fn find_guid(
+            &self,
+            channel: u32,
+            sender: &str,
+            guid: &MessageGuid,
+        ) -> Result<Option<crate::history::LineId>, StoreError> {
+            self.inner.find_guid(channel, sender, guid)
         }
         fn attach_media(
             &self,
@@ -2933,6 +3219,390 @@ mod tests {
                 ("three".to_string(), "new name".to_string())
             ]
         );
+    }
+
+    fn a_guid() -> MessageGuid {
+        MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap()
+    }
+
+    fn said_with_guid(events: Vec<Event>) -> Vec<(String, Option<MessageGuid>)> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, guid, .. } => Some((text, guid)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A session as `login`, with one person behind it or not, an inbox
+    /// or not, and an identity or not: the three facts a guid's sender
+    /// could be read from.
+    fn attach_as(
+        core: &Core,
+        (login, person, inbox, identity): (&str, bool, bool, Option<[u8; 32]>),
+    ) -> (Uid, crate::Events) {
+        let (uid, rx) = core
+            .attach(crate::roster::AttachInfo {
+                account: None,
+                nick: login.to_string(),
+                icon: 1,
+                admin: false,
+                access: chatter(),
+                login: login.to_string(),
+                addr: None,
+                can_detach: false,
+                transport: crate::Transport::default(),
+                has_inbox: inbox,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
+                is_person: person,
+                reads_on_delivery: false,
+                identity,
+                system: false,
+            })
+            .unwrap();
+        core.announce(uid);
+        (uid, rx)
+    }
+
+    /// Who sends a guid again decides whether it is the line it repeats:
+    /// the sender is its account where one person is behind it, or its
+    /// identity, whatever its inbox; and anyone else's session. A repeat
+    /// is answered with the line's id and heard by nobody.
+    #[test]
+    fn a_guid_sent_again_by_its_sender_is_one_line() {
+        let person = ("alice", true, true, None);
+        let bob = ("bob", true, true, None);
+        let guest = ("guest", false, false, None);
+        let mailed_guest = ("guest", false, true, None);
+        let unmailed = ("alice", true, false, None);
+        let (seven, eight) = (
+            ("guest", false, false, Some([7; 32])),
+            ("guest", false, false, Some([8; 32])),
+        );
+        // (case, first sender, second sender, from a second session,
+        // one line)
+        let cases = [
+            ("its session", person, person, false, true),
+            ("its account", person, person, true, true),
+            ("another account", person, bob, true, false),
+            ("its guest session", guest, guest, false, true),
+            ("another guest", guest, guest, true, false),
+            ("guests with mail", mailed_guest, mailed_guest, true, false),
+            ("a person without mail", unmailed, unmailed, true, true),
+            ("its identity as a guest", seven, seven, true, true),
+            ("another identity as a guest", seven, eight, true, false),
+        ];
+        for (case, first, second, new_session, one) in cases {
+            let core = Core::new().with_history(
+                Arc::new(crate::history::MemoryLog::default()),
+                Default::default(),
+            );
+            let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+            let (a, _ra) = attach_as(&core, first);
+            let (b, _rb) = match new_session {
+                true => {
+                    let (b, rb) = attach_as(&core, second);
+                    (b, Some(rb))
+                }
+                false => (a, None),
+            };
+            drain(&mut rx);
+            let say = |uid, text: &str| {
+                core.chat_public_guid(uid, 0, (text.into(), 0, None), Some(a_guid()))
+                    .unwrap()
+                    .expect("a logged line")
+            };
+            let (original, again) = (say(a, "hi"), say(b, "hi again"));
+            let heard: Vec<String> = said_with_guid(drain(&mut rx))
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect();
+            if one {
+                assert_eq!(again, original, "{case}");
+                assert_eq!(heard, ["hi"], "{case}");
+            } else {
+                assert_ne!(again, original, "{case}");
+                assert_eq!(heard, ["hi", "hi again"], "{case}");
+            }
+        }
+    }
+
+    /// The guid rides on the sending session's copy of its line and on
+    /// nobody else's, its own account's other session included.
+    #[test]
+    fn a_lines_guid_reaches_its_sending_session_alone() {
+        let core = Core::new();
+        let (a, mut ra) = super::inbox_tests::attach(&core, "alice", true);
+        let (_, mut other) = super::inbox_tests::attach(&core, "alice", true);
+        drain(&mut ra);
+        drain(&mut other);
+        core.chat_public_guid(a, 0, ("hi".into(), 0, None), Some(a_guid()))
+            .unwrap();
+        assert_eq!(
+            said_with_guid(drain(&mut ra)),
+            [("hi".to_string(), Some(a_guid()))]
+        );
+        assert_eq!(
+            said_with_guid(drain(&mut other)),
+            [("hi".to_string(), None)]
+        );
+    }
+
+    /// Past the in-memory window a guid is remembered only where the log
+    /// keeps its line: with history, by a person, a repeat is still its
+    /// line; without history, or from a guest, it is a second one.
+    #[test]
+    fn past_its_window_a_guid_is_held_by_the_log_alone() {
+        // (case, a log, a person, lines heard)
+        let cases = [
+            ("the log keeps it", true, true, 1),
+            ("no log", false, true, 2),
+            ("a guest's", true, false, 2),
+        ];
+        for (case, logged, person, heard) in cases {
+            let mut core = Core::new();
+            if logged {
+                core = core.with_history(
+                    Arc::new(crate::history::MemoryLog::default()),
+                    Default::default(),
+                );
+            }
+            let (a, mut ra) = attach_as(&core, ("alice", person, person, None));
+            drain(&mut ra);
+            let say = || core.chat_public_guid(a, 0, ("hi".into(), 0, None), Some(a_guid()));
+            let original = say().unwrap();
+            core.clock().advance(GUID_WINDOW - Duration::from_secs(1));
+            assert_eq!(say().unwrap(), original, "{case}: inside the window");
+            core.clock().advance(Duration::from_secs(1));
+            say().unwrap();
+            assert_eq!(said_with_guid(drain(&mut ra)).len(), heard, "{case}");
+        }
+    }
+
+    /// A log that finds no guid, so the lookup before staging always
+    /// misses and only its conflict on append can tell a repeat.
+    struct ForgetfulLog(crate::history::MemoryLog);
+
+    impl crate::history::ChatLog for ForgetfulLog {
+        fn append_all(
+            &self,
+            lines: &[NewLine],
+        ) -> Result<Vec<crate::history::Appended>, StoreError> {
+            self.0.append_all(lines)
+        }
+        fn query(&self, q: &HistoryQuery) -> Result<HistoryPage, StoreError> {
+            self.0.query(q)
+        }
+        fn line(
+            &self,
+            id: crate::history::LineId,
+        ) -> Result<Option<crate::history::LogLine>, StoreError> {
+            self.0.line(id)
+        }
+        fn lines_by(
+            &self,
+            channel: Option<u32>,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.0.lines_by(channel, who, since)
+        }
+        fn lines_by_ghost(
+            &self,
+            channel: Option<u32>,
+            ghost: [u8; 16],
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.0.lines_by_ghost(channel, ghost, since)
+        }
+        fn tombstone(
+            &self,
+            id: crate::history::LineId,
+            by: &str,
+            at: SystemTime,
+        ) -> Result<bool, StoreError> {
+            self.0.tombstone(id, by, at)
+        }
+        fn prune(
+            &self,
+            keep: &crate::history::Retention,
+            now: SystemTime,
+        ) -> Result<usize, StoreError> {
+            self.0.prune(keep, now)
+        }
+        fn channels(&self) -> Result<Vec<(u32, crate::history::LineId)>, StoreError> {
+            self.0.channels()
+        }
+        fn delete_channel(&self, channel: u32) -> Result<usize, StoreError> {
+            self.0.delete_channel(channel)
+        }
+        fn attach_media(
+            &self,
+            id: crate::history::LineId,
+            media: &crate::history::MediaMeta,
+        ) -> Result<(), StoreError> {
+            self.0.attach_media(id, media)
+        }
+        fn find_guid(
+            &self,
+            _: u32,
+            _: &str,
+            _: &MessageGuid,
+        ) -> Result<Option<crate::history::LineId>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    /// A line the log already holds under its guid, which nothing before
+    /// the commit found, is a repeat by the log's own conflict: its
+    /// sender is answered the line's id, and nobody hears anything.
+    #[test]
+    fn a_guid_only_the_logs_conflict_finds_is_one_line() {
+        use crate::history::ChatLog;
+        let log = Arc::new(ForgetfulLog(Default::default()));
+        let id = log
+            .append(&NewLine {
+                channel: 0,
+                ghost: None,
+                from_nick: "alice".into(),
+                from_login: Some("alice".into()),
+                from_fingerprint: None,
+                icon: 1,
+                text: "hi".into(),
+                flags: LineFlags::default(),
+                at: SystemTime::now(),
+                guid: Some(("login:alice".into(), a_guid())),
+            })
+            .unwrap();
+        let core = Core::new().with_history(log.clone(), Default::default());
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (a, mut ra) = attach_as(&core, ("alice", true, true, None));
+        drain(&mut rx);
+        drain(&mut ra);
+        let again = core.chat_public_guid(a, 0, ("hi".into(), 0, None), Some(a_guid()));
+        assert_eq!(again, Ok(Some(id)));
+        assert!(drain(&mut rx).is_empty(), "the room heard nothing");
+        assert!(drain(&mut ra).is_empty(), "nor did its sender");
+        let page = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines.len(), 1, "and nothing was logged");
+    }
+
+    /// A room keeps so many guids and forgets the oldest first.
+    #[test]
+    fn a_rooms_guids_are_bounded_and_the_oldest_forgotten() {
+        let mut recent = RecentGuids::default();
+        let now = Instant::now();
+        let sender = GuidSender::Session { uid: 1, serial: 1 };
+        let guid = |n: usize| MessageGuid::parse(&format!("{n:032x}")).unwrap();
+        for n in 0..=GUID_KEEP {
+            recent.remember(now, (sender.clone(), guid(n)), Some(n as u64));
+        }
+        assert_eq!(
+            (recent.order.len(), recent.ids.len()),
+            (GUID_KEEP, GUID_KEEP)
+        );
+        assert_eq!(recent.find(now, &(sender.clone(), guid(0))), None);
+        assert_eq!(recent.find(now, &(sender, guid(1))), Some(Some(1)));
+    }
+
+    /// A repeat that reaches the queue while its original is still
+    /// waiting to be logged is that line too, once the commit comes.
+    #[test]
+    fn a_guid_sent_again_while_its_line_waits_in_the_queue_is_one_line() {
+        let log = Arc::new(GatedLog {
+            inner: Default::default(),
+            gate: Mutex::new(false),
+            opened: Condvar::new(),
+        });
+        let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (first, _) = test_attach(&core, "first", chatter());
+        let (sender, _) = test_attach(&core, "sender", chatter());
+        drain(&mut rx);
+        let send = |uid, guid: Option<MessageGuid>| {
+            let core = core.clone();
+            std::thread::spawn(move || core.chat_public_guid(uid, 0, ("hi".into(), 0, None), guid))
+        };
+        // A line leads a commit that waits at the gate; the original and
+        // its repeat queue behind it.
+        let lead = send(first, None);
+        while {
+            let st = core.chat_commit.state.lock().unwrap();
+            !st.leading || !st.queue.is_empty()
+        } {
+            std::thread::yield_now();
+        }
+        let original = send(sender, Some(a_guid()));
+        while core.chat_commit.state.lock().unwrap().queue.is_empty() {
+            std::thread::yield_now();
+        }
+        let again = send(sender, Some(a_guid()));
+        while core.chat_commit.state.lock().unwrap().queue.len() < 2 {
+            std::thread::yield_now();
+        }
+        *log.gate.lock().unwrap() = true;
+        log.opened.notify_all();
+
+        assert!(lead.join().unwrap().is_ok());
+        let original = original.join().unwrap().unwrap();
+        assert!(original.is_some());
+        assert_eq!(again.join().unwrap().unwrap(), original);
+        assert_eq!(said_with_guid(drain(&mut rx)).len(), 2, "the lead and one");
+    }
+
+    /// A repeat that missed its original's answer on the way in, because
+    /// that was still being logged, and reached a later commit, is
+    /// answered there as that line was.
+    #[test]
+    fn a_guid_sent_again_in_a_later_commit_is_one_line() {
+        let log = Arc::new(GatedLog {
+            inner: Default::default(),
+            gate: Mutex::new(false),
+            opened: Condvar::new(),
+        });
+        let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
+        let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (sender, _) = test_attach(&core, "sender", chatter());
+        drain(&mut rx);
+        let send = || {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                core.chat_public_guid(sender, 0, ("hi".into(), 0, None), Some(a_guid()))
+            })
+        };
+        // The original leads a commit held at the gate; the repeat, which
+        // found nothing remembered, waits for the next.
+        let original = send();
+        while {
+            let st = core.chat_commit.state.lock().unwrap();
+            !st.leading || !st.queue.is_empty()
+        } {
+            std::thread::yield_now();
+        }
+        let again = send();
+        while core.chat_commit.state.lock().unwrap().queue.is_empty() {
+            std::thread::yield_now();
+        }
+        *log.gate.lock().unwrap() = true;
+        log.opened.notify_all();
+
+        let original = original.join().unwrap().unwrap();
+        assert!(original.is_some());
+        assert_eq!(again.join().unwrap().unwrap(), original);
+        assert_eq!(said_with_guid(drain(&mut rx)).len(), 1);
     }
 
     fn flood_limits() -> crate::FloodLimits {

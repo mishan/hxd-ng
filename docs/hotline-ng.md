@@ -176,6 +176,7 @@ over them.
 | `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
+| `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -411,7 +412,8 @@ belong to the `inbox` capability (§4).
 - **`text`** MUST be non-empty unless the message carries `media`
   (inline-media.md §8.3); an empty message is `bad_request`.
 - **`guid`** is the client's own id for the message: a UUID, hyphenated or
-  not. A client SHOULD send one. Two sends with the same guid between the
+  not, in either case; its version and variant bits are not checked, so
+  any 32 hex digits serve. A client SHOULD send one. Two sends with the same guid between the
   same sender and recipient of a **stored** message — the recipient has an
   inbox and the sender has a mailbox — are one message, stored once and
   never refused, so a retry after a lost reply is safe. A message that is
@@ -422,9 +424,13 @@ belong to the `inbox` capability (§4).
   for the retry receives it, and the retry is answered `queued: false`
   where the first send was answered `true`. That is delivery, not an
   error.
-- **The reply** is `{ "queued": bool }`: `true` when the message waited
-  in the recipient's inbox rather than going straight to a live session.
-  It carries no message id (rationale §5).
+- **The reply** is `{ "queued": bool, "id"? }`: `queued` is `true` when
+  the message waited in the recipient's inbox rather than going straight
+  to a live session. A queued message's reply carries `id`, the stored
+  message's id as the recipient's `msg` event will carry it, when the
+  sender's own account has an inbox (rationale §5); a sender without one,
+  such as an identity admitted as a guest, is answered `queued` alone, as
+  is a message delivered at once.
 - **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
   `at`, `queued` and, when the message was stored, `id`. `from.uid` is 0
   when a queued message's sender no longer has a session. `from.login` is
@@ -621,10 +627,10 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?` | `{}` | `no_such_room`, `not_a_member`, `read_only`, `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -637,6 +643,37 @@ family document. Each family of §4 adds its own.
 
 - **`chat`** needs the send-chat privilege. The text MAY contain line
   breaks and is relayed as one event. `media` is inline-media.md §8.3's.
+  The reply carries `id` when the server kept the line (the `history`
+  capability): the id its `chat` event carries, so the sender can match
+  its own line without waiting for that event.
+- **`guid`** on `chat` is the client's own id for the line, as on `msg`
+  (§7.1), honored by a server that offers the `chat_guid` capability (§4);
+  one that does not ignores it (§5), and there a retry is a second line.
+  It is a UUID, hyphenated or not, and anything else is `bad_request`.
+  Two sends with the same guid from the same sender into the same room
+  are one line while the server remembers the guid: the repeat, whatever
+  its text, is answered as the original was, `id` and all, even if that
+  line has since been redacted or purged, and nothing is relayed or
+  logged for it. The sender is its account where exactly one person is
+  behind it (a password, or a linked identity), or else the identity the
+  session proved, so a retry from a resumed session or from a new login
+  is the same line whether or not the account has an inbox; any other
+  session, such as a plain guest's, holds its guids for itself alone.
+  Where the server keeps the line (the `history` capability) and the
+  sender is an account or an identity, the guid is kept with the line,
+  across restarts, for as long as the line is (chat-history.md §4.2): a
+  line redacted or purged by a moderator keeps its guid, and one that
+  retention or a room's deletion removes takes it along. In front of
+  that, and without `history` or for a guest's session the only memory,
+  the server remembers each room's latest guids for a bounded window,
+  which a restart forgets (*hxd-ng:* ten minutes, and at most a room's
+  latest 1024 lines sent with one), shared by the room's senders, so a
+  busy room can end one sender's window early. A send after what the
+  server remembers is a second line. A client SHOULD send a guid with
+  every line it may have to send again, and reuse it on retry.
+  *hxd-ng:* a repeat is charged as a request (§9), and not as a line of
+  chat when it is found before it is queued, as one sent after its line
+  is logged is.
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -689,7 +726,7 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. |
+| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
@@ -950,8 +987,9 @@ normative, this list is not.
   received (§6.2), or logs in again when `detach` was `null` (§2);
 - on `resync_required`: `sync`, then `inbox`, then `history` from its last
   line id, keeping events it already had (§6.3, §7.1);
-- should send a `guid` with every private message, and reuse it on retry
-  (§7.1);
+- should send a `guid` with every private message and every chat line it
+  may send again, and reuse it on retry (§7.1, §7.3); retries a chat
+  line only where the server offers `chat_guid` (§4);
 - reads an absent `system` as `false` (§7.4);
 - treats `rate_limited` as a delay, not a failure (§9);
 - renders no markup in chat that a classic client would not also see as

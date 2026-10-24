@@ -48,8 +48,9 @@ describe('config', () => {
       const probe = await crew.connect({ nick: 'Probe' });
       // `accounts` needs no section: every server administers its
       // accounts directory. Nor does `rooms`, on unless `[rooms]
-      // enabled = false` (chat-rooms.md §7).
-      assert.deepEqual(probe.conn.caps, ['accounts', 'rooms']);
+      // enabled = false` (chat-rooms.md §7). Nor `chat_guid`, which
+      // every server of this build honors (hotline-ng.md §7.3).
+      assert.deepEqual(probe.conn.caps, ['accounts', 'rooms', 'chat_guid']);
       assert.equal(probe.conn.media, null);
     });
   });

@@ -432,7 +432,7 @@ async fn ng_addresses_an_absent_account_and_a_legacy_client_reads_it() {
         )
         .await;
     assert_eq!(ok["queued"], true, "nobody was there to take it");
-    assert!(ok.get("id").is_none(), "and the sender is told no more");
+    assert!(ok["id"].is_u64(), "and which stored message it became");
 
     // And the sender is gone by the time it is read — which is the case
     // the frame shape below has to answer.
@@ -718,7 +718,9 @@ async fn the_same_guid_sent_twice_is_one_message() {
 
     let (mut bob, hello) = Ng::login(srv.ng, "bob").await;
     assert_eq!(hello["inbox"]["unread"], 1, "one message, not two");
-    assert_eq!(bob.msg_event().await["text"], "did that send?");
+    let delivered = bob.msg_event().await;
+    assert_eq!(delivered["text"], "did that send?");
+    assert_eq!(delivered["id"], first["id"], "the id the sender was told");
 
     // Anything that is not a uuid is refused rather than indexed.
     let junk = alice

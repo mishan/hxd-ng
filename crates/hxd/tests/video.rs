@@ -1164,7 +1164,7 @@ async fn the_ng_login_reply_carries_the_caps_and_the_ceilings() {
     let c = Ng::login(ng, "sharer").await;
     assert_eq!(
         c.caps,
-        json!(["voice", "video"]),
+        json!(["voice", "video", "chat_guid"]),
         "video never without voice"
     );
     assert_eq!(c.video["camera"]["max_width"], json!(1280));

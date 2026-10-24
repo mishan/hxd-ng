@@ -7,7 +7,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use crate::inbox::{Mailbox, StoreError};
+use crate::inbox::{Mailbox, MessageGuid, StoreError};
 
 pub type LineId = u64;
 
@@ -80,6 +80,35 @@ pub struct NewLine {
     pub text: String,
     pub flags: LineFlags,
     pub at: SystemTime,
+    /// The client's own id for the line and who it is held under
+    /// (`docs/hotline-ng.md` §7.3): one line per channel, sender and
+    /// guid. Kept so a repeat after a restart finds its line; never read
+    /// back into a [`LogLine`]. The sender is [`guid_sender_key`]'s.
+    pub guid: Option<(String, MessageGuid)>,
+}
+
+/// How a line's guid sender is kept, the same in memory and in the log:
+/// `login:<login>` for an account one person is behind, and
+/// `fp:<hex>` for the identity a session proved where none is. Never a
+/// uid or a session, which do not outlive a restart.
+pub fn guid_sender_key(login: Option<&str>, fingerprint: Option<&[u8; 32]>) -> Option<String> {
+    match (login, fingerprint) {
+        (Some(login), _) => Some(format!("login:{login}")),
+        (None, Some(fp)) => Some(format!(
+            "fp:{}",
+            fp.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )),
+        (None, None) => None,
+    }
+}
+
+/// What appending a line did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Appended {
+    pub id: LineId,
+    /// False where the line's guid was logged already: nothing was
+    /// appended, and `id` is that line's.
+    pub new: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,14 +180,16 @@ pub fn sent_by(line: &LogLine, who: &Mailbox) -> bool {
 }
 
 pub trait ChatLog: Send + Sync + 'static {
-    fn append(&self, line: &NewLine) -> Result<LineId, StoreError>;
+    fn append(&self, line: &NewLine) -> Result<LineId, StoreError> {
+        self.append_all(std::slice::from_ref(line))
+            .map(|done| done[0].id)
+    }
     /// Several lines at once, in order, all or none: what public chat
     /// commits when lines arrive faster than one commit each can keep up
     /// with (`Core::chat_public`). A store that can make them one
-    /// transaction should; this one is a line at a time.
-    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<LineId>, StoreError> {
-        lines.iter().map(|line| self.append(line)).collect()
-    }
+    /// transaction should. A line whose guid is logged already is not
+    /// appended again ([`Appended::new`]).
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<Appended>, StoreError>;
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError>;
     /// One line by id, tombstone or not: what a redaction reads before it
     /// clears the line, and what a report names.
@@ -196,6 +227,15 @@ pub trait ChatLog: Send + Sync + 'static {
     /// Delete every line in `channel`, answering how many: a deleted
     /// room's (`hxd room delete --purge`).
     fn delete_channel(&self, channel: u32) -> Result<usize, StoreError>;
+    /// The line `sender` sent into `channel` under `guid`, tombstone or
+    /// not, while the log keeps it ([`NewLine::guid`]). Appending a second
+    /// appends nothing and answers the first's id.
+    fn find_guid(
+        &self,
+        channel: u32,
+        sender: &str,
+        guid: &MessageGuid,
+    ) -> Result<Option<LineId>, StoreError>;
 }
 
 #[derive(Default)]
@@ -208,17 +248,24 @@ struct MemoryInner {
     next_id: LineId,
     lines: Vec<LogLine>,
     ghosts: std::collections::HashMap<LineId, [u8; 16]>,
+    guids: std::collections::HashMap<(u32, String, MessageGuid), LineId>,
 }
 
-impl ChatLog for MemoryLog {
-    fn append(&self, line: &NewLine) -> Result<LineId, StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.next_id = inner
+impl MemoryInner {
+    fn append(&mut self, line: &NewLine) -> Result<Appended, StoreError> {
+        let guid = line
+            .guid
+            .as_ref()
+            .map(|(sender, guid)| (line.channel, sender.clone(), guid.clone()));
+        if let Some(&id) = guid.as_ref().and_then(|k| self.guids.get(k)) {
+            return Ok(Appended { id, new: false });
+        }
+        self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or_else(|| StoreError::new("chat line ids exhausted"))?;
-        let id = inner.next_id;
-        inner.lines.push(LogLine {
+        let id = self.next_id;
+        self.lines.push(LogLine {
             id,
             channel: line.channel,
             from_nick: line.from_nick.clone(),
@@ -231,9 +278,19 @@ impl ChatLog for MemoryLog {
             media: None,
         });
         if let Some(key) = line.ghost {
-            inner.ghosts.insert(id, key);
+            self.ghosts.insert(id, key);
         }
-        Ok(id)
+        if let Some(key) = guid {
+            self.guids.insert(key, id);
+        }
+        Ok(Appended { id, new: true })
+    }
+}
+
+impl ChatLog for MemoryLog {
+    fn append_all(&self, lines: &[NewLine]) -> Result<Vec<Appended>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        lines.iter().map(|line| inner.append(line)).collect()
     }
 
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError> {
@@ -343,8 +400,14 @@ impl ChatLog for MemoryLog {
             .collect();
         kept.reverse();
         inner.lines = kept;
-        let MemoryInner { lines, ghosts, .. } = &mut *inner;
+        let MemoryInner {
+            lines,
+            ghosts,
+            guids,
+            ..
+        } = &mut *inner;
         ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
+        guids.retain(|_, id| lines.iter().any(|line| line.id == *id));
         Ok(before - inner.lines.len())
     }
 
@@ -361,8 +424,14 @@ impl ChatLog for MemoryLog {
         let mut inner = self.inner.lock().unwrap();
         let before = inner.lines.len();
         inner.lines.retain(|line| line.channel != channel);
-        let MemoryInner { lines, ghosts, .. } = &mut *inner;
+        let MemoryInner {
+            lines,
+            ghosts,
+            guids,
+            ..
+        } = &mut *inner;
         ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
+        guids.retain(|_, id| lines.iter().any(|line| line.id == *id));
         Ok(before - inner.lines.len())
     }
 
@@ -375,6 +444,16 @@ impl ChatLog for MemoryLog {
             .ok_or_else(|| StoreError::new("no such chat line"))?;
         line.media = Some(media.clone());
         Ok(())
+    }
+
+    fn find_guid(
+        &self,
+        channel: u32,
+        sender: &str,
+        guid: &MessageGuid,
+    ) -> Result<Option<LineId>, StoreError> {
+        let key = (channel, sender.to_string(), guid.clone());
+        Ok(self.inner.lock().unwrap().guids.get(&key).copied())
     }
 }
 
@@ -396,6 +475,7 @@ pub mod conformance {
                 LineFlags::default()
             },
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(100 + n),
+            guid: None,
         }
     }
 
@@ -413,6 +493,64 @@ pub mod conformance {
         retention_is_per_channel(new_log());
         a_senders_lines_are_found_in_every_channel(new_log());
         channels_are_listed_and_deleted_whole(new_log());
+        a_line_is_found_by_its_guid_once(new_log());
+    }
+
+    /// A line logged with a guid is found by its channel, sender and
+    /// guid, tombstone or not, until it is pruned; a second with the same
+    /// three is not logged and is answered the first's id, and one in
+    /// another channel or from another sender, or with no guid, is a line
+    /// like any other.
+    fn a_line_is_found_by_its_guid_once(log: Box<dyn ChatLog>) {
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        let alice = guid_sender_key(Some("alice"), None).unwrap();
+        let keyed = guid_sender_key(None, Some(&[3; 32])).unwrap();
+        let with = |n, channel, sender: &str| NewLine {
+            guid: Some((sender.to_string(), guid.clone())),
+            ..in_channel(n, channel)
+        };
+        let id = log.append(&with(1, 0, &alice)).unwrap();
+        assert_eq!(log.find_guid(0, &alice, &guid).unwrap(), Some(id));
+        let done = log.append_all(&[with(2, 0, &alice), line(8)]).unwrap();
+        assert_eq!(done[0], Appended { id, new: false }, "one line a guid");
+        assert!(
+            done[1].new && done[1].id > id,
+            "and the next is logged after it"
+        );
+        let elsewhere = log.append(&with(3, 9, &alice)).unwrap();
+        let other = log.append(&with(4, 0, &keyed)).unwrap();
+        assert_eq!(log.find_guid(9, &alice, &guid).unwrap(), Some(elsewhere));
+        assert_eq!(log.find_guid(0, &keyed, &guid).unwrap(), Some(other));
+        assert_eq!(log.find_guid(0, "login:bob", &guid).unwrap(), None);
+        log.append(&line(5)).unwrap();
+        log.append(&line(6)).unwrap();
+        let page = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines.len(), 5, "the repeat was not logged");
+
+        assert!(log.tombstone(id, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        assert_eq!(
+            log.find_guid(0, &alice, &guid).unwrap(),
+            Some(id),
+            "redacted"
+        );
+        let keep = Retention {
+            max_lines: 0,
+            max_age: Some(Duration::from_secs(1)),
+            channels: Vec::new(),
+        };
+        log.prune(&keep, SystemTime::UNIX_EPOCH + Duration::from_secs(1000))
+            .unwrap();
+        assert_eq!(log.find_guid(0, &alice, &guid).unwrap(), None, "pruned");
+        let reused = log.append(&with(7, 0, &alice)).unwrap();
+        assert_ne!(reused, id);
+        assert_eq!(log.find_guid(0, &alice, &guid).unwrap(), Some(reused));
     }
 
     fn in_channel(n: u64, channel: u32) -> NewLine {
@@ -535,7 +673,13 @@ pub mod conformance {
     fn lines_appended_together_keep_their_order(log: Box<dyn ChatLog>) {
         fill(&*log, 2);
         let lines: Vec<NewLine> = (3..=7).map(line).collect();
-        assert_eq!(log.append_all(&lines).unwrap(), vec![3, 4, 5, 6, 7]);
+        let ids: Vec<LineId> = log
+            .append_all(&lines)
+            .unwrap()
+            .iter()
+            .map(|done| done.id)
+            .collect();
+        assert_eq!(ids, vec![3, 4, 5, 6, 7]);
         assert_eq!(log.append(&line(8)).unwrap(), 8);
         let page = log
             .query(&HistoryQuery {
@@ -548,7 +692,7 @@ pub mod conformance {
         let texts: Vec<&str> = page.lines.iter().map(|l| l.text.as_str()).collect();
         let want: Vec<String> = (1..=8).map(|n| format!("line-{n}")).collect();
         assert_eq!(texts, want);
-        assert_eq!(log.append_all(&[]).unwrap(), Vec::<LineId>::new());
+        assert!(log.append_all(&[]).unwrap().is_empty());
     }
 
     fn fill(log: &dyn ChatLog, count: u64) {

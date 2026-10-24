@@ -204,9 +204,15 @@ still ends.
 can't express would leave a gap in the seq stream a client could not
 tell from loss, and resume's `last_seq` accounting would break.
 
-**The `msg` reply hides the id** (spec §7.1). The message id is the
-*recipient's* handle for marking read; handing a monotonic id to the
-sender would tell them how much mail the server carries.
+**The `msg` reply names a queued message to a sender with an inbox**
+(spec §7.1). The id is the *recipient's* handle for marking read, and
+it is monotonic, so it says something about how much mail the server
+carries; but an account with an inbox can already learn as much by
+mailing itself and reading its own inbox, so its reply gives nothing
+away that was not there to take, and it lets a client with a send queue
+record which stored message each send became. A sender with no inbox,
+such as an identity admitted as a guest, may still leave mail, has no
+inbox to read the counter from, and is not told it.
 
 **`guid` answers as of now** (spec §7.1). A retry of a message that
 queued, sent after the recipient arrived, is delivered by that retry; the

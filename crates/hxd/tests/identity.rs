@@ -3201,6 +3201,22 @@ async fn linking_an_identity_takes_the_accounts_mail_with_it() {
     assert_eq!(m["data"]["queued"], true, "it had been waiting");
 }
 
+/// An identity admitted as a guest may leave mail, and has no inbox of
+/// its own: its reply says the message waited and does not name it.
+#[tokio::test]
+async fn an_identity_guest_is_not_told_its_queued_messages_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_inbox(dir.path()).await;
+    let p = person(41, "Drifter");
+    let auth = authenticate(ng, &p).await;
+    assert_eq!(auth["outcome"], "unattested_guest");
+    let (mut drifter, _) = ng_login(ng, auth["token"].as_str().unwrap(), "Drifter").await;
+    let ok = drifter
+        .request("msg", json!({ "to_login": "alice", "text": "hello" }))
+        .await;
+    assert_eq!(ok["ok"], json!({ "queued": true }), "{ok}");
+}
+
 #[tokio::test]
 async fn the_identity_routes_answer_cors_so_a_page_elsewhere_can_read_them() {
     let dir = tempfile::tempdir().unwrap();

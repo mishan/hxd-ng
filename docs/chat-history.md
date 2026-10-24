@@ -248,6 +248,15 @@ CREATE INDEX chat_line_by_channel ON chat_line (channel, id);
 CREATE INDEX chat_line_at ON chat_line (at);   -- retention by age
 ```
 
+Schema v22 adds `guid` and `guid_from`: a line's client guid
+(hotline-ng.md §7.3) and who it is held under, `login:<login>` for an
+account one person is behind, and for a session no one person is
+behind, `fp:<hex>` for the identity it proved; never a uid or a
+session, and a plain guest's line has neither. A partial unique index
+on `(channel, guid_from, guid)` keeps one line per guid; a second insert
+is dropped and answered the first's id. Neither column is read back into
+a history page.
+
 `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the spec's one
 guarantee: an id is never reused, so a client's cursor from last week
 still means what it meant. Plain `INTEGER PRIMARY KEY` can hand out a
