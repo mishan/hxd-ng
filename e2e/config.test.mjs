@@ -77,12 +77,13 @@ describe('config', () => {
     assert.match(output, /\[identity\] needs \[ng\]/);
   });
 
-  test('identity with no hosts and no v1 proofs is refused, since nobody could log in', async () => {
+  test('identity with no hosts is refused, since nobody could log in', async () => {
     const { code, output } = await startFailing({
-      config: { identity: { key: 'identity-server.key', login_proof_v1: false } },
+      config: { identity: { key: 'identity-server.key' } },
     });
     assert.notEqual(code, 0);
-    assert.match(output, /\[identity\] hosts is empty and login_proof_v1 = false/);
+    assert.match(output, /\[identity\] hosts is empty, so no identity could log in/);
+    assert.match(output, /login_proof_v1 = true/);
   });
 
   test('an out-of-range max_page is refused', async () => {

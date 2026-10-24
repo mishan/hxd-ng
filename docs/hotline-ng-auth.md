@@ -387,7 +387,7 @@ without `host`, under the same domain. It names no host, so a server
 that publishes another's `server_key` can hand a user that server's
 challenge and spend the proof the user signs there, logged in as them
 (rationale §5). A server MAY accept `v = 1` while clients move to
-`v = 2` (*hxd-ng:* `[identity] login_proof_v1`, on by default for now),
+`v = 2` (*hxd-ng:* `[identity] login_proof_v1`, off by default),
 and MUST refuse it otherwise.
 
 `downstream` declares the hop *behind* the client (§8): `local` (the
@@ -835,8 +835,8 @@ one profile and one switch.
 | `[identity]` present | absent | The master switch for this document's endpoints and the identity profile together. Absent, discovery reports `enabled: false` and the endpoints answer `404`. Needs `[ng]`; `[identity]` without it is a startup error. |
 | `[identity] key` | `identity-server.key` | The server's Ed25519 seed (§4.3), hex, mode 0600; generated on first run. |
 | `[identity] clock_skew` | `300` | Seconds of tolerance on the proof's `time` (§6.2). |
-| `[identity] hosts` | empty | The hosts this server answers as, `host[:port]` (§6.2): challenges are signed, and `v = 2` proofs accepted, only for these. Empty is none: only `v = 1` proofs log in while `login_proof_v1` allows them, and the startup log says so. Not required, so that a configuration from before `v = 2` still starts. |
-| `[identity] login_proof_v1` | `true` | Accept the deprecated `v = 1` proof (§6.2), with a warning in the log at most once a minute. To be turned off by default once the clients in use send `v = 2`. |
+| `[identity] hosts` | empty | The hosts this server answers as, `host[:port]` (§6.2): challenges are signed, and `v = 2` proofs accepted, only for these. Empty is none, so with `login_proof_v1` off the server refuses to start, saying what to set; with it on only `v = 1` proofs log in, and the startup log says so. |
+| `[identity] login_proof_v1` | `false` | Accept the deprecated `v = 1` proof (§6.2), with a warning in the log at most once a minute, for clients that predate `v = 2`. Off, one is refused `unsupported_proof`. |
 | `[identity] trtp` | `true` | Serve TRTP over WebSocket (§7.3). |
 | `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and forwarded-address headers are believed (§6.3). Single addresses or CIDR blocks; IPv4-mapped peers on a `[::]` bind match their IPv4 form. Proxies only, never a range that contains clients. Non-empty turns on the mTLS binding. |
 | `[ng] forwarded_header` | `"x-forwarded-for"` | The one header a trusted proxy writes the client's address into: `"x-forwarded-for"`, `"forwarded"` (RFC 7239), or `"none"` (§6.3). |
@@ -877,10 +877,9 @@ them.
 
 ## 13. Open questions
 
-- **Retiring `v = 1` proofs.** `[identity] login_proof_v1` defaults to
-  accepting them so that clients that predate `v = 2` keep logging in;
-  it turns off by default once those clients sign `v = 2`, and goes
-  once nothing sends `v = 1`.
+- **Retiring `v = 1` proofs.** `[identity] login_proof_v1` is off by
+  default, now that the clients sign `v = 2`; the setting goes once
+  nothing sends `v = 1`.
 
 - **Other methods.** Which of §6.5's methods, if any, to define fully.
   Rationale §10 has the positions: OIDC first if asked.

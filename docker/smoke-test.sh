@@ -5,8 +5,10 @@
 # in relay mode in front of the first, and check the relay answers
 # discovery and carries a WebSocket on /trtp to the server's classic
 # port, and once more with HXD_CLASSIC=off, healthy on the ng port
-# alone. What CI runs before it publishes anything, and runnable as it is
-# against a local build:
+# alone. A fresh volume without HXD_IDENTITY_HOSTS starts with identity
+# off, and the first server's volume, which holds an identity key, is
+# refused without them. What CI runs before it publishes anything, and
+# runnable as it is against a local build:
 #
 #   docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng
 set -euo pipefail
@@ -15,6 +17,8 @@ image=${1:?usage: smoke-test.sh IMAGE}
 name=hxd-ng-smoke-$$
 relay=$name-relay
 ngonly=$name-ng-only
+upgrade=$name-upgrade
+fresh=$name-fresh
 
 fail() {
     echo "smoke-test: $*" >&2
@@ -37,6 +41,8 @@ cleanup() {
     # is given an anonymous one.
     docker rm -f -v "$relay" >/dev/null 2>&1 || true
     docker rm -f -v "$ngonly" >/dev/null 2>&1 || true
+    docker rm -f "$upgrade" >/dev/null 2>&1 || true
+    docker rm -f -v "$fresh" >/dev/null 2>&1 || true
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker volume rm -f "$name" >/dev/null 2>&1 || true
     docker network rm "$name" >/dev/null 2>&1 || true
@@ -59,7 +65,7 @@ docker run -d --name "$name" --network "$name" \
     -p 127.0.0.1::5500 -p 127.0.0.1::5600 -p 127.0.0.1::5700 \
     -v "$tls_dir":/etc/hxd-ng/tls:ro \
     -e HXD_TLS_CERT=/etc/hxd-ng/tls/cert.pem -e HXD_TLS_KEY=/etc/hxd-ng/tls/key.pem \
-    -e HXD_NAME=smoke \
+    -e HXD_NAME=smoke -e HXD_IDENTITY_HOSTS=localhost \
     -e HXD_ADMIN_LOGIN=Admin -e HXD_ADMIN_PASSWORD=smoke \
     "$image" >/dev/null
 
@@ -166,7 +172,7 @@ docker exec "$relay" bash -c "$health" ||
 # port. Asked every second here, rather than waiting out the interval.
 docker run -d --name "$ngonly" --health-interval 1s \
     -p 127.0.0.1::5700 \
-    -e HXD_CLASSIC=off -e HXD_NAME=smoke-ng-only \
+    -e HXD_CLASSIC=off -e HXD_NAME=smoke-ng-only -e HXD_IDENTITY_HOSTS=localhost \
     "$image" >/dev/null
 ngport=$(docker port "$ngonly" 5700/tcp | head -n1)
 state=
@@ -187,9 +193,37 @@ case $discovery in
 esac
 echo "smoke-test: ng-only server healthy, discovery on $ngport"
 
-for container in "$ngonly" "$relay" "$name"; do
+# A fresh volume and no HXD_IDENTITY_HOSTS: it starts, identity off.
+docker run -d --name "$fresh" -p 127.0.0.1::5700 "$image" >/dev/null
+freshport=$(docker port "$fresh" 5700/tcp | head -n1)
+discovery=
+for _ in $(seq 60); do
+    [ "$(docker inspect -f '{{.State.Running}}' "$fresh")" = true ] ||
+        fail "a fresh volume without HXD_IDENTITY_HOSTS exited"
+    discovery=$(curl -fsS --max-time 5 "http://$freshport/.well-known/hotline" 2>/dev/null) &&
+        break
+    sleep 1
+done
+case $discovery in
+    *'"identity":{"enabled":false}'*) ;;
+    *) fail "a fresh volume without HXD_IDENTITY_HOSTS: $discovery" ;;
+esac
+echo "smoke-test: a fresh volume without HXD_IDENTITY_HOSTS starts with identity off"
+
+for container in "$fresh" "$ngonly" "$relay" "$name"; do
     docker stop "$container" >/dev/null
     status=$(docker inspect -f '{{.State.ExitCode}}' "$container")
     [ "$status" = 0 ] || fail "$container exited $status on SIGTERM"
 done
+
+# The first server's volume now holds an identity key, so its users may
+# have linked identities: without HXD_IDENTITY_HOSTS it must not start.
+if out=$(timeout 60 docker run --rm --name "$upgrade" -v "$name":/var/lib/hxd-ng "$image" 2>&1); then
+    fail "a volume with an identity key started without HXD_IDENTITY_HOSTS"
+fi
+case $out in
+    *"HXD_IDENTITY needs HXD_IDENTITY_HOSTS"*) ;;
+    *) fail "a volume with an identity key and no hosts was refused with: $out" ;;
+esac
+echo "smoke-test: an identity key and no HXD_IDENTITY_HOSTS refused"
 echo "smoke-test: ok"

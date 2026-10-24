@@ -30,6 +30,8 @@ services:
       - "127.0.0.1:5700:5700"   # ng: only the proxy on this host reaches it
     environment:
       HXD_NAME: "My Hotline Server"
+      # The name clients reach the server by: the one nginx serves.
+      HXD_IDENTITY_HOSTS: "hl.example"
       # nginx on the host reaches the loopback-published port through
       # Docker, which connects from the network's gateway. Trusting the
       # gateway is safe only while 5700 is published on loopback alone:

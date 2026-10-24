@@ -95,7 +95,7 @@ async fn start(dir: &Path, classic: &TcpListener) -> (Server, SocketAddr, Value)
             dir.join("hxd-ng.toml"),
             format!(
                 "[server]\nname = \"ng only\"\nbind = \"{}\"\nclassic = false\n\
-                 [ng]\nbind = \"{ng}\"\n[identity]\n[banner]\nfile = \"banner.gif\"\n",
+                 [ng]\nbind = \"{ng}\"\n[identity]\nhosts = [\"{ng}\"]\n[banner]\nfile = \"banner.gif\"\n",
                 classic.local_addr().unwrap()
             ),
         )
