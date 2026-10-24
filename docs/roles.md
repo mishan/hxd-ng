@@ -326,8 +326,9 @@ exactly these bits":
   it later removes that `false`, and the account follows its role again.
 - **New User (350)** makes an account with no roles, then overrides as
   for 353.
-- Bit 56 keeps account-admin.md §4's rule: the period editors cannot
-  show it, so this wire leaves it as the account had it.
+- A bit above what the editor can show (access-bits.md §1: 40 for 1.5)
+  is left as the account had it, as account-admin.md §4 says, so a bit
+  only a role gives, such as 55 or 57, goes on following the role.
 
 The cost: an override pins its bit against later role edits. That is
 what the administrator asked for, and easy to forget. And 353 carries
@@ -378,7 +379,7 @@ transactions act on the role:
 | Transaction | On `@name` | Needs |
 |---|---|---|
 | Open User (352) | `NAME` = the role's title, `LOGIN` = `@name`, `PASSWORD` = the single NUL, `ACCESS` = the role's access grants | `read_users` |
-| Set User (353) | `ACCESS` replaces the role's access bits, and a changed `NAME` its title. Its `extra`, color, position, mentionability and raw bits past the bitmap are kept, since the editor cannot show them. Bit 56 stays as the role had it. A role that does not exist is refused, "No such role.": roles are made with 350 | `manage_roles`, and §5's edit rule |
+| Set User (353) | `ACCESS` replaces the role's access bits, and a changed `NAME` its title. Its `extra`, color, position, mentionability and raw bits past the bitmap are kept, since the editor cannot show them, and so are the bits above its tier (access-bits.md §1). A role that does not exist is refused, "No such role.": roles are made with 350 | `manage_roles`, and §5's edit rule |
 | New User (350) | Creates the role, with the bitmap as its grants | `manage_roles`, and grants the session's configuration has |
 | Delete User (351) | Deletes the role, under §5's delete rule | `manage_roles`, and §5's edit rule |
 

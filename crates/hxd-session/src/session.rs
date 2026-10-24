@@ -1382,7 +1382,8 @@ struct LoginRequest {
     password: Vec<u8>,
     nick: Option<Vec<u8>>,
     icon: u16,
-    clientversion: u16,
+    /// `None` when the login carried no version, as 1.2's does not.
+    clientversion: Option<u16>,
     /// The extensions the client says it implements (`0x01F0`).
     caps: Caps,
     /// A 1-byte all-zero LOGIN chunk: the HOPE session-key probe.
@@ -1398,7 +1399,7 @@ fn parse_login(f: &Frame) -> LoginRequest {
         match c.tag {
             tag::NAME => req.nick = Some(c.data.to_vec()),
             tag::ICON => req.icon = c.as_uint() as u16,
-            tag::VERSION => req.clientversion = c.as_uint() as u16,
+            tag::VERSION => req.clientversion = Some(c.as_uint() as u16),
             tag::CAPABILITIES => req.caps = Caps::from_wire(c.data),
             crate::peer::field::SERVER_KEY => req.server_key = c.data.try_into().ok(),
             crate::peer::field::KEY_PROOF => req.link_proof = c.data.try_into().ok(),
@@ -1450,7 +1451,7 @@ fn resends_icon_untasked(req: &LoginRequest) -> bool {
         | 1 << cap::CHAT_HISTORY;
     const OPTIONAL: u64 = 1 << cap::VOICE | 1 << cap::VIDEO;
     let bits = req.caps.bits();
-    req.clientversion == 185
+    req.clientversion == Some(185)
         && bits & ALWAYS == ALWAYS
         && bits & !(ALWAYS | OPTIONAL) == 0
         && (!req.caps.has(cap::VIDEO) || req.caps.has(cap::VOICE))
@@ -1517,6 +1518,9 @@ struct Session {
     /// The rooms this session has been told are read-only, which it is
     /// told once a room rather than once a dropped line.
     told_read_only: Vec<u32>,
+    /// The highest access bit this client's user editor can show
+    /// ([`accounts::editor_tier`]).
+    editor_tier: u8,
 }
 
 impl Session {
@@ -2560,7 +2564,7 @@ async fn login_phase(
             agreement_sent = true;
         }
     }
-    if req.clientversion >= 150 && !agreement_sent {
+    if req.clientversion.unwrap_or(0) >= 150 && !agreement_sent {
         push(
             tx,
             hdr::AGREEMENT,
@@ -2593,11 +2597,12 @@ async fn login_phase(
         banner_sent: false,
         banner_image: None,
         told_read_only: Vec::new(),
+        editor_tier: accounts::editor_tier(req.clientversion),
     };
 
     // A 1.5+ client that sent no name finishes its login via
     // AGREEMENTAGREE or USER_CHANGE; everyone else is done now.
-    if req.clientversion < 150 || got_name {
+    if req.clientversion.unwrap_or(0) < 150 || got_name {
         complete_login(tx, ctx, &mut sess, Some(permit)).await;
     }
     Some(LoginOutcome::Session(Box::new(sess), events))
@@ -5379,10 +5384,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
         t if accounts::handles(t) => {
             let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
-            let (uid, enc) = (sess.uid, sess.enc);
+            let (uid, enc, tier) = (sess.uid, sess.enc, sess.editor_tier);
             // The account store is file I/O.
             let done = off_reactor(&ctx.core, move |c| {
-                accounts::transaction(c, uid, enc, t, &fields)
+                accounts::transaction(c, uid, enc, tier, t, &fields)
             })
             .await;
             match done {
@@ -5626,7 +5631,7 @@ mod tests {
     #[test]
     fn only_gtkhxs_login_shape_gets_the_quiet_icon_refusal() {
         let login = |version: u16, caps: Option<u64>| LoginRequest {
-            clientversion: version,
+            clientversion: Some(version),
             caps: caps.map(Caps::from_bits).unwrap_or_default(),
             ..LoginRequest::default()
         };

@@ -739,7 +739,7 @@ impl AuthBackend for FileAuth {
         // operator puts a `raw_bits` entry for a bit this build has no
         // name for yet; `write_access` keeps those.
         let mut acc = toml_edit::Table::new();
-        write_access(&mut acc, access, self.roles().granted(&[]), false);
+        write_access(&mut acc, access, self.roles().granted(&[]), None);
         doc["access"] = toml_edit::Item::Table(acc);
         let mut id = toml_edit::Table::new();
         id["fingerprint"] = toml_edit::value(hl_identity::Fingerprint(*fingerprint).to_string());
@@ -861,7 +861,7 @@ impl AccountAdmin for FileAuth {
                 table,
                 edit.access.unwrap_or_default(),
                 baseline,
-                edit.history_unsaid,
+                edit.editor_tier,
             );
         }
         let text = doc.to_string();
@@ -932,14 +932,19 @@ fn admin_error(e: AuthError) -> AdminError {
 /// `raw_bits` becomes the set bits that have no name and no role, and
 /// `raw_deny` gains the unset ones a role gives and loses any set bit.
 /// Read-chat-history with no key follows read-chat, so it is written only
-/// where it parts from it; with `history_unsaid` it is not touched at all.
+/// where it parts from it. A bit above `tier` is not touched at all: its
+/// key, `raw_bits` entry or `raw_deny` entry stays as written.
 fn write_access(
     table: &mut dyn toml_edit::TableLike,
     access: AccessBits,
     baseline: AccessBits,
-    history_unsaid: bool,
+    tier: Option<u8>,
 ) {
-    if !history_unsaid {
+    let said = AccessBits::from_raw(tier.map_or(u64::MAX, |t| u64::MAX << (63 - t.min(63))));
+    let unsaid = |b: i64| u8::try_from(b).is_ok_and(|b| b < 64 && !said.has(b));
+    let access = AccessBits::from_raw(access.raw() & said.raw());
+    let baseline = AccessBits::from_raw(baseline.raw() & said.raw());
+    if !unsaid(bit::CHAT_HISTORY.into()) {
         if let Some(old) = table.remove("chat_history") {
             if !table.contains_key("read_chat_history") {
                 table.insert("read_chat_history", old);
@@ -947,10 +952,10 @@ fn write_access(
         }
     }
     for (key, b) in NAMES {
-        let history = *b == bit::CHAT_HISTORY;
-        if history && history_unsaid {
+        if unsaid((*b).into()) {
             continue;
         }
+        let history = *b == bit::CHAT_HISTORY;
         let on = access.has(*b);
         if baseline.has(*b) {
             if on {
@@ -976,7 +981,6 @@ fn write_access(
             .map(|a| a.iter().filter_map(|v| v.as_integer()).collect())
             .unwrap_or_default()
     };
-    let history_kept = |list: &[i64]| history_unsaid && list.contains(&bit::CHAT_HISTORY.into());
     let unnamed = |bits: AccessBits| -> Vec<i64> {
         access::names_of(bits)
             .1
@@ -985,14 +989,11 @@ fn write_access(
             .collect()
     };
     let mut raw = unnamed(AccessBits::from_raw(access.raw() & !baseline.raw()));
-    // History granted by number is as much the file's to keep as by name.
-    if history_kept(&listed(table, "raw_bits")) {
-        raw.push(bit::CHAT_HISTORY.into());
-    }
+    raw.extend(listed(table, "raw_bits").into_iter().filter(|b| unsaid(*b)));
     // An operator's own denial stays while the bit stays unset.
     let mut deny: Vec<i64> = listed(table, "raw_deny")
         .into_iter()
-        .filter(|b| u8::try_from(*b).is_ok_and(|b| !access.has(b)) || history_kept(&[*b]))
+        .filter(|b| u8::try_from(*b).is_ok_and(|b| !access.has(b)))
         .collect();
     deny.extend(unnamed(AccessBits::from_raw(
         baseline.raw() & !access.raw(),
@@ -2530,36 +2531,35 @@ mod tests {
             send_chat = true\nraw_bits = [41]\nraw_deny = [42]\n";
         const UNREAD: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = false\n";
         use bit::{CHAT_HISTORY as HISTORY, READ_CHAT as READ, SEND_MEDIA as MEDIA};
-        // The file, the bits the editor flips from what it opened, whether
-        // it leaves history unsaid as the classic editor does, and the
-        // file the save leaves.
-        type Row<'a> = (&'a str, &'a [(u8, bool)], bool, String);
+        // The file, the bits the editor flips from what it opened, the
+        // highest bit it can show, and the file the save leaves.
+        type Row<'a> = (&'a str, &'a [(u8, bool)], Option<u8>, String);
         let rows: &[Row] = &[
-            (HELD, &[], true, HELD.into()),
-            (HELD, &[], false, HELD.into()),
-            (PLAIN, &[], true, PLAIN.into()),
+            (HELD, &[], Some(40), HELD.into()),
+            (HELD, &[], None, HELD.into()),
+            (PLAIN, &[], Some(40), PLAIN.into()),
             (
                 HELD,
                 &[(MEDIA, false)],
-                true,
+                None,
                 format!("{HELD}send_media = false\n"),
             ),
             (
                 &format!("{HELD}send_media = false\n"),
                 &[(MEDIA, true)],
-                true,
+                None,
                 HELD.into(),
             ),
             (
                 HELD,
                 &[(58, false)],
-                true,
+                None,
                 format!("{HELD}raw_deny = [58]\n"),
             ),
             (
                 &format!("{HELD}raw_deny = [58]\n"),
                 &[(58, true)],
-                true,
+                None,
                 HELD.into(),
             ),
             // Bit 56 a role gives is the role's on the ng editor too,
@@ -2567,24 +2567,24 @@ mod tests {
             (
                 HELD,
                 &[(HISTORY, false)],
-                false,
+                None,
                 format!("{HELD}read_chat_history = false\n"),
             ),
             (
                 &format!("{HELD}read_chat_history = false\n"),
                 &[(HISTORY, true)],
-                false,
+                None,
                 HELD.into(),
             ),
-            (HELD, &[(READ, false)], false, UNREAD.into()),
+            (HELD, &[(READ, false)], None, UNREAD.into()),
             (
                 HELD,
                 &[(READ, false), (HISTORY, false)],
-                false,
+                None,
                 format!("{UNREAD}read_chat_history = false\n"),
             ),
         ];
-        for (before, flips, unsaid, after) in rows {
+        for (before, flips, tier, after) in rows {
             let td = tempfile::tempdir().unwrap();
             write(td.path(), "roles.toml", ROLES);
             write(td.path(), "al.toml", before);
@@ -2602,12 +2602,12 @@ mod tests {
             let edit = AccountEdit {
                 login: "al".into(),
                 access: Some(access),
-                history_unsaid: *unsaid,
+                editor_tier: *tier,
                 ..Default::default()
             };
             auth.write_account(&edit, &|_, _| Ok(())).unwrap();
             let saved = std::fs::read_to_string(td.path().join("al.toml")).unwrap();
-            assert_eq!(&saved, after, "{before:?} with {flips:?}, unsaid {unsaid}");
+            assert_eq!(&saved, after, "{before:?} with {flips:?}, tier {tier:?}");
             assert_eq!(auth.read_account("al").unwrap().access, access);
         }
 
@@ -2629,6 +2629,52 @@ mod tests {
         auth.reload().unwrap();
         let access = auth.read_account("al").unwrap().access;
         assert!(!access.has(bit::SEND_MEDIA) && !access.has(58));
+    }
+
+    #[test]
+    fn a_save_keeps_the_bits_above_its_editor_as_the_file_has_them() {
+        const ROLES: &str = "[role.r]\naccess = { send_media = true, raw_bits = [58] }\n";
+        const FILE: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = true\n\
+            can_broadcast = true\nsend_msgs = true\nvoice_chat = true\nvideo_chat = false\n\
+            raw_bits = [41, 61]\nraw_deny = [58]\n";
+        let unsent = FILE.replace("send_msgs = true", "send_msgs = false");
+        let unraw = FILE.replace("raw_bits = [41, 61]", "raw_bits = [61]");
+        // The highest bit the editor shows, a bit it clears, and the file
+        // the save leaves. It sends every bit above its tier clear.
+        let rows: &[(u8, Option<u8>, &str)] = &[
+            (31, None, FILE),
+            (40, None, FILE),
+            (54, None, FILE),
+            (31, Some(bit::SEND_MSGS), FILE),
+            (40, Some(bit::SEND_MSGS), &unsent),
+            (40, Some(41), FILE),
+            (54, Some(41), &unraw),
+            (63, Some(bit::SEND_MSGS), &unsent),
+        ];
+        for (tier, clear, after) in rows {
+            let td = tempfile::tempdir().unwrap();
+            write(td.path(), "roles.toml", ROLES);
+            write(td.path(), "al.toml", FILE);
+            let auth = FileAuth::new(td.path())
+                .with_roles(td.path().join("roles.toml"))
+                .unwrap();
+            let opened = auth.read_account("al").unwrap().access;
+            let shown = AccessBits::from_raw(opened.raw() & u64::MAX << (63 - tier));
+            let edit = AccountEdit {
+                login: "al".into(),
+                access: Some(clear.map_or(shown, |b| shown.without(b))),
+                editor_tier: Some(*tier),
+                ..Default::default()
+            };
+            auth.write_account(&edit, &|_, _| Ok(())).unwrap();
+            let saved = std::fs::read_to_string(td.path().join("al.toml")).unwrap();
+            assert_eq!(&saved, after, "tier {tier}, clearing {clear:?}");
+            let expected = match clear {
+                Some(b) if b <= tier => opened.without(*b),
+                _ => opened,
+            };
+            assert_eq!(auth.read_account("al").unwrap().access, expected);
+        }
     }
 
     #[test]
