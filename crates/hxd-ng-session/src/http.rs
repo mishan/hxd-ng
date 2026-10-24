@@ -24,10 +24,11 @@
 //! | `GET  /ng` (and `/`) | upgrade → the JSON protocol |
 //! | `GET  /trtp` | upgrade → the TRTP tunnel |
 //!
-//! TLS is still the reverse proxy's job. The one thing this layer asks of
-//! the proxy is the mTLS header contract (§5.3): `X-Hotline-Client-Cert`
-//! is believed only from `NgConfig::trusted_proxies`, and stripped from
-//! everyone else.
+//! TLS is still the reverse proxy's job. This layer asks two things of
+//! the proxy: the mTLS header contract (§5.3), `X-Hotline-Client-Cert`
+//! believed only from `NgConfig::trusted_proxies` and stripped from
+//! everyone else; and `Host` passed on as the client sent it, which a
+//! login proof names (§6.2).
 //!
 //! Everything above the upgrades answers CORS. These routes are
 //! authenticated by a token in the body or the URL and never by a cookie,
@@ -457,8 +458,8 @@ async fn route(
             return boxed(crate::metrics::scrape(&req, peer, client, source, &ctx).await);
         }
         (&Method::GET, "/.well-known/hotline") => discovery(&ctx, host.as_deref()),
-        (&Method::POST, "/identity/challenge") => challenge(&ctx, client, gates),
-        (&Method::POST, "/identity/auth") => auth(req, peer, client, &ctx).await,
+        (&Method::POST, "/identity/challenge") => challenge(&ctx, client, gates, host.as_deref()),
+        (&Method::POST, "/identity/auth") => auth(req, peer, client, host.clone(), &ctx).await,
         (&Method::POST, "/identity/link") => link(req, peer, client, &ctx).await,
         (&Method::POST, "/identity/unlink") => unlink(req, peer, &ctx).await,
         (&Method::PUT, "/identity/card") => put_card(req, peer, &ctx).await,
@@ -1681,7 +1682,7 @@ async fn enroll_fetch(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
     }
 }
 
-fn challenge(ctx: &NgCtx, client: SocketAddr, gates: &Gates) -> Resp {
+fn challenge(ctx: &NgCtx, client: SocketAddr, gates: &Gates, host: Option<&str>) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
@@ -1701,13 +1702,25 @@ fn challenge(ctx: &NgCtx, client: SocketAddr, gates: &Gates) -> Resp {
             "too many outstanding challenges; retry shortly",
         );
     };
-    json_resp(
-        StatusCode::OK,
-        json!({ "challenge": b64(&ch), "server_key": b64(&st.server_key()), "expires_in": 60 }),
-    )
+    let mut reply =
+        json!({ "challenge": b64(&ch), "server_key": b64(&st.server_key()), "expires_in": 60 });
+    if let Some(signed) = st.sign_challenge(&ch, host) {
+        reply["server_challenge"] = json!(b64(&signed));
+    }
+    json_resp(StatusCode::OK, reply)
 }
 
-async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx: &NgCtx) -> Resp {
+/// `host` is the request's `Host` as the client sent it, which a proxy
+/// must pass on unchanged: `X-Forwarded-Host` is not read, because a
+/// proxy that forgets to overwrite it hands the choice of host to
+/// whoever is on the other end.
+async fn auth(
+    req: Request<Incoming>,
+    peer: SocketAddr,
+    client: SocketAddr,
+    host: Option<String>,
+    ctx: &NgCtx,
+) -> Resp {
     let Some(st) = ctx.identity.as_ref() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
@@ -1815,7 +1828,7 @@ async fn auth(req: Request<Incoming>, peer: SocketAddr, client: SocketAddr, ctx:
     let verifier = st.clone();
     let shown = card.clone();
     let verified = crate::spawn_blocking("identity", move || match (proof, device_from_cert) {
-        (Some(proof), _) => verifier.verify_proof(&shown, &cert, &proof),
+        (Some(proof), _) => verifier.verify_proof(&shown, &cert, &proof, host.as_deref()),
         (None, Some(device)) => verifier.verify_presented(&shown, &cert, &device),
         (None, None) => unreachable!("checked above"),
     })
@@ -2114,6 +2127,13 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::Denied => "refused by server policy",
             AuthRefused::CardTooLarge => "the user card exceeds 16 KiB",
             AuthRefused::UnknownChallenge => "unknown or expired challenge",
+            AuthRefused::WrongHost => {
+                "the login proof names another host than this request was sent to, \
+                 or one this server does not answer as"
+            }
+            AuthRefused::UnsupportedProof => {
+                "this server no longer accepts v1 login proofs; sign a v2 proof naming its host"
+            }
             AuthRefused::LoginFailed | AuthRefused::GuestLink => {
                 "the account name or password is wrong"
             }

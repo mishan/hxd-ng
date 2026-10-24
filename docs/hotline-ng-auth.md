@@ -136,8 +136,9 @@ sig = Ed25519.sign(key, domain || 0x00 || cbor_bytes_without_sig)
   MUST reject a non-deterministic encoding.
 - In JSON, an object is carried as base64url, without padding, of its
   CBOR bytes.
-- Every object has an integer `v`; this document defines `v = 1`. A
-  reader MUST reject a `v` it does not know, including `0`.
+- Every object has an integer `v`; this document defines `v = 1`, and
+  `v = 2` for the login proof (§6.2). A reader MUST reject a `v` it
+  does not know, including `0`.
 - Unknown keys MUST be ignored on read. They are covered by the
   signature.
 - Timestamps are Unix seconds, UTC. `bstr(n)` is a byte string of
@@ -159,7 +160,8 @@ other keys.
 
 A server implementing this document MUST have an Ed25519 keypair,
 generated on first start and kept across restarts. It is published in
-discovery (§5), bound into login proofs (§6.2), and used by the
+discovery (§5), signs every challenge the server issues and is bound
+into the login proof that answers it (§6.2), and is used by the
 federation spec to sign. It is not a TLS key.
 
 ## 5. Discovery
@@ -200,7 +202,7 @@ This document owns:
 |---|---|
 | `v` | `1`. |
 | `name` | The server's name. |
-| `server_key` | The server key (§4.3), base64url. MUST be present when `identity.enabled` is true. *hxd-ng* sends `null` when identity is disabled. |
+| `server_key` | The server key (§4.3), base64url. MUST be present when `identity.enabled` is true. *hxd-ng* sends `null` when identity is disabled. Anyone can publish anyone's key; a client believes it of a host only once the challenge it signs has verified under it (§6.2). |
 | `ng.ws` | The path of the ng JSON protocol (§7.2). Present only when the listener serves it, which a relay (§10.2) need not. |
 | `ng.trtp` | The path of TRTP over WebSocket (§7.3). Present only when the server serves it. |
 | `ng.htxf` | The path of HTXF over WebSocket (§7.4). Present only when the server serves it, which is only beside `ng.trtp`. |
@@ -286,12 +288,75 @@ Works for every client, browsers included.
 **Step 1.** `POST` to the `challenge` endpoint, with an empty body.
 
 ```jsonc
-{ "challenge": "…base64url 32 bytes…", "server_key": "…", "expires_in": 60 }
+{
+  "challenge": "…base64url 32 bytes…",
+  "server_key": "…",
+  "expires_in": 60,
+  "server_challenge": "…base64url CBOR…"
+}
 ```
 
 The server MUST store the challenge for `expires_in` seconds and MUST
 consume it on use. *hxd-ng* bounds the number of outstanding challenges
 and answers `503` when the bound is reached.
+
+`server_challenge` is the server key's proof that it issued this
+challenge to a client that addressed it as the request's host: a
+**server challenge**, domain `hl-identity/server-challenge/v1`, signed by
+the server key (§4.3):
+
+| Key | Type | Req | Notes |
+|---|---|---|---|
+| `v` | uint | yes | `1` |
+| `challenge` | bstr(32) | yes | As above. |
+| `server_key` | bstr(32) | yes | The key that signs it. |
+| `host` | tstr | yes | The request's host, in the form below. |
+| `expires` | uint | yes | When the challenge expires. |
+| `sig` | bstr(64) | yes | |
+
+The server MUST sign it for the host the request was sent to, and MUST
+omit it when the request named no host or a host the server does not
+answer as. A client MUST verify it before it signs a proof: the
+signature under its `server_key`; `challenge` and `server_key` those of
+the reply; `host` the host the client sent the request to; `expires`
+not past, within the client's clock-skew tolerance. A reply without one,
+or with one that fails any of these, MUST be refused: the server has not
+shown that it holds the key it names, and a proof signed for that key
+could be spent by its holder (rationale §5). A client that sends `v = 2`
+MUST NOT fall back to `v = 1` for a server whose reply lacks it, or B
+need only strip it. A client that pins a server's key for a host does
+so on this signature, never on discovery's word alone.
+
+**The host** is the authority of the URL the client sent `challenge`
+and `auth` to, which MUST be the same for both: `host[:port]` as the
+WHATWG URL Standard serializes it — lowercase, a domain name's
+non-ASCII labels as their A-labels (punycode), an IPv4 address in
+dotted decimal, an IPv6 address in brackets in its compressed form —
+and with the port left off when it is 80 or 443, whatever the scheme,
+since a server behind a TLS proxy cannot tell which the client used.
+`https://HL.example:443/` and `http://hl.example/` are both
+`hl.example`; `wss://[2001:DB8:0:0:0:0:0:1]:5700` is
+`[2001:db8::1]:5700`. A trailing dot is kept, and `hl.example.` is
+another name than `hl.example`. A `host` field not in this form is a
+malformed object.
+
+The server reads the host the client sent from the `Host` header,
+brought to the same form, as it brings the names it is configured with.
+Behind a reverse proxy the proxy MUST forward `Host` as the client sent
+it; a server MUST NOT read the host from `X-Forwarded-Host` or
+`Forwarded`, because a proxy that fails to overwrite such a header lets
+its sender choose the host the proof is checked against. A request
+without `Host` (HTTP/1.0) names no host.
+
+**The hosts a server answers as** MUST be names it was configured with
+(*hxd-ng:* `[identity] hosts`), never whatever `Host` a request
+carries. `Host` is written by whoever sends the request: a server that
+took any as its own name would sign B's name for B, reached by address,
+and accept the proof made for it, and neither check above would bind.
+Against a configured list it does not matter who wrote the header, a
+client or a proxy: B can claim only a name A answers as, and the proof
+and the signature then name A. A server with no names configured signs
+no challenge and accepts no `v = 2` proof.
 
 **Step 2.** `POST` to the `auth` endpoint:
 
@@ -309,12 +374,21 @@ the key being proved:
 
 | Key | Type | Req | Notes |
 |---|---|---|---|
-| `v` | uint | yes | `1` |
+| `v` | uint | yes | `2` |
 | `challenge` | bstr(32) | yes | From step 1. |
-| `server_key` | bstr(32) | yes | From step 1. Binds the proof to this server (rationale §5). |
+| `server_key` | bstr(32) | yes | From step 1. Binds the proof to this server's key. |
+| `host` | tstr | yes | The host the client sent `challenge` and `auth` to, in the form above. Binds the proof to the server the client meant (rationale §5). |
 | `device` | bstr(32) | yes | The public key the proof is signed with. Named for the identity profile, where it is a device key; the transport reads it as *the key*. |
 | `time` | uint | yes | The signer's clock. |
 | `sig` | bstr(64) | yes | |
+
+A client MUST send `v = 2`. **`v = 1` is deprecated:** the same map
+without `host`, under the same domain. It names no host, so a server
+that publishes another's `server_key` can hand a user that server's
+challenge and spend the proof the user signs there, logged in as them
+(rationale §5). A server MAY accept `v = 1` while clients move to
+`v = 2` (*hxd-ng:* `[identity] login_proof_v1`, on by default for now),
+and MUST refuse it otherwise.
 
 `downstream` declares the hop *behind* the client (§8): `local` (the
 default) for a client that is the endpoint or a tunnel listening only on
@@ -322,12 +396,23 @@ loopback, `cleartext` for a tunnel forwarding over a network hop.
 *hxd-ng* also accepts `loopback` as a synonym for `local`. Any other
 value, of any JSON type, is a `400`.
 
-The transport's check, failing on the first error: the signature
-verifies with `device`; `challenge` is known and unexpired; `server_key`
-is this server's; `time` is within the server's clock-skew tolerance
-(*hxd-ng:* 300 seconds). Passing it establishes a `key` principal whose
-`id` is the fingerprint of `device`. The profile's verification then
-runs on the same request (§6.4).
+The transport's check, failing on the first error:
+
+1. `proof` decodes, and its signature verifies with `device`;
+2. `challenge` is known and unexpired, and is spent whatever follows;
+3. a `v = 1` proof is one this server still accepts
+   (`unsupported_proof` otherwise);
+4. for `v = 2`, the request has a `Host`, and it is a host the server
+   answers as (`wrong_host` otherwise);
+5. `server_key` is this server's;
+6. for `v = 2`, `host` equals the request's `Host` (`wrong_host`
+   otherwise);
+7. `time` is within the server's clock-skew tolerance (*hxd-ng:* 300
+   seconds).
+
+Passing it establishes a `key` principal whose `id` is the fingerprint
+of `device`. The profile's verification then runs on the same request
+(§6.4).
 
 On success, `200`:
 
@@ -345,15 +430,21 @@ On failure, `{ "error": code, "text": "…" }`. The transport's codes:
 | `code` | Status | Meaning |
 |---|---|---|
 | `bad_proof`, `unknown_challenge` | 401 | Prove it again. |
+| `unsupported_proof` | 401 | A `v = 1` proof this server no longer accepts: prove it again with `v = 2`. |
+| `wrong_host` | 421 | The proof names another host than the request was sent to, or the request was sent to a host this server does not answer as. A relay, or a proxy that rewrites `Host`; proving it again here will not help. |
 | `denied` | 403 | Policy refused this principal. |
 | `server_error` | 500 | The server failed. |
 
 A profile adds codes of its own in the same shape
 (`hotline-ng-identity.md` §5.3). A client MUST treat any `401` as "prove
-it again", any `403` as "not with this principal", and a code it does
-not recognize by its status. A body the server cannot parse, or one
-missing a field this document or the profile requires, is a `400` with a
-plain-text reason, not a JSON error. A server without authentication
+it again", any `403` as "not with this principal", any `421` as "not the
+server this was meant for", and a code it does not recognize by its
+status. An HTTP stack may repeat a request that met `421` on its own;
+the repeat finds its challenge spent and is answered
+`unknown_challenge`, which a client that saw `wrong_host` first should
+not take for a reason to prove it again. A body the server cannot parse,
+or one missing a field this document or the profile requires, is a
+`400` with a plain-text reason, not a JSON error. A server without authentication
 enabled answers `404` on these endpoints.
 
 ### 6.3 mTLS binding
@@ -654,7 +745,9 @@ a classic client, and forwards bytes over TRTP over WebSocket (§7.3).
 - It authenticates upstream with its own key, by either binding, with the
   objects its profile requires. Under Hotline identity it is a device like
   any other, with a device certificate scoped to what a tunnel needs
-  (`hotline-ng-identity.md` §10).
+  (`hotline-ng-identity.md` §10). By challenge, it is a client like any
+  other: it verifies the server challenge and signs for the host of the
+  server it was told to reach (§6.2).
 - It MUST forward bytes verbatim in both directions and MUST NOT alter the
   classic login; the server reconciles that with the principal (§9).
 - It MUST listen only on loopback unless its user opts in to another
@@ -695,9 +788,10 @@ and `auth` endpoints and the profile's public endpoints as well, and has
 a principal for every socket.
 
 - It holds its own server key (§4.3) and is, for authentication, the
-  server: its allow list, ban list and the profile's admission policy
-  apply at the HTTP layer, and the federation spec treats its signatures
-  as the operator's.
+  server: it signs its challenges for its own host, a proof made for it
+  names that host (§6.2), its allow list, ban list and the profile's
+  admission policy apply at the HTTP layer, and the federation spec
+  treats its signatures as the operator's.
 - It MUST refuse a socket whose principal is banned, not on an allow list
   it enforces, or refused by the profile, before any bytes reach the
   legacy server.
@@ -741,6 +835,8 @@ one profile and one switch.
 | `[identity]` present | absent | The master switch for this document's endpoints and the identity profile together. Absent, discovery reports `enabled: false` and the endpoints answer `404`. Needs `[ng]`; `[identity]` without it is a startup error. |
 | `[identity] key` | `identity-server.key` | The server's Ed25519 seed (§4.3), hex, mode 0600; generated on first run. |
 | `[identity] clock_skew` | `300` | Seconds of tolerance on the proof's `time` (§6.2). |
+| `[identity] hosts` | empty | The hosts this server answers as, `host[:port]` (§6.2): challenges are signed, and `v = 2` proofs accepted, only for these. Empty is none: only `v = 1` proofs log in while `login_proof_v1` allows them, and the startup log says so. Not required, so that a configuration from before `v = 2` still starts. |
+| `[identity] login_proof_v1` | `true` | Accept the deprecated `v = 1` proof (§6.2), with a warning in the log at most once a minute. To be turned off by default once the clients in use send `v = 2`. |
 | `[identity] trtp` | `true` | Serve TRTP over WebSocket (§7.3). |
 | `[ng] trusted_proxies` | empty | Addresses whose `X-Hotline-Client-Cert` and forwarded-address headers are believed (§6.3). Single addresses or CIDR blocks; IPv4-mapped peers on a `[::]` bind match their IPv4 form. Proxies only, never a range that contains clients. Non-empty turns on the mTLS binding. |
 | `[ng] forwarded_header` | `"x-forwarded-for"` | The one header a trusted proxy writes the client's address into: `"x-forwarded-for"`, `"forwarded"` (RFC 7239), or `"none"` (§6.3). |
@@ -780,6 +876,11 @@ them.
   cache.
 
 ## 13. Open questions
+
+- **Retiring `v = 1` proofs.** `[identity] login_proof_v1` defaults to
+  accepting them so that clients that predate `v = 2` keep logging in;
+  it turns off by default once those clients sign `v = 2`, and goes
+  once nothing sends `v = 1`.
 
 - **Other methods.** Which of §6.5's methods, if any, to define fully.
   Rationale §10 has the positions: OIDC first if asked.

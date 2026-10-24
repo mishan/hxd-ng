@@ -140,11 +140,15 @@ in Caddy and in nginx, is
 [hotline-ng-auth-rationale.md](hotline-ng-auth-rationale.md) §6.1; one
 that does not must strip it.
 
-**`Host`, for the registrar.** Discovery names the registrar only when
-it is asked for under `[registrar] host`, so the proxy must forward the
-`Host` header as the client sent it (`proxy_set_header Host $host;` in
-nginx); a proxy that rewrites it to the backend's address leaves the
-`registrar` block `null`.
+**`Host`, for logins and the registrar.** An identity's login proof
+names the host the client addressed, and the server holds it to the
+`Host` header the request arrived with (`X-Forwarded-Host` is not read),
+so the proxy must forward `Host` as the client sent it
+(`proxy_set_header Host $host;` in nginx). A proxy that rewrites it to
+the backend's address refuses every such login as `wrong_host`, and
+leaves discovery's `registrar` block `null`, since that is named only
+when asked for under `[registrar] host`. List the names the server is
+reached by in `[identity] hosts`.
 
 **Limits behind a proxy.** A trusted proxy's connections carry
 everyone, so they count toward `[limits] ng_connections` alone and the
@@ -356,7 +360,9 @@ account may: as many as the accounts it has been let create, which
 lets the port hold. Each of those logins still costs its address a
 connection at `reconnect_seconds` first.
 
-`hlid` makes the keys and objects and talks to the server. From nothing:
+`hlid` makes the keys and objects and talks to the server. It logs in
+only under a name the server lists in `[identity] hosts`, so the
+commands below need `hosts = ["127.0.0.1:5700"]` there. From nothing:
 
 ```sh
 hlid init --name Alice        # identity key, device key, certificate, card
@@ -950,6 +956,9 @@ new_accounts = "guest"              # deny | guest | create
 unattested = "guest"                # deny | guest | allow
 min_attestation_age = 0             # seconds an attestation must have existed
 clock_skew = 300                    # tolerated clock difference, seconds
+hosts = []                          # e.g. ["hl.example", "hl.example:5700"];
+                                    # the names clients reach this server by
+login_proof_v1 = true               # accept the old login proof; see below
 successors = "identity-successors"  # hotline-ng-identity.md §3.4 commitments;
                                     # "" = memory only, the weaker mode
 trtp = true                         # serve the tunnel at /trtp; never with
@@ -1001,6 +1010,28 @@ revoked_devices = []
 # read_chat = true
 # send_chat = true
 ```
+
+**`hosts`** are the names, `host[:port]` with the port left off for 80
+and 443, that clients put in the URL they reach this server by. A login
+proof names one, and the server signs each challenge for the one it was
+asked under, so that a server elsewhere cannot pass this one's
+challenges to its own users and log in here as them
+([hotline-ng-auth.md](hotline-ng-auth.md) §6.2). Only these count: a
+`Host` header is whatever the sender wrote, so the server never takes
+one as its own name, and a request under any other name is refused
+however it got here, past the proxy or around it. Empty, it signs no
+challenge and accepts no new login proof, so `hlid` and every client
+that signs the new proof cannot log in with an identity here; clients
+still on the old proof can while `login_proof_v1` is on. The startup
+log says so. A name outside ASCII may be written either way; it is
+compared in its `xn--` form.
+
+**`login_proof_v1`** accepts the login proof clients signed before
+proofs named a host. It can be relayed in just that way, and logins
+that use one are warned about in the log, at most once a minute.
+It is on because the browser client still sends it; it will be off by
+default once that client sends the new proof, and setting it to
+`false` now refuses those clients with `unsupported_proof`.
 
 ### `[inbox]`
 

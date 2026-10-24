@@ -63,7 +63,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use hl_identity::{
     attestation, caps, cbor, cert, Attestation, Bundle, Card, DeviceCert, DeviceKey, Fingerprint,
-    IdentityKey, LoginProof, PublicKey, ServerKey,
+    IdentityKey, LoginProof, PublicKey, ServerChallenge, ServerKey,
 };
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -834,7 +834,7 @@ fn inspect(args: &[String]) -> R<()> {
     } else if let Ok(p) = LoginProof::parse(&bytes) {
         json!({
             "type": "login_proof",
-            "device": hex(&p.device), "challenge": hex(&p.challenge), "server_key": hex(&p.server_key), "time": p.time,
+            "device": hex(&p.device), "challenge": hex(&p.challenge), "server_key": hex(&p.server_key), "host": p.host, "time": p.time,
         })
     } else if let Some(doc) = registrar::describe(&bytes) {
         doc
@@ -932,8 +932,9 @@ fn authenticate_with(
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
         .build();
-    let ch: Value = agent
-        .post(&format!("{base}/identity/challenge"))
+    let req = agent.post(&format!("{base}/identity/challenge"));
+    let host = addressed(&req)?;
+    let ch: Value = req
         .call()
         .map_err(|e| format!("challenge: {e}"))?
         .into_json()
@@ -944,7 +945,20 @@ fn authenticate_with(
     let server_key: [u8; 32] = unb64(ch["server_key"].as_str().unwrap_or(""))?
         .try_into()
         .map_err(|_| "server_key: bad length".to_string())?;
-    let proof = LoginProof::sign(&c.device, &challenge, &server_key, now());
+    // Nothing is signed for a server that has not shown it holds the key
+    // it names for the host addressed: one that published another's key
+    // could hand on that server's challenge and spend the answer there.
+    let vouched = ch["server_challenge"].as_str().ok_or_else(|| {
+        format!(
+            "the server did not sign its challenge for {host}: it is not one of \
+                 the names it answers as ([identity] hosts)"
+        )
+    })?;
+    ServerChallenge::parse(&unb64(vouched)?)
+        .and_then(|sc| sc.check(&challenge, &server_key, &host, now(), CLOCK_SKEW))
+        .map_err(|e| format!("the server's challenge does not hold for {host}: {e}"))?;
+    let proof = LoginProof::sign(&c.device, &challenge, &server_key, &host, now())
+        .map_err(|e| format!("{host}: {e}"))?;
     let mut body = json!({
         "card": b64(&c.card),
         "device_cert": b64(&c.cert),
@@ -964,6 +978,21 @@ fn authenticate_with(
         }
         Err(e) => Err(format!("auth: {e}")),
     }
+}
+
+/// What a server's clock may differ from this one's by, as a server's
+/// default `[identity] clock_skew` allows.
+const CLOCK_SKEW: u64 = 300;
+
+/// The `host[:port]` a request is addressed to, as the `Host` header
+/// ureq writes for it carries it.
+fn addressed(req: &ureq::Request) -> R<String> {
+    let url = req.request_url().map_err(|e| e.to_string())?;
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host()),
+        None => url.host().to_owned(),
+    };
+    hl_identity::proof::canonical_host(&host).ok_or_else(|| format!("{host} is not a host"))
 }
 
 fn auth_cmd(args: &[String]) -> R<()> {

@@ -316,6 +316,34 @@ subscription is opt-in per subscribing server with a per-list policy.
 
 Residual risk: PM metadata, and everything not E2E.
 
+### Relaying server
+A server B the user logs in to with an identity publishes another server
+A's key as its own, fetches a challenge from A, hands it to the user, and
+posts the proof the user signs to A's `auth`. B is then logged in to A
+as the user, with their account, links and standing there. It takes only
+that the user uses one identity on both, which is the point of a
+portable identity.
+
+Mitigations (`hotline-ng-auth.md` §6.2, rationale §5): the `v = 2` login
+proof names the host the client addressed, and A refuses one that names
+another host than the `Host` it arrived with, or a host A does not
+answer as (`[identity] hosts`); and A signs each challenge for the host
+it was asked under, which a client verifies before signing, so B cannot
+show A's key as its own. The mTLS binding cannot be relayed at all: the
+certificate proves possession only inside the TLS session the client
+opened, which was with B.
+
+Residual risk: a client that still sends `v = 1`, to a server that still
+accepts it (`[identity] login_proof_v1`, on by default until the clients
+in use have moved), is as exposed as before. A server must compare
+against names it was configured with: one that took any `Host` as its
+own would sign B's name for B and accept the proof made for it, so
+hxd-ng with `hosts` empty signs no challenge and accepts no `v = 2`
+proof, and says so at startup. Against the list, how a request reached
+A does not matter: under B's name it is refused, directly or through a
+proxy with a default site. A proxy in front of A that rewrites
+`Host` breaks `v = 2` logins rather than weakening them.
+
 ### Cleartext 1.x sessions
 A legacy client on plain TCP exposes its own traffic and everything the
 server sends it, including other users' public chat, user lists and file

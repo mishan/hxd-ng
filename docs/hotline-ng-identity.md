@@ -195,10 +195,14 @@ Domain `hl-identity/attestation/v1`, signed by a registrar key.
 ### 3.6 Login proof
 
 Defined by the transport, `hotline-ng-auth.md` §6.2 (domain
-`hl-identity/login/v1`). Under this profile it is signed by the device
-key, and its `device` must equal the device certificate's `device`
-(§5.2). `hl-identity` implements it beside the objects above because a
-client that makes one needs the other three.
+`hl-identity/login/v1`, `v = 2`, naming the host the client addressed;
+`v = 1`, which names none, is deprecated and relayable). Under this
+profile it is signed by the device key, and its `device` must equal the
+device certificate's `device` (§5.2). Before signing one, a client
+verifies the server's signature over the challenge for that host, the
+server challenge of the same section. `hl-identity` implements both
+beside the objects above because a client that makes one needs the
+other three.
 
 ### 3.7 Server key
 

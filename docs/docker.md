@@ -279,6 +279,7 @@ the same way with `hxd-entrypoint room …` and applied on SIGHUP.
 | `HXD_IDENTITY_NEW_ACCOUNTS` | `guest` | `deny`, `guest` or `create`. |
 | `HXD_IDENTITY_UNATTESTED` | `guest` | `deny`, `guest` or `allow`. |
 | `HXD_IDENTITY_WEB` | | Where a web client for this server lives, e.g. `https://hl.example/app/`. |
+| `HXD_IDENTITY_HOSTS` | | The names clients reach the server by, comma-separated `host[:port]`, e.g. `hl.example`: a login proof must name one ([operating.md](operating.md#identity)). Empty, `hlid` and clients that sign the new proof cannot log in with an identity. |
 | `HXD_REVOKED_IDENTITIES` | | Identity fingerprints refused, every device of each, comma-separated in the 52-character form `hlid` prints. |
 | `HXD_REVOKED_DEVICES` | | Device fingerprints refused: one stolen device, leaving the identity's others in. |
 

@@ -40,6 +40,14 @@ async fn start(dir: &Path, sections: &str, limits: &str) -> Server {
     } else {
         "exempt = []\n"
     };
+    let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng_addr = ng.local_addr().unwrap();
+    // An identity answers as the address the tests reach it by.
+    let sections = sections.replace(
+        "[identity]\n",
+        &format!("[identity]\nhosts = [\"{ng_addr}\"]\n"),
+    );
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n{sections}\n\
          [limits]\n{exempt}{limits}\n"
@@ -57,11 +65,9 @@ async fn start(dir: &Path, sections: &str, limits: &str) -> Server {
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
-    let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
-        ng: ng.local_addr().unwrap(),
+        ng: ng_addr,
     };
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -471,7 +477,7 @@ async fn auth_with_password(ng: SocketAddr, p: &Person, password: &str) -> Reply
     let server_key: [u8; 32] = unb64(ch["server_key"].as_str().unwrap())
         .try_into()
         .unwrap();
-    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, now());
+    let proof = LoginProof::sign(&p.dev, &challenge, &server_key, &ng.to_string(), now()).unwrap();
     let body = json!({
         "card": b64(&p.card),
         "device_cert": b64(&p.cert),

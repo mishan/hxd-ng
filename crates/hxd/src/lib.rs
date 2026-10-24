@@ -1739,6 +1739,15 @@ pub struct IdentitySection {
     pub newcomer_delay: u64,
     #[serde(default = "default_clock_skew")]
     pub clock_skew: u64,
+    /// The `host[:port]` names this server answers as, which a `v = 2`
+    /// login proof must name (`docs/hotline-ng-auth.md` §6.2). Empty is
+    /// none, and only `v = 1` proofs log in.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Accept `v = 1` login proofs, which name no host and so can be
+    /// relayed (§6.2). On until clients send `v = 2`.
+    #[serde(default = "default_true")]
+    pub login_proof_v1: bool,
     /// Serve the TRTP-over-WebSocket path.
     #[serde(default = "default_true")]
     pub trtp: bool,
@@ -3046,6 +3055,27 @@ fn build_identity(
     if section.new_accounts != "create" && section.default_access.is_some() {
         tracing::warn!("[identity] default_access has no effect unless new_accounts = create");
     }
+    let mut hosts = Vec::new();
+    for h in &section.hosts {
+        let host = hl_identity::proof::canonical_host(h)
+            .ok_or_else(|| format!("[identity] hosts: {h:?} is not host[:port]"))?;
+        hosts.push(host);
+    }
+    if hosts.is_empty() && !section.login_proof_v1 {
+        return Err(
+            "[identity] hosts is empty and login_proof_v1 = false: no identity \
+                    could log in; list the names clients reach this server by"
+                .into(),
+        );
+    }
+    if hosts.is_empty() {
+        tracing::warn!(
+            "[identity] hosts is empty: no challenge is signed and no v2 login proof \
+             accepted, so hlid and clients that sign v2 cannot log in with an identity \
+             here, and the v1 clients that can are relayable; list the names clients \
+             reach this server by (hotline-ng-auth.md §6.2)"
+        );
+    }
     let state = IdentityState::new(
         key,
         IdentityConfig {
@@ -3070,6 +3100,8 @@ fn build_identity(
                 .map(|h| h.to_lowercase())
                 .collect(),
             newcomer_delay: section.newcomer_delay,
+            hosts,
+            login_proof_v1: section.login_proof_v1,
         },
         auth,
         core,

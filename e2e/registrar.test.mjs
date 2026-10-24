@@ -58,10 +58,12 @@ describe('the registrar', () => {
 
   before(async () => {
     server = await startServer({
-      config: {
-        identity: { key: 'identity-server.key' },
+      // `hosts` names the address hlid reaches it by, without which it
+      // signs no challenge and hlid cannot publish the card it registers.
+      config: (ports) => ({
+        identity: { key: 'identity-server.key', hosts: [`127.0.0.1:${ports.ng}`] },
         registrar: { host: '127.0.0.1' },
-      },
+      }),
     });
     const init = hlid(server.dir, ['init', '--name', 'Alice']);
     fingerprint = /fingerprint: (\S+)/.exec(init)?.[1];
