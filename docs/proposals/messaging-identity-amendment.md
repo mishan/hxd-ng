@@ -1,8 +1,12 @@
 # Proposal: portable identity in the Instant Messaging extension
 
-Status: proposal to fogWraith for `Docs/Protocol/Capabilities-Messaging.md`.
-Written against the version current on 2026-09-06. Companion to hxd-ng's
-`docs/hotline-ng-identity.md`, referred to below as "the identity spec".
+Status: superseded by the edit to `Docs/Protocol/Capabilities-Messaging.md`
+proposed upstream as [fogWraith/Hotline#3](https://github.com/fogWraith/Hotline/pull/3),
+which renumbers what has since been allocated and replaces part C with
+signed and sealed messages (`docs/e2e-messages.md`). Kept for the
+reasoning. Written against the version current on 2026-09-06.
+Companion to hxd-ng's `docs/hotline-ng-identity.md`, referred to below
+as "the identity spec".
 
 ## Summary
 
