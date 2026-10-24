@@ -3873,7 +3873,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             }
             // Hotline's own client asks for a quick preview with 2, mhxd's
-            // with 1; either way it reads the data fork's bytes alone.
+            // with 1; either way it reads the data fork's bytes alone, from
+            // the resume offset if one comes with it. The field alone
+            // decides (Capabilities-Large-File.md, Preview or Resume): a
+            // resume carries none.
             let preview = match f.chunks().find(|chunk| chunk.tag == tag::FILE_PREVIEW) {
                 None => false,
                 Some(chunk) => match files::wire_uint(chunk.data) {
@@ -4394,20 +4397,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 }
             }
             if let Some(quote) = quote {
-                if quote.data_offset > u64::from(u32::MAX)
-                    || quote.resource_offset > u64::from(u32::MAX)
+                if !large
+                    && (quote.data_offset > u64::from(u32::MAX)
+                        || quote.resource_offset > u64::from(u32::MAX))
                 {
-                    if !large {
-                        reply_error(tx, f.trans, "Stored partial needs Large File support.");
-                        return;
-                    }
-                } else {
-                    let rflt = hxfiles_xfer::rflt::encode(hxfiles_xfer::rflt::Resume {
-                        data: quote.data_offset as u32,
-                        resource: quote.resource_offset as u32,
-                    });
-                    chunks.push((tag::RFLT, rflt.to_vec()));
+                    reply_error(tx, f.trans, "Stored partial needs Large File support.");
+                    return;
                 }
+                let rflt = hxfiles_xfer::rflt::encode(hxfiles_xfer::rflt::Resume {
+                    data: quote.data_offset.min(u64::from(u32::MAX)) as u32,
+                    resource: quote.resource_offset.min(u64::from(u32::MAX)) as u32,
+                });
+                chunks.push((tag::RFLT, rflt.to_vec()));
                 if large {
                     chunks.push((tag::OFFSET64, quote.data_offset.to_be_bytes().to_vec()));
                     if let Some(digest) = quote.digest {

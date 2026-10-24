@@ -988,35 +988,44 @@ async fn classic_resume_folders_and_get_info_follow_the_reference() {
 }
 
 #[tokio::test]
-async fn a_preview_is_the_data_fork_alone() {
+async fn the_transfer_option_alone_makes_a_download_a_preview() {
     let server = start().await;
-    let mut classic = Legacy::login(server.legacy, false).await;
-    // Hotline's own client sends 2, mhxd's sends 1.
-    for (option, offset, expected) in [
-        (vec![0, 2], 0, b"hello world".as_slice()),
-        (vec![0, 1], 6, b"world".as_slice()),
+    let option = |value: u16| (tag::FILE_PREVIEW, value.to_be_bytes().to_vec());
+    let resume = |data: u32| {
+        let record = rflt::encode(rflt::Resume { data, resource: 0 });
+        (tag::RFLT, record.to_vec())
+    };
+    // Hotline's own client previews with 2 and mhxd's with 1, which it
+    // resumes with an RFLT; a resume without the option is a flattened
+    // object, from 0 if the RFLT says so.
+    for (large, asked, framed, data) in [
+        (false, vec![option(2)], false, b"hello world".as_slice()),
+        (false, vec![option(1), resume(6)], false, b"world"),
+        (false, vec![option(2), resume(6)], false, b"world"),
+        (
+            true,
+            vec![option(2), (tag::OFFSET64, 6u64.to_be_bytes().to_vec())],
+            false,
+            b"world",
+        ),
+        (false, vec![resume(0)], true, b"hello world"),
     ] {
-        let resume = rflt::encode(rflt::Resume {
-            data: offset,
-            resource: 0,
-        });
-        let get = classic
-            .request(
-                FILE_GET,
-                &[
-                    (tag::FILE_NAME, b"hello.txt".to_vec()),
-                    (tag::FILE_PREVIEW, option),
-                    (tag::RFLT, resume.to_vec()),
-                ],
-            )
-            .await;
+        let mut classic = Legacy::login(server.legacy, large).await;
+        let mut chunks = vec![(tag::FILE_NAME, b"hello.txt".to_vec())];
+        chunks.extend(asked);
+        let get = classic.request(FILE_GET, &chunks).await;
         assert_eq!(get.flag & 1, 0);
+        let bytes = transfer(server.htxf, classic_download(reference_of(&get))).await;
         assert_eq!(
             field(&get, tag::HTXF_SIZE).as_deref(),
-            Some((expected.len() as u32).to_be_bytes().as_slice())
+            Some((bytes.len() as u32).to_be_bytes().as_slice())
         );
-        let bytes = transfer(server.htxf, classic_download(reference_of(&get))).await;
-        assert_eq!(bytes, expected);
+        if framed {
+            assert!(bytes.starts_with(b"FILP"));
+            assert!(bytes.windows(data.len()).any(|window| window == data));
+        } else {
+            assert_eq!(bytes, data);
+        }
     }
 }
 
@@ -2481,6 +2490,75 @@ impl FolderDownload {
             .unwrap()
             .unwrap();
         object
+    }
+}
+
+#[tokio::test]
+async fn a_partial_past_32_bits_is_quoted_with_its_rflt_clamped() {
+    let (server, root, _source) = start_local().await;
+    let mut capable = Legacy::login(server.legacy, true).await;
+    let first = capable
+        .request(
+            FILE_PUT,
+            &[
+                (tag::FILE_NAME, b"large.bin".to_vec()),
+                (tag::HTXF_SIZE, 11u32.to_be_bytes().to_vec()),
+                (tag::XFERSIZE64, 11u64.to_be_bytes().to_vec()),
+            ],
+        )
+        .await;
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&first),
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE | htxf::FLAG_SIZE64,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"hello").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+
+    let held: u64 = 5 << 30;
+    let partials = root.path().join(".hxd-state/partials");
+    let data = std::fs::read_dir(&partials)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "data"))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(data)
+        .unwrap()
+        .set_len(held)
+        .unwrap();
+
+    // Any non-zero option asks to resume; hx and the OpenLine client send 1.
+    for option in [1u16, 2, 0x100] {
+        let resume = capable
+            .request(
+                FILE_PUT,
+                &[
+                    (tag::FILE_NAME, b"large.bin".to_vec()),
+                    (tag::FILE_PREVIEW, option.to_be_bytes().to_vec()),
+                ],
+            )
+            .await;
+        assert_eq!(resume.flag & 1, 0, "{option}");
+        assert_eq!(
+            field(&resume, tag::OFFSET64),
+            Some(held.to_be_bytes().to_vec())
+        );
+        let quoted = rflt::parse_compatible(&field(&resume, tag::RFLT).unwrap());
+        assert_eq!((quoted.data, quoted.resource), (u32::MAX, 0));
     }
 }
 

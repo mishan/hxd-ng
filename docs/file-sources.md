@@ -56,6 +56,10 @@ size only to drive the progress bar. A quick preview adds a non-zero
 `FILE_PREVIEW` (`0x00cc`): Hotline's own client sends 2, mhxd's 1, and
 the transfer is then the data fork alone, from the resume offset, with no
 FILP framing and no resource fork, and `HTXF_SIZE` counts just that.
+The field alone decides: any non-zero value is a preview, RFLT or not,
+and a resume carries none (Large File extension, Preview or Resume). On
+`FilePut` the same field asks to resume, at any non-zero value, and the
+reply's RFLT is clamped to 32 bits beside the exact `OFFSET64`.
 
 Browsing needs `FileList` (`0x00c8`), whose entries carry a 4-byte type,
 a 4-byte creator and **a size per entry**, and `FileGetInfo` (`0x00ce`)
