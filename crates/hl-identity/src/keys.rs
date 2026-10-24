@@ -133,7 +133,10 @@ fn sign_domain(key: &SigningKey, domain: &str, bytes: &[u8]) -> [u8; 64] {
 /// key, such a key would be a shared identity — one every holder could
 /// sign for, and a single allow-list entry, link or block for all of
 /// them. `is_weak` rejects the small-order points, and `verify_strict`
-/// closes the cofactor ambiguity for everything else.
+/// closes the cofactor ambiguity for everything else. Decompression
+/// also reduces y mod p, so a point with a small y has a second
+/// encoding; requiring the canonical one keeps one key to one
+/// fingerprint.
 pub fn verify_domain(
     public: &PublicKey,
     domain: &str,
@@ -141,7 +144,7 @@ pub fn verify_domain(
     sig: &[u8; 64],
 ) -> Result<(), Error> {
     let key = VerifyingKey::from_bytes(public).map_err(|_| Error::InvalidKey)?;
-    if key.is_weak() {
+    if key.is_weak() || key.to_edwards().compress().to_bytes() != *public {
         return Err(Error::InvalidKey);
     }
     let mut msg = Vec::with_capacity(domain.len() + 1 + bytes.len());
@@ -362,6 +365,31 @@ mod tests {
             verify_domain(&order8, "hl-identity/card/v1", b"x", &sig),
             Err(Error::InvalidKey) | Err(Error::BadSignature)
         ));
+    }
+
+    #[test]
+    fn a_key_in_its_second_encoding_is_refused() {
+        // y + p fits in 255 bits only for y below 19; find such a point
+        // that is not small order, whose two encodings would otherwise
+        // be two fingerprints for one key.
+        let (alias, canonical) = (2u8..19)
+            .find_map(|y| {
+                let mut alias = [0xffu8; 32];
+                alias[0] = 0xed + y;
+                alias[31] = 0x7f;
+                let key = VerifyingKey::from_bytes(&alias).ok()?;
+                (!key.is_weak()).then(|| (alias, key.to_edwards().compress().to_bytes()))
+            })
+            .expect("some small y is a point of large order");
+        assert_ne!(alias, canonical);
+        assert_eq!(
+            verify_domain(&alias, "a", b"", &[0; 64]),
+            Err(Error::InvalidKey)
+        );
+        assert_eq!(
+            verify_domain(&canonical, "a", b"", &[0; 64]),
+            Err(Error::BadSignature)
+        );
     }
 
     #[test]
