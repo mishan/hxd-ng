@@ -68,6 +68,7 @@ describe('revocation by hand', () => {
       time: Math.floor(Date.now() / 1000),
     });
     return postAuth(endpoint(doc.identity.endpoints.auth), {
+      host: challenge.host,
       card: new Uint8Array(readFileSync(join(server.dir, 'card.bin'))),
       deviceCert: new Uint8Array(readFileSync(join(server.dir, 'cert.bin'))),
       proof,

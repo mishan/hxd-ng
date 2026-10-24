@@ -127,6 +127,7 @@ describe('identity login', () => {
       time: Math.floor(Date.now() / 1000),
     });
     const auth = await postAuth(endpoint(doc.identity.endpoints.auth), {
+      host: challenge.host,
       card,
       deviceCert: cert,
       proof,
@@ -183,6 +184,7 @@ describe('identity login', () => {
     await assert.rejects(
       () =>
         postAuth(endpoint(doc.identity.endpoints.auth), {
+          host: challenge.host,
           card: new Uint8Array(readFileSync(join(server.dir, 'card2.bin'))),
           deviceCert: new Uint8Array(readFileSync(join(server.dir, 'cert2.bin'))),
           proof,
@@ -209,12 +211,13 @@ describe('identity login', () => {
     const endpoint = (path) => new URL(path, server.httpBase).toString();
     const challenge = await fetchChallenge(endpoint(doc.identity.endpoints.challenge));
     const req = {
+      host: challenge.host,
       card: new Uint8Array(readFileSync(join(server.dir, 'card3.bin'))),
       deviceCert: new Uint8Array(readFileSync(join(server.dir, 'cert3.bin'))),
       proof: await signLoginProof(device.key, {
         challenge: challenge.challenge,
         serverKey: challenge.serverKey,
-      host: challenge.host,
+        host: challenge.host,
         device: device.signPub,
         time: Math.floor(Date.now() / 1000),
       }),
