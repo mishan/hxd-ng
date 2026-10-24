@@ -63,6 +63,7 @@ describe('revocation by hand', () => {
     const proof = await signLoginProof(device.key, {
       challenge: challenge.challenge,
       serverKey: challenge.serverKey,
+      host: challenge.host,
       device: device.signPub,
       time: Math.floor(Date.now() / 1000),
     });
@@ -90,13 +91,16 @@ describe('revocation by hand', () => {
 
   before(async () => {
     server = await startServer({
-      config: {
+      // The names this server signs its challenges for and takes
+      // host-bound proofs under (hotline-ng-auth.md §6.2).
+      config: (ports) => ({
         identity: {
           key: 'identity-server.key',
+          hosts: [`127.0.0.1:${ports.ng}`],
           new_accounts: 'guest',
           unattested: 'guest',
         },
-      },
+      }),
     });
     device = await newDevice();
     const keygen = hlid(server.dir, ['keygen', 'identity', 'identity.key']);

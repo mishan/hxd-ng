@@ -55,16 +55,19 @@ describe('identity login', () => {
 
   before(async () => {
     server = await startServer({
-      config: {
+      // The names this server signs its challenges for and takes
+      // host-bound proofs under (hotline-ng-auth.md §6.2).
+      config: (ports) => ({
         identity: {
           key: 'identity-server.key',
+          hosts: [`127.0.0.1:${ports.ng}`],
           // Nobody has attested this identity, so the strictest useful
           // posture that still lets a stranger in: a guest with a name
           // the server can prove is stable.
           new_accounts: 'guest',
           unattested: 'guest',
         },
-      },
+      }),
     });
   });
   after(async () => {
@@ -119,6 +122,7 @@ describe('identity login', () => {
     const proof = await signLoginProof(device.key, {
       challenge: challenge.challenge,
       serverKey: challenge.serverKey,
+      host: challenge.host,
       device: device.signPub,
       time: Math.floor(Date.now() / 1000),
     });
@@ -171,6 +175,7 @@ describe('identity login', () => {
     const proof = await signLoginProof(impostor.key, {
       challenge: challenge.challenge,
       serverKey: challenge.serverKey,
+      host: challenge.host,
       device: device.signPub,
       time: Math.floor(Date.now() / 1000),
     });
@@ -209,6 +214,7 @@ describe('identity login', () => {
       proof: await signLoginProof(device.key, {
         challenge: challenge.challenge,
         serverKey: challenge.serverKey,
+      host: challenge.host,
         device: device.signPub,
         time: Math.floor(Date.now() / 1000),
       }),
