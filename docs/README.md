@@ -32,7 +32,7 @@ to another project.
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
 | [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |
-| [e2e-messages.md](e2e-messages.md) — end-to-end private messages under the identity's `device_enc` key | no | ng | spec |
+| [e2e-messages.md](e2e-messages.md) — messages signed by a device key (private messages, public chat, news) and private messages sealed to its `device_enc` key | no | ng | spec |
 | [push-notifications.md](push-notifications.md) — the notify decision, the subscriber model, and the multi-vendor sidecar | yes, through the Web Push gateway or a uniqush-push 2.11 sidecar; not the sidecar's APNs and FCM devices | ng | design |
 | [webpush-gateway.md](webpush-gateway.md) — the in-process Web Push sender and the device registry | yes | ng | design |
 
