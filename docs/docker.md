@@ -23,6 +23,7 @@ docker run -d --name hxd-ng --restart unless-stopped \
   -p 5500-5501:5500-5501 \
   -p 127.0.0.1:5700:5700 \
   -e HXD_NAME="My Hotline Server" \
+  -e HXD_IDENTITY_HOSTS=hl.example \
   -e HXD_NG_TRUSTED_PROXIES=127.0.0.1,::1,gateway \
   -e HXD_ADMIN_LOGIN=admin -e HXD_ADMIN_PASSWORD='change me' \
   ghcr.io/mishan/hxd-ng:latest
@@ -275,11 +276,11 @@ the same way with `hxd-entrypoint room …` and applied on SIGHUP.
 | `HXD_NG_FORWARDED_HEADER` | `x-forwarded-for` | Or `forwarded`, or `none`. |
 | `HXD_NG_GRACE` | 300 | Seconds a dropped ng session waits to be resumed. |
 | `HXD_NG_MAX_DETACHED_PER_ADDR` | 2 | Detached sessions per client address. |
-| `HXD_IDENTITY` | `on` | Portable identity and the `/trtp` tunnel ([hotline-ng-identity.md](hotline-ng-identity.md)). The server key is generated into the volume on first start. |
+| `HXD_IDENTITY` | `on` | Portable identity and the `/trtp` tunnel ([hotline-ng-identity.md](hotline-ng-identity.md)). The server key is generated into the volume on first start. Needs `HXD_IDENTITY_HOSTS`: left at its default, a volume with no server key yet starts with identity off until they are set, saying so in the log. |
 | `HXD_IDENTITY_NEW_ACCOUNTS` | `guest` | `deny`, `guest` or `create`. |
 | `HXD_IDENTITY_UNATTESTED` | `guest` | `deny`, `guest` or `allow`. |
 | `HXD_IDENTITY_WEB` | | Where a web client for this server lives, e.g. `https://hl.example/app/`. |
-| `HXD_IDENTITY_HOSTS` | | The names clients reach the server by, comma-separated `host[:port]`, e.g. `hl.example`: a login proof must name one ([operating.md](operating.md#identity)). Empty, `hlid` and clients that sign the new proof cannot log in with an identity. |
+| `HXD_IDENTITY_HOSTS` | | The names clients reach the server by, comma-separated `host[:port]` with the port left off for 80 and 443, e.g. `hl.example`: a login proof must name one ([operating.md](operating.md#identity)). Needed while `HXD_IDENTITY` is on. Without it, a container with `HXD_IDENTITY=on`, or with a volume that already holds the server key, stops at start and says so, since that volume's users may have linked identities: a volume from before this variable was needed must set it to start again. |
 | `HXD_REVOKED_IDENTITIES` | | Identity fingerprints refused, every device of each, comma-separated in the 52-character form `hlid` prints. |
 | `HXD_REVOKED_DEVICES` | | Device fingerprints refused: one stolen device, leaving the identity's others in. |
 

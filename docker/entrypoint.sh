@@ -237,9 +237,24 @@ generate() {
         str HXD_NG_FORWARDED_HEADER forwarded_header
     fi
 
-    # On with the ng port it lives on; asked for without it, an error.
+    # On with the ng port it lives on; asked for without it, or without
+    # the hosts a login proof must name, an error. On only by default,
+    # a volume with no identity key yet has no linked identities to
+    # lock out, so there it waits for the hosts instead.
+    identity=false
     if on HXD_IDENTITY "$ng"; then
+        identity=true
         $ng || die "HXD_IDENTITY needs HXD_NG: the identity endpoints are on the ng port"
+        if [ -z "${HXD_IDENTITY_HOSTS:-}" ]; then
+            if [ -z "${HXD_IDENTITY+set}" ] && [ ! -e "$DATA/identity-server.key" ]; then
+                echo "hxd-entrypoint: identity, and the /trtp tunnel with it, is off until HXD_IDENTITY_HOSTS names the hosts clients reach this server by" >&2
+                identity=false
+            else
+                die "HXD_IDENTITY needs HXD_IDENTITY_HOSTS: a login proof names the host it was made for, so set it to the names clients reach this server by, comma-separated host[:port] with the port left off for 80 and 443, e.g. HXD_IDENTITY_HOSTS=hl.example; or turn identity, and the /trtp tunnel with it, off with HXD_IDENTITY=off"
+            fi
+        fi
+    fi
+    if $identity; then
         echo
         echo "[identity]"
         echo "key = \"$DATA/identity-server.key\""
@@ -247,7 +262,7 @@ generate() {
         str HXD_IDENTITY_NEW_ACCOUNTS new_accounts
         str HXD_IDENTITY_UNATTESTED unattested
         str HXD_IDENTITY_WEB web
-        [ -z "${HXD_IDENTITY_HOSTS:-}" ] || kvlist hosts "$HXD_IDENTITY_HOSTS"
+        kvlist hosts "$HXD_IDENTITY_HOSTS"
         # The generated file is rewritten at every start, so these are the
         # only lists that last; `hxd identity revoke` is refused below.
         fingerprints HXD_REVOKED_IDENTITIES revoked_identities

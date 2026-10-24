@@ -143,9 +143,9 @@ That protects a careless client, since the check is the server's. It
 holds only against names A was configured with: `Host` is whatever the
 sender wrote, and an A that took any as its own would, reached by
 address, sign B's name for B and accept the proof made for it. So a
-server with no names signs nothing and takes no `v = 2` proof; it is
-not required to have them, because a configuration written before them
-should still start, and its `v = 1` clients still log in. And the
+server with no names signs nothing and takes no `v = 2` proof, so
+hxd-ng refuses to start without them unless `v = 1` is turned on, with
+which its old clients still log in. And the
 challenge reply carries the server key's signature over the
 challenge and the host it was asked under, which a client verifies
 before signing: A signs only the names it lists, so B cannot get A's
@@ -159,10 +159,10 @@ possession only within that session; B cannot carry it into a session
 of its own with A, and A believes the header that names one only from
 its own proxies.
 
-The `v = 1` proof stays acceptable for a while, behind a setting, so
-that clients that predate `v = 2` keep logging in. It is still exactly
-as relayable as before; the warning in the log is there so that an
-operator knows when it is safe to turn it off.
+The `v = 1` proof can still be accepted, behind a setting that is off
+by default, so that clients that predate `v = 2` can keep logging in. It
+is exactly as relayable as before; the warning in the log is there so
+that an operator who turned it on knows when it is safe to turn it off.
 
 `challenge` is free for the caller and costs the server a random draw
 and a signature, which is why it wants a rate limit and a bounded table

@@ -334,12 +334,13 @@ certificate proves possession only inside the TLS session the client
 opened, which was with B.
 
 Residual risk: a client that still sends `v = 1`, to a server that still
-accepts it (`[identity] login_proof_v1`, on by default until the clients
-in use have moved), is as exposed as before. A server must compare
-against names it was configured with: one that took any `Host` as its
-own would sign B's name for B and accept the proof made for it, so
-hxd-ng with `hosts` empty signs no challenge and accepts no `v = 2`
-proof, and says so at startup. Against the list, how a request reached
+accepts it (`[identity] login_proof_v1`, off by default; an operator
+turns it on only for clients that predate `v = 2`), is as exposed as
+before. A server must compare against names it was configured with:
+one that took any `Host` as its own would sign B's name for B and
+accept the proof made for it, so hxd-ng with `hosts` empty signs no
+challenge and accepts no `v = 2` proof, and refuses to start unless
+`login_proof_v1` is on. Against the list, how a request reached
 A does not matter: under B's name it is refused, directly or through a
 proxy with a default site. A proxy in front of A that rewrites
 `Host` breaks `v = 2` logins rather than weakening them.

@@ -1745,8 +1745,8 @@ pub struct IdentitySection {
     #[serde(default)]
     pub hosts: Vec<String>,
     /// Accept `v = 1` login proofs, which name no host and so can be
-    /// relayed (§6.2). On until clients send `v = 2`.
-    #[serde(default = "default_true")]
+    /// relayed (§6.2).
+    #[serde(default)]
     pub login_proof_v1: bool,
     /// Serve the TRTP-over-WebSocket path.
     #[serde(default = "default_true")]
@@ -3063,8 +3063,14 @@ fn build_identity(
     }
     if hosts.is_empty() && !section.login_proof_v1 {
         return Err(
-            "[identity] hosts is empty and login_proof_v1 = false: no identity \
-                    could log in; list the names clients reach this server by"
+            "[identity] hosts is empty, so no identity could log in: a login proof \
+             names the host it was made for, and this server answers as none \
+             (hotline-ng-auth.md §6.2). Set [identity] hosts to the names clients \
+             reach this server by, as host[:port] with the port left off for 80 \
+             and 443, e.g. hosts = [\"hl.example\"] (HXD_IDENTITY_HOSTS in the \
+             Docker image); or, to keep accepting clients that sign the old proof \
+             for now, set [identity] login_proof_v1 = true, whose proofs a \
+             relaying server can forward"
                 .into(),
         );
     }

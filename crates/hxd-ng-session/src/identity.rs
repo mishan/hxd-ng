@@ -102,7 +102,7 @@ pub struct IdentityConfig {
     /// accepted in a `v = 2` proof: a `Host` is whatever the sender put
     /// there, so taking any would let another server name itself to
     /// this one and be vouched for under its own name. Empty, there are
-    /// none, and only `v = 1` proofs log in.
+    /// none, and no identity logs in unless `login_proof_v1` is on.
     pub hosts: Vec<String>,
     /// Accept a `v = 1` login proof, which names no host and so can be
     /// relayed (`hotline-ng-auth.md` §6.2).
@@ -126,7 +126,7 @@ impl Default for IdentityConfig {
             banned_registrars: Vec::new(),
             newcomer_delay: 0,
             hosts: Vec::new(),
-            login_proof_v1: true,
+            login_proof_v1: false,
         }
     }
 }
@@ -720,7 +720,7 @@ impl IdentityState {
         tracing::warn!(
             fingerprint = %fingerprint.short(),
             "accepted a v1 login proof, which a relaying server can forward \
-             (hotline-ng-auth.md §6.2); [identity] login_proof_v1 = false refuses them"
+             (hotline-ng-auth.md §6.2); turning [identity] login_proof_v1 off refuses them"
         );
     }
 

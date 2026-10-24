@@ -23,6 +23,8 @@ services:
       - "127.0.0.1:5700:5700"
     environment:
       HXD_NAME: "My Hotline Server"
+      # The name clients reach the server by: the one nginx serves.
+      HXD_IDENTITY_HOSTS: "hl.example"
       HXD_NG_TRUSTED_PROXIES: "127.0.0.1,::1,gateway"
       HXD_ADMIN_LOGIN: admin
       HXD_ADMIN_PASSWORD: ${HXD_ADMIN_PASSWORD:-}

@@ -957,8 +957,9 @@ unattested = "guest"                # deny | guest | allow
 min_attestation_age = 0             # seconds an attestation must have existed
 clock_skew = 300                    # tolerated clock difference, seconds
 hosts = []                          # e.g. ["hl.example", "hl.example:5700"];
-                                    # the names clients reach this server by
-login_proof_v1 = true               # accept the old login proof; see below
+                                    # the names clients reach this server by;
+                                    # needed unless login_proof_v1 is on
+login_proof_v1 = false              # accept the old login proof; see below
 successors = "identity-successors"  # hotline-ng-identity.md §3.4 commitments;
                                     # "" = memory only, the weaker mode
 trtp = true                         # serve the tunnel at /trtp; never with
@@ -1020,18 +1021,22 @@ challenges to its own users and log in here as them
 `Host` header is whatever the sender wrote, so the server never takes
 one as its own name, and a request under any other name is refused
 however it got here, past the proxy or around it. Empty, it signs no
-challenge and accepts no new login proof, so `hlid` and every client
-that signs the new proof cannot log in with an identity here; clients
-still on the old proof can while `login_proof_v1` is on. The startup
-log says so. A name outside ASCII may be written either way; it is
-compared in its `xn--` form.
+challenge and accepts no new login proof, so no identity could log in
+and the server refuses to start, saying what to set; with
+`login_proof_v1` on it starts, and only clients still on the old proof
+can log in with an identity, which the startup log says. A
+configuration written before `hosts` existed needs one or the other to
+start: the names, or the old proof turned on. A name outside ASCII may
+be written either way; it is compared in its `xn--` form.
 
 **`login_proof_v1`** accepts the login proof clients signed before
 proofs named a host. It can be relayed in just that way, and logins
 that use one are warned about in the log, at most once a minute.
-It is on because the browser client still sends it; it will be off by
-default once that client sends the new proof, and setting it to
-`false` now refuses those clients with `unsupported_proof`.
+It is off, and such a login is refused with `unsupported_proof`; `hlid`
+and the browser client sign the new proof. Turning it on keeps older
+clients logging in for now, at the cost of the relaying the new proof
+closes: a server that shows this one's key as its own can log its
+users in here as them.
 
 ### `[inbox]`
 
