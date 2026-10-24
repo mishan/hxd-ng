@@ -511,10 +511,11 @@ pub mod conformance {
         };
         let id = log.append(&with(1, 0, &alice)).unwrap();
         assert_eq!(log.find_guid(0, &alice, &guid).unwrap(), Some(id));
-        assert_eq!(
-            log.append_all(&[with(2, 0, &alice), line(8)]).unwrap()[0],
-            Appended { id, new: false },
-            "one line a guid"
+        let done = log.append_all(&[with(2, 0, &alice), line(8)]).unwrap();
+        assert_eq!(done[0], Appended { id, new: false }, "one line a guid");
+        assert!(
+            done[1].new && done[1].id > id,
+            "and the next is logged after it"
         );
         let elsewhere = log.append(&with(3, 9, &alice)).unwrap();
         let other = log.append(&with(4, 0, &keyed)).unwrap();

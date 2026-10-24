@@ -892,17 +892,11 @@ impl Core {
                 }
             }
         }
-        for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
-            if let (None, Some((handle, _))) = (&result, &s.media) {
-                match self.media_for_send(s.info.uid, handle) {
-                    Ok(reference) => s.media = Some((*handle, reference)),
-                    Err(_) => *result = Some(Err(ChatError::NoSuchMedia)),
-                }
-            }
-        }
         // A repeat of a line already logged is answered as that line was,
         // and one of a line earlier in this batch as that one will be:
-        // neither is logged or heard.
+        // neither is logged or heard. Before the image is asked about
+        // again, so a repeat whose handle has gone since is still its
+        // line.
         let now = self.clock.now();
         let mut repeats = Vec::new();
         {
@@ -923,6 +917,14 @@ impl Core {
         }
         for &(i, _) in &repeats {
             results[i] = Some(Ok(None));
+        }
+        for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
+            if let (None, Some((handle, _))) = (&result, &s.media) {
+                match self.media_for_send(s.info.uid, handle) {
+                    Ok(reference) => s.media = Some((*handle, reference)),
+                    Err(_) => *result = Some(Err(ChatError::NoSuchMedia)),
+                }
+            }
         }
         let live: Vec<usize> = (0..batch.len()).filter(|&i| results[i].is_none()).collect();
         let ids: Vec<crate::history::Appended> = match self.history.as_ref() {

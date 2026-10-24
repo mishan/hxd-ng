@@ -412,7 +412,8 @@ belong to the `inbox` capability (§4).
 - **`text`** MUST be non-empty unless the message carries `media`
   (inline-media.md §8.3); an empty message is `bad_request`.
 - **`guid`** is the client's own id for the message: a UUID, hyphenated or
-  not. A client SHOULD send one. Two sends with the same guid between the
+  not, in either case; its version and variant bits are not checked, so
+  any 32 hex digits serve. A client SHOULD send one. Two sends with the same guid between the
   same sender and recipient of a **stored** message — the recipient has an
   inbox and the sender has a mailbox — are one message, stored once and
   never refused, so a retry after a lost reply is safe. A message that is
@@ -670,8 +671,9 @@ family document. Each family of §4 adds its own.
   busy room can end one sender's window early. A send after what the
   server remembers is a second line. A client SHOULD send a guid with
   every line it may have to send again, and reuse it on retry.
-  *hxd-ng:* a repeat is charged as a request (§9), and once the line it
-  repeats is logged, not as a line of chat.
+  *hxd-ng:* a repeat is charged as a request (§9), and not as a line of
+  chat when it is found before it is queued, as one sent after its line
+  is logged is.
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
