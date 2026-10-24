@@ -239,7 +239,9 @@ client path nor a manifest entry may supply an arbitrary host or URL.
 - Encode FILP with the real variable-length filename/comment area, the DATA
   fork, and the trailing zero-length MACR marker.
 - Parse 32-bit RFLT resumes for old clients and negotiated 64-bit offsets for
-  positions beyond the legacy ceiling.
+  positions beyond the legacy ceiling. An upload's resume quote carries
+  both, the RFLT clamped. `FILE_PREVIEW` alone makes a download a preview,
+  whatever offset comes with it.
 - Keep the legacy Mac Roman conversion and path/name rules at the
   `hxd-session` edge.
 
