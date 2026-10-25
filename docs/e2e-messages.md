@@ -3,8 +3,9 @@
 Status: draft, 2026-10. Nothing here is built. This is the end-to-end
 messaging document that `hotline-ng-identity.md` §3.3 names for the
 `device_enc` key, and the construction the server linking user keys
-draft leaves to it ("Sealed Messages in Link Private Message"); §5 says
-where the two still differ. It rests on the `server_challenge` and
+draft leaves to it ("Sealed Messages in Link Private Message"); §5
+follows that draft's link wire, and §6 the messaging identity draft's
+classic one. It rests on the `server_challenge` and
 `[identity] hosts` of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s
 `chat_guid` (§4, §7.1, §7.3), and hl-identity's `verify_domain`, which
 refuses a key that does not re-encode to its own bytes (§3.1). Rotating
@@ -266,10 +267,11 @@ where the maps are otherwise alike. Unknown keys are covered and
 ignored, with these exceptions: a line or an article that carries `to`,
 and a private message that carries `in`, is rejected, which keeps the
 barrier structural; `in` holds exactly the keys its object's table
-gives it; and so does an article's `parent`. A `v` other than `1` is
-rejected, as identity objects are; a reader rejects a `tstr` that is
-not valid UTF-8, and each object's table says what else it rejects.
-`S`, the skew allowance used below, is ten minutes.
+gives it; so does an article's `parent`; and a map that carries
+`cert_sha256`, which only the link form holds (§5), is rejected. A `v`
+other than `1` is rejected, as identity objects are; a reader rejects a
+`tstr` that is not valid UTF-8, and each object's table says what else
+it rejects. `S`, the skew allowance used below, is ten minutes.
 
 **Signatures are verified strictly**, by one rule every implementation
 applies exactly: `S` is less than the group order `L`; the public key
@@ -314,8 +316,9 @@ verifier does (`hotline-ng-identity.md` §3.4).
   in deterministic encoding, carried beside the text it signs. This is
   how a signed message that is not sealed is sent, stored and served, so
   the text crosses the wire once. A detached form is at most 1020 bytes,
-  so that it fits a link's Link Chat (§5); one that holds a text key is
-  rejected.
+  the bound the classic wire's `DATA_MESSAGE_SIGNED` shares (§6); one
+  that holds a text key is rejected. Across a server link it travels in
+  a smaller **link form**, with `cert` replaced by its hash (§5).
 
 To verify a detached form, a reader decodes it (rejecting a
 non-deterministic encoding, as for any identity object), inserts the
@@ -435,7 +438,8 @@ Every reader, a server on ingest (§4.11), a client (§8) and a
 moderator's tool (§4.12), checks a signed message in this order:
 
 1. the map: deterministic encoding, `v = 1`, the fields of its table,
-   and for a detached form, reassembly as §3.1 says;
+   and for a detached form, reassembly as §3.1 says, or for a link form,
+   told by `cert_sha256` in place of `cert`, as §5 says;
 2. `cert`: a valid device certificate whose signature by its identity
    key verifies by §3.1's strict rule, allowing messages, at most 512
    bytes, and valid at `sent` and at the time the reader's server
@@ -896,8 +900,10 @@ it asks `challenge` (`hotline-ng-auth.md` §6.2) for the
 The `signed` parameter, on every request that takes one, is base64url
 (no padding) of the detached form (§3.1). On every event and listing
 that carries one, `signed` is the detached form exactly as it was
-received, and the text beside it is the canonical text it was checked
-against.
+received, or for a linked line as §5 restores it, or its link form as
+it arrived when the certificate could not be fetched (§5), which a
+client tells by `cert_sha256` in place of `cert`; and the text beside
+it is the canonical text it was checked against.
 
 ### 4.7 Signed chat
 
@@ -993,8 +999,8 @@ A curated room can require signed lines:
 - **Only rooms.** The lobby cannot be marked: it is every period
   client's, and every link's. A private chat cannot be (§1.3).
 - **Classic sessions read it as read-only.** A period or extended
-  client, on any port or through `/trtp`, cannot sign (§6), so it is
-  treated as a member that may read and not post, exactly as in a
+  client, on any port or through `/trtp`, cannot sign a line (§6), so
+  it is treated as a member that may read and not post, exactly as in a
   read-only room (`chat-rooms.md` §6.2, §6.3): its join notice says
   `read-only`, `/rooms` adds `(signed lines only)` after the room's
   count, following `(encrypted connections only)` when the room is
@@ -1112,7 +1118,7 @@ client's bug.
 A server MUST store the detached form with the line, the inbox row and
 the article; serve it unchanged with the text it was checked against, on
 every event, `history` page, `inbox` listing and article; and carry it
-across links (§5).
+across links in its link form (§5).
 
 A server MUST NOT alter signed text, by truncation, rewriting or a
 change of line ending in what it stores and serves on the ng wire;
@@ -1144,7 +1150,9 @@ and get the text alone.
   carries `signed`. A moderator's tool verifies it by §3.5, its scope
   against the server's own key, or for a ghost's line the home key the
   target carries, so a moderator judges what the sender signed rather
-  than what the server kept.
+  than what the server kept. A ghost's line stored before its
+  certificate was fetched carries its link form, which the tool cannot
+  verify until the certificate is.
 - **Pasted evidence**, for lines and private messages only. `report`
   gains `signed?` beside `evidence`: the detached form of what
   `evidence` pastes, or a whole private message (§3.1), such as a sealed
@@ -1228,40 +1236,90 @@ stands for now, and nothing carries a session's `sealed` across a link
 but the answer to 915.
 
 The draft, as published in fogWraith's Hotline repository
-(`Docs/Protocol/Server-Link-User-Keys.md`), already binds the
-recipient's identity fingerprint, judges freshness by the recipient's
-clock and checks the sender's certificate as §3.9 does. What still
-differs: its sealed message "proves the sender" by a signature of the
-sender's device key, where a deniable box (§3.11) proves it by HPKE's
-auth mode and carries no signature, so the draft should allow either;
-and the signature's domain is this document's `hl-identity/message/v1`
-(§3.2), which the draft does not name.
+([`Docs/Protocol/Server-Link-User-Keys.md`](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Server-Link-User-Keys.md)),
+binds the recipient's identity fingerprint, allows a signed box or a
+deniable one (§3.11) under this document's domains, judges freshness by
+the recipient's clock and checks the sender's certificate as §3.9 does.
+It carries signed messages as this section does, and differs from this
+document in nothing that matters. The field numbers below are proposed
+in that draft; the extension (`Capabilities-Server-Link.md`) has not
+reserved them yet.
 
-Signed messages ask this of the link wire, which fogWraith's extension
-owns:
+Signed messages cross the link wire this way:
 
 - **A lobby line's signature** rides Link Chat (904) as one optional
-  field holding the detached form (here `DATA_LINK_SIGNED`; the number
-  is the extension's to allocate). The extension's fields beside a
-  904's baseline share one bound of 1024 bytes, field headers included
-  (`Capabilities-Server-Link.md`, Relaying Fields), so
-  `DATA_LINK_SIGNED` is at most 1020 bytes, which is §3.1's bound on a
-  detached form, and leaves nothing for any other field in a signed
-  line. Relaying Fields passes it on unchanged through
+  field, `DATA_LINK_SIGNED` (`0x0647`), holding the link form below, at
+  most 256 bytes. A signed lobby line's link form is 201 bytes, and 206
+  for an action, so with its header it takes about a fifth of the 1024
+  bytes the extension's fields beside a 904's baseline share
+  (`Capabilities-Server-Link.md`, Relaying Fields), and leaves room for
+  other extensions. Relaying Fields passes it on unchanged through
   servers that know nothing of it, and drops a transaction whole rather
   than trim it. A relay that builds a fresh 904 can still leave it out;
   §8's stripping check is the defense.
 - **A signed private message** rides 905 the same way, beside its text,
-  and the target's home server checks `to` against its user's identity.
-- **The home server's discovery key** in its server group (900, 912,
-  913), relayed like the group's other fields, so a reader can check a
-  ghost's line's `in.server`. It is the `server_key` of discovery, not
-  the link key, which is a different key unless the operator made them
-  one (`server-link.md` §8). The ng `user` object's `remote` gains
+  for a message signed and not sealed: 187 bytes, and 193 for an
+  automatic response. A sealed message carries its signature, or its
+  deniable proof, inside `DATA_LINK_SEALED`, never beside it.
+- **The home server's discovery key**, `DATA_LINK_DISCOVERY_KEY`
+  (`0x0648`), in its server group (900, 912, 913), relayed like the
+  group's other fields, so a reader can check a ghost's line's
+  `in.server`. It is the `server_key` of discovery, not the link key,
+  which is a different key unless the operator made them one
+  (`server-link.md` §8). The ng `user` object's `remote` gains
   `server_key`, base64url, for a ghost whose home server sent one, and
   so does the `remote` a ghost's `chat` event carries in `from`
   (`server-link.md` §5), so a line can be checked after the ghost has
   left the roster.
+
+**The link form** is the detached form (§3.1) without `cert`, carrying
+in its place `cert_sha256`, a bstr(32): the SHA-256 of the certificate.
+The signature still covers `cert` exactly as §3.1 defines, so the link
+changes only what is sent, never what is signed, and a line signed once
+for local readers crosses a link unchanged. A verifier fetches the
+certificate, checks that its SHA-256 equals `cert_sha256`, removes
+`cert_sha256`, restores `cert` and the canonical text under their keys,
+and verifies `sig` over the deterministic encoding without `sig`, as
+§3.1 says. A fetched certificate whose SHA-256 differs is treated as
+one that could not be fetched, since a device change looks the same,
+so a relay that rewrites the hash, or serves another certificate under
+the same identity, makes the line unverifiable, as stripping would,
+and can never make it verify. A link form that carries `cert`, or lacks
+`cert_sha256`, is rejected, and a signed message whose own map carries
+`cert_sha256` cannot take the link form; hxd-ng refuses one on ingest,
+`bad_signature` (§3.1), since it could neither carry it across a link
+signed nor strip its signature.
+
+**The certificate is fetched** through Link Device Keys (915), in the
+server's own name: a 915 without `DATA_LINK_USER_ID`. A receiving hxd-ng
+server keeps certificates by hash, so one fetch serves every line the
+device signs, and never holds a link's lines for a fetch: the order of a
+path and a room's commit order stay as they are. A line whose certificate
+is cached is checked and served in full, `cert` restored, to its own
+clients, in history and to moderators (§4.12), so they verify on their own
+and the line still verifies after its sender has left. One whose
+certificate is not cached yet is relayed at once in its link form, as it
+arrived, which names its certificate only by hash and which a client shows
+as **unverified** (§8); the server fetches the certificate in the
+background, and once it has it, history holds and serves the full form, so
+a later page or a moderator verifies the line. A line whose certificate
+cannot be fetched, because its home server no longer answers for that
+session (the sender has left, or moved to another device) or never
+exported the sender's fingerprint, stays unverified. As a home server,
+hxd-ng answers a server's own 915 only for a session it has seen sign: one
+that signed a lobby line, or, for one that signed only private messages,
+over the links those went out on. It answers it without step 5's condition
+that the session's client can open sealed messages, so a client that signs
+without `sealed` can still be verified across a link, and holds it to the
+per-link rate limit, since it has no ghost behind it. A server's own
+request is indistinguishable from a user's that a relay has stripped of
+`DATA_LINK_USER_ID`, so the requester's checks of a user's 915 (a current
+ghost, exclusions, refused private messages) are no guarantee against a
+server on the path; having seen the session sign is what bounds it. Janus
+up to 2.0.28 answers `UnknownUser` to a 915 without `DATA_LINK_USER_ID`,
+so a Janus relay of those versions on the path blocks servers' own
+fetches, and the lines behind it stay unverified; Janus 2.0.29, in
+development, is to relay them.
 
 The text survives the crossing: 904 carries the raw text the user typed,
 never the formatted line, as UTF-8 with CR line endings. A receiving
@@ -1269,51 +1327,73 @@ server canonicalizes a signed 904's or 905's text (§3.1), CR to LF,
 before it stores, shows or serves it; canonical text holds no CR, so
 that gives back exactly what was signed. `server-link.md` §4.4's cut at
 8192 bytes applies only to a classic line in Mac Roman; a signed line
-is at most 4096.
+is at most 4096, and one that does not fit a link's bounds is dropped,
+never cut.
 
-A linked lobby line's scope is its home server's key and room 0. A
-receiving server SHOULD check a 904's signature as a client would, by
-§3.5 with that scope and no session to compare, and not show one that
-fails; it relays it onward unchanged regardless, as the extension
-requires, and never shows it with the signature removed. It stores the
-detached form with the ghost's line in history (`server-link.md` §4.3),
-with its home server's `server_key` beside it, and a `history` line of a
-ghost carries that key as `from.remote.server_key`: history's `from`
-already carries the ghost's `remote` (`server-link.md` §5), and
-`chat-history.md` gains the key in it. Without the key every stored
-linked line would read as signed for elsewhere. So a
-server's history of a linked lobby verifies line by line. A ghost has no
-`identity` on its row until user keys cross, so until then its line is
-named by its certificate's fingerprint and the contact pinned to it, if
-any, and once they do, a client also checks that fingerprint against the
-row's. A ghost whose row has no `server_key` cannot have its lines'
-scope checked: they are shown as unverified (§8), which is not the same
-as failing, and a receiving server neither drops them nor counts them
-invalid.
+A linked lobby line's scope is its home server's key and room 0. The draft
+makes a receiving server's check a MAY; hxd-ng, which MUST check what its
+own clients send (§4.11), checks every signed 904, and a 905 as the
+target's home server, once it holds the certificate, as a client would: by
+§3.5 with that scope (for a 905, `to` its user's identity fingerprint) and
+no session to compare, and the signer against the fingerprint in the
+sender's user group. It does not show one that fails, and answers a 905
+that fails `BadSignature` (reason 14, proposed in the user keys draft); it
+relays a 904 onward unchanged regardless, as the extension requires, and
+never shows or relays one with the signature removed. It stores the signed
+form with the ghost's line in history (`server-link.md` §4.3), with its
+home server's `server_key` beside it, and a `history` line of a ghost
+carries that key as `from.remote.server_key`: history's `from` already
+carries the ghost's `remote` (`server-link.md` §5), and `chat-history.md`
+gains the key in it. Without the key every stored linked line would read
+as signed for elsewhere. So a server's history of a linked lobby verifies
+line by line. A ghost has no `identity` on its row until user keys cross,
+so until then its line is named by its certificate's fingerprint and the
+contact pinned to it, if any, and once they do, a client also checks that
+fingerprint against the row's. A ghost whose row has no `server_key`
+cannot have its lines' scope checked: they are shown as unverified (§8),
+which is not the same as failing, and a receiving server neither drops
+them nor counts them invalid.
 
 Rooms do not cross links yet (`chat-rooms.md` §8.1); when they do, a
 room's scope is its host's key and the host's room id.
 
 ## 6. On the classic wire
 
-Not in v1. A classic client would need a way to fetch a ghost's or a
-user's certificate and to send and receive the sealed field, which
-belongs with the identity amendments to fogWraith's Messaging extension,
-whose rule that no messaging transaction names a ghost would need an
-exception. GtkHx is the client expected to do it. That amendment
-queues messages offline for days, which v1's hold time would drop; it
-needs §10's mail marker first. A classic client that knows nothing of
-this receives the placeholder.
+The messaging identity draft proposes signed and sealed messages for
+fogWraith's Instant Messaging extension
+([`Docs/Protocol/Capabilities-Messaging-Identity.md`](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging-Identity.md)),
+for messages between friends on one server whose accounts are linked to
+identities, under capability bit 13 (`CAPABILITY_IDENTITY`). IM Send (810)
+and IM Deliver (811) carry a signed message as `DATA_MESSAGE_SIGNED`
+beside the body: §3.2's detached form with the certificate inside, at most
+1020 bytes (§3.1), unlike a link's, since a message read from the offline
+queue must verify after its sender has left. A signed message is delivered
+only to sessions that negotiated `CAPABILITY_TEXT_ENCODING`, and others
+get the body alone; one that fails a server's check is refused
+`BadSignature` (reason 16). They carry a sealed message as
+`DATA_MESSAGE_SEALED`, §3.8's or §3.11's bytes, with
+`DATA_MESSAGE_SEALED_TO` naming the `device_enc` key as `msg`'s `cert`
+does (§4.3). As here, a sealed message goes only to a live session that
+can open it and is never queued. A sender learns the recipient's devices
+from Get User Info (825), which lists a `DATA_FRIEND_DEVICE_CERT` for each
+live sealed-capable device, to friends alone, and none while the recipient
+is `Invisible`. The draft makes a server's check of a signed message a
+MAY; hxd-ng checks it on ingest as §4.11 does. Friends on linked servers,
+and sealed mail for an offline device (§10), are left to the draft's later
+versions. GtkHx is the client expected to do it.
 
-Signing is not in v1 on the classic wire either. A classic reader gets
-a signed line, message or article as text, as now, with nothing to say
-it was signed, and a classic sender's lines are never signed. A binding
-needs the raw UTF-8 text beside the signature, as fields of 106 and of
-a 700 entry, because the line a classic client is sent is formatted by
-the server (`\r%13.13s:  %s`) and cannot be turned back into what was
-signed; and the same pair on 105, for sending. It belongs with the same
-amendments. A room that requires signing is read-only to a classic
-client (§4.8).
+Outside bit 13, classic chat and private messages carry no signature.
+Chat (105, 106) and private messages (108, 104) have no field for one:
+a classic reader gets a signed line, message or article as text, as
+now, with nothing to say it was signed, and a classic sender's lines
+are never signed. The user keys draft notes the same of a ghost's
+chat, as 106, and a ghost's private message, as 104; a sealed one from
+a ghost arrives as the placeholder. A binding for chat needs the raw UTF-8 text beside the
+signature, as fields of 106 and of a 700 entry, because the line a
+classic client is sent is formatted by the server (`\r%13.13s:  %s`)
+and cannot be turned back into what was signed; and the same pair on
+105, for sending. It is not in v1. A room that requires signing is
+read-only to a classic client (§4.8).
 
 ## 7. Limits
 
@@ -1323,8 +1403,8 @@ client (§4.8).
 - A signed request costs the server two verifications, the certificate's
   and the message's, and MAY weigh more against the request limit for
   it (hxd-ng: one more).
-- A detached form is at most 1020 bytes (§3.1), and signed text is
-  refused over its limit, never cut (§4.7).
+- A detached form is at most 1020 bytes (§3.1), and its link form 256
+  (§5); signed text is refused over its limit, never cut (§4.7).
 - `device_cert` is rate-limited per session (§4.2).
 
 ## 8. What a client should do
@@ -1367,13 +1447,16 @@ client (§4.8).
   2. **Signed for elsewhere**: valid, its scope another room, server,
      category, parent or recipient. Shown with where it was signed,
      never as said here.
-  3. **Unverified**: valid, but nothing to check it against: a live
-     line or message from a local uid whose row has no `identity`, an
-     article with no `from.fingerprint`, a ghost's line whose row has no
-     `server_key` (§5), or a history line whose `from.remote` has no
-     `server_key`, or a private message read by a session that
-     proved no identity to check `to` against (§3.5). Shown as signed
-     by its fingerprint, and not as from the nick beside it.
+  3. **Unverified**: valid, or for a link form uncheckable, but nothing to
+     check it against: a live line or message from a local uid whose row
+     has no `identity`, an article with no `from.fingerprint`, a ghost's
+     line whose row has no `server_key` (§5), or a history line whose
+     `from.remote` has no `server_key`, a linked line or message served in
+     its link form because its certificate was not fetched (§5), or a
+     private message read by a session that proved no identity to check
+     `to` against (§3.5). Shown as signed by its fingerprint, or for a
+     link form, which names none, by a key that could not be checked, and
+     not as from the nick beside it.
   4. **Invalid**: a signature that fails §3.5, or names a signer other
      than the one the server names (a roster row's or an article's
      other fingerprint). Marked so that the mark outweighs the nick;
@@ -1420,7 +1503,10 @@ the padded plaintext's.
 A detached public line with no unknown keys, a four-byte room id and
 `act` encodes to 684 bytes with a 512-byte certificate, and to 405 with
 a certificate that leaves out `name`, which encodes to 234. The bound is
-1020 (§3.1), 1360 characters of base64url beside the text.
+1020 (§3.1), 1360 characters of base64url beside the text. On a link
+the form carries the certificate's hash instead (§5): 201 bytes for a
+lobby line, 206 for an action, 187 for a private message and 193 for an
+automatic response, inside the link's bound of 256.
 
 ## 10. Leaving room for offline messages
 
@@ -1474,7 +1560,7 @@ device added after the mail was sent, which cannot read it.
   client tell a stripped signature from none for anyone whose card it
   holds, at the price of making signing a commitment of the identity
   rather than a choice per line.
-- **The classic wire** (§6).
+- **Signed chat on the classic wire** (§6).
 - **Private chat**, which needs a group construction this one is not,
   and an answer to §1.3 before it is signed.
 
@@ -1505,7 +1591,8 @@ file's `device_cert` has the `name` "browser"), and `rejects` entries
 naming the error each must fail with. They are:
 
 - a public line in the lobby, in a room, and as an action, each also as
-  its detached form, with the reassembled bytes equal to `unsigned_hex`;
+  its detached form, and the lobby line and the action as their link
+  form (§5), with the reassembled bytes equal to `unsigned_hex`;
 - canonical text: CR LF, a lone CR, the two mixed, a trailing CR, a TAB
   kept, and text in NFD left as it is;
 - the certificate window (§3.5), with `S` of 600 seconds: `issued` at
@@ -1515,7 +1602,8 @@ naming the error each must fail with. They are:
 - a mixed-order `A` whose signature satisfies the cofactorless equation,
   accepted, and one whose signature satisfies only the cofactored
   equation, rejected;
-- a private message signed only, and the same map as the plaintext of a
+- a private message signed only, with its link form (§5) as a message
+  and as an automatic response, and the same map as the plaintext of a
   sealed message, with its keys, ephemeral key, padding and bytes, so
   the two are seen to share their signature;
 - a deniable box (§3.11): the sender's and recipient's `device_enc`
@@ -1525,7 +1613,10 @@ naming the error each must fail with. They are:
 - an article, with a signed parent and an unsigned one;
 - rejects: each object under another's domain, a line and an article
   with `to`, a private message with `in`, an `in` with an unknown key, a
-  detached form holding its text, one over 1020 bytes, a detached
+  detached form holding its text, one over 1020 bytes, a link form
+  carrying `cert`, one lacking `cert_sha256`, one whose certificate
+  hashes to another `cert_sha256`, one over 256 bytes, a whole or
+  detached map carrying `cert_sha256`, a detached
   private message with `quote`, empty and overlong text, text with
   U+0000 or another C0 control, an `act` or `auto` of `false`, a
   `parent` with `id` and no `by`, a non-deterministic encoding, a
