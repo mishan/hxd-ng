@@ -12,13 +12,20 @@ use hl_identity::registrar::{
     FREEZE_DOMAIN, RECORDS_DOMAIN, REGISTER_DOMAIN, REVOKE_ATTESTATION_DOMAIN,
     REVOKE_DEVICE_DOMAIN, REVOKE_IDENTITY_DOMAIN, ROTATE_DOMAIN,
 };
+use hl_identity::sealed::{self, Opened, Opening, Replay};
 use hl_identity::{
     attestation, card, cert, enroll, message, proof, Attestation, AttestationRevocation, Bundle,
     Card, DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Fingerprint, Freeze, IdentityKey,
     IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest, RegistrarKeys,
     Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
 };
+use hpke::aead::AesGcm256;
+use hpke::kdf::HkdfSha256;
+use hpke::kem::X25519HkdfSha256;
+use hpke::rand_core::{CryptoRng, RngCore};
+use hpke::{Deserializable, Kem, OpModeR, OpModeS, Serializable};
 use serde_json::Value as Json;
+use sha2::{Digest, Sha256};
 
 const VECTORS: &str = include_str!("../../../docs/identity-test-vectors.json");
 
@@ -1057,6 +1064,241 @@ fn message_rejects() {
             Err(str_of(r, "error").to_owned()),
             "reject `{}`",
             str_of(r, "name")
+        );
+    }
+}
+
+// --- Sealed messages (e2e-messages.md §3.7–§3.11) -------------------------
+
+/// HPKE's one draw per box, the ikm its ephemeral key is derived from,
+/// fixed as a vector fixes it.
+struct Ikm(Option<Vec<u8>>);
+
+impl RngCore for Ikm {
+    fn next_u32(&mut self) -> u32 {
+        unreachable!("HPKE draws its ephemeral key with fill_bytes")
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        unreachable!("HPKE draws its ephemeral key with fill_bytes")
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        dest.copy_from_slice(&self.0.take().expect("one ephemeral key per box"));
+    }
+}
+
+impl CryptoRng for Ikm {}
+
+fn derive(ikm: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let (sk, pk) = X25519HkdfSha256::derive_keypair(ikm);
+    (sk.to_bytes().to_vec(), pk.to_bytes().to_vec())
+}
+
+/// The CFRG's vectors for RFC 9180, from `test-vectors.json` in
+/// github.com/cfrg/draft-irtf-cfrg-hpke at commit
+/// 5f503c564da00b0687b3de75f1dfbdfc4079ad31, cut to §3.8's suite in base
+/// and auth mode and to each one's first encryption, the only one a
+/// single-shot seal makes: so the HPKE a sealed message rests on is the
+/// standard's, whatever version of the crate is pinned.
+#[test]
+fn rfc9180_vectors() {
+    let v: Json = serde_json::from_str(include_str!("rfc9180-vectors.json")).unwrap();
+    let entries = v.as_array().unwrap();
+    let modes: Vec<u64> = entries.iter().map(|e| u64_of(e, "mode")).collect();
+    assert_eq!(modes, [0, 2]);
+    for e in entries {
+        let mode = u64_of(e, "mode");
+        let suite = (
+            u64_of(e, "kem_id"),
+            u64_of(e, "kdf_id"),
+            u64_of(e, "aead_id"),
+        );
+        assert_eq!(suite, (0x20, 1, 2), "mode {mode}");
+        let hex = |k| unhex(str_of(e, k));
+        assert_eq!(
+            derive(&hex("ikmR")),
+            (hex("skRm"), hex("pkRm")),
+            "mode {mode}"
+        );
+        assert_eq!(
+            derive(&hex("ikmE")),
+            (hex("skEm"), hex("pkEm")),
+            "mode {mode}"
+        );
+        let pk_r = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&hex("pkRm")).unwrap();
+        let sk_r = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&hex("skRm")).unwrap();
+        let (seal_mode, open_mode) = match mode {
+            0 => (OpModeS::Base, OpModeR::Base),
+            2 => {
+                assert_eq!(derive(&hex("ikmS")), (hex("skSm"), hex("pkSm")));
+                let pk_s = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&hex("pkSm")).unwrap();
+                let sk_s = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&hex("skSm")).unwrap();
+                (OpModeS::Auth((sk_s, pk_s.clone())), OpModeR::Auth(pk_s))
+            }
+            other => panic!("mode {other} is not one this suite uses"),
+        };
+        let c = &e["encryptions"][0];
+        let (info, aad, pt) = (hex("info"), unhex(str_of(c, "aad")), unhex(str_of(c, "pt")));
+        let (enc, ct) = hpke::single_shot_seal::<AesGcm256, HkdfSha256, X25519HkdfSha256, _>(
+            &seal_mode,
+            &pk_r,
+            &info,
+            &pt,
+            &aad,
+            &mut Ikm(Some(hex("ikmE"))),
+        )
+        .unwrap();
+        assert_eq!(enc.to_bytes().to_vec(), hex("enc"), "mode {mode}");
+        assert_eq!(ct, unhex(str_of(c, "ct")), "mode {mode}");
+        let opened = hpke::single_shot_open::<AesGcm256, HkdfSha256, X25519HkdfSha256>(
+            &open_mode, &sk_r, &enc, &info, &ct, &aad,
+        )
+        .unwrap();
+        assert_eq!(opened, pt, "mode {mode}");
+    }
+}
+
+/// A replay memory that starts empty, as each vector is read with.
+#[derive(Default)]
+struct Memory {
+    latest: u64,
+    accepted: Vec<(Fingerprint, [u8; 16])>,
+}
+
+impl Replay for Memory {
+    fn latest(&mut self, now: u64) -> u64 {
+        self.latest = self.latest.max(now);
+        self.latest
+    }
+
+    fn accepted(&self, signer: &Fingerprint, id: &[u8; 16]) -> bool {
+        self.accepted.contains(&(*signer, *id))
+    }
+
+    fn accept(&mut self, signer: Fingerprint, id: [u8; 16], _until: u64) -> bool {
+        if self.accepted(&signer, &id) {
+            return false;
+        }
+        self.accepted.push((signer, id));
+        true
+    }
+}
+
+/// The recipient's device and what its reader knows.
+fn sealed_reader(v: &Json) -> (DeviceKey, [u8; 32], Opening) {
+    let s = &v["sealed"];
+    let r = &s["recipient"];
+    let seed = unhex32(str_of(r, "seed_hex"));
+    let reader = DeviceKey::from_seed(&seed);
+    assert_eq!(reader.public_enc(), unhex32(str_of(r, "public_enc_hex")));
+    let ctx = Opening {
+        now: u64_of(s, "now"),
+        at: u64_of(s, "at"),
+        reader: Fingerprint::parse(str_of(r, "identity_fingerprint")).unwrap(),
+        sender: Sender::Named(key_of(v, "identity").fingerprint()),
+    };
+    (reader, seed, ctx)
+}
+
+#[test]
+fn sealed_vectors() {
+    let v = vectors();
+    let k = keys(&v);
+    let s = &v["sealed"];
+    assert_eq!(str_of(s, "signed_info").as_bytes(), sealed::SIGNED_INFO);
+    assert_eq!(str_of(s, "deniable_info").as_bytes(), sealed::DENIABLE_INFO);
+    assert_eq!(u64_of(s, "hold"), sealed::HOLD);
+    let (reader, seed, ctx) = sealed_reader(&v);
+    let mut x25519 = Sha256::new();
+    x25519.update(b"hl-identity/device-enc/v1");
+    x25519.update(seed);
+    let sk_r = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&x25519.finalize()).unwrap();
+
+    let pm = &v["private_message"];
+    let message = private_message_of(&pm["fields"]);
+    let (signed, unsigned) = (
+        unhex(str_of(pm, "signed_hex")),
+        unhex(str_of(pm, "unsigned_hex")),
+    );
+    for (name, deniable) in [("sealed_message", false), ("deniable_box", true)] {
+        let e = &v[name];
+        let hex = |k| unhex(str_of(e, k));
+        let bytes = hex("sealed_hex");
+        let ikm: [u8; 32] = hex("ikm_e_hex").try_into().unwrap();
+        let again =
+            sealed::seal_from_ikm(&message, &k.dev, &reader.public_enc(), deniable, &ikm).unwrap();
+        assert_eq!(again, bytes, "{name} seals again");
+        assert_eq!(
+            derive(&ikm),
+            (hex("ephemeral_secret_hex"), hex("enc_hex")),
+            "{name}"
+        );
+
+        let (info, plaintext, rest) = if deniable {
+            assert_eq!(hex("plaintext_hex"), unsigned, "{name}");
+            assert_eq!(hex("sender_enc_hex"), k.dev.public_enc(), "{name}");
+            assert_eq!(bytes[1..33], k.dev.public_enc(), "{name} pkS");
+            (sealed::DENIABLE_INFO, &unsigned, &bytes[33..])
+        } else {
+            assert_eq!(str_of(e, "plaintext_of"), "private_message");
+            (sealed::SIGNED_INFO, &signed, &bytes[1..])
+        };
+        let padded = hex("padded_hex");
+        assert_eq!(message::pad(plaintext, deniable).unwrap(), padded, "{name}");
+        assert_eq!(rest[..32], hex("enc_hex"), "{name} enc");
+        assert_eq!(
+            bytes.len(),
+            padded.len() + if deniable { 32 } else { 0 } + sealed::OVERHEAD
+        );
+        let mode = match deniable {
+            false => OpModeR::Base,
+            true => OpModeR::Auth(
+                <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&k.dev.public_enc()).unwrap(),
+            ),
+        };
+        let enc = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(&rest[..32]).unwrap();
+        let opened = hpke::single_shot_open::<AesGcm256, HkdfSha256, X25519HkdfSha256>(
+            &mode,
+            &sk_r,
+            &enc,
+            info,
+            &rest[32..],
+            &bytes[..1],
+        )
+        .unwrap();
+        assert_eq!(opened, padded, "{name} padded plaintext");
+
+        match sealed::open(&bytes, &reader, &ctx, &mut Memory::default()) {
+            Opened::Verified { message: m, .. } if !deniable => assert_eq!(m.whole(), signed),
+            Opened::Deniable { message: m, .. } if deniable => assert_eq!(m, message),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn sealed_rejects() {
+    let v = vectors();
+    let (reader, _, ctx) = sealed_reader(&v);
+    for r in v["sealed_rejects"].as_array().unwrap() {
+        let name = str_of(r, "name");
+        let got = sealed::open(
+            &unhex(str_of(r, "hex")),
+            &reader,
+            &ctx,
+            &mut Memory::default(),
+        );
+        let (state, error) = match got {
+            Opened::Unopened(e) => ("unopened", e),
+            Opened::Invalid { error, .. } => ("invalid", error),
+            Opened::Dropped(e) => ("dropped", e),
+            other => panic!("reject `{name}` was shown: {other:?}"),
+        };
+        assert_eq!(
+            (state, format!("{error:?}")),
+            (str_of(r, "expect"), str_of(r, "error").to_owned()),
+            "reject `{name}`"
         );
     }
 }

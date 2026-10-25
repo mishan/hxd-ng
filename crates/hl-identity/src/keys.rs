@@ -109,7 +109,7 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-fn fresh_seed() -> Zeroizing<[u8; 32]> {
+pub(crate) fn fresh_seed() -> Zeroizing<[u8; 32]> {
     let mut seed = Zeroizing::new([0u8; 32]);
     getrandom::getrandom(&mut *seed).expect("OS CSPRNG unavailable");
     seed
@@ -244,6 +244,11 @@ impl DeviceKey {
 
     pub(crate) fn sign(&self, domain: &str, bytes: &[u8]) -> [u8; 64] {
         sign_domain(&self.signing, domain, bytes)
+    }
+
+    /// The X25519 secret, which sealing hands to HPKE.
+    pub(crate) fn enc_secret(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.enc.to_bytes())
     }
 }
 

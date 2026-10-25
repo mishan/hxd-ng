@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Hotline identity objects: keys, device certificates, user cards, attestations, login proofs, signed messages"
+description = "Hotline identity objects: keys, device certificates, user cards, attestations, login proofs, signed and sealed messages"
 publish = false
 
 [dependencies]
@@ -21,6 +21,12 @@ sha2 = "0.10"
 hmac = "0.12"
 getrandom = "0.2"
 zeroize = "1"
+# HPKE (RFC 9180) for sealed messages: DHKEM(X25519, HKDF-SHA256),
+# HKDF-SHA256 and AES-256-GCM. 0.13 rather than 0.14 because it shares
+# x25519-dalek, hkdf, aes-gcm and sha2 with what is already here, where
+# 0.14 would bring a second major of each. It stays on 0.13 until
+# x25519-dalek 3, hkdf 0.13, sha2 0.11 and aes-gcm 0.11 can move together.
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 # The WHATWG serialization a login proof's `host` is compared in, which is
 # what browsers and HTTP clients put in `Host`.
 url = "2"
