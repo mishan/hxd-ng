@@ -31,7 +31,8 @@ pub enum Error {
     /// `issued` is in the future (beyond the skew allowance), or
     /// `expires` isn't after `issued`.
     NotYetValid,
-    /// A proof's `time` is outside the skew allowance.
+    /// A proof's `time` is outside the skew allowance, or a sealed
+    /// message's `sent` outside the window its reader accepts.
     ClockSkew,
     /// A proof echoes a different challenge or server key than expected.
     ChallengeMismatch,
@@ -44,6 +45,11 @@ pub enum Error {
     TooLarge,
     /// A fetched certificate does not hash to the one a link form names.
     CertMismatch,
+    /// A sealed message did not open: another key, another form, or
+    /// altered.
+    OpenFailed,
+    /// A sealed message already accepted.
+    Replayed,
 }
 
 impl fmt::Display for Error {
@@ -67,6 +73,8 @@ impl fmt::Display for Error {
             }
             Error::TooLarge => write!(f, "object too large"),
             Error::CertMismatch => write!(f, "certificate does not match"),
+            Error::OpenFailed => write!(f, "sealed message does not open"),
+            Error::Replayed => write!(f, "sealed message already accepted"),
         }
     }
 }

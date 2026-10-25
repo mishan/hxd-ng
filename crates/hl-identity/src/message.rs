@@ -404,7 +404,7 @@ impl Object for Article {
 pub struct Signed<T> {
     pub message: T,
     pub cert: DeviceCert,
-    whole: Value,
+    pub(crate) whole: Value,
 }
 
 /// What a reader was handed. The texts of a detached or link form come
@@ -660,7 +660,7 @@ fn pad_sizes(deniable: bool) -> impl Iterator<Item = usize> {
 
 /// §3.5 step 2: a certificate that allows messages, at most
 /// [`CERT_MAX_BYTES`], valid at `sent` and at `at`.
-fn check_cert(bytes: &[u8], sent: u64, at: u64) -> Result<DeviceCert, Error> {
+pub(crate) fn check_cert(bytes: &[u8], sent: u64, at: u64) -> Result<DeviceCert, Error> {
     if bytes.len() > CERT_MAX_BYTES {
         return Err(Error::BadField("cert"));
     }

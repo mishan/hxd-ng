@@ -1,8 +1,9 @@
 # Signed and sealed messages
 
 Status: draft, 2026-10. `hl-identity` has the signed objects of §3.1 to
-§3.5, their detached and link forms (§5) and the padding of §3.7, with
-§13's vectors for them; nothing else here is built. This is the
+§3.5, their detached and link forms (§5), and sealing and opening both
+kinds of box (§3.7 to §3.11), with §13's vectors for them; nothing here
+is on the wire yet. This is the
 end-to-end messaging document that `hotline-ng-identity.md` §3.3 names
 for the `device_enc` key, and the construction the server linking user
 keys draft leaves to it ("Sealed Messages in Link Private Message"); §5
@@ -576,7 +577,9 @@ says what differs for `0x02`):
 3. checks freshness (§3.10);
 4. checks `(sender fingerprint, id)` is not one it has already accepted,
    the sender fingerprint being SHA-256 of `cert`'s identity key, never
-   what the server says;
+   what the server says: the fingerprint read from `cert` as parsed,
+   before step 5 checks it; a `cert` that does not parse goes on to fail
+   step 5;
 5. checks `cert` as §3.5 step 2 does, valid now as well, and that
    its identity key hashes to the **fingerprint the sender is shown
    with** (below);
@@ -1243,9 +1246,9 @@ binds the recipient's identity fingerprint, allows a signed box or a
 deniable one (§3.11) under this document's domains, judges freshness by
 the recipient's clock and checks the sender's certificate as §3.9 does.
 It carries signed messages as this section does, and differs from this
-document in nothing that matters. The field numbers below are proposed
-in that draft; the extension (`Capabilities-Server-Link.md`) has not
-reserved them yet.
+document in nothing that matters. The extension
+(`Capabilities-Server-Link.md`) reserves the field numbers below for
+that draft, which it has not adopted yet.
 
 Signed messages cross the link wire this way:
 
@@ -1339,7 +1342,7 @@ target's home server, once it holds the certificate, as a client would: by
 §3.5 with that scope (for a 905, `to` its user's identity fingerprint) and
 no session to compare, and the signer against the fingerprint in the
 sender's user group. It does not show one that fails, and answers a 905
-that fails `BadSignature` (reason 14, proposed in the user keys draft); it
+that fails `BadSignature` (reason 14, reserved for the user keys draft); it
 relays a 904 onward unchanged regardless, as the extension requires, and
 never shows or relays one with the signature removed. It stores the signed
 form with the ghost's line in history (`server-link.md` §4.3), with its
@@ -1365,7 +1368,9 @@ The messaging identity draft proposes signed and sealed messages for
 fogWraith's Instant Messaging extension
 ([`Docs/Protocol/Capabilities-Messaging-Identity.md`](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging-Identity.md)),
 for messages between friends on one server whose accounts are linked to
-identities, under capability bit 13 (`CAPABILITY_IDENTITY`). IM Send (810)
+identities, under capability bit 13 (`CAPABILITY_IDENTITY`), which
+`Capabilities.md` and `Capabilities-Messaging.md` reserve for it with
+its fields and reason codes, the draft not yet adopted. IM Send (810)
 and IM Deliver (811) carry a signed message as `DATA_MESSAGE_SIGNED`
 beside the body: §3.2's detached form with the certificate inside, at most
 1020 bytes (§3.1), unlike a link's, since a message read from the offline
@@ -1590,8 +1595,10 @@ In `identity-test-vectors.json`, in its shape (`domain`, `fields`,
 per object, signed by the file's device key under a new certificate
 from its identity key with `caps` 3 and no `name`, the file's
 `device_cert` having the `name` "browser", and `message_rejects`
-entries naming the error each must fail with); those of a sealed
-message and a deniable box come with sealing. They are:
+entries naming the error each must fail with), and for sealing a
+`sealed` entry naming the recipient's device and what its reader knows,
+the ikm each box's ephemeral key is derived from, and `sealed_rejects`
+naming the state of §8 each opens in and its error. They are:
 
 - a public line in the lobby, in a room, and as an action, each also as
   its detached form, and the lobby line and the action as their link
@@ -1635,3 +1642,5 @@ message and a deniable box come with sealing. They are:
 RFC 9180 prints no vector for the HPKE suite; the CFRG's
 `test-vectors.json` for HPKE has them, and an implementation should
 pass every one it has for this suite, in base and auth mode, first.
+hl-identity checks its HPKE against them, kept for this suite in
+`crates/hl-identity/tests/rfc9180-vectors.json`.
