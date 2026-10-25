@@ -250,6 +250,10 @@ pub struct IdentityTag {
     /// For a key nobody here answers for: unix seconds before which it
     /// may not chat, message or post (`identity-registrar.md` §7.3).
     pub quiet_until: Option<u64>,
+    /// The client signs public lines by default
+    /// (`docs/e2e-messages.md` §4.6): a hint to readers, set by the
+    /// client and so nothing more.
+    pub signs: bool,
 }
 
 impl IdentityTag {
@@ -348,6 +352,10 @@ pub enum Event {
         /// session is handed and on no other: how that session knows the
         /// line for its own, and nobody else's business.
         guid: Option<crate::inbox::MessageGuid>,
+        /// A signed line's detached form, as it came
+        /// (`docs/e2e-messages.md` §4.7). A wire with nowhere to put it
+        /// carries the text alone.
+        signed: Option<Vec<u8>>,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -420,6 +428,9 @@ pub enum Event {
         /// fetch; one read after it carries the metadata alone, and the
         /// client renders the placeholder (`docs/inline-media.md` §9).
         media: Option<crate::media::MediaRef>,
+        /// A signed message's detached form, as it came
+        /// (`docs/e2e-messages.md` §4.9).
+        signed: Option<Vec<u8>>,
     },
     /// An administrator broadcast. Delivered to everyone, sender included
     /// (the wire push carries the sender, matching the reference server).
@@ -588,15 +599,23 @@ impl Event {
     /// estimate, not an exact one.
     pub fn weight(&self) -> usize {
         let text = match self {
-            Event::Chat { text, from, .. } => text.len() + from.nick.len(),
+            Event::Chat {
+                text, from, signed, ..
+            } => text.len() + from.nick.len() + signed.as_ref().map_or(0, Vec::len),
             Event::Notice { text, .. } => text.len(),
             Event::ChatSubject { subject, .. } => subject.len(),
             Event::Msg {
                 from_nick,
                 text,
                 from_login,
+                signed,
                 ..
-            } => from_nick.len() + text.len() + from_login.as_ref().map_or(0, String::len),
+            } => {
+                from_nick.len()
+                    + text.len()
+                    + from_login.as_ref().map_or(0, String::len)
+                    + signed.as_ref().map_or(0, Vec::len)
+            }
             Event::Broadcast {
                 from_nick, text, ..
             } => from_nick.len() + text.len(),
@@ -1964,6 +1983,29 @@ impl Core {
         changed
     }
 
+    /// Whether `uid`'s client says it signs public lines by default, as
+    /// a `resume` says it again (`docs/e2e-messages.md` §4.6); a change
+    /// is told as any change to the row is. A session that proved no
+    /// identity has no row to say it on.
+    pub fn set_signs(&self, uid: Uid, signs: bool) {
+        let mut r = self.roster.lock().unwrap();
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return;
+        };
+        let Some(id) = sess.info.transport.identity.as_mut() else {
+            return;
+        };
+        if id.signs == signs {
+            return;
+        }
+        id.signs = signs;
+        if sess.visible {
+            let ev = Event::Changed(sess.info.clone());
+            r.broadcast(&ev, None);
+            r.export_changed(uid);
+        }
+    }
+
     /// End a session outright: leave every private chat (announcing the
     /// parts), remove from the roster, broadcast the part. The legacy
     /// frontend calls this when its socket dies; `logout` and moderation
@@ -2716,6 +2758,7 @@ mod tests {
             at: SystemTime::now(),
             media: None,
             guid: None,
+            signed: None,
         }
         .weight();
         assert_eq!(

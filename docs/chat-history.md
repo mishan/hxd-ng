@@ -257,6 +257,23 @@ on `(channel, guid_from, guid)` keeps one line per guid; a second insert
 is dropped and answered the first's id. Neither column is read back into
 a history page.
 
+Schema v24 adds `signed` and `signed_content` (e2e-messages.md §4.7): a
+signed line's detached form, served on its history line, and the
+SHA-256 of what it says, which signing it again does not change and
+which is never served. A partial index on `(login_fp, guid)` over the
+signed lines is the index of signed lines by `(signer, id)`, since the
+line's fingerprint is its signer's and its guid its id: a signed line
+sent again under that pair is answered as its line when it says the
+same in the same room, and refused as an equivocation otherwise, in any
+room, for as long as the line is kept. A redaction clears both columns
+with the words, so the index does not reach a redacted line: its guid
+still answers a line sent again under that id in its room as the
+original, and in another room such a line is a new one. A server with
+no log has no index, and a repeat is caught only as far as the room's
+memory of guids reaches (hotline-ng.md §7.3). Two sends of one id into
+two rooms at the same moment are a known limit: each room commits its
+lines apart, so both can be logged before either is in the index.
+
 `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the spec's one
 guarantee: an id is never reused, so a client's cursor from last week
 still means what it meant. Plain `INTEGER PRIMARY KEY` can hand out a
@@ -438,7 +455,8 @@ id and time, and a `deleted` flag when tombstoned:
 { "id": 1001, "at": 1729137541,
   "from": { "nick": "alice", "icon": 128 },
   "text": "What's up?", "style": "normal",
-  "media": { … } }               // inline-media.md §8, when the line had one
+  "media": { … },                // inline-media.md §8, when the line had one
+  "signed": "pmF2AWJpZFA…" }     // e2e-messages.md §4.7, when it was signed
 ```
 
 No `uid` in `from`: the sender's uid was recycled minutes after they

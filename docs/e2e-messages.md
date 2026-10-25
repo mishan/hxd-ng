@@ -2,8 +2,18 @@
 
 Status: draft, 2026-10. `hl-identity` has the signed objects of §3.1 to
 §3.5, their detached and link forms (§5), and sealing and opening both
-kinds of box (§3.7 to §3.11), with §13's vectors for them; nothing here
-is on the wire yet. This is the
+kinds of box (§3.7 to §3.11), with §13's vectors for them. hxd-ng
+carries signed public lines, in the lobby and in rooms, and signed
+private messages that are not sealed, on the ng wire: the `signed`
+capability and `signs` (§4.6), the checks of §4.11 on ingest, the index
+of signed lines by `(signer, id)` (§4.7), `signed` on events, `history`
+and `inbox`, and moderation's share of them (§4.12), the classic wire
+getting the text alone (§6). Not built yet: sealing on the wire (§4.1 to
+§4.5), rooms that require signing (§4.8), signed articles (§4.10) and
+the link forms on a link (§5). Until links carry them, hxd-ng does not
+offer `signed` with `[link]` configured (§4.6), so no signed line exists
+for a link to strip. The index of signed lines does not reach a redacted
+line, whose content goes with its words (§4.12). This is the
 end-to-end messaging document that `hotline-ng-identity.md` §3.3 names
 for the `device_enc` key, and the construction the server linking user
 keys draft leaves to it ("Sealed Messages in Link Private Message"); §5
@@ -880,9 +890,13 @@ them it signs no `server_challenge` (`hotline-ng-auth.md` §6.2) and no
 client can pin its key; and only beside `chat_guid` (`hotline-ng.md` §4,
 §7.3), since a signed line's id is its guid: a server that lists
 `signed` without `chat_guid` is broken, and a client does not sign lines
-to it. A client MUST NOT send `signed` to a server without the
-capability: a server that ignored an unknown parameter would relay the
-text unsigned, and the sender would never know.
+to it. *hxd-ng*, until links carry signatures (§5): not with `[link]`
+configured either, since a signed lobby line must not cross a link
+without its signature (§4.11); and its `news_post` does not take
+`signed` yet (§4.10), refusing it `bad_request` rather than keeping
+the article unsigned. A client MUST NOT send `signed` to a server
+without the capability: a server that ignored an unknown parameter
+would relay the text unsigned, and the sender would never know.
 
 A client that can sign sends `signs` in `login` and in every `resume`,
 and only if its session proves a device key whose certificate allows
@@ -948,7 +962,11 @@ while a signed `id` is the signer's across every room. A server
 offering `signed` therefore keeps an index of signed lines by
 `(signer, id)`, for as long as it keeps the lines, and refuses a line
 under a pair it holds in another room, or with other content, as an
-equivocation; `chat-history.md` gains the index.
+equivocation; `chat-history.md` gains the index. Each room commits its
+lines apart (`hotline-ng.md` §7.3), so two sends of one id into two
+rooms at the same moment can both be logged before either is in the
+index: the refusal holds as far as the server remembers (§4.11), and a
+reader drops the second copy (§3.6).
 
 ### 4.8 Rooms that require signing
 
@@ -1046,9 +1064,11 @@ sealed deniably, signed in the clear, or neither (§8):
 - `guid` is required, and equal to the message's `id`, as §4.7.
 - `text` is canonical and 1 to 4096 bytes, as §4.7; `quote` is absent
   from the map.
-- `to` in the map is the recipient's identity fingerprint: the target
-  session's, for `to`, or the identity the account is linked to
-  (`hotline-ng-identity.md` §8), for `to_login`. A recipient with none
+- `to` in the map is the recipient's identity fingerprint: the identity
+  the recipient's account is linked to (`hotline-ng-identity.md` §8),
+  whether `to` names a session of it or `to_login` the account, or for
+  a session with no account of its own, the identity it proved. A
+  recipient with none
   is `bad_request`; one with another is `bad_signature`. For a ghost,
   the recipient's fingerprint is what its row shows, and its home
   server checks (§5).
@@ -1138,7 +1158,10 @@ and get the text alone.
 
 - **Redaction** (`moderation.md` §3.1) moves the detached form with the
   body and nick into the audit row's `evidence`, and the sweeper scrubs
-  it with them. A tombstone carries no signature. A tombstone that still
+  it with them. *hxd-ng* keeps nothing of what a redacted line said, so
+  the index of signed lines (§4.7) does not reach it: its guid still
+  answers a line sent again under its id in its room as that line. A
+  tombstone carries no signature. A tombstone that still
   verified would need the signature to cover a commitment to the text
   rather than the text, and would keep a proof that a removed line was
   said, which is a cost to its author's deniability that no reader

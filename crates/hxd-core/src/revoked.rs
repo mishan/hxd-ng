@@ -236,6 +236,7 @@ mod tests {
             device: [device; 32],
             handle: None,
             quiet_until: None,
+            signs: false,
         }
     }
 

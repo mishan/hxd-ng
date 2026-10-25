@@ -208,6 +208,7 @@ fn refused(e: hxd_core::ModError) -> String {
         Protected => "protected".into(),
         NoIdentity => "a guest has no identity to purge by".into(),
         OwnReport => "that report is about you".into(),
+        SignedByAnother => "that evidence is signed by someone else".into(),
         RateLimited => "rate limited".into(),
         NoSession => "no session".into(),
         NoSuchBan => "no such ban standing".into(),

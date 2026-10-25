@@ -24,6 +24,7 @@ mod registrar;
 pub mod registrars;
 mod registry;
 pub mod rooms;
+mod signed;
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -121,6 +122,10 @@ pub struct NgConfig {
     pub forwarded_header: ForwardedHeader,
     /// What the HTTP layer holds addresses, and everyone, to.
     pub http_limits: HttpLimits,
+    /// `[link]` is configured. A link does not carry a signature yet, and
+    /// a signed lobby line must not cross one without it
+    /// (`docs/e2e-messages.md` §4.11), so such a server signs nothing.
+    pub linked: bool,
 }
 
 /// What the ng port holds one address to, and everyone together
@@ -266,6 +271,7 @@ impl Default for NgConfig {
             trusted_proxies: TrustedProxies::default(),
             forwarded_header: ForwardedHeader::default(),
             http_limits: HttpLimits::default(),
+            linked: false,
         }
     }
 }

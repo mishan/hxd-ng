@@ -722,6 +722,7 @@ fn a_room_id_is_never_drawn_again() {
         flags: Default::default(),
         at: SystemTime::now(),
         guid: None,
+        signed: None,
     })
     .unwrap();
     let store = Arc::new(MemoryRooms::new(RoomFile {

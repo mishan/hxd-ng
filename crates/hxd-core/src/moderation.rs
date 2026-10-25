@@ -192,6 +192,9 @@ pub struct Act {
     /// What was removed, for moderators to read until the sweeper
     /// scrubs it to nothing (§3.1). The row stays.
     pub evidence: Option<String>,
+    /// A redacted signed line's detached form, which goes with its words
+    /// and is scrubbed with them (`docs/e2e-messages.md` §4.12).
+    pub signed: Option<Vec<u8>>,
     pub media_hash: Option<[u8; 32]>,
     pub at: SystemTime,
 }
@@ -212,6 +215,7 @@ impl Act {
             fingerprint: None,
             reason,
             evidence: None,
+            signed: None,
             media_hash: None,
             at: SystemTime::now(),
         }
@@ -388,6 +392,11 @@ pub struct Report {
     /// `false` when the evidence is only the reporter's word — pasted,
     /// rather than read out of the store (§4.2).
     pub verified: bool,
+    /// The detached form of a signed line or message, read from its row
+    /// or checked when it was pasted (`docs/e2e-messages.md` §4.12): a
+    /// reported line's text is copied into `evidence` beside it, which
+    /// is what it covers.
+    pub signed: Option<Vec<u8>>,
     /// The image the report makes a moderator's to see: the reported
     /// handle, or the one a reported chat line carried. Pinned and
     /// granted to moderators while the report is open (§4.3).
@@ -611,6 +620,9 @@ pub enum ModError {
     NoIdentity,
     /// A moderator may not close a report about themselves.
     OwnReport,
+    /// Pasted evidence signed by someone other than the person the
+    /// report names (`docs/e2e-messages.md` §4.12).
+    SignedByAnother,
     RateLimited,
     NoSession,
     /// No ban by that id, or none still standing.
@@ -969,6 +981,7 @@ impl Core {
         act.media = media;
         act.media_hash = record.as_ref().map(|r| r.hash);
         act.evidence = Some(line_evidence(&line));
+        act.signed = line.signed.clone();
         store.record(&act)?;
 
         self.tombstone_lines(&acting, &[(id, line.channel)])?;
@@ -1264,6 +1277,10 @@ impl Core {
                     gone.push(id);
                 }
             }
+            channel
+                .as_ref()
+                .map_or(&self.chat_commit, |c| &c.commit)
+                .forget_said(&gone);
             let events: Vec<Event> = if gone.len() <= PURGE_SINGLY {
                 gone.into_iter()
                     .map(|id| Event::ChatRedacted { id })
@@ -1506,9 +1523,36 @@ impl Core {
         why: &str,
         evidence: Option<String>,
     ) -> Result<Filed, ModError> {
+        self.report_signed(by, what, why, evidence, None)
+    }
+
+    /// [`Core::report`], with pasted evidence that is signed: its
+    /// detached form, or a whole private message, which its frontend
+    /// checked, and the identity that signed it, which must be the person
+    /// reported (`docs/e2e-messages.md` §4.12). `evidence` is then the
+    /// text the signature covers, kept as it is rather than trimmed.
+    pub fn report_signed(
+        &self,
+        by: Uid,
+        what: ReportRequest,
+        why: &str,
+        evidence: Option<String>,
+        pasted: Option<(Vec<u8>, [u8; 32])>,
+    ) -> Result<Filed, ModError> {
         let store = self.moderation_store()?.clone();
         let why = reason(why, MAX_REPORT_REASON)?;
-        let evidence = bounded(evidence, MAX_EVIDENCE, "That evidence is too long.")?;
+        let evidence = match &pasted {
+            Some(_)
+                if evidence
+                    .as_ref()
+                    .is_some_and(|e| e.chars().count() > MAX_EVIDENCE) =>
+            {
+                return Err(ModError::BadRequest("That evidence is too long."))
+            }
+            Some(_) => evidence,
+            None => bounded(evidence, MAX_EVIDENCE, "That evidence is too long.")?,
+        };
+        let mut signed = None;
         let (reporter, keys) = {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&by).ok_or(ModError::NoSession)?;
@@ -1541,11 +1585,15 @@ impl Core {
                     .media
                     .as_ref()
                     .and_then(|m| Handle::try_from(m.id.as_slice()).ok());
+                // A signed line's signature is checked against its text,
+                // which a redaction would otherwise take from the report.
+                let text = line.signed.is_some().then(|| line.text.clone());
+                signed = line.signed.clone();
                 (
                     ReportTarget::Line(id),
                     Subject::of_line(&line),
                     gone,
-                    None,
+                    text,
                     true,
                 )
             }
@@ -1581,6 +1629,7 @@ impl Core {
                         ..Subject::default()
                     },
                 };
+                signed = msg.signed.map(|s| s.form);
                 (ReportTarget::Msg(id), about, false, Some(msg.body), true)
             }
             ReportRequest::User(who) => {
@@ -1610,6 +1659,12 @@ impl Core {
                     }
                     PersonRef::Fingerprint(_) => self.resolve_person(&who)?,
                 };
+                if let Some((form, signer)) = pasted.clone() {
+                    if about.fingerprint != Some(signer) {
+                        return Err(ModError::SignedByAnother);
+                    }
+                    signed = Some(form);
+                }
                 // A pasted private message is the reporter's word, and
                 // the moderator is shown that it is (§4.2).
                 let verified = evidence.is_none();
@@ -1663,6 +1718,7 @@ impl Core {
             reason: why,
             evidence,
             verified,
+            signed,
             media,
             closed: gone.then(|| Closed {
                 at: now,

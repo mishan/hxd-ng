@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
     Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine,
-    Retention,
+    Retention, Signature, SignedAt,
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
@@ -72,7 +72,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -630,6 +630,23 @@ const SCHEMA_V23: &str = "
 ALTER TABLE moderation ADD COLUMN target_room INTEGER;
 ";
 
+/// Signed lines and messages (`docs/e2e-messages.md` §4.7, §4.9,
+/// §4.12): the detached form each came with, and the hash of what it
+/// says, which tells a line signed again under its id from an
+/// equivocation; the index of signed lines by signer and id; and a
+/// redacted line's form in its audit row, or a reported one's in its
+/// report.
+const SCHEMA_V24: &str = "
+ALTER TABLE chat_line ADD COLUMN signed BLOB;
+ALTER TABLE chat_line ADD COLUMN signed_content BLOB;
+CREATE INDEX chat_line_signed ON chat_line (login_fp, guid)
+  WHERE signed_content IS NOT NULL;
+ALTER TABLE message ADD COLUMN signed BLOB;
+ALTER TABLE message ADD COLUMN signed_content BLOB;
+ALTER TABLE moderation ADD COLUMN evidence_signed BLOB;
+ALTER TABLE report ADD COLUMN signed BLOB;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -676,8 +693,9 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
     let inserted = conn
         .prepare_cached(
             "INSERT INTO chat_line
-           (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+           (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from,
+            signed, signed_content)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
         )
         .and_then(|mut stmt| {
@@ -693,6 +711,8 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
                 line.ghost.as_ref().map(|k| &k[..]),
                 line.guid.as_ref().map(|(_, g)| g.as_str()),
                 line.guid.as_ref().map(|(sender, _)| sender),
+                line.signed.as_ref().map(|s| &s.form),
+                line.signed.as_ref().map(|s| &s.content[..]),
             ])
         })
         .map_err(StoreError::new)?;
@@ -1337,6 +1357,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 23 {
         steps.push_str(SCHEMA_V23);
     }
+    if version < 24 {
+        steps.push_str(SCHEMA_V24);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1519,7 +1542,8 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
                        sender_nick, body, guid, sent_at, delivered_at, read_at, \
-                       media_id, media_type, media_w, media_h, media_bytes";
+                       media_id, media_type, media_w, media_h, media_bytes, \
+                       signed, signed_content";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -1575,6 +1599,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let delivered: Option<i64> = r.get(10)?;
     let read: Option<i64> = r.get(11)?;
     let media = media_columns(r, 12)?;
+    let signed: (Option<Vec<u8>>, Option<Vec<u8>>) = (r.get(17)?, r.get(18)?);
     Ok((|| {
         Ok(StoredMessage {
             // `INTEGER PRIMARY KEY` is signed and `MessageId` is not, so
@@ -1603,6 +1628,16 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
             delivered_at: delivered.map(from_unix),
             read_at: read.map(from_unix),
             media: media?,
+            signed: match signed {
+                (None, None) => None,
+                (Some(form), Some(content)) => Some(Signature {
+                    form,
+                    content: <[u8; 32]>::try_from(content).map_err(|_| {
+                        StoreError::new("a signed message's content is not 32 bytes")
+                    })?,
+                }),
+                _ => return Err(StoreError::new("a signed message is half stored")),
+            },
         })
     })())
 }
@@ -1647,8 +1682,8 @@ impl MessageStore for SqliteStore {
             "INSERT INTO message
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
-                media_id, media_type, media_w, media_h, media_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                media_id, media_type, media_w, media_h, media_bytes, signed, signed_content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -1671,6 +1706,8 @@ impl MessageStore for SqliteStore {
                 m.media.as_ref().map(|x| x.width),
                 m.media.as_ref().map(|x| x.height),
                 m.media.as_ref().map(|x| x.bytes),
+                m.signed.as_ref().map(|x| &x.form),
+                m.signed.as_ref().map(|x| &x.content[..]),
             ],
         )
         .map_err(StoreError::new)?;
@@ -1687,6 +1724,23 @@ impl MessageStore for SqliteStore {
     ) -> Result<Option<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         find_guid_in(&conn, to, from, guid)
+    }
+
+    /// Through `message_guid`, whose key begins with the guid.
+    fn find_sent(
+        &self,
+        from: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<Option<StoredMessage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM message WHERE guid = ?1 AND {} LIMIT 1",
+            mailbox_sql(from, "sender", 2)
+        );
+        conn.query_row(&sql, params![guid.as_str(), bind(from)], row)
+            .optional()
+            .map_err(StoreError::new)?
+            .transpose()
     }
 
     fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
@@ -2135,7 +2189,7 @@ fn clamp_id(id: MessageId) -> i64 {
 }
 
 const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
-                               media_id, media_type, media_w, media_h, media_bytes";
+                               media_id, media_type, media_w, media_h, media_bytes, signed";
 
 fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -2148,6 +2202,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let body: String = r.get(7)?;
     let at: i64 = r.get(8)?;
     let media = media_columns(r, 9)?;
+    let signed: Option<Vec<u8>> = r.get(14)?;
     Ok((|| {
         let media = media?;
         Ok(LogLine {
@@ -2167,6 +2222,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
             ),
             at: from_unix(at),
             media,
+            signed,
         })
     })())
 }
@@ -2335,7 +2391,8 @@ impl ChatLog for SqliteStore {
         let changed = conn
             .execute(
                 "UPDATE chat_line
-                    SET nick = '', body = '', flags = flags | ?1,
+                    SET nick = '', body = '', signed = NULL, signed_content = NULL,
+                        flags = flags | ?1,
                         deleted_at = IFNULL(deleted_at, ?2),
                         deleted_by = IFNULL(deleted_by, ?3)
                   WHERE id = ?4",
@@ -2440,6 +2497,42 @@ impl ChatLog for SqliteStore {
         find_line_guid(&self.conn.lock().unwrap(), channel, sender, guid)
     }
 
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        guid: &MessageGuid,
+    ) -> Result<Option<SignedAt>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .prepare_cached(
+                "SELECT channel, id, signed_content FROM chat_line
+                  WHERE login_fp = ?1 AND guid = ?2 AND signed_content IS NOT NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![fp_hex(signer), guid.as_str()], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .optional()
+            })
+            .map_err(StoreError::new)?;
+        found
+            .map(|(channel, id, content)| {
+                Ok(SignedAt {
+                    channel: u32::try_from(channel)
+                        .map_err(|_| StoreError::new("chat channel is not a u32"))?,
+                    id: LineId::try_from(id)
+                        .map_err(|_| StoreError::new("negative chat line id"))?,
+                    content: <[u8; 32]>::try_from(content)
+                        .map_err(|_| StoreError::new("a signed line's content is not 32 bytes"))?,
+                })
+            })
+            .transpose()
+    }
+
     fn attach_media(&self, id: LineId, media: &MediaMeta) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let changed = conn
@@ -2502,6 +2595,7 @@ mod tests {
                     flags: Default::default(),
                     at: SystemTime::now(),
                     guid: None,
+                    signed: None,
                 })
                 .unwrap();
         }
@@ -2570,6 +2664,7 @@ mod tests {
                     flags: Default::default(),
                     at: SystemTime::now(),
                     guid: None,
+                    signed: None,
                 })
                 .unwrap();
             std::thread::sleep(Duration::from_millis(1));
@@ -2610,6 +2705,7 @@ mod tests {
             flags: Default::default(),
             at: SystemTime::now(),
             guid: None,
+            signed: None,
         };
         store.append(&line()).unwrap();
         // An operator's shell, say, in the middle of a read.
@@ -2740,6 +2836,7 @@ mod tests {
             flags: Default::default(),
             at: SystemTime::now(),
             guid: None,
+            signed: None,
         };
         let began = std::time::Instant::now();
         let ids = beside.append_all(&[line.clone(), line]).unwrap();
@@ -3678,6 +3775,7 @@ mod tests {
                     guid: None,
                     kind: hxd_core::inbox::MessageKind::Message,
                     media: None,
+                    signed: None,
                 },
                 100,
             )
@@ -3809,6 +3907,7 @@ mod tests {
                     guid: None,
                     kind: MessageKind::Message,
                     media: None,
+                    signed: None,
                 },
                 100,
             )
@@ -3855,6 +3954,7 @@ mod tests {
                     guid: None,
                     kind: MessageKind::Message,
                     media: None,
+                    signed: None,
                 },
                 100,
             )
@@ -3879,6 +3979,7 @@ mod tests {
             guid: MessageGuid::parse("11111111-2222-4333-8444-555555555555"),
             kind: MessageKind::Message,
             media: None,
+            signed: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored(_)));
         m.body = "twice".into();
@@ -3908,6 +4009,7 @@ mod tests {
             guid: Some(g.clone()),
             kind: MessageKind::Message,
             media: None,
+            signed: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -3965,6 +4067,7 @@ mod tests {
                     guid: None,
                     kind: MessageKind::Message,
                     media: None,
+                    signed: None,
                 },
                 100,
             )

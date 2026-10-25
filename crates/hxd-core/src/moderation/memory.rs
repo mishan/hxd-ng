@@ -165,6 +165,7 @@ impl ModerationStore for MemoryModeration {
         {
             if act.evidence.as_deref().is_some_and(|e| !e.is_empty()) {
                 act.evidence = Some(String::new());
+                act.signed = None;
                 n += 1;
             }
         }

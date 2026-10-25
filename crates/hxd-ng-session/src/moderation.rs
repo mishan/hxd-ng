@@ -49,6 +49,10 @@ pub fn mod_err(e: &ModError) -> (&'static str, &'static str) {
             "own_report",
             "That report is about you: another moderator closes it.",
         ),
+        ModError::SignedByAnother => (
+            "bad_signature",
+            "That evidence is signed by someone other than who it reports.",
+        ),
         ModError::RateLimited => ("rate_limited", "Slow down."),
         ModError::NoSuchBan => ("no_such_ban", "There is no such ban standing."),
         ModError::ConfigBan => (
@@ -105,6 +109,13 @@ pub fn report_json(r: &Report) -> Value {
             if let Some(h) = &r.media {
                 target["media"] = json!(hxd_core::media::handle_str(h));
             }
+            // A signed line's text and signature, from its row when it
+            // was reported, so a moderator's tool checks what was signed
+            // (`docs/e2e-messages.md` §4.12).
+            if let Some(signed) = &r.signed {
+                target["text"] = json!(r.evidence.as_deref().unwrap_or_default());
+                target["signed"] = json!(crate::proto::b64url(signed));
+            }
         }
         ReportTarget::Media(h) => target["media"] = json!(hxd_core::media::handle_str(&h)),
         ReportTarget::Msg(id) => target["msg"] = json!(id),
@@ -123,8 +134,16 @@ pub fn report_json(r: &Report) -> Value {
     if let Some(by) = &r.reporter {
         v["by"] = json!({ "login": by.login });
     }
-    if let Some(evidence) = &r.evidence {
-        v["evidence"] = json!(evidence);
+    match (&r.target, &r.signed) {
+        (ReportTarget::Line(_), Some(_)) => {}
+        (_, signed) => {
+            if let Some(evidence) = &r.evidence {
+                v["evidence"] = json!(evidence);
+            }
+            if let Some(signed) = signed {
+                v["signed"] = json!(crate::proto::b64url(signed));
+            }
+        }
     }
     if let Some(closed) = &r.closed {
         v["closed"] = closed_json(closed);
@@ -168,6 +187,9 @@ fn act_json(a: &Act) -> Value {
     // "there was something here" is the audit row's own job.
     if let Some(evidence) = a.evidence.as_ref().filter(|e| !e.is_empty()) {
         v["evidence"] = json!(evidence);
+    }
+    if let Some(signed) = &a.signed {
+        v["signed"] = json!(crate::proto::b64url(signed));
     }
     v
 }
@@ -218,6 +240,9 @@ struct ReportParams {
     reason: String,
     #[serde(default)]
     evidence: Option<String>,
+    /// What `evidence` pastes, signed (`docs/e2e-messages.md` §4.12).
+    #[serde(default)]
+    signed: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -326,7 +351,25 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 p.user.is_some(),
                 p.article.is_some(),
             ];
-            if named.iter().filter(|n| **n).count() != 1 {
+            // Pasted and signed, it may name nobody: the signature does.
+            let pasted = match p.signed.as_deref() {
+                None => None,
+                Some(_) if p.user.is_none() && named.iter().any(|n| *n) => {
+                    return reply_err(
+                        id,
+                        "bad_request",
+                        "Signed evidence is pasted about a user, or about nobody named.",
+                    )
+                }
+                Some(signed) => {
+                    match crate::signed::pasted(ctx, state, p.evidence.as_deref(), signed) {
+                        Ok(pasted) => Some(pasted),
+                        Err(refused) => return refused.reply(id),
+                    }
+                }
+            };
+            let count = named.iter().filter(|n| **n).count();
+            if count != 1 && !(count == 0 && pasted.is_some()) {
                 return reply_err(
                     id,
                     "bad_request",
@@ -346,6 +389,8 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 ReportRequest::Msg(msg)
             } else if let Some(article) = p.article {
                 ReportRequest::Article(article)
+            } else if let (None, Some(pasted)) = (&p.user, &pasted) {
+                ReportRequest::User(PersonRef::Fingerprint(pasted.signer))
             } else {
                 match p.user.as_ref().and_then(UserParams::person) {
                     Some(who) => ReportRequest::User(who),
@@ -360,13 +405,18 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             };
             answer(
                 off_reactor(core, move |c| {
-                    c.report(uid, what, &p.reason, p.evidence).map(|f| {
-                        json!({
-                            "id": f.id,
-                            "outcome": f.outcome.map_or("open", Outcome::name),
-                            "follow_up": f.follow_up,
+                    let (evidence, pasted) = match pasted {
+                        Some(pasted) => (Some(pasted.text), Some((pasted.form, pasted.signer))),
+                        None => (p.evidence, None),
+                    };
+                    c.report_signed(uid, what, &p.reason, evidence, pasted)
+                        .map(|f| {
+                            json!({
+                                "id": f.id,
+                                "outcome": f.outcome.map_or("open", Outcome::name),
+                                "follow_up": f.follow_up,
+                            })
                         })
-                    })
                 })
                 .await,
             )

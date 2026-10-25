@@ -647,6 +647,7 @@ impl Core {
                 sent_at: SystemTime::now(),
                 queued: false,
                 media: None,
+                signed: None,
             },
         );
     }

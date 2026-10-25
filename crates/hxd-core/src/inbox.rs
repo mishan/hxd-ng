@@ -220,6 +220,9 @@ pub struct NewMessage {
     /// image, and the handle may well die first
     /// (`docs/inline-media.md` §9).
     pub media: Option<crate::history::MediaMeta>,
+    /// A signed message's detached form (`docs/e2e-messages.md` §4.9),
+    /// kept with the row so it verifies when it is read days later.
+    pub signed: Option<crate::history::Signature>,
 }
 
 /// A message as the store holds it.
@@ -237,6 +240,7 @@ pub struct StoredMessage {
     /// handle still resolves — a reference whose bytes have gone still
     /// renders as a placeholder.
     pub media: Option<crate::history::MediaMeta>,
+    pub signed: Option<crate::history::Signature>,
     /// When the server handed this to a live connection — *not* when a
     /// client rendered it. A stronger guarantee needs per-message client
     /// acks, which is what fogWraith's `IM Acknowledge (812)` is for and
@@ -338,6 +342,15 @@ pub trait MessageStore: Send + Sync + 'static {
         &self,
         to: &Mailbox,
         from: Option<&Mailbox>,
+        guid: &MessageGuid,
+    ) -> Result<Option<StoredMessage>, StoreError>;
+
+    /// A message `from` sent under `guid`, to anyone: what a signed id,
+    /// which is its signer's whoever it is sent to, is held to
+    /// (`docs/e2e-messages.md` §3.6).
+    fn find_sent(
+        &self,
+        from: &Mailbox,
         guid: &MessageGuid,
     ) -> Result<Option<StoredMessage>, StoreError>;
 

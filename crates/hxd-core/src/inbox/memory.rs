@@ -228,6 +228,7 @@ impl MessageStore for MemoryStore {
             guid: m.guid.clone(),
             kind: m.kind,
             media: m.media.clone(),
+            signed: m.signed.clone(),
             delivered_at: None,
             // A receipt is not something anyone reads; stamping it here
             // keeps it out of unread counts and ages it on the read clock
@@ -255,6 +256,21 @@ impl MessageStore for MemoryStore {
                         (None, None) => true,
                         _ => false,
                     }
+            })
+            .cloned())
+    }
+
+    fn find_sent(
+        &self,
+        from: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<Option<StoredMessage>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .msgs
+            .iter()
+            .find(|m| {
+                m.guid.as_ref() == Some(guid) && m.sender.as_ref().is_some_and(|s| is(s, from))
             })
             .cloned())
     }
@@ -573,6 +589,7 @@ mod tests {
                     guid: None,
                     kind: MessageKind::Message,
                     media: None,
+                    signed: None,
                 },
                 usize::MAX,
             )

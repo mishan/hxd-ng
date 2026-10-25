@@ -2,10 +2,12 @@
 
 Status: built — the core below, plus history (chat-history.md), the
 inbox (private-messages.md), news (news.md), media (inline-media.md),
-voice and video (voice.md, capabilities-video.md), files (§7.2) and
-identity (hotline-ng-identity.md). The vouch requests, `retry_after`,
-the `*@host` ban entry and the general rate limits of §9 are design not
-yet built in hxd-ng, and say so where they appear.
+voice and video (voice.md, capabilities-video.md), files (§7.2),
+identity (hotline-ng-identity.md), and signed lines and private
+messages that are not sealed (e2e-messages.md §4.6 to §4.12). The vouch
+requests, `retry_after`, the `*@host` ban entry and the general rate
+limits of §9 are design not yet built in hxd-ng, and say so where they
+appear.
 
 > **Conformance language:** The key words "MUST", "MUST NOT", "REQUIRED",
 > "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and
@@ -177,6 +179,7 @@ over them.
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
+| `signed` | Signed lines and messages: `signed` on `chat`, `msg` and `report`, and on the events and listings that carry them; `signs` at login. Only with `chat_guid`, a `server_key` and `[identity] hosts`; *hxd-ng:* and not with `[link]` configured, until links carry signatures; `news_post` does not take `signed` yet, and refuses it `bad_request` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -270,7 +273,8 @@ Starts a new session.
     "login": "alice",        // omit or "" for guest
     "password": "…",         // omit for password-less accounts
     "nick": "Alice",         // honored only with the use-any-name privilege
-    "icon": 128              // classic icon id; optional
+    "icon": 128,             // classic icon id; optional
+    "signs": "default"       // optional: "default" | "able" (e2e-messages.md §4.6)
 } }
 ```
 
@@ -304,6 +308,7 @@ hotline-ng-identity.md §8.1 says.
 | `detach` | §2. |
 | `caps` | §4. |
 | `seq` | The seq the client is at: 0 for a new session. |
+| `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
 
 The roster is complete at the reply: the client needs no event to learn
 who is present, and every event that follows is a change to it.
@@ -336,6 +341,10 @@ Attaches this connection to an existing session.
 
 - `last_seq` is the highest seq the client has received. It MAY be
   omitted, meaning 0.
+- `signs` is as at login (§6.1), said again on every resume: a resume
+  that leaves out `"default"` takes `signs` off the roster row
+  (`user_changed`). A reply that resumes (`ok`, not
+  `resync_required`) echoes it as the login reply does.
 - On success the reply's `replay` is the number of buffered events that
   follow it, in seq order, before any live event. `self` is the session's
   `user` object as it is now.
@@ -627,10 +636,10 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?` | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?` | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -674,6 +683,15 @@ family document. Each family of §4 adds its own.
   *hxd-ng:* a repeat is charged as a request (§9), and not as a line of
   chat when it is found before it is queued, as one sent after its line
   is logged is.
+- **`signed`** on `chat` and `msg`, with the `signed` capability, is the
+  detached form of the line or message as e2e-messages.md §4.7 and §4.9
+  have it, checked as its §4.11 says: `guid` is required and is its id,
+  and whatever fails is `bad_signature`, with a `text` naming the
+  check. A repeat under the same guid that is signed and says something
+  else, an unsigned original included, is `bad_signature` too, not the
+  line it repeats, and so is a signed `msg` under a guid its sender used
+  toward someone else, as far as the server remembers: where it stores
+  messages. *hxd-ng:* it costs one more against the request limit (§9).
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -695,7 +713,7 @@ family document. Each family of §4 adds its own.
   (chat-history.md §7). A server MAY rate-limit this request.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, from: { nick, login? }, text, at,
-  read, media? }`; there is no uid, which may have been reused since.
+  read, media?, signed? }`; there is no uid, which may have been reused since.
 - **`msg_read`** marks every message of this account's with an id at or
   below `up_to` read, and returns the counts after it.
 - **`block`** refuses mail from an account, or from the identity of a
@@ -726,11 +744,11 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. |
+| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7). |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login? }, "text", "at", "queued", "id"?, "media"? }` | A private message (§7.1). |
+| `msg` | `{ "from": { uid, nick, login? }, "text", "at", "queued", "id"?, "media"?, "signed"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
@@ -767,7 +785,7 @@ counts in §3's sequence.
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
 | `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged}`, the home server's name and tag and whether this server puts the tag in its users' names. A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
-| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
@@ -788,7 +806,10 @@ capability loses every character Mac Roman lacks, which becomes `?`.
 
 A server truncates text over these limits rather than rejecting the
 request. A client SHOULD enforce them before sending, so that what its
-user typed is what arrives.
+user typed is what arrives. The exception is signed text
+(e2e-messages.md §4.7): cutting it would break its signature, so a
+signed line or message over its limit, or not canonical
+(e2e-messages.md §3.1), is `bad_request`, never cut.
 
 **Chat text is plain text.** A server MUST NOT parse, rewrite or
 annotate it. A client MAY render a closed markdown dialect in it on
@@ -948,6 +969,7 @@ news body is different: it declares its own type (news.md §5).
 | `blocked` | `msg` | The recipient blocks you. |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
+| `bad_signature` | `chat`, `msg`, `report` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
 
 The files codes are §7.2's. Each family's document lists its own. A
 client MUST treat a code it does not recognize as a failure of that one

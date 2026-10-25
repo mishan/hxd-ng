@@ -564,8 +564,14 @@ impl<T: Object> Signed<T> {
     /// Whether two messages say the same thing (§3.6): one signed again,
     /// differing only in `sent`, `cert` and `sig`, is the same message.
     pub fn same_content(&self, other: &Self) -> bool {
-        let content = |v: &Value| cbor::encode(&v.without("sent").without("cert").without("sig"));
-        content(&self.whole) == content(&other.whole)
+        self.content_sha256() == other.content_sha256()
+    }
+
+    /// SHA-256 of what [`Signed::same_content`] compares, for a reader
+    /// that keeps a message's content without the message.
+    pub fn content_sha256(&self) -> [u8; 32] {
+        let content = self.whole.without("sent").without("cert").without("sig");
+        Sha256::digest(cbor::encode(&content)).into()
     }
 
     /// The map without its texts, refused where its form's limits are

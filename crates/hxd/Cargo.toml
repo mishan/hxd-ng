@@ -135,5 +135,8 @@ hxd-feeds = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false }
 tempfile = "3"
+# The signed-messages e2e signs what hl-identity will not: a line under a
+# certificate that does not allow messages. Same pin as hl-identity's.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 # The TLS e2e connects as a client would.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

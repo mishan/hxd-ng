@@ -1264,6 +1264,7 @@ fn the_sweeper_scrubs_evidence_and_ages_out_closed_reports() {
             reason: "x".into(),
             evidence: None,
             verified: true,
+            signed: None,
             media: None,
             closed: Some(Closed {
                 at: old,

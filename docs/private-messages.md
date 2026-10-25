@@ -347,6 +347,13 @@ becomes per device. That is an `envelope` table keyed by
 `message.id` and never off `guid`, so deduplication and encryption never
 meet.
 
+**A signed message keeps its signature** (e2e-messages.md §4.9): schema
+v24 adds `signed`, the detached form as it was sent, served on the `msg`
+event and the `inbox` row so it verifies when it is read days later, and
+`signed_content`, the hash of what it says. A retry under the same guid
+that is signed and says something else is refused as an equivocation
+rather than answered as the stored message.
+
 `Mailbox`'s matching rule appears in SQL as **one shape per kind of
 mailbox** — `<col>_fp = ?` for an identified one, `<col>_fp IS NULL AND
 <col> = ?` for a bare login — built in one function so the two

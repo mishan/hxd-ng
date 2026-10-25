@@ -570,6 +570,12 @@ impl Core {
         let _ = self.peer_router.set(router);
     }
 
+    /// Whether `uid` is a ghost shown here.
+    pub fn is_ghost(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.ghosts.get(&uid).is_some_and(|g| g.visible)
+    }
+
     /// A private message to `to`: `None` when `to` is not a ghost shown
     /// here, so the message is a local one; otherwise its answer, refused
     /// at once for what could never be delivered.
@@ -652,6 +658,7 @@ impl Core {
                 sent_at: SystemTime::now(),
                 queued: false,
                 media: None,
+                signed: None,
             },
         );
         Ok(())

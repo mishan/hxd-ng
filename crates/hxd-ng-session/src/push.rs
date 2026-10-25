@@ -243,11 +243,17 @@ pub struct DeviceOnSocket {
     /// Unregistering another device is account management.
     pub(crate) may_manage: bool,
     pub(crate) expires: Option<SystemTime>,
+    /// The identity and the device key it proved, which a message this
+    /// session signs must be signed by (`docs/e2e-messages.md` §4.11).
+    pub(crate) identity: hl_identity::Fingerprint,
+    pub(crate) key: hl_identity::PublicKey,
 }
 
 impl DeviceOnSocket {
     pub(crate) fn of(identity: &crate::identity::TransportIdentity) -> Self {
         DeviceOnSocket {
+            identity: identity.fingerprint,
+            key: identity.device,
             devid: DeviceId::of_device(&hl_identity::Fingerprint::of(&identity.device).0),
             may_message: identity.allows(hl_identity::caps::MESSAGE),
             may_manage: identity.allows(hl_identity::caps::MANAGE),

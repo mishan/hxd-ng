@@ -52,7 +52,7 @@ fn hash(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, StoreError> {
 
 const ACT_COLUMNS: &str = "id, kind, actor, actor_fp, target_line, target_media, \
                            target_article, target_report, target_login, target_fp, \
-                           reason, evidence, media_hash, at, target_room";
+                           reason, evidence, media_hash, at, target_room, evidence_signed";
 
 fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -70,6 +70,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     let media_hash: Option<Vec<u8>> = r.get(12)?;
     let at: i64 = r.get(13)?;
     let room: Option<i64> = r.get(14)?;
+    let signed: Option<Vec<u8>> = r.get(15)?;
     Ok((|| {
         Ok(Act {
             id: id_of(id, "act id")?,
@@ -96,6 +97,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
             fingerprint: fp(target_fp)?,
             reason,
             evidence,
+            signed,
             media_hash: hash(media_hash)?,
             at: from_unix(at),
         })
@@ -105,7 +107,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
 const REPORT_COLUMNS: &str = "id, kind, reporter, reporter_fp, target_line, target_media, \
                               target_msg, target_article, target_login, target_fp, \
                               target_nick, reason, evidence, verified, at, closed_at, \
-                              closed_by, outcome, note, duplicate_of";
+                              closed_by, outcome, note, duplicate_of, signed";
 
 fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -128,6 +130,7 @@ fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
     let outcome: Option<i64> = r.get(17)?;
     let note: Option<String> = r.get(18)?;
     let duplicate_of: Option<i64> = r.get(19)?;
+    let signed: Option<Vec<u8>> = r.get(20)?;
     Ok((|| {
         let missing = || StoreError::new(format!("stored report {id} names no target"));
         let media = handle(media)?;
@@ -181,6 +184,7 @@ fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
             reason,
             evidence,
             verified,
+            signed,
             media,
             closed,
         })
@@ -218,8 +222,8 @@ impl ModerationStore for SqliteStore {
             "INSERT INTO moderation
                (kind, actor, actor_fp, target_line, target_media, target_article,
                 target_report, target_login, target_fp, reason, evidence, media_hash, at,
-                target_room)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                target_room, evidence_signed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 act.kind.as_i64(),
                 act.actor,
@@ -235,6 +239,7 @@ impl ModerationStore for SqliteStore {
                 act.media_hash.map(|h| h.to_vec()),
                 unix(act.at),
                 act.room.map(i64::from),
+                act.signed,
             ],
         ))?;
         id_of(conn.last_insert_rowid(), "act id")
@@ -274,9 +279,9 @@ impl ModerationStore for SqliteStore {
             "INSERT INTO report
                (kind, reporter, reporter_fp, target_line, target_media, target_msg,
                 target_article, target_login, target_fp, target_nick, reason, evidence,
-                verified, at, closed_at, closed_by, outcome, note, duplicate_of)
+                verified, at, closed_at, closed_by, outcome, note, duplicate_of, signed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19)",
+                     ?16, ?17, ?18, ?19, ?20)",
             params![
                 report.target.kind_i64(),
                 report.reporter.as_ref().map(|m| m.login.clone()),
@@ -301,6 +306,7 @@ impl ModerationStore for SqliteStore {
                 closed.map(|c| c.outcome.as_i64()),
                 closed.and_then(|c| c.note.clone()),
                 closed.and_then(|c| c.duplicate_of).map(clamp),
+                report.signed,
             ],
         ))?;
         id_of(conn.last_insert_rowid(), "report id")
@@ -418,7 +424,7 @@ impl ModerationStore for SqliteStore {
     fn scrub_evidence(&self, before: SystemTime) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
-            "UPDATE moderation SET evidence = ''
+            "UPDATE moderation SET evidence = '', evidence_signed = NULL
               WHERE at < ?1 AND kind NOT IN (?2, ?3) AND evidence IS NOT NULL AND evidence != ''",
             params![
                 unix(before),
