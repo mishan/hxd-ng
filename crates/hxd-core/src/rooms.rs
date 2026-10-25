@@ -59,6 +59,10 @@ pub struct Room {
     pub archived_at: Option<SystemTime>,
     /// A tombstone: the id stays taken, and nothing else is kept.
     pub deleted: bool,
+    /// Every line in it is signed (`docs/e2e-messages.md` §4.8). Set
+    /// when the room is made and never changed, which its mark kept
+    /// beside its log holds a rooms file to.
+    pub signed: bool,
 }
 
 impl Room {
@@ -193,6 +197,9 @@ pub struct RoomPolicy {
     /// set to refuse private chat or to answer automatically declines an
     /// invite by itself (§6.2), so `/join` says what to turn off.
     pub invites_declined: bool,
+    /// This server carries signed lines (`docs/e2e-messages.md` §4.6),
+    /// without which a room that requires them is one nobody can post in.
+    pub signed: bool,
 }
 
 impl Default for RoomPolicy {
@@ -204,6 +211,7 @@ impl Default for RoomPolicy {
             announce: true,
             announce_names: 3,
             invites_declined: false,
+            signed: false,
         }
     }
 }
@@ -261,12 +269,19 @@ pub struct RoomEdit {
     pub post: Option<Vec<String>>,
     pub max_lines: Option<Option<u32>>,
     pub max_days: Option<Option<u32>>,
+    /// Only a new room's to set; an edit may name the mark it has.
+    pub signed: Option<bool>,
 }
 
 impl RoomEdit {
     /// Make the change to `room`, refusing a field no room may have; a
     /// topic is set as `by`'s, now.
     pub fn apply(self, room: &mut Room, by: &str, now: SystemTime) -> Result<(), RoomError> {
+        if self.signed.is_some_and(|signed| signed != room.signed) {
+            return Err(RoomError::Invalid(
+                "a room's signed mark is set when it is made and never changes",
+            ));
+        }
         if let Some(name) = self.name {
             if !valid_name(&name) {
                 return Err(RoomError::Invalid(
@@ -425,12 +440,26 @@ fn admits(sess: &UserSession, room: &Room) -> bool {
         && (sess.manage_rooms || sess.moderate || reads(sess, room))
 }
 
-/// May `sess` send in `room`, given that it is in it?
-fn may_post(sess: &UserSession, room: &Room) -> bool {
+/// May `sess` send in `room` by its gates (§5), given that it is in it?
+fn gates_post(sess: &UserSession, room: &Room) -> bool {
     admits(sess, room)
         && (sess.manage_rooms
             || (sess.access.has(bit::SEND_CHAT)
                 && (room.post.is_empty() || named(&room.post, sess))))
+}
+
+/// May `sess` send in `room`: its gates, and in a room that requires
+/// signed lines, a session that can sign one (`docs/e2e-messages.md`
+/// §4.8), which no classic session can.
+fn may_post(sess: &UserSession, room: &Room) -> bool {
+    gates_post(sess, room)
+        && (!room.signed
+            || sess
+                .info
+                .transport
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.can_sign))
 }
 
 impl RosterInner {
@@ -532,7 +561,10 @@ impl RosterInner {
         if !entry.members.contains(&uid) {
             return Err(crate::ChatError::NotAMember);
         }
-        if !may_post(sess, &entry.room) {
+        // The gates alone: one they let post that cannot sign is told a
+        // signature is required, line by line (`docs/e2e-messages.md`
+        // §4.8).
+        if !gates_post(sess, &entry.room) {
             return Err(crate::ChatError::ReadOnly);
         }
         Ok(())
@@ -796,6 +828,7 @@ impl Core {
                 file.rooms.len()
             ));
         }
+        let mut marks = self.room_marks_check(&file)?;
         let mut drawn = Vec::new();
         let purge: Vec<u32>;
         {
@@ -830,6 +863,13 @@ impl Core {
             store
                 .put(room)
                 .map_err(|e| format!("writing room {}'s id: {e}", room.name))?;
+        }
+        marks.extend(drawn.iter().map(|room| (room.id, room.signed)));
+        if let Some(log) = self.history.as_ref() {
+            for (id, signed) in marks {
+                log.set_room_mark(id, signed)
+                    .map_err(|e| format!("keeping room {id}'s signed mark: {e}"))?;
+            }
         }
         let mut r = self.roster.lock().unwrap();
         // A topic set since the flush above, or not written by it, is
@@ -887,6 +927,60 @@ impl Core {
             }
         }
         Ok(file)
+    }
+
+    /// The file's `signed` marks against what this server carries and
+    /// the marks kept beside the log (`docs/e2e-messages.md` §4.8): a room
+    /// whose mark is not kept yet, which predates it, is given the file's
+    /// unless that is signed and its log holds an unsigned line that is
+    /// not a tombstone. Answers the marks to keep.
+    fn room_marks_check(&self, file: &RoomFile) -> Result<Vec<(u32, bool)>, String> {
+        let live = || file.rooms.iter().filter(|r| !r.deleted);
+        let Some(log) = self.history.as_ref() else {
+            return match live().find(|r| r.signed) {
+                Some(r) => Err(format!(
+                    "room {}: a signed room needs [history], to keep its log and its mark",
+                    r.name
+                )),
+                None => Ok(Vec::new()),
+            };
+        };
+        if let Some(r) = live().find(|r| r.signed && !self.room_state.policy.signed) {
+            return Err(format!(
+                "room {}: this server carries no signed lines, which needs [identity] hosts \
+                 and no [link]",
+                r.name
+            ));
+        }
+        let kept = log
+            .room_marks()
+            .map_err(|e| format!("rooms' signed marks: {e}"))?;
+        let mut marks = Vec::new();
+        for room in live().filter(|r| r.id != 0) {
+            match kept.get(&room.id) {
+                Some(&signed) if signed == room.signed => {}
+                Some(&signed) => {
+                    return Err(format!(
+                        "room {}: signed is {signed} for good, set when the room was made",
+                        room.name
+                    ))
+                }
+                None => {
+                    let unsigned = room.signed
+                        && log
+                            .holds_unsigned(room.id)
+                            .map_err(|e| format!("room {}'s log: {e}", room.name))?;
+                    if unsigned {
+                        return Err(format!(
+                            "room {}: marked signed, and its log holds unsigned lines",
+                            room.name
+                        ));
+                    }
+                    marks.push((room.id, room.signed));
+                }
+            }
+        }
+        Ok(marks)
     }
 
     /// Write the topics changed since the last write (§4), and with
@@ -955,7 +1049,28 @@ impl Core {
         if edit.name.is_none() {
             return Err(RoomError::Invalid("a room needs a name"));
         }
-        self.room_write(uid, None, |room, by, now| edit.apply(room, by, now))
+        let signed = edit.signed == Some(true);
+        if signed && !(self.room_state.policy.signed && self.history.is_some()) {
+            return Err(RoomError::Invalid("this server carries no signed lines"));
+        }
+        let room = self.room_write(uid, None, |room, by, now| {
+            room.signed = signed;
+            edit.apply(room, by, now)
+        })?;
+        // A mark that would not keep is kept at the next start, whose log
+        // holds nothing unsigned of a room this new.
+        if let Some(log) = self.history.as_ref() {
+            if let Err(e) = log.set_room_mark(room.id, room.signed) {
+                warn!("rooms: room {}'s signed mark: {e}", room.id);
+            }
+        }
+        Ok(room)
+    }
+
+    /// Does `room` require signed lines?
+    pub(crate) fn room_signed(&self, room: u32) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.rooms.get(&room).is_some_and(|e| e.room.signed)
     }
 
     /// Change a room, for a session that may manage rooms. A narrowed
@@ -1110,7 +1225,8 @@ impl Core {
                 .get(&id)
                 .filter(|e| sees(sess, &e.room))
                 .ok_or(RoomError::NoSuchRoom)?;
-            if !(sess.set_subject && may_post(sess, &entry.room)) {
+            // A topic is not a line, and needs no signature.
+            if !(sess.set_subject && gates_post(sess, &entry.room)) {
                 return Err(RoomError::AccessDenied);
             }
             let text: String = text.chars().take(TOPIC_MAX).collect();
@@ -1386,6 +1502,7 @@ pub mod conformance {
             max_days: Some(30),
             archived_at: Some(at),
             deleted: false,
+            signed: true,
         };
         store.put(&full).unwrap();
         assert_eq!(store.load().unwrap().rooms, [full]);

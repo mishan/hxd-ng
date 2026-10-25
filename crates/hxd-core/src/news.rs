@@ -298,6 +298,35 @@ pub struct Article {
     /// The name of the feed that posted it, for a feed's article
     /// (news-feeds.md §5).
     pub feed: Option<String>,
+    /// What a signed article was signed with, until it is deleted.
+    pub signed: Option<ArticleSignature>,
+}
+
+/// A signed article's detached form (`docs/e2e-messages.md` §4.10),
+/// checked by the frontend that took it and served exactly as it came,
+/// with what the index of signed articles keys and compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleSignature {
+    pub form: Vec<u8>,
+    /// SHA-256 of what it says, which signing it again does not change
+    /// (§3.6).
+    pub content: [u8; 32],
+    /// The fingerprint of the identity that signed it.
+    pub signer: [u8; 32],
+    /// Its `id`.
+    pub id: [u8; 16],
+}
+
+/// What a signed post says of where it was posted, for the domain to
+/// check against the store (§4.11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPost {
+    pub signature: ArticleSignature,
+    /// `in.category`: the guid of the category it was signed for.
+    pub category: [u8; 16],
+    /// `parent.id` and `parent.by`, which a reply to a signed article
+    /// carries and a reply to an unsigned one does not.
+    pub parent: Option<([u8; 16], [u8; 32])>,
 }
 
 /// One article as the legacy 1.5 listing shows it (§12.3): what a
@@ -492,6 +521,7 @@ pub struct NewPost {
     /// A feed's item, recorded as seen in the post's own write, so no
     /// crash between the two can post it twice.
     pub feed: Option<FeedPost>,
+    pub signed: Option<ArticleSignature>,
 }
 
 pub type FeedId = u64;
@@ -877,6 +907,10 @@ pub enum NewsError {
     /// Malformed input the domain refuses, with what was wrong for a
     /// human.
     BadRequest(&'static str),
+    /// A signed post that fails a check only the store can answer, or
+    /// says something else under an id its signer already used
+    /// (`docs/e2e-messages.md` §4.11), naming the check.
+    BadSignature(&'static str),
     /// The session asking has gone.
     NoSession,
     /// This server answers no searches (`[news] search = false`).
@@ -936,8 +970,11 @@ pub trait NewsStore: Send + Sync + 'static {
     fn node(&self, id: NodeId) -> Result<Option<Node>, StoreError>;
 
     /// Create a node. Refuses a missing parent, a category as a parent,
-    /// a name its siblings already use, and a node deeper than
-    /// `max_depth` levels from the root.
+    /// a name its siblings already use, a node deeper than `max_depth`
+    /// levels from the root, and, as a store error, a guid another node
+    /// holds: a signed article names its category by guid, so two nodes
+    /// sharing one could show it where it was not posted
+    /// (`docs/e2e-messages.md` §4.10).
     fn create_node(&self, n: &NewNode, max_depth: u16) -> Result<Node, NewsError>;
 
     fn rename_node(&self, id: NodeId, name: &str) -> Result<Node, NewsError>;
@@ -957,6 +994,15 @@ pub trait NewsStore: Send + Sync + 'static {
     fn post(&self, p: &NewPost, max_depth: u16, max_refs: usize) -> Result<Posted, NewsError>;
 
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError>;
+
+    /// The live article `signer` signed under `id`, and what it says: the
+    /// index of signed articles (`docs/e2e-messages.md` §4.10). A deleted
+    /// article is not in it, since its signature goes with its body.
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        id: &[u8; 16],
+    ) -> Result<Option<(ArticleId, [u8; 32])>, StoreError>;
 
     /// One category's threads. `NoSuchNode` or `NotACategory` for a
     /// query that names something else. A thread whose every article is
@@ -1392,6 +1438,7 @@ pub struct PostRequest {
     pub body: String,
     pub mime: BodyType,
     pub attachments: Vec<crate::media::Handle>,
+    pub signed: Option<SignedPost>,
 }
 
 /// The longest node name, in bytes. The legacy wire carries a name as a
@@ -1606,6 +1653,46 @@ fn news_room(store: &dyn NewsStore, post: &NewPost, policy: NewsPolicy) -> Resul
         }
     }
     Ok(())
+}
+
+/// A signed post's category and parent against the store, and its id
+/// against the index of signed articles (`docs/e2e-messages.md` §4.11):
+/// `Some` with the article it is a retry of. Under the post serial, so
+/// two posts under one id cannot both miss the index.
+fn news_signed_check(
+    store: &dyn NewsStore,
+    post: &NewPost,
+    signed: &SignedPost,
+) -> Result<Option<ArticleId>, NewsError> {
+    let sig = &signed.signature;
+    let failed = |e: StoreError| store_failed(e.into());
+    if let Some((id, content)) = store.find_signed(&sig.signer, &sig.id).map_err(failed)? {
+        if content != sig.content {
+            return Err(NewsError::BadSignature(
+                "You signed something else under that id; sign this under another.",
+            ));
+        }
+        return Ok(Some(id));
+    }
+    let node = store
+        .node(post.category)
+        .map_err(failed)?
+        .ok_or(NewsError::NoSuchNode)?;
+    if node.guid != signed.category {
+        return Err(NewsError::BadSignature("Signed for another category."));
+    }
+    if let Some(parent) = post.parent {
+        let parent = store
+            .article(parent)
+            .map_err(failed)?
+            .ok_or(NewsError::NoSuchArticle)?;
+        if parent.signed.as_ref().map(|s| (s.id, s.signer)) != signed.parent {
+            return Err(NewsError::BadSignature(
+                "Signed as a reply to another article.",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 fn store_failed(e: NewsError) -> NewsError {
@@ -2265,6 +2352,13 @@ impl Core {
             return Err(NewsError::BadBodyType);
         }
         let subject = clean_subject(&req.subject);
+        // Signed text is refused rather than changed, since a change
+        // would break its signature (`docs/e2e-messages.md` §4.10).
+        if req.signed.is_some() && subject != req.subject {
+            return Err(NewsError::BadRequest(
+                "A signed subject has no tab and no space at either end; it is never changed.",
+            ));
+        }
         if subject.is_empty() {
             return Err(NewsError::BadRequest("An article needs a subject."));
         }
@@ -2297,6 +2391,7 @@ impl Core {
                 .checked_sub(policy.attach.map_or(Duration::ZERO, |a| a.stage_ttl))
                 .unwrap_or(SystemTime::UNIX_EPOCH),
             feed: None,
+            signed: req.signed.as_ref().map(|s| s.signature.clone()),
         };
         if !post.attachments.is_empty() {
             let attach = policy.attach.ok_or(NewsError::NoSuchMedia)?;
@@ -2312,6 +2407,14 @@ impl Core {
         }
         let posted = {
             let _serial = self.news_post_serial.lock().unwrap();
+            if let Some(signed) = &req.signed {
+                if let Some(id) = news_signed_check(&**store, &post, signed)? {
+                    // It posted nothing, so it takes back the post a
+                    // signed post's frontend reserved for it.
+                    self.news_post_refund(uid);
+                    return Ok(id);
+                }
+            }
             news_room(&**store, &post, policy)?;
             store
                 .post(&post, policy.max_depth, policy.max_refs)
@@ -2742,6 +2845,7 @@ mod tests {
                 body: body.into(),
                 mime: BodyType::Plain,
                 attachments: Vec::new(),
+                signed: None,
             },
         )
     }
@@ -3025,6 +3129,7 @@ mod tests {
                     body: body.into(),
                     mime,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
         };

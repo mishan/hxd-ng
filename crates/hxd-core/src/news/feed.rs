@@ -408,6 +408,7 @@ impl Core {
                 hash,
                 seen: now,
             }),
+            signed: None,
         }
     }
 }

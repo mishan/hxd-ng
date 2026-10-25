@@ -17,17 +17,18 @@ use std::time::{Duration, SystemTime};
 use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::media::MediaType;
 use hxd_core::news::{
-    Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, Author, BlobId, BodyType, FeedId,
-    FeedListing, FeedPoll, FeedState, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage,
-    Node, NodeId, NodeKind, Posted, Reference, SeenItem, StagedAttachment, SubScope, Subscriber,
-    Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
+    Article, ArticleId, ArticlePage, ArticleSignature, Attachment, AttachmentFetch, Author, BlobId,
+    BodyType, FeedId, FeedListing, FeedPoll, FeedState, Listed, NewNode, NewPost, NewsError,
+    NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SeenItem, StagedAttachment,
+    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 use super::{bind, cutoff, fp_from_hex, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
 const ARTICLE_COLUMNS: &str = "id, category, parent, root, depth, nick, login, login_fp, \
-                               subject, body, mime, at, deleted_at IS NOT NULL, plain, feed";
+                               subject, body, mime, at, deleted_at IS NOT NULL, plain, feed, \
+                               signed, signed_content, signed_by, signed_id";
 
 const NODE_COLUMNS: &str = "n.id, n.parent, n.kind, n.name, n.guid, n.add_sn, n.delete_sn, \
      n.created_at, \
@@ -93,6 +94,7 @@ struct RawArticle {
     deleted: bool,
     plain: Option<String>,
     feed: Option<i64>,
+    signed: [Option<Vec<u8>>; 4],
 }
 
 fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
@@ -112,6 +114,7 @@ fn raw_article(r: &Row<'_>) -> rusqlite::Result<RawArticle> {
         deleted: r.get(12)?,
         plain: r.get(13)?,
         feed: r.get(14)?,
+        signed: [r.get(15)?, r.get(16)?, r.get(17)?, r.get(18)?],
     })
 }
 
@@ -204,6 +207,19 @@ impl RawArticle {
             referenced_by: u32::try_from(referenced_by).unwrap_or(u32::MAX),
             attachments,
             feed,
+            signed: match self.signed {
+                [None, None, None, None] => None,
+                [Some(form), Some(content), Some(signer), Some(signed_id)] => {
+                    let bad = || StoreError::new(format!("article {id}'s signature is damaged"));
+                    Some(ArticleSignature {
+                        form,
+                        content: content.try_into().map_err(|_| bad())?,
+                        signer: signer.try_into().map_err(|_| bad())?,
+                        id: signed_id.try_into().map_err(|_| bad())?,
+                    })
+                }
+                _ => return Err(StoreError::new(format!("article {id} is half signed"))),
+            },
         })
     }
 }
@@ -884,6 +900,17 @@ impl NewsStore for SqliteStore {
         if name_taken(&tx, n.parent, &n.name, None)? {
             return Err(NewsError::NameTaken);
         }
+        let guid_taken = sql(tx
+            .prepare_cached("SELECT 1 FROM news_node WHERE guid = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row(params![n.guid.as_slice()], |r| r.get::<_, i64>(0))
+                    .optional()
+            }))?;
+        if guid_taken.is_some() {
+            return Err(NewsError::Store(StoreError::new(
+                "a node holds that guid already",
+            )));
+        }
         tx.execute(
             "INSERT INTO news_node (parent, kind, name, guid, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -985,8 +1012,10 @@ impl NewsStore for SqliteStore {
         sql(tx.execute(
             "INSERT INTO news_article
                (category, parent, root, path, depth, nick, login, login_fp,
-                subject, body, mime, plain, at, guest_key, feed)
-             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                subject, body, mime, plain, at, guest_key, feed,
+                signed, signed_content, signed_by, signed_id)
+             VALUES (?1, ?2, 0, X'', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17)",
             params![
                 clamp_node(p.category),
                 p.parent.map(i64::from),
@@ -1001,6 +1030,10 @@ impl NewsStore for SqliteStore {
                 unix(p.at),
                 guest_key(p),
                 p.feed.map(|f| f.feed as i64),
+                p.signed.as_ref().map(|s| &s.form),
+                p.signed.as_ref().map(|s| &s.content[..]),
+                p.signed.as_ref().map(|s| &s.signer[..]),
+                p.signed.as_ref().map(|s| &s.id[..]),
             ],
         ))?;
         // Past u32 is an article the legacy wire cannot name (§3.2). The
@@ -1114,6 +1147,34 @@ impl NewsStore for SqliteStore {
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError> {
         let conn = self.conn.lock().unwrap();
         load_article(&conn, id)
+    }
+
+    /// Through `news_article_signed`.
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        id: &[u8; 16],
+    ) -> Result<Option<(ArticleId, [u8; 32])>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<(i64, Vec<u8>)> = sql(conn
+            .prepare_cached(
+                "SELECT id, signed_content FROM news_article
+                  WHERE signed_by = ?1 AND signed_id = ?2",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![&signer[..], &id[..]], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+            }))?;
+        found
+            .map(|(article, content)| {
+                let content = content
+                    .try_into()
+                    .map_err(|_| StoreError::new("a signed article's content is not 32 bytes"))?;
+                Ok((article_id(article)?, content))
+            })
+            .transpose()
     }
 
     fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError> {
@@ -1291,6 +1352,7 @@ impl NewsStore for SqliteStore {
             "UPDATE news_article
                 SET subject = '', body = '', plain = NULL, attach_names = NULL, nick = '',
                     login = NULL, login_fp = NULL, guest_key = NULL,
+                    signed = NULL, signed_content = NULL, signed_by = NULL, signed_id = NULL,
                     deleted_at = ?1, deleted_by = ?2
               WHERE id = ?3",
             params![unix(at), by, i64::from(id)],

@@ -1067,6 +1067,7 @@ mod tests {
                     handle: Some("ann@example.org".into()),
                     quiet_until: None,
                     signs: false,
+                    can_sign: false,
                 }),
                 ..Default::default()
             },

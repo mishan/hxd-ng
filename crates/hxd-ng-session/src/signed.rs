@@ -1,13 +1,16 @@
-//! Signed lines and messages as they arrive (`docs/e2e-messages.md`
-//! §4.6, §4.11): every one is checked before it is relayed or stored, so
-//! an invalid signature in a client's view is a sign of tampering rather
-//! than of another client's bug, and what the domain keeps is a form it
-//! never has to read.
+//! Signed lines, messages and articles as they arrive
+//! (`docs/e2e-messages.md` §4.6, §4.11): every one is checked before it
+//! is relayed or stored, so an invalid signature in a client's view is a
+//! sign of tampering rather than of another client's bug, and what the
+//! domain keeps is a form it never has to read.
 
-use hl_identity::message::{ChatLine, Object, PrivateMessage, Signed, DETACHED_MAX_BYTES, SKEW};
+use hl_identity::message::{
+    Article, ChatLine, Object, PrivateMessage, Signed, DETACHED_MAX_BYTES, SKEW,
+};
 use hl_identity::{cbor, Error, Fingerprint};
 use hxd_core::history::Signature;
 use hxd_core::inbox::MessageGuid;
+use hxd_core::news::{ArticleId, ArticleSignature, SignedPost};
 use hxd_core::SignedMsg;
 
 use crate::conn::SessState;
@@ -81,12 +84,10 @@ fn invalid(e: Error) -> Refused {
 }
 
 /// What a signed request must be besides valid (§4.11): this session's
-/// device under this session's identity, signed lately, and under the
-/// request's guid.
+/// device under this session's identity, and signed lately.
 fn of_this_session<T: Object>(
     state: &SessState,
     signed: &Signed<T>,
-    guid: Option<&MessageGuid>,
     now: u64,
 ) -> Result<(), Refused> {
     let Some(device) = state.device.as_ref() else {
@@ -103,6 +104,11 @@ fn of_this_session<T: Object>(
     if signed.message.sent().abs_diff(now) > SKEW {
         return Err(Refused::BadSignature("signed too long ago; sign it again"));
     }
+    Ok(())
+}
+
+/// A `chat`'s or a `msg`'s guid, which is its signed id.
+fn under_guid<T: Object>(signed: &Signed<T>, guid: Option<&MessageGuid>) -> Result<(), Refused> {
     match guid {
         None => Err(Refused::BadRequest("A signed message carries its `guid`.")),
         Some(g) if id_of(g) != signed.message.id() => Err(Refused::BadSignature(
@@ -146,7 +152,8 @@ pub(crate) fn line(
     text_ok(text)?;
     let form = decode(signed)?;
     let line = Signed::<ChatLine>::parse_detached(&form, [text], now).map_err(invalid)?;
-    of_this_session(state, &line, guid, now)?;
+    of_this_session(state, &line, now)?;
+    under_guid(&line, guid)?;
     let server = ctx.identity.as_ref().map(|st| st.server_key());
     if Some(line.message.server) != server {
         return Err(Refused::BadSignature("Signed for another server."));
@@ -176,13 +183,75 @@ pub(crate) fn msg(
     text_ok(text)?;
     let form = decode(signed)?;
     let msg = Signed::<PrivateMessage>::parse_detached(&form, [text], now).map_err(invalid)?;
-    of_this_session(state, &msg, guid, now)?;
+    of_this_session(state, &msg, now)?;
+    under_guid(&msg, guid)?;
     Ok(SignedMsg {
         to: msg.message.to.0,
         signature: Signature {
             content: msg.content_sha256(),
             form,
         },
+    })
+}
+
+/// A `news_post`'s `signed` (§4.10), for an article of `subject` and
+/// `body` as `mime`, replying to `parent`. The category's guid and the
+/// parent's signature are the domain's to check, against the store.
+pub(crate) fn article(
+    ctx: &NgCtx,
+    state: &SessState,
+    (subject, body, mime): (&str, &str, Option<&str>),
+    parent: Option<ArticleId>,
+    signed: &str,
+) -> Result<SignedPost, Refused> {
+    let now = now(ctx)?;
+    if !(hl_identity::message::is_canonical(subject) && hl_identity::message::is_canonical(body)) {
+        return Err(Refused::BadRequest(
+            "Signed text holds no CR and no control character but LF and TAB.",
+        ));
+    }
+    if subject.is_empty() || subject.len() > 255 || subject.contains('\n') {
+        return Err(Refused::BadRequest(
+            "A signed subject is one line of 1 to 255 bytes; it is never cut.",
+        ));
+    }
+    if body.len() > 65_535 {
+        return Err(Refused::BadRequest(
+            "A signed body is at most 65 535 bytes; it is never cut.",
+        ));
+    }
+    let Some(mime) = mime else {
+        return Err(Refused::BadRequest("A signed article sends its `mime`."));
+    };
+    let form = decode(signed)?;
+    let article =
+        Signed::<Article>::parse_detached(&form, [subject, body], now).map_err(invalid)?;
+    of_this_session(state, &article, now)?;
+    let server = ctx.identity.as_ref().map(|st| st.server_key());
+    if Some(article.message.server) != server {
+        return Err(Refused::BadSignature("Signed for another server."));
+    }
+    if article.message.mime != mime {
+        return Err(Refused::BadSignature("Signed as another `mime`."));
+    }
+    if article.message.parent.map(|p| p.article) != parent.map(u64::from) {
+        return Err(Refused::BadSignature(
+            "Signed as a reply to another article.",
+        ));
+    }
+    Ok(SignedPost {
+        signature: ArticleSignature {
+            content: article.content_sha256(),
+            signer: article.signer().0,
+            id: article.message.id,
+            form,
+        },
+        category: article.message.category,
+        parent: article
+            .message
+            .parent
+            .and_then(|p| p.signed)
+            .map(|(id, by)| (id, by.0)),
     })
 }
 

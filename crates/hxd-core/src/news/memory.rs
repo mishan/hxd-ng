@@ -138,6 +138,7 @@ struct ArticleRow {
     at: SystemTime,
     deleted: bool,
     feed: Option<FeedId>,
+    signed: Option<super::ArticleSignature>,
 }
 
 impl ArticleRow {
@@ -293,6 +294,7 @@ impl Inner {
             referenced_by,
             attachments: Vec::new(),
             feed: a.feed.map(|f| self.feeds[f as usize - 1].name.clone()),
+            signed: a.signed.clone(),
         }
     }
 
@@ -496,6 +498,11 @@ impl NewsStore for MemoryNews {
         if inner.name_taken(n.parent, &n.name, None) {
             return Err(NewsError::NameTaken);
         }
+        if inner.nodes.iter().any(|node| node.guid == n.guid) {
+            return Err(NewsError::Store(StoreError::new(
+                "a node holds that guid already",
+            )));
+        }
         inner.last_node += 1;
         let row = NodeRow {
             id: inner.last_node,
@@ -609,6 +616,7 @@ impl NewsStore for MemoryNews {
             at: whole_seconds(p.at),
             deleted: false,
             feed: p.feed.map(|f| f.feed),
+            signed: p.signed.clone(),
         });
         if let Some(f) = p.feed {
             inner.feed_items.insert(
@@ -640,6 +648,18 @@ impl NewsStore for MemoryNews {
     fn article(&self, id: ArticleId) -> Result<Option<Article>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.row(id).map(|a| inner.view(a)))
+    }
+
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        id: &[u8; 16],
+    ) -> Result<Option<(ArticleId, [u8; 32])>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.articles.iter().find_map(|a| {
+            let s = a.signed.as_ref()?;
+            (s.signer == *signer && s.id == *id).then_some((a.id, s.content))
+        }))
     }
 
     fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError> {
@@ -753,6 +773,7 @@ impl NewsStore for MemoryNews {
         row.subject.clear();
         row.body.clear();
         row.plain = None;
+        row.signed = None;
         row.author = Author {
             nick: String::new(),
             login: None,

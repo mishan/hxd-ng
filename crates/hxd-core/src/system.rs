@@ -372,10 +372,13 @@ impl Core {
         const MORE: &str = "… and more; /rooms <word> narrows it";
         let mut out = String::new();
         for (i, v) in list.iter().enumerate() {
-            let line = match v.room.topic.text.as_str() {
+            let mut line = match v.room.topic.text.as_str() {
                 "" => format!("#{} ({} here)", v.room.name, v.members),
                 topic => format!("#{} — {topic} ({} here)", v.room.name, v.members),
             };
+            if v.room.signed {
+                line.push_str(" (signed lines only)");
+            }
             let tail = if i + 1 == list.len() {
                 0
             } else {

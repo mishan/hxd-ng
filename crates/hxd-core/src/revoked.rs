@@ -237,6 +237,7 @@ mod tests {
             handle: None,
             quiet_until: None,
             signs: false,
+            can_sign: false,
         }
     }
 

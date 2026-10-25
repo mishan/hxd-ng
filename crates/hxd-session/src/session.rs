@@ -1163,6 +1163,7 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NoSuchMedia => "Media rejected",
         ChatError::Flooding => "You were kicked for flooding.",
         ChatError::ReadOnly => "That room is read-only.",
+        ChatError::SignatureRequired => "That room takes signed lines only.",
         // A classic client cannot sign (`docs/e2e-messages.md` §6), so
         // these three never come back to it.
         ChatError::Equivocation | ChatError::SignedElsewhere | ChatError::NoIdentity => {
@@ -1520,8 +1521,8 @@ struct Session {
     /// as on mhxd, which is all a client showing it needs. Kept rather
     /// than read again, so the bytes are the ones the push described.
     banner_image: Option<crate::banner::Image>,
-    /// The rooms this session has been told are read-only, which it is
-    /// told once a room rather than once a dropped line.
+    /// The rooms this session has been told it may not send in, which it
+    /// is told once a room rather than once a dropped line.
     told_read_only: Vec<u32>,
     /// The highest access bit this client's user editor can show
     /// ([`accounts::editor_tier`]).
@@ -3377,10 +3378,14 @@ async fn public_chat(
         match result {
             // 105 has no reply, and a line that vanishes with no word is
             // a bug to the person typing it (`docs/chat-rooms.md` §6.3).
-            Err(ChatError::ReadOnly) => {
+            Err(e @ (ChatError::ReadOnly | ChatError::SignatureRequired)) => {
                 if !sess.told_read_only.contains(&room) {
                     sess.told_read_only.push(room);
-                    server_line(tx, ctx, sess, room, "this room is read-only");
+                    let text = match e {
+                        ChatError::ReadOnly => "this room is read-only",
+                        _ => "this room takes signed lines only, which this client cannot send",
+                    };
+                    server_line(tx, ctx, sess, room, text);
                 }
             }
             // Not in the room, or a room it may not see: dropped as a

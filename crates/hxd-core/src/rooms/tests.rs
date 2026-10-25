@@ -976,3 +976,204 @@ fn a_topic_that_would_not_write_outlives_a_reload_and_is_written_later() {
     core.flush_room_topics(true);
     assert_eq!(filed(), "second");
 }
+
+fn line_in(channel: u32, signed: bool) -> NewLine {
+    NewLine {
+        channel,
+        ghost: None,
+        from_nick: "old".into(),
+        from_login: None,
+        from_fingerprint: None,
+        icon: 0,
+        text: "a line from before".into(),
+        flags: Default::default(),
+        at: SystemTime::now(),
+        guid: None,
+        signed: signed.then(|| crate::history::Signature {
+            form: vec![0xa5],
+            content: [1; 32],
+        }),
+    }
+}
+
+const SIGNING: RoomPolicy = RoomPolicy {
+    max_joined: 32,
+    max_rooms: 256,
+    lobby: String::new(),
+    announce: true,
+    announce_names: 3,
+    invites_declined: false,
+    signed: true,
+};
+
+/// A room's `signed` mark against the log it is kept beside and what the
+/// server carries (`docs/e2e-messages.md` §4.8): a mark the file would
+/// change, a room marked over unsigned lines it already holds, and a
+/// mark on a server that could not keep or carry it all refuse startup,
+/// naming the room; a room whose mark is not kept yet has it kept.
+#[test]
+fn a_rooms_signed_mark_is_held_to_what_is_kept_at_startup() {
+    struct Case {
+        name: &'static str,
+        history: bool,
+        policy_signed: bool,
+        lines: &'static [(bool, bool)],
+        kept: Option<bool>,
+        file: bool,
+        refused: Option<&'static str>,
+    }
+    let base = Case {
+        name: "",
+        history: true,
+        policy_signed: true,
+        lines: &[],
+        kept: None,
+        file: true,
+        refused: None,
+    };
+    let cases = [
+        Case {
+            name: "no store to keep its log and mark",
+            history: false,
+            refused: Some("needs [history]"),
+            ..base
+        },
+        Case {
+            name: "a server that carries no signed lines",
+            policy_signed: false,
+            refused: Some("carries no signed lines"),
+            ..base
+        },
+        Case {
+            name: "a room from before the mark, with an unsigned line",
+            lines: &[(false, false), (true, false)],
+            refused: Some("room den: marked signed, and its log holds unsigned lines"),
+            ..base
+        },
+        Case {
+            name: "a room from before the mark, its unsigned lines tombstones",
+            lines: &[(false, true), (true, false)],
+            ..base
+        },
+        Case {
+            name: "a kept mark the file adds signed to",
+            kept: Some(false),
+            refused: Some("room den: signed is false for good"),
+            ..base
+        },
+        Case {
+            name: "a kept mark the file takes signed from",
+            kept: Some(true),
+            file: false,
+            refused: Some("room den: signed is true for good"),
+            ..base
+        },
+        Case {
+            name: "an unmarked room over unsigned lines",
+            lines: &[(false, false)],
+            file: false,
+            ..base
+        },
+    ];
+    for case in cases {
+        let log = Arc::new(MemoryLog::default());
+        for &(signed, tombstoned) in case.lines {
+            let id = log.append(&line_in(5, signed)).unwrap();
+            if tombstoned {
+                log.tombstone(id, "mod", SystemTime::now()).unwrap();
+            }
+        }
+        if let Some(kept) = case.kept {
+            log.set_room_mark(5, kept).unwrap();
+        }
+        let store = Arc::new(MemoryRooms::new(RoomFile {
+            rooms: vec![Room {
+                id: 5,
+                name: "den".into(),
+                signed: case.file,
+                ..Room::default()
+            }],
+            ..RoomFile::default()
+        }));
+        let core = match case.history {
+            true => Core::new().with_history(log.clone(), HistoryPolicy::default()),
+            false => Core::new(),
+        };
+        let policy = RoomPolicy {
+            signed: case.policy_signed,
+            ..SIGNING
+        };
+        match (core.with_rooms(store, policy), case.refused) {
+            (Ok(_), None) => {
+                let marks = log.room_marks().unwrap();
+                assert_eq!(marks.get(&5), Some(&case.file), "{}: kept", case.name);
+            }
+            (Err(e), Some(why)) => assert!(e.contains(why), "{}: {e}", case.name),
+            (Ok(_), Some(_)) => panic!("{}: started", case.name),
+            (Err(e), None) => panic!("{}: {e}", case.name),
+        }
+    }
+}
+
+/// The mark is set when a room is made, kept beside its log, and never
+/// changes: not by an edit, and not by a reload, which leaves the rooms as
+/// they were.
+#[test]
+fn a_rooms_signed_mark_is_set_once() {
+    let log = Arc::new(MemoryLog::default());
+    let store = Arc::new(MemoryRooms::default());
+    let core = Core::new()
+        .with_history(log.clone(), HistoryPolicy::default())
+        .with_rooms(store.clone(), SIGNING)
+        .unwrap();
+    let (boss, _) = attach(&core, manager("boss"));
+    let signed = RoomEdit {
+        signed: Some(true),
+        ..named("den")
+    };
+    let den = core.room_create(boss, signed).unwrap();
+    assert!(den.signed);
+    let plain = core.room_create(boss, named("hall")).unwrap().id;
+    assert_eq!(
+        log.room_marks().unwrap(),
+        [(den.id, true), (plain, false)].into_iter().collect()
+    );
+    for (room, signed) in [(den.id, false), (plain, true)] {
+        let edit = RoomEdit {
+            signed: Some(signed),
+            ..RoomEdit::default()
+        };
+        assert!(matches!(
+            core.room_edit(boss, room, edit),
+            Err(RoomError::Invalid(_))
+        ));
+    }
+    let same = RoomEdit {
+        signed: Some(true),
+        topic: Some("signed only".into()),
+        ..RoomEdit::default()
+    };
+    assert!(core.room_edit(boss, den.id, same).unwrap().signed);
+    let mut file = store.load().unwrap();
+    file.rooms.iter_mut().for_each(|r| r.signed = !r.signed);
+    *store.0.lock().unwrap() = file;
+    assert!(core.reload_rooms().is_err());
+    let (alice, _) = attach(&core, member("alice"));
+    let marks: Vec<(u32, bool)> = core
+        .room_list(alice)
+        .iter()
+        .map(|v| (v.room.id, v.room.signed))
+        .collect();
+    assert!(marks.contains(&(den.id, true)) && marks.contains(&(plain, false)));
+
+    let without = with_rooms(Core::new().with_history(log, HistoryPolicy::default()));
+    let (boss, _) = attach(&without, manager("boss"));
+    let signed = RoomEdit {
+        signed: Some(true),
+        ..named("den")
+    };
+    assert_eq!(
+        without.room_create(boss, signed),
+        Err(RoomError::Invalid("this server carries no signed lines"))
+    );
+}

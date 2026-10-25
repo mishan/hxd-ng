@@ -3000,6 +3000,14 @@ impl NewsStore for CountingNews {
         self.inner.article(id)
     }
 
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        id: &[u8; 16],
+    ) -> Result<Option<(ArticleId, [u8; 32])>, StoreError> {
+        self.inner.find_signed(signer, id)
+    }
+
     fn threads(&self, q: &ThreadQuery) -> Result<ThreadPage, NewsError> {
         self.inner.threads(q)
     }

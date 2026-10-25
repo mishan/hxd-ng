@@ -114,8 +114,9 @@ has to be typed.
 
 A signed line's detached form goes with its words, into the audit
 row's `evidence_signed` (schema v24), and is scrubbed with them; the
-tombstone carries none (e2e-messages.md §4.12). `moderation_log` shows it
-as `signed`.
+tombstone carries none (e2e-messages.md §4.12). So does a signed
+article's, when someone else's delete of it is an act. `moderation_log`
+shows it as `signed`.
 
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an

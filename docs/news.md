@@ -1189,6 +1189,9 @@ meets no ladder.
 }
 ```
 
+Node objects always carry `guid` (§9.2, §9.5), whether or not the
+server carries signed articles.
+
 `post`, `attach` and `subscribe` are this session's resolved permissions, not the
 server's ceiling — the same courtesy `moderator` does in
 moderation.md §2, so a client can gray out a compose button instead of
@@ -1210,7 +1213,7 @@ is not one (§9.4).
 | `news_threads` | `category`, `before?` / `after?` (thread root id), `order?` (`"created"`, the default and so far the only one: `"recent"` is an open question, §18, and asking for it is `bad_request`), `limit?` (1–200, default 50) | `{ "threads": [ … ], "has_more": bool }` |
 | `news_thread` | `root`, `after?` (article id), `snapshot?` (article id returned by the first page; required with `after`), `limit?` (1–100, default 25) | `{ "articles": [ … ], "has_more": bool, "snapshot": article_id }` |
 | `news_article` | `id` | `{ "article": { … } }` |
-| `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles) | `{ "id": 51 }` |
+| `news_post` | `category`, `parent?`, `subject`, `body`, `mime?` (`"text/plain"` \| `"text/markdown"`, default plain), `attach?` (handles), `signed?` (§9.5) | `{ "id": 51 }` |
 | `news_delete` | `id`, `reason?` | `{}` |
 | `news_refs` | `id`, `limit?` (1–200, default 50) | `{ "referenced_by": [ … ] }` — the articles pointing at this one |
 | `news_search` | `q`, `category?`, `from?`, `before?` / `after?` (times), `order?` (`"relevance"`, the default, or `"recent"`), `offset?`, `limit?` (1–50, default 20) | `{ "hits": [ … ], "total": 137, "capped": false }` |
@@ -1231,8 +1234,9 @@ share is the one every guest from its address spends together and whose
 message says so),
 `name_taken`, `not_empty` (deleting a bundle with children),
 `bad_body_type` (`text/markdown` against a server in `markdown = "off"`),
-and `read_only` (posting into, renaming or deleting a category a feed
-fills — [news-feeds.md](news-feeds.md) §3).
+`read_only` (posting into, renaming or deleting a category a feed
+fills — [news-feeds.md](news-feeds.md) §3), and `bad_signature` (a
+signed post that fails a check, §9.5).
 
 There is deliberately **no error code for a bad search query**: §6.2
 compiles anything into something, so `news_search` answers with results
@@ -1302,7 +1306,8 @@ article is a tombstone is not listed: there is nothing left in it to
 read.
 
 A `node` object is `{ "id", "parent", "kind", "name", "count",
-"created_at" }` — `parent` null at the root, `count` the sub-nodes of a
+"created_at", "guid" }` — `guid` the base64url of its 16 bytes (§9.5),
+`parent` null at the root, `count` the sub-nodes of a
 bundle or the live articles of a category — with `children` on a bundle
 that a `news_tree` of `depth` above 1 reached into, and `"feed": {
 "name", "replies" }` on a category a feed fills: nobody starts a thread
@@ -1323,6 +1328,10 @@ an article elsewhere that pointed at it still says so. Its replies stay
 where they are: a tombstone in the middle of a thread is what keeps the
 conversation legible, and dropping it would reparent four replies onto
 nothing.
+
+An article posted signed carries `"signed"`, its detached form as it
+was posted (§9.5), in `news_article`, `news_thread` and `news_threads`;
+a search hit does not, and a deleted article loses it with its body.
 
 ### 9.3 Events: your copy is stale
 
@@ -1442,6 +1451,37 @@ Two differences from `/media`, both following from §7.1:
   when the caller staged it and has not posted it yet. A tombstoned
   article's attachments stop resolving at once, which is what makes
   `news_delete` a real deletion on every wire.
+
+### 9.5 Signed articles
+
+With the `signed` capability ([e2e-messages.md](e2e-messages.md) §4.6),
+`news_post` takes `signed`, base64url of the article's detached form
+(§3.4 there), whose subject and body are the request's own. The
+frontend checks it as that document's §4.10 and §4.11 say, and the
+domain checks what only the store can answer: the category's guid
+against the map's `in.category`, and the parent's own signature against
+its `parent.id` and `parent.by`. Signed text is refused rather than cut
+or cleaned, so a signed subject that the domain's cleaning would change,
+one with a tab or a space at either end, is `bad_request`.
+
+**Node guids are never shared.** A signed article names its category by
+guid, so two nodes with one guid could show an article where it was not
+posted. `create_node` refuses a guid another node holds, in both stores
+(schema version 25's unique index on `news_node (guid)`). The domain
+draws guids at random; an importer (§12.6) keeps a tree's own only where
+none is shared.
+
+**The index of signed articles.** Schema version 25 adds `signed`,
+`signed_content`, `signed_by` and `signed_id` to `news_article`: the
+form, the SHA-256 of what it says, its signer's fingerprint and its id,
+with a unique index on `(signed_by, signed_id)`. A post under a pair the
+index holds is answered with that article's id when it says the same,
+signed again or not, and refused `bad_signature` otherwise, under the
+post serial so that two posts cannot both miss it. A tombstone clears
+the four columns with the body, so the index does not reach a deleted
+article, and a moderator's delete moves the form into the audit row
+beside the article's words (§11). The legacy binding (§12) serves a
+signed article's text as it serves any article's.
 
 ## 10. Subscriptions and push notifications
 
@@ -2649,7 +2689,8 @@ unlinked and its hash remembered.
   answer, not a protocol one. Markdown makes it more tempting — a typo
   in a table is very visible — and an edit would have to re-render, re-
   extract references and re-index, which is three more reasons to decide
-  it deliberately.
+  it deliberately. A signed article could change only with a new signed
+  form (§9.5).
 - **The markdown dialect is a compatibility surface.** Once clients
   render it, changing what the server accepts or how it downgrades
   changes what old articles look like. Pinning the dialect in this

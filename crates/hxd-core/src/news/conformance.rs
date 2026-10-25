@@ -15,9 +15,9 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    ArticleId, Author, AutoFollow, BodyType, CompiledQuery, FeedId, FeedPoll, FeedPost, GuestKey,
-    GuestKeyer, NewNode, NewPost, NewsError, NewsStore, NewsUsage, NodeId, NodeKind, Posted,
-    SearchOrder, SearchQuery, SeenItem, SubScope, TextLen, ThreadQuery, Writer,
+    ArticleId, ArticleSignature, Author, AutoFollow, BodyType, CompiledQuery, FeedId, FeedPoll,
+    FeedPost, GuestKey, GuestKeyer, NewNode, NewPost, NewsError, NewsStore, NewsUsage, NodeId,
+    NodeKind, Posted, SearchOrder, SearchQuery, SeenItem, SubScope, TextLen, ThreadQuery, Writer,
 };
 use crate::inbox::Mailbox;
 
@@ -28,6 +28,8 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_name_is_unique_among_its_siblings_only(&*new_store());
     containment_is_the_legacy_wires(&*new_store());
     nodes_nest_no_deeper_than_allowed(&*new_store());
+    a_guid_is_never_given_twice(&*new_store());
+    a_signed_article_is_found_by_its_signer_until_it_is_deleted(&*new_store());
     an_article_round_trips_whole(&*new_store());
     a_thread_comes_back_in_preorder(&*new_store());
     a_reply_stays_in_its_parents_category_and_depth(&*new_store());
@@ -118,6 +120,7 @@ fn corpus(s: &dyn NewsStore) -> Corpus {
                 guest: None,
                 attachment_cutoff: t(0),
                 feed: None,
+                signed: None,
             },
             32,
             32,
@@ -875,13 +878,23 @@ fn alice() -> Author {
     }
 }
 
+/// A guid of its own for each name under each parent, as a store keeps
+/// them: the parent's id, then the name's first bytes.
+fn guid_of(parent: Option<NodeId>, name: &str) -> [u8; 16] {
+    let mut guid = [0; 16];
+    guid[..8].copy_from_slice(&parent.unwrap_or(u64::MAX).to_be_bytes());
+    let name = &name.as_bytes()[..name.len().min(8)];
+    guid[8..8 + name.len()].copy_from_slice(name);
+    guid
+}
+
 fn node(s: &dyn NewsStore, parent: Option<NodeId>, kind: NodeKind, name: &str) -> NodeId {
     s.create_node(
         &NewNode {
             parent,
             kind,
             name: name.into(),
-            guid: [name.len() as u8; 16],
+            guid: guid_of(parent, name),
             at: t(50),
         },
         16,
@@ -911,6 +924,7 @@ fn new_post(category: NodeId, parent: Option<ArticleId>, body: &str, at: u64) ->
         guest: None,
         attachment_cutoff: t(0),
         feed: None,
+        signed: None,
     }
 }
 
@@ -1004,7 +1018,11 @@ fn nodes_nest_and_list_by_name(s: &dyn NewsStore) {
     assert_eq!(p.kind, NodeKind::Bundle);
     assert_eq!(p.parent, None);
     assert_eq!(p.children, 1, "a bundle counts its sub-nodes");
-    assert_eq!(p.guid, [8u8; 16], "the guid is the one it was made with");
+    assert_eq!(
+        p.guid,
+        guid_of(None, "Projects"),
+        "the guid is the one it was made with"
+    );
     assert_eq!((p.add_sn, p.delete_sn), (1, 1));
     assert_eq!(p.created_at, t(50));
 
@@ -1081,7 +1099,7 @@ fn nodes_nest_no_deeper_than_allowed(s: &dyn NewsStore) {
                 parent,
                 kind: NodeKind::Bundle,
                 name: name.into(),
-                guid: [0; 16],
+                guid: guid_of(parent, name),
                 at: t(1),
             },
             2,
@@ -1090,6 +1108,54 @@ fn nodes_nest_no_deeper_than_allowed(s: &dyn NewsStore) {
     let one = deep(None, "one").unwrap();
     let two = deep(Some(one.id), "two").unwrap();
     assert_eq!(deep(Some(two.id), "three"), Err(NewsError::TooDeep));
+}
+
+/// A signed article names its category by guid
+/// (`docs/e2e-messages.md` §4.10).
+fn a_guid_is_never_given_twice(s: &dyn NewsStore) {
+    let first = node(s, None, NodeKind::Category, "General");
+    let guid = s.node(first).unwrap().unwrap().guid;
+    let twin = NewNode {
+        parent: None,
+        kind: NodeKind::Category,
+        name: "Other".into(),
+        guid,
+        at: t(1),
+    };
+    assert!(matches!(s.create_node(&twin, 16), Err(NewsError::Store(_))));
+    assert_eq!(s.nodes(None).unwrap().len(), 1);
+}
+
+fn a_signed_article_is_found_by_its_signer_until_it_is_deleted(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let signature = ArticleSignature {
+        form: vec![0xa8, 1, 2, 3],
+        content: [9; 32],
+        signer: [7; 32],
+        id: [5; 16],
+    };
+    let id = s
+        .post(
+            &NewPost {
+                signed: Some(signature.clone()),
+                ..new_post(cat, None, "signed", 1)
+            },
+            32,
+            32,
+        )
+        .unwrap()
+        .id;
+    s.post(&new_post(cat, None, "unsigned", 2), 32, 32).unwrap();
+    assert_eq!(s.article(id).unwrap().unwrap().signed, Some(signature));
+    assert_eq!(
+        s.find_signed(&[7; 32], &[5; 16]).unwrap(),
+        Some((id, [9; 32]))
+    );
+    assert_eq!(s.find_signed(&[8; 32], &[5; 16]).unwrap(), None);
+    assert_eq!(s.find_signed(&[7; 32], &[6; 16]).unwrap(), None);
+    s.tombstone(id, "mod", t(3)).unwrap();
+    assert_eq!(s.article(id).unwrap().unwrap().signed, None);
+    assert_eq!(s.find_signed(&[7; 32], &[5; 16]).unwrap(), None);
 }
 
 fn an_article_round_trips_whole(s: &dyn NewsStore) {

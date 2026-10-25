@@ -271,6 +271,12 @@ pub trait ChatLog: Send + Sync + 'static {
         signer: &[u8; 32],
         guid: &MessageGuid,
     ) -> Result<Option<SignedAt>, StoreError>;
+    /// Each room's `signed` mark as kept beside its log
+    /// (`docs/e2e-messages.md` §4.8), which a rooms file must agree with.
+    fn room_marks(&self) -> Result<std::collections::HashMap<u32, bool>, StoreError>;
+    fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError>;
+    /// Does `channel` hold a line that is neither signed nor a tombstone?
+    fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError>;
 }
 
 #[derive(Default)]
@@ -285,6 +291,7 @@ struct MemoryInner {
     ghosts: std::collections::HashMap<LineId, [u8; 16]>,
     guids: std::collections::HashMap<(u32, String, MessageGuid), LineId>,
     signed: std::collections::HashMap<([u8; 32], MessageGuid), SignedAt>,
+    marks: std::collections::HashMap<u32, bool>,
 }
 
 impl MemoryInner {
@@ -516,6 +523,21 @@ impl ChatLog for MemoryLog {
         let key = (*signer, guid.clone());
         Ok(self.inner.lock().unwrap().signed.get(&key).copied())
     }
+
+    fn room_marks(&self) -> Result<std::collections::HashMap<u32, bool>, StoreError> {
+        Ok(self.inner.lock().unwrap().marks.clone())
+    }
+
+    fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError> {
+        self.inner.lock().unwrap().marks.insert(room, signed);
+        Ok(())
+    }
+
+    fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
+        Ok(self.inner.lock().unwrap().lines.iter().any(|l| {
+            l.channel == channel && l.signed.is_none() && !l.flags.contains(LineFlags::DELETED)
+        }))
+    }
 }
 
 pub mod conformance {
@@ -557,6 +579,35 @@ pub mod conformance {
         channels_are_listed_and_deleted_whole(new_log());
         a_line_is_found_by_its_guid_once(new_log());
         a_signed_line_is_found_by_its_signer_in_any_channel(new_log());
+        a_rooms_mark_is_kept_and_its_unsigned_lines_are_found(new_log());
+    }
+
+    /// What a room that requires signing is held to across restarts
+    /// (`docs/e2e-messages.md` §4.8): its mark, and whether its log holds
+    /// a line that is neither signed nor a tombstone.
+    fn a_rooms_mark_is_kept_and_its_unsigned_lines_are_found(log: Box<dyn ChatLog>) {
+        assert!(log.room_marks().unwrap().is_empty());
+        log.set_room_mark(7, false).unwrap();
+        log.set_room_mark(8, true).unwrap();
+        log.set_room_mark(7, true).unwrap();
+        let marks = log.room_marks().unwrap();
+        assert_eq!(marks, [(7, true), (8, true)].into_iter().collect());
+        let signed = Signature {
+            form: vec![0xa5],
+            content: [1; 32],
+        };
+        log.append(&NewLine {
+            signed: Some(signed),
+            ..in_channel(1, 7)
+        })
+        .unwrap();
+        assert!(!log.holds_unsigned(7).unwrap(), "a signed line");
+        let unsigned = log.append(&in_channel(2, 7)).unwrap();
+        assert!(log.holds_unsigned(7).unwrap());
+        assert!(!log.holds_unsigned(8).unwrap(), "another channel's");
+        log.tombstone(unsigned, "mod", SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(!log.holds_unsigned(7).unwrap(), "a tombstone");
     }
 
     /// A signed line keeps its form and is found by its signer and guid,
