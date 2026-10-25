@@ -691,6 +691,143 @@ async fn an_operators_edits_reach_the_rooms_aware() {
     }
 }
 
+/// One reload that takes a room from several members at once: each is
+/// told once that it was parted and nothing of the others, and the
+/// member who stays hears one part for each.
+#[tokio::test]
+async fn a_reload_parting_many_tells_each_of_them_once() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_with_core(td.path()).await;
+    let (mut boss, _) = login(addr, "boss").await;
+    let lounge = create(&mut boss, json!({ "name": "lounge" })).await;
+    let mut losing = Vec::new();
+    for who in ["alice", "bob", "eve"] {
+        let (mut c, _) = login(addr, who).await;
+        ok(&mut c, "room_join", json!({ "room": lounge })).await;
+        losing.push(c);
+    }
+    let (mut dave, _) = login(addr, "dave").await;
+    ok(&mut dave, "room_join", json!({ "room": lounge })).await;
+    for c in losing.iter_mut().chain([&mut dave]) {
+        sent(c).await;
+    }
+
+    let accounts = td.path().join("accounts");
+    for who in ["alice", "bob", "eve"] {
+        std::fs::write(
+            accounts.join(format!("{who}.toml")),
+            format!("name = \"{who}\"\npassword = \"pw\"\n[access]\nsend_chat = true\n"),
+        )
+        .unwrap();
+    }
+    core.reload_accounts();
+    let parts = |events: Vec<hxd_testclient::ng::Event>| -> Vec<Value> {
+        events
+            .into_iter()
+            .filter(|e| e.ev == "room_member_parted")
+            .map(|e| e.data)
+            .collect()
+    };
+    for c in &mut losing {
+        let uid = c.uid;
+        assert_eq!(
+            parts(sent(c).await),
+            [json!({ "room": lounge, "uid": uid, "reason": "access" })]
+        );
+    }
+    let mut heard: Vec<u64> = parts(sent(&mut dave).await)
+        .iter()
+        .map(|d| d["uid"].as_u64().unwrap())
+        .collect();
+    heard.sort_unstable();
+    let mut expected: Vec<u64> = losing.iter().map(|c| c.uid.unwrap()).collect();
+    expected.sort_unstable();
+    assert_eq!(heard, expected);
+    for c in losing.iter().chain([&dave]) {
+        no_seq_faults(c);
+    }
+}
+
+/// The operator moves room management and moderation: boss stops
+/// managing rooms, carol stops moderating, and dave starts doing both.
+fn reassign(dir: &Path) {
+    let write = |login: &str, access: &str, extra: &str| {
+        std::fs::write(
+            dir.join("accounts").join(format!("{login}.toml")),
+            format!(
+                "name = \"{login}\"\npassword = \"pw\"\n[access]\n{MEMBER}{access}[extra]\n{extra}"
+            ),
+        )
+        .unwrap();
+    };
+    write("boss", "", "set_subject = true\n");
+    write("carol", "disconnect_users = true\n", "moderate = false\n");
+    write("dave", "", "manage_rooms = true\nmoderate = true\n");
+}
+
+/// `manage_rooms` and `moderate` are no access bits, so
+/// `account_changed` says them beside the bits: a session made a manager
+/// or a moderator by a reload is told so, and one that stops being one
+/// is told by their absence.
+#[tokio::test]
+async fn a_reload_tells_a_session_it_manages_or_moderates_or_no_longer_does() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_with_core(td.path()).await;
+    let (mut boss, hello) = login(addr, "boss").await;
+    assert_eq!(hello["self"]["manage_rooms"], true);
+    let (mut carol, hello) = login(addr, "carol").await;
+    assert_eq!(hello["self"]["moderator"], true);
+    let (mut dave, _) = login(addr, "dave").await;
+
+    reassign(td.path());
+    core.reload_accounts();
+    for c in [&mut boss, &mut carol] {
+        let told = c.event("account_changed").await.unwrap().data;
+        assert!(told.get("manage_rooms").is_none(), "{told}");
+        assert!(told.get("moderator").is_none(), "{told}");
+    }
+    let told = dave.event("account_changed").await.unwrap().data;
+    assert_eq!(told["manage_rooms"], true, "{told}");
+    assert_eq!(told["moderator"], true, "{told}");
+    for c in [&boss, &carol, &dave] {
+        no_seq_faults(c);
+    }
+}
+
+/// What a reload changed while a session was away, in a gap that
+/// swallowed its `account_changed`, `sync` says again.
+#[tokio::test]
+async fn sync_repeats_management_and_moderation_a_gap_swallowed() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_with_core(td.path()).await;
+    let mut away = Vec::new();
+    for who in ["boss", "dave"] {
+        let (mut c, _) = login(addr, who).await;
+        sent(&mut c).await;
+        away.push((c.session.clone().unwrap(), c.rx.last_seq));
+        c.close().await.unwrap();
+    }
+    // More than a detached session's buffer holds.
+    let (mut bob, _) = login(addr, "bob").await;
+    for i in 0..600 {
+        bob.chat(&format!("{i}")).await.unwrap();
+    }
+    reassign(td.path());
+    core.reload_accounts();
+
+    let mut synced = Vec::new();
+    for (session, last_seq) in away {
+        let (mut c, resumed) = Client::resume(addr, session, last_seq, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(resumed, Resumed::ResyncRequired);
+        synced.push(c.sync().await.unwrap()["accounts"].clone());
+    }
+    assert!(synced[0].get("manage_rooms").is_none(), "{}", synced[0]);
+    assert_eq!(synced[1]["manage_rooms"], true, "{}", synced[1]);
+    assert_eq!(synced[1]["moderator"], true, "{}", synced[1]);
+}
+
 /// Awareness is the session's: one that asked about rooms and is in
 /// none is still told of a new room after a resume.
 #[tokio::test]

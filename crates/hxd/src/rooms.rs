@@ -185,7 +185,7 @@ hxd [--config …] room create <name> [--topic T] [--read LOGIN,…] [--post LOG
 [--max-lines N|default] [--max-days N|default]\n  \
 hxd [--config …] room edit <name> [--name NEW] [the same flags as create]\n  \
 hxd [--config …] room archive|unarchive <name>\n  \
-hxd [--config …] room delete <name> --purge";
+hxd [--config …] room delete <name> --purge [--reason R]";
 
 const HEADER: &str = "# Rooms on this server (docs/chat-rooms.md). `hxd room` and room\n\
 # managers edit this file; an entry without an id is given one by the\n\
@@ -384,7 +384,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
     let store = FileRooms::new(&config.rooms.file);
     let mut words = Vec::new();
     let mut edit = RoomEdit::default();
-    let (mut archived, mut purge) = (false, false);
+    let (mut archived, mut purge, mut reason) = (false, false, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or(format!("{arg} needs a value"));
@@ -407,6 +407,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
         match arg.as_str() {
             "--archived" => archived = true,
             "--purge" => purge = true,
+            "--reason" => reason = Some(value()?.clone()),
             "--name" => edit.name = Some(value()?.clone()),
             "--topic" => edit.topic = Some(value()?.clone()),
             "--read" => edit.read = Some(entries(value()?)),
@@ -421,6 +422,10 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
         }
     }
     let editing = edit != RoomEdit::default();
+    // Only a delete is an act with a reason, and only a delete purges.
+    if reason.is_some() && !purge {
+        return Err(USAGE.into());
+    }
     let file = store.load().map_err(|e| e.to_string())?;
     let find = |name: &str| {
         file.rooms
@@ -492,10 +497,22 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
                     config.rooms.file.display()
                 ));
             }
-            put(&Room::tombstone(room.id))?;
+            let why = reason.as_deref().unwrap_or_default();
+            let recorded = crate::moderation::room_delete(config, room.id, &room.name, why)?;
+            let again = if recorded {
+                "; the moderation log records the delete already: run it again"
+            } else {
+                ""
+            };
+            put(&Room::tombstone(room.id)).map_err(|e| format!("{e}{again}"))?;
+            let logged = if recorded {
+                ""
+            } else {
+                " The moderation log does not record it: there is no database to keep it in."
+            };
             Ok(format!(
                 "deleted #{name} (id {}); {sighup}, parting its members and then \
-                 deleting its lines",
+                 deleting its lines.{logged}",
                 room.id
             ))
         }
@@ -651,6 +668,42 @@ mod tests {
         assert_eq!(
             FileRooms::new(&config.rooms.file).load().unwrap().rooms,
             [Room::tombstone(id)]
+        );
+    }
+
+    /// A delete is a moderation act, recorded with its reason before the
+    /// tombstone is written, where `hxd moderation log` reads it.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_delete_is_in_the_moderation_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.rooms.file = dir.path().join("rooms.toml");
+        config.paths.accounts = dir.path().join("accounts");
+        config.roles.file = dir.path().join("roles.toml");
+        let db = dir.path().join("hx.db");
+        hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal).unwrap();
+        config.history = Some(toml::from_str(&format!("db = {db:?}")).unwrap());
+        let run = |words: &str| {
+            let args: Vec<String> = words.split(' ').map(String::from).collect();
+            command(&config, &args)
+        };
+        run("create lounge").unwrap();
+        Core::new()
+            .with_rooms(
+                Arc::new(FileRooms::new(&config.rooms.file)),
+                RoomPolicy::default(),
+            )
+            .unwrap();
+        let id = FileRooms::new(&config.rooms.file).load().unwrap().rooms[0].id;
+        assert!(run("archive lounge --reason spam").is_err());
+        run("delete lounge --purge --reason spam").unwrap();
+        let log = crate::moderation::log(&config, 10).unwrap();
+        assert!(
+            log.contains(&format!(
+                "room_delete by cli: room {id}  — spam\n    #lounge"
+            )),
+            "{log}"
         );
     }
 }

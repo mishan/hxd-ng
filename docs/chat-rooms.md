@@ -206,8 +206,10 @@ cheaper than to everyone who could be.
   is still not reused, and the server that loads the tombstone parts
   the room's members and then deletes its lines when there is a log.
   The moderation table records it, with a room target and a
-  room-delete kind it gains for the purpose (§11); R1's command does
-  not record it yet. An entry no server has loaded has no id and no
+  room-delete kind it gains for the purpose (§11), before the
+  tombstone is written: `hxd room delete <name> --purge [--reason R]`
+  writes the row where there is a database to keep it in, with the
+  room's name as its evidence. An entry no server has loaded has no id and no
   lines, and is deleted by taking it out of the file.
 
 There is no room a user can create. A user who wants a conversation
@@ -642,7 +644,9 @@ may send there. `secure` is present and true on a secure room (§5.1),
 here and in every room object, so a client on a connection it would
 refuse can say so before a join. `max_lines` and `max_days` are
 present when the room has a retention of its own (§3). `self` gains
-`"manage_rooms": true` when it is.
+`"manage_rooms": true` when it is, and so do `account_changed` and
+`sync`'s `accounts` block, which a session that stops being one
+receives without it (account-admin.md §5.4).
 
 `last_id` lets a client that keeps its own read cursor per room badge
 the rooms it has not joined. **It is not pushed:** nothing is sent
@@ -867,7 +871,8 @@ Parting a room parts its voice room, as parting a private chat does.
   marker and `/join` error.
 - **voice.md** §2: a room's voice rule (§9).
 - **inline-media.md** §5: a secure room's handle (§5.1).
-- **account-admin.md** §1 and **access-bits.md** §4: `manage_rooms`.
+- **account-admin.md** §1 and **access-bits.md** §4: `manage_rooms`;
+  account-admin.md §5.4: `manage_rooms` on `account_changed`.
 - **AGENTS.md**: the public-chat invariant (§10).
 
 ## 12. Configuration

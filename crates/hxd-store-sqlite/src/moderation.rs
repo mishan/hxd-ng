@@ -52,7 +52,7 @@ fn hash(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, StoreError> {
 
 const ACT_COLUMNS: &str = "id, kind, actor, actor_fp, target_line, target_media, \
                            target_article, target_report, target_login, target_fp, \
-                           reason, evidence, media_hash, at";
+                           reason, evidence, media_hash, at, target_room";
 
 fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -69,6 +69,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     let evidence: Option<String> = r.get(11)?;
     let media_hash: Option<Vec<u8>> = r.get(12)?;
     let at: i64 = r.get(13)?;
+    let room: Option<i64> = r.get(14)?;
     Ok((|| {
         Ok(Act {
             id: id_of(id, "act id")?,
@@ -85,6 +86,12 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
                 })
                 .transpose()?,
             report: report.map(|n| id_of(n, "report id")).transpose()?,
+            room: room
+                .map(|n| {
+                    u32::try_from(n)
+                        .map_err(|_| StoreError::new(format!("stored room {n} is not an id")))
+                })
+                .transpose()?,
             login,
             fingerprint: fp(target_fp)?,
             reason,
@@ -210,8 +217,9 @@ impl ModerationStore for SqliteStore {
         sql(conn.execute(
             "INSERT INTO moderation
                (kind, actor, actor_fp, target_line, target_media, target_article,
-                target_report, target_login, target_fp, reason, evidence, media_hash, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                target_report, target_login, target_fp, reason, evidence, media_hash, at,
+                target_room)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 act.kind.as_i64(),
                 act.actor,
@@ -226,6 +234,7 @@ impl ModerationStore for SqliteStore {
                 act.evidence,
                 act.media_hash.map(|h| h.to_vec()),
                 unix(act.at),
+                act.room.map(i64::from),
             ],
         ))?;
         id_of(conn.last_insert_rowid(), "act id")
@@ -410,8 +419,12 @@ impl ModerationStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
             "UPDATE moderation SET evidence = ''
-              WHERE at < ?1 AND kind != ?2 AND evidence IS NOT NULL AND evidence != ''",
-            params![unix(before), ActKind::Close.as_i64()],
+              WHERE at < ?1 AND kind NOT IN (?2, ?3) AND evidence IS NOT NULL AND evidence != ''",
+            params![
+                unix(before),
+                ActKind::Close.as_i64(),
+                ActKind::RoomDelete.as_i64()
+            ],
         ))
     }
 

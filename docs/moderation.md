@@ -74,7 +74,9 @@ may.
 It is `[extra]` and not an access bit for the reason hotline-ng-rationale.md §4/D5
 gives: server-local policy that never crosses the wire as a bit. It does
 cross the ng wire as a fact — the login reply's `self` gains
-`"moderator": true` so a client can show the controls — which is a
+`"moderator": true` so a client can show the controls, and so do
+`account_changed` and `sync`'s `accounts` block, so a session that
+stops being one hides them (account-admin.md §5.4) — which is a
 statement about this session, not a bitmap position anyone else has to
 agree on.
 
@@ -490,7 +492,7 @@ went by, and the sweeper's two partial indexes:
 ```sql
 CREATE TABLE moderation (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete (| vouched_banned, with vouching)
+  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete | ban | unban | room_delete (| vouched_banned, with vouching)
   actor        TEXT    NOT NULL,        -- login, or 'cli'
   actor_fp     TEXT,
   target_line  INTEGER,
@@ -568,6 +570,16 @@ The `vouched_by` columns sketched above are not in either version: a
 column nothing writes is one a later build has to guess at, and they
 land with vouching.
 
+Version 23 added a room as a target, for a room's deletion
+(chat-rooms.md §2.4), whose entry in the rooms file keeps only its id:
+
+```sql
+ALTER TABLE moderation ADD COLUMN target_room INTEGER;
+```
+
+A room delete's evidence is the room's name, the operator's and not
+anything a user wrote, so the sweeper keeps it as it keeps a close's.
+
 `chat_line` gains `deleted_by TEXT`; the audit row is the record, the
 column is the fast answer.
 
@@ -587,6 +599,7 @@ hxd media revoke <handle-or-prefix> --reason "…" [--no-block]
 hxd purge <login> [--fingerprint FP] [--since 1h] --reason "…" [--dry-run]
 hxd reports [--all] | hxd reports close <id> --outcome dismissed|duplicate [--note "…"] [--of <id>]
 hxd moderation log [--limit N]
+hxd room delete <name> --purge [--reason "…"]
 hxd ban add <address[/prefix]|login:NAME|identity:FP|*@HOST> --reason "…" [--for 7d|all] [--note "…"]
 hxd ban list [--all] | hxd ban lift <id>
 ```

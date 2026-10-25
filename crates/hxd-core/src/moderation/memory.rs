@@ -161,7 +161,7 @@ impl ModerationStore for MemoryModeration {
         for act in inner
             .acts
             .iter_mut()
-            .filter(|a| a.at < before && a.kind != ActKind::Close)
+            .filter(|a| a.at < before && !matches!(a.kind, ActKind::Close | ActKind::RoomDelete))
         {
             if act.evidence.as_deref().is_some_and(|e| !e.is_empty()) {
                 act.evidence = Some(String::new());

@@ -187,10 +187,17 @@ the server.
 
 | `ev` | `data` | Sent when |
 |---|---|---|
-| `account_changed` | `{ "access", "raw_bits" }` (§5.1) | An administrator changed the account this session is logged in as (§3). |
+| `account_changed` | `{ "access", "raw_bits", "manage_rooms"?, "moderator"? }` (§5.1) | An administrator changed the account this session is logged in as (§3). |
 
-The `sync` reply carries the §5.1 block too (hotline-ng.md §6.3), since
-an `account_changed` may have been lost in the gap it recovers from.
+`manage_rooms` is present and true when the session may manage rooms,
+on a server that keeps rooms (chat-rooms.md §7.1), and `moderator` when
+it moderates (moderation.md §2): the login reply's `self` says the
+same. Neither is a bit, so a session that loses one is told by its
+absence.
+
+The `sync` reply carries the §5.1 block too (hotline-ng.md §6.3), with
+`manage_rooms` and `moderator` as here, since an `account_changed` may
+have been lost in the gap it recovers from.
 
 ## 6. The command line
 

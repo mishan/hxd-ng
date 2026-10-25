@@ -320,7 +320,7 @@ hxd room create trading --topic "Buy and sell" --post alice,bob --position 2
 hxd room edit trading --name market --max-days 30
 hxd room archive market            # hides it and parts its members, keeping its lines
 hxd room unarchive market
-hxd room delete market --purge     # leaves only its id; the server deletes its lines
+hxd room delete market --purge --reason "spam"   # leaves only its id; the server deletes its lines
 hxd room                           # every flag
 ```
 

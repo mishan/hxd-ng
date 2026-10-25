@@ -623,11 +623,14 @@ impl RosterInner {
             None => self.rooms.values().collect(),
         };
         let mut shown = Shown::new();
-        let sessions = self
-            .users
-            .iter()
-            .filter(|(uid, s)| s.rooms_aware && uids.is_none_or(|u| u.contains(uid)));
-        for (uid, sess) in sessions {
+        let sessions: Vec<(&Uid, &UserSession)> = match uids {
+            Some(uids) => uids
+                .iter()
+                .filter_map(|uid| self.users.get_key_value(uid))
+                .collect(),
+            None => self.users.iter().collect(),
+        };
+        for (uid, sess) in sessions.into_iter().filter(|(_, s)| s.rooms_aware) {
             for entry in entries.iter().filter(|e| listed(sess, &e.room)) {
                 shown.insert((*uid, entry.room.id), listed_as(sess, &entry.room));
             }
@@ -646,6 +649,12 @@ impl RosterInner {
         uids: Option<&[Uid]>,
     ) {
         let after = self.room_shown(rooms, uids);
+        let members: HashSet<(u32, Uid)> = self
+            .rooms
+            .iter()
+            .filter(|(id, _)| rooms.is_none_or(|ids| ids.contains(id)))
+            .flat_map(|(id, e)| e.members.iter().map(move |uid| (*id, *uid)))
+            .collect();
         let mut sends = Vec::new();
         for &(uid, room) in before.keys().filter(|k| !after.contains_key(k)) {
             sends.push((uid, Event::RoomRemoved { room }));
@@ -662,7 +671,7 @@ impl RosterInner {
                         topic: now.topic.clone(),
                         ..was.clone()
                     } == *now;
-                    if topic_only && entry.members.contains(&uid) {
+                    if topic_only && members.contains(&(room, uid)) {
                         continue;
                     }
                     false
@@ -750,6 +759,12 @@ impl Core {
                 sess.rooms_aware = true;
             }
         }
+    }
+
+    /// May this session manage rooms?
+    pub fn manages_rooms(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).is_some_and(|s| s.manage_rooms)
     }
 
     /// The newest line logged in `room`, 0 the lobby, where there is a log.
