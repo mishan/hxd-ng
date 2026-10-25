@@ -4,13 +4,17 @@
 //! back to the stated fields, the composed login verifies, and every
 //! reject fails with the named error.
 
+use hl_identity::message::{
+    Article, ChatLine, ChatScope, Context, Form, NewsScope, Object, Outcome, Parent,
+    PrivateMessage, Sender, Signed,
+};
 use hl_identity::registrar::{
     FREEZE_DOMAIN, RECORDS_DOMAIN, REGISTER_DOMAIN, REVOKE_ATTESTATION_DOMAIN,
     REVOKE_DEVICE_DOMAIN, REVOKE_IDENTITY_DOMAIN, ROTATE_DOMAIN,
 };
 use hl_identity::{
-    attestation, card, cert, enroll, proof, Attestation, AttestationRevocation, Bundle, Card,
-    DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Freeze, IdentityKey,
+    attestation, card, cert, enroll, message, proof, Attestation, AttestationRevocation, Bundle,
+    Card, DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Fingerprint, Freeze, IdentityKey,
     IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest, RegistrarKeys,
     Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
 };
@@ -705,4 +709,354 @@ fn record_list_vectors() {
     assert_eq!(list.fingerprint, Some(other.fingerprint().0));
     assert!(list.entries.is_empty());
     check_signed(e, RECORDS_DOMAIN, &k.reg.public(), &signed);
+}
+
+// --- Signed messages (e2e-messages.md §13) --------------------------------
+
+fn texts_of_if_any(e: &Json) -> Vec<String> {
+    if e["texts"].is_array() {
+        texts_of(e)
+    } else {
+        Vec::new()
+    }
+}
+
+fn texts_of(e: &Json) -> Vec<String> {
+    e["texts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing texts"))
+        .iter()
+        .map(|t| t.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A vector's texts as its object takes them, which fails here if the
+/// file gives the wrong number.
+fn texts_as<'a, T: Object>(texts: &'a [String]) -> T::Texts<'a>
+where
+    T::Texts<'a>: TryFrom<Vec<&'a str>>,
+{
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    texts
+        .try_into()
+        .ok()
+        .expect("as many texts as the object has text keys")
+}
+
+fn opt16(f: &Json, k: &str) -> Option<[u8; 16]> {
+    f[k].as_str().map(|s| unhex(s).try_into().unwrap())
+}
+
+fn at_of(v: &Json) -> u64 {
+    u64_of(&v["messages"], "at")
+}
+
+/// Every form of one signed object, held to the file byte for byte:
+/// the struct re-signs to `signed_hex`, it parses back to the struct,
+/// its detached and link forms are the published ones, and each
+/// reassembles to the whole map.
+fn check_message<T: Object + PartialEq + std::fmt::Debug>(v: &Json, name: &str, built: T)
+where
+    for<'a> T::Texts<'a>: TryFrom<Vec<&'a str>>,
+{
+    let k = keys(v);
+    let e = &v[name];
+    let at = at_of(v);
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(str_of(e, "domain"), T::DOMAIN, "{name}");
+    assert_eq!(built.sign(&k.dev).unwrap(), signed, "{name} re-signs");
+    check_signed(e, T::DOMAIN, &k.dev.public(), &signed);
+
+    let whole = Signed::<T>::parse(&signed, at).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(whole.message, built, "{name}");
+    assert_eq!(whole.signer(), k.id.fingerprint(), "{name}");
+
+    let texts = texts_of(e);
+    let texts = texts_as::<T>(&texts);
+    let detached = unhex(str_of(e, "detached_hex"));
+    assert_eq!(whole.detached().unwrap(), detached, "{name} detached");
+    let back = Signed::<T>::parse_detached(&detached, texts, at).unwrap();
+    assert_eq!(back.whole(), signed, "{name} reassembled");
+
+    if let Some(link) = e["link_hex"].as_str() {
+        let link = unhex(link);
+        assert_eq!(whole.link().unwrap(), link, "{name} link form");
+        let cert = unhex(str_of(&v["message_cert"], "signed_hex"));
+        let back = Signed::<T>::parse_link(&link, texts, &cert, at).unwrap();
+        assert_eq!(back.whole(), signed, "{name} restored from its link form");
+    }
+}
+
+fn chat_line_of(f: &Json) -> ChatLine {
+    ChatLine {
+        id: opt16(f, "id").unwrap(),
+        sent: u64_of(f, "sent"),
+        server: unhex32(str_of(&f["in"], "server")),
+        room: u64_of(&f["in"], "room"),
+        cert: unhex(str_of(f, "cert")),
+        text: str_of(f, "text").to_owned(),
+        act: f["act"].as_bool().unwrap_or(false),
+    }
+}
+
+fn private_message_of(f: &Json) -> PrivateMessage {
+    PrivateMessage {
+        id: opt16(f, "id").unwrap(),
+        sent: u64_of(f, "sent"),
+        to: Fingerprint(unhex32(str_of(f, "to"))),
+        cert: unhex(str_of(f, "cert")),
+        text: str_of(f, "text").to_owned(),
+        quote: f["quote"].as_str().map(str::to_owned),
+        auto: f["auto"].as_bool().unwrap_or(false),
+    }
+}
+
+fn parent_of(p: &Json) -> Option<Parent> {
+    if p.is_null() {
+        return None;
+    }
+    Some(Parent {
+        article: u64_of(p, "article"),
+        signed: opt16(p, "id").map(|id| (id, Fingerprint(unhex32(str_of(p, "by"))))),
+    })
+}
+
+fn article_of(f: &Json) -> Article {
+    Article {
+        id: opt16(f, "id").unwrap(),
+        sent: u64_of(f, "sent"),
+        server: unhex32(str_of(&f["in"], "server")),
+        category: opt16(&f["in"], "category").unwrap(),
+        parent: parent_of(&f["parent"]),
+        cert: unhex(str_of(f, "cert")),
+        subject: str_of(f, "subject").to_owned(),
+        body: str_of(f, "body").to_owned(),
+        mime: str_of(f, "mime").to_owned(),
+    }
+}
+
+#[test]
+fn message_cert_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["message_cert"];
+    let f = &e["fields"];
+    let dc = DeviceCert {
+        identity: unhex32(str_of(f, "identity")),
+        device: unhex32(str_of(f, "device")),
+        device_enc: unhex32(str_of(f, "device_enc")),
+        issued: u64_of(f, "issued"),
+        expires: u64_of(f, "expires"),
+        caps: f["caps"].as_u64(),
+        name: None,
+    };
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(dc.sign(&k.id), signed);
+    assert!(signed.len() <= message::CERT_MAX_BYTES);
+    check_signed(e, cert::DOMAIN, &k.id.public(), &signed);
+}
+
+#[test]
+fn message_vectors() {
+    let v = vectors();
+    assert_eq!(u64_of(&v["messages"], "skew"), message::SKEW);
+    for name in ["chat_lobby", "chat_room", "chat_action"] {
+        check_message(&v, name, chat_line_of(&v[name]["fields"]));
+    }
+    for name in ["private_message", "private_message_auto"] {
+        check_message(&v, name, private_message_of(&v[name]["fields"]));
+    }
+    for name in ["article_signed_parent", "article_unsigned_parent"] {
+        check_message(&v, name, article_of(&v[name]["fields"]));
+    }
+}
+
+#[test]
+fn canonical_text_vectors() {
+    let v = vectors();
+    for c in v["canonical_text"].as_array().unwrap() {
+        assert_eq!(
+            message::canonicalize(str_of(c, "input")),
+            str_of(c, "canonical"),
+            "{}",
+            str_of(c, "name")
+        );
+    }
+}
+
+fn read_as<T: Object>(v: &Json, r: &Json, scope: &T::Scope) -> Outcome
+where
+    for<'a> T::Texts<'a>: TryFrom<Vec<&'a str>>,
+{
+    let e = &v[str_of(r, "vector")];
+    let k = keys(v);
+    let sender = match str_of(r, "sender") {
+        "named" => Sender::Named(k.id.fingerprint()),
+        "other" => Sender::Named(key_of(v, "other").fingerprint()),
+        "certificate" => Sender::Certificate,
+        "unknown" => Sender::Unknown,
+        other => panic!("unknown sender {other}"),
+    };
+    let texts = texts_of(e);
+    let texts = texts_as::<T>(&texts);
+    let cert = r["cert"]
+        .as_str()
+        .map(|c| unhex(str_of(&v[c], "signed_hex")));
+    let (whole, detached, link) = (
+        unhex(str_of(e, "signed_hex")),
+        unhex(str_of(e, "detached_hex")),
+        e["link_hex"].as_str().map(unhex),
+    );
+    let form = match str_of(r, "form") {
+        "whole" => Form::Whole(&whole),
+        "detached" => Form::Detached {
+            bytes: &detached,
+            texts,
+        },
+        "link" => Form::Link {
+            bytes: link.as_deref().unwrap(),
+            texts,
+            cert: cert.as_deref(),
+        },
+        other => panic!("unknown form {other}"),
+    };
+    let ctx = Context {
+        at: r["at"].as_u64().unwrap_or_else(|| at_of(v)),
+        sender,
+        scope,
+    };
+    Signed::<T>::read(form, &ctx)
+}
+
+#[test]
+fn message_read_vectors() {
+    let v = vectors();
+    let signer = key_of(&v, "identity").fingerprint();
+    for r in v["message_reads"].as_array().unwrap() {
+        let name = str_of(r, "name");
+        let vector = str_of(r, "vector");
+        let s = &r["scope"];
+        let outcome = if vector.starts_with("chat_") {
+            let scope = ChatScope {
+                server: s["server"].as_str().map(unhex32),
+                room: u64_of(s, "room"),
+            };
+            read_as::<ChatLine>(&v, r, &scope)
+        } else if vector.starts_with("private_message") {
+            let reader = r["reader"]
+                .as_str()
+                .map(|fp| Fingerprint::parse(fp).unwrap());
+            read_as::<PrivateMessage>(&v, r, &reader)
+        } else {
+            let scope = NewsScope {
+                server: unhex32(str_of(s, "server")),
+                category: opt16(s, "category").unwrap(),
+                parent: parent_of(&s["parent"]),
+            };
+            read_as::<Article>(&v, r, &scope)
+        };
+        let apart = r["sent_apart"].as_bool().unwrap_or(false);
+        let state = match &outcome {
+            Outcome::Verified {
+                signer: s,
+                sent_apart,
+            } if *s == signer && *sent_apart == apart => "verified",
+            Outcome::Elsewhere {
+                signer: s,
+                sent_apart,
+            } if *s == signer && *sent_apart == apart => "elsewhere",
+            Outcome::Unverified { .. } => "unverified",
+            Outcome::Invalid(_) => "invalid",
+            other => panic!("{name}: another signer or sent_apart: {other:?}"),
+        };
+        assert_eq!(state, str_of(r, "expect"), "{name}: {outcome:?}");
+    }
+}
+
+#[test]
+fn message_cert_window_vectors() {
+    let v = vectors();
+    for c in v["cert_window"]["cases"].as_array().unwrap() {
+        let got = Signed::<ChatLine>::parse(&unhex(str_of(c, "signed_hex")), u64_of(c, "sent"))
+            .map(|s| (s.cert.issued, s.cert.expires));
+        let want = match str_of(c, "expect") {
+            "ok" => Ok((u64_of(c, "issued"), u64_of(c, "expires"))),
+            error => Err(error.to_owned()),
+        };
+        assert_eq!(
+            got.map_err(|e| format!("{e:?}")),
+            want,
+            "{}",
+            str_of(c, "name")
+        );
+    }
+}
+
+#[test]
+fn mixed_order_key_vectors() {
+    let v = vectors();
+    let m = &v["mixed_order_key"];
+    let device = unhex32(str_of(m, "device_hex"));
+    let at = at_of(&v);
+    let ok = Signed::<ChatLine>::parse(&unhex(str_of(&m["accepted"], "signed_hex")), at).unwrap();
+    assert_eq!(ok.cert.device, device);
+    assert_eq!(
+        ok.cert,
+        DeviceCert::parse(&unhex(str_of(&m["accepted"], "cert_hex"))).unwrap()
+    );
+    let bad = &m["rejected"];
+    assert_eq!(
+        DeviceCert::parse(&unhex(str_of(bad, "cert_hex")))
+            .unwrap()
+            .device,
+        device
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            Signed::<ChatLine>::parse(&unhex(str_of(bad, "signed_hex")), at).unwrap_err()
+        ),
+        str_of(bad, "error")
+    );
+}
+
+fn parse_message<T: Object>(r: &Json, bytes: &[u8], at: u64) -> Result<(), hl_identity::Error>
+where
+    for<'a> T::Texts<'a>: TryFrom<Vec<&'a str>>,
+{
+    let texts = texts_of_if_any(r);
+    match str_of(r, "form") {
+        "whole" => Signed::<T>::parse(bytes, at),
+        "detached" => Signed::<T>::parse_detached(bytes, texts_as::<T>(&texts), at),
+        "link" => Signed::<T>::parse_link(
+            bytes,
+            texts_as::<T>(&texts),
+            &unhex(str_of(r, "cert_hex")),
+            at,
+        ),
+        other => panic!("unknown form {other}"),
+    }
+    .map(drop)
+}
+
+#[test]
+fn message_rejects() {
+    let v = vectors();
+    let at = at_of(&v);
+    for r in v["message_rejects"].as_array().unwrap() {
+        let bytes = unhex(str_of(r, "hex"));
+        let result = match (str_of(r, "object"), str_of(r, "form")) {
+            ("chat_line", _) => parse_message::<ChatLine>(r, &bytes, at),
+            ("private_message", _) => parse_message::<PrivateMessage>(r, &bytes, at),
+            ("article", _) => parse_message::<Article>(r, &bytes, at),
+            ("padded_plaintext", form) => message::unpad(&bytes, form == "deniable").map(drop),
+            (other, _) => panic!("unknown object kind {other}"),
+        };
+        assert_eq!(
+            result.map_err(|e| format!("{e:?}")),
+            Err(str_of(r, "error").to_owned()),
+            "reject `{}`",
+            str_of(r, "name")
+        );
+    }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Hotline identity objects: keys, device certificates, user cards, attestations, login proofs"
+description = "Hotline identity objects: keys, device certificates, user cards, attestations, login proofs, signed messages"
 publish = false
 
 [dependencies]

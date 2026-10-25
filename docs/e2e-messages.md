@@ -1,15 +1,17 @@
 # Signed and sealed messages
 
-Status: draft, 2026-10. Nothing here is built. This is the end-to-end
-messaging document that `hotline-ng-identity.md` §3.3 names for the
-`device_enc` key, and the construction the server linking user keys
-draft leaves to it ("Sealed Messages in Link Private Message"); §5
+Status: draft, 2026-10. `hl-identity` has the signed objects of §3.1 to
+§3.5, their detached and link forms (§5) and the padding of §3.7, with
+§13's vectors for them; nothing else here is built. This is the
+end-to-end messaging document that `hotline-ng-identity.md` §3.3 names
+for the `device_enc` key, and the construction the server linking user
+keys draft leaves to it ("Sealed Messages in Link Private Message"); §5
 follows that draft's link wire, and §6 the messaging identity draft's
-classic one. It rests on the `server_challenge` and
-`[identity] hosts` of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s
-`chat_guid` (§4, §7.1, §7.3), and hl-identity's `verify_domain`, which
-refuses a key that does not re-encode to its own bytes (§3.1). Rotating
-the server key with a handover is left to a separate draft (§4.13).
+classic one. It rests on the `server_challenge` and `[identity] hosts`
+of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s `chat_guid` (§4, §7.1,
+§7.3), and hl-identity's `verify_domain`, which refuses a key that does
+not re-encode to its own bytes (§3.1). Rotating the server key with a
+handover is left to a separate draft (§4.13).
 
 A user who logs in with a key can **sign** what they write with their
 device's key, so that no server can write a line in their name or alter
@@ -1583,12 +1585,13 @@ device added after the mail was sent, which cannot read it.
 
 ## 13. Test vectors
 
-To come, beside `identity-test-vectors.json` and in its shape: `domain`,
-`fields`, `unsigned_hex`, `signature_input_hex`, `signature_hex` and
-`signed_hex` per object, signed by the file's device key under a new
-certificate from its identity key with `caps` 3 and no `name` (the
-file's `device_cert` has the `name` "browser"), and `rejects` entries
-naming the error each must fail with. They are:
+In `identity-test-vectors.json`, in its shape (`domain`, `fields`,
+`unsigned_hex`, `signature_input_hex`, `signature_hex` and `signed_hex`
+per object, signed by the file's device key under a new certificate
+from its identity key with `caps` 3 and no `name`, the file's
+`device_cert` having the `name` "browser", and `message_rejects`
+entries naming the error each must fail with); those of a sealed
+message and a deniable box come with sealing. They are:
 
 - a public line in the lobby, in a room, and as an action, each also as
   its detached form, and the lobby line and the action as their link
