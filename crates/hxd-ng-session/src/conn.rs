@@ -1471,6 +1471,12 @@ async fn handle_sync(
     state.access = ctx.core.access_of(state.uid).unwrap_or(state.access);
     if ctx.core.accounts_enabled() {
         ok["accounts"] = crate::accounts::access_json(state.access);
+        if ctx.core.rooms_enabled() && ctx.core.manages_rooms(state.uid) {
+            ok["accounts"]["manage_rooms"] = json!(true);
+        }
+        if ctx.core.is_moderator(state.uid) {
+            ok["accounts"]["moderator"] = json!(true);
+        }
     }
     // The rooms it is in and how far each has got, for a client to catch
     // up on each with `history` (docs/chat-rooms.md §7.4).

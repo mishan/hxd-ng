@@ -281,6 +281,25 @@ pub fn redact(config: &Config, id: u64, reason: &str) -> Result<(), String> {
         .map_err(refused)
 }
 
+/// The audit row for `hxd room delete`, where there is a database to
+/// keep it in: a server without one keeps its trail in memory, out of
+/// this process's reach. `false` when there is none, or none yet.
+#[cfg(feature = "inbox")]
+pub fn room_delete(config: &Config, room: u32, name: &str, reason: &str) -> Result<bool, String> {
+    if !db(config).is_some_and(|p| p.exists()) {
+        return Ok(false);
+    }
+    operator_core(config, false)?
+        .room_delete_record(Actor::Operator, room, name, reason)
+        .map_err(refused)?;
+    Ok(true)
+}
+
+#[cfg(not(feature = "inbox"))]
+pub fn room_delete(_: &Config, _: u32, _: &str, _: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
 /// `hxd media revoke`: images live in the running server's memory, and
 /// this process is not that server.
 pub fn media_revoke() -> Result<(), String> {
@@ -429,10 +448,15 @@ pub fn log(config: &Config, limit: usize) -> Result<String, String> {
             if let Some(report) = a.report {
                 target.push(format!("report #{report}"));
             }
+            if let Some(room) = a.room {
+                target.push(format!("room {room}"));
+            }
             if let Some(login) = &a.login {
                 target.push(format!("of {login}"));
             }
-            let why = if a.reason.is_empty() && a.kind == ActKind::NewsDelete {
+            let why = if a.reason.is_empty()
+                && matches!(a.kind, ActKind::NewsDelete | ActKind::RoomDelete)
+            {
                 "(no reason given)"
             } else {
                 a.reason.as_str()

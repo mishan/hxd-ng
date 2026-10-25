@@ -147,6 +147,9 @@ fn act_json(a: &Act) -> Value {
     if let Some(report) = a.report {
         target["report"] = json!(report);
     }
+    if let Some(room) = a.room {
+        target["room"] = json!(room);
+    }
     if let Some(login) = &a.login {
         target["login"] = json!(login);
     }

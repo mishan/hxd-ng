@@ -129,7 +129,8 @@ impl Core {
             }
             Ok(())
         })?;
-        self.end_account(&login.to_ascii_lowercase(), Some(uid));
+        let login = login.to_ascii_lowercase();
+        self.end_account(|l| l == login, Some(uid));
         Ok(())
     }
 
@@ -224,25 +225,34 @@ impl Core {
         };
         logins.sort();
         logins.dedup();
-        let (mut told, mut ended) = (0, 0);
+        let mut accounts = std::collections::HashMap::new();
+        let mut gone = std::collections::HashSet::new();
         // Read with the roster unlocked: the store is file I/O.
         for login in logins {
             match admin.read_account(&login) {
-                Ok(account) => told += self.apply_account(&account),
-                Err(AdminError::NoSuchAccount) => ended += self.end_account(&login, None),
+                Ok(account) => {
+                    accounts.insert(login, account);
+                }
+                Err(AdminError::NoSuchAccount) => {
+                    gone.insert(login);
+                }
                 Err(e) => tracing::warn!(login, "account reload skipped: {e}"),
             }
         }
-        (told, ended)
+        // Each step once for every session together, not once an
+        // account: each walks the roster or the rooms.
+        let ended = self.end_account(|l| gone.contains(l), None);
+        (self.apply_accounts(|l| accounts.get(l)), ended)
     }
 
-    /// Disconnect every session logged in as `login` but `keep`.
-    fn end_account(&self, login: &str, keep: Option<Uid>) -> usize {
+    /// Disconnect every session logged in as a login `gone` names but
+    /// `keep`.
+    fn end_account(&self, gone: impl Fn(&str) -> bool, keep: Option<Uid>) -> usize {
         let mut r = self.roster.lock().unwrap();
         let ended: Vec<Uid> = r
             .users
             .iter()
-            .filter(|(u, s)| Some(**u) != keep && !s.system && s.login == login)
+            .filter(|(u, s)| Some(**u) != keep && !s.system && gone(&s.login))
             .map(|(u, _)| *u)
             .collect();
         for target in &ended {
@@ -254,15 +264,21 @@ impl Core {
     /// Give every session logged in as `account` what it now says.
     /// Answers how many were told.
     pub(crate) fn apply_account(&self, account: &Account) -> usize {
+        self.apply_accounts(|l| (l == account.login).then_some(account))
+    }
+
+    /// Give every session whose login `account_of` answers that account.
+    fn apply_accounts<'a>(&self, account_of: impl Fn(&str) -> Option<&'a Account>) -> usize {
         let mut r = self.roster.lock().unwrap();
-        let uids: Vec<Uid> = r
+        let told: Vec<(Uid, &Account)> = r
             .users
             .iter()
-            .filter(|(_, s)| !s.system && s.login == account.login)
-            .map(|(u, _)| *u)
+            .filter(|(_, s)| !s.system)
+            .filter_map(|(u, s)| Some((*u, account_of(&s.login)?)))
             .collect();
+        let uids: Vec<Uid> = told.iter().map(|(u, _)| *u).collect();
         let listed_before = r.room_shown(None, Some(&uids));
-        for &uid in &uids {
+        for &(uid, account) in &told {
             give_account(&mut r, uid, account);
         }
         // What it may read may have narrowed (docs/chat-rooms.md §5).

@@ -72,7 +72,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -622,6 +622,12 @@ ALTER TABLE chat_line ADD COLUMN guid TEXT;
 ALTER TABLE chat_line ADD COLUMN guid_from TEXT;
 CREATE UNIQUE INDEX chat_line_guid ON chat_line (channel, guid_from, guid)
   WHERE guid IS NOT NULL;
+";
+
+/// A room as an act's target (`docs/moderation.md` §7): its deletion,
+/// which outlives the room's name in the rooms file.
+const SCHEMA_V23: &str = "
+ALTER TABLE moderation ADD COLUMN target_room INTEGER;
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1327,6 +1333,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 22 {
         steps.push_str(SCHEMA_V22);
+    }
+    if version < 23 {
+        steps.push_str(SCHEMA_V23);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

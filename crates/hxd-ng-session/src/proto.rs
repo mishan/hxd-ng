@@ -754,10 +754,18 @@ pub fn event_json(se: &SeqEvent) -> String {
             json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
         ),
         Event::Kicked => ("kicked", json!({})),
-        Event::AccountChanged(account) => (
-            "account_changed",
-            crate::accounts::access_json(account.access),
-        ),
+        Event::AccountChanged(account) => {
+            let mut data = crate::accounts::access_json(account.access);
+            // Not bits, so the bitmap cannot say they were lost; as the
+            // login reply's `self` says them (docs/account-admin.md §5.4).
+            if account.manage_rooms {
+                data["manage_rooms"] = json!(true);
+            }
+            if account.moderate {
+                data["moderator"] = json!(true);
+            }
+            ("account_changed", data)
+        }
         // A client blanks the line in place (moderation.md §5); history
         // already answers it as the tombstone.
         Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),

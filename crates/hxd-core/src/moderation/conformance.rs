@@ -17,7 +17,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn ModerationStore>) {
     closed_reports_age_out_and_ids_are_never_reused(&*new_store());
     blocks_are_a_set(&*new_store());
     a_reports_image_is_held_while_it_is_open(&*new_store());
-    a_close_keeps_its_outcome_through_the_scrub(&*new_store());
+    a_close_and_a_room_delete_keep_their_evidence_through_the_scrub(&*new_store());
     a_ban_round_trips_and_a_reban_extends_its_one_row(&*new_store());
     a_lifted_ban_stays_on_record_and_a_new_one_is_a_new_row(&*new_store());
     bans_list_standing_or_all_and_age_out(&*new_store());
@@ -40,6 +40,7 @@ fn act(kind: ActKind, at: u64) -> Act {
         media: Some([9; 16]),
         article: Some(51),
         report: Some(4),
+        room: Some(2754100983),
         login: Some("bob".into()),
         fingerprint: Some([2; 32]),
         reason: "spam".into(),
@@ -110,6 +111,7 @@ fn acts_round_trip_and_page_newest_first(s: &dyn ModerationStore) {
         media: None,
         article: None,
         report: None,
+        room: None,
         login: None,
         fingerprint: None,
         evidence: None,
@@ -281,16 +283,22 @@ fn a_reports_image_is_held_while_it_is_open(s: &dyn ModerationStore) {
     assert!(!s.holds_media(&[7; 16]).unwrap());
 }
 
-fn a_close_keeps_its_outcome_through_the_scrub(s: &dyn ModerationStore) {
+fn a_close_and_a_room_delete_keep_their_evidence_through_the_scrub(s: &dyn ModerationStore) {
     s.record(&Act {
         evidence: Some("dismissed".into()),
         ..act(ActKind::Close, 100)
     })
     .unwrap();
+    s.record(&Act {
+        evidence: Some("#lounge".into()),
+        ..act(ActKind::RoomDelete, 100)
+    })
+    .unwrap();
     s.record(&act(ActKind::NodeDelete, 100)).unwrap();
     assert_eq!(s.scrub_evidence(t(200)).unwrap(), 1);
     let all = s.acts(None, 10).unwrap();
-    assert_eq!(all[1].evidence.as_deref(), Some("dismissed"));
+    assert_eq!(all[2].evidence.as_deref(), Some("dismissed"));
+    assert_eq!(all[1].evidence.as_deref(), Some("#lounge"));
     assert_eq!(all[0].evidence.as_deref(), Some(""));
 }
 

@@ -123,6 +123,8 @@ pub enum ActKind {
     Ban,
     /// A ban lifted.
     Unban,
+    /// A room deleted, its lines with it (`docs/chat-rooms.md` §2.4).
+    RoomDelete,
 }
 
 impl ActKind {
@@ -136,6 +138,7 @@ impl ActKind {
             ActKind::NodeDelete => 6,
             ActKind::Ban => 7,
             ActKind::Unban => 8,
+            ActKind::RoomDelete => 9,
         }
     }
 
@@ -149,6 +152,7 @@ impl ActKind {
             6 => ActKind::NodeDelete,
             7 => ActKind::Ban,
             8 => ActKind::Unban,
+            9 => ActKind::RoomDelete,
             _ => return None,
         })
     }
@@ -163,6 +167,7 @@ impl ActKind {
             ActKind::NodeDelete => "news_node_delete",
             ActKind::Ban => "ban",
             ActKind::Unban => "unban",
+            ActKind::RoomDelete => "room_delete",
         }
     }
 }
@@ -179,6 +184,7 @@ pub struct Act {
     pub media: Option<Handle>,
     pub article: Option<ArticleId>,
     pub report: Option<ReportId>,
+    pub room: Option<u32>,
     /// Whose content it was.
     pub login: Option<String>,
     pub fingerprint: Option<[u8; 32]>,
@@ -201,6 +207,7 @@ impl Act {
             media: None,
             article: None,
             report: None,
+            room: None,
             login: None,
             fingerprint: None,
             reason,
@@ -480,8 +487,8 @@ pub trait ModerationStore: Send + Sync + 'static {
 
     /// Scrub the evidence of every act recorded before `before` to an
     /// empty string, leaving the rows (§3.1). Returns how many changed.
-    /// A close's evidence is its outcome, not anything removed, and is
-    /// kept.
+    /// A close's evidence is its outcome and a room delete's the room's
+    /// name, not anything a user wrote, and both are kept.
     fn scrub_evidence(&self, before: SystemTime) -> Result<usize, StoreError>;
     /// Delete reports closed before `before`. Returns how many went.
     fn prune_reports(&self, before: SystemTime) -> Result<usize, StoreError>;
@@ -913,6 +920,24 @@ impl Core {
     }
 
     // --- The acts (§3) ------------------------------------------------
+
+    /// Record a room's deletion (`docs/chat-rooms.md` §2.4), before its
+    /// tombstone is written: the server that loads the tombstone does
+    /// the rest, and the room's name is gone from the file by then.
+    pub fn room_delete_record(
+        &self,
+        by: Actor,
+        room: u32,
+        name: &str,
+        why: &str,
+    ) -> Result<ActId, ModError> {
+        let acting = self.acting(by)?;
+        let why = bounded(Some(why.into()), MAX_ACT_REASON, "That reason is too long.")?;
+        let mut act = Act::new(ActKind::RoomDelete, &acting, why.unwrap_or_default());
+        act.room = Some(room);
+        act.evidence = Some(format!("#{name}"));
+        Ok(self.moderation_store()?.record(&act)?)
+    }
 
     /// Redact a logged line (§3.1), the lobby's or a room's: the audit
     /// row takes its words, the log keeps its id and time, and every
