@@ -344,27 +344,33 @@ mod tests {
 
     #[test]
     fn small_order_keys_cannot_sign_for_everyone() {
-        // The neutral element with S = 0 verifies any message under the
-        // permissive equation, and its fingerprint would then be an
-        // identity shared by everyone who tried it.
-        let neutral = [0u8; 32];
-        let sig = [0u8; 64];
-        assert_eq!(
-            verify_domain(&neutral, "hl-identity/card/v1", b"anything", &sig),
-            Err(Error::InvalidKey)
-        );
-        assert_eq!(
-            verify_domain(&neutral, "hl-identity/card/v1", b"something else", &sig),
-            Err(Error::InvalidKey)
-        );
-        // The order-8 point with the low bit set decompresses fine and is
-        // still weak.
-        let mut order8 = [0u8; 32];
-        order8[0] = 0x01;
-        assert!(matches!(
-            verify_domain(&order8, "hl-identity/card/v1", b"x", &sig),
-            Err(Error::InvalidKey) | Err(Error::BadSignature)
-        ));
+        // The neutral element, with R the neutral element and S = 0,
+        // verifies any message under the permissive equation, and its
+        // fingerprint would then be an identity shared by everyone who
+        // tried it. The other small-order points do the same for a share
+        // of messages.
+        let mut neutral = [0u8; 32];
+        neutral[0] = 0x01;
+        let mut sig = [0u8; 64];
+        sig[0] = 0x01;
+        let order8 = [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x05,
+        ];
+        for (name, key) in [
+            ("neutral element", neutral),
+            ("all zero, of order 4", [0u8; 32]),
+            ("of order 8", order8),
+        ] {
+            for msg in [&b"anything"[..], b"something else"] {
+                assert_eq!(
+                    verify_domain(&key, "hl-identity/card/v1", msg, &sig),
+                    Err(Error::InvalidKey),
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]

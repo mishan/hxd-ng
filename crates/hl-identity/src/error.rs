@@ -42,6 +42,8 @@ pub enum Error {
     CapabilityMissing,
     /// The object exceeds its size limit.
     TooLarge,
+    /// A fetched certificate does not hash to the one a link form names.
+    CertMismatch,
 }
 
 impl fmt::Display for Error {
@@ -64,6 +66,7 @@ impl fmt::Display for Error {
                 write!(f, "device certificate lacks the required capability")
             }
             Error::TooLarge => write!(f, "object too large"),
+            Error::CertMismatch => write!(f, "certificate does not match"),
         }
     }
 }

@@ -242,6 +242,15 @@ pub fn decode_canonical(bytes: &[u8]) -> Result<Value, CborError> {
     Ok(v)
 }
 
+/// The length of the one item at the start of `bytes`, whatever follows
+/// it: a padded plaintext's map (`e2e-messages.md` §3.7). Whether the
+/// item is canonical is [`decode_canonical`]'s to say.
+pub(crate) fn item_len(bytes: &[u8]) -> Result<usize, CborError> {
+    let mut r = Reader { buf: bytes, pos: 0 };
+    r.item(0)?;
+    Ok(r.pos)
+}
+
 /// Sorted maps put duplicates side by side, so one pass over each map's
 /// adjacent key pairs finds them. Re-encoding alone can't: a duplicated
 /// key re-encodes to the same duplicated bytes.

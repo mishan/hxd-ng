@@ -1,11 +1,12 @@
 //! Hotline identity objects.
 //!
 //! The objects of `docs/hotline-ng-identity.md` §3, the login proof of
-//! `docs/hotline-ng-auth.md` §6.2 and the registrar's objects of
-//! `docs/identity-registrar.md` §4: keys, device certificates, user
-//! cards, registrar attestations, login proofs, and the requests, records
-//! and signed lists a registrar handles, with their deterministic CBOR
-//! encoding and domain-separated Ed25519 signatures. No HTTP, no sockets,
+//! `docs/hotline-ng-auth.md` §6.2, the registrar's objects of
+//! `docs/identity-registrar.md` §4 and the signed messages of
+//! `docs/e2e-messages.md` §3: keys, device certificates, user cards,
+//! registrar attestations, login proofs, the requests, records and
+//! signed lists a registrar handles, and signed messages, with their
+//! deterministic CBOR encoding and domain-separated Ed25519 signatures. No HTTP, no sockets,
 //! no storage — a server, a registrar, a proxy, a relay and a client all
 //! use this crate and nothing in it knows which one it is.
 //!
@@ -28,6 +29,7 @@ pub mod cert;
 pub mod enroll;
 mod error;
 pub mod keys;
+pub mod message;
 mod names;
 pub mod proof;
 pub mod registrar;
@@ -40,6 +42,7 @@ pub use cert::{caps, DeviceCert};
 pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
+pub use message::{Article, ChatLine, PrivateMessage, Signed};
 pub use proof::{LoginProof, ServerChallenge};
 pub use registrar::{
     AttestationRevocation, DeviceRevocation, Freeze, IdentityRevocation, ListKind, Record,
