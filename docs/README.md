@@ -59,6 +59,7 @@ to another project.
 | [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes | period and extended clients that speak HOPE | design |
 | [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less aliases and folder transfers on ng | all | design |
 | [ng-uploads.md](ng-uploads.md) — uploads on the ng wire: `files_upload`, pieces over HTTP, resume | yes, server | ng | design |
+| [attachments.md](attachments.md): files on chat lines and private messages, kept in the file area, and bound into signed messages | no | ng; period and extended see the name and fetch the file | design |
 | [file-sources.md](file-sources.md) — exploratory background for files | superseded | — | design |
 | [tracker-registration.md](tracker-registration.md) — HTRK v1/v3 server heartbeats, authentication and operator configuration | yes | server infrastructure | design; implements fogWraith specs |
 | [metrics.md](metrics.md) — `GET /metrics`: locks, the store, the blocking pool, fan-out, the wires, the roster's census | yes, behind the `metrics` feature | operators | design |
