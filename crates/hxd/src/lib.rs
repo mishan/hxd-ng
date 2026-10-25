@@ -124,6 +124,37 @@ pub struct Config {
     /// false`; the rooms themselves are in `[rooms] file`.
     #[serde(default)]
     pub rooms: rooms::RoomsSection,
+    /// What a detached session holds of sealed messages
+    /// (`docs/e2e-messages.md` §4.3).
+    #[serde(default)]
+    pub sealed: SealedSection,
+}
+
+/// `[sealed]`, in KiB.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedSection {
+    #[serde(default = "default_held_per_sender_kb")]
+    pub held_per_sender_kb: usize,
+    #[serde(default = "default_held_kb")]
+    pub held_kb: usize,
+}
+
+fn default_held_per_sender_kb() -> usize {
+    hxd_core::SealedHolds::default().per_sender / 1024
+}
+
+fn default_held_kb() -> usize {
+    hxd_core::SealedHolds::default().all / 1024
+}
+
+impl Default for SealedSection {
+    fn default() -> Self {
+        SealedSection {
+            held_per_sender_kb: default_held_per_sender_kb(),
+            held_kb: default_held_kb(),
+        }
+    }
 }
 
 /// `[hope]`.
@@ -4193,6 +4224,11 @@ pub fn build_ctx(
             .with_queue_budget(budget)
             .with_logins_in_flight(config.server.logins_in_flight),
     };
+
+    let core = core.with_sealed_holds(hxd_core::SealedHolds {
+        per_sender: config.sealed.held_per_sender_kb.saturating_mul(1024),
+        all: config.sealed.held_kb.saturating_mul(1024),
+    });
 
     // The reserved login is refused at the one place every frontend's
     // login goes through, so none of them can miss it.

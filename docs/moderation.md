@@ -323,6 +323,9 @@ or a PM to a guest) can still be reported by pasting: as built, that is
 a report on its sender (`user`) with the text as `evidence`, which the
 server marks `verified: false` and the moderator sees. It is the
 reporter's word about a person, not a row the server can vouch for.
+Pasted text is at most 4096 characters or 8192 bytes, whichever allows
+more, so an opened deniable box (e2e-messages.md §4.12), whose text runs
+to 8192 bytes, can be pasted whole.
 
 **Signed evidence** (e2e-messages.md §4.12). A signed line or message
 keeps its detached form on its row, and a report of it copies the form
@@ -331,9 +334,10 @@ otherwise take, as `target.text` and `target.signed`, and for an inbox
 message as `signed` beside `evidence`. Pasted evidence, for a public
 line or a private message, may carry `signed`, the detached form of
 what `evidence` pastes, or a whole private message with `evidence` left
-out and taken from its `text`. The server checks it with the
-certificate at `sent` alone, a line's scope against its own key and a
-message's against the reporter's identity, and refuses it
+out and taken from its `text`, as long as its own limits allow (a
+sealed message's text runs to 8192 bytes), never cut. The server checks
+it with the certificate at `sent` alone, a line's scope against its own
+key and a message's against the reporter's identity, and refuses it
 `bad_signature` otherwise. The person the report names is then the
 certificate's identity: a `user` named must be that identity, and with
 none named, which pasted signed evidence alone may do, the server names

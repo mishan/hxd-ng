@@ -30,6 +30,7 @@ pub mod revoked;
 pub mod rooms;
 pub mod roster;
 pub mod rotation;
+pub mod sealed;
 pub mod server_link;
 pub mod system;
 pub mod video;
@@ -90,6 +91,7 @@ pub use roster::{
     SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_BYTES,
     LIVE_QUEUE_CAP, LOGINS_IN_FLIGHT, OUTBOX_BUFFER_CAP,
 };
+pub use sealed::{SealedDevice, SealedError, SealedHolds};
 pub use system::SystemPolicy;
 pub use video::{
     PublishRefusal, VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,

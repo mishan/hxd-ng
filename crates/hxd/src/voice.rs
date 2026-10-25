@@ -163,6 +163,7 @@ mod tests {
             metrics: None,
             link: None,
             rooms: Default::default(),
+            sealed: Default::default(),
         }
     }
 

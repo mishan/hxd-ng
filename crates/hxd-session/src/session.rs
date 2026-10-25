@@ -3079,6 +3079,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // transaction to unsend it (moderation.md §6). History (700)
         // shows the tombstone, which is what a capable client reads.
         Event::ChatRedacted { .. } | Event::ChatPurged { .. } => {}
+        // Sent only to a session that said it can open one, which this
+        // wire has no way to say (`docs/e2e-messages.md` §6).
+        Event::Sealed { .. } => {}
         // Unwrapped above, and a room's events are never nested. A
         // listing's changes go to rooms-aware sessions, which this wire's
         // never are.

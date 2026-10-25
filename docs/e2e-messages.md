@@ -9,22 +9,29 @@ messages that are not sealed, and signed articles, on the ng wire: the
 the indexes of signed lines and signed articles by `(signer, id)` (§4.7,
 §4.10), `signed` on events, `history`, `inbox` and articles, rooms that
 require signing (§4.8), and moderation's share of them (§4.12), the
-classic wire getting the text alone (§6). Not built yet: sealing on the
-wire (§4.1 to §4.5) and the link forms on a link (§5). Until links carry
-them, hxd-ng does not offer `signed` with `[link]` configured (§4.6), so
-no signed line exists for a link to strip. The indexes do not reach a
-redacted line or a deleted article, whose content goes with its words
-(§4.12). Secure rooms are not built yet, so `/rooms` shows `(signed
-lines only)` alone (§4.8). This is the end-to-end messaging document
-that `hotline-ng-identity.md` §3.3 names for the `device_enc` key, and
-the construction the server linking user keys draft leaves to it
-("Sealed Messages in Link Private Message"); §5 follows that draft's
-link wire, and §6 the messaging identity draft's classic one. It rests
-on the `server_challenge` and `[identity] hosts` of `hotline-ng-auth.md`
-§6.2, `hotline-ng.md`'s `chat_guid` (§4, §7.1, §7.3), and hl-identity's
-`verify_domain`, which refuses a key that does not re-encode to its own
-bytes (§3.1). Rotating the server key with a handover is left to a
-separate draft (§4.13).
+classic wire getting the text alone (§6); and sealed private messages:
+`sealed` at login and resume and on the roster, `device_cert`, `msg`
+carrying a box to the session of the device it was sealed to, held for a
+detached one within `[sealed]` and lost with `sealed_lost` by a resume
+without `sealed`, never stored (§4.1 to §4.5), and a sealed message's
+report (§4.12). Not built yet: the link forms on a link (§5). Until
+links carry them, a sealed message or `device_cert` to a linked server's
+user is `not_sealed`, and nothing sealed crosses; a session's device is
+the one it logged in with (`hotline-ng.md` §6.2), so a resume cannot
+prove another `device_enc` (§4.1). Nor, until then, does hxd-ng offer
+`signed` with `[link]` configured (§4.6), so no signed line exists for a
+link to strip. The indexes do not reach a redacted line or a deleted
+article, whose content goes with its words (§4.12). Secure rooms are not
+built yet, so `/rooms` shows `(signed lines only)` alone (§4.8). This is
+the end-to-end messaging document that `hotline-ng-identity.md` §3.3
+names for the `device_enc` key, and the construction the server linking
+user keys draft leaves to it ("Sealed Messages in Link Private
+Message"); §5 follows that draft's link wire, and §6 the messaging
+identity draft's classic one. It rests on the `server_challenge` and
+`[identity] hosts` of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s
+`chat_guid` (§4, §7.1, §7.3), and hl-identity's `verify_domain`, which
+refuses a key that does not re-encode to its own bytes (§3.1). Rotating
+the server key with a handover is left to a separate draft (§4.13).
 
 A user who logs in with a key can **sign** what they write with their
 device's key, so that no server can write a line in their name or alter
@@ -792,7 +799,8 @@ for the asker and the target is intended: a client knows whether its own
 session is `sealed`, so `not_sealed` only ever tells it something about
 the target, and its `text` says which. It weighs 4 against the request
 limit, as a search does, and is rate-limited on top, since it is what a
-client would scrape to watch who logs in with which device.
+client would scrape to watch who logs in with which device (*hxd-ng:*
+20 a minute per session).
 
 A client checks the certificate exactly as §3.9 step 5 checks the
 sender's, against the fingerprint the roster shows for `uid`, and seals

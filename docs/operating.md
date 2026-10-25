@@ -1088,6 +1088,19 @@ couple of hundred a second. `normal` loses at most the last moments
 before a power cut, never a line that reached the disk, and never the
 database.
 
+### `[sealed]`
+
+Sealed private messages (e2e-messages.md §4) are never stored: one to a
+session that is away waits in its resume buffer, and only there. These
+bound what that buffer holds of them, so one sender cannot crowd out
+everyone else's; past either, a `msg` is refused `mailbox_full`.
+
+```toml
+[sealed]
+held_per_sender_kb = 64  # from one sender, per detached session
+held_kb = 256            # from everyone, per detached session
+```
+
 ### `[history]`
 
 Absent means no server-held scrollback. When `db` is omitted, history uses

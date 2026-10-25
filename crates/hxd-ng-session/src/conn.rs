@@ -52,6 +52,7 @@ fn req_label(req: &str) -> &'static str {
         "block",
         "blocks",
         "chat",
+        "device_cert",
         "history",
         "inbox",
         "login",
@@ -115,7 +116,7 @@ fn request_weight(req: &str) -> u32 {
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
         | "account_list" | "files_preview" | "room_create" | "room_edit" | "room_archive"
-        | "room_unarchive" => 4,
+        | "room_unarchive" | "device_cert" => 4,
         _ => 1,
     }
 }
@@ -367,9 +368,13 @@ pub(crate) async fn run(
                     // A signature costs two verifications, its certificate's
                     // and its own (`docs/e2e-messages.md` §7).
                     let signed = u32::from(req.params.get("signed").is_some());
+                    // And a sealed message one for each 2048 bytes of its
+                    // box (§4.3), here as its base64url's length says.
+                    let sealed = req.params.get("sealed").and_then(Value::as_str);
+                    let sealed = sealed.map_or(0, |b| (b.len() * 3 / 4 / 2048) as u32);
                     let over = ctx
                         .core
-                        .spend_request(state.uid, request_weight(&req.req) + signed)
+                        .spend_request(state.uid, request_weight(&req.req) + signed + sealed)
                         .err();
                     let newcomer = matches!(req.req.as_str(), "chat" | "msg" | "news_post")
                         .then(|| ctx.core.newcomer_wait(state.uid))
@@ -722,6 +727,11 @@ async fn handle_login(
     // bounded here rather than only where it is rendered. In characters,
     // because that is what one Mac Roman byte is worth (§8).
     nick.truncate_to_chars(NICK_MAX_CHARS);
+    // Whose device this session is, for the requests that are about a
+    // device rather than an account: decided here, at login, and kept
+    // with the session so a resume cannot change it.
+    let device = identity.map(crate::push::DeviceOnSocket::of);
+    let sealed = crate::sealed::device(device.as_ref(), p.sealed);
     let attach = AttachInfo {
         account: Some(Box::new(account.clone())),
         nick,
@@ -754,6 +764,7 @@ async fn handle_login(
                 hxd_core::IdentityTag {
                     signs: signs == Some(Signs::Default),
                     can_sign: signs.is_some(),
+                    sealed: sealed.clone().map(std::sync::Arc::new),
                     ..i.tag().on_account(account.identity.fingerprint)
                 }
             }),
@@ -833,10 +844,6 @@ async fn handle_login(
     }
     ctx.core.announce(uid);
 
-    // Whose device this session is, for the requests that are about a
-    // device rather than an account: decided here, at login, and kept
-    // with the session so a resume cannot change it.
-    let device = identity.map(crate::push::DeviceOnSocket::of);
     let Some((session_id, token)) = ctx.registry.issue(&ctx.core, uid, device.clone()) else {
         warn!(uid, "ng login could not issue a session token");
         ctx.core.end_session(uid);
@@ -887,7 +894,10 @@ async fn handle_login(
         me_json["manage_rooms"] = json!(true);
     }
     if let Some(i) = identity {
-        let signs = me_json["identity"]["signs"].clone();
+        let (signs, sealed) = (
+            me_json["identity"]["signs"].clone(),
+            me_json["identity"]["sealed"].clone(),
+        );
         // `age` and `outcome` are for the user themself, never the roster.
         // The outcome reflects the account this session actually landed
         // on, which can differ from the token's if a link was made in
@@ -910,6 +920,9 @@ async fn handle_login(
         });
         if !signs.is_null() {
             me_json["identity"]["signs"] = signs;
+        }
+        if !sealed.is_null() {
+            me_json["identity"]["sealed"] = sealed;
         }
     }
     // `identity` is a property of the server, not of the config's
@@ -972,6 +985,9 @@ async fn handle_login(
     });
     if let Some(signs) = signs(ctx, identity.map(TransportIdentity::may_message), p.signs) {
         ok["signs"] = json!(signs.as_str());
+    }
+    if sealed.is_some() {
+        ok["sealed"] = json!(true);
     }
     // The ceilings, so a client configures its encoders before the first
     // join rather than discovering them by rejection. Present only when
@@ -1141,6 +1157,11 @@ async fn handle_resume(
         let _ = send_frame(ws_tx, Message::Text(reply_err_account(req.id, refused))).await;
         return None;
     }
+    // Before the replay is taken, so what it holds sealed for a session
+    // that no longer says it can open it is already the placeholder.
+    let device = ctx.registry.device(&p.session);
+    let sealed = crate::sealed::device(device.as_ref(), p.sealed);
+    ctx.core.set_sealed(uid, sealed.clone());
     let (events, replay) = match ctx.core.resume(uid, p.last_seq) {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
@@ -1173,7 +1194,6 @@ async fn handle_resume(
     .ok()
     .flatten()
     .map(|account| account.masked(&mask));
-    let device = ctx.registry.device(&p.session);
     let signs = signs(ctx, device.as_ref().map(|d| d.may_message), p.signs);
     ctx.core
         .set_signs(uid, signs == Some(Signs::Default), signs.is_some());
@@ -1208,6 +1228,9 @@ async fn handle_resume(
             let mut ok = json!({ "replay": replay.len(), "self": user_json(&me) });
             if let Some(signs) = signs {
                 ok["signs"] = json!(signs.as_str());
+            }
+            if sealed.is_some() {
+                ok["sealed"] = json!(true);
             }
             if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
                 lost(ctx);
@@ -1808,7 +1831,13 @@ async fn dispatch(
                 "access_denied",
                 "You are not allowed to send private messages.",
             ),
-            Ok(p) => {
+            Ok(p) if p.sealed.is_some() || p.cert.is_some() => {
+                crate::sealed::msg(ctx, state, req.id, p).await
+            }
+            Ok(mut p) => {
+                let Some(text) = p.text.take() else {
+                    return finish(ws_tx, reply_err(req.id, "bad_request", "Malformed msg.")).await;
+                };
                 // Parsed, not stored as it arrived: this indexes a
                 // column, and an index over arbitrary client text is a
                 // place to put anything.
@@ -1826,13 +1855,13 @@ async fn dispatch(
                 let signed = match p.signed.as_deref() {
                     None => None,
                     Some(signed) => {
-                        match crate::signed::msg(ctx, state, guid.as_ref(), &p.text, signed) {
+                        match crate::signed::msg(ctx, state, guid.as_ref(), &text, signed) {
                             Ok(signed) => Some(signed),
                             Err(refused) => return finish(ws_tx, refused.reply(req.id)).await,
                         }
                     }
                 };
-                let mut text = p.text;
+                let mut text = text;
                 text.truncate_to_char_boundary(4096);
                 let media = match p.media.as_deref().map(hxd_core::media::handle_from_str) {
                     None => None,
@@ -1979,6 +2008,8 @@ async fn dispatch(
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed msg."),
         },
+
+        "device_cert" => crate::sealed::device_cert(ctx, state, req.id, &req.params).await,
 
         // --- The inbox (docs/private-messages.md §6) -------------------
         //
