@@ -1,15 +1,18 @@
-//! Signed lines and private messages on the ng wire
-//! (`docs/e2e-messages.md` §4.6–§4.12): real servers on loopback with an
-//! identity, one SQLite file for the log, the inbox and the moderation
-//! trail, users who log in with a device key and sign with it through
-//! hl-identity's own API, and a classic client beside them.
+//! Signed lines, private messages and articles, and rooms that require
+//! signing, on the ng wire (`docs/e2e-messages.md` §4.6–§4.12): real
+//! servers on loopback with an identity, one SQLite file for the log, the
+//! inbox, the news and the moderation trail, users who log in with a
+//! device key and sign with it through hl-identity's own API, and a
+//! classic client beside them.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hl_identity::message::{ChatLine, Object, PrivateMessage, Signed, CHAT_DOMAIN};
+use hl_identity::message::{
+    Article, ChatLine, Object, Parent, PrivateMessage, Signed, CHAT_DOMAIN,
+};
 use hl_identity::{cbor, cert, Card, DeviceCert, DeviceKey, IdentityKey, LoginProof, ServerKey};
 use hxd_core::{Core, HistoryPolicy, ModerationPolicy, NewsPolicy, RoomPolicy, SystemPolicy};
 use hxd_ng_session::{IdentityConfig, IdentityState, NgConfig, NgCtx, Registry};
@@ -30,6 +33,7 @@ struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
     store: Arc<SqliteStore>,
+    system: u16,
     stop: [tokio::task::AbortHandle; 2],
 }
 
@@ -76,7 +80,8 @@ async fn start(dir: &Path) -> Server {
 async fn start_with(dir: &Path, linked: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-    let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n";
+    let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n\
+                  read_news = true\npost_news = true\n";
     let account = |login: &str, extra: &str| {
         std::fs::write(
             accounts.join(format!("{login}.toml")),
@@ -88,7 +93,7 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
         let fp = fingerprint(&person(seed, login));
         account(login, &format!("[identity]\nfingerprint = \"{fp}\"\n"));
     }
-    account("carol", "disconnect_users = true\n");
+    account("carol", "disconnect_users = true\ndelete_articles = true\n");
     account("dave", "");
     account("eve", "");
     account("boss", "[extra]\nmanage_rooms = true\n");
@@ -115,11 +120,15 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
         .with_system(SystemPolicy::default())
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
-            RoomPolicy::default(),
+            RoomPolicy {
+                signed: !linked,
+                ..RoomPolicy::default()
+            },
         )
         .unwrap();
     let core = Arc::new(core);
     core.start_system_session().unwrap();
+    let system = core.system_uid().unwrap();
     let auth: Arc<dyn hxd_core::AuthBackend> = auth;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -183,8 +192,24 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
         legacy,
         ng,
         store,
+        system,
         stop,
     }
+}
+
+/// A server started again on the same database, once every connection to
+/// the first has gone.
+async fn restart(server: Server, dir: &Path) -> Server {
+    server.stop.iter().for_each(tokio::task::AbortHandle::abort);
+    timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&server.store) > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first server let go of its store");
+    drop(server);
+    start(dir).await
 }
 
 /// One HTTP/1.1 request, closed after its answer: the JSON body.
@@ -460,16 +485,7 @@ async fn a_signed_line_is_heard_and_kept_with_its_signature() {
         c.logout().await.unwrap();
     }
     drop(classic);
-    server.stop.iter().for_each(tokio::task::AbortHandle::abort);
-    timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(&server.store) > 1 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the first server let go of its store");
-    drop(server);
-    let server = start(dir.path()).await;
+    let server = restart(server, dir.path()).await;
     let (mut d, _) = Client::account(server.ng, "dave", "pw", "dave")
         .await
         .unwrap();
@@ -719,17 +735,6 @@ async fn a_signed_message_is_delivered_kept_and_reported() {
     )
     .await;
     assert_eq!(code, "bad_request", "the system account has no identity");
-    let (code, text) = refused(
-        &mut a,
-        "news_post",
-        json!({ "category": 1, "subject": "s", "body": "b", "signed": "pmF2AQ" }),
-    )
-    .await;
-    assert_eq!(
-        (code.as_str(), text.as_str()),
-        ("bad_request", "Signed articles are not carried yet.")
-    );
-
     // Reported from the inbox, the report carries the signature; pasted,
     // it names whoever signed it.
     let id = inbox["messages"][0]["id"].clone();
@@ -928,4 +933,478 @@ async fn a_linked_server_does_not_carry_signed_messages() {
     )
     .await;
     assert_eq!(code, "bad_request");
+}
+
+const GENERAL: [u8; 16] = [0x42; 16];
+
+/// A category the tests post into, with a guid they sign for.
+fn general(server: &Server) -> u64 {
+    use hxd_core::news::{NewNode, NewsStore, NodeKind};
+    server
+        .store
+        .create_node(
+            &NewNode {
+                parent: None,
+                kind: NodeKind::Category,
+                name: "General".into(),
+                guid: GENERAL,
+                at: std::time::SystemTime::now(),
+            },
+            16,
+        )
+        .unwrap()
+        .id
+}
+
+fn article(p: &Person, id: u8, subject: &str, body: &str, parent: Option<Parent>) -> Article {
+    Article {
+        id: [id; 16],
+        sent: now(),
+        server: ServerKey::from_seed(&SERVER_SEED).public(),
+        category: GENERAL,
+        parent,
+        cert: p.cert.clone(),
+        subject: subject.into(),
+        body: body.into(),
+        mime: "text/plain".into(),
+    }
+}
+
+fn signed_article(p: &Person, a: &Article) -> String {
+    detached::<Article>(&a.sign(&p.dev).unwrap(), a.sent)
+}
+
+/// `news_post`'s params for `a`, signed by `p`.
+fn post_of(category: u64, p: &Person, a: &Article) -> Value {
+    let mut params = json!({
+        "category": category, "subject": a.subject, "body": a.body, "mime": a.mime,
+        "signed": signed_article(p, a),
+    });
+    if let Some(parent) = a.parent {
+        params["parent"] = json!(parent.article);
+    }
+    params
+}
+
+#[tokio::test]
+async fn a_signed_article_is_posted_served_and_kept_with_its_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let cat = general(&server);
+    let alice = person(1, "alice");
+    let (mut a, _) = login_as(server.ng, &alice, json!({})).await;
+    let tree = ok(&mut a, "news_tree", json!({})).await;
+    assert_eq!(tree["nodes"][0]["guid"], b64(&GENERAL), "{tree}");
+
+    let starter = article(&alice, 1, "Signed news", "line one\nline two", None);
+    let params = post_of(cat, &alice, &starter);
+    let signed = params["signed"].clone();
+    let id = ok(&mut a, "news_post", params).await["id"]
+        .as_u64()
+        .unwrap();
+    let got = ok(&mut a, "news_article", json!({ "id": id })).await;
+    assert_eq!(got["article"]["signed"], signed);
+    assert_eq!(got["article"]["body"], "line one\nline two");
+    let threads = ok(&mut a, "news_threads", json!({ "category": cat })).await;
+    assert_eq!(threads["threads"][0]["article"]["signed"], signed);
+    let thread = ok(&mut a, "news_thread", json!({ "root": id })).await;
+    assert_eq!(thread["articles"][0]["signed"], signed);
+
+    // Signed again, later, it is the same post; other words under its id
+    // are not.
+    let again = Article {
+        sent: now() - 30,
+        ..starter.clone()
+    };
+    let retry = ok(&mut a, "news_post", post_of(cat, &alice, &again)).await;
+    assert_eq!(retry["id"], id, "answered as the article it repeats");
+    let other = Article {
+        subject: "Other news".into(),
+        ..starter.clone()
+    };
+    let (code, _) = refused(&mut a, "news_post", post_of(cat, &alice, &other)).await;
+    assert_eq!(code, "bad_signature", "an equivocation");
+
+    // A reply names a signed parent by its id and signer.
+    let parent = Parent {
+        article: u64::from(id as u32),
+        signed: Some(([1; 16], fingerprint(&alice))),
+    };
+    let reply = article(&alice, 2, "Re: Signed news", "a reply", Some(parent));
+    let reply = ok(&mut a, "news_post", post_of(cat, &alice, &reply)).await["id"]
+        .as_u64()
+        .unwrap();
+    let thread = ok(&mut a, "news_thread", json!({ "root": id })).await;
+    assert_eq!(thread["articles"][1]["id"], reply);
+    assert!(thread["articles"][1]["signed"].is_string());
+
+    // A period client reads the text, as it reads any article.
+    let mut classic = hxd_testclient::legacy::Client::login_at(
+        server.legacy,
+        &hxd_testclient::legacy::Login::account("eve", "eve", "pw"),
+    )
+    .await
+    .unwrap();
+    let mut path = 1u16.to_be_bytes().to_vec();
+    path.extend_from_slice(&[0, 0, 7]);
+    path.extend_from_slice(b"General");
+    let read = classic
+        .call(
+            0x190,
+            &[
+                (tag::NEWSPATH, path),
+                (tag::THREADID, (id as u32).to_be_bytes().to_vec()),
+                (tag::NEWSTYPE, b"text/plain".to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(!read.is_error());
+    assert_eq!(read.bytes(tag::NEWSDATA).unwrap(), b"line one\rline two");
+    assert_eq!(read.bytes(tag::NEWSSUBJECT).unwrap(), b"Signed news");
+
+    drop(classic);
+    a.logout().await.unwrap();
+    let server = restart(server, dir.path()).await;
+    let (mut a, _) = login_as(server.ng, &alice, json!({})).await;
+    let got = ok(&mut a, "news_article", json!({ "id": id })).await;
+    assert_eq!(got["article"]["signed"], signed, "after a restart");
+    let retry = ok(&mut a, "news_post", post_of(cat, &alice, &again)).await;
+    assert_eq!(retry["id"], id, "the index outlives the server");
+
+    // Deleted by a moderator, it loses its signature to the evidence.
+    let (mut carol, _) = Client::account(server.ng, "carol", "pw", "carol")
+        .await
+        .unwrap();
+    ok(
+        &mut carol,
+        "news_delete",
+        json!({ "id": reply, "reason": "x" }),
+    )
+    .await;
+    let gone = ok(&mut a, "news_article", json!({ "id": reply })).await;
+    assert!(gone["article"].get("signed").is_none(), "{gone}");
+    let log = ok(&mut carol, "moderation_log", json!({})).await;
+    let delete = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "news_delete")
+        .unwrap();
+    assert!(delete["signed"].is_string(), "{delete}");
+}
+
+#[tokio::test]
+async fn a_signed_article_that_does_not_check_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let cat = general(&server);
+    let (alice, bob) = (person(1, "alice"), person(2, "bob"));
+    let (mut a, _) = login_as(server.ng, &alice, json!({})).await;
+    let signed_starter = ok(
+        &mut a,
+        "news_post",
+        post_of(cat, &alice, &article(&alice, 1, "Signed", "s", None)),
+    )
+    .await["id"]
+        .as_u64()
+        .unwrap();
+    let unsigned_starter = ok(
+        &mut a,
+        "news_post",
+        json!({ "category": cat, "subject": "Unsigned", "body": "u" }),
+    )
+    .await["id"]
+        .as_u64()
+        .unwrap();
+    let base = article(&alice, 9, "Hello", "world", None);
+    let post = |a: Article| post_of(cat, &alice, &a);
+    let reply_to = |article: u64, signed| {
+        post(Article {
+            parent: Some(Parent { article, signed }),
+            ..base.clone()
+        })
+    };
+    let alices = Some(([1; 16], fingerprint(&alice)));
+    let mut no_parent = reply_to(signed_starter, alices);
+    no_parent.as_object_mut().unwrap().remove("parent");
+    let mut no_mime = post(base.clone());
+    no_mime.as_object_mut().unwrap().remove("mime");
+    let mut other_mime = post(Article {
+        mime: "text/markdown".into(),
+        ..base.clone()
+    });
+    other_mime["mime"] = json!("text/plain");
+    let with = |key: &str, value: Value| {
+        let mut params = post(base.clone());
+        params[key] = value;
+        params
+    };
+    let cases: Vec<(&str, Value, &str, Option<&str>)> = vec![
+        (
+            "another category",
+            post(Article {
+                category: [0x43; 16],
+                ..base.clone()
+            }),
+            "bad_signature",
+            Some("Signed for another category."),
+        ),
+        (
+            "another server",
+            post(Article {
+                server: ServerKey::from_seed(&[0x66; 32]).public(),
+                ..base.clone()
+            }),
+            "bad_signature",
+            Some("Signed for another server."),
+        ),
+        (
+            "a signed parent named as unsigned",
+            reply_to(signed_starter, None),
+            "bad_signature",
+            Some("Signed as a reply to another article."),
+        ),
+        (
+            "an unsigned parent named as signed",
+            reply_to(unsigned_starter, alices),
+            "bad_signature",
+            Some("Signed as a reply to another article."),
+        ),
+        (
+            "a reply posted as a thread",
+            no_parent,
+            "bad_signature",
+            Some("Signed as a reply to another article."),
+        ),
+        (
+            "signed an hour ago",
+            post(Article {
+                sent: now() - 3600,
+                ..base.clone()
+            }),
+            "bad_signature",
+            Some("signed too long ago; sign it again"),
+        ),
+        (
+            "another identity's certificate",
+            post_of(cat, &bob, &article(&bob, 9, "Hello", "world", None)),
+            "bad_signature",
+            Some("Signed by another identity."),
+        ),
+        ("no mime", no_mime, "bad_request", None),
+        ("another mime", other_mime, "bad_signature", None),
+        (
+            "a subject with a raw CR",
+            with("subject", json!("Hel\rlo")),
+            "bad_request",
+            None,
+        ),
+        (
+            "a subject the server would trim",
+            post(Article {
+                subject: "Hello\t".into(),
+                ..base.clone()
+            }),
+            "bad_request",
+            None,
+        ),
+        (
+            "a body over the limit",
+            with("body", json!("x".repeat(65_536))),
+            "bad_request",
+            None,
+        ),
+        (
+            "other words than it signed",
+            with("body", json!("word")),
+            "bad_signature",
+            None,
+        ),
+    ];
+    for (case, params, want, text) in cases {
+        let (code, said) = refused(&mut a, "news_post", params).await;
+        assert_eq!(code, want, "{case}: {said}");
+        if let Some(text) = text {
+            assert_eq!(said, text, "{case}");
+        }
+    }
+    let threads = ok(&mut a, "news_threads", json!({ "category": cat })).await;
+    assert_eq!(
+        threads["threads"].as_array().unwrap().len(),
+        2,
+        "nothing else was posted: {threads}"
+    );
+}
+
+/// `text` to the system account from a classic client, and its answer.
+async fn command(c: &mut hxd_testclient::legacy::Client, system: u16, text: &str) -> String {
+    use hxproto::messages::ClientHdr;
+    let trans = c
+        .send(
+            ClientHdr::Msg.as_u32(),
+            &[
+                (tag::UID, system.to_be_bytes().to_vec()),
+                (tag::BODY, text.as_bytes().to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(!c.reply(trans).await.unwrap().is_error());
+    let answer = c
+        .recv_where(|f| f.ty == 0x68 && f.uint(tag::UID) == Some(u32::from(system)))
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&answer.bytes(tag::BODY).unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn a_room_that_requires_signing_takes_signed_lines_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let (alice, bob) = (person(1, "alice"), person(2, "bob"));
+    let (mut boss, _) = Client::account(server.ng, "boss", "pw", "boss")
+        .await
+        .unwrap();
+    let den = ok(
+        &mut boss,
+        "room_create",
+        json!({ "name": "den", "signed": true }),
+    )
+    .await["room"]
+        .clone();
+    assert_eq!(den["signed"], true, "{den}");
+    let den = den["id"].as_u64().unwrap();
+    let (code, _) = refused(
+        &mut boss,
+        "room_edit",
+        json!({ "room": den, "signed": false }),
+    )
+    .await;
+    assert_eq!(code, "bad_request", "the mark never changes");
+    let stage = ok(
+        &mut boss,
+        "room_create",
+        json!({ "name": "stage", "signed": true, "post": ["alice"] }),
+    )
+    .await["room"]["id"]
+        .as_u64()
+        .unwrap();
+    let plain = ok(&mut boss, "room_create", json!({ "name": "hall" })).await["room"].clone();
+    assert!(plain.get("signed").is_none(), "{plain}");
+
+    let (mut a, _) = login_as(server.ng, &alice, json!({ "signs": "able" })).await;
+    let (mut b, _) = login_as(server.ng, &bob, json!({})).await;
+    let (mut d, _) = Client::account(server.ng, "dave", "pw", "dave")
+        .await
+        .unwrap();
+    let joined = ok(&mut a, "room_join", json!({ "room": den })).await;
+    assert_eq!(
+        (&joined["signed"], &joined["may_post"]),
+        (&json!(true), &json!(true))
+    );
+    for (c, who) in [
+        (&mut b, "a session that did not say it signs"),
+        (&mut d, "one with no device"),
+    ] {
+        let joined = ok(c, "room_join", json!({ "room": den })).await;
+        assert_eq!(joined["may_post"], false, "{who}");
+        let listed = ok(c, "rooms", json!({})).await;
+        let row = listed["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == den)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (&row["signed"], &row["may_post"]),
+            (&json!(true), &json!(false)),
+            "{who}"
+        );
+        // The gates let it post, so it is told what is missing.
+        let (code, _) = refused(c, "chat", json!({ "text": "hi", "room": den })).await;
+        assert_eq!(code, "signature_required", "{who}");
+    }
+    let (code, _) = refused(&mut a, "chat", json!({ "text": "hi", "room": den })).await;
+    assert_eq!(code, "signature_required", "unsigned, from one that signs");
+    ok(&mut d, "room_join", json!({ "room": stage })).await;
+    let (code, _) = refused(&mut d, "chat", json!({ "text": "hi", "room": stage })).await;
+    assert_eq!(code, "read_only", "the gates come first");
+    let g = guid(20);
+    let signed = signed_line(&alice, &line(&alice, &g, den, "signed here"));
+    ok(
+        &mut a,
+        "chat",
+        json!({ "text": "signed here", "room": den, "guid": g, "signed": signed }),
+    )
+    .await;
+
+    // A period client reads it as read-only, and is told once why its
+    // lines go nowhere.
+    let mut classic = hxd_testclient::legacy::Client::login_at(
+        server.legacy,
+        &hxd_testclient::legacy::Login::account("eve", "eve", "pw"),
+    )
+    .await
+    .unwrap();
+    let rooms = command(&mut classic, server.system, "/rooms").await;
+    let line_of = |name: &str| {
+        rooms
+            .split('\r')
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} in {rooms:?}"))
+            .to_string()
+    };
+    assert!(
+        line_of("#den ").ends_with("here) (signed lines only)"),
+        "{rooms:?}"
+    );
+    assert!(line_of("#hall ").ends_with("here)"), "{rooms:?}");
+    let cid = |id: u64| (tag::CHAT_ID, (id as u32).to_be_bytes().to_vec());
+    classic.call(0x73, &[cid(den)]).await.unwrap();
+    for text in [&b"first"[..], b"second"] {
+        classic
+            .send(0x69, &[(tag::BODY, text.to_vec()), cid(den)])
+            .await
+            .unwrap();
+    }
+    classic.ping().await.unwrap();
+    let notices: Vec<String> = classic
+        .rx
+        .take_backlog()
+        .iter()
+        .filter(|f| f.ty == HDR_CHAT && f.uint(tag::CHAT_ID) == Some(den as u32))
+        .map(|f| String::from_utf8_lossy(&f.bytes(tag::BODY).unwrap()).into_owned())
+        .collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(notices[0].ends_with("this room is public, logged and read-only"));
+    assert_eq!(
+        notices[1],
+        "\r *** this room takes signed lines only, which this client cannot send"
+    );
+    let page = ok(&mut a, "history", json!({ "room": den })).await;
+    let texts: Vec<Value> = history_lines(&page)
+        .iter()
+        .map(|l| l["text"].clone())
+        .collect();
+    assert_eq!(texts, [json!("signed here")], "nothing unsigned was logged");
+
+    // A resume that says it signs may post, and is told so.
+    ok(&mut b, "rooms", json!({})).await;
+    let (session, seq) = (b.session.clone().unwrap(), b.rx.last_seq);
+    b.close().await.unwrap();
+    let mut b = Client::connect(server.ng).await.unwrap();
+    b.rx.last_seq = seq;
+    ok(
+        &mut b,
+        "resume",
+        json!({ "session": session.0, "token": session.1, "last_seq": seq, "signs": "able" }),
+    )
+    .await;
+    b.event_where("room_changed", |d| {
+        d["room"]["id"] == den && d["room"]["may_post"] == true
+    })
+    .await
+    .unwrap();
 }

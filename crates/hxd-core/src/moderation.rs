@@ -192,8 +192,9 @@ pub struct Act {
     /// What was removed, for moderators to read until the sweeper
     /// scrubs it to nothing (§3.1). The row stays.
     pub evidence: Option<String>,
-    /// A redacted signed line's detached form, which goes with its words
-    /// and is scrubbed with them (`docs/e2e-messages.md` §4.12).
+    /// A redacted signed line's or a deleted signed article's detached
+    /// form, which goes with its words and is scrubbed with them
+    /// (`docs/e2e-messages.md` §4.12).
     pub signed: Option<Vec<u8>>,
     pub media_hash: Option<[u8; 32]>,
     pub at: SystemTime,
@@ -1388,6 +1389,7 @@ impl Core {
             .about(&Subject::of_author(&article.author));
         act.article = Some(article.id);
         act.evidence = Some(evidence);
+        act.signed = article.signed.as_ref().map(|s| s.form.clone());
         if let Err(e) = store.record(&act) {
             warn!("moderation store: {e}");
         }

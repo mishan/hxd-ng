@@ -80,6 +80,7 @@ fn post(
             body: "a local post".into(),
             mime: BodyType::Plain,
             attachments: Vec::new(),
+            signed: None,
         },
     )
 }

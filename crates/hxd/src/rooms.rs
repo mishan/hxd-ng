@@ -80,6 +80,7 @@ impl RoomsSection {
             announce: self.announce,
             announce_names: self.announce_names,
             invites_declined: false,
+            signed: false,
         }
     }
 
@@ -107,9 +108,22 @@ pub fn with_rooms(core: Core, config: &Config) -> Result<Core, String> {
         Arc::new(FileRooms::new(&config.rooms.file)),
         RoomPolicy {
             invites_declined: config.server.version < 151,
+            signed: carries_signed(config),
             ..config.rooms.policy()
         },
     )
+}
+
+/// Does this server carry signed lines (`docs/e2e-messages.md` §4.6)?
+/// What the ng port offers `signed` on: a server key and the hosts a
+/// client pins it by, and no link to carry them over unsigned.
+fn carries_signed(config: &Config) -> bool {
+    config.ng.is_some()
+        && config.link.is_none()
+        && config
+            .identity
+            .as_ref()
+            .is_some_and(|i| !i.hosts.is_empty())
 }
 
 /// Topics changed in memory reach the file every few seconds (§4).
@@ -160,6 +174,8 @@ struct RoomDoc {
     archived_at: Option<u64>,
     #[serde(default)]
     deleted: bool,
+    #[serde(default)]
+    signed: bool,
 }
 
 fn at(secs: u64) -> SystemTime {
@@ -182,8 +198,8 @@ fn topic(text: Option<String>, by: Option<String>, when: Option<u64>) -> Topic {
 const USAGE: &str = "usage:\n  \
 hxd [--config …] room list [--archived]\n  \
 hxd [--config …] room create <name> [--topic T] [--read LOGIN,…] [--post LOGIN,…] [--position N]\n    \
-[--max-lines N|default] [--max-days N|default]\n  \
-hxd [--config …] room edit <name> [--name NEW] [the same flags as create]\n  \
+[--max-lines N|default] [--max-days N|default] [--signed]\n  \
+hxd [--config …] room edit <name> [--name NEW] [the same flags as create, but --signed]\n  \
 hxd [--config …] room archive|unarchive <name>\n  \
 hxd [--config …] room delete <name> --purge [--reason R]";
 
@@ -292,6 +308,7 @@ fn write_room(t: &mut Table, room: &Room) {
     set(t, "max_lines", room.max_lines.map(|n| i64::from(n).into()));
     set(t, "max_days", room.max_days.map(|n| i64::from(n).into()));
     set(t, "archived_at", room.archived_at.map(|t| secs(t).into()));
+    set(t, "signed", room.signed.then(|| true.into()));
     set(t, "deleted", None);
 }
 
@@ -325,6 +342,7 @@ impl RoomStore for FileRooms {
                     max_days: r.max_days,
                     archived_at: r.archived_at.map(at),
                     deleted: r.deleted,
+                    signed: r.signed,
                 })
                 .collect(),
         })
@@ -417,6 +435,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
             }
             "--max-lines" => edit.max_lines = Some(retention(value()?)?),
             "--max-days" => edit.max_days = Some(retention(value()?)?),
+            "--signed" => edit.signed = Some(true),
             other if other.starts_with('-') => return Err(format!("unknown argument {other:?}")),
             other => words.push(other),
         }
@@ -445,7 +464,17 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
             if edit.name.is_some() {
                 return Err("--name renames a room with `edit`".into());
             }
-            let mut room = Room::default();
+            if edit.signed.is_some() && !(carries_signed(config) && config.history.is_some()) {
+                return Err(
+                    "--signed needs a server that carries signed lines: [history], \
+                     [identity] hosts, and no [link]"
+                        .into(),
+                );
+            }
+            let mut room = Room {
+                signed: edit.signed.is_some(),
+                ..Room::default()
+            };
             RoomEdit {
                 name: Some(name.into()),
                 ..edit
@@ -537,6 +566,9 @@ fn listing(file: &RoomFile, archived: bool) -> String {
             if r.archived_at.is_some() {
                 line += " (archived)";
             }
+            if r.signed {
+                line += " (signed lines only)";
+            }
             for (gate, list) in [("read", &r.read), ("post", &r.post)] {
                 if !list.is_empty() {
                     line += &format!(" {gate}: {}", list.join(","));
@@ -622,6 +654,8 @@ mod tests {
             "[[room]]\nname = \"lounge\"\nreed = [\"carol\"]\n",
             "[[room]]\nname = \"Lounge\"\n",
             "[[room]]\nname = \"a\"\n[[room]]\nname = \"a\"\n",
+            // The lobby is every period client's (docs/e2e-messages.md §4.8).
+            "[lobby]\nsigned = true\n",
         ] {
             let path = dir.path().join("rooms.toml");
             std::fs::write(&path, bad).unwrap();
@@ -669,6 +703,37 @@ mod tests {
             FileRooms::new(&config.rooms.file).load().unwrap().rooms,
             [Room::tombstone(id)]
         );
+    }
+
+    /// `--signed` marks a room as it is made, on a server that carries
+    /// signed lines, and never after (docs/e2e-messages.md §4.8).
+    #[test]
+    fn the_command_marks_a_room_signed_only_as_it_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.rooms.file = dir.path().join("rooms.toml");
+        let run = |config: &Config, words: &str| {
+            let args: Vec<String> = words.split(' ').map(String::from).collect();
+            command(config, &args)
+        };
+        assert!(run(&config, "create den --signed").is_err());
+        config.history = Some(toml::from_str("db = \"hx.db\"").unwrap());
+        config.ng = Some(toml::from_str("").unwrap());
+        config.identity = Some(toml::from_str("hosts = [\"hl.example\"]").unwrap());
+        run(&config, "create den --signed").unwrap();
+        run(&config, "create hall").unwrap();
+        assert!(run(&config, "edit hall --signed").is_err());
+        run(&config, "edit den --signed --topic signed").unwrap();
+        let file = FileRooms::new(&config.rooms.file).load().unwrap();
+        let marks: Vec<(&str, bool)> = file
+            .rooms
+            .iter()
+            .map(|r| (r.name.as_str(), r.signed))
+            .collect();
+        assert_eq!(marks, [("den", true), ("hall", false)]);
+        assert!(run(&config, "list")
+            .unwrap()
+            .contains("#den (signed lines only)"));
     }
 
     /// A delete is a moderation act, recorded with its reason before the

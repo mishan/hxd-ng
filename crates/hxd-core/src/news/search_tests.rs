@@ -67,6 +67,7 @@ fn post(core: &Core, uid: Uid, category: NodeId, body: &str) -> ArticleId {
             body: body.into(),
             mime: BodyType::Plain,
             attachments: Vec::new(),
+            signed: None,
         },
     )
     .unwrap()

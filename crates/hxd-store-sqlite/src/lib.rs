@@ -22,6 +22,7 @@
 //! be able to refuse a message.
 
 use hxd_core::instrument::TimedMutex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -72,7 +73,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -645,6 +646,27 @@ ALTER TABLE message ADD COLUMN signed BLOB;
 ALTER TABLE message ADD COLUMN signed_content BLOB;
 ALTER TABLE moderation ADD COLUMN evidence_signed BLOB;
 ALTER TABLE report ADD COLUMN signed BLOB;
+";
+
+/// Signed articles and rooms that require signing
+/// (`docs/e2e-messages.md` §4.8, §4.10): an article's detached form,
+/// what it says, its signer and its id, which the index of signed
+/// articles keys, all cleared with a deleted article's body; node guids
+/// never shared, since a signed article names its category by one; and
+/// each room's mark, kept beside its log so a rooms file cannot change
+/// it.
+const SCHEMA_V25: &str = "
+ALTER TABLE news_article ADD COLUMN signed BLOB;
+ALTER TABLE news_article ADD COLUMN signed_content BLOB;
+ALTER TABLE news_article ADD COLUMN signed_by BLOB;
+ALTER TABLE news_article ADD COLUMN signed_id BLOB;
+CREATE UNIQUE INDEX news_article_signed ON news_article (signed_by, signed_id)
+  WHERE signed_by IS NOT NULL;
+CREATE UNIQUE INDEX news_node_guid ON news_node (guid);
+CREATE TABLE room_mark (
+  room   INTEGER PRIMARY KEY,
+  signed INTEGER NOT NULL
+);
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1359,6 +1381,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 24 {
         steps.push_str(SCHEMA_V24);
+    }
+    if version < 25 {
+        steps.push_str(SCHEMA_V25);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2488,6 +2513,44 @@ impl ChatLog for SqliteStore {
         .map_err(StoreError::new)
     }
 
+    fn room_marks(&self) -> Result<HashMap<u32, bool>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT room, signed FROM room_mark")
+            .map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)))
+            .map_err(StoreError::new)?;
+        rows.map(|row| {
+            let (room, signed) = row.map_err(StoreError::new)?;
+            let room = u32::try_from(room).map_err(|_| StoreError::new("room id is not a u32"))?;
+            Ok((room, signed))
+        })
+        .collect()
+    }
+
+    fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO room_mark (room, signed) VALUES (?1, ?2)
+             ON CONFLICT (room) DO UPDATE SET signed = excluded.signed",
+            params![i64::from(room), signed],
+        )
+        .map_err(StoreError::new)?;
+        Ok(())
+    }
+
+    fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM chat_line
+                             WHERE channel = ?1 AND signed IS NULL AND flags & ?2 = 0)",
+            params![i64::from(channel), i64::from(LineFlags::DELETED.bits())],
+            |r| r.get(0),
+        )
+        .map_err(StoreError::new)
+    }
+
     fn find_guid(
         &self,
         channel: u32,
@@ -2947,6 +3010,7 @@ mod tests {
                     guest: None,
                     attachment_cutoff: UNIX_EPOCH,
                     feed: None,
+                    signed: None,
                 },
                 32,
                 32,
@@ -3022,6 +3086,7 @@ mod tests {
                     guest: None,
                     attachment_cutoff: UNIX_EPOCH,
                     feed: None,
+                    signed: None,
                 },
                 32,
                 32,
@@ -3111,6 +3176,7 @@ mod tests {
             guest: None,
             attachment_cutoff: UNIX_EPOCH,
             feed: None,
+            signed: None,
         };
         assert!(matches!(
             store.post(&post, 32, 32),
@@ -3642,6 +3708,7 @@ mod tests {
                     attachment_owner: None,
                     attachment_cutoff: from_unix(0),
                     feed: None,
+                    signed: None,
                 },
                 32,
                 32,

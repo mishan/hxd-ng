@@ -193,6 +193,7 @@ impl Server {
                     body: body.into(),
                     mime: BodyType::Plain,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
             .unwrap()

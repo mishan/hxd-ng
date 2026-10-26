@@ -608,6 +608,7 @@ fn a_purge_of_a_news_flood_goes_out_batched_and_cuts_no_reader_off() {
                     body: "spam".into(),
                     mime: BodyType::Plain,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
             .unwrap();
@@ -680,6 +681,7 @@ fn a_purge_takes_a_persons_window_across_every_store_and_nothing_else() {
                     body: body.into(),
                     mime: BodyType::Plain,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
             .unwrap()
@@ -1179,6 +1181,7 @@ fn deleting_someone_elses_article_is_an_act_with_a_ladder() {
                     body: body.into(),
                     mime: BodyType::Plain,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
             .unwrap()
@@ -1635,6 +1638,7 @@ fn deleting_a_category_is_on_the_record_and_answers_its_reports() {
                     body: "b".into(),
                     mime: BodyType::Plain,
                     attachments: Vec::new(),
+                    signed: None,
                 },
             )
             .unwrap()

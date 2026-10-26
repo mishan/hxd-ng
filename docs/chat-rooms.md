@@ -121,6 +121,7 @@ undoes:
 | `read` | Who may see, join and read it. §5 |
 | `post` | Who may send in it. §5 |
 | `secure` | Only encrypted connections may join or read it. §5.1 |
+| `signed` | Every line in it is signed. Set when the room is made, never changed. §5.2 |
 | `linked` | Crosses server links. False, and refused when true, until §8.1 is built |
 | `max_lines`, `max_days` | This room's retention, over `[history]`'s. §3 |
 | `archived_at` | Set on archive. §2.4 |
@@ -192,8 +193,9 @@ cheaper than to everyone who could be.
 - **Create**: `hxd room create <name>` or the ng `room_create`. Every
   session that can see the room hears `room_added` (§7.3).
 - **Edit**: name, topic, position, gates and retention, by the same two
-  routes. A rename keeps the id, so history and voice are untouched.
-  A narrowed gate parts any member it no longer admits (§5).
+  routes; never `signed` (§5.2). A rename keeps the id, so history and
+  voice are untouched. A narrowed gate parts any member it no longer
+  admits (§5).
 - **Archive**: the room disappears from listings, its members are
   parted with a notice, and joins are refused. **Its log stays**, under
   retention, and moderators can still page it. Archived is what
@@ -315,6 +317,11 @@ name = "announcements"
 post = ["@moderators"]
 
 [[room]]
+id = 2049117735
+name = "notary"
+signed = true             # every line signed (§5.2); set when it is made
+
+[[room]]
 id = 3002288816
 name = "old-news"
 archived_at = 1791000000
@@ -355,6 +362,16 @@ whoever lost access. The
   does not parse. The CLI and the server do not share a lock, so an
   edit made while a manager edits from an ng client can lose one of the
   two, as with accounts.
+- **A room's `signed` mark is kept beside its log** (§5.2), in the
+  database, for every room, signed or not, and the file must agree with
+  it: a reload or a start whose file changes a room's mark is a file
+  that does not parse. A room whose mark is not kept yet, one from before
+  marks were, or one written into the file since, has its mark kept as
+  the file has it, unless the file marks it signed and its log holds an
+  unsigned line that is not a tombstone, which fails the load naming the
+  room. `signed` in `[lobby]`, which no key of the file allows, does not
+  parse; nor does a signed room on a server with no `[history]` to keep
+  its log and its mark, or on one that carries no signed lines.
 - **A file that does not parse** leaves the rooms as they were on a
   reload, and logs why. At startup it is an error: a server that came
   up without its rooms would show a restricted room's name to nobody,
@@ -457,6 +474,35 @@ every link (§3).
   A conversation that should leave no record is a private chat, and
   end-to-end encryption is a different feature.
 
+### 5.2 Rooms that require signing
+
+A room with `signed = true` takes signed lines alone
+([e2e-messages.md](e2e-messages.md) §4.8). The mark is set when the room
+is made, by `room_create`'s `signed` or `hxd room create --signed`, on a
+server that carries signed lines (e2e-messages.md §4.6) and keeps
+`[history]`, and never changes (§4): `room_edit` naming another mark is
+`bad_request`, and `hxd room edit` takes no `--signed` but the mark the
+room has. The lobby is never signed, and a private chat cannot be.
+
+- **It is a third condition on posting**, beside §5's gates: a session
+  posts in a signed room when the gates let it and it can sign, which an
+  ng session can when it proved a device whose certificate allows
+  messages and said `signs` at login or on its latest resume. `may_post`
+  is false for one that cannot, and a resume that changes it is told by
+  `room_changed`. Reading is §5's alone: the mark is about what a line
+  carries, not who may hear it. So is setting the topic, which is not a
+  line and carries no signature.
+- **An unsigned line is refused, not dropped.** From a session the gates
+  let post, an unsigned `chat` is `signature_required`, and from one they
+  do not, `read_only`, as in any room. Nothing is logged, relayed or
+  counted against the flood.
+- **A classic session reads it as read-only** (§6.2, §6.3), since no
+  classic client can sign: its join notice says `read-only`, `/rooms`
+  marks the room `(signed lines only)`, and its first 105 there is
+  answered in the room with `*** this room takes signed lines only,
+  which this client cannot send` when the gates let it post, and with
+  the read-only room's notice when they do not.
+
 ## 6. The classic wire, for period clients
 
 A room appears to a 1.5 client as a private chat it has been invited
@@ -474,7 +520,7 @@ like `/report` and `/msg`:
 
 | Command | Does | Needs |
 |---|---|---|
-| `/rooms` | Lists the rooms this session may see, one per line: `#name — topic (n here)`, members first, with `(encrypted connections only)` after a secure room's count. One message, capped at a private message's length (4096 bytes), ending `… and more; /rooms <word> narrows it` when cut | — |
+| `/rooms` | Lists the rooms this session may see, one per line: `#name — topic (n here)`, members first, with `(encrypted connections only)` after a secure room's count and then `(signed lines only)` after a signed room's (§5.2). One message, capped at a private message's length (4096 bytes), ending `… and more; /rooms <word> narrows it` when cut | — |
 | `/rooms <word>` | Only rooms whose name or topic contains the word | — |
 | `/join <name>` | Invites this session into the room (§6.2). `#` before the name is accepted and ignored. Answers `ok: invited to #name`, `ok: already in #name` (and sends no invite), `error: #name needs an encrypted connection` (§5.1), or `error: no such room` | §5, see |
 | `/part <name>` | Leaves the room, for a client whose window closed without sending 116. Answers `ok: left #name`, `error: you are not in #name`, or `error: no such room` | — |
@@ -499,7 +545,8 @@ server without rooms they are unknown commands, answered with the help.
    one notice in the room, never logged: `\r *** #lounge — this room is
    public and logged`, or `public` alone on a server without
    `[history]`, and `public, logged and read-only` (or `public and
-   read-only`) when the session may not post, each followed by `, for
+   read-only`) when the session may not post, as a classic session may
+   not in a signed room (§5.2), each followed by `, for
    encrypted connections only` in a secure room. It and every other line
    of §6 come from the system account's uid, or the session's own on a
    server without one. A period
@@ -527,7 +574,7 @@ the session may see (otherwise §5's last rule):
 
 | Transaction | Does |
 |---|---|
-| 105 Send Chat | Sends in the room, under §5, through the room's queue and the flood count. A session that may read but not post gets, the first time, a notice in the room, `*** this room is read-only`, and its lines are dropped. 105 has no reply, and a line that vanishes with no word is a bug to the person typing it |
+| 105 Send Chat | Sends in the room, under §5, through the room's queue and the flood count. A session that may read but not post gets, the first time, a notice in the room, `*** this room is read-only`, or in a signed room one its gates let post `*** this room takes signed lines only, which this client cannot send` (§5.2), and its lines are dropped. 105 has no reply, and a line that vanishes with no word is a bug to the person typing it |
 | 113 Invite to Chat | A member invites someone who may see the room. The invitee sees *alice invites you to chat* as for a private chat. Inviting someone who may not see it is refused with the same task error as a chat that does not exist |
 | 115 Join Chat | §6.2 |
 | 116 Leave Chat | Parts the room |
@@ -640,7 +687,8 @@ A `rooms` block beside `history`:
 never including the lobby or an archived room (a moderator or a manager
 still pages an archived room by its id). `last_id` is the newest line id
 in the room, absent without history. `may_post` is whether this session
-may send there. `secure` is present and true on a secure room (§5.1),
+may send there. `signed` is present and true on a room that requires
+signing (§5.2), as `secure` is on a secure room (§5.1),
 here and in every room object, so a client on a connection it would
 refuse can say so before a join. `max_lines` and `max_days` are
 present when the room has a retention of its own (§3). `self` gains
@@ -664,12 +712,12 @@ else, who is admitted is not their business.
 | `req` | `params` | `ok` | Errors besides hotline-ng.md §10's universal set |
 |---|---|---|---|
 | `rooms` | — | `{ "list": […] }`, as in the login reply | `not_available` |
-| `room_join` | `room` | `{ "members": [ uid… ], "topic", "topic_by"?, "topic_at"?, "last_id"?, "may_post" }` | `no_such_room`, `too_many_rooms`, `encryption_required` |
+| `room_join` | `room` | `{ "members": [ uid… ], "topic", "topic_by"?, "topic_at"?, "last_id"?, "may_post", "signed"? }` | `no_such_room`, `too_many_rooms`, `encryption_required` |
 | `room_part` | `room` | `{}` | `no_such_room`, `not_a_member` |
 | `room_topic` | `room`, `topic` | `{}` | `no_such_room`, `access_denied` |
-| `chat` | gains `room?` | as now | gains `no_such_room`, `not_a_member`, `read_only` |
+| `chat` | gains `room?` | as now | gains `no_such_room`, `not_a_member`, `read_only`, `signature_required` |
 | `history` | gains `room?` | as now | gains `no_such_room`, `encryption_required` |
-| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
+| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `signed?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
 | `room_edit` | `room`, then any of `room_create`'s fields | `{ "room": {…} }` | `access_denied`, `no_such_room`, `name_taken`, `bad_request` |
 | `room_archive` / `room_unarchive` | `room` | `{}` | `access_denied`, `no_such_room` |
 
@@ -680,11 +728,15 @@ else, who is admitted is not their business.
   wire never had.
 - `chat` naming a room the session has not joined is `not_a_member`:
   sending does not imply joining. `read_only` is a room it may read but
-  not post in.
+  not post in. `signature_required` is an unsigned line into a room
+  that requires signing, from a session its gates let post (§5.2).
 - `encryption_required` is a secure room on a connection that is not
   encrypted (§5.1).
 - `too_many_rooms` is this session's `max_joined`; `rooms_full` is the
   server's `max_rooms`.
+- `signed` in `room_create` on a server that carries no signed lines,
+  or keeps no `[history]`, is `bad_request`, and so is `signed` in
+  `room_edit` other than the room's own (§5.2).
 - In `room_create` and `room_edit`, `read` and `post` replace the list
   when present and leave it when absent; `[]` clears it. An entry that
   is neither a login nor `@role`, or that names `@everyone`, is
@@ -707,7 +759,7 @@ else, who is admitted is not their business.
 | `room_member_joined` | `{ "room", "user": {…} }` | A session joined a room this session is in |
 | `room_member_parted` | `{ "room", "uid", "reason"? }` | A session left a room this session is in, or this session was parted. `reason`, `"access"`, `"archived"` or `"insecure"` (§5.1), is sent to the session the server parted, and to nobody else: why someone lost access is not the room's business. Not sent when the session left the server: `user_parted` says that |
 | `room_added` | `{ "room": {…} }` | A room this session may see was created, unarchived, or became visible to it |
-| `room_changed` | `{ "room": {…} }` | A visible room's name, position, retention, gates, `secure` or this session's `may_post` changed, to sessions that may see it; or its topic alone, to those that may see it and are not in it (members hear `subject`). Gates count only for a manager, who alone is shown them |
+| `room_changed` | `{ "room": {…} }` | A visible room's name, position, retention, gates, `secure` or this session's `may_post` changed (a resume that says another `signs`, in a signed room, §5.2), to sessions that may see it; or its topic alone, to those that may see it and are not in it (members hear `subject`). Gates count only for a manager, who alone is shown them |
 | `room_removed` | `{ "room" }` | A room was archived, or stopped being visible to this session. If it was a member, it was parted first |
 | `chat_redacted` | gains `room` | moderation.md §5, for a line in a room: sent only to sessions that may read that room, and of those to the rooms-aware and its members |
 | `chat_purged` | gains `room` | moderation.md §5. One event per room the purge touched, carrying that room's ids, each sent only to sessions that may read that room. The lobby's is unchanged and has no `room` |
@@ -903,7 +955,7 @@ Docker's entrypoint keeps the file in its data directory, and gains
 `HXD_ROOMS_ANNOUNCE` and nothing else (docs/docker.md).
 
 `hxd room` subcommands: `list [--archived]`, `create <name> [--topic …]
-[--read entry,…] [--post entry,…] [--secure] [--position n]
+[--read entry,…] [--post entry,…] [--secure] [--signed] [--position n]
 [--max-lines n] [--max-days n]`, `edit <name> [--name new]
 [--no-secure] …`, `archive <name>`, `unarchive <name>`, `delete <name>
 --purge`.

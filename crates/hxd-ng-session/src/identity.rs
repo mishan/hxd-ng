@@ -215,6 +215,7 @@ impl TransportIdentity {
             handle: self.handle.clone(),
             quiet_until: self.quiet_until,
             signs: false,
+            can_sign: false,
         }
     }
 }

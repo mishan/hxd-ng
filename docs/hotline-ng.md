@@ -3,8 +3,9 @@
 Status: built — the core below, plus history (chat-history.md), the
 inbox (private-messages.md), news (news.md), media (inline-media.md),
 voice and video (voice.md, capabilities-video.md), files (§7.2),
-identity (hotline-ng-identity.md), and signed lines and private
-messages that are not sealed (e2e-messages.md §4.6 to §4.12). The vouch
+identity (hotline-ng-identity.md), and signed lines, articles and
+private messages that are not sealed, and rooms that require signing
+(e2e-messages.md §4.6 to §4.12). The vouch
 requests, `retry_after`, the `*@host` ban entry and the general rate
 limits of §9 are design not yet built in hxd-ng, and say so where they
 appear.
@@ -179,7 +180,7 @@ over them.
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
-| `signed` | Signed lines and messages: `signed` on `chat`, `msg` and `report`, and on the events and listings that carry them; `signs` at login. Only with `chat_guid`, a `server_key` and `[identity] hosts`; *hxd-ng:* and not with `[link]` configured, until links carry signatures; `news_post` does not take `signed` yet, and refuses it `bad_request` | e2e-messages.md §4.6 | `signs`, echoed |
+| `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts`; *hxd-ng:* and not with `[link]` configured, until links carry signatures | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -636,7 +637,7 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `bad_signature`, `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?` | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `server_error` |
@@ -959,6 +960,7 @@ news body is different: it declares its own type (news.md §5).
 | `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |
 | `read_only` | `chat` | This session may read that room and not send in it. |
+| `signature_required` | `chat` | An unsigned line into a room that requires signing, from a session that may otherwise send there (chat-rooms.md §5.2, e2e-messages.md §4.8). Nothing was relayed or logged. |
 | `too_many_rooms` | `room_join` | This session is in as many rooms as it may be. |
 | `rooms_full` | `room_create` | The server holds as many rooms as it may. |
 | `name_taken` | `room_create`, `room_edit` | A room has that name already. |
@@ -969,7 +971,7 @@ news body is different: it declares its own type (news.md §5).
 | `blocked` | `msg` | The recipient blocks you. |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
-| `bad_signature` | `chat`, `msg`, `report` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
+| `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
 
 The files codes are §7.2's. Each family's document lists its own. A
 client MUST treat a code it does not recognize as a failure of that one

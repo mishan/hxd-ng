@@ -51,6 +51,9 @@ pub fn room_json(v: &RoomView) -> Value {
         "members": v.members,
         "may_post": v.may_post,
     });
+    if r.signed {
+        out["signed"] = json!(true);
+    }
     if let Some(id) = v.last_id {
         out["last_id"] = json!(id);
     }
@@ -149,6 +152,7 @@ struct EditParams {
     max_lines: Option<Option<u32>>,
     #[serde(default, deserialize_with = "set_or_clear")]
     max_days: Option<Option<u32>>,
+    signed: Option<bool>,
 }
 
 impl EditParams {
@@ -161,6 +165,7 @@ impl EditParams {
             post: self.post,
             max_lines: self.max_lines,
             max_days: self.max_days,
+            signed: self.signed,
         }
     }
 }
@@ -273,6 +278,10 @@ fn join(ctx: &NgCtx, id: u64, uid: Uid, room: u32) -> String {
     }
     if let Some(at) = topic.at {
         ok["topic_at"] = json!(unix(at));
+    }
+    // So a client knows before it sends (`docs/e2e-messages.md` §4.8).
+    if view.as_ref().is_some_and(|v| v.room.signed) {
+        ok["signed"] = json!(true);
     }
     if let Some(last) = view.and_then(|v| v.last_id) {
         ok["last_id"] = json!(last);

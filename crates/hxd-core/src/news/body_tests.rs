@@ -107,6 +107,7 @@ fn post(
             body: body.into(),
             mime,
             attachments: Vec::new(),
+            signed: None,
         },
     )
 }

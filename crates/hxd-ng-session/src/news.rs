@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::conn::off_reactor;
+use crate::conn::{off_reactor, SessState};
 use crate::proto::{reply_err, reply_err_retry, reply_ok, unix, ReqEnvelope};
 use crate::NgCtx;
 
@@ -45,6 +45,7 @@ pub fn news_err(e: &NewsError) -> (&'static str, &'static str) {
             "This server takes plain-text articles only.",
         ),
         NewsError::BadRequest(text) => ("bad_request", text),
+        NewsError::BadSignature(text) => ("bad_signature", text),
         NewsError::SearchOff => ("not_available", "This server does not search its news."),
         NewsError::RateLimited => ("rate_limited", "Slow down."),
         NewsError::Media(r) => (crate::media::reject_status(*r).1, r.text()),
@@ -129,6 +130,7 @@ pub fn node_json(n: &Node) -> Value {
         "name": n.name,
         "count": n.children,
         "created_at": unix(n.created_at),
+        "guid": crate::proto::b64url(&n.guid),
     });
     if let Some(feed) = &n.feed {
         v["feed"] = json!({ "name": feed.name, "replies": feed.replies });
@@ -188,7 +190,7 @@ pub fn article_json(a: &Article) -> Value {
     if let Some(feed) = &a.feed {
         from["feed"] = json!(feed);
     }
-    json!({
+    let mut v = json!({
         "id": a.id,
         "category": a.category,
         "parent": a.parent,
@@ -203,7 +205,11 @@ pub fn article_json(a: &Article) -> Value {
         "attachments": a.attachments.iter().map(attachment_json).collect::<Vec<_>>(),
         "refs": a.refs.iter().map(ref_json).collect::<Vec<_>>(),
         "referenced_by": a.referenced_by,
-    })
+    });
+    if let Some(signed) = &a.signed {
+        v["signed"] = json!(crate::proto::b64url(&signed.form));
+    }
+    v
 }
 
 fn thread_json(h: &ThreadHead) -> Value {
@@ -380,6 +386,10 @@ struct PostParams {
     mime: Option<String>,
     #[serde(default)]
     attach: Vec<String>,
+    /// The article's detached form, base64url (`docs/e2e-messages.md`
+    /// §4.10).
+    #[serde(default)]
+    signed: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,8 +443,8 @@ fn page_size(asked: Option<usize>, default: usize, ceiling: usize) -> Result<usi
 }
 
 /// Handle one `news_*` request and return the frame that answers it.
-pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
-    let id = req.id;
+pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) -> String {
+    let (id, uid) = (req.id, state.uid);
     let refused = |e: NewsError| {
         if matches!(e, NewsError::RateLimited) {
             instrument::rate_limited("ng", "news_search");
@@ -630,14 +640,20 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
         }
 
         "news_post" => {
-            // Refused rather than ignored: a post the client signed must
-            // not be kept as though it were not (`docs/e2e-messages.md`
-            // §4.10, which comes later).
-            if params.get("signed").is_some() {
-                return bad("Signed articles are not carried yet.");
-            }
             let Some(p) = parse::<PostParams>(params) else {
                 return malformed();
+            };
+            // Refused rather than cut over a limit, since cutting would
+            // break the signature (`docs/e2e-messages.md` §4.10).
+            let signed = match p.signed.as_deref() {
+                None => None,
+                Some(signed) => {
+                    let texts = (p.subject.as_str(), p.body.as_str(), p.mime.as_deref());
+                    match crate::signed::article(ctx, state, texts, p.parent, signed) {
+                        Ok(signed) => Some(signed),
+                        Err(refused) => return refused.reply(id),
+                    }
+                }
             };
             let mime = match p.mime.as_deref() {
                 None => BodyType::Plain,
@@ -658,6 +674,7 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
                     .map(|h| hxd_core::media::handle_from_str(h))
                     .collect::<Option<Vec<_>>>()
                     .unwrap_or_default(),
+                signed,
             };
             if post.attachments.len() != p.attach.len() {
                 return reply_err(id, "no_such_media", "No such media.");

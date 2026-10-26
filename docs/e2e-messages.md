@@ -3,26 +3,28 @@
 Status: draft, 2026-10. `hl-identity` has the signed objects of §3.1 to
 §3.5, their detached and link forms (§5), and sealing and opening both
 kinds of box (§3.7 to §3.11), with §13's vectors for them. hxd-ng
-carries signed public lines, in the lobby and in rooms, and signed
-private messages that are not sealed, on the ng wire: the `signed`
-capability and `signs` (§4.6), the checks of §4.11 on ingest, the index
-of signed lines by `(signer, id)` (§4.7), `signed` on events, `history`
-and `inbox`, and moderation's share of them (§4.12), the classic wire
-getting the text alone (§6). Not built yet: sealing on the wire (§4.1 to
-§4.5), rooms that require signing (§4.8), signed articles (§4.10) and
-the link forms on a link (§5). Until links carry them, hxd-ng does not
-offer `signed` with `[link]` configured (§4.6), so no signed line exists
-for a link to strip. The index of signed lines does not reach a redacted
-line, whose content goes with its words (§4.12). This is the
-end-to-end messaging document that `hotline-ng-identity.md` §3.3 names
-for the `device_enc` key, and the construction the server linking user
-keys draft leaves to it ("Sealed Messages in Link Private Message"); §5
-follows that draft's link wire, and §6 the messaging identity draft's
-classic one. It rests on the `server_challenge` and `[identity] hosts`
-of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s `chat_guid` (§4, §7.1,
-§7.3), and hl-identity's `verify_domain`, which refuses a key that does
-not re-encode to its own bytes (§3.1). Rotating the server key with a
-handover is left to a separate draft (§4.13).
+carries signed public lines, in the lobby and in rooms, signed private
+messages that are not sealed, and signed articles, on the ng wire: the
+`signed` capability and `signs` (§4.6), the checks of §4.11 on ingest,
+the indexes of signed lines and signed articles by `(signer, id)` (§4.7,
+§4.10), `signed` on events, `history`, `inbox` and articles, rooms that
+require signing (§4.8), and moderation's share of them (§4.12), the
+classic wire getting the text alone (§6). Not built yet: sealing on the
+wire (§4.1 to §4.5) and the link forms on a link (§5). Until links carry
+them, hxd-ng does not offer `signed` with `[link]` configured (§4.6), so
+no signed line exists for a link to strip. The indexes do not reach a
+redacted line or a deleted article, whose content goes with its words
+(§4.12). Secure rooms are not built yet, so `/rooms` shows `(signed
+lines only)` alone (§4.8). This is the end-to-end messaging document
+that `hotline-ng-identity.md` §3.3 names for the `device_enc` key, and
+the construction the server linking user keys draft leaves to it
+("Sealed Messages in Link Private Message"); §5 follows that draft's
+link wire, and §6 the messaging identity draft's classic one. It rests
+on the `server_challenge` and `[identity] hosts` of `hotline-ng-auth.md`
+§6.2, `hotline-ng.md`'s `chat_guid` (§4, §7.1, §7.3), and hl-identity's
+`verify_domain`, which refuses a key that does not re-encode to its own
+bytes (§3.1). Rotating the server key with a handover is left to a
+separate draft (§4.13).
 
 A user who logs in with a key can **sign** what they write with their
 device's key, so that no server can write a line in their name or alter
@@ -892,9 +894,7 @@ client can pin its key; and only beside `chat_guid` (`hotline-ng.md` §4,
 `signed` without `chat_guid` is broken, and a client does not sign lines
 to it. *hxd-ng*, until links carry signatures (§5): not with `[link]`
 configured either, since a signed lobby line must not cross a link
-without its signature (§4.11); and its `news_post` does not take
-`signed` yet (§4.10), refusing it `bad_request` rather than keeping
-the article unsigned. A client MUST NOT send `signed` to a server
+without its signature (§4.11). A client MUST NOT send `signed` to a server
 without the capability: a server that ignored an unknown parameter
 would relay the text unsigned, and the sender would never know.
 
@@ -1019,6 +1019,8 @@ A curated room can require signed lines:
   post, as a classic one is told the room is read-only. A resume that
   changes this changes `may_post`, which `room_changed` already
   announces.
+- **A topic is not a line.** Setting a signed room's topic needs the
+  gates alone (`chat-rooms.md` §5), and carries no signature.
 - **Only rooms.** The lobby cannot be marked: it is every period
   client's, and every link's. A private chat cannot be (§1.3).
 - **Classic sessions read it as read-only.** A period or extended
@@ -1089,9 +1091,12 @@ without `subject` and `body` (`news.md` §9.2):
 
 - `subject` and `body` are canonical and within §3.4's bounds and the
   server's `max_subject` and `max_body`; over them is `bad_request`,
-  never cut. `mime` MUST be sent and equal the map's. `parent`, when
-  sent, is the map's `parent.article`, and the map has no `parent`
-  without it.
+  never cut. So is a subject a server would change as it keeps it:
+  *hxd-ng* makes a subject one line, trimmed, with a tab as a space
+  (`news.md` §9.2), so a signed subject with a tab, or a space at
+  either end, is `bad_request`. `mime` MUST be sent and equal the
+  map's. `parent`, when sent, is the map's `parent.article`, and the
+  map has no `parent` without it.
 - `in.category` is the guid of the category posted into. On a server
   with `signed`, a `node` object gains `guid`, base64url of its 16
   bytes, so a client can name it. Such a server MUST never give two
@@ -1103,7 +1108,12 @@ without `subject` and `body` (`news.md` §9.2):
   signed again or not, is the same post, answered with the article's
   id; with other content it is refused `bad_signature`. The server
   recognizes it by an index of signed articles by `(signer, id)`, which
-  `news.md` gains with the node guid's uniqueness.
+  `news.md` gains with the node guid's uniqueness. *hxd-ng* keeps nothing
+  of what a deleted article said, so the index does not reach it, as it
+  does not reach a redacted line (§4.12).
+- An article is never edited (`news.md` §18), so nothing but its
+  deletion changes a signed one, and a feed's article, which a feed
+  rewrites, is never signed.
 
 An `article` object gains `signed` wherever it is served, in
 `news_article`, `news_thread` and `news_threads`; a search hit does not.
@@ -1166,6 +1176,10 @@ and get the text alone.
   rather than the text, and would keep a proof that a removed line was
   said, which is a cost to its author's deniability that no reader
   needs.
+- **An article deleted as a moderation act** (`moderation.md` §3.1,
+  `news.md` §11) moves its detached form into the audit row beside the
+  subject and body its `evidence` keeps, as a redaction does, and the
+  sweeper scrubs it with them.
 - **Purge** (`moderation.md` §3.3) selects on the stored fingerprint,
   which for a signed line is its certificate's (§4.11 made it the
   session's).

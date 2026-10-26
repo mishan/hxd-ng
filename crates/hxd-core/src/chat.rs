@@ -648,6 +648,9 @@ pub enum ChatError {
     Flooding,
     /// The sender may read the room and not send in it.
     ReadOnly,
+    /// An unsigned line into a room that requires signed lines, from a
+    /// sender its gates let post (`docs/e2e-messages.md` §4.8).
+    SignatureRequired,
     /// A signed line or message under an id its signer already used for
     /// something else (`docs/e2e-messages.md` §3.6).
     Equivocation,
@@ -846,10 +849,12 @@ impl Core {
         )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
+        let mut signed_only = false;
         if room != 0 {
             if let Err(e) = self.room_may_send(from, room) {
                 return lines.iter().map(|_| Err(e)).collect();
             }
+            signed_only = self.room_signed(room);
         }
         let channel = (room != 0).then(|| self.room_channel(room));
         let commit = channel.as_ref().map_or(&self.chat_commit, |c| &c.commit);
@@ -861,6 +866,12 @@ impl Core {
         // been sent one at a time.
         let mut tipped = None;
         for (i, ((mut text, style, media), guid, signed)) in lines.into_iter().enumerate() {
+            // Neither counted as a line nor answered as a repeat
+            // (`docs/e2e-messages.md` §4.8).
+            if signed_only && signed.is_none() {
+                results[i] = Some(Err(ChatError::SignatureRequired));
+                continue;
+            }
             // A repeat puts nothing in the room, so it spends no chat
             // lines. One still in the queue behind its original is not
             // found here, and is found when its commit comes.
@@ -3154,6 +3165,15 @@ mod tests {
         ) -> Result<Option<crate::history::SignedAt>, StoreError> {
             self.inner.find_signed(signer, guid)
         }
+        fn room_marks(&self) -> Result<HashMap<u32, bool>, StoreError> {
+            self.inner.room_marks()
+        }
+        fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError> {
+            self.inner.set_room_mark(room, signed)
+        }
+        fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
+            self.inner.holds_unsigned(channel)
+        }
         fn attach_media(
             &self,
             id: crate::history::LineId,
@@ -3392,6 +3412,15 @@ mod tests {
             guid: &MessageGuid,
         ) -> Result<Option<crate::history::SignedAt>, StoreError> {
             self.inner.find_signed(signer, guid)
+        }
+        fn room_marks(&self) -> Result<HashMap<u32, bool>, StoreError> {
+            self.inner.room_marks()
+        }
+        fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError> {
+            self.inner.set_room_mark(room, signed)
+        }
+        fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
+            self.inner.holds_unsigned(channel)
         }
         fn attach_media(
             &self,
@@ -3700,6 +3729,15 @@ mod tests {
             _: &MessageGuid,
         ) -> Result<Option<crate::history::SignedAt>, StoreError> {
             Ok(None)
+        }
+        fn room_marks(&self) -> Result<HashMap<u32, bool>, StoreError> {
+            self.0.room_marks()
+        }
+        fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError> {
+            self.0.set_room_mark(room, signed)
+        }
+        fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
+            self.0.holds_unsigned(channel)
         }
     }
 

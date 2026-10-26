@@ -317,6 +317,7 @@ logged where `[history]` logs the lobby's.
 ```sh
 hxd room list --archived
 hxd room create trading --topic "Buy and sell" --post alice,bob --position 2
+hxd room create notary --signed    # every line signed, for good
 hxd room edit trading --name market --max-days 30
 hxd room archive market            # hides it and parts its members, keeping its lines
 hxd room unarchive market
@@ -330,6 +331,22 @@ server account, which invites it into a private chat that is the room,
 so classic users need `[system]`; `/rooms` lists them. A classic session
 that may see a room is told so in the lobby at most once a day
 (`[rooms] announce`).
+
+A room made with `--signed` (`signed = true` in its entry) takes only
+lines its senders signed with their device keys
+([e2e-messages.md](e2e-messages.md) §4.8). It needs `[history]`, and a
+server that carries signed lines: `[identity] hosts` set and no
+`[link]`. The mark is kept in the database beside the room's log and
+never changes: an edit that names another is refused, and a rooms file
+that changes one, or a `[lobby]` that has one, is a file that does not
+parse, so a reload leaves the rooms as they were and a start fails,
+naming the room. A room from before the database kept marks has its
+mark kept at the first start that reads it, and one marked signed then
+must hold no unsigned line that is not a tombstone. Classic clients,
+which cannot sign, read such a room as read-only. A server with a signed
+room that then gains `[link]`, or loses `[identity] hosts`, `[ng]` or
+`[history]`, will not start until the change is undone or the room is
+deleted with `hxd room delete <name> --purge`.
 
 ### Portable identity
 

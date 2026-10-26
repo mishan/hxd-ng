@@ -749,9 +749,13 @@ async fn handle_login(
             joins_rooms: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
-            identity: identity.map(|i| hxd_core::IdentityTag {
-                signs: signs(ctx, Some(i.may_message()), p.signs) == Some(Signs::Default),
-                ..i.tag().on_account(account.identity.fingerprint)
+            identity: identity.map(|i| {
+                let signs = signs(ctx, Some(i.may_message()), p.signs);
+                hxd_core::IdentityTag {
+                    signs: signs == Some(Signs::Default),
+                    can_sign: signs.is_some(),
+                    ..i.tag().on_account(account.identity.fingerprint)
+                }
             }),
             // Always, when the server has a pipeline at all: an ng
             // client is told what it may ignore rather than asked what
@@ -1171,7 +1175,8 @@ async fn handle_resume(
     .map(|account| account.masked(&mask));
     let device = ctx.registry.device(&p.session);
     let signs = signs(ctx, device.as_ref().map(|d| d.may_message), p.signs);
-    ctx.core.set_signs(uid, signs == Some(Signs::Default));
+    ctx.core
+        .set_signs(uid, signs == Some(Signs::Default), signs.is_some());
     let state = SessState {
         uid,
         session_id: p.session.clone(),
@@ -1694,6 +1699,11 @@ async fn dispatch(
                     Some(Err(ChatError::ReadOnly)) => {
                         reply_err(req.id, "read_only", "You may not send in that room.")
                     }
+                    Some(Err(ChatError::SignatureRequired)) => reply_err(
+                        req.id,
+                        "signature_required",
+                        "That room takes signed lines only.",
+                    ),
                     // Not this session's upload, or its bytes have gone.
                     // One answer for both, so a send cannot be used to
                     // test whether someone else's handle exists.
@@ -2302,7 +2312,7 @@ async fn dispatch(
         //
         // One family, handled in its own module: the requests are many
         // and all of them are translations of one domain call.
-        r if r.starts_with("news_") => crate::news::handle(ctx, state.uid, req).await,
+        r if r.starts_with("news_") => crate::news::handle(ctx, state, req).await,
 
         r if r.starts_with("push_") => crate::push::handle(ctx, state, req).await,
 

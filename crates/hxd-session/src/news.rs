@@ -307,7 +307,7 @@ pub(crate) fn error_text(e: &NewsError) -> &'static str {
         NewsError::NameTaken => "That name is already in use there.",
         NewsError::NotEmpty => "That bundle is not empty.",
         NewsError::BadBodyType => "This server does not take articles of that type.",
-        NewsError::BadRequest(why) => why,
+        NewsError::BadRequest(why) | NewsError::BadSignature(why) => why,
         NewsError::Protected => "That author's articles are protected.",
         NewsError::NewsFull => "This server's news is full.",
         NewsError::ReadOnly => "A feed fills that category; it cannot be posted to or changed.",
@@ -789,6 +789,7 @@ fn post_thread(
             body,
             mime,
             attachments: Vec::new(),
+            signed: None,
         },
     )?;
     Ok(Vec::new())
@@ -1178,6 +1179,7 @@ fn flat_post(core: &Core, cfg: &LegacyNews, who: Asker, text: &str) -> Result<()
         body,
         mime: BodyType::Plain,
         attachments: Vec::new(),
+        signed: None,
     };
     let kept = |line: &str| format!("{line}\n{}", post.body);
     let Some((id, line)) = post.re.as_ref() else {
@@ -1302,6 +1304,7 @@ mod tests {
             referenced_by: 0,
             attachments: Vec::new(),
             feed: None,
+            signed: None,
         }
     }
 

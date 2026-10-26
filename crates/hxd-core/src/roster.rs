@@ -254,6 +254,11 @@ pub struct IdentityTag {
     /// (`docs/e2e-messages.md` §4.6): a hint to readers, set by the
     /// client and so nothing more.
     pub signs: bool,
+    /// The session can sign: it said `signs`, either way, on a device
+    /// whose certificate allows messages, to a server that carries them
+    /// (§4.6). What a room that requires signing asks (§4.8). Not shown
+    /// to anyone.
+    pub can_sign: bool,
 }
 
 impl IdentityTag {
@@ -1983,22 +1988,33 @@ impl Core {
         changed
     }
 
-    /// Whether `uid`'s client says it signs public lines by default, as
-    /// a `resume` says it again (`docs/e2e-messages.md` §4.6); a change
-    /// is told as any change to the row is. A session that proved no
-    /// identity has no row to say it on.
-    pub fn set_signs(&self, uid: Uid, signs: bool) {
+    /// Whether `uid`'s client says it signs public lines by default, and
+    /// whether it can sign at all, as a `resume` says them again
+    /// (`docs/e2e-messages.md` §4.6); a change to the first is told as
+    /// any change to the row is, and to the second as the change to
+    /// `may_post` it makes in a room that requires signing (§4.8). A
+    /// session that proved no identity has no row to say it on.
+    pub fn set_signs(&self, uid: Uid, signs: bool, can_sign: bool) {
         let mut r = self.roster.lock().unwrap();
+        let before = r.room_shown(None, Some(&[uid]));
         let Some(sess) = r.users.get_mut(&uid) else {
             return;
         };
         let Some(id) = sess.info.transport.identity.as_mut() else {
             return;
         };
-        if id.signs == signs {
+        let was = (id.signs, id.can_sign);
+        id.signs = signs;
+        id.can_sign = can_sign;
+        if was.1 != can_sign {
+            r.room_announce(before, None, Some(&[uid]));
+        }
+        if was.0 == signs {
             return;
         }
-        id.signs = signs;
+        let Some(sess) = r.users.get(&uid) else {
+            return;
+        };
         if sess.visible {
             let ev = Event::Changed(sess.info.clone());
             r.broadcast(&ev, None);
