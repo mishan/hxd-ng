@@ -2182,7 +2182,10 @@ impl Core {
 
     /// Re-attach a connection to a detached (or live — takeover) session.
     pub fn resume(&self, uid: Uid, last_seq: u64) -> Resume {
-        let mut r = self.roster.lock().unwrap();
+        self.resume_locked(&mut self.roster.lock().unwrap(), uid, last_seq)
+    }
+
+    pub(crate) fn resume_locked(&self, r: &mut RosterInner, uid: Uid, last_seq: u64) -> Resume {
         let Some(sess) = r.users.get_mut(&uid) else {
             return Resume::Gone;
         };

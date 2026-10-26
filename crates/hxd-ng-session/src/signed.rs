@@ -274,7 +274,13 @@ pub(crate) fn pasted(
     evidence: Option<&str>,
     signed: &str,
 ) -> Result<Pasted, Refused> {
-    now(ctx)?;
+    // Not `now`: a sealed message opened and signed is carried with
+    // `[link]` configured, where signed lines are not offered.
+    if ctx.identity.is_none() {
+        return Err(Refused::BadRequest(
+            "This server does not carry signed messages.",
+        ));
+    }
     let form = decode(signed)?;
     // Before it is decoded: a detached form beside its text, or a whole
     // message, each to its own bound.

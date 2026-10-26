@@ -1161,8 +1161,7 @@ async fn handle_resume(
     // that no longer says it can open it is already the placeholder.
     let device = ctx.registry.device(&p.session);
     let sealed = crate::sealed::device(device.as_ref(), p.sealed);
-    ctx.core.set_sealed(uid, sealed.clone());
-    let (events, replay) = match ctx.core.resume(uid, p.last_seq) {
+    let (events, replay) = match ctx.core.resume_sealed(uid, p.last_seq, sealed.clone()) {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
         Resume::Gone => {

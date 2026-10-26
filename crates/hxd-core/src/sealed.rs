@@ -71,31 +71,21 @@ impl Core {
         self
     }
 
-    /// Whether `uid` can open sealed messages, as a `resume` says again
-    /// (§4.1). Losing it changes the roster row, and every sealed message
-    /// held for the session becomes the placeholder, in place, so the
-    /// outbox keeps its seqs.
-    pub fn set_sealed(&self, uid: Uid, sealed: Option<SealedDevice>) {
+    /// [`Core::resume`], with whether `uid` can open sealed messages, as
+    /// the `resume` says again (§4.1), set under the same lock, so of two
+    /// resumes racing the one attached last has its own mark. Losing it
+    /// changes the roster row, and every sealed message held for the
+    /// session becomes the placeholder, in place, so the outbox keeps its
+    /// seqs.
+    pub fn resume_sealed(
+        &self,
+        uid: Uid,
+        last_seq: u64,
+        sealed: Option<SealedDevice>,
+    ) -> crate::Resume {
         let mut r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get_mut(&uid) else {
-            return;
-        };
-        let Some(id) = sess.info.transport.identity.as_mut() else {
-            return;
-        };
-        if id.sealed.as_deref() == sealed.as_ref() {
-            return;
-        }
-        let lost = sealed.is_none();
-        id.sealed = sealed.map(Arc::new);
-        if lost {
-            sess.outbox.lose_sealed();
-        }
-        if sess.visible {
-            let ev = Event::Changed(sess.info.clone());
-            r.broadcast(&ev, None);
-            r.export_changed(uid);
-        }
+        set_sealed(&mut r, uid, sealed);
+        self.resume_locked(&mut r, uid, last_seq)
     }
 
     /// The certificate of the device `of`'s session proves now, for a
@@ -127,9 +117,7 @@ impl Core {
             .get(&of)
             .filter(|s| s.visible && s.mailbox() == owner)
             .ok_or(SealedError::NoSuchUser)?;
-        let device = sealed_of(target)
-            .filter(|d| d.expires > self.clock.unix())
-            .ok_or(SealedError::NotSealed)?;
+        let device = self.sealable(target).ok_or(SealedError::NotSealed)?;
         Ok(device.cert.clone())
     }
 
@@ -208,13 +196,21 @@ impl Core {
         target: &crate::roster::UserSession,
         sealed_to: &[u8; 32],
     ) -> Result<(), SealedError> {
-        let device = sealed_of(target)
-            .filter(|d| d.expires > self.clock.unix())
-            .ok_or(SealedError::NotSealed)?;
+        let device = self.sealable(target).ok_or(SealedError::NotSealed)?;
         if <[u8; 32]>::from(Sha256::digest(device.enc)) != *sealed_to {
             return Err(SealedError::CertChanged);
         }
         Ok(())
+    }
+
+    /// The device `target` can open sealed messages with now: unexpired,
+    /// and not a session a kick or a revocation has ended but whose
+    /// connection has yet to hear it (§4.2, §4.3).
+    fn sealable<'a>(&self, target: &'a crate::roster::UserSession) -> Option<&'a SealedDevice> {
+        if target.kicked || self.refuses_session(target) {
+            return None;
+        }
+        sealed_of(target).filter(|d| d.expires > self.clock.unix())
     }
 
     /// Whether `owner` refuses messages from `other`, with no lock held.
@@ -234,6 +230,28 @@ impl Core {
                 Err(SealedError::ServerError)
             }
         }
+    }
+}
+
+fn set_sealed(r: &mut crate::roster::RosterInner, uid: Uid, sealed: Option<SealedDevice>) {
+    let Some(sess) = r.users.get_mut(&uid) else {
+        return;
+    };
+    let Some(id) = sess.info.transport.identity.as_mut() else {
+        return;
+    };
+    if id.sealed.as_deref() == sealed.as_ref() {
+        return;
+    }
+    let lost = sealed.is_none();
+    id.sealed = sealed.map(Arc::new);
+    if lost {
+        sess.outbox.lose_sealed();
+    }
+    if sess.visible {
+        let ev = Event::Changed(sess.info.clone());
+        r.broadcast(&ev, None);
+        r.export_changed(uid);
     }
 }
 
