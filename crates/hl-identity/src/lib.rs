@@ -2,10 +2,12 @@
 //!
 //! The objects of `docs/hotline-ng-identity.md` §3, the login proof of
 //! `docs/hotline-ng-auth.md` §6.2, the registrar's objects of
-//! `docs/identity-registrar.md` §4 and the signed and sealed messages of
-//! `docs/e2e-messages.md` §3: keys, device certificates, user cards,
+//! `docs/identity-registrar.md` §4, the signed and sealed messages of
+//! `docs/e2e-messages.md` §3 and the server key handover of
+//! `docs/server-key-handover.md`: keys, device certificates, user cards,
 //! registrar attestations, login proofs, the requests, records and
-//! signed lists a registrar handles, and signed messages, with their
+//! signed lists a registrar handles, signed messages, and a server key's
+//! handover to its successor and a client's check of it, with their
 //! deterministic CBOR encoding and domain-separated Ed25519 signatures,
 //! and private messages sealed to a device with HPKE. No HTTP, no sockets,
 //! no storage — a server, a registrar, a proxy, a relay and a client all
@@ -18,9 +20,10 @@
 //! sequences, because the caller owns the clock, the trust list and the
 //! cache. [`verify_login`] is that sequence for the common case.
 //!
-//! Test vectors live in `docs/identity-test-vectors.json` and are checked
-//! by `tests/vectors.rs`; other implementations should check against the
-//! same file.
+//! Test vectors live in `docs/identity-test-vectors.json` and
+//! `docs/server-handover-vectors.json`, checked by `tests/vectors.rs` and
+//! `tests/server_handover.rs`; other implementations should check against
+//! the same files.
 
 pub mod attestation;
 pub mod bundle;
@@ -29,6 +32,7 @@ pub mod cbor;
 pub mod cert;
 pub mod enroll;
 mod error;
+pub mod handover;
 pub mod keys;
 pub mod message;
 mod names;
@@ -43,6 +47,7 @@ pub use card::Card;
 pub use cert::{caps, DeviceCert};
 pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
+pub use handover::Handover;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use message::{Article, ChatLine, PrivateMessage, Signed};
 pub use proof::{LoginProof, ServerChallenge};

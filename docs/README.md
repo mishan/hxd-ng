@@ -33,6 +33,8 @@ to another project.
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
 | [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |
 | [e2e-messages.md](e2e-messages.md) — messages signed by a device key (private messages, public chat, news) and private messages sealed to its `device_enc` key | no | ng | spec |
+| [server-key-handover.md](server-key-handover.md) — rotating the server key through a signed handover to a pre-committed successor, keeping the old key as an alias | the object and the client's check, in hl-identity; not the server's side | ng | spec |
+| [server-handover-vectors.json](server-handover-vectors.json) — handovers, challenges with `next`, and the client's decisions | yes | — | spec |
 | [push-notifications.md](push-notifications.md) — the notify decision, the subscriber model, and the multi-vendor sidecar | yes, through the Web Push gateway or a uniqush-push 2.11 sidecar; not the sidecar's APNs and FCM devices | ng | design |
 | [webpush-gateway.md](webpush-gateway.md) — the in-process Web Push sender and the device registry | yes | ng | design |
 
@@ -83,8 +85,9 @@ to another project.
 4. `news.md` §9–§10, `inline-media.md` §8, `moderation.md` §5,
    `voice.md` §6, `capabilities-video.md` — the ng request families,
    each in its own document.
-5. `identity-test-vectors.json` — check your objects against it before
-   anything else.
+5. `identity-test-vectors.json`, and `server-handover-vectors.json` for
+   a client that follows a handover — check your objects against them
+   before anything else.
 
 Everything else is how this server does it, and is worth reading for
 the reasoning but binds nobody.

@@ -162,6 +162,9 @@ pub struct ServerChallenge {
     pub server_key: PublicKey,
     pub host: String,
     pub expires: u64,
+    /// The commitment to the key that will follow `server_key`
+    /// (`server-key-handover.md` §2).
+    pub next: Option<[u8; 32]>,
 }
 
 impl ServerChallenge {
@@ -171,6 +174,7 @@ impl ServerChallenge {
         challenge: &[u8; 32],
         host: &str,
         expires: u64,
+        next: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, Error> {
         let unsigned = map(vec![
             ("v", Some(Value::Uint(signed::VERSION))),
@@ -178,6 +182,7 @@ impl ServerChallenge {
             ("server_key", Some(Value::Bytes(key.public().to_vec()))),
             ("host", Some(Value::Text(canonical(host)?))),
             ("expires", Some(Value::Uint(expires))),
+            ("next", next.map(|n| Value::Bytes(n.to_vec()))),
         ]);
         Ok(signed::seal(unsigned, |body| key.sign(SERVER_DOMAIN, body)))
     }
@@ -192,6 +197,7 @@ impl ServerChallenge {
             server_key: signed::bytes32(v, "server_key")?,
             host: host_field(v)?,
             expires: signed::uint(v, "expires")?,
+            next: signed::opt_bytes32(v, "next")?,
         };
         env.verify(&c.server_key, SERVER_DOMAIN)?;
         Ok(c)
@@ -391,7 +397,7 @@ mod tests {
         let other = ServerKey::from_seed(&[6u8; 32]).public();
         let ch = [0xabu8; 32];
         let c = ServerChallenge::parse(
-            &ServerChallenge::sign(&key, &ch, "A.example", NOW + 60).unwrap(),
+            &ServerChallenge::sign(&key, &ch, "A.example", NOW + 60, None).unwrap(),
         )
         .unwrap();
         assert_eq!(c.host, "a.example");
