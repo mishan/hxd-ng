@@ -62,6 +62,9 @@ pub const MAX_REPORT_REASON: usize = 1024;
 pub const MAX_NOTE: usize = 1024;
 /// Pasted evidence, in characters: a private message body's worth.
 pub const MAX_EVIDENCE: usize = 4096;
+/// Or in bytes, whichever allows more: a sealed message's text, which
+/// a deniable box's report pastes unsigned (`docs/e2e-messages.md` §4.12).
+pub const MAX_EVIDENCE_BYTES: usize = 8192;
 /// Reports one reporter may file in an hour (§4.4).
 pub const REPORTS_PER_HOUR: u32 = 10;
 /// Who a report closed with no moderator involved was closed by (§4.4).
@@ -1544,15 +1547,19 @@ impl Core {
         let store = self.moderation_store()?.clone();
         let why = reason(why, MAX_REPORT_REASON)?;
         let evidence = match &pasted {
-            Some(_)
-                if evidence
-                    .as_ref()
-                    .is_some_and(|e| e.chars().count() > MAX_EVIDENCE) =>
-            {
-                return Err(ModError::BadRequest("That evidence is too long."))
-            }
+            // Bounded by what its signature covers, which a sealed
+            // message's runs to 8192 bytes of (`docs/e2e-messages.md`
+            // §4.3), and never cut.
             Some(_) => evidence,
-            None => bounded(evidence, MAX_EVIDENCE, "That evidence is too long.")?,
+            None => match evidence
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) if t.chars().count() > MAX_EVIDENCE && t.len() > MAX_EVIDENCE_BYTES => {
+                    return Err(ModError::BadRequest("That evidence is too long."))
+                }
+                other => other,
+            },
         };
         let mut signed = None;
         let (reporter, keys) = {

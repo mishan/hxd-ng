@@ -24,6 +24,7 @@ mod registrar;
 pub mod registrars;
 mod registry;
 pub mod rooms;
+mod sealed;
 mod signed;
 
 use std::future::Future;

@@ -259,6 +259,10 @@ pub struct IdentityTag {
     /// (§4.6). What a room that requires signing asks (§4.8). Not shown
     /// to anyone.
     pub can_sign: bool,
+    /// The session can open sealed messages, with the device it proved
+    /// (`docs/e2e-messages.md` §4.1): shown as `sealed`, and what a box
+    /// to it must be sealed to.
+    pub sealed: Option<Arc<crate::sealed::SealedDevice>>,
 }
 
 impl IdentityTag {
@@ -436,6 +440,20 @@ pub enum Event {
         /// A signed message's detached form, as it came
         /// (`docs/e2e-messages.md` §4.9).
         signed: Option<Vec<u8>>,
+    },
+    /// A sealed private message (`docs/e2e-messages.md` §4.4), only ever
+    /// to the session of the device it was sealed to, and never stored.
+    Sealed {
+        from: Uid,
+        from_nick: String,
+        from_login: Option<String>,
+        /// The sender's identity, as the roster shows it.
+        from_fingerprint: [u8; 32],
+        /// The box exactly as it was sent; `None` once the session stopped
+        /// saying it can open one while this was held for it (§4.1).
+        sealed: Option<Vec<u8>>,
+        /// When this server received it.
+        at: std::time::SystemTime,
     },
     /// An administrator broadcast. Delivered to everyone, sender included
     /// (the wire push carries the sender, matching the reference server).
@@ -621,6 +639,16 @@ impl Event {
                     + from_login.as_ref().map_or(0, String::len)
                     + signed.as_ref().map_or(0, Vec::len)
             }
+            Event::Sealed {
+                from_nick,
+                from_login,
+                sealed,
+                ..
+            } => {
+                from_nick.len()
+                    + from_login.as_ref().map_or(0, String::len)
+                    + sealed.as_ref().map_or(0, Vec::len)
+            }
             Event::Broadcast {
                 from_nick, text, ..
             } => from_nick.len() + text.len(),
@@ -668,6 +696,7 @@ impl Event {
             Event::ChatUserJoined { .. } => "chat_user_joined",
             Event::ChatUserParted { .. } => "chat_user_parted",
             Event::Msg { .. } => "msg",
+            Event::Sealed { .. } => "sealed",
             Event::Broadcast { .. } => "broadcast",
             Event::Kicked => "kicked",
             Event::AccountChanged(..) => "account_changed",
@@ -744,6 +773,40 @@ impl Outbox {
         Outbox {
             next_seq: 1,
             sink: Sink::Live(tx, conn),
+        }
+    }
+
+    /// What a detached session holds of sealed messages, in bytes: from
+    /// `sender`, and in all. `None` while it is not detached.
+    pub(crate) fn sealed_held(&self, sender: &[u8; 32]) -> Option<(usize, usize)> {
+        let Sink::Buffering { buf, .. } = &self.sink else {
+            return None;
+        };
+        let held = buf.iter().filter_map(|se| match &se.event {
+            Event::Sealed {
+                from_fingerprint,
+                sealed: Some(b),
+                ..
+            } => Some((from_fingerprint == sender, b.len())),
+            _ => None,
+        });
+        Some(held.fold((0, 0), |(mine, all), (theirs, n)| {
+            (mine + if theirs { n } else { 0 }, all + n)
+        }))
+    }
+
+    /// Every sealed message held for a session that can no longer open
+    /// one becomes the placeholder, keeping its seq (§4.1).
+    pub(crate) fn lose_sealed(&mut self) {
+        let Sink::Buffering { buf, share, .. } = &mut self.sink else {
+            return;
+        };
+        for se in buf.iter_mut() {
+            if let Event::Sealed { sealed, .. } = &mut se.event {
+                if let Some(b) = sealed.take() {
+                    share.give(b.len());
+                }
+            }
         }
     }
 
@@ -862,6 +925,9 @@ pub(crate) struct UserSession {
     /// connection's, as the flood allowances are, so a resume carries on
     /// from where the dropped connection left it.
     pub(crate) requests: Option<crate::RateBucket>,
+    /// What it has left of `device_cert`'s ration (`crate::sealed`),
+    /// kept with the session for the same reason.
+    pub(crate) device_certs: Option<crate::RateBucket>,
     /// See [`AttachInfo::is_person`].
     pub(crate) is_person: bool,
     /// See [`AttachInfo::reads_on_delivery`].
@@ -1432,6 +1498,9 @@ pub struct Core {
     /// The time for whatever built on this core reads a clock
     /// (`crate::clock`).
     pub(crate) clock: crate::clock::Clock,
+    /// What a detached session holds of sealed messages
+    /// ([`Core::with_sealed_holds`]).
+    pub(crate) sealed_holds: crate::sealed::SealedHolds,
     /// Where the registrars' record lists are kept, beside the bans.
     pub(crate) record_cache: Option<Arc<dyn crate::identity_records::RecordCache>>,
     /// The audit trail and the reports, or `None` — in which case every
@@ -1907,6 +1976,11 @@ impl Core {
                     self.request_limits.requests_per,
                     Instant::now(),
                 ),
+                device_certs: crate::RateBucket::new(
+                    crate::sealed::DEVICE_CERTS,
+                    crate::sealed::DEVICE_CERTS_PER,
+                    Instant::now(),
+                ),
                 is_person: info.is_person,
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
@@ -2108,7 +2182,10 @@ impl Core {
 
     /// Re-attach a connection to a detached (or live — takeover) session.
     pub fn resume(&self, uid: Uid, last_seq: u64) -> Resume {
-        let mut r = self.roster.lock().unwrap();
+        self.resume_locked(&mut self.roster.lock().unwrap(), uid, last_seq)
+    }
+
+    pub(crate) fn resume_locked(&self, r: &mut RosterInner, uid: Uid, last_seq: u64) -> Resume {
         let Some(sess) = r.users.get_mut(&uid) else {
             return Resume::Gone;
         };

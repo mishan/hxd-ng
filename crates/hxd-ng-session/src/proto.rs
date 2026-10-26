@@ -32,6 +32,9 @@ pub struct LoginParams {
     pub icon: Option<u16>,
     /// Whether the client signs (`docs/e2e-messages.md` §4.6).
     pub signs: Option<Signs>,
+    /// Whether it can open sealed messages (§4.1).
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +44,8 @@ pub struct ResumeParams {
     #[serde(default)]
     pub last_seq: u64,
     pub signs: Option<Signs>,
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 /// `signs` on `login` and `resume`: any other value is `bad_request`,
@@ -111,7 +116,9 @@ pub struct MsgParams {
     pub to: Option<u16>,
     #[serde(default)]
     pub to_login: Option<String>,
-    pub text: String,
+    /// Absent only beside `sealed`, which carries a message in its place.
+    #[serde(default)]
+    pub text: Option<String>,
     /// The client's own id for this message. Sending it again with the
     /// same guid is the same message — stored once — which is what makes
     /// a retry safe after a socket died between the send and the reply.
@@ -129,6 +136,12 @@ pub struct MsgParams {
     /// §4.9).
     #[serde(default)]
     pub signed: Option<String>,
+    /// A sealed message, base64url, and the SHA-256 of the `device_enc`
+    /// key it was sealed to (§4.3).
+    #[serde(default)]
+    pub sealed: Option<String>,
+    #[serde(default)]
+    pub cert: Option<String>,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -626,6 +639,9 @@ impl serde::Serialize for UserOut<'_> {
             if id.signs {
                 identity["signs"] = json!(true);
             }
+            if id.sealed.is_some() {
+                identity["sealed"] = json!(true);
+            }
             m.serialize_entry("identity", &identity)?;
         }
         m.end()
@@ -781,6 +797,35 @@ pub fn event_json(se: &SeqEvent) -> String {
             }
             if let Some(signed) = signed {
                 data["signed"] = json!(b64url(signed));
+            }
+            ("msg", data)
+        }
+        // `id` and `queued: true` never: a sealed message is never stored.
+        Event::Sealed {
+            from,
+            from_nick,
+            from_login,
+            from_fingerprint,
+            sealed,
+            at,
+        } => {
+            let mut from_obj = json!({
+                "uid": from,
+                "nick": from_nick,
+                "fingerprint": hl_identity::Fingerprint(*from_fingerprint).to_string(),
+            });
+            if let Some(login) = from_login {
+                from_obj["login"] = json!(login);
+            }
+            let mut data = json!({
+                "from": from_obj,
+                "text": "[Encrypted message]",
+                "at": unix(*at),
+                "queued": false,
+            });
+            match sealed {
+                Some(sealed) => data["sealed"] = json!(b64url(sealed)),
+                None => data["sealed_lost"] = json!(true),
             }
             ("msg", data)
         }
@@ -1068,6 +1113,7 @@ mod tests {
                     quiet_until: None,
                     signs: false,
                     can_sign: false,
+                    sealed: None,
                 }),
                 ..Default::default()
             },

@@ -181,6 +181,11 @@ pub struct TransportIdentity {
     /// stops buzzing without anyone remembering to unregister it
     /// (push-notifications.md §5.1).
     pub device_expires: u64,
+    /// The certificate as it was proved, and its `device_enc` key: what a
+    /// sealed message to this device is sealed to
+    /// (`docs/e2e-messages.md` §4.2).
+    pub device_cert: Vec<u8>,
+    pub device_enc: [u8; 32],
     /// The linked account's login when `outcome` is `Linked` or
     /// `Created`. The application login re-reads the account; this is
     /// which one.
@@ -216,6 +221,7 @@ impl TransportIdentity {
             quiet_until: self.quiet_until,
             signs: false,
             can_sign: false,
+            sealed: None,
         }
     }
 }
@@ -1105,6 +1111,8 @@ impl IdentityState {
             outcome,
             device_caps: cert.caps,
             device_expires: cert.expires,
+            device_cert: cert_bytes.clone(),
+            device_enc: cert.device_enc,
             account,
             downstream_cleartext: req.downstream == Downstream::Cleartext,
             quiet_until,
@@ -2714,6 +2722,8 @@ mod tests {
             outcome: Outcome::Guest,
             device_caps: None,
             device_expires: u64::MAX,
+            device_cert: Vec::new(),
+            device_enc: [0; 32],
             account: None,
             downstream_cleartext: false,
             quiet_until: None,

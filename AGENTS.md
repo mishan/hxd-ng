@@ -54,7 +54,7 @@ been exercised on newer toolchains; CI runs stable.
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
-| `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
+| `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share), and the signed messages of `docs/e2e-messages.md` §3 (`message.rs`) and their sealing with HPKE (`sealed.rs`) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, user groups (`users.rs`), the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins, the task fanning the core's export feed out to the links, and each link's ghosts), one session loop per link, and the dialer. Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
 | `hl-tunnel` | `WsByteStream`: a WebSocket whose binary frames carry a classic byte stream, as `AsyncRead + AsyncWrite`, with the keep-alive ping and the silence deadline. What the ng port's `/trtp` and `/htxf` and `hlrelay` all run the classic protocol over. |
@@ -388,11 +388,21 @@ Three layers, all `cargo test --workspace`:
   `signature_required` or `read_only` by the gates, `may_post` false
   for a session that cannot sign, and a period client reading it as
   read-only, told once and its lines dropped; and a linked server
-  offering none), `voice.rs` (voice signaling on both wires against a
-  recording media layer: the capability and privilege gates, the chunk
-  and JSON shapes, one room shared by a classic and an ng client, joins
-  past a session's allowance refused on each wire while leaves never
-  are, and a burst of mute flips announced once with its final state),
+  offering none), `sealed.rs` (sealed messages sealed and opened with
+  hl-identity's own API: a signed box and a deniable one reaching the
+  device they were sealed to and not its other session, `device_cert`
+  answering each device's own certificate and refusing by its rules and
+  its ration, every check of a `msg` refused by name, a box held for a
+  detached session and handed over at its resume, one sender held to
+  its share and everyone to the whole, a certificate past its expiry
+  sealed to no more, the placeholders a resume without `sealed`
+  replays, the reports a deniable box and a signed one make at full
+  length, and nothing sealed in any file of the database), `voice.rs`
+  (voice signaling on both wires against a recording media layer: the
+  capability and privilege gates, the chunk and JSON shapes, one room
+  shared by a classic and an ng client, joins past a session's
+  allowance refused on each wire while leaves never are, and a burst of
+  mute flips announced once with its final state),
   `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line

@@ -247,6 +247,10 @@ pub struct DeviceOnSocket {
     /// session signs must be signed by (`docs/e2e-messages.md` §4.11).
     pub(crate) identity: hl_identity::Fingerprint,
     pub(crate) key: hl_identity::PublicKey,
+    /// The device as a session that says it can open sealed messages
+    /// offers it: only one whose certificate allows messages and is at
+    /// most 512 bytes (`docs/e2e-messages.md` §4.1).
+    pub(crate) sealable: Option<hxd_core::SealedDevice>,
 }
 
 impl DeviceOnSocket {
@@ -254,6 +258,13 @@ impl DeviceOnSocket {
         DeviceOnSocket {
             identity: identity.fingerprint,
             key: identity.device,
+            sealable: (identity.allows(hl_identity::caps::MESSAGE)
+                && identity.device_cert.len() <= 512)
+                .then(|| hxd_core::SealedDevice {
+                    cert: identity.device_cert.clone(),
+                    enc: identity.device_enc,
+                    expires: identity.device_expires,
+                }),
             devid: DeviceId::of_device(&hl_identity::Fingerprint::of(&identity.device).0),
             may_message: identity.allows(hl_identity::caps::MESSAGE),
             may_manage: identity.allows(hl_identity::caps::MANAGE),

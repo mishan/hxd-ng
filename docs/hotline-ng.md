@@ -275,7 +275,8 @@ Starts a new session.
     "password": "…",         // omit for password-less accounts
     "nick": "Alice",         // honored only with the use-any-name privilege
     "icon": 128,             // classic icon id; optional
-    "signs": "default"       // optional: "default" | "able" (e2e-messages.md §4.6)
+    "signs": "default",      // optional: "default" | "able" (e2e-messages.md §4.6)
+    "sealed": true           // optional: it can open sealed messages (e2e-messages.md §4.1)
 } }
 ```
 
@@ -310,6 +311,7 @@ hotline-ng-identity.md §8.1 says.
 | `caps` | §4. |
 | `seq` | The seq the client is at: 0 for a new session. |
 | `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
+| `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
 who is present, and every event that follows is a change to it.
@@ -346,6 +348,10 @@ Attaches this connection to an existing session.
   that leaves out `"default"` takes `signs` off the roster row
   (`user_changed`). A reply that resumes (`ok`, not
   `resync_required`) echoes it as the login reply does.
+- `sealed` is too: a resume without it loses `sealed`, and every sealed
+  message held for the session is replayed as `msg` with `sealed_lost`
+  in its place (e2e-messages.md §4.1). *hxd-ng:* a session's device is
+  the one it logged in with, whatever a resuming socket proves.
 - On success the reply's `replay` is the number of buffered events that
   follow it, in seq order, before any live event. `self` is the session's
   `user` object as it is now.
@@ -640,7 +646,8 @@ family document. Each family of §4 adds its own.
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?` | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `server_error` |
+| `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -693,6 +700,12 @@ family document. Each family of §4 adds its own.
   line it repeats, and so is a signed `msg` under a guid its sender used
   toward someone else, as far as the server remembers: where it stores
   messages. *hxd-ng:* it costs one more against the request limit (§9).
+- **`sealed`** on `msg` is a sealed message, and **`device_cert`** the
+  certificate to seal one to, as e2e-messages.md §4.2 and §4.3 have
+  them: from and to sessions that said `sealed` (§6.1), never stored
+  and never queued, so `queued` is always `false`. *hxd-ng:* a sealed
+  `msg` costs one more against the request limit for each 2048 bytes of
+  its box, and `device_cert` 4, rationed on top at 20 a minute (§9).
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -749,7 +762,7 @@ blind (identity-registrar.md §7.3).
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login? }, "text", "at", "queued", "id"?, "media"?, "signed"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). |
+| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "media"?, "signed"?, "sealed"?, "sealed_lost"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
@@ -786,7 +799,7 @@ counts in §3's sequence.
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
 | `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged}`, the home server's name and tag and whether this server puts the tag in its users' names. A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
-| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6). |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6), and `sealed: true` that it can open sealed messages (§4.1). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
@@ -857,12 +870,12 @@ news body is different: it declares its own type (news.md §5).
   renegotiates media costs 4: `news_post`, `news_delete`,
   `news_node_create`, `news_node_rename`, `news_node_delete`,
   `news_search`, `voice_join`, `voice_leave`, `video_start`,
-  `video_stop`, `video_subscribe`, `push_register`, `report` and
-  `purge`. Every other request, the reads and a trickled `voice_ice`
-  candidate among them, costs 1, and only `logout` is free. A request
-  the bucket cannot pay for costs nothing, and is answered
-  `rate_limited` with `retry_after`, the whole seconds until it could
-  be. The bucket is the session's rather than the connection's: it is
+  `video_stop`, `video_subscribe`, `push_register`, `report`,
+  `purge` and `device_cert`. Every other request, the reads and a
+  trickled `voice_ice` candidate among them, costs 1, and only `logout`
+  is free. A request the bucket cannot pay for costs nothing, and is
+  answered `rate_limited` with `retry_after`, the whole seconds until it
+  could be. The bucket is the session's rather than the connection's: it is
   filled at login and kept across a detach, so a resume finds it as the
   dropped connection left it rather than refilled. An account with
   `[extra] can_spam` is held to none, as it is held to no flood budget.
@@ -874,8 +887,8 @@ news body is different: it declares its own type (news.md §5).
   `folder_seconds`, five hundred and then one each ten seconds, counted
   with the classic wire's New Folder and folder uploads), past which
   `files_mkdir` is too; and
-  `history`, `news_search`, media and news-attachment uploads (asked
-  before the body is read), media and news-image downloads, avatar
+  `history`, `news_search`, `device_cert`, media and news-attachment
+  uploads (asked before the body is read), media and news-image downloads, avatar
   fetches and enrollment have limits of their own. Login attempts are
   limited per address and login: past `[limits] login_failures` wrong
   passwords for one login — here, on the classic wire, or at
@@ -964,13 +977,15 @@ news body is different: it declares its own type (news.md §5).
 | `too_many_rooms` | `room_join` | This session is in as many rooms as it may be. |
 | `rooms_full` | `room_create` | The server holds as many rooms as it may. |
 | `name_taken` | `room_create`, `room_edit` | A room has that name already. |
-| `no_such_user` | `msg`, `block`, `unblock` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
+| `no_such_user` | `msg`, `block`, `unblock`, `device_cert` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
-| `mailbox_full` | `msg` | The recipient's inbox is at its cap. |
+| `mailbox_full` | `msg` | The recipient's inbox is at its cap, or for a sealed message, the detached recipient holds as many as it may (e2e-messages.md §4.3; *hxd-ng:* `[sealed]`). |
 | `quota_exceeded` | `msg` | The recipient is not connected, and you have stored as much mail today as the server allows. To someone connected, the same message is delivered. *hxd-ng:* `[inbox] max_sent_per_day` and `max_sent_bytes_per_day`. |
-| `blocked` | `msg` | The recipient blocks you. |
+| `blocked` | `msg`, `device_cert` | The recipient blocks you. |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
+| `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3). *hxd-ng:* and a user of a linked server, until links carry them. |
+| `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). |
 | `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
 
 The files codes are §7.2's. Each family's document lists its own. A
