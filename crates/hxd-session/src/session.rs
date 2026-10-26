@@ -4773,7 +4773,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             // A user of another server: answered when that server answers,
             // on a task of its own, since a reply carries its task ID.
-            if let Some(answer) = ctx.core.peer_msg(sess.uid, to, &body, media.is_some()) {
+            if let Some(answer) = ctx
+                .core
+                .peer_msg(sess.uid, to, &body, media.is_some(), None)
+            {
                 let (tx, trans) = (tx.clone(), f.trans);
                 tokio::spawn(async move {
                     match peer_answer(answer).await {
@@ -5632,6 +5635,8 @@ mod tests {
                 tagged: true,
                 refuses_msgs: true,
                 transport: None,
+                fingerprint: None,
+                server_key: None,
             }),
         };
         let long = "\u{3042}".repeat(12);

@@ -4149,7 +4149,6 @@ pub fn build_ng_ctx(
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
             http_limits: config.limits.http_limits()?,
-            linked: config.link.is_some(),
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -4816,6 +4815,7 @@ sync = "full"
         // One file, two connections, each writing and reading its own.
         let id = history
             .append(&NewLine {
+                home_key: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "n".into(),

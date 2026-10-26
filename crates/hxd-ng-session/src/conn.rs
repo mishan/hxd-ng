@@ -1883,19 +1883,45 @@ async fn dispatch(
                     .await;
                 }
                 let from = state.uid;
+                let (signed, link) = match signed {
+                    Some((signed, link)) => (Some(signed), link),
+                    None => (None, None),
+                };
                 let outcome = match (p.to, p.to_login.clone()) {
                     (Some(uid), None) => {
-                        // A link does not carry a signature yet, and a
-                        // signed message never crosses without one
-                        // (`docs/e2e-messages.md` §4.11).
-                        if signed.is_some() && ctx.core.is_ghost(uid) {
-                            let why = "Signed messages do not cross this link.";
-                            return finish(ws_tx, reply_err(req.id, "not_delivered", why)).await;
+                        // To a ghost, signed to the identity its home
+                        // server says it proved, which checks it (§4.9,
+                        // §5); and never without its signature (§4.11).
+                        if let Some(signed) = signed.as_ref().filter(|_| ctx.core.is_ghost(uid)) {
+                            let out = match ctx.core.ghost_fingerprint(uid) {
+                                None => Some(reply_err(
+                                    req.id,
+                                    "bad_request",
+                                    "That user proved no identity to sign a message to.",
+                                )),
+                                Some(fp) if fp != signed.to => Some(reply_err(
+                                    req.id,
+                                    "bad_signature",
+                                    "Signed to someone else.",
+                                )),
+                                Some(_) if link.is_none() => Some(reply_err(
+                                    req.id,
+                                    "not_delivered",
+                                    "That signed message is too large to cross a link.",
+                                )),
+                                Some(_) => None,
+                            };
+                            if let Some(out) = out {
+                                return finish(ws_tx, out).await;
+                            }
                         }
                         // A user of another server, answered here and now:
                         // replies keep their requests' order (§5), and the
                         // wait is bounded by `PEER_WAIT`.
-                        if let Some(answer) = ctx.core.peer_msg(from, uid, &text, media.is_some()) {
+                        if let Some(answer) =
+                            ctx.core
+                                .peer_msg(from, uid, &text, media.is_some(), link.clone())
+                        {
                             let wait = hxd_core::server_link::PEER_WAIT;
                             let answer = tokio::select! {
                                 answer = tokio::time::timeout(wait, answer) => answer,

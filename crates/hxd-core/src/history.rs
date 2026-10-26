@@ -89,6 +89,9 @@ pub struct NewLine {
     /// `from_fingerprint` and its id `guid`'s, which the frontend that
     /// checked it made sure of.
     pub signed: Option<Signature>,
+    /// For a linked server's user's signed line, its home server's key,
+    /// which the line's scope names (`docs/e2e-messages.md` §5).
+    pub home_key: Option<[u8; 32]>,
 }
 
 /// A signed line's or message's detached form
@@ -148,6 +151,8 @@ pub struct LogLine {
     pub media: Option<MediaMeta>,
     /// The detached form a signed line came with, until it is redacted.
     pub signed: Option<Vec<u8>>,
+    /// [`NewLine::home_key`].
+    pub home_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +282,12 @@ pub trait ChatLog: Send + Sync + 'static {
     fn set_room_mark(&self, room: u32, signed: bool) -> Result<(), StoreError>;
     /// Does `channel` hold a line that is neither signed nor a tombstone?
     fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError>;
+    /// Replace a signed line's form with `form`: a linked server's line
+    /// logged in its link form, once its certificate is held. A
+    /// tombstone keeps none.
+    fn restore_signed(&self, id: LineId, form: &[u8]) -> Result<(), StoreError>;
+    /// Does a line keep `key` as its home server's ([`NewLine::home_key`])?
+    fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError>;
 }
 
 #[derive(Default)]
@@ -320,6 +331,7 @@ impl MemoryInner {
             at: line.at,
             media: None,
             signed: line.signed.as_ref().map(|s| s.form.clone()),
+            home_key: line.home_key,
         });
         if let Some(key) = line.ghost {
             self.ghosts.insert(id, key);
@@ -538,6 +550,24 @@ impl ChatLog for MemoryLog {
             l.channel == channel && l.signed.is_none() && !l.flags.contains(LineFlags::DELETED)
         }))
     }
+
+    fn restore_signed(&self, id: LineId, form: &[u8]) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(signed) = inner
+            .lines
+            .iter_mut()
+            .find(|l| l.id == id)
+            .and_then(|l| l.signed.as_mut())
+        {
+            *signed = form.to_vec();
+        }
+        Ok(())
+    }
+
+    fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.lines.iter().any(|l| l.home_key == Some(*key)))
+    }
 }
 
 pub mod conformance {
@@ -545,6 +575,7 @@ pub mod conformance {
 
     fn line(n: u64) -> NewLine {
         NewLine {
+            home_key: None,
             channel: 0,
             ghost: None,
             from_nick: format!("user-{n}"),
@@ -580,6 +611,42 @@ pub mod conformance {
         a_line_is_found_by_its_guid_once(new_log());
         a_signed_line_is_found_by_its_signer_in_any_channel(new_log());
         a_rooms_mark_is_kept_and_its_unsigned_lines_are_found(new_log());
+        a_linked_lines_signature_is_restored_beside_its_home_key(new_log());
+    }
+
+    /// A linked server's signed line, logged in its link form with its
+    /// home server's key, takes its whole form once its certificate is
+    /// held (`docs/e2e-messages.md` §5); a tombstone takes none.
+    fn a_linked_lines_signature_is_restored_beside_its_home_key(log: Box<dyn ChatLog>) {
+        let linked = |n| NewLine {
+            ghost: Some([n as u8; 16]),
+            from_login: None,
+            from_fingerprint: None,
+            signed: Some(Signature {
+                form: vec![0xa5, n as u8],
+                content: [n as u8; 32],
+            }),
+            home_key: Some([7; 32]),
+            ..line(n)
+        };
+        let (kept, redacted) = (
+            log.append(&linked(1)).unwrap(),
+            log.append(&linked(2)).unwrap(),
+        );
+        assert!(log.holds_home_key(&[7; 32]).unwrap());
+        assert!(!log.holds_home_key(&[8; 32]).unwrap());
+        assert!(log
+            .tombstone(redacted, "mod", SystemTime::UNIX_EPOCH)
+            .unwrap());
+        for id in [kept, redacted] {
+            log.restore_signed(id, &[0xa5, 0xff]).unwrap();
+        }
+        let line = log.line(kept).unwrap().unwrap();
+        assert_eq!(
+            (line.signed, line.home_key),
+            (Some(vec![0xa5, 0xff]), Some([7; 32]))
+        );
+        assert_eq!(log.line(redacted).unwrap().unwrap().signed, None);
     }
 
     /// What a room that requires signing is held to across restarts

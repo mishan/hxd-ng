@@ -27,6 +27,8 @@ pub mod tx {
     pub const SERVERS: u32 = 912;
     pub const SERVER_UPDATE: u32 = 913;
     pub const SERVER_GONE: u32 = 914;
+    /// The user keys draft's, reserved for it and not adopted.
+    pub const DEVICE_KEYS: u32 = 915;
 }
 
 pub mod field {
@@ -59,6 +61,16 @@ pub mod field {
     /// The user transport draft's, reserved for it and not adopted: how a
     /// user is connected to their home server.
     pub const USER_TRANSPORT: u16 = 0x0645;
+    /// The user keys draft's, reserved for it and not adopted: a user's
+    /// identity fingerprint, a device certificate, a sealed message and
+    /// the key it was sealed to, a signed message's link form, and a
+    /// server's discovery key.
+    pub const USER_KEY: u16 = 0x0642;
+    pub const DEVICE_CERT: u16 = 0x0643;
+    pub const SEALED: u16 = 0x0644;
+    pub const SEALED_TO: u16 = 0x0646;
+    pub const SIGNED: u16 = 0x0647;
+    pub const DISCOVERY_KEY: u16 = 0x0648;
     pub use hxd_session::peer::field::{KEY_PROOF, SERVER_KEY};
 }
 
@@ -67,6 +79,8 @@ pub mod feature {
     pub const PRIVATE_MESSAGES: u32 = 1 << 1;
     pub const USER_INFO: u32 = 1 << 2;
     pub const TRANSIT: u32 = 1 << 3;
+    /// The user keys draft's: Link Device Keys crosses the link.
+    pub const USER_KEYS: u32 = 1 << 4;
 }
 
 /// `DATA_LINK_REASON`.
@@ -86,6 +100,9 @@ pub enum Reason {
     Banned = 10,
     InvalidRequester = 11,
     RefusedFields = 12,
+    /// The user keys draft's.
+    NoDeviceKeys = 13,
+    BadSignature = 14,
     Shutdown = 16,
     Unlinked = 17,
     ProtocolError = 18,
@@ -114,6 +131,8 @@ impl Reason {
             10 => Banned,
             11 => InvalidRequester,
             12 => RefusedFields,
+            13 => NoDeviceKeys,
+            14 => BadSignature,
             16 => Shutdown,
             17 => Unlinked,
             18 => ProtocolError,

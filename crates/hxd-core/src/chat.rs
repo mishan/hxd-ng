@@ -294,10 +294,19 @@ pub(crate) struct Staged {
     /// The client's id for the line, and who it is held under.
     guid: Option<GuidKey>,
     signed: Option<Signature>,
+    /// A signed lobby line's link form, the only form it may cross a
+    /// link in (`docs/e2e-messages.md` §4.11).
+    link: Option<crate::server_link::LinkForm>,
 }
 
 impl Staged {
-    pub(crate) fn ghost(info: UserInfo, key: [u8; 16], text: String, style: u16) -> Staged {
+    pub(crate) fn ghost(
+        info: UserInfo,
+        key: [u8; 16],
+        text: String,
+        style: u16,
+        signed: Option<Signature>,
+    ) -> Staged {
         Staged {
             info,
             login: None,
@@ -309,7 +318,8 @@ impl Staged {
             media: None,
             at: SystemTime::now(),
             guid: None,
-            signed: None,
+            signed,
+            link: None,
         }
     }
 }
@@ -664,6 +674,14 @@ pub enum ChatError {
     ServerError,
 }
 
+/// A signed public line's signature and, for a lobby line that can
+/// take one, its link form (`docs/e2e-messages.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedLine {
+    pub signature: Signature,
+    pub link: Option<crate::server_link::LinkForm>,
+}
+
 /// A signed private message's signature, and the recipient fingerprint
 /// it names (`docs/e2e-messages.md` §3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,7 +766,7 @@ impl Core {
         room: u32,
         line: (String, u16, Option<crate::media::Handle>),
         guid: Option<MessageGuid>,
-        signed: Option<Signature>,
+        signed: Option<SignedLine>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
         self.chat_public_lines(from, room, vec![(line, guid, signed)])
             .pop()
@@ -845,7 +863,7 @@ impl Core {
         lines: Vec<(
             (String, u16, Option<crate::media::Handle>),
             Option<MessageGuid>,
-            Option<Signature>,
+            Option<SignedLine>,
         )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
@@ -866,6 +884,10 @@ impl Core {
         // been sent one at a time.
         let mut tipped = None;
         for (i, ((mut text, style, media), guid, signed)) in lines.into_iter().enumerate() {
+            let (signed, link) = match signed {
+                Some(s) => (Some(s.signature), s.link),
+                None => (None, None),
+            };
             // Neither counted as a line nor answered as a repeat
             // (`docs/e2e-messages.md` §4.8).
             if signed_only && signed.is_none() {
@@ -965,6 +987,7 @@ impl Core {
                 at: SystemTime::now(),
                 guid,
                 signed,
+                link,
             });
             at.push(i);
         }
@@ -989,11 +1012,14 @@ impl Core {
 
     /// Ghosts' lines, logged together in their order: a link's lines come
     /// to one task that logs them, and handed over one at a time they
-    /// would each take a commit of their own.
-    pub fn ghost_chat_all(&self, lines: Vec<crate::server_link::GhostLine>) {
-        let _ = self
-            .chat_commit
-            .submit_all(self, lines.into_iter().map(|l| l.0).collect());
+    /// would each take a commit of their own. Answers each line's id in
+    /// the log, as a local line's is.
+    pub fn ghost_chat_all(
+        &self,
+        lines: Vec<crate::server_link::GhostLine>,
+    ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
+        self.chat_commit
+            .submit_all(self, lines.into_iter().map(|l| l.0).collect())
     }
 
     /// Log a batch of `room`'s lines in one commit and relay them in
@@ -1119,6 +1145,11 @@ impl Core {
                                 _ => None,
                             },
                             signed: s.signed.clone(),
+                            home_key: s
+                                .signed
+                                .as_ref()
+                                .and(s.info.remote.as_ref())
+                                .and_then(|r| r.server_key),
                         }
                     })
                     .collect();
@@ -1179,6 +1210,9 @@ impl Core {
         for (i, id) in heard {
             let s = batch[i].take().expect("each line relayed once");
             let sender = s.info.uid;
+            // A signed line crosses a link with its signature or not at
+            // all (`docs/e2e-messages.md` §4.11).
+            let crosses = s.signed.is_none() || s.link.is_some();
             let ev = Event::Chat {
                 cid: room,
                 from: s.info,
@@ -1225,8 +1259,8 @@ impl Core {
                     from, text, style, ..
                 } = &ev
                 {
-                    if s.principal.is_some() && !text.is_empty() {
-                        r.export_chat(from.uid, text, *style);
+                    if s.principal.is_some() && !text.is_empty() && crosses {
+                        r.export_chat(from.uid, text, *style, s.link.clone());
                     }
                 }
                 s.media
@@ -3174,6 +3208,16 @@ mod tests {
         fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
             self.inner.holds_unsigned(channel)
         }
+        fn restore_signed(
+            &self,
+            id: crate::history::LineId,
+            form: &[u8],
+        ) -> Result<(), StoreError> {
+            self.inner.restore_signed(id, form)
+        }
+        fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+            self.inner.holds_home_key(key)
+        }
         fn attach_media(
             &self,
             id: crate::history::LineId,
@@ -3252,7 +3296,7 @@ mod tests {
             let core = core.clone();
             std::thread::spawn(move || {
                 let lines = (0..n)
-                    .map(|i| Staged::ghost(ghost.clone(), [7; 16], format!("g {i}"), 0))
+                    .map(|i| Staged::ghost(ghost.clone(), [7; 16], format!("g {i}"), 0, None))
                     .collect();
                 core.chat_commit.submit_all(&core, lines)
             })
@@ -3421,6 +3465,16 @@ mod tests {
         }
         fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
             self.inner.holds_unsigned(channel)
+        }
+        fn restore_signed(
+            &self,
+            id: crate::history::LineId,
+            form: &[u8],
+        ) -> Result<(), StoreError> {
+            self.inner.restore_signed(id, form)
+        }
+        fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+            self.inner.holds_home_key(key)
         }
         fn attach_media(
             &self,
@@ -3739,6 +3793,16 @@ mod tests {
         fn holds_unsigned(&self, channel: u32) -> Result<bool, StoreError> {
             self.0.holds_unsigned(channel)
         }
+        fn restore_signed(
+            &self,
+            id: crate::history::LineId,
+            form: &[u8],
+        ) -> Result<(), StoreError> {
+            self.0.restore_signed(id, form)
+        }
+        fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+            self.0.holds_home_key(key)
+        }
     }
 
     /// A line the log already holds under its guid, which nothing before
@@ -3750,6 +3814,7 @@ mod tests {
         let log = Arc::new(ForgetfulLog(Default::default()));
         let id = log
             .append(&NewLine {
+                home_key: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "alice".into(),

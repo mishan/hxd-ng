@@ -117,6 +117,12 @@ impl ServerGroup {
         admissible_extra(&self.extra)
     }
 
+    /// `DATA_LINK_DISCOVERY_KEY`: the key the server publishes in
+    /// Hotline-ng discovery, which its users' signed lines are scoped to.
+    pub fn discovery_key(&self) -> Option<[u8; 32]> {
+        crate::wire::find(&self.extra, field::DISCOVERY_KEY).and_then(Field::fixed)
+    }
+
     pub fn to_fields(&self) -> Vec<Field> {
         let mut f = vec![
             Field::new(field::SERVER_ID, self.id.0),

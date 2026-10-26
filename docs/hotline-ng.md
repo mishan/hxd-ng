@@ -180,7 +180,7 @@ over them.
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
-| `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts`; *hxd-ng:* and not with `[link]` configured, until links carry signatures | e2e-messages.md §4.6 | `signs`, echoed |
+| `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -706,6 +706,9 @@ family document. Each family of §4 adds its own.
   and never queued, so `queued` is always `false`. *hxd-ng:* a sealed
   `msg` costs one more against the request limit for each 2048 bytes of
   its box, and `device_cert` 4, rationed on top at 20 a minute (§9).
+  To a user of a linked server, both go by its home server, which checks
+  the key a box was sealed to (e2e-messages.md §5), over a link trying
+  the user keys draft and no other.
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -758,7 +761,7 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"? }` | A line of public chat. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7). |
+| `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held; such a `history` line's `from` carries `remote: { server_key }`, the key it was checked against. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
@@ -798,8 +801,8 @@ counts in §3's sequence.
 | `admin` | The user may disconnect other users: the classic wire's admin color. |
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
-| `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged}`, the home server's name and tag and whether this server puts the tag in its users' names. A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
-| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1). It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6), and `sealed: true` that it can open sealed messages (§4.1). |
+| `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged, server_key?}`, the home server's name and tag, whether this server puts the tag in its users' names, and the home server's discovery key, base64url, when it said one over a link trying the user keys draft (server-link.md §7.7), which its signed lines are scoped to (e2e-messages.md §5). A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}` alone, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6), and `sealed: true` that it can open sealed messages (§4.1). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
@@ -984,7 +987,7 @@ news body is different: it declares its own type (news.md §5).
 | `blocked` | `msg`, `device_cert` | The recipient blocks you. |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
-| `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3). *hxd-ng:* and a user of a linked server, until links carry them. |
+| `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3), or a user of a linked server behind a link that does not carry them. |
 | `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). |
 | `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
 

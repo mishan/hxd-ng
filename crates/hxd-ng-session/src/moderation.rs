@@ -363,7 +363,19 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 }
                 Some(signed) => {
                     match crate::signed::pasted(ctx, state, p.evidence.as_deref(), signed) {
-                        Ok(pasted) => Some(pasted),
+                        Ok(pasted) => {
+                            // A linked server's line, under a key this
+                            // server vouched for when it showed one.
+                            if let Some(key) = pasted.elsewhere {
+                                if off_reactor(core, move |c| c.knows_server_key(&key)).await
+                                    != Some(true)
+                                {
+                                    let text = "Signed for a server this one does not know.";
+                                    return reply_err(id, "bad_signature", text);
+                                }
+                            }
+                            Some(pasted)
+                        }
                         Err(refused) => return refused.reply(id),
                     }
                 }

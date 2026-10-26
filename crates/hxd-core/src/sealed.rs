@@ -255,6 +255,6 @@ fn set_sealed(r: &mut crate::roster::RosterInner, uid: Uid, sealed: Option<Seale
     }
 }
 
-fn sealed_of(sess: &crate::roster::UserSession) -> Option<&SealedDevice> {
+pub(crate) fn sealed_of(sess: &crate::roster::UserSession) -> Option<&SealedDevice> {
     sess.info.transport.identity.as_ref()?.sealed.as_deref()
 }

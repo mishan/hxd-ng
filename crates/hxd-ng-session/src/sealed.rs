@@ -5,6 +5,7 @@
 //! holds, which it has no key to read.
 
 use hl_identity::sealed::{check_len, sender_enc};
+use hxd_core::server_link::PeerRefusal;
 use hxd_core::{SealedDevice, SealedError};
 use serde::Deserialize;
 use serde_json::json;
@@ -56,14 +57,31 @@ fn refused(id: u64, e: SealedError) -> String {
     }
 }
 
-/// Nothing sealed crosses a link yet (§5), so no ghost can be one to
-/// seal to.
-fn across_link(id: u64) -> String {
-    reply_err(
-        id,
-        "not_sealed",
-        "Sealed messages do not cross links to other servers yet.",
-    )
+/// What a ghost's home server, or a link on the way, answered (§5).
+fn across_link(id: u64, why: PeerRefusal) -> String {
+    match why {
+        PeerRefusal::NoDeviceKeys => {
+            reply_err(id, "not_sealed", "That user cannot open sealed messages.")
+        }
+        PeerRefusal::CannotCross => reply_err(
+            id,
+            "not_sealed",
+            "Sealed messages do not cross the link to that user's server.",
+        ),
+        why => reply_err(id, "not_delivered", why.text()),
+    }
+}
+
+/// A linked server's answer, waited for as long as an answer over a link
+/// is.
+async fn peer_answer<T>(
+    answer: tokio::sync::oneshot::Receiver<Result<T, PeerRefusal>>,
+) -> Result<T, PeerRefusal> {
+    match tokio::time::timeout(hxd_core::server_link::PEER_WAIT, answer).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(PeerRefusal::Unreachable),
+        Err(_) => Err(PeerRefusal::Unanswered),
+    }
 }
 
 fn unb64(s: &str) -> Option<Vec<u8>> {
@@ -88,10 +106,18 @@ pub(crate) async fn device_cert(
     let Ok(p) = serde_json::from_value::<DeviceCertParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed device_cert.");
     };
-    if ctx.core.is_ghost(p.uid) {
-        return across_link(id);
-    }
     let asker = state.uid;
+    // A ghost's, through Link Device Keys to its home server (§5).
+    match ctx.core.peer_device_cert(asker, p.uid) {
+        None => {}
+        Some(Err(e)) => return refused(id, e),
+        Some(Ok(answer)) => {
+            return match peer_answer(answer).await {
+                Ok(cert) => reply_ok(id, json!({ "cert": b64url(&cert) })),
+                Err(why) => across_link(id, why),
+            }
+        }
+    }
     match off_reactor(&ctx.core, move |c| c.device_cert(asker, p.uid)).await {
         Some(Ok(cert)) => reply_ok(id, json!({ "cert": b64url(&cert) })),
         Some(Err(e)) => refused(id, e),
@@ -135,10 +161,22 @@ pub(crate) async fn msg(ctx: &NgCtx, state: &SessState, id: u64, p: MsgParams) -
             return bad("A deniable box is sealed under this session's own `device_enc` key.");
         }
     }
-    if ctx.core.is_ghost(to) {
-        return across_link(id);
-    }
     let from = state.uid;
+    // A ghost's home server checks the key it was sealed to (§5).
+    match ctx.core.peer_sealed(from, to, sealed.clone(), sealed_to) {
+        None => {}
+        Some(Err(SealedError::SelfNotSealed)) => {
+            return bad("This session did not say it can open sealed messages.")
+        }
+        Some(Err(e)) => return refused(id, e),
+        Some(Ok(answer)) => {
+            return match peer_answer(answer).await {
+                Ok(()) => reply_ok(id, json!({ "queued": false })),
+                Err(PeerRefusal::NoDeviceKeys) => refused(id, SealedError::CertChanged),
+                Err(why) => across_link(id, why),
+            }
+        }
+    }
     match off_reactor(&ctx.core, move |c| {
         c.msg_sealed(from, to, sealed, sealed_to)
     })

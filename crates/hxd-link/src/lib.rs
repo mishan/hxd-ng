@@ -10,6 +10,7 @@
 mod dial;
 pub mod hub;
 pub mod key;
+mod keys;
 mod link;
 pub mod server;
 pub mod users;

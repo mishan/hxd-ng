@@ -6,7 +6,8 @@ reload), L2 (users crossing one link both ways, ghosts on both wires), L3
 (public chat both ways), L4 (private messages and user info), L5
 (moderation both ways), L6 (interruption and its grace period), L7
 (relaying between this server's links), L8's metrics and `hxd link`
-commands, and the user transport draft (§3.2). The rest is design. It implements fogWraith's
+commands, the user transport draft (§3.2), and the user keys draft's
+signed and sealed messages (§7.7, L9). The rest is design. It implements fogWraith's
 [Server Linking Extension](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Server-Link.md)
 ("the extension" below), through its fifth revision (server keys), against
 Janus 2.0.19 as the first peer.
@@ -420,7 +421,13 @@ only as its home server said over a link trying the user transport draft
 ghosts, as it gains `weak` for a home server's RC4.
 Clients already must not treat anything but `encrypted` as protected.
 `msg` events gain `from.remote` for a ghost sender, and chat events and
-`history` entries carry the ghost's `remote` in `from`. These are wire changes: they land in
+`history` entries carry the ghost's `remote` in `from`. Over a link
+trying the user keys draft (§7.7), `remote` gains `server_key`, the home
+server's discovery key, base64url, on the user object and in a `chat`
+event's `from`, and a ghost whose home server said a fingerprint has
+`identity: {fingerprint}` and nothing more of one; a `history` line of a
+ghost's signed line carries the key it was checked against as
+`from.remote.server_key`. These are wire changes: they land in
 `hotline-ng.md` with the server, and the e2e pin on hx-ng advances when
 the client handles them.
 
@@ -837,6 +844,80 @@ for a `Shutdown` and then lets none in and dials none, so its peers hold
 its users rather than take them into a link it is about to drop. Ghosts are not marked away meanwhile, and
 nothing is said in chat, both the extension's MAYs.
 
+### 7.7 User keys
+
+The user keys draft (`Server-Link-User-Keys.md` in fogWraith's
+repository; its numbers reserved by the extension, not adopted) is tried
+only with a peer whose entry has `drafts = ["user_keys"]` and whose
+operator agreed, as the extension's "Trying out a draft" asks. What it
+carries, and how a server checks it, is `e2e-messages.md` §5; this is the
+wire.
+
+- **Feature bit 4** (`LINK_FEATURE_USER_KEYS`) is offered to such a peer,
+  and Link Device Keys (915) crosses only a link where both offered it.
+- **This server's group in its Hello** carries `DATA_LINK_DISCOVERY_KEY`
+  (`0x0648`), its discovery `server_key`, when it carries signed messages
+  (`[identity] hosts`). Only the server a group describes says it; a
+  relay passes another's on with the group.
+- **A local user's group** carries `DATA_LINK_USER_KEY` (`0x0642`), the
+  fingerprint the user's connection proved (an identity login, or a
+  `/trtp` tunnel under one; never the identity of an account a password
+  logged in to), and only while `[identity] login_proof_v1` is off, as
+  `e2e-messages.md` §5 explains.
+- **A signed lobby line** goes out as Link Chat with `DATA_LINK_SIGNED`
+  (`0x0647`), its link form; **a signed private message** to a ghost as
+  905 with it; **a sealed one** as 905 with `DATA_LINK_SEALED`
+  (`0x0644`), `DATA_LINK_SEALED_TO` (`0x0646`) and `[Encrypted message]`
+  as its `FieldData`. A signed lobby line goes to every peer with its
+  signature, one that does not try the draft included, which passes it
+  on as a field it does not know; a signed or sealed message to a user
+  behind such a peer is refused at once.
+- **Read** from a peer trying it: the fingerprints and discovery keys,
+  statements this server takes only where they were agreed, as the
+  transport is. Read from any peer: a signature or a sealed message,
+  since leaving it out would strip a signature or garble a message, and
+  the extension reserves the numbers for nothing else.
+- **Relayed** as Relaying Fields has every field: a 904 or 905 whole, to
+  every link it goes on to, whichever drafts each tries.
+
+**Link Device Keys (915)**, as a home server (`link.rs`): a request
+without `DATA_LINK_USER_ID` is a server's own, answered only for a
+session seen to sign (a lobby line, or a private message over that
+link; `keys.rs`'s `Seen`, in the hub), with the certificate it signed
+with; a user's is answered by the draft's step 5 (a current ghost of the
+link asking about a user exported over it and not blocking it, which can
+open sealed messages, its certificate unexpired), spending a line of the
+ghost's chat allowance as a message does. Either way the certificate is
+at most 512 bytes, allows messages and is unexpired, and the user's
+fingerprint is said; `NoDeviceKeys` (13) otherwise. This server answers
+at most 60 a minute over one link. A request about a ghost goes on
+toward its home as 906 does, its IDs translated, over links that
+negotiated bit 4.
+
+**Certificates this server fetches** (`keys.rs`'s `Certs`, a lock of its
+own never taken with the hub's): by a server's own 915 to the home
+server of the ghost whose line or message names one, over a link that
+negotiated bit 4, for a ghost whose group gives a fingerprint; kept by
+hash, each at most 512 bytes, at most 1024 and 256 KiB, the oldest going
+first; at most 32 fetches under way across every link and 8 over one,
+and a hash that could not be had not asked for again for a minute. Lines
+logged in their link form wait for theirs, at most 1024, and 256 for the
+fetches over one link, and are kept whole once it comes. A refusal, no answer, or a certificate that does not hash to what
+it is fetched for leaves them unverified, and the link as it was: Janus
+up to 2.0.28 answers `UnknownUser` to every server's own request.
+
+**A sealed 905** to a local user is checked here as `e2e-messages.md`
+§5 says, `DATA_LINK_SEALED_TO` against the target's current `device_enc`
+key, and refused `NoDeviceKeys` when it differs or is missing, when the
+target cannot open sealed messages, or when the sending ghost has no
+fingerprint; one whose size is not a box's is `RefusedFields`. It is
+delivered as a local sealed message is, held for a detached session
+within `[sealed]` and never stored. A signed 905 that fails its check,
+carries `FieldQuotingMsg`, or whose `FieldOptions` says otherwise than
+its signature whether it is an automatic response, is refused
+`BadSignature` (14), and a sealed one carrying `FieldQuotingMsg`
+`RefusedFields`; this server's own carry `FieldOptions` to agree.
+
 ## 8. Server identity and configuration
 
 - **The server key** is `[link] key`, its own file, generated on first run
@@ -878,7 +959,7 @@ key = "ed25519:b64..."      # the peer's public key, base64url, prefix optional 
 account = "link-hx"         # the account the peer issued this server, or this server's for the peer
 # password = "..."          # tls mode only: what the peer issued
 features = ["chat", "msgs", "info", "transit"]
-drafts = ["user_transport"]  # drafts tried with this peer, as its operator agreed (§3.2)
+drafts = ["user_transport", "user_keys"]  # tried with this peer, as its operator agreed (§3.2, §7.7)
 ghosts = 1000               # this link's bound
 ```
 
@@ -945,7 +1026,7 @@ use: dead code fails `-D warnings`.
 | L6 | Interruption, grace, reconciliation, epoch | `link.rs` |
 | L7 | Relaying between this server's own links: servers, users, chat and requests passed on between transit links | `link.rs` |
 | L8 | Verified TLS, trusted addresses, `hxd link` commands, metrics and the ghost gauge (the commands, metrics and gauge built; the rest planned) | `link.rs`, `limits.rs`, `metrics.rs` |
-| L9 | User keys, after the end-to-end document | later |
+| L9 | User keys, after the end-to-end document: the user keys draft's fingerprints, discovery keys, signed and sealed messages and Link Device Keys, with peers trying it (§7.7) | `link.rs` |
 
 L1 to L3 make a test link with Janus. **L5 is the minimum for a real
 network**: the extension makes moderation part of every link, always

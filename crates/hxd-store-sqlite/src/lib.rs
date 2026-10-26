@@ -73,7 +73,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -669,6 +669,13 @@ CREATE TABLE room_mark (
 );
 ";
 
+/// A linked server's user's signed line keeps its home server's key, which
+/// the line's scope names (`docs/e2e-messages.md` §5, §4.12).
+const SCHEMA_V26: &str = "
+ALTER TABLE chat_line ADD COLUMN home_key BLOB;
+CREATE INDEX chat_line_home_key ON chat_line (home_key) WHERE home_key IS NOT NULL;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -716,8 +723,8 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
         .prepare_cached(
             "INSERT INTO chat_line
            (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from,
-            signed, signed_content)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            signed, signed_content, home_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
         )
         .and_then(|mut stmt| {
@@ -735,6 +742,7 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
                 line.guid.as_ref().map(|(sender, _)| sender),
                 line.signed.as_ref().map(|s| &s.form),
                 line.signed.as_ref().map(|s| &s.content[..]),
+                line.home_key.as_ref().map(|k| &k[..]),
             ])
         })
         .map_err(StoreError::new)?;
@@ -1384,6 +1392,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 25 {
         steps.push_str(SCHEMA_V25);
+    }
+    if version < 26 {
+        steps.push_str(SCHEMA_V26);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2214,7 +2225,8 @@ fn clamp_id(id: MessageId) -> i64 {
 }
 
 const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
-                               media_id, media_type, media_w, media_h, media_bytes, signed";
+                               media_id, media_type, media_w, media_h, media_bytes, signed, \
+                               home_key";
 
 fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -2228,6 +2240,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let at: i64 = r.get(8)?;
     let media = media_columns(r, 9)?;
     let signed: Option<Vec<u8>> = r.get(14)?;
+    let home_key: Option<Vec<u8>> = r.get(15)?;
     Ok((|| {
         let media = media?;
         Ok(LogLine {
@@ -2248,6 +2261,10 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
             at: from_unix(at),
             media,
             signed,
+            home_key: home_key
+                .map(|k| k.try_into())
+                .transpose()
+                .map_err(|_| StoreError::new("a chat line's home key is not 32 bytes"))?,
         })
     })())
 }
@@ -2551,6 +2568,26 @@ impl ChatLog for SqliteStore {
         .map_err(StoreError::new)
     }
 
+    fn restore_signed(&self, id: LineId, form: &[u8]) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_line SET signed = ?2 WHERE id = ?1 AND signed IS NOT NULL",
+            params![clamp_id(id), form],
+        )
+        .map_err(StoreError::new)?;
+        Ok(())
+    }
+
+    fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM chat_line WHERE home_key = ?1)",
+            params![&key[..]],
+            |r| r.get(0),
+        )
+        .map_err(StoreError::new)
+    }
+
     fn find_guid(
         &self,
         channel: u32,
@@ -2648,6 +2685,7 @@ mod tests {
         for _ in 0..500 {
             store
                 .append(&NewLine {
+                    home_key: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -2717,6 +2755,7 @@ mod tests {
             );
             store
                 .append(&NewLine {
+                    home_key: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -2758,6 +2797,7 @@ mod tests {
             SqliteStore::open_inner(&path, Synchronous::Normal, false, Checkpoints::Own(32))
                 .unwrap();
         let line = || NewLine {
+            home_key: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -2889,6 +2929,7 @@ mod tests {
         };
         held.wait();
         let line = NewLine {
+            home_key: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),

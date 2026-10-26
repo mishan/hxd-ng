@@ -68,11 +68,6 @@ fn fingerprint(p: &Person) -> Fingerprint {
 }
 
 async fn start(dir: &Path) -> Server {
-    start_with(dir, false).await
-}
-
-/// `linked`: `[link]` is configured.
-async fn start_with(dir: &Path, linked: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n";
@@ -157,7 +152,6 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
             grace: Duration::from_secs(60),
             max_detached_per_addr: 4,
             caps: vec!["history".into(), "inbox".into()],
-            linked,
             ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
@@ -497,21 +491,6 @@ async fn a_sealed_message_reaches_the_device_it_was_sealed_to_alone() {
     for b in [&sealed, &deniable] {
         assert!(!stored(dir.path(), &b[40..72]));
     }
-}
-
-#[tokio::test]
-async fn a_linked_server_takes_an_opened_signed_box_as_evidence() {
-    let dir = tempfile::tempdir().unwrap();
-    let server = start_with(dir.path(), true).await;
-    let (alice, bob) = (person(1, 1, "alice"), person(2, 2, "bob"));
-    let (mut a, _) = login_as(server.ng, &alice, json!({ "sealed": true })).await;
-    let whole = message(&bob, 1, &alice, "rude").sign(&bob.dev).unwrap();
-    ok(
-        &mut a,
-        "report",
-        json!({ "reason": "rude", "signed": b64(&whole) }),
-    )
-    .await;
 }
 
 #[tokio::test]

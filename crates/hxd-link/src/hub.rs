@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use hxd_core::instrument;
 use hxd_core::roster::Uid;
 use hxd_core::server_link::{
-    GhostBan, GhostInfo, GhostLine, LocalUser, NetworkBan, PeerEvent, PeerRefusal, PeerRouter,
-    RemoteRef, Requester, PEER_WAIT,
+    GhostBan, GhostInfo, GhostLine, LinkForm, LocalUser, NetworkBan, PeerEvent, PeerRefusal,
+    PeerRouter, RemoteRef, Requester, PEER_WAIT,
 };
 use hxd_core::Core;
 use hxd_session::peer::{LinkGrant, LinkIo, LinkLogin, Packed, PeerAcceptor};
@@ -25,9 +25,13 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::key::{check_public, verify_proof, LinkKey, Role};
+use crate::keys::{Certs, Checked, Seen, Unchecked};
+use crate::link::Terms;
 use crate::server::{same_tag, ServerGroup, ServerId};
 use crate::users::{flag, UserGroup};
 use crate::wire::{feature, field, find, tx, Field, Hello, Reason, VERSION};
+use hl_identity::message::{link_cert_sha256, ChatLine, PrivateMessage, Signed};
+use hxd_core::history::Signature;
 
 /// Events the core may hold for the hub before the feed counts as fallen
 /// behind, and events one link may hold before it does.
@@ -68,6 +72,11 @@ pub struct PeerEntry {
     /// agreed to, so each local user's group says how they are connected,
     /// and the peer's are read.
     pub user_transport: bool,
+    /// Trying the user keys draft with this peer: signed lines and
+    /// messages cross with their signatures, sealed messages and Link
+    /// Device Keys cross, and the users' fingerprints and the servers'
+    /// discovery keys are said and read.
+    pub user_keys: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +94,14 @@ pub struct HubConfig {
     /// brief outage shows nobody leaving and coming back.
     pub grace: std::time::Duration,
     pub peers: Vec<PeerEntry>,
+    /// The key this server publishes in Hotline-ng discovery, which its
+    /// users' signed lines are scoped to: said in its own server group to
+    /// peers trying the user keys draft.
+    pub discovery_key: Option<[u8; 32]>,
+    /// Whether a session's proven identity is one the user keys draft
+    /// lets this server say: every key login here names this server's
+    /// host, which a v1 login proof does not.
+    pub export_keys: bool,
 }
 
 /// A live link.
@@ -130,9 +147,21 @@ struct Inner {
     /// Ghosts' chat lines, in the order their links received them, on
     /// their way to the one task that logs them: a commit blocks, and a
     /// link's reader must not.
-    chat: mpsc::Sender<GhostLine>,
-    chat_rx: Mutex<Option<mpsc::Receiver<GhostLine>>>,
+    chat: mpsc::Sender<Logging>,
+    chat_rx: Mutex<Option<mpsc::Receiver<Logging>>>,
+    discovery_key: Option<[u8; 32]>,
+    export_keys: bool,
+    /// Certificates fetched for ghosts' signed lines. Never taken with
+    /// the state's lock.
+    certs: Mutex<Certs>,
 }
+
+/// A ghost's signed line logged before its certificate is held: the hash
+/// it names it by, and what to check once it is.
+type Pending = ([u8; 32], Unchecked);
+
+/// A ghost's line on its way to the log.
+type Logging = (GhostLine, Option<Pending>);
 
 /// Ghosts' lines waiting to be logged, across every link. Past it a line
 /// is not shown here, and is logged as dropped.
@@ -154,6 +183,9 @@ struct State {
     /// Peers the operator paused: every link with them is closed with
     /// `Suspended`, and none is dialed.
     suspended: std::collections::HashSet<String>,
+    /// Local sessions seen to sign, as a linked server's own Link Device
+    /// Keys asks.
+    seen: Seen,
 }
 
 /// An interrupted link's servers and ghosts, kept without telling anyone
@@ -186,8 +218,8 @@ struct Live {
     /// Servers learned over this link, the peer excluded.
     servers: HashMap<ServerId, ServerGroup>,
     features: u32,
-    /// The entry it started under tries the user transport draft.
-    user_transport: bool,
+    /// The drafts the entry it started under tries.
+    terms: Terms,
     /// Where the export feed reaches this link, once it is established.
     exports: Option<mpsc::Sender<Export>>,
     /// Requests this server sends the peer, once the link is established.
@@ -231,11 +263,14 @@ impl Hub {
         Hub(Arc::new(Inner {
             key: LinkKey::from_seed(seed),
             epoch,
+            discovery_key: config.discovery_key,
+            export_keys: config.export_keys,
             config: Mutex::new(config),
             core,
             state: Mutex::default(),
             chat,
             chat_rx: Mutex::new(Some(chat_rx)),
+            certs: Mutex::default(),
         }))
     }
 
@@ -271,7 +306,9 @@ impl Hub {
             .core
             .set_peer_router(Arc::new(Router(Arc::downgrade(&self.0))));
         if let Some(mut lines) = self.0.chat_rx.lock().unwrap().take() {
-            let core = self.0.core.clone();
+            // Weak: the hub holds the channel's sender, so a strong hub here
+            // would keep the channel, and this task, open for good.
+            let (core, hub) = (self.0.core.clone(), Arc::downgrade(&self.0));
             tokio::task::spawn_blocking(move || {
                 // Everything waiting goes in one call, so ghosts' lines
                 // share commits as local lines do.
@@ -282,7 +319,16 @@ impl Hub {
                         let Ok(line) = lines.try_recv() else { break };
                         batch.push(line);
                     }
-                    core.ghost_chat_all(batch);
+                    let (batch, pending): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                    let ids = core.ghost_chat_all(batch);
+                    let Some(hub) = hub.upgrade().map(Hub) else {
+                        continue;
+                    };
+                    for (id, pending) in ids.into_iter().zip(pending) {
+                        if let (Ok(Some(id)), Some((hash, line))) = (id, pending) {
+                            hub.logged(hash, id, line);
+                        }
+                    }
                 }
             });
         }
@@ -481,6 +527,15 @@ impl Hub {
 
     pub(crate) fn hello(&self, features: u32) -> Hello {
         let config = self.0.config.lock().unwrap();
+        // The user keys draft's, to a peer trying it: only the server a
+        // group describes says its discovery key.
+        let extra = self
+            .0
+            .discovery_key
+            .filter(|_| features & feature::USER_KEYS != 0)
+            .map(|k| Field::new(field::DISCOVERY_KEY, k))
+            .into_iter()
+            .collect();
         Hello {
             version: VERSION,
             features,
@@ -491,8 +546,17 @@ impl Hub {
                 name: config.name.clone(),
                 hops: 0,
                 color: config.color,
-                extra: vec![],
+                extra,
             },
+        }
+    }
+
+    /// What a link under `entry` is sent.
+    pub(crate) fn terms(&self, entry: &PeerEntry) -> Terms {
+        Terms {
+            transport: entry.user_transport,
+            user_keys: entry.user_keys,
+            fingerprints: entry.user_keys && self.0.export_keys,
         }
     }
 
@@ -501,7 +565,7 @@ impl Hub {
     /// a connection it has given up on.
     pub(crate) fn register(&self, peer: &str) -> (u64, oneshot::Receiver<Reason>) {
         let (tx, rx) = oneshot::channel();
-        let user_transport = self.entry(peer).is_some_and(|e| e.user_transport);
+        let terms = self.entry(peer).map(|e| self.terms(&e)).unwrap_or_default();
         let mut state = self.0.state.lock().unwrap();
         state.generation += 1;
         let generation = state.generation;
@@ -530,7 +594,7 @@ impl Hub {
                 peer: None,
                 servers: HashMap::new(),
                 features: 0,
-                user_transport,
+                terms,
                 exports: None,
                 ghosts: HashMap::new(),
                 requests: None,
@@ -1229,19 +1293,29 @@ impl Hub {
     /// Hand one export to every established link. A link too far behind
     /// to take it is closed and starts over from a snapshot.
     fn fan_out(&self, (n, event): (u64, PeerEvent)) {
-        // At most two packings: with the user transport draft's field and
-        // without, each made the first time a link needs it.
-        let mut packed = [None, None];
+        // At most one packing for each set of drafts a link may try, each
+        // made the first time a link needs it.
+        let mut packed: [Option<Arc<Packed>>; 4] = Default::default();
         let mut state = self.0.state.lock().unwrap();
+        match &event {
+            PeerEvent::Chat {
+                from,
+                signed: Some(signed),
+                ..
+            } => state.seen.saw(*from, signed.cert.clone(), None),
+            PeerEvent::Gone(uid, _) => state.seen.gone(*uid),
+            _ => {}
+        }
         for live in state.links.values_mut() {
             let Some(tx) = &live.exports else { continue };
-            let transport = live.user_transport;
-            let packed = packed[usize::from(transport)].get_or_insert_with(|| {
+            let terms = live.terms;
+            let slot = usize::from(terms.transport) | usize::from(terms.fingerprints) << 1;
+            let packed = packed[slot].get_or_insert_with(|| {
                 Arc::new(crate::link::pack(
                     self.server_id(),
                     self.epoch(),
                     &event,
-                    transport,
+                    terms,
                 ))
             });
             if let Err(e) = tx.try_send((n, packed.clone())) {
@@ -1346,14 +1420,18 @@ impl Hub {
                 tagged: show_tags,
                 refuses_msgs: g.flags & flag::REFUSES_MESSAGES != 0
                     || live.features & feature::PRIVATE_MESSAGES == 0,
-                transport: g.transport.filter(|_| live.user_transport),
+                transport: g.transport.filter(|_| live.terms.transport),
+                // A statement of the user keys draft, read only from a
+                // peer trying it, as the transport is.
+                fingerprint: g.key.filter(|_| live.terms.user_keys),
+                server_key: home.discovery_key().filter(|_| live.terms.user_keys),
             },
             visible: !g.exclude.contains(&self.server_id()),
         })
     }
 
     /// A chat line from one of the peer's users, shown here unless the
-    /// core declines to.
+    /// core declines to, or, signed, unless it fails its check.
     pub(crate) fn chat(
         &self,
         peer: &str,
@@ -1363,14 +1441,26 @@ impl Hub {
         style: u16,
         fields: &[Field],
     ) -> Result<(), &'static str> {
-        let uid = {
+        let (uid, signer, home, fetches) = {
             let mut state = self.0.state.lock().unwrap();
             let live = state
                 .links
                 .get(peer)
                 .filter(|l| l.generation == generation)
                 .ok_or("no such user on this link")?;
-            let uid = live.ghosts.get(&id).ok_or("no such user on this link")?.uid;
+            let slot = live.ghosts.get(&id).ok_or("no such user on this link")?;
+            let uid = slot.uid;
+            let keyed = live.terms.user_keys;
+            let signer = slot.group.key.filter(|_| keyed);
+            let home = live
+                .peer
+                .iter()
+                .chain(live.servers.values())
+                .find(|s| s.id == slot.group.home)
+                .and_then(ServerGroup::discovery_key)
+                .filter(|_| keyed);
+            // A certificate is fetched only for a line it can be held to.
+            let fetches = signer.is_some() && live.features & feature::USER_KEYS != 0;
             // Passed on whatever this server shows, its speaker named by
             // the ID this server gives it.
             let both = feature::TRANSIT | feature::PUBLIC_CHAT;
@@ -1381,12 +1471,32 @@ impl Hub {
                 }
                 relay(&mut state, peer, Relay::Chat(passed));
             }
-            uid
+            (uid, signer, home, fetches)
         };
-        let Some(line) = self.0.core.ghost_line(uid, text, style) else {
+        // Wherever it arrived from: a signed line is never shown without
+        // its signature (`docs/e2e-messages.md` §4.11).
+        let (text, signed, pending) = match find(fields, field::SIGNED) {
+            None => (text, None, None),
+            Some(signed) => {
+                let line = Unchecked {
+                    form: signed.data.clone(),
+                    text: hl_identity::message::canonicalize(&text),
+                    act: style == 1,
+                    signer,
+                    home,
+                    at: unix_now(),
+                };
+                let text = line.text.clone();
+                let Some((signature, pending)) = self.signed_line(peer, uid, line, fetches) else {
+                    return Err("signed line that fails its check not shown");
+                };
+                (text, Some(signature), pending)
+            }
+        };
+        let Some(line) = self.0.core.ghost_line(uid, text, style, signed) else {
             return Ok(());
         };
-        self.0.chat.try_send(line).map_err(|e| match e {
+        self.0.chat.try_send((line, pending)).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 instrument::link_dropped("chat");
                 "too many lines waiting to be logged"
@@ -1395,6 +1505,199 @@ impl Hub {
         })
     }
 
+    /// A ghost's signed line, as it is shown and logged: whole when its
+    /// certificate is held and it checks, and otherwise in its link form
+    /// as it came, with what to check once its certificate, now fetched
+    /// if it can be, is held; `None` when it fails.
+    fn signed_line(
+        &self,
+        peer: &str,
+        uid: Uid,
+        line: Unchecked,
+        fetches: bool,
+    ) -> Option<(Signature, Option<Pending>)> {
+        let hash = link_cert_sha256(&line.form).ok()?;
+        if !line.in_scope() {
+            return None;
+        }
+        let cert = self.0.certs.lock().unwrap().get(&hash);
+        let as_it_came = Signature {
+            content: Signed::<ChatLine>::link_content_sha256(&line.form, [&line.text]).ok()?,
+            form: line.form.clone(),
+        };
+        let Some(cert) = cert else {
+            let now = std::time::Instant::now();
+            if fetches && self.0.certs.lock().unwrap().should_fetch(hash, peer, now) {
+                self.fetch_cert(uid, hash);
+            }
+            return Some((as_it_came, Some((hash, line))));
+        };
+        match line.check(&cert) {
+            Checked::Whole(whole) => Some((whole, None)),
+            Checked::Unverifiable => Some((as_it_came, None)),
+            Checked::Failed => None,
+        }
+    }
+
+    /// Ghost line `id` was logged in its link form: checked and kept whole
+    /// once its certificate is held, now or when its fetch ends. A store
+    /// write: off the reactor.
+    fn logged(&self, hash: [u8; 32], id: hxd_core::history::LineId, line: Unchecked) {
+        let held = self.0.certs.lock().unwrap().logged(hash, id, line);
+        if let Some((cert, line)) = held {
+            self.restore(id, &line, &cert);
+        }
+    }
+
+    fn restore(&self, id: hxd_core::history::LineId, line: &Unchecked, cert: &[u8]) {
+        if let Checked::Whole(whole) = line.check(cert) {
+            self.0.core.ghost_line_signed(id, whole.form);
+        }
+    }
+
+    /// Fetch the certificate `hash` names from the home server of ghost
+    /// `uid`, in this server's own name (a Link Device Keys without
+    /// `DATA_LINK_USER_ID`), and keep it. A refusal, a certificate that
+    /// is not the one named, or no answer, and the lines that name it
+    /// stay unverified: Janus up to 2.0.28 answers `UnknownUser` to
+    /// every request of this kind.
+    fn fetch_cert(&self, uid: Uid, hash: [u8; 32]) {
+        let asked = self.request(uid, feature::USER_KEYS, tx::DEVICE_KEYS, |id| {
+            vec![Field::u16(field::TARGET_ID, id)]
+        });
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let cert = match asked {
+                Ok(reply) => match tokio::time::timeout(PEER_WAIT, reply).await {
+                    Ok(Ok((error, fields))) if refusal(error, &fields).is_none() => {
+                        find(&fields, field::DEVICE_CERT).map(|c| c.data.clone())
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            let now = std::time::Instant::now();
+            let fetched = hub.0.certs.lock().unwrap().fetched(hash, cert, now);
+            if let Some((cert, waited)) = fetched.filter(|(_, w)| !w.is_empty()) {
+                tokio::task::spawn_blocking(move || {
+                    for (id, line) in waited {
+                        hub.restore(id, &line, &cert);
+                    }
+                });
+            }
+        });
+    }
+
+    /// A signed private message from the peer's user `from` to local user
+    /// `to`, as delivered: whole when its certificate is held and it
+    /// checks, in its link form otherwise, the certificate then fetched
+    /// for the next. One that fails is refused `BadSignature`.
+    pub(crate) fn signed_msg(
+        &self,
+        peer: &str,
+        generation: u64,
+        (from, to): (u16, Uid),
+        (text, auto): (&str, bool),
+        form: &[u8],
+    ) -> Result<Vec<u8>, Reason> {
+        let hash = link_cert_sha256(form).map_err(|_| Reason::BadSignature)?;
+        let (uid, signer, fetches) = {
+            let state = self.0.state.lock().unwrap();
+            let live = state
+                .links
+                .get(peer)
+                .filter(|l| l.generation == generation)
+                .ok_or(Reason::UnknownUser)?;
+            let slot = live.ghosts.get(&from).ok_or(Reason::UnknownUser)?;
+            let keyed = live.terms.user_keys;
+            let signer = slot.group.key.filter(|_| keyed);
+            (
+                slot.uid,
+                signer,
+                signer.is_some() && live.features & feature::USER_KEYS != 0,
+            )
+        };
+        let cert = self.0.certs.lock().unwrap().get(&hash);
+        let Some(cert) = cert else {
+            let now = std::time::Instant::now();
+            if fetches && self.0.certs.lock().unwrap().should_fetch(hash, peer, now) {
+                self.fetch_cert(uid, hash);
+            }
+            return Ok(form.to_vec());
+        };
+        let recipient = self.0.core.peer_identity(to);
+        match crate::keys::check::<PrivateMessage>(form, [text], &cert, unix_now(), signer, |m| {
+            Some(m.to.0) == recipient && m.auto == auto
+        }) {
+            Checked::Whole(whole) => Ok(whole.form),
+            Checked::Unverifiable => Ok(form.to_vec()),
+            Checked::Failed => Err(Reason::BadSignature),
+        }
+    }
+
+    /// A server's own Link Device Keys over `peer`'s link: the certificate
+    /// local user `uid` signed with, only where it signed (a lobby line,
+    /// or a private message over this link), its fingerprint is said, and
+    /// the certificate is still unexpired.
+    pub(crate) fn own_device_cert(&self, peer: &str, uid: Uid) -> Result<Vec<u8>, Reason> {
+        let cert = self.0.state.lock().unwrap().seen.cert_for(uid, peer);
+        let cert = cert
+            .filter(|_| self.0.export_keys)
+            .ok_or(Reason::NoDeviceKeys)?;
+        sendable(&cert)
+            .then(|| cert.to_vec())
+            .ok_or(Reason::NoDeviceKeys)
+    }
+
+    /// A user's Link Device Keys, from the peer's ghost `asker` about
+    /// local user `of` (the draft's step 5): never for a user whose
+    /// fingerprint is not said, since the certificate reveals it.
+    pub(crate) fn user_device_cert(
+        &self,
+        entry: &PeerEntry,
+        asker: Uid,
+        of: Uid,
+    ) -> Result<Vec<u8>, Reason> {
+        if !self.terms(entry).fingerprints {
+            return Err(Reason::NoDeviceKeys);
+        }
+        let cert = self
+            .0
+            .core
+            .ghost_device_cert(asker, of)
+            .map_err(reason_of)?;
+        sendable(&cert).then_some(cert).ok_or(Reason::NoDeviceKeys)
+    }
+
+    /// The link ghost `to` came over, if it tries the user keys draft, on
+    /// which a signed or sealed message may cross; one `from` signs over
+    /// it makes the certificate it was signed with answerable there.
+    fn keyed_link(&self, to: Uid, signed: Option<(Uid, Arc<[u8]>)>) -> Result<(), PeerRefusal> {
+        let mut state = self.0.state.lock().unwrap();
+        let name = state
+            .links
+            .iter()
+            .find(|(_, l)| l.ghosts.values().any(|s| s.uid == to))
+            .filter(|(_, l)| l.terms.user_keys)
+            .map(|(name, _)| name.clone())
+            .ok_or(PeerRefusal::CannotCross)?;
+        if let Some((from, cert)) = signed {
+            state.seen.saw(from, cert, Some(&name));
+        }
+        Ok(())
+    }
+
+    /// Whether a server behind a link trying the user keys draft gives
+    /// `key` as its discovery key.
+    fn knows_server_key(&self, key: &[u8; 32]) -> bool {
+        let state = self.0.state.lock().unwrap();
+        state
+            .links
+            .values()
+            .filter(|l| l.terms.user_keys)
+            .flat_map(|l| l.peer.iter().chain(l.servers.values()))
+            .any(|s| s.discovery_key() == Some(*key))
+    }
     pub(crate) fn core(&self) -> &Core {
         &self.0.core
     }
@@ -1508,6 +1811,20 @@ impl Hub {
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Whether a certificate may be handed to a linked server (the draft's
+/// step 5): at most 512 bytes, allowing messages, and unexpired.
+fn sendable(cert: &[u8]) -> bool {
+    cert.len() <= hl_identity::message::CERT_MAX_BYTES
+        && hl_identity::DeviceCert::parse(cert)
+            .is_ok_and(|c| c.allows(hl_identity::caps::MESSAGE) && c.expires > unix_now())
+}
+
 /// The color a server's users are shown in when it suggests none: one of
 /// its own, from its tag, the same wherever it is shown.
 fn derived_color(tag: &str) -> u32 {
@@ -1533,6 +1850,10 @@ async fn feed(hub: Hub, mut rx: mpsc::Receiver<(u64, PeerEvent)>) {
         // A new feed before the links close, so none can subscribe while
         // there is none to hear what changed after its snapshot.
         rx = hub.0.core.peer_feed(FEED_CAP);
+        // Its departures went with it: only those still here signed.
+        let (_, users) = hub.0.core.peer_snapshot();
+        let here = users.iter().map(|u| u.uid).collect();
+        hub.0.state.lock().unwrap().seen.keep(&here);
         hub.close_all(Reason::Shutdown);
     }
 }
@@ -1547,6 +1868,7 @@ fn same_terms(a: &PeerEntry, b: &PeerEntry) -> bool {
         && a.features == b.features
         && a.ghosts == b.ghosts
         && a.user_transport == b.user_transport
+        && a.user_keys == b.user_keys
 }
 
 impl PeerAcceptor for Hub {
@@ -1832,6 +2154,8 @@ fn refusal(error: bool, fields: &[Field]) -> Option<PeerRefusal> {
         Some(Some(Reason::FeatureNotNegotiated)) => PeerRefusal::FeatureNotNegotiated,
         Some(Some(Reason::Unreachable)) => PeerRefusal::Unreachable,
         Some(Some(Reason::UnknownBan)) => PeerRefusal::UnknownBan,
+        Some(Some(Reason::NoDeviceKeys)) => PeerRefusal::NoDeviceKeys,
+        Some(Some(Reason::BadSignature)) => PeerRefusal::BadSignature,
         _ => PeerRefusal::Refused,
     })
 }
@@ -1847,25 +2171,117 @@ pub(crate) fn reason_of(why: PeerRefusal) -> Reason {
         PeerRefusal::Unreachable | PeerRefusal::Unanswered => Reason::Unreachable,
         PeerRefusal::Refused | PeerRefusal::CannotCross => Reason::RefusedFields,
         PeerRefusal::UnknownBan => Reason::UnknownBan,
+        PeerRefusal::NoDeviceKeys => Reason::NoDeviceKeys,
+        PeerRefusal::BadSignature => Reason::BadSignature,
     }
 }
 
-impl PeerRouter for Router {
-    fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>> {
-        let text = crate::link::link_line_endings(&text);
+impl Router {
+    /// [`Router::send`] over a link trying the user keys draft, for a
+    /// signed or sealed message: refused at once over any other.
+    fn send_keyed(
+        &self,
+        to: Uid,
+        signed: Option<(Uid, Arc<[u8]>)>,
+        build: impl FnOnce(u16) -> Vec<Field>,
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        let keyed = match self.0.upgrade() {
+            Some(inner) => Hub(inner).keyed_link(to, signed),
+            None => Err(PeerRefusal::Unreachable),
+        };
+        if let Err(why) = keyed {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Err(why));
+            return rx;
+        }
         self.send(
             to,
             feature::PRIVATE_MESSAGES,
             tx::PRIVATE_MESSAGE,
-            |id| {
-                vec![
-                    Field::u16(field::USER_ID, from),
-                    Field::u16(field::TARGET_ID, id),
-                    Field::new(field::DATA, text.into_bytes()),
-                ]
-            },
+            build,
             |_| Ok(()),
         )
+    }
+}
+
+impl PeerRouter for Router {
+    fn msg(
+        &self,
+        from: Uid,
+        to: Uid,
+        text: String,
+        signed: Option<LinkForm>,
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        let text = crate::link::link_line_endings(&text);
+        let build = |id| {
+            let mut f = vec![
+                Field::u16(field::USER_ID, from),
+                Field::u16(field::TARGET_ID, id),
+                Field::new(field::DATA, text.into_bytes()),
+            ];
+            if let Some(signed) = &signed {
+                // `FieldOptions` agrees with what the signature covers.
+                if crate::keys::automatic(&signed.form) {
+                    f.push(Field::u16(field::OPTIONS, crate::link::AUTOMATIC as u16));
+                }
+                f.push(Field::new(field::SIGNED, signed.form.to_vec()));
+            }
+            f
+        };
+        match signed.as_ref().map(|s| s.cert.clone()) {
+            Some(cert) => self.send_keyed(to, Some((from, cert)), build),
+            None => self.send(
+                to,
+                feature::PRIVATE_MESSAGES,
+                tx::PRIVATE_MESSAGE,
+                build,
+                |_| Ok(()),
+            ),
+        }
+    }
+
+    fn msg_sealed(
+        &self,
+        from: Uid,
+        to: Uid,
+        sealed: Vec<u8>,
+        sealed_to: [u8; 32],
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>> {
+        // The placeholder 905 requires, and nothing of the message.
+        self.send_keyed(to, None, |id| {
+            vec![
+                Field::u16(field::USER_ID, from),
+                Field::u16(field::TARGET_ID, id),
+                Field::new(field::DATA, &b"[Encrypted message]"[..]),
+                Field::new(field::SEALED, sealed),
+                Field::new(field::SEALED_TO, sealed_to),
+            ]
+        })
+    }
+
+    fn device_cert(&self, asker: Uid, of: Uid) -> oneshot::Receiver<Result<Vec<u8>, PeerRefusal>> {
+        self.send(
+            of,
+            feature::USER_KEYS,
+            tx::DEVICE_KEYS,
+            |id| {
+                vec![
+                    Field::u16(field::USER_ID, asker),
+                    Field::u16(field::TARGET_ID, id),
+                ]
+            },
+            |fields| {
+                find(&fields, field::DEVICE_CERT)
+                    .map(|c| c.data.clone())
+                    .ok_or(PeerRefusal::Refused)
+            },
+        )
+    }
+
+    fn knows_server_key(&self, key: &[u8; 32]) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|inner| Hub(inner).knows_server_key(key))
     }
 
     fn kick(
@@ -1963,6 +2379,8 @@ mod tests {
                 max_ghosts: 100,
                 grace: std::time::Duration::from_secs(60),
                 peers: vec![],
+                discovery_key: None,
+                export_keys: true,
             },
             Arc::new(Core::new()),
         )
@@ -2025,7 +2443,7 @@ mod tests {
         h.apply_user("a", generation, user(9, 2)).unwrap();
         let mut link = h.subscribe("a", generation).unwrap();
         let ghost = h.ghost_uid("a", generation, 9).unwrap();
-        let answer = Router(Arc::downgrade(&h.0)).msg(1, ghost, "hi".into());
+        let answer = Router(Arc::downgrade(&h.0)).msg(1, ghost, "hi".into(), None);
         let sent = link.requests.recv().await.unwrap();
         tokio::time::sleep(PEER_WAIT + std::time::Duration::from_secs(1)).await;
         assert_eq!(answer.await.unwrap(), Err(PeerRefusal::Unanswered));
@@ -2105,8 +2523,15 @@ mod tests {
             color: None,
             exclude: vec![],
             encrypted: None,
+            fingerprint: None,
         };
-        UserGroup::parse(&crate::users::of_local(&local, ServerId([2; 8]), false)).unwrap()
+        UserGroup::parse(&crate::users::of_local(
+            &local,
+            ServerId([2; 8]),
+            false,
+            false,
+        ))
+        .unwrap()
     }
 
     fn uids(h: &Hub) -> Vec<Uid> {
@@ -2272,6 +2697,7 @@ mod tests {
             features: 0,
             ghosts: 10,
             user_transport: false,
+            user_keys: false,
         });
         h
     }
@@ -2285,8 +2711,15 @@ mod tests {
             color: None,
             exclude: vec![],
             encrypted: None,
+            fingerprint: None,
         };
-        UserGroup::parse(&crate::users::of_local(&local, ServerId([home; 8]), false)).unwrap()
+        UserGroup::parse(&crate::users::of_local(
+            &local,
+            ServerId([home; 8]),
+            false,
+            false,
+        ))
+        .unwrap()
     }
 
     impl ServerGroup {

@@ -1684,8 +1684,20 @@ features = []                      # e.g. ["chat", "msgs", "info", "transit"]:
                                    # the peer's network, and relays between
                                    # its links
 ghosts = 1000                      # this link's users shown
-drafts = []                        # e.g. ["user_transport"] (server-link.md §3.2)
+drafts = []                        # e.g. ["user_transport", "user_keys"]: drafts
+                                   # beside the extension, tried only as the
+                                   # peer's operator agreed (server-link.md
+                                   # §3.2, §7.7)
 ```
+
+`user_keys` carries signed and sealed messages over the link
+([e2e-messages.md](e2e-messages.md) §5): with it this server tells the
+peer its discovery key and its users' proven fingerprints (only while
+`[identity] login_proof_v1` is off), sends signed lines and messages with
+their signatures, and fetches the certificates of the peer's users' signed
+lines to check them. A peer without it is sent signed lobby lines with
+their signatures all the same, which it passes on, and a signed or sealed
+message to its users is refused.
 
 ### `[hope]`
 

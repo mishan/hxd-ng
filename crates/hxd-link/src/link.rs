@@ -77,6 +77,7 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
         features: 0,
         pending: HashMap::new(),
         peer_id: None,
+        device_keys: (Instant::now(), 0),
     };
     // A reload between the login and here found no link to close: the
     // entry this link was authorized under must still be the one in force.
@@ -122,7 +123,15 @@ struct Link<'a> {
     pending: HashMap<u32, oneshot::Sender<Reply>>,
     /// The peer's own server ID, once its Hello was accepted.
     peer_id: Option<ServerId>,
+    /// Link Device Keys answered here in the minute that began then.
+    device_keys: (Instant, u32),
 }
+
+/// `FieldOptions`'s automatic response.
+pub(crate) const AUTOMATIC: u32 = 4;
+
+/// Link Device Keys this server answers over one link in a minute.
+const DEVICE_KEYS_PER_MINUTE: u32 = 60;
 
 /// Requests one link waits on at once; past it a request is not sent,
 /// and its asker hears that the server did not answer.
@@ -147,14 +156,29 @@ pub(crate) fn link_line_endings(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
-/// One export, packed as every link sends it, or with `transport` every
-/// link trying the user transport draft: `own` and `epoch` are this
-/// server's, for a line's network-wide ID.
-pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent, transport: bool) -> Packed {
+/// The drafts a link tries, as what it is sent shows them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Terms {
+    /// The user transport draft: how each user is connected here.
+    pub(crate) transport: bool,
+    /// The user keys draft: signed and sealed messages, and what the
+    /// peer says of its users' keys.
+    pub(crate) user_keys: bool,
+    /// The user keys draft, and this server says its users'
+    /// fingerprints.
+    pub(crate) fingerprints: bool,
+}
+
+/// One export, packed as a link with `terms` is sent it: `own` and
+/// `epoch` are this server's, for a line's network-wide ID. A signed line
+/// goes to every link with its signature, as a relay passes one on,
+/// since it never crosses without it (`docs/e2e-messages.md` §4.11).
+pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent, terms: Terms) -> Packed {
     match event {
-        PeerEvent::Shown(u) | PeerEvent::Changed(u) => {
-            Packed::new(tx::USER_UPDATE, chunks(&of_local(u, own, transport)))
-        }
+        PeerEvent::Shown(u) | PeerEvent::Changed(u) => Packed::new(
+            tx::USER_UPDATE,
+            chunks(&of_local(u, own, terms.transport, terms.fingerprints)),
+        ),
         PeerEvent::Gone(uid, why) => {
             let reason = match why {
                 GoneReason::Disconnected => Reason::Disconnected,
@@ -173,6 +197,7 @@ pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent, transport: 
             text,
             style,
             line,
+            signed,
         } => {
             let mut line_id = own.0.to_vec();
             line_id.extend(epoch);
@@ -184,6 +209,9 @@ pub(crate) fn pack(own: ServerId, epoch: [u8; 8], event: &PeerEvent, transport: 
             ];
             if *style == 1 {
                 f.push(Field::u16(field::CHAT_OPTIONS, 1));
+            }
+            if let Some(signed) = signed {
+                f.push(Field::new(field::SIGNED, signed.form.to_vec()));
             }
             Packed::new(tx::CHAT, chunks(&f))
         }
@@ -258,7 +286,12 @@ impl Link<'_> {
 
     async fn session(&mut self, io: &mut LinkIo, closed: &mut oneshot::Receiver<Reason>) -> End {
         let began = Timer::start();
-        let features = self.entry.features & crate::hub::SUPPORTED;
+        let features = self.entry.features & crate::hub::SUPPORTED
+            | if self.entry.user_keys {
+                feature::USER_KEYS
+            } else {
+                0
+            };
         let hello = self.hub.hello(features);
         self.notify(io, tx::HELLO, &hello.to_fields());
 
@@ -345,9 +378,11 @@ impl Link<'_> {
             }
         }
         let own = self.hub.server_id();
-        let transport = self.entry.user_transport;
-        let mut groups: Vec<Vec<Field>> =
-            users.iter().map(|u| of_local(u, own, transport)).collect();
+        let terms = self.hub.terms(self.entry);
+        let mut groups: Vec<Vec<Field>> = users
+            .iter()
+            .map(|u| of_local(u, own, terms.transport, terms.fingerprints))
+            .collect();
         groups.extend(relayed);
         self.send_snapshot(io, groups);
         for what in after {
@@ -674,17 +709,110 @@ impl Link<'_> {
         if let Some(sent) = self.forward_request(io, f, to, feature::PRIVATE_MESSAGES, Some(from)) {
             return sent.map(|()| true);
         }
+        let sender = from;
         let from = self
             .hub
             .ghost_uid(&self.entry.name, self.generation, from)
             .ok_or(Reason::UnknownUser)?;
+        // The draft's: a sealed message's quote is inside it, and a signed
+        // one covers none.
+        let quoted = find(&fs, field::QUOTING).is_some();
+        if let Some(sealed) = find(&fs, field::SEALED) {
+            if quoted {
+                return Err(Reason::RefusedFields);
+            }
+            let sealed_to = find(&fs, field::SEALED_TO)
+                .and_then(Field::fixed)
+                .ok_or(Reason::NoDeviceKeys)?;
+            let form = sealed.data.first().copied().unwrap_or(0);
+            hl_identity::sealed::check_len(form, sealed.data.len())
+                .map_err(|_| Reason::RefusedFields)?;
+            return self
+                .hub
+                .core()
+                .ghost_sealed(from, to, sealed.data.clone(), sealed_to)
+                .map(|()| false)
+                .map_err(reason_of);
+        }
+        // Signed text is canonical, which a link's CR line endings are not.
+        let (text, signed) = match find(&fs, field::SIGNED) {
+            None => (text, None),
+            Some(_) if quoted => return Err(Reason::BadSignature),
+            Some(signed) => {
+                let text = hl_identity::message::canonicalize(&text);
+                let auto = find(&fs, field::OPTIONS)
+                    .and_then(Field::uint)
+                    .is_some_and(|o| o & AUTOMATIC != 0);
+                let form = self.hub.signed_msg(
+                    &self.entry.name,
+                    self.generation,
+                    (sender, to),
+                    (&text, auto),
+                    &signed.data,
+                )?;
+                (text, Some(form))
+            }
+        };
         // Quoting and an automatic response's flag are not kept: this
         // server's own messages carry neither yet.
         self.hub
             .core()
-            .ghost_msg(from, to, text)
+            .ghost_msg(from, to, text, signed)
             .map(|()| false)
             .map_err(reason_of)
+    }
+
+    /// Link Device Keys (915), the user keys draft's: a certificate of a
+    /// local user's, or forwarded toward a ghost's home (`None`: answered
+    /// when its reply comes). A request without `DATA_LINK_USER_ID` is the
+    /// peer's own, answered only for a session seen to sign.
+    fn device_keys(&mut self, io: &LinkIo, f: &Frame) -> Result<Option<Vec<u8>>, Reason> {
+        let fs = fields(f);
+        let extra: Vec<Field> = fs
+            .iter()
+            .filter(|f| ![field::USER_ID, field::TARGET_ID].contains(&f.id))
+            .cloned()
+            .collect();
+        crate::server::admissible_extra(&extra).map_err(|_| Reason::RefusedFields)?;
+        if self.features & feature::USER_KEYS == 0 {
+            return Err(Reason::FeatureNotNegotiated);
+        }
+        let id = |which| {
+            find(&fs, which)
+                .and_then(Field::fixed)
+                .map(u16::from_be_bytes)
+        };
+        let target = id(field::TARGET_ID).ok_or(Reason::RefusedFields)?;
+        let asker = id(field::USER_ID);
+        if let Some(sent) = self.forward_request(io, f, target, feature::USER_KEYS, asker) {
+            return sent.map(|()| None);
+        }
+        if !self.device_keys_allowed(Instant::now()) {
+            return Err(Reason::RateLimited);
+        }
+        let cert = match asker {
+            None => self.hub.own_device_cert(&self.entry.name, target)?,
+            Some(asker) => {
+                let asker = self
+                    .hub
+                    .ghost_uid(&self.entry.name, self.generation, asker)
+                    .ok_or(Reason::UnknownUser)?;
+                self.hub.user_device_cert(self.entry, asker, target)?
+            }
+        };
+        Ok(Some(cert))
+    }
+
+    /// Link Device Keys answered here, at most so many a minute over one
+    /// link: a server's own request has no ghost behind it to hold to a
+    /// limit of its own.
+    fn device_keys_allowed(&mut self, now: Instant) -> bool {
+        let (since, n) = &mut self.device_keys;
+        if now.duration_since(*since) >= Duration::from_secs(60) {
+            (*since, *n) = (now, 0);
+        }
+        *n += 1;
+        *n <= DEVICE_KEYS_PER_MINUTE
     }
 
     /// Link User Info (906): about a local user, or forwarded toward a
@@ -937,6 +1065,11 @@ impl Link<'_> {
             tx::PRIVATE_MESSAGE => match self.private_message(io, &f) {
                 Ok(true) => {}
                 Ok(false) => answer(io, &f, vec![Field::u16(field::REASON, Reason::Ok as u16)]),
+                Err(reason) => refuse(io, &f, reason),
+            },
+            tx::DEVICE_KEYS => match self.device_keys(io, &f) {
+                Ok(None) => {}
+                Ok(Some(cert)) => answer(io, &f, vec![Field::new(field::DEVICE_CERT, cert)]),
                 Err(reason) => refuse(io, &f, reason),
             },
             tx::USER_INFO => match self.user_info(io, &f) {
