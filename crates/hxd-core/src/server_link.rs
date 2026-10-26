@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use sha2::Digest;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserInfo, UserSession};
@@ -34,6 +35,21 @@ pub struct RemoteRef {
     /// How the ghost is connected to its home server, as that server said
     /// (`DATA_LINK_USER_TRANSPORT`), over a link trying the draft.
     pub transport: Option<RemoteTransport>,
+    /// The identity fingerprint its home server says it proved
+    /// (`DATA_LINK_USER_KEY`).
+    pub fingerprint: Option<[u8; 32]>,
+    /// Its home server's discovery key (`DATA_LINK_DISCOVERY_KEY`), which
+    /// that server's signed lines are scoped to.
+    pub server_key: Option<[u8; 32]>,
+}
+
+/// A signed line or message as it crosses a link
+/// (`docs/e2e-messages.md` §5): its link form, and the certificate the
+/// form names by hash, which a linked server fetches once it is seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkForm {
+    pub form: Arc<[u8]>,
+    pub cert: Arc<[u8]>,
 }
 
 /// A ghost's connection to its home server, as the user transport draft
@@ -100,8 +116,14 @@ pub enum PeerRefusal {
     /// Refused here: the sender has no ghost over that link to send as.
     NotExported,
     /// Refused here: what a link cannot carry, an image or a text over
-    /// [`MAX_LINK_TEXT`].
+    /// [`MAX_LINK_TEXT`], or a signed or sealed message over a link that
+    /// does not try the user keys draft.
     CannotCross,
+    /// The target's device cannot open sealed messages, or is not the
+    /// one a message was sealed to.
+    NoDeviceKeys,
+    /// The target's home server checked the signature, and it failed.
+    BadSignature,
 }
 
 /// How long an act on a ghost waits for its answer before the client is
@@ -133,6 +155,10 @@ impl PeerRefusal {
                 "Users on other servers cannot see you, so you cannot message them."
             }
             PeerRefusal::CannotCross => "That cannot be sent to a user on another server.",
+            PeerRefusal::NoDeviceKeys => {
+                "That user's device cannot open sealed messages, or is not the one you sealed to."
+            }
+            PeerRefusal::BadSignature => "That user's server found the signature does not verify.",
         }
     }
 }
@@ -141,7 +167,27 @@ impl PeerRefusal {
 /// answer comes: the frontends await it on a task of their own, never in
 /// their session loops.
 pub trait PeerRouter: Send + Sync {
-    fn msg(&self, from: Uid, to: Uid, text: String) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    fn msg(
+        &self,
+        from: Uid,
+        to: Uid,
+        text: String,
+        signed: Option<LinkForm>,
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    /// A sealed message, sealed to the `device_enc` key `sealed_to`
+    /// hashes (Link Private Message with `DATA_LINK_SEALED`).
+    fn msg_sealed(
+        &self,
+        from: Uid,
+        to: Uid,
+        sealed: Vec<u8>,
+        sealed_to: [u8; 32],
+    ) -> oneshot::Receiver<Result<(), PeerRefusal>>;
+    /// The certificate of the device ghost `of` proves now, asked of its
+    /// home server for local user `asker` (Link Device Keys).
+    fn device_cert(&self, asker: Uid, of: Uid) -> oneshot::Receiver<Result<Vec<u8>, PeerRefusal>>;
+    /// Whether a linked server's group gives `key` as its discovery key.
+    fn knows_server_key(&self, key: &[u8; 32]) -> bool;
     fn user_info(&self, of: Uid) -> oneshot::Receiver<Result<String, PeerRefusal>>;
     /// Ask a ghost's home server to kick it from this one, or with `ban`
     /// to ban it from the network for a time (`None`, until lifted) and a
@@ -278,6 +324,9 @@ pub struct LocalUser {
     /// Whether the user's connection here is encrypted, when this server
     /// saw it rather than assumed it.
     pub encrypted: Option<bool>,
+    /// The identity the user's connection proved here, never an
+    /// account's that a password logged in to.
+    pub fingerprint: Option<[u8; 32]>,
 }
 
 impl LocalUser {
@@ -293,6 +342,7 @@ impl LocalUser {
             // itself declared cleartext is cleartext whatever is in front.
             encrypted: (!sess.info.transport.assumed || !sess.info.transport.encrypted)
                 .then_some(sess.info.transport.encrypted),
+            fingerprint: sess.info.transport.identity.as_ref().map(|i| i.fingerprint),
         }
     }
 }
@@ -317,6 +367,8 @@ pub enum PeerEvent {
         text: std::sync::Arc<str>,
         style: u16,
         line: u32,
+        /// A signed line's link form.
+        signed: Option<LinkForm>,
     },
 }
 
@@ -379,7 +431,13 @@ impl RosterInner {
         self.feed.linked
     }
 
-    pub(crate) fn export_chat(&mut self, uid: Uid, text: &str, style: u16) {
+    pub(crate) fn export_chat(
+        &mut self,
+        uid: Uid,
+        text: &str,
+        style: u16,
+        signed: Option<LinkForm>,
+    ) {
         if self.users.get(&uid).is_some_and(exported) {
             self.feed.lines = self.feed.lines.wrapping_add(1);
             let line = self.feed.lines;
@@ -388,6 +446,7 @@ impl RosterInner {
                 text: text.into(),
                 style,
                 line,
+                signed,
             });
         }
     }
@@ -546,7 +605,14 @@ impl Core {
     /// [`Core::ghost_chat`]; `None` when it is not shown here: no such
     /// ghost, one excluded here, or one past local users' chat limit. The
     /// hub relays a line whatever this answers.
-    pub fn ghost_line(&self, uid: Uid, text: String, style: u16) -> Option<GhostLine> {
+    /// A signed line carries the form its frontend checked it in.
+    pub fn ghost_line(
+        &self,
+        uid: Uid,
+        text: String,
+        style: u16,
+        signed: Option<crate::history::Signature>,
+    ) -> Option<GhostLine> {
         let limits = self.flood_limits;
         let mut r = self.roster.lock().unwrap();
         let g = r.ghosts.get_mut(&uid).filter(|g| g.visible)?;
@@ -562,6 +628,7 @@ impl Core {
             g.key,
             text,
             style,
+            signed,
         )))
     }
 
@@ -585,6 +652,7 @@ impl Core {
         to: Uid,
         text: &str,
         media: bool,
+        signed: Option<LinkForm>,
     ) -> Option<oneshot::Receiver<Result<(), PeerRefusal>>> {
         let r = self.roster.lock().unwrap();
         let g = r.ghosts.get(&to).filter(|g| g.visible)?;
@@ -600,9 +668,216 @@ impl Core {
         drop(r);
         Some(match (refused, self.peer_router.get()) {
             (Some(why), _) => answered(Err(why)),
-            (None, Some(router)) => router.msg(from, to, text.to_owned()),
+            (None, Some(router)) => router.msg(from, to, text.to_owned(), signed),
             (None, None) => answered(Err(PeerRefusal::Unreachable)),
         })
+    }
+
+    /// The identity fingerprint ghost `uid`'s home server says it proved:
+    /// what a signed message to it must name. `None` when `uid` is no
+    /// ghost shown here, or one without.
+    pub fn ghost_fingerprint(&self, uid: Uid) -> Option<[u8; 32]> {
+        let r = self.roster.lock().unwrap();
+        let g = r.ghosts.get(&uid).filter(|g| g.visible)?;
+        g.info.remote.as_ref()?.fingerprint
+    }
+
+    /// A sealed message to `to`: `None` when `to` is not a ghost shown
+    /// here, and refused at once when the sender cannot open them itself
+    /// (§4.3) or is not one a link shows.
+    #[allow(clippy::type_complexity)]
+    pub fn peer_sealed(
+        &self,
+        from: Uid,
+        to: Uid,
+        sealed: Vec<u8>,
+        sealed_to: [u8; 32],
+    ) -> Option<Result<oneshot::Receiver<Result<(), PeerRefusal>>, crate::SealedError>> {
+        use crate::SealedError;
+        let r = self.roster.lock().unwrap();
+        let g = r.ghosts.get(&to).filter(|g| g.visible)?;
+        let refuses = g.info.remote.as_ref().is_some_and(|r| r.refuses_msgs);
+        let refused = match r.users.get(&from) {
+            None => Some(SealedError::NoSuchUser),
+            Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
+            Some(s) if !exported(s) || refuses => Some(SealedError::NotSealed),
+            _ => None,
+        };
+        drop(r);
+        Some(match (refused, self.peer_router.get()) {
+            (Some(why), _) => Err(why),
+            (None, None) => Err(SealedError::NotSealed),
+            (None, Some(router)) => Ok(router.msg_sealed(from, to, sealed, sealed_to)),
+        })
+    }
+
+    /// The certificate of the device ghost `of` proves now, for a local
+    /// session that can open sealed messages (§4.2): `None` when `of` is
+    /// no ghost shown here. Rationed as a local fetch is.
+    #[allow(clippy::type_complexity)]
+    pub fn peer_device_cert(
+        &self,
+        asker: Uid,
+        of: Uid,
+    ) -> Option<Result<oneshot::Receiver<Result<Vec<u8>, PeerRefusal>>, crate::SealedError>> {
+        use crate::SealedError;
+        let mut r = self.roster.lock().unwrap();
+        r.ghosts.get(&of).filter(|g| g.visible)?;
+        let refused = match r.users.get_mut(&asker) {
+            None => Some(SealedError::NoSuchUser),
+            Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
+            // Asked in its name, so only for a session a link shows.
+            Some(s) if !exported(s) => Some(SealedError::NotSealed),
+            Some(s) => s
+                .device_certs
+                .as_mut()
+                .and_then(|b| b.spend(1, Instant::now()).err())
+                .map(SealedError::RateLimited),
+        };
+        drop(r);
+        Some(match (refused, self.peer_router.get()) {
+            (Some(why), _) => Err(why),
+            (None, None) => Err(SealedError::NotSealed),
+            (None, Some(router)) => Ok(router.device_cert(asker, of)),
+        })
+    }
+
+    /// The certificate of the device local user `of` proves now, for
+    /// ghost `asker` to seal to (Link Device Keys, step 5): only for a
+    /// session that can open sealed messages, with a certificate still
+    /// unexpired, and not refusing the ghost. Spends a line of the
+    /// ghost's chat allowance, as a private message does.
+    pub fn ghost_device_cert(&self, asker: Uid, of: Uid) -> Result<Vec<u8>, PeerRefusal> {
+        let limits = self.flood_limits;
+        let now = self.clock.unix();
+        let mut r = self.roster.lock().unwrap();
+        let r = &mut *r;
+        let target = r
+            .users
+            .get(&of)
+            .filter(|s| exported(s))
+            .ok_or(PeerRefusal::UnknownUser)?;
+        let g = r.ghosts.get_mut(&asker).ok_or(PeerRefusal::UnknownUser)?;
+        if !g.visible {
+            return Err(PeerRefusal::Excluded);
+        }
+        if target.blocked_ghosts.contains(&(asker, g.key)) {
+            return Err(PeerRefusal::RefusesMessages);
+        }
+        if !g.flood.chat(1, &limits, Instant::now()) {
+            return Err(PeerRefusal::RateLimited);
+        }
+        crate::sealed::sealed_of(target)
+            .filter(|d| d.expires > now)
+            .map(|d| d.cert.clone())
+            .ok_or(PeerRefusal::NoDeviceKeys)
+    }
+
+    /// A sealed message from ghost `from` to local user `to`, sealed to
+    /// the `device_enc` key `sealed_to` hashes: delivered as a local one
+    /// is, live or held for a detached session, and never stored. The
+    /// box's sender is the fingerprint the ghost's group gives.
+    pub fn ghost_sealed(
+        &self,
+        from: Uid,
+        to: Uid,
+        sealed: Vec<u8>,
+        sealed_to: [u8; 32],
+    ) -> Result<(), PeerRefusal> {
+        let limits = self.flood_limits;
+        let now = self.clock.unix();
+        let mut r = self.roster.lock().unwrap();
+        let r = &mut *r;
+        let target = r
+            .users
+            .get(&to)
+            .filter(|s| exported(s))
+            .ok_or(PeerRefusal::UnknownUser)?;
+        let g = r.ghosts.get_mut(&from).ok_or(PeerRefusal::UnknownUser)?;
+        if !g.visible {
+            return Err(PeerRefusal::Excluded);
+        }
+        if target.blocked_ghosts.contains(&(from, g.key)) {
+            return Err(PeerRefusal::RefusesMessages);
+        }
+        let device = crate::sealed::sealed_of(target)
+            .filter(|d| d.expires > now)
+            .ok_or(PeerRefusal::NoDeviceKeys)?;
+        if <[u8; 32]>::from(sha2::Sha256::digest(device.enc)) != sealed_to {
+            return Err(PeerRefusal::NoDeviceKeys);
+        }
+        // Who sealed it is what the recipient checks the box against.
+        let from_fingerprint = g
+            .info
+            .remote
+            .as_ref()
+            .and_then(|r| r.fingerprint)
+            .ok_or(PeerRefusal::NoDeviceKeys)?;
+        if let Some((mine, all)) = target.outbox.sealed_held(&from_fingerprint) {
+            let holds = self.sealed_holds;
+            if mine + sealed.len() > holds.per_sender || all + sealed.len() > holds.all {
+                return Err(PeerRefusal::RateLimited);
+            }
+        }
+        if !g.flood.chat(1, &limits, Instant::now()) {
+            return Err(PeerRefusal::RateLimited);
+        }
+        let from_nick = g.info.nick.clone();
+        r.send_to(
+            to,
+            Event::Sealed {
+                from,
+                from_nick,
+                from_login: None,
+                from_fingerprint,
+                sealed: Some(sealed),
+                at: SystemTime::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// The identity a local user's messages are signed to
+    /// (`docs/e2e-messages.md` §4.9): a signed message from a ghost names
+    /// it.
+    pub fn peer_identity(&self, uid: Uid) -> Option<[u8; 32]> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid).filter(|s| exported(s))?;
+        sess.mailbox().fingerprint
+    }
+
+    /// Whether `key` is a linked server's discovery key, or one a ghost's
+    /// signed line was checked against in history: what pasted evidence
+    /// of a ghost's line may be scoped to (`docs/e2e-messages.md` §4.12).
+    /// A store read: off the reactor.
+    pub fn knows_server_key(&self, key: &[u8; 32]) -> bool {
+        if self
+            .peer_router
+            .get()
+            .is_some_and(|r| r.knows_server_key(key))
+        {
+            return true;
+        }
+        match self.history.as_ref().map(|log| log.holds_home_key(key)) {
+            Some(Ok(held)) => held,
+            Some(Err(e)) => {
+                tracing::warn!("chat log would not answer for a server key: {e}");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// A ghost's signed line, logged in its link form before its
+    /// certificate was held, now in its whole detached form: a reader of
+    /// history can check it from here on. A redacted line stays as it
+    /// is. A store write: off the reactor.
+    pub fn ghost_line_signed(&self, id: crate::history::LineId, form: Vec<u8>) {
+        if let Some(log) = self.history.as_ref() {
+            if let Err(e) = log.restore_signed(id, &form) {
+                tracing::warn!("chat log would not keep a linked line's signature: {e}");
+            }
+        }
     }
 
     /// User info for `uid`: `None` when it is not a ghost shown here.
@@ -627,7 +902,13 @@ impl Core {
     /// showed the ghost's server. Delivered live, as from the ghost: a
     /// ghost has no mailbox, so nothing waits, and only a block the
     /// recipient's session holds ([`Core::block_ghost`]) refuses it.
-    pub fn ghost_msg(&self, from: Uid, to: Uid, text: String) -> Result<(), PeerRefusal> {
+    pub fn ghost_msg(
+        &self,
+        from: Uid,
+        to: Uid,
+        text: String,
+        signed: Option<Vec<u8>>,
+    ) -> Result<(), PeerRefusal> {
         let limits = self.flood_limits;
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
@@ -658,7 +939,7 @@ impl Core {
                 sent_at: SystemTime::now(),
                 queued: false,
                 media: None,
-                signed: None,
+                signed,
             },
         );
         Ok(())
@@ -987,6 +1268,8 @@ mod tests {
                 tagged: false,
                 refuses_msgs: true,
                 transport: None,
+                fingerprint: None,
+                server_key: None,
             },
             visible,
         }
@@ -1078,7 +1361,7 @@ mod tests {
         let core = Core::new().with_flood_limits(crate::FloodLimits::MHXD);
         let (_me, mut rx) = test_attach(&core, "me", chatter());
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
-        let line = core.ghost_line(g, "bye".into(), 0).unwrap();
+        let line = core.ghost_line(g, "bye".into(), 0, None).unwrap();
         core.ghost_part(g);
         core.ghost_chat(line);
         let heard = drain(&mut rx);
@@ -1088,9 +1371,9 @@ mod tests {
         );
 
         let hidden = core.ghost_attach(ghost("eve", false)).unwrap();
-        assert!(core.ghost_line(hidden, "hi".into(), 0).is_none());
+        assert!(core.ghost_line(hidden, "hi".into(), 0, None).is_none());
         let shown = core.ghost_attach(ghost("bob", true)).unwrap();
-        let line = core.ghost_line(shown, "hi".into(), 0).unwrap();
+        let line = core.ghost_line(shown, "hi".into(), 0, None).unwrap();
         core.ghost_update(shown, ghost("bob", false));
         core.ghost_chat(line);
         assert!(!drain(&mut rx)
@@ -1100,7 +1383,7 @@ mod tests {
         let loud = core.ghost_attach(ghost("loud", true)).unwrap();
         let limit = core.flood_limits.chat_lines as usize;
         let shown = (0..limit + 5)
-            .filter(|_| core.ghost_line(loud, "x".into(), 0).is_some())
+            .filter(|_| core.ghost_line(loud, "x".into(), 0, None).is_some())
             .count();
         assert_eq!(shown, limit);
         assert!(
@@ -1122,7 +1405,7 @@ mod tests {
         let (me, _rx) = test_attach(&core, "me", chatter());
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
         let refused = |text: &str, media| {
-            core.peer_msg(me, g, text, media)
+            core.peer_msg(me, g, text, media, None)
                 .unwrap()
                 .try_recv()
                 .unwrap()
@@ -1142,7 +1425,7 @@ mod tests {
         );
         // A ghost hidden here is nobody: the message is a local one.
         let hidden = core.ghost_attach(ghost("eve", false)).unwrap();
-        assert!(core.peer_msg(me, hidden, "hi", false).is_none());
+        assert!(core.peer_msg(me, hidden, "hi", false, None).is_none());
     }
 
     #[test]
@@ -1151,17 +1434,17 @@ mod tests {
         let (me, mut rx) = test_attach(&core, "me", chatter());
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
         drain(&mut rx);
-        assert_eq!(core.ghost_msg(g, me, "hi".into()), Ok(()));
+        assert_eq!(core.ghost_msg(g, me, "hi".into(), None), Ok(()));
         assert!(matches!(
             &drain(&mut rx)[..],
             [Event::Msg { from, from_login: None, text, .. }] if *from == g && text == "hi"
         ));
         assert_eq!(
-            core.ghost_msg(g, 0x7ff0, "hi".into()),
+            core.ghost_msg(g, 0x7ff0, "hi".into(), None),
             Err(PeerRefusal::UnknownUser)
         );
         assert_eq!(
-            core.ghost_msg(0x7ff1, me, "hi".into()),
+            core.ghost_msg(0x7ff1, me, "hi".into(), None),
             Err(PeerRefusal::UnknownUser)
         );
         let text = core.info_text_for_peer(me).unwrap();
@@ -1180,7 +1463,7 @@ mod tests {
         assert!(core.ghost_kick(0, g, None).is_some(), "kicked again");
         core.ghost_update(g, ghost("robert", true));
         assert!(core.roster_rows().iter().all(|u| u.uid != g));
-        assert!(core.ghost_line(g, "hi".into(), 0).is_none());
+        assert!(core.ghost_line(g, "hi".into(), 0, None).is_none());
         let kinds: Vec<&str> = drain(&mut rx).iter().map(Event::kind).collect();
         assert_eq!(kinds, ["joined", "parted"]);
     }
@@ -1360,11 +1643,11 @@ mod tests {
         let g = core.ghost_attach(ghost("bob", true)).unwrap();
         core.chat_public(bob, "mine".into(), 0, None).unwrap();
         for text in ["spam", "more spam"] {
-            core.ghost_chat(core.ghost_line(g, text.into(), 0).unwrap());
+            core.ghost_chat(core.ghost_line(g, text.into(), 0, None).unwrap());
         }
         // Another ghost of the same name, from the same server.
         let twin = core.ghost_attach(ghost("bob", true)).unwrap();
-        core.ghost_chat(core.ghost_line(twin, "hi".into(), 0).unwrap());
+        core.ghost_chat(core.ghost_line(twin, "hi".into(), 0, None).unwrap());
         let target = core.ghost_ref(g).unwrap();
         // Kicked, so hidden, before the purge, as the frontends do.
         core.ghost_kick(0, g, None).unwrap();

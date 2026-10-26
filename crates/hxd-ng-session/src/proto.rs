@@ -626,10 +626,15 @@ impl serde::Serialize for UserOut<'_> {
             m.serialize_entry("color", &color)?;
         }
         if let Some(r) = &u.remote {
-            m.serialize_entry(
-                "remote",
-                &json!({ "server": r.home_name, "tag": r.home_tag, "tagged": r.tagged }),
-            )?;
+            m.serialize_entry("remote", &remote_json(r))?;
+            // As its home server says, over a link trying the user keys
+            // draft; nothing more of an identity crosses.
+            if let Some(fp) = r.fingerprint {
+                m.serialize_entry(
+                    "identity",
+                    &json!({ "fingerprint": hl_identity::Fingerprint(fp).to_string() }),
+                )?;
+            }
         }
         if let Some(id) = &u.transport.identity {
             let mut identity = json!({
@@ -646,6 +651,16 @@ impl serde::Serialize for UserOut<'_> {
         }
         m.end()
     }
+}
+
+/// Where a ghost is from (`docs/server-link.md` §5), with its home
+/// server's key when that server gave one (`docs/e2e-messages.md` §5).
+fn remote_json(r: &hxd_core::server_link::RemoteRef) -> Value {
+    let mut v = json!({ "server": r.home_name, "tag": r.home_tag, "tagged": r.tagged });
+    if let Some(key) = r.server_key {
+        v["server_key"] = json!(b64url(&key));
+    }
+    v
 }
 
 /// An event on the wire, written as it goes.
@@ -686,6 +701,8 @@ struct ChatData<'a> {
 struct FromData<'a> {
     uid: hxd_core::Uid,
     nick: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<Value>,
 }
 
 /// Encode one domain event as a wire event frame.
@@ -732,6 +749,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             from: FromData {
                 uid: from.uid,
                 nick: &from.nick,
+                remote: from.remote.as_ref().map(remote_json),
             },
             text,
             style: if *style == 1 { "action" } else { "normal" },
@@ -962,6 +980,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
                 from: FromData {
                     uid: from.uid,
                     nick: &from.nick,
+                    remote: None,
                 },
                 text,
                 style: if *style == 1 { "action" } else { "normal" },
@@ -1017,10 +1036,16 @@ pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
     let mut value = json!({
         "id": line.id,
         "at": unix(line.at),
-        "from": if deleted {
-            json!({ "icon": line.icon })
-        } else {
-            json!({ "nick": line.from_nick, "icon": line.icon })
+        "from": match (deleted, line.home_key) {
+            (true, _) => json!({ "icon": line.icon }),
+            (false, None) => json!({ "nick": line.from_nick, "icon": line.icon }),
+            // The key a linked line's scope names, kept beside it
+            // (`docs/e2e-messages.md` §5).
+            (false, Some(key)) => json!({
+                "nick": line.from_nick,
+                "icon": line.icon,
+                "remote": { "server_key": b64url(&key) },
+            }),
         },
         "text": if deleted { "" } else { &line.text },
         "style": if line.flags.contains(LineFlags::ACTION) { "action" } else { "normal" },

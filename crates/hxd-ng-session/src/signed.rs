@@ -11,7 +11,8 @@ use hl_identity::{cbor, Error, Fingerprint};
 use hxd_core::history::Signature;
 use hxd_core::inbox::MessageGuid;
 use hxd_core::news::{ArticleId, ArticleSignature, SignedPost};
-use hxd_core::SignedMsg;
+use hxd_core::server_link::LinkForm;
+use hxd_core::{SignedLine, SignedMsg};
 
 use crate::conn::SessState;
 use crate::proto::reply_err;
@@ -34,15 +35,22 @@ impl Refused {
 
 /// Whether this server carries signed messages: it publishes a server
 /// key for them to be scoped to, and names the hosts a client pins it by
-/// (§4.6), and it has no links to carry them over unsigned
-/// ([`crate::NgConfig::linked`]). `chat_guid`, the other condition, it
-/// always offers.
+/// (§4.6). `chat_guid`, the other condition, it always offers. A link
+/// carries them only where it tries the user keys draft, and a signed
+/// line or message goes nowhere else (§4.11, §5).
 pub(crate) fn offered(ctx: &NgCtx) -> bool {
-    !ctx.cfg.linked
-        && ctx
-            .identity
-            .as_ref()
-            .is_some_and(|i| !i.config().hosts.is_empty())
+    ctx.identity
+        .as_ref()
+        .is_some_and(|i| !i.config().hosts.is_empty())
+}
+
+/// The form a signed lobby line or private message crosses a link in
+/// (§5): `None` for one too large to take it, which crosses no link.
+fn link_form<T: Object>(signed: &Signed<T>) -> Option<LinkForm> {
+    Some(LinkForm {
+        form: signed.link().ok()?.into(),
+        cert: signed.message.cert().into(),
+    })
 }
 
 /// A text a signature covers, as a request carries it: canonical and
@@ -147,7 +155,7 @@ pub(crate) fn line(
     guid: Option<&MessageGuid>,
     (text, action): (&str, bool),
     signed: &str,
-) -> Result<Signature, Refused> {
+) -> Result<SignedLine, Refused> {
     let now = now(ctx)?;
     text_ok(text)?;
     let form = decode(signed)?;
@@ -164,9 +172,12 @@ pub(crate) fn line(
     if line.message.act != action {
         return Err(Refused::BadSignature("Signed in another style."));
     }
-    Ok(Signature {
-        content: line.content_sha256(),
-        form,
+    Ok(SignedLine {
+        signature: Signature {
+            content: line.content_sha256(),
+            form,
+        },
+        link: if room == 0 { link_form(&line) } else { None },
     })
 }
 
@@ -178,20 +189,23 @@ pub(crate) fn msg(
     guid: Option<&MessageGuid>,
     text: &str,
     signed: &str,
-) -> Result<SignedMsg, Refused> {
+) -> Result<(SignedMsg, Option<LinkForm>), Refused> {
     let now = now(ctx)?;
     text_ok(text)?;
     let form = decode(signed)?;
     let msg = Signed::<PrivateMessage>::parse_detached(&form, [text], now).map_err(invalid)?;
     of_this_session(state, &msg, now)?;
     under_guid(&msg, guid)?;
-    Ok(SignedMsg {
-        to: msg.message.to.0,
-        signature: Signature {
-            content: msg.content_sha256(),
-            form,
+    Ok((
+        SignedMsg {
+            to: msg.message.to.0,
+            signature: Signature {
+                content: msg.content_sha256(),
+                form,
+            },
         },
-    })
+        link_form(&msg),
+    ))
 }
 
 /// A `news_post`'s `signed` (§4.10), for an article of `subject` and
@@ -261,26 +275,24 @@ pub(crate) struct Pasted {
     pub(crate) signer: [u8; 32],
     /// The text the signature covers.
     pub(crate) text: String,
+    /// The key a line is scoped to when it is not this server's: a linked
+    /// server's, which this server must know for it to stand (§4.12).
+    pub(crate) elsewhere: Option<[u8; 32]>,
 }
 
 /// `report`'s `signed`: a public line's or a private message's detached
 /// form beside `evidence`, or with none a whole private message. Checked
 /// as a reader checks one, with the certificate at `sent` alone, since
 /// this server never received it; a line's scope against this server's
-/// key and a message's against the reporter's identity.
+/// key, or, left to the caller as [`Pasted::elsewhere`], a linked
+/// server's, and a message's against the reporter's identity.
 pub(crate) fn pasted(
     ctx: &NgCtx,
     state: &SessState,
     evidence: Option<&str>,
     signed: &str,
 ) -> Result<Pasted, Refused> {
-    // Not `now`: a sealed message opened and signed is carried with
-    // `[link]` configured, where signed lines are not offered.
-    if ctx.identity.is_none() {
-        return Err(Refused::BadRequest(
-            "This server does not carry signed messages.",
-        ));
-    }
+    now(ctx)?;
     let form = decode(signed)?;
     // Before it is decoded: a detached form beside its text, or a whole
     // message, each to its own bound.
@@ -296,13 +308,13 @@ pub(crate) fn pasted(
         return Err(invalid(Error::MissingField("sent")));
     };
     let reporter = state.device.as_ref().map(|d| d.identity);
-    let elsewhere = Refused::BadSignature("Signed for another server.");
+    let mut elsewhere = None;
     let (signer, text) = match (evidence, map.get("in").is_some()) {
         (Some(text), true) => {
             let line = Signed::<ChatLine>::parse_detached(&form, [text], *sent).map_err(invalid)?;
             let server = ctx.identity.as_ref().map(|st| st.server_key());
             if Some(line.message.server) != server {
-                return Err(elsewhere);
+                elsewhere = Some(line.message.server);
             }
             (line.signer(), line.message.text)
         }
@@ -322,6 +334,7 @@ pub(crate) fn pasted(
         form,
         signer: signer.0,
         text,
+        elsewhere,
     })
 }
 

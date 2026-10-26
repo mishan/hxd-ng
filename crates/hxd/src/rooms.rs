@@ -116,10 +116,9 @@ pub fn with_rooms(core: Core, config: &Config) -> Result<Core, String> {
 
 /// Does this server carry signed lines (`docs/e2e-messages.md` §4.6)?
 /// What the ng port offers `signed` on: a server key and the hosts a
-/// client pins it by, and no link to carry them over unsigned.
+/// client pins it by.
 fn carries_signed(config: &Config) -> bool {
     config.ng.is_some()
-        && config.link.is_none()
         && config
             .identity
             .as_ref()

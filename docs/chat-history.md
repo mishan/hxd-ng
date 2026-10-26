@@ -274,6 +274,17 @@ memory of guids reaches (hotline-ng.md §7.3). Two sends of one id into
 two rooms at the same moment are a known limit: each room commits its
 lines apart, so both can be logged before either is in the index.
 
+Schema v26 adds `home_key` (e2e-messages.md §5): for a linked server's
+user's signed line, its home server's discovery key, which the line's
+scope names, kept beside it so the line still verifies after that
+server's key changes or its link is gone, and served as the line's
+`from.remote.server_key`. Such a line is logged in its link form when
+its certificate is not held yet, and its `signed` replaced with the
+whole detached form once it is; a redacted line keeps none. A partial
+index over the column answers whether a key was ever one a line was
+checked against, which pasted evidence of a linked line may name
+(e2e-messages.md §4.12).
+
 `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the spec's one
 guarantee: an id is never reused, so a client's cursor from last week
 still means what it meant. Plain `INTEGER PRIMARY KEY` can hand out a
@@ -458,6 +469,9 @@ id and time, and a `deleted` flag when tombstoned:
   "media": { … },                // inline-media.md §8, when the line had one
   "signed": "pmF2AWJpZFA…" }     // e2e-messages.md §4.7, when it was signed
 ```
+
+A linked server's user's signed line carries its home server's key in
+`from`: `"from": { "nick", "icon", "remote": { "server_key": "…" } }`.
 
 No `uid` in `from`: the sender's uid was recycled minutes after they
 left, and a client that keyed anything on it would attribute old lines

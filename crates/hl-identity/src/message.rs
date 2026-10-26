@@ -507,6 +507,21 @@ impl<T: Object> Signed<T> {
         Self::reassemble(Value::Map(entries), texts, at)
     }
 
+    /// [`Signed::content_sha256`] of a link form and its texts, from
+    /// before its certificate is held: what a reader keeps of a message
+    /// it could not check yet. A form that is not one is refused.
+    pub fn link_content_sha256(bytes: &[u8], texts: T::Texts<'_>) -> Result<[u8; 32], Error> {
+        let (value, _) = link_value(bytes)?;
+        let Value::Map(mut entries) = value.without("cert_sha256").without("sent").without("sig")
+        else {
+            unreachable!("link_value returns maps")
+        };
+        for (key, text) in T::TEXT_KEYS.into_iter().zip(texts) {
+            entries.push((Value::Text((*key).into()), canonical_value(text)));
+        }
+        Ok(Sha256::digest(cbor::encode(&Value::Map(entries))).into())
+    }
+
     /// §3.5 in order, then the sender and the scope: the state a reader
     /// shows the message in.
     pub fn read(form: Form<'_, T>, ctx: &Context<'_, T::Scope>) -> Outcome {
@@ -1061,6 +1076,10 @@ mod tests {
         assert_eq!(
             link_cert_sha256(&link),
             Ok(<[u8; 32]>::from(Sha256::digest(&w.cert)))
+        );
+        assert_eq!(
+            Signed::<ChatLine>::link_content_sha256(&link, ["hi"]),
+            Ok(s.content_sha256())
         );
     }
 

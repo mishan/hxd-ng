@@ -30,6 +30,9 @@ pub struct UserGroup {
     /// `DATA_LINK_USER_TRANSPORT`, if the group carries one this server
     /// knows: read only over a link trying the draft.
     pub transport: Option<RemoteTransport>,
+    /// `DATA_LINK_USER_KEY`: the identity fingerprint the user's home
+    /// server says they proved.
+    pub key: Option<[u8; 32]>,
     /// The group as it arrived, every field in order.
     pub fields: Vec<Field>,
 }
@@ -46,8 +49,9 @@ pub enum UserGroupError {
 
 /// A local user's group, as this server exports it, with how the user is
 /// connected here when `transport` (the user transport draft) and this
-/// server saw it rather than assumed it.
-pub fn of_local(user: &LocalUser, home: ServerId, transport: bool) -> Vec<Field> {
+/// server saw it rather than assumed it, and with `keys` (the user keys
+/// draft) the identity the user's connection proved.
+pub fn of_local(user: &LocalUser, home: ServerId, transport: bool, keys: bool) -> Vec<Field> {
     let mut f = vec![
         Field::u16(field::USER_ID, user.uid),
         Field::new(field::SERVER_ID, home.0),
@@ -73,6 +77,9 @@ pub fn of_local(user: &LocalUser, home: ServerId, transport: bool) -> Vec<Field>
             if encrypted { 1 } else { 2 },
         ));
     }
+    if let Some(fp) = user.fingerprint.filter(|_| keys) {
+        f.push(Field::new(field::USER_KEY, fp));
+    }
     f
 }
 
@@ -92,6 +99,7 @@ impl UserGroup {
         let (mut home, mut name, mut icon, mut flags, mut color) = (None, None, None, None, None);
         let mut exclude = Vec::new();
         let mut transport = None;
+        let mut key = None;
         let mut extra = Vec::new();
         let mut kept = vec![first.clone()];
         let malformed = |f: &Field| UserGroupError::Malformed(f.id);
@@ -142,6 +150,10 @@ impl UserGroup {
                     };
                     extra.push(f.clone())
                 }
+                field::USER_KEY => {
+                    key = f.fixed();
+                    extra.push(f.clone())
+                }
                 _ => extra.push(f.clone()),
             }
             kept.push(f.clone());
@@ -160,6 +172,7 @@ impl UserGroup {
             color,
             exclude,
             transport,
+            key,
             fields: kept,
         })
     }
@@ -189,16 +202,17 @@ mod tests {
             color: Some(0xff8000),
             exclude: vec![],
             encrypted: None,
+            fingerprint: None,
         }
     }
 
     #[test]
     fn exported_groups_parse_back_with_unknown_fields_kept_in_place() {
         let home = ServerId([5; 8]);
-        let mut fields = of_local(&local(3, "ann"), home, false);
+        let mut fields = of_local(&local(3, "ann"), home, false, false);
         fields.push(Field::new(0x0700, b"later".to_vec()));
         fields.push(Field::new(field::EXCLUDE, [9; 8]));
-        fields.extend(of_local(&local(4, "bob"), home, false));
+        fields.extend(of_local(&local(4, "bob"), home, false, false));
         fields.push(Field::u16(field::MORE, 1));
         let parsed: Vec<UserGroup> = UserGroup::parse_all(&fields)
             .into_iter()
@@ -212,7 +226,10 @@ mod tests {
             8,
             "every field of its own, the unknown one included"
         );
-        assert_eq!(parsed[1].fields, of_local(&local(4, "bob"), home, false));
+        assert_eq!(
+            parsed[1].fields,
+            of_local(&local(4, "bob"), home, false, false)
+        );
     }
 
     #[test]
@@ -224,18 +241,18 @@ mod tests {
         };
         let read = |fields: &[Field]| UserGroup::parse(fields).unwrap().transport;
         assert_eq!(
-            read(&of_local(&seen(Some(true)), home, true)),
+            read(&of_local(&seen(Some(true)), home, true, false)),
             Some(RemoteTransport::Encrypted)
         );
         assert_eq!(
-            read(&of_local(&seen(Some(false)), home, true)),
+            read(&of_local(&seen(Some(false)), home, true, false)),
             Some(RemoteTransport::Cleartext)
         );
         // Not seen, or not tried with this peer: nothing said.
-        assert!(!of_local(&seen(None), home, true)
+        assert!(!of_local(&seen(None), home, true, false)
             .iter()
             .any(|f| f.id == field::USER_TRANSPORT));
-        assert!(!of_local(&seen(Some(true)), home, false)
+        assert!(!of_local(&seen(Some(true)), home, false, false)
             .iter()
             .any(|f| f.id == field::USER_TRANSPORT));
         // Read in either width; a value this server does not know is unknown.
@@ -245,33 +262,46 @@ mod tests {
             (vec![0, 9], None),
             (vec![0, 0], None),
         ] {
-            let mut fields = of_local(&seen(None), home, false);
+            let mut fields = of_local(&seen(None), home, false, false);
             fields.push(Field::new(field::USER_TRANSPORT, data.clone()));
             assert_eq!(read(&fields), expect, "{data:?}");
         }
     }
 
     #[test]
+    fn a_users_key_crosses_only_where_the_draft_is_tried() {
+        let home = ServerId([5; 8]);
+        let keyed = LocalUser {
+            fingerprint: Some([9; 32]),
+            ..local(3, "ann")
+        };
+        let read = |fields: &[Field]| UserGroup::parse(fields).unwrap().key;
+        assert_eq!(read(&of_local(&keyed, home, false, true)), Some([9; 32]));
+        assert_eq!(read(&of_local(&keyed, home, false, false)), None);
+        assert_eq!(read(&of_local(&local(3, "ann"), home, false, true)), None);
+    }
+
+    #[test]
     fn a_group_that_cannot_cross_is_refused_whole() {
         let home = ServerId([5; 8]);
-        let long = of_local(&local(3, &"n".repeat(MAX_NAME + 1)), home, false);
+        let long = of_local(&local(3, &"n".repeat(MAX_NAME + 1)), home, false, false);
         assert_eq!(
             UserGroup::parse(&long),
             Err(UserGroupError::Inadmissible("name too long"))
         );
-        let mut login = of_local(&local(3, "ann"), home, false);
+        let mut login = of_local(&local(3, "ann"), home, false, false);
         login.push(Field::new(105, b"ann-login".to_vec()));
         assert!(matches!(
             UserGroup::parse(&login),
             Err(UserGroupError::Inadmissible(_))
         ));
-        let mut no_home = of_local(&local(3, "ann"), home, false);
+        let mut no_home = of_local(&local(3, "ann"), home, false, false);
         no_home.retain(|f| f.id != field::SERVER_ID);
         assert_eq!(
             UserGroup::parse(&no_home),
             Err(UserGroupError::Missing(field::SERVER_ID))
         );
-        let mut twice = of_local(&local(3, "ann"), home, false);
+        let mut twice = of_local(&local(3, "ann"), home, false, false);
         twice.push(Field::new(field::USER_NAME, b"bob".to_vec()));
         assert_eq!(
             UserGroup::parse(&twice),
@@ -281,7 +311,7 @@ mod tests {
 
     #[test]
     fn numbers_may_come_in_either_width_the_wire_allows() {
-        let mut wide = of_local(&local(3, "ann"), ServerId([5; 8]), false);
+        let mut wide = of_local(&local(3, "ann"), ServerId([5; 8]), false, false);
         for f in &mut wide {
             if f.id == field::USER_ICON {
                 *f = Field::u32(field::USER_ICON, 128);

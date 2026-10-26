@@ -9,10 +9,15 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
+use hl_identity::message::{link_cert_sha256, ChatLine, Object, PrivateMessage, Signed};
+use hl_identity::sealed::{open, seal_to, Opened, Opening, Replay};
+use hl_identity::{cert, Card, DeviceCert, DeviceKey, Fingerprint, IdentityKey, LoginProof};
+use hl_identity::{message::Sender, ServerKey};
 use hxd_testclient::legacy::{self, push, Login, UserRow};
 use hxd_testclient::ng;
 use hxproto::messages::{tag, ClientHdr};
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 struct Server {
     legacy: SocketAddr,
@@ -23,6 +28,16 @@ struct Server {
 
 fn public(seed: u8) -> String {
     B64.encode(hxd_link::LinkKey::from_seed(&[seed; 32]).public())
+}
+
+/// The seed of the discovery key of the server whose link key is `seed`
+/// repeated: its signed lines' scope.
+fn identity_seed(seed: u8) -> [u8; 32] {
+    [seed + 0x40; 32]
+}
+
+fn discovery_key(seed: u8) -> [u8; 32] {
+    ServerKey::from_seed(&identity_seed(seed)).public()
 }
 
 /// A server whose link key is `seed` repeated, with `link` as more keys
@@ -48,15 +63,33 @@ async fn start(
          send_msgs = true\nget_user_info = true\ndisconnect_users = true\ncreate_pchats = true\n",
     )
     .unwrap();
-    let seed_hex: String = [seed; 32].iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(dir.join("link.key"), seed_hex).unwrap();
+    // The people who log in with their keys, on whichever server a test
+    // puts them.
+    for (n, login) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+        std::fs::write(
+            accounts.join(format!("{login}.toml")),
+            format!(
+                "name = \"{login}\"\npassword = \"pw\"\n[access]\nread_chat = true\n\
+                 send_chat = true\nsend_msgs = true\nread_chat_history = true\n\
+                 [identity]\nfingerprint = \"{}\"\n",
+                fingerprint(&person(n))
+            ),
+        )
+        .unwrap();
+    }
+    let hex = |seed: [u8; 32]| seed.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    std::fs::write(dir.join("link.key"), hex([seed; 32])).unwrap();
+    std::fs::write(dir.join("identity.key"), hex(identity_seed(seed))).unwrap();
     let issued = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     std::fs::write(dir.join("cert.pem"), issued.cert.pem()).unwrap();
     std::fs::write(dir.join("key.pem"), issued.signing_key.serialize_pem()).unwrap();
+    let ngl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ng = ngl.local_addr().unwrap();
     let text = format!(
         "[server]\nname = \"{tag} server\"\n[paths]\naccounts = \"{d}/accounts\"\n\
          [inbox]\ndb = \"{d}/hx.db\"\n[history]\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
+         [identity]\nkey = \"{d}/identity.key\"\nsuccessors = \"\"\nhosts = [\"{ng}\"]\n\
          [limits]\nspam_points = 0\nchat_lines = 0\nng_requests = 0\n\
          [tls]\ncert = \"{d}/cert.pem\"\nkey = \"{d}/key.pem\"\n\
          [link]\ntag = \"{tag}\"\nkey = \"{d}/link.key\"\n{link}\n{peers}\n"
@@ -76,10 +109,9 @@ async fn start(
         hxd_session::LegacyTls::load(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap(),
     );
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ngl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
-        ng: ngl.local_addr().unwrap(),
+        ng,
         hub: hub.clone(),
         config: path,
     };
@@ -905,6 +937,14 @@ async fn chain() -> (Server, Server, Server, [tempfile::TempDir; 3]) {
 
 /// [`chain`], `cc`'s link to `bb` offering only `cc_offers`.
 async fn chain_offering(cc_offers: &str) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
+    chain_trying(cc_offers, "").await
+}
+
+/// [`chain_offering`], every link trying `drafts` as well.
+async fn chain_trying(
+    cc_offers: &str,
+    drafts: &str,
+) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
     const TRANSIT: &str = r#"["chat", "msgs", "info", "transit"]"#;
     let dirs = [
         tempfile::tempdir().unwrap(),
@@ -916,14 +956,14 @@ async fn chain_offering(cc_offers: &str) -> (Server, Server, Server, [tempfile::
     let accept = |name: &str, seed: u8| {
         format!(
             "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n",
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n{drafts}\n",
             public(seed)
         )
     };
     let dial = |name: &str| {
         format!(
             "[[link.peer]]\nname = \"bb\"\ndial = \"{b_addr}\"\nprotection = \"key\"\n\
-             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n",
+             key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n{drafts}\n",
             public(2)
         )
     };
@@ -1140,4 +1180,488 @@ async fn no_act_on_another_user_reaches_a_ghost() {
             "{ty:?}: a ghost refused unlike a user who is not there"
         );
     }
+}
+
+/// A user with an identity, a device and a certificate for it.
+struct Person {
+    id: IdentityKey,
+    dev: DeviceKey,
+    card: Vec<u8>,
+    cert: Vec<u8>,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Alice, bob or carol, by seed, as the accounts every server has name
+/// them.
+fn person(seed: u8) -> Person {
+    let name = ["alice", "bob", "carol"][usize::from(seed) - 1];
+    let id = IdentityKey::from_seed(&[seed; 32]);
+    let dev = DeviceKey::from_seed(&[seed + 100; 32]);
+    let card = Card::new(&id, name, now()).sign(&id, vec![]).unwrap();
+    let cert = DeviceCert::for_device(&id, &dev, now() - 3600, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(&id);
+    Person {
+        id,
+        dev,
+        card,
+        cert,
+    }
+}
+
+fn fingerprint(p: &Person) -> Fingerprint {
+    Fingerprint::of(&p.id.public())
+}
+
+fn unb64(s: &str) -> Vec<u8> {
+    B64.decode(s).unwrap()
+}
+
+/// One HTTP/1.1 request, closed after its answer: the JSON body.
+async fn http_json(addr: SocketAddr, path: &str) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    serde_json::from_slice(&raw[split + 4..]).unwrap()
+}
+
+/// `p` logged in to `server`'s ng port with their key, saying it can sign
+/// and open sealed messages, and its login reply.
+async fn keyed(server: &Server, p: &Person) -> (ng::Client, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = server.ng;
+    let ch = http_json(addr, "/identity/challenge").await;
+    let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
+    let key: [u8; 32] = unb64(ch["server_key"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let proof = LoginProof::sign(&p.dev, &challenge, &key, &addr.to_string(), now()).unwrap();
+    let body = json!({ "card": B64.encode(&p.card), "device_cert": B64.encode(&p.cert),
+                       "proof": B64.encode(&proof) })
+    .to_string();
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST /identity/auth HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let auth: Value = serde_json::from_slice(&raw[split + 4..]).unwrap();
+    let token = auth["token"].as_str().expect("a transport token");
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut c = ng::Client::over(Box::new(tcp), &format!("ws://{addr}/ng?token={token}"))
+        .await
+        .unwrap();
+    let hello = c
+        .login(json!({ "signs": "default", "sealed": true }))
+        .await
+        .unwrap();
+    assert!(hello["caps"].as_array().unwrap().contains(&json!("signed")));
+    (c, hello)
+}
+
+/// The row of a ghost `is` picks out, from `hello` or once `c` hears of
+/// it.
+async fn ghost_row(c: &mut ng::Client, hello: &Value, is: impl Fn(&Value) -> bool) -> Value {
+    let is = |u: &Value| u.get("remote").is_some() && is(u);
+    if let Some(u) = hello["users"].as_array().unwrap().iter().find(|u| is(u)) {
+        return u.clone();
+    }
+    c.event_where("user_joined", |d| is(&d["user"]))
+        .await
+        .unwrap()
+        .data["user"]
+        .clone()
+}
+
+/// The ghost of the user whose identity is `p`'s.
+async fn identity_row(c: &mut ng::Client, hello: &Value, p: &Person) -> Value {
+    let fp = fingerprint(p).to_string();
+    ghost_row(c, hello, |u| u["identity"]["fingerprint"] == fp).await
+}
+
+/// The `n`th guid a test signs under, and the id it spells.
+fn guid(n: u8) -> (String, [u8; 16]) {
+    let guid = format!("{n:02x}0e1000-1234-4abc-89ab-000000000000");
+    let id = [
+        n, 0x0e, 0x10, 0, 0x12, 0x34, 0x4a, 0xbc, 0x89, 0xab, 0, 0, 0, 0, 0, 0,
+    ];
+    (guid, id)
+}
+
+/// A signed private message of `from`'s to `to`, as `msg` sends it.
+fn signed_msg(from: &Person, n: u8, to: &Person, text: &str) -> (String, String) {
+    let (guid, id) = guid(n);
+    let m = PrivateMessage {
+        id,
+        sent: now(),
+        to: fingerprint(to),
+        cert: from.cert.clone(),
+        text: text.into(),
+        quote: None,
+        auto: false,
+    };
+    let detached = Signed::<PrivateMessage>::parse(&m.sign(&from.dev).unwrap(), now())
+        .unwrap()
+        .detached()
+        .unwrap();
+    (guid, B64.encode(detached))
+}
+
+/// A signed lobby line of `p`'s on the server whose link key is `home`.
+fn signed_line(p: &Person, home: u8, n: u8, text: &str) -> (String, String) {
+    let (guid, id) = guid(n);
+    let line = ChatLine {
+        id,
+        sent: now(),
+        server: discovery_key(home),
+        room: 0,
+        cert: p.cert.clone(),
+        text: text.into(),
+        act: false,
+    };
+    let whole = line.sign(&p.dev).unwrap();
+    let detached = Signed::<ChatLine>::parse(&whole, now())
+        .unwrap()
+        .detached()
+        .unwrap();
+    (guid, B64.encode(detached))
+}
+
+/// A form as a `chat` event or a history line serves it: whole, which
+/// verifies under the scope `home` names, or its link form, which names
+/// its certificate by hash alone.
+fn whole(signed: &Value, text: &str, home: u8) -> bool {
+    let form = unb64(signed.as_str().unwrap());
+    if link_cert_sha256(&form).is_ok() {
+        return false;
+    }
+    let line = Signed::<ChatLine>::parse_detached(&form, [text], now()).unwrap();
+    assert_eq!(
+        (line.message.server, line.message.room),
+        (discovery_key(home), 0)
+    );
+    true
+}
+
+/// `reader` hears `sender`'s signed lines from the server whose link key
+/// is `home`: the first in its link form, verifiable once its server has
+/// fetched the certificate, and history serving it whole by then; the
+/// next whole as it is heard. Either way with its text canonical and its
+/// home server's key beside it.
+async fn signed_lines_cross(
+    sender: &mut ng::Client,
+    p: &Person,
+    home: u8,
+    reader: &mut ng::Client,
+    first: u8,
+) {
+    let key = B64.encode(discovery_key(home));
+    let text: &str = &format!("signed {first}\nacross");
+    let (guid, signed) = signed_line(p, home, first, text);
+    sender
+        .request(
+            "chat",
+            json!({ "text": text, "guid": guid, "signed": signed }),
+        )
+        .await
+        .unwrap();
+    let heard = reader
+        .event_where("chat", |d| d["text"] == text)
+        .await
+        .unwrap()
+        .data;
+    assert_eq!(heard["from"]["remote"]["server_key"], key);
+    assert!(!whole(&heard["signed"], text, home), "{heard}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let page = reader.request("history", json!({})).await.unwrap();
+        let logged = page["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["text"] == text)
+            .cloned()
+            .unwrap();
+        assert_eq!(logged["from"]["remote"]["server_key"], key);
+        if whole(&logged["signed"], text, home) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never whole: {logged}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let text: &str = &format!("signed {}", first + 1);
+    let (guid, signed) = signed_line(p, home, first + 1, text);
+    sender
+        .request(
+            "chat",
+            json!({ "text": text, "guid": guid, "signed": signed }),
+        )
+        .await
+        .unwrap();
+    let heard = reader
+        .event_where("chat", |d| d["text"] == text)
+        .await
+        .unwrap()
+        .data;
+    assert!(whole(&heard["signed"], text, home), "{heard}");
+}
+
+const USER_KEYS: &str = "drafts = [\"user_keys\"]";
+
+#[tokio::test]
+async fn a_signed_lobby_line_crosses_both_ways_and_verifies_where_it_is_heard() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (alice, bob) = (person(1), person(2));
+    let (mut on_a, a_hello) = keyed(&a, &alice).await;
+    let (mut on_b, b_hello) = keyed(&b, &bob).await;
+    // Each ghost carries the identity its home server says it proved, and
+    // that server's key.
+    let row = identity_row(&mut on_b, &b_hello, &alice).await;
+    assert_eq!(row["remote"]["server_key"], B64.encode(discovery_key(1)));
+    identity_row(&mut on_a, &a_hello, &bob).await;
+    signed_lines_cross(&mut on_a, &alice, 1, &mut on_b, 1).await;
+    signed_lines_cross(&mut on_b, &bob, 2, &mut on_a, 3).await;
+
+    // A line of a ghost's, pasted, stands under its home server's key,
+    // which this server showed; under a key it never knew, it does not.
+    let (_, signed) = signed_line(&alice, 1, 9, "pasted");
+    on_b.request(
+        "report",
+        json!({ "reason": "x", "evidence": "pasted", "signed": signed }),
+    )
+    .await
+    .unwrap();
+    let (_, elsewhere) = signed_line(&alice, 9, 10, "pasted");
+    let refused = on_b
+        .request(
+            "report",
+            json!({ "reason": "x", "evidence": "pasted", "signed": elsewhere }),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(hxd_testclient::Error::Refused { code, .. }) if code == "bad_signature"),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_in_the_middle_passes_signed_lines_and_their_fetches_on() {
+    let (a, _b, c, _dirs) = chain_trying(r#"["chat", "msgs", "info", "transit"]"#, USER_KEYS).await;
+    let (alice, carol) = (person(1), person(3));
+    let (mut on_a, _) = keyed(&a, &alice).await;
+    let (mut on_c, c_hello) = keyed(&c, &carol).await;
+    identity_row(&mut on_c, &c_hello, &alice).await;
+    signed_lines_cross(&mut on_a, &alice, 1, &mut on_c, 1).await;
+}
+
+/// A signed line never crosses without its signature (§4.11), so a peer
+/// that does not try the draft is sent one with it, which it shows
+/// unverified, in its link form; it is told nothing of anyone's keys, and
+/// neither a signed message nor a certificate crosses to it.
+#[tokio::test]
+async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, "", "").await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (alice, bob) = (person(1), person(2));
+    let (mut on_a, a_hello) = keyed(&a, &alice).await;
+    let (mut on_b, b_hello) = keyed(&b, &bob).await;
+    let (guid, signed) = signed_line(&alice, 1, 1, "signed");
+    on_a.request(
+        "chat",
+        json!({ "text": "signed", "guid": guid, "signed": signed }),
+    )
+    .await
+    .unwrap();
+    let heard = on_b
+        .event_where("chat", |d| d["text"] == "signed")
+        .await
+        .unwrap()
+        .data;
+    let form = unb64(heard["signed"].as_str().unwrap());
+    assert!(link_cert_sha256(&form).is_ok(), "{heard}");
+    assert!(
+        heard["from"]["remote"].get("server_key").is_none(),
+        "{heard}"
+    );
+    let alice_there = ghost_row(&mut on_b, &b_hello, |u| u["nick"] == "alice").await;
+    assert!(alice_there.get("identity").is_none(), "{alice_there}");
+
+    let bob_here = ghost_row(&mut on_a, &a_hello, |u| u["nick"] == "bob").await["uid"].clone();
+    let (guid, signed) = signed_msg(&alice, 2, &bob, "hi");
+    for (req, params, code) in [
+        (
+            "msg",
+            json!({ "to": bob_here, "text": "hi", "guid": guid, "signed": signed }),
+            "bad_request",
+        ),
+        ("device_cert", json!({ "uid": bob_here }), "not_delivered"),
+    ] {
+        match on_a.request(req, params).await {
+            Err(hxd_testclient::Error::Refused { code: got, .. }) => assert_eq!(got, code, "{req}"),
+            other => panic!("{req}: {other:?}"),
+        }
+    }
+}
+
+/// A replay memory that starts empty.
+#[derive(Default)]
+struct Memory(Vec<(Fingerprint, [u8; 16])>);
+
+impl Replay for Memory {
+    fn latest(&mut self, now: u64) -> u64 {
+        now
+    }
+
+    fn accepted(&self, signer: &Fingerprint, id: &[u8; 16]) -> bool {
+        self.0.contains(&(*signer, *id))
+    }
+
+    fn accept(&mut self, signer: Fingerprint, id: [u8; 16], _: u64) -> bool {
+        let new = !self.accepted(&signer, &id);
+        self.0.push((signer, id));
+        new
+    }
+}
+
+/// What `msg` names a box's key by.
+fn key_hash(cert: &[u8]) -> String {
+    B64.encode(Sha256::digest(DeviceCert::parse(cert).unwrap().device_enc))
+}
+
+#[tokio::test]
+async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (alice, bob, carol) = (person(1), person(2), person(3));
+    let (mut on_a, a_hello) = keyed(&a, &alice).await;
+    let (mut on_b, _) = keyed(&b, &bob).await;
+    let bob_here = identity_row(&mut on_a, &a_hello, &bob).await["uid"].clone();
+
+    // Signed: heard in its link form until bob's server holds alice's
+    // certificate, which it fetches from hers, and whole from then on.
+    let mut n = 1;
+    loop {
+        let text = format!("signed {n}");
+        let (guid, signed) = signed_msg(&alice, n, &bob, &text);
+        on_a.request(
+            "msg",
+            json!({ "to": bob_here, "text": text, "guid": guid, "signed": signed }),
+        )
+        .await
+        .unwrap();
+        let got = on_b
+            .event_where("msg", |d| d["text"] == text.as_str())
+            .await
+            .unwrap()
+            .data;
+        let form = unb64(got["signed"].as_str().unwrap());
+        if link_cert_sha256(&form).is_err() {
+            let m =
+                Signed::<PrivateMessage>::parse_detached(&form, [text.as_str()], now()).unwrap();
+            assert_eq!(m.message.to, fingerprint(&bob));
+            break;
+        }
+        assert!(n < 100, "never whole");
+        n += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Signed to someone else, it is not sent at all.
+    let (guid, signed) = signed_msg(&alice, 200, &carol, "elsewhere");
+    let refused = on_a
+        .request(
+            "msg",
+            json!({ "to": bob_here, "text": "elsewhere", "guid": guid, "signed": signed }),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(hxd_testclient::Error::Refused { code, .. }) if code == "bad_signature"),
+        "{refused:?}"
+    );
+
+    // Sealed: to the certificate bob's server hands over the link, opened
+    // by his device alone; and one sealed to another key is refused there.
+    let got = on_a
+        .request("device_cert", json!({ "uid": bob_here }))
+        .await
+        .unwrap();
+    assert_eq!(unb64(got["cert"].as_str().unwrap()), bob.cert);
+    let m = PrivateMessage {
+        id: [7; 16],
+        sent: now(),
+        to: fingerprint(&bob),
+        cert: alice.cert.clone(),
+        text: "only you".into(),
+        quote: None,
+        auto: false,
+    };
+    let sealed = seal_to(
+        &m,
+        &alice.dev,
+        &DeviceCert::parse(&bob.cert).unwrap(),
+        false,
+    )
+    .unwrap();
+    let sent = on_a
+        .request(
+            "msg",
+            json!({ "to": bob_here, "sealed": B64.encode(&sealed), "cert": key_hash(&bob.cert) }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent, json!({ "queued": false }));
+    let ev = on_b
+        .event_where("msg", |d| d.get("sealed").is_some())
+        .await
+        .unwrap()
+        .data;
+    assert_eq!(ev["text"], "[Encrypted message]");
+    assert_eq!(ev["from"]["fingerprint"], fingerprint(&alice).to_string());
+    let opening = Opening {
+        now: now(),
+        at: ev["at"].as_u64().unwrap(),
+        reader: fingerprint(&bob),
+        sender: Sender::Named(fingerprint(&alice)),
+    };
+    let opened = open(
+        &unb64(ev["sealed"].as_str().unwrap()),
+        &bob.dev,
+        &opening,
+        &mut Memory::default(),
+    );
+    let Opened::Verified { message, .. } = opened else {
+        panic!("not verified: {opened:?}");
+    };
+    assert_eq!(message.message.text, "only you");
+    let wrong = on_a
+        .request(
+            "msg",
+            json!({ "to": bob_here, "sealed": B64.encode(&sealed), "cert": key_hash(&carol.cert) }),
+        )
+        .await;
+    assert!(
+        matches!(&wrong, Err(hxd_testclient::Error::Refused { code, .. }) if code == "cert_changed"),
+        "{wrong:?}"
+    );
 }

@@ -14,13 +14,16 @@ classic wire getting the text alone (§6); and sealed private messages:
 carrying a box to the session of the device it was sealed to, held for a
 detached one within `[sealed]` and lost with `sealed_lost` by a resume
 without `sealed`, never stored (§4.1 to §4.5), and a sealed message's
-report (§4.12). Not built yet: the link forms on a link (§5). Until
-links carry them, a sealed message or `device_cert` to a linked server's
-user is `not_sealed`, and nothing sealed crosses; a session's device is
-the one it logged in with (`hotline-ng.md` §6.2), so a resume cannot
-prove another `device_enc` (§4.1). Nor, until then, does hxd-ng offer
-`signed` with `[link]` configured (§4.6), so no signed line exists for a
-link to strip. The indexes do not reach a redacted line or a deleted
+report (§4.12); and both across server links, to and from peers that
+try the server linking user keys draft (§5, `server-link.md` §7.7):
+signed lobby lines and signed private messages in their link form,
+checked where they arrive once the certificate a server fetches by Link
+Device Keys is held, sealed messages, `device_cert` for a linked
+server's user, and pasted evidence of a linked server's line. A signed
+lobby line reaches a peer that does not try the draft with its signature
+all the same (§4.11). A session's device is the one it logged in with (`hotline-ng.md` §6.2),
+so a resume cannot prove another `device_enc` (§4.1). The indexes do
+not reach a redacted line or a deleted
 article, whose content goes with its words (§4.12). Secure rooms are not
 built yet, so `/rooms` shows `(signed lines only)` alone (§4.8). This is
 the end-to-end messaging document that `hotline-ng-identity.md` §3.3
@@ -900,9 +903,9 @@ them it signs no `server_challenge` (`hotline-ng-auth.md` §6.2) and no
 client can pin its key; and only beside `chat_guid` (`hotline-ng.md` §4,
 §7.3), since a signed line's id is its guid: a server that lists
 `signed` without `chat_guid` is broken, and a client does not sign lines
-to it. *hxd-ng*, until links carry signatures (§5): not with `[link]`
-configured either, since a signed lobby line must not cross a link
-without its signature (§4.11). A client MUST NOT send `signed` to a server
+to it. A linked server lists it too: a signed lobby line crosses every
+link with its signature (§4.11, §5). A client MUST NOT send
+`signed` to a server
 without the capability: a server that ignored an unknown parameter
 would relay the text unsigned, and the sender would never know.
 
@@ -1396,13 +1399,44 @@ carries that key as `from.remote.server_key`: history's `from` already
 carries the ghost's `remote` (`server-link.md` §5), and `chat-history.md`
 gains the key in it. Without the key every stored linked line would read
 as signed for elsewhere. So a server's history of a linked lobby verifies
-line by line. A ghost has no `identity` on its row until user keys cross,
-so until then its line is named by its certificate's fingerprint and the
-contact pinned to it, if any, and once they do, a client also checks that
-fingerprint against the row's. A ghost whose row has no `server_key`
-cannot have its lines' scope checked: they are shown as unverified (§8),
-which is not the same as failing, and a receiving server neither drops
-them nor counts them invalid.
+line by line. A ghost's row carries `identity.fingerprint` when its home
+server said one (`DATA_LINK_USER_KEY`) over a link trying the draft, and a
+client checks a line's certificate against it; without one, its line is
+named by its certificate's fingerprint and the contact pinned to it, if
+any. A ghost whose row has no `server_key` cannot have its lines' scope
+checked: they are shown as unverified (§8), which is not the same as
+failing, and a receiving server neither drops them nor counts them
+invalid.
+
+*hxd-ng* tries the draft only with a peer whose `[[link.peer]]` entry
+lists `user_keys` in `drafts`, as that peer's operator agreed
+(`server-link.md` §7.7, the extension's "Trying out a draft"). With
+such a peer it says its discovery key and its users' fingerprints,
+sends signed and sealed messages, and offers Link Device Keys (link
+feature bit 4); it reads the fingerprints and discovery keys only from
+such a peer, and a signature or a sealed message from any. A signed
+lobby line goes to every peer with `DATA_LINK_SIGNED`, one that does not
+try the draft included, since it may not cross without its signature
+(§4.11) and a peer passes a field it does not know on as it came, which
+is how a relay already carries one; a line relayed between two links
+goes on whole the same way. Toward a peer that does not try the draft,
+a signed message to a user behind it is refused `bad_request` (that
+peer says no fingerprint to sign it to), a sealed one `not_sealed`, and
+a `device_cert` `not_delivered`. It says a fingerprint only while
+`[identity] login_proof_v1` is off: it does not record which proof a
+session logged in with, and the draft exports only a key proved with
+one naming this server's host. A scope that does not match is a failure
+here, not "signed for elsewhere": a line from a linked server scoped to
+any other is a replay, and a link form's room, style and home key are
+checked before its certificate is held. A line or message from a ghost
+whose home server said no fingerprint stays unverified even when its
+certificate is held, since certificates are kept by hash and one held
+may be another user's, and none is fetched for it. A line logged before its certificate came that
+fails once it does stays in history in its link form, unverified. A
+sealed message from a ghost whose home server said no fingerprint is
+refused `NoDeviceKeys`, since its recipient could not check who sealed
+it. A ghost's sealed `msg` event carries the fingerprint its home server
+said as `from.fingerprint`.
 
 Rooms do not cross links yet (`chat-rooms.md` §8.1); when they do, a
 room's scope is its host's key and the host's room id.

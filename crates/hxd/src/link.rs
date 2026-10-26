@@ -64,8 +64,8 @@ pub struct PeerSection {
     #[serde(default = "default_ghosts")]
     pub ghosts: usize,
     /// Drafts beside the extension this server tries with this peer, as
-    /// the peer's operator agreed to: so far `user_transport`
-    /// (`docs/server-link.md` §3.2).
+    /// the peer's operator agreed to: `user_transport`
+    /// (`docs/server-link.md` §3.2) and `user_keys` (§7.7).
     #[serde(default)]
     pub drafts: Vec<String>,
 }
@@ -167,7 +167,11 @@ pub fn check(config: &Config) -> Result<(), String> {
         }
         peer_key(peer)?;
         features(peer)?;
-        if let Some(d) = peer.drafts.iter().find(|d| *d != "user_transport") {
+        if let Some(d) = peer
+            .drafts
+            .iter()
+            .find(|d| !matches!(d.as_str(), "user_transport" | "user_keys"))
+        {
             return Err(format!("[[link.peer]] {}: unknown draft {d:?}", peer.name));
         }
     }
@@ -187,6 +191,7 @@ fn entries(section: &LinkSection) -> Result<Vec<hxd_link::PeerEntry>, String> {
                 features: features(p)?,
                 ghosts: p.ghosts,
                 user_transport: p.drafts.iter().any(|d| d == "user_transport"),
+                user_keys: p.drafts.iter().any(|d| d == "user_keys"),
             })
         })
         .collect()
@@ -198,6 +203,15 @@ pub fn build(config: &Config, core: Arc<hxd_core::Core>) -> Result<Option<hxd_li
     };
     let seed = crate::load_secret(&section.key, "link server")?;
     let peers = entries(section)?;
+    // The key signed lines are scoped to, where this server carries them
+    // (`docs/e2e-messages.md` §4.6).
+    let identity = config
+        .identity
+        .as_ref()
+        .filter(|i| config.ng.is_some() && !i.hosts.is_empty());
+    let discovery_key = identity
+        .map(|i| crate::load_key(&i.key, "server identity").map(|k| k.public()))
+        .transpose()?;
     let hub = hxd_link::Hub::new(
         &seed,
         hxd_link::HubConfig {
@@ -208,6 +222,8 @@ pub fn build(config: &Config, core: Arc<hxd_core::Core>) -> Result<Option<hxd_li
             max_ghosts: section.max_ghosts,
             grace: std::time::Duration::from_secs(section.grace),
             peers,
+            discovery_key,
+            export_keys: identity.is_some_and(|i| !i.login_proof_v1),
         },
         core,
     );

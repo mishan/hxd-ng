@@ -73,11 +73,6 @@ fn fingerprint(p: &Person) -> hl_identity::Fingerprint {
 }
 
 async fn start(dir: &Path) -> Server {
-    start_with(dir, false).await
-}
-
-/// `linked`: `[link]` is configured.
-async fn start_with(dir: &Path, linked: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n\
@@ -121,7 +116,7 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
             RoomPolicy {
-                signed: !linked,
+                signed: true,
                 ..RoomPolicy::default()
             },
         )
@@ -171,7 +166,6 @@ async fn start_with(dir: &Path, linked: bool) -> Server {
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
             caps: vec!["history".into(), "inbox".into()],
-            linked,
             ..Default::default()
         }),
         registry: Arc::new(Registry::new()),
@@ -912,27 +906,6 @@ async fn a_resume_that_does_not_say_it_signs_loses_the_mark() {
     })
     .await
     .unwrap();
-}
-
-/// A link would carry a signed lobby line without its signature, so a
-/// linked server offers nothing to sign, and refuses what is signed.
-#[tokio::test]
-async fn a_linked_server_does_not_carry_signed_messages() {
-    let dir = tempfile::tempdir().unwrap();
-    let server = start_with(dir.path(), true).await;
-    let alice = person(1, "alice");
-    let (mut a, hello) = login_as(server.ng, &alice, json!({ "signs": "default" })).await;
-    assert!(!hello["caps"].as_array().unwrap().contains(&json!("signed")));
-    assert!(hello.get("signs").is_none());
-    let g = guid(11);
-    let signed = signed_line(&alice, &line(&alice, &g, 0, "hi"));
-    let (code, _) = refused(
-        &mut a,
-        "chat",
-        json!({ "text": "hi", "guid": g, "signed": signed }),
-    )
-    .await;
-    assert_eq!(code, "bad_request");
 }
 
 const GENERAL: [u8; 16] = [0x42; 16];
