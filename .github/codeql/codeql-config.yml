@@ -1,0 +1,8 @@
+# Test code logs in with fixed passwords and keys on purpose, and every
+# edit to it raised rust/hard-coded-cryptographic-value again.
+paths-ignore:
+  - "**/tests/**"
+  - "**/tests.rs"
+  - "**/benches/**"
+  - fuzz
+  - crates/hxd-testclient
