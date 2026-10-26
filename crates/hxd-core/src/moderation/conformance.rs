@@ -45,6 +45,7 @@ fn act(kind: ActKind, at: u64) -> Act {
         fingerprint: Some([2; 32]),
         reason: "spam".into(),
         evidence: Some("#17 Bob: buy now".into()),
+        signed: Some(vec![0xa5, 1, 2]),
         media_hash: Some([8; 32]),
         at: t(at),
     }
@@ -64,6 +65,7 @@ fn report(target: ReportTarget, at: u64) -> Report {
         reason: "rude".into(),
         evidence: Some("the body".into()),
         verified: false,
+        signed: Some(vec![0xa5, 3, 4]),
         media: match target {
             ReportTarget::Media(h) => Some(h),
             _ => None,
@@ -115,6 +117,7 @@ fn acts_round_trip_and_page_newest_first(s: &dyn ModerationStore) {
         login: None,
         fingerprint: None,
         evidence: None,
+        signed: None,
         media_hash: None,
         ..act(ActKind::Close, 400)
     };
@@ -131,8 +134,10 @@ fn evidence_is_scrubbed_and_the_row_stays(s: &dyn ModerationStore) {
     let all = s.acts(None, 10).unwrap();
     assert_eq!(all.len(), 2, "the rows stay");
     assert_eq!(all[1].evidence.as_deref(), Some(""));
+    assert_eq!(all[1].signed, None, "a signature goes with the words");
     assert_eq!(all[1].reason, "spam", "and so does why");
     assert_eq!(all[0].evidence.as_deref(), Some("#17 Bob: buy now"));
+    assert!(all[0].signed.is_some());
 }
 
 fn reports_round_trip_and_filter(s: &dyn ModerationStore) {

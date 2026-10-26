@@ -630,6 +630,12 @@ pub(crate) async fn handle(ctx: &NgCtx, uid: Uid, req: &ReqEnvelope) -> String {
         }
 
         "news_post" => {
+            // Refused rather than ignored: a post the client signed must
+            // not be kept as though it were not (`docs/e2e-messages.md`
+            // §4.10, which comes later).
+            if params.get("signed").is_some() {
+                return bad("Signed articles are not carried yet.");
+            }
             let Some(p) = parse::<PostParams>(params) else {
                 return malformed();
             };

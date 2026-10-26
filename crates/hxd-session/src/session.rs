@@ -1163,6 +1163,11 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NoSuchMedia => "Media rejected",
         ChatError::Flooding => "You were kicked for flooding.",
         ChatError::ReadOnly => "That room is read-only.",
+        // A classic client cannot sign (`docs/e2e-messages.md` §6), so
+        // these three never come back to it.
+        ChatError::Equivocation | ChatError::SignedElsewhere | ChatError::NoIdentity => {
+            "Signature refused."
+        }
         ChatError::ServerError => "Server error.",
     }
 }

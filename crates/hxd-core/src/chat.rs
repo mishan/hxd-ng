@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, warn};
 
-use crate::history::{HistoryPage, HistoryQuery, LineFlags, NewLine};
+use crate::history::{HistoryPage, HistoryQuery, LineFlags, NewLine, Signature};
 use crate::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     StoreError, StoredMessage,
@@ -293,6 +293,7 @@ pub(crate) struct Staged {
     at: SystemTime,
     /// The client's id for the line, and who it is held under.
     guid: Option<GuidKey>,
+    signed: Option<Signature>,
 }
 
 impl Staged {
@@ -308,6 +309,7 @@ impl Staged {
             media: None,
             at: SystemTime::now(),
             guid: None,
+            signed: None,
         }
     }
 }
@@ -350,14 +352,48 @@ const GUID_WINDOW: Duration = Duration::from_secs(10 * 60);
 const GUID_KEEP: usize = 1024;
 
 /// The guids a room's lines were sent under lately, oldest first, each
-/// with the id its line was answered. Shared by the room's senders, so a
-/// busy one can push out another's before its window ends. Expired
-/// entries go only when the room is next sent to, so a room archived or
-/// deleted keeps what it held, which is no more than the bound.
+/// with the id its line was answered and, for a signed line, what it
+/// said. Shared by the room's senders, so a busy one can push out
+/// another's before its window ends. Expired entries go only when the
+/// room is next sent to, so a room archived or deleted keeps what it
+/// held, which is no more than the bound.
 #[derive(Default)]
 struct RecentGuids {
     order: std::collections::VecDeque<(Instant, GuidKey)>,
-    ids: HashMap<GuidKey, Option<crate::history::LineId>>,
+    ids: HashMap<GuidKey, Remembered>,
+}
+
+/// What a line sent under a guid was answered, and what it said.
+type Remembered = (Option<crate::history::LineId>, Said);
+
+/// What a line said, as far as a signed repeat is held to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Said {
+    Unsigned,
+    /// The hash of a signed line's content ([`Signature::content`]).
+    Signed([u8; 32]),
+    /// Redacted: nothing of what it said is kept to hold a repeat to.
+    Forgotten,
+}
+
+impl Said {
+    fn of(signed: Option<&Signature>) -> Said {
+        signed.map_or(Said::Unsigned, |s| Said::Signed(s.content))
+    }
+}
+
+/// A repeat is answered as its line was, unless it is signed and says
+/// something else, an unsigned line being something else: one id, one
+/// message (`docs/e2e-messages.md` §3.6).
+fn repeat_of(
+    (id, was): Remembered,
+    now: Option<&Signature>,
+) -> Result<Option<crate::history::LineId>, ChatError> {
+    match (was, now) {
+        (_, None) | (Said::Forgotten, _) => Ok(id),
+        (Said::Signed(was), Some(now)) if was == now.content => Ok(id),
+        _ => Err(ChatError::Equivocation),
+    }
 }
 
 /// A guid and who it is held under ([`guid_sender`]).
@@ -366,12 +402,12 @@ type GuidKey = (GuidSender, MessageGuid);
 impl RecentGuids {
     /// What the line sent under `key` was answered, if that is still
     /// remembered.
-    fn find(&mut self, now: Instant, key: &GuidKey) -> Option<Option<crate::history::LineId>> {
+    fn find(&mut self, now: Instant, key: &GuidKey) -> Option<Remembered> {
         self.expire(now);
         self.ids.get(key).copied()
     }
 
-    fn remember(&mut self, now: Instant, key: GuidKey, id: Option<crate::history::LineId>) {
+    fn remember(&mut self, now: Instant, key: GuidKey, id: Remembered) {
         self.expire(now);
         if self.ids.contains_key(&key) {
             return;
@@ -390,6 +426,15 @@ impl RecentGuids {
             .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= GUID_WINDOW)
         {
             self.forget_oldest();
+        }
+    }
+
+    /// A redaction leaves nothing of what its lines said.
+    fn forget_said(&mut self, lines: &[crate::history::LineId]) {
+        for (id, said) in self.ids.values_mut() {
+            if id.is_some_and(|id| lines.contains(&id)) {
+                *said = Said::Forgotten;
+            }
         }
     }
 
@@ -434,6 +479,12 @@ impl ChatCommit {
             state: Mutex::default(),
             recent: Mutex::default(),
         }
+    }
+
+    /// Lines just redacted: a repeat of one is no longer held to what it
+    /// said, which is gone.
+    pub(crate) fn forget_said(&self, lines: &[crate::history::LineId]) {
+        self.recent.lock().unwrap().forget_said(lines);
     }
 
     /// Lines from one caller, queued together in their order and answered
@@ -597,10 +648,25 @@ pub enum ChatError {
     Flooding,
     /// The sender may read the room and not send in it.
     ReadOnly,
+    /// A signed line or message under an id its signer already used for
+    /// something else (`docs/e2e-messages.md` §3.6).
+    Equivocation,
+    /// A signed message to someone other than the identity it names.
+    SignedElsewhere,
+    /// A signed message to a recipient with no identity to sign it to.
+    NoIdentity,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
     ServerError,
+}
+
+/// A signed private message's signature, and the recipient fingerprint
+/// it names (`docs/e2e-messages.md` §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedMsg {
+    pub signature: Signature,
+    pub to: [u8; 32],
 }
 
 /// What became of a private message.
@@ -642,7 +708,11 @@ impl Core {
         room: u32,
         lines: Vec<(String, u16, Option<crate::media::Handle>)>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
-        self.chat_public_lines(from, room, lines.into_iter().map(|l| (l, None)).collect())
+        self.chat_public_lines(
+            from,
+            room,
+            lines.into_iter().map(|l| (l, None, None)).collect(),
+        )
     }
 
     /// One line into `room`, as [`Core::chat_public_all`] sends one,
@@ -656,12 +726,53 @@ impl Core {
         &self,
         from: Uid,
         room: u32,
-        (text, style, media): (String, u16, Option<crate::media::Handle>),
+        line: (String, u16, Option<crate::media::Handle>),
         guid: Option<MessageGuid>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_lines(from, room, vec![((text, style, media), guid)])
+        self.chat_public_signed(from, room, line, guid, None)
+    }
+
+    /// [`Core::chat_public_guid`], for a line that may be signed: its
+    /// frontend checked the signature, and that its id is `guid` and its
+    /// signer the sender's identity. A signed line its signer already
+    /// said under that id is answered as that line when it says the same
+    /// thing in the same room, and refused as an equivocation otherwise
+    /// (`docs/e2e-messages.md` §4.7), as far as the log and the room's
+    /// memory of guids remember.
+    pub fn chat_public_signed(
+        &self,
+        from: Uid,
+        room: u32,
+        line: (String, u16, Option<crate::media::Handle>),
+        guid: Option<MessageGuid>,
+        signed: Option<Signature>,
+    ) -> Result<Option<crate::history::LineId>, ChatError> {
+        self.chat_public_lines(from, room, vec![(line, guid, signed)])
             .pop()
             .expect("an answer for each line")
+    }
+
+    /// What the signed line `signer` said under `guid` was answered, from
+    /// the log's index of signed lines, which spans rooms: `None` when
+    /// it holds none.
+    fn signed_answer(
+        &self,
+        room: u32,
+        signer: &[u8; 32],
+        guid: &MessageGuid,
+        signed: &Signature,
+    ) -> Result<Option<Option<crate::history::LineId>>, ChatError> {
+        let Some(log) = self.history.as_ref() else {
+            return Ok(None);
+        };
+        match log.find_signed(signer, guid) {
+            Ok(Some(at)) if at.channel == room && at.content == signed.content => {
+                Ok(Some(Some(at.id)))
+            }
+            Ok(Some(_)) => Err(ChatError::Equivocation),
+            Ok(None) => Ok(None),
+            Err(e) => Err(history_store_failed(e)),
+        }
     }
 
     /// What the line sent under `key` into `room` was answered, if that is
@@ -674,20 +785,34 @@ impl Core {
         recent: &Mutex<RecentGuids>,
         room: u32,
         key: &GuidKey,
-    ) -> Option<Option<crate::history::LineId>> {
-        if let Some(id) = recent.lock().unwrap().find(self.clock.now(), key) {
-            return Some(id);
+    ) -> Option<Remembered> {
+        if let Some(found) = recent.lock().unwrap().find(self.clock.now(), key) {
+            return Some(found);
         }
         let (GuidSender::Kept(sender), guid) = key else {
             return None;
         };
         match self.history.as_ref()?.find_guid(room, sender, guid) {
+            // A signed line the log keeps was asked about by its
+            // signer's index first, so this one is unsigned or redacted.
             Ok(Some(id)) => {
+                let redacted = match self.history.as_ref()?.line(id) {
+                    Ok(line) => line.is_some_and(|l| l.flags.contains(LineFlags::DELETED)),
+                    Err(e) => {
+                        warn!("chat log would not read a line: {e}");
+                        false
+                    }
+                };
+                let said = if redacted {
+                    Said::Forgotten
+                } else {
+                    Said::Unsigned
+                };
                 recent
                     .lock()
                     .unwrap()
-                    .remember(self.clock.now(), key.clone(), Some(id));
-                Some(Some(id))
+                    .remember(self.clock.now(), key.clone(), (Some(id), said));
+                Some((Some(id), said))
             }
             Ok(None) => None,
             Err(e) => {
@@ -717,6 +842,7 @@ impl Core {
         lines: Vec<(
             (String, u16, Option<crate::media::Handle>),
             Option<MessageGuid>,
+            Option<Signature>,
         )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
@@ -734,7 +860,7 @@ impl Core {
         // heard before the room hears of the kick, as they would have
         // been sent one at a time.
         let mut tipped = None;
-        for (i, ((mut text, style, media), guid)) in lines.into_iter().enumerate() {
+        for (i, ((mut text, style, media), guid, signed)) in lines.into_iter().enumerate() {
             // A repeat puts nothing in the room, so it spends no chat
             // lines. One still in the queue behind its original is not
             // found here, and is found when its commit comes.
@@ -742,14 +868,31 @@ impl Core {
                 None => None,
                 Some(guid) => {
                     let r = self.roster.lock().unwrap();
-                    let Some(sender) = r.users.get(&from).map(|s| guid_sender(from, s)) else {
+                    let Some((sender, signer)) = r
+                        .users
+                        .get(&from)
+                        .map(|s| (guid_sender(from, s), s.identity))
+                    else {
                         results[i] = Some(Err(ChatError::NoSuchUser));
                         continue;
                     };
                     drop(r);
+                    if let (Some(signed), Some(signer)) = (&signed, signer) {
+                        match self.signed_answer(room, &signer, &guid, signed) {
+                            Ok(None) => {}
+                            Ok(Some(id)) => {
+                                results[i] = Some(Ok(id));
+                                continue;
+                            }
+                            Err(e) => {
+                                results[i] = Some(Err(e));
+                                continue;
+                            }
+                        }
+                    }
                     let key = (sender, guid);
-                    if let Some(id) = self.guid_answer(&commit.recent, room, &key) {
-                        results[i] = Some(Ok(id));
+                    if let Some(found) = self.guid_answer(&commit.recent, room, &key) {
+                        results[i] = Some(repeat_of(found, signed.as_ref()));
                         continue;
                     }
                     Some(key)
@@ -810,6 +953,7 @@ impl Core {
                 media,
                 at: SystemTime::now(),
                 guid,
+                signed,
             });
             at.push(i);
         }
@@ -901,15 +1045,19 @@ impl Core {
         let mut repeats = Vec::new();
         {
             let mut recent = commit.recent.lock().unwrap();
-            let mut first_seen = HashMap::new();
+            let mut first_seen: HashMap<&GuidKey, usize> = HashMap::new();
             for (i, s) in batch.iter().enumerate() {
                 let Some(key) = s.guid.as_ref().filter(|_| results[i].is_none()) else {
                     continue;
                 };
-                if let Some(id) = recent.find(now, key) {
-                    results[i] = Some(Ok(id));
+                if let Some(found) = recent.find(now, key) {
+                    results[i] = Some(repeat_of(found, s.signed.as_ref()));
                 } else if let Some(&first) = first_seen.get(key) {
-                    repeats.push((i, first));
+                    let said = Said::of(batch[first].signed.as_ref());
+                    match repeat_of((None, said), s.signed.as_ref()) {
+                        Ok(_) => repeats.push((i, first)),
+                        Err(e) => results[i] = Some(Err(e)),
+                    }
                 } else {
                     first_seen.insert(key, i);
                 }
@@ -959,6 +1107,7 @@ impl Core {
                                 }
                                 _ => None,
                             },
+                            signed: s.signed.clone(),
                         }
                     })
                     .collect();
@@ -992,7 +1141,8 @@ impl Core {
             for (i, done) in live.into_iter().zip(ids) {
                 let id = logged.then_some(done.id);
                 if let Some(guid) = batch[i].guid.clone() {
-                    recent.remember(now, guid, id);
+                    let said = Said::of(batch[i].signed.as_ref());
+                    recent.remember(now, guid, (id, said));
                 }
                 if done.new {
                     heard.push((i, id));
@@ -1027,6 +1177,7 @@ impl Core {
                 at: s.at,
                 media: s.media.as_ref().map(|(_, r)| r.clone()),
                 guid: None,
+                signed: s.signed.map(|s| s.form),
             };
             // The sender's own copy carries its guid; nobody else's does.
             let mine = s.guid.as_ref().map(|(_, g)| {
@@ -1154,6 +1305,7 @@ impl Core {
             at: SystemTime::now(),
             media: media.as_ref().map(|(_, r)| r.clone()),
             guid: None,
+            signed: None,
         };
         for uid in &members {
             r.send_to(*uid, ev.clone());
@@ -1740,10 +1892,29 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
+        self.msg_signed(from, to, text, guid, media, None)
+    }
+
+    /// [`Core::msg`], for a message that may be signed: its frontend
+    /// checked the signature, and that its id is `guid` and its signer
+    /// the sender's identity; `to` is the recipient fingerprint it names,
+    /// which must be the recipient's (`docs/e2e-messages.md` §4.9).
+    pub fn msg_signed(
+        &self,
+        from: Uid,
+        to: Uid,
+        text: String,
+        guid: Option<MessageGuid>,
+        media: Option<crate::media::Handle>,
+        signed: Option<SignedMsg>,
+    ) -> Result<MsgOutcome, ChatError> {
         // A message to the reserved account is a command line, not mail
         // (`docs/system-account.md` §1). Answered, never delivered and
         // never stored — there is nobody behind it to read it.
         if Some(to) == self.system_uid() {
+            if signed.is_some() {
+                return Err(ChatError::NoIdentity);
+            }
             return self.run_system_command(from, &text);
         }
         let (sender, recipient) = {
@@ -1772,7 +1943,7 @@ impl Core {
                 },
             )
         };
-        self.deliver(sender, recipient, text, guid, media)
+        self.deliver(sender, recipient, text, guid, media, signed)
     }
 
     /// A private message to an *account*, whether or not it holds a
@@ -1787,8 +1958,25 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
+        self.msg_login_signed(from, to, text, guid, media, None)
+    }
+
+    /// [`Core::msg_login`], as [`Core::msg_signed`] is [`Core::msg`]:
+    /// the account's linked identity is the fingerprint it must name.
+    pub fn msg_login_signed(
+        &self,
+        from: Uid,
+        to: &str,
+        text: String,
+        guid: Option<MessageGuid>,
+        media: Option<crate::media::Handle>,
+        signed: Option<SignedMsg>,
+    ) -> Result<MsgOutcome, ChatError> {
         // The same account by name, for a client that addresses by login.
         if self.is_system_login(to) {
+            if signed.is_some() {
+                return Err(ChatError::NoIdentity);
+            }
             return self.run_system_command(from, &text);
         }
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
@@ -1818,6 +2006,7 @@ impl Core {
             text,
             guid,
             media,
+            signed,
         )
     }
 
@@ -1871,9 +2060,20 @@ impl Core {
         text: String,
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
+        signed: Option<SignedMsg>,
     ) -> Result<MsgOutcome, ChatError> {
         let now = SystemTime::now();
         let from = sender.uid;
+        // Against the recipient as resolved here, which is who the message
+        // goes to: a uid named a moment ago may be someone else's now.
+        let signed = match signed {
+            None => None,
+            Some(s) => match to.mailbox.fingerprint {
+                None => return Err(ChatError::NoIdentity),
+                Some(fp) if fp != s.to => return Err(ChatError::SignedElsewhere),
+                Some(_) => Some(s.signature),
+            },
+        };
 
         // The handle resolves before anything is delivered or stored: a
         // message carrying an image this sender may not attach is
@@ -1970,6 +2170,7 @@ impl Core {
                     sent_at: now,
                     queued: false,
                     media,
+                    signed: signed.map(|s| s.form),
                 },
             );
             return Ok(MsgOutcome::Delivered);
@@ -1985,6 +2186,19 @@ impl Core {
             .map_err(store_failed)?
         {
             return Err(ChatError::Blocked);
+        }
+        // A signed id is its signer's across recipients (§3.6): one this
+        // sender used toward someone else is another message. Toward this
+        // recipient, `push` finds it.
+        if let (Some(_), Some(g)) = (&signed, &guid) {
+            if let Some(m) = store.find_sent(&from_mailbox, g).map_err(store_failed)? {
+                if !to
+                    .mailbox
+                    .matches(&m.recipient.login, m.recipient.fingerprint.as_ref())
+                {
+                    return Err(ChatError::Equivocation);
+                }
+            }
         }
 
         // The sender's quota (`docs/private-messages.md` §9): what one
@@ -2046,6 +2260,7 @@ impl Core {
                     sent_at: now,
                     queued: false,
                     media,
+                    signed: signed.map(|s| s.form),
                 },
             );
             return Ok(MsgOutcome::Delivered);
@@ -2073,6 +2288,7 @@ impl Core {
                     guid,
                     kind: MessageKind::Message,
                     media: media.as_ref().map(|m| m.to_meta()),
+                    signed: signed.clone(),
                 },
                 self.inbox_policy.max_queued,
             )
@@ -2090,6 +2306,12 @@ impl Core {
                 id
             }
             crate::inbox::Pushed::Existing(m) => {
+                // An unsigned message under the id says something else.
+                if let Some(now) = &signed {
+                    if m.signed.as_ref().map(|was| was.content) != Some(now.content) {
+                        return Err(ChatError::Equivocation);
+                    }
+                }
                 // A retry is that same message, and it gets the answer
                 // the first send would get *now* rather than the one it
                 // got then. The recipient may have attached in between:
@@ -2395,6 +2617,7 @@ impl Core {
                         sent_at: m.sent_at,
                         queued: Some(m.id) != fresh,
                         media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
+                        signed: m.signed.map(|s| s.form),
                     },
                 );
                 delivered.push(m.id);
@@ -2924,6 +3147,13 @@ mod tests {
         ) -> Result<Option<crate::history::LineId>, StoreError> {
             self.inner.find_guid(channel, sender, guid)
         }
+        fn find_signed(
+            &self,
+            signer: &[u8; 32],
+            guid: &MessageGuid,
+        ) -> Result<Option<crate::history::SignedAt>, StoreError> {
+            self.inner.find_signed(signer, guid)
+        }
         fn attach_media(
             &self,
             id: crate::history::LineId,
@@ -3155,6 +3385,13 @@ mod tests {
             guid: &MessageGuid,
         ) -> Result<Option<crate::history::LineId>, StoreError> {
             self.inner.find_guid(channel, sender, guid)
+        }
+        fn find_signed(
+            &self,
+            signer: &[u8; 32],
+            guid: &MessageGuid,
+        ) -> Result<Option<crate::history::SignedAt>, StoreError> {
+            self.inner.find_signed(signer, guid)
         }
         fn attach_media(
             &self,
@@ -3457,6 +3694,13 @@ mod tests {
         ) -> Result<Option<crate::history::LineId>, StoreError> {
             Ok(None)
         }
+        fn find_signed(
+            &self,
+            _: &[u8; 32],
+            _: &MessageGuid,
+        ) -> Result<Option<crate::history::SignedAt>, StoreError> {
+            Ok(None)
+        }
     }
 
     /// A line the log already holds under its guid, which nothing before
@@ -3478,6 +3722,7 @@ mod tests {
                 flags: LineFlags::default(),
                 at: SystemTime::now(),
                 guid: Some(("login:alice".into(), a_guid())),
+                signed: None,
             })
             .unwrap();
         let core = Core::new().with_history(log.clone(), Default::default());
@@ -3508,14 +3753,21 @@ mod tests {
         let sender = GuidSender::Session { uid: 1, serial: 1 };
         let guid = |n: usize| MessageGuid::parse(&format!("{n:032x}")).unwrap();
         for n in 0..=GUID_KEEP {
-            recent.remember(now, (sender.clone(), guid(n)), Some(n as u64));
+            recent.remember(
+                now,
+                (sender.clone(), guid(n)),
+                (Some(n as u64), Said::Unsigned),
+            );
         }
         assert_eq!(
             (recent.order.len(), recent.ids.len()),
             (GUID_KEEP, GUID_KEEP)
         );
         assert_eq!(recent.find(now, &(sender.clone(), guid(0))), None);
-        assert_eq!(recent.find(now, &(sender, guid(1))), Some(Some(1)));
+        assert_eq!(
+            recent.find(now, &(sender, guid(1))),
+            Some((Some(1), Said::Unsigned))
+        );
     }
 
     /// A repeat that reaches the queue while its original is still
@@ -5557,6 +5809,13 @@ mod inbox_tests {
         }
         fn is_pending(&self, to: &Mailbox, id: MessageId) -> Result<bool, StoreError> {
             self.inner.is_pending(to, id)
+        }
+        fn find_sent(
+            &self,
+            from: &Mailbox,
+            guid: &MessageGuid,
+        ) -> Result<Option<StoredMessage>, StoreError> {
+            self.inner.find_sent(from, guid)
         }
         fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
             self.inner.pending(to, limit)

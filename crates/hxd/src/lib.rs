@@ -4118,6 +4118,7 @@ pub fn build_ng_ctx(
             trusted_proxies: TrustedProxies::parse(&ng.trusted_proxies)?,
             forwarded_header: ForwardedHeader::parse(&ng.forwarded_header)?,
             http_limits: config.limits.http_limits()?,
+            linked: config.link.is_some(),
         }),
         registry: Arc::new(Registry::new()),
         identity,
@@ -4789,6 +4790,7 @@ sync = "full"
                 flags: Default::default(),
                 at: SystemTime::now(),
                 guid: None,
+                signed: None,
             })
             .unwrap();
         let page = history
@@ -5514,6 +5516,7 @@ sync = "full"
                         guid: None,
                         kind,
                         media: None,
+                        signed: None,
                     },
                     usize::MAX,
                 )

@@ -85,6 +85,29 @@ pub struct NewLine {
     /// guid. Kept so a repeat after a restart finds its line; never read
     /// back into a [`LogLine`]. The sender is [`guid_sender_key`]'s.
     pub guid: Option<(String, MessageGuid)>,
+    /// A signed line's detached form, and what it says. Its signer is
+    /// `from_fingerprint` and its id `guid`'s, which the frontend that
+    /// checked it made sure of.
+    pub signed: Option<Signature>,
+}
+
+/// A signed line's or message's detached form
+/// (`docs/e2e-messages.md` §3.1), checked by the frontend that took it,
+/// and kept and served exactly as it came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub form: Vec<u8>,
+    /// SHA-256 of what it says, which signing it again does not change
+    /// (§3.6): what tells the same line from an equivocation.
+    pub content: [u8; 32],
+}
+
+/// Where a signed line is logged, as [`ChatLog::find_signed`] finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedAt {
+    pub channel: u32,
+    pub id: LineId,
+    pub content: [u8; 32],
 }
 
 /// How a line's guid sender is kept, the same in memory and in the log:
@@ -123,6 +146,8 @@ pub struct LogLine {
     pub flags: LineFlags,
     pub at: SystemTime,
     pub media: Option<MediaMeta>,
+    /// The detached form a signed line came with, until it is redacted.
+    pub signed: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +261,16 @@ pub trait ChatLog: Send + Sync + 'static {
         sender: &str,
         guid: &MessageGuid,
     ) -> Result<Option<LineId>, StoreError>;
+    /// The signed line `signer` logged under `guid`, in any channel,
+    /// while the log keeps it: the index of signed lines by
+    /// `(signer, id)` (`docs/e2e-messages.md` §4.7). A redacted line is
+    /// not in it, since what it said goes with its words; its guid still
+    /// answers a line sent again under that id ([`ChatLog::find_guid`]).
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        guid: &MessageGuid,
+    ) -> Result<Option<SignedAt>, StoreError>;
 }
 
 #[derive(Default)]
@@ -249,6 +284,7 @@ struct MemoryInner {
     lines: Vec<LogLine>,
     ghosts: std::collections::HashMap<LineId, [u8; 16]>,
     guids: std::collections::HashMap<(u32, String, MessageGuid), LineId>,
+    signed: std::collections::HashMap<([u8; 32], MessageGuid), SignedAt>,
 }
 
 impl MemoryInner {
@@ -276,9 +312,19 @@ impl MemoryInner {
             flags: line.flags,
             at: line.at,
             media: None,
+            signed: line.signed.as_ref().map(|s| s.form.clone()),
         });
         if let Some(key) = line.ghost {
             self.ghosts.insert(id, key);
+        }
+        if let (Some(s), Some(fp), Some((_, g))) = (&line.signed, line.from_fingerprint, &line.guid)
+        {
+            let at = SignedAt {
+                channel: line.channel,
+                id,
+                content: s.content,
+            };
+            self.signed.insert((fp, g.clone()), at);
         }
         if let Some(key) = guid {
             self.guids.insert(key, id);
@@ -369,7 +415,9 @@ impl ChatLog for MemoryLog {
         };
         line.from_nick.clear();
         line.text.clear();
+        line.signed = None;
         line.flags = line.flags.with(LineFlags::DELETED);
+        inner.signed.retain(|_, at| at.id != id);
         // The public timestamp is the original receive time; who and
         // when are the moderation record's, which this store has no
         // column for.
@@ -404,10 +452,12 @@ impl ChatLog for MemoryLog {
             lines,
             ghosts,
             guids,
+            signed,
             ..
         } = &mut *inner;
         ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
         guids.retain(|_, id| lines.iter().any(|line| line.id == *id));
+        signed.retain(|_, at| lines.iter().any(|line| line.id == at.id));
         Ok(before - inner.lines.len())
     }
 
@@ -428,10 +478,12 @@ impl ChatLog for MemoryLog {
             lines,
             ghosts,
             guids,
+            signed,
             ..
         } = &mut *inner;
         ghosts.retain(|id, _| lines.iter().any(|line| line.id == *id));
         guids.retain(|_, id| lines.iter().any(|line| line.id == *id));
+        signed.retain(|_, at| lines.iter().any(|line| line.id == at.id));
         Ok(before - inner.lines.len())
     }
 
@@ -455,6 +507,15 @@ impl ChatLog for MemoryLog {
         let key = (channel, sender.to_string(), guid.clone());
         Ok(self.inner.lock().unwrap().guids.get(&key).copied())
     }
+
+    fn find_signed(
+        &self,
+        signer: &[u8; 32],
+        guid: &MessageGuid,
+    ) -> Result<Option<SignedAt>, StoreError> {
+        let key = (*signer, guid.clone());
+        Ok(self.inner.lock().unwrap().signed.get(&key).copied())
+    }
 }
 
 pub mod conformance {
@@ -476,6 +537,7 @@ pub mod conformance {
             },
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(100 + n),
             guid: None,
+            signed: None,
         }
     }
 
@@ -494,6 +556,42 @@ pub mod conformance {
         a_senders_lines_are_found_in_every_channel(new_log());
         channels_are_listed_and_deleted_whole(new_log());
         a_line_is_found_by_its_guid_once(new_log());
+        a_signed_line_is_found_by_its_signer_in_any_channel(new_log());
+    }
+
+    /// A signed line keeps its form and is found by its signer and guid,
+    /// in whichever channel it was said, until it is redacted; another
+    /// sender's unsigned line under the same guid is not.
+    fn a_signed_line_is_found_by_its_signer_in_any_channel(log: Box<dyn ChatLog>) {
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000002").unwrap();
+        let sender = guid_sender_key(Some("login-3"), None).unwrap();
+        let signed = Signature {
+            form: vec![0xa5, 1, 2, 3],
+            content: [9; 32],
+        };
+        let id = log
+            .append(&NewLine {
+                guid: Some((sender.clone(), guid.clone())),
+                signed: Some(signed.clone()),
+                ..in_channel(3, 7)
+            })
+            .unwrap();
+        log.append(&NewLine {
+            guid: Some((sender, guid.clone())),
+            ..line(4)
+        })
+        .unwrap();
+        let found = SignedAt {
+            channel: 7,
+            id,
+            content: signed.content,
+        };
+        assert_eq!(log.find_signed(&[3; 32], &guid).unwrap(), Some(found));
+        assert_eq!(log.find_signed(&[4; 32], &guid).unwrap(), None);
+        assert_eq!(log.line(id).unwrap().unwrap().signed, Some(signed.form));
+        assert!(log.tombstone(id, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        assert_eq!(log.line(id).unwrap().unwrap().signed, None, "redacted");
+        assert_eq!(log.find_signed(&[3; 32], &guid).unwrap(), None);
     }
 
     /// A line logged with a guid is found by its channel, sender and

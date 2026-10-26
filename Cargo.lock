@@ -1403,6 +1403,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "console-subscriber",
+ "ed25519-dalek",
  "futures-util",
  "hl-identity",
  "hl-tunnel",

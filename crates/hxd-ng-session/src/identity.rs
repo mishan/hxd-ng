@@ -200,6 +200,10 @@ impl TransportIdentity {
     pub fn allows(&self, cap: u64) -> bool {
         self.device_caps.is_none_or(|c| c & cap == cap)
     }
+
+    pub fn may_message(&self) -> bool {
+        self.allows(hl_identity::caps::MESSAGE)
+    }
 }
 
 impl TransportIdentity {
@@ -210,6 +214,7 @@ impl TransportIdentity {
             device: Fingerprint::of(&self.device).0,
             handle: self.handle.clone(),
             quiet_until: self.quiet_until,
+            signs: false,
         }
     }
 }

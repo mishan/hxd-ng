@@ -88,6 +88,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         guid: None,
         kind: MessageKind::Message,
         media: None,
+        signed: None,
     }
 }
 
@@ -129,6 +130,10 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
                 height: 600,
                 bytes: 124_000,
             }),
+            signed: Some(crate::history::Signature {
+                form: vec![0xa5, 1, 2],
+                content: [4; 32],
+            }),
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -152,6 +157,12 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
         (media.width, media.height, media.bytes),
         (800, 600, 124_000),
         "{case}: canonical dimensions and size"
+    );
+    let signed = got.signed.as_ref().expect("{case}: the signature survived");
+    assert_eq!(
+        (&signed.form[..], signed.content),
+        (&[0xa5, 1, 2][..], [4; 32]),
+        "{case}: its form and content"
     );
 }
 
@@ -912,6 +923,16 @@ fn a_guid_is_scoped_to_one_sender_and_one_recipient(s: &dyn MessageStore) {
         s.find_guid(&dave, None, &guid(7)).unwrap().map(|m| m.body),
         Some("from a guest".to_string()),
         "{case}: and a sender with no mailbox is not every sender"
+    );
+    // Toward anyone, a sender's guid finds what it sent under it.
+    assert_eq!(
+        s.find_sent(&alice, &guid(7)).unwrap().map(|m| m.body),
+        Some("from alice".to_string()),
+        "{case}: what a sender sent under a guid, to anyone"
+    );
+    assert!(
+        s.find_sent(&carol, &guid(7)).unwrap().is_none(),
+        "{case}: and nobody else's"
     );
 }
 

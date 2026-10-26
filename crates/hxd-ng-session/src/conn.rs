@@ -34,7 +34,7 @@ use crate::proto::{
     reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
     stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
     ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, VideoStartParams, VideoStateParams, VideoStopParams,
+    ReqEnvelope, ResumeParams, Signs, VideoStartParams, VideoStateParams, VideoStopParams,
     VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
@@ -364,9 +364,12 @@ pub(crate) async fn run(
                     // client that waits that long is served. The limit
                     // is the session's (§9), so a resume does not refill
                     // it.
+                    // A signature costs two verifications, its certificate's
+                    // and its own (`docs/e2e-messages.md` §7).
+                    let signed = u32::from(req.params.get("signed").is_some());
                     let over = ctx
                         .core
-                        .spend_request(state.uid, request_weight(&req.req))
+                        .spend_request(state.uid, request_weight(&req.req) + signed)
                         .err();
                     let newcomer = matches!(req.req.as_str(), "chat" | "msg" | "news_post")
                         .then(|| ctx.core.newcomer_wait(state.uid))
@@ -746,7 +749,10 @@ async fn handle_login(
             joins_rooms: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
-            identity: identity.map(|i| i.tag().on_account(account.identity.fingerprint)),
+            identity: identity.map(|i| hxd_core::IdentityTag {
+                signs: signs(ctx, Some(i.may_message()), p.signs) == Some(Signs::Default),
+                ..i.tag().on_account(account.identity.fingerprint)
+            }),
             // Always, when the server has a pipeline at all: an ng
             // client is told what it may ignore rather than asked what
             // it supports, so an event with a `media` object is safe to
@@ -877,6 +883,7 @@ async fn handle_login(
         me_json["manage_rooms"] = json!(true);
     }
     if let Some(i) = identity {
+        let signs = me_json["identity"]["signs"].clone();
         // `age` and `outcome` are for the user themself, never the roster.
         // The outcome reflects the account this session actually landed
         // on, which can differ from the token's if a link was made in
@@ -897,6 +904,9 @@ async fn handle_login(
             "outcome": outcome,
             "account": if account.login == "guest" { Value::Null } else { json!(account.login) },
         });
+        if !signs.is_null() {
+            me_json["identity"]["signs"] = signs;
+        }
     }
     // `identity` is a property of the server, not of the config's
     // extension list: it's on whenever the identity endpoints are.
@@ -941,6 +951,9 @@ async fn handle_login(
     if !caps.iter().any(|c| c == "chat_guid") {
         caps.push("chat_guid".into());
     }
+    if crate::signed::offered(ctx) && !caps.iter().any(|c| c == "signed") {
+        caps.push("signed".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -953,6 +966,9 @@ async fn handle_login(
         "caps": caps,
         "seq": 0,
     });
+    if let Some(signs) = signs(ctx, identity.map(TransportIdentity::may_message), p.signs) {
+        ok["signs"] = json!(signs.as_str());
+    }
     // The ceilings, so a client configures its encoders before the first
     // join rather than discovering them by rejection. Present only when
     // video is — `"video"` never appears in `caps` without `"voice"`,
@@ -1153,6 +1169,9 @@ async fn handle_resume(
     .ok()
     .flatten()
     .map(|account| account.masked(&mask));
+    let device = ctx.registry.device(&p.session);
+    let signs = signs(ctx, device.as_ref().map(|d| d.may_message), p.signs);
+    ctx.core.set_signs(uid, signs == Some(Signs::Default));
     let state = SessState {
         uid,
         session_id: p.session.clone(),
@@ -1160,7 +1179,7 @@ async fn handle_resume(
         // The device the session logged in as, whatever this socket did
         // or did not present: the token proves continuity, and the
         // certificate's rights are the session's.
-        device: ctx.registry.device(&p.session),
+        device,
         file_list: account.as_ref().is_some_and(|account| account.file_list),
         file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
         set_subject: account.as_ref().is_some_and(|account| account.set_subject),
@@ -1181,7 +1200,10 @@ async fn handle_resume(
                 lost(ctx);
                 return None;
             };
-            let ok = json!({ "replay": replay.len(), "self": user_json(&me) });
+            let mut ok = json!({ "replay": replay.len(), "self": user_json(&me) });
+            if let Some(signs) = signs {
+                ok["signs"] = json!(signs.as_str());
+            }
             if !send_frame(ws_tx, Message::Text(reply_ok(req.id, ok))).await {
                 lost(ctx);
                 return None;
@@ -1508,6 +1530,23 @@ fn media_now(
     })
 }
 
+/// What a session that said `signs` is taken to do: nothing, unless the
+/// server carries signed messages and the session proved a device whose
+/// certificate allows them (`docs/e2e-messages.md` §4.6).
+fn signs(ctx: &NgCtx, may_message: Option<bool>, asked: Option<Signs>) -> Option<Signs> {
+    asked.filter(|_| may_message == Some(true) && crate::signed::offered(ctx))
+}
+
+/// A signed line or message under an id its signer used for something
+/// else (`docs/e2e-messages.md` §3.6).
+fn equivocation(id: u64) -> String {
+    reply_err(
+        id,
+        "bad_signature",
+        "You signed something else under that id; sign this under another.",
+    )
+}
+
 /// Is this `msg` addressed to the system account, by uid or by login?
 fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
     match (p.to, p.to_login.as_deref()) {
@@ -1623,11 +1662,23 @@ async fn dispatch(
                         .await
                     }
                 };
+                let (uid, room) = (state.uid, p.room);
+                // Refused rather than cut over its limit: cutting would
+                // break the signature (`docs/e2e-messages.md` §4.7).
+                let signed = match p.signed.as_deref() {
+                    None => None,
+                    Some(signed) => {
+                        let text = (p.text.as_str(), style == 1);
+                        match crate::signed::line(ctx, state, room, guid.as_ref(), text, signed) {
+                            Ok(signed) => Some(signed),
+                            Err(refused) => return finish(ws_tx, refused.reply(req.id)).await,
+                        }
+                    }
+                };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
-                let (uid, room) = (state.uid, p.room);
                 let said = off_reactor(&ctx.core, move |c| {
-                    c.chat_public_guid(uid, room, (text, style, media), guid)
+                    c.chat_public_signed(uid, room, (text, style, media), guid, signed)
                 })
                 .await;
                 match said {
@@ -1654,6 +1705,7 @@ async fn dispatch(
                     Some(Err(ChatError::Flooding)) => {
                         reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
+                    Some(Err(ChatError::Equivocation)) => equivocation(req.id),
                     _ => reply_err(req.id, "server_error", "Server error."),
                 }
             }
@@ -1747,6 +1799,29 @@ async fn dispatch(
                 "You are not allowed to send private messages.",
             ),
             Ok(p) => {
+                // Parsed, not stored as it arrived: this indexes a
+                // column, and an index over arbitrary client text is a
+                // place to put anything.
+                let guid = match p.guid.as_deref().map(MessageGuid::parse) {
+                    None => None,
+                    Some(Some(g)) => Some(g),
+                    Some(None) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(req.id, "bad_request", "`guid` is not a UUID."),
+                        )
+                        .await
+                    }
+                };
+                let signed = match p.signed.as_deref() {
+                    None => None,
+                    Some(signed) => {
+                        match crate::signed::msg(ctx, state, guid.as_ref(), &p.text, signed) {
+                            Ok(signed) => Some(signed),
+                            Err(refused) => return finish(ws_tx, refused.reply(req.id)).await,
+                        }
+                    }
+                };
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
                 let media = match p.media.as_deref().map(hxd_core::media::handle_from_str) {
@@ -1769,23 +1844,16 @@ async fn dispatch(
                     )
                     .await;
                 }
-                // Parsed, not stored as it arrived: this indexes a
-                // column, and an index over arbitrary client text is a
-                // place to put anything.
-                let guid = match p.guid.as_deref().map(MessageGuid::parse) {
-                    None => None,
-                    Some(Some(g)) => Some(g),
-                    Some(None) => {
-                        return finish(
-                            ws_tx,
-                            reply_err(req.id, "bad_request", "`guid` is not a UUID."),
-                        )
-                        .await
-                    }
-                };
                 let from = state.uid;
                 let outcome = match (p.to, p.to_login.clone()) {
                     (Some(uid), None) => {
+                        // A link does not carry a signature yet, and a
+                        // signed message never crosses without one
+                        // (`docs/e2e-messages.md` §4.11).
+                        if signed.is_some() && ctx.core.is_ghost(uid) {
+                            let why = "Signed messages do not cross this link.";
+                            return finish(ws_tx, reply_err(req.id, "not_delivered", why)).await;
+                        }
                         // A user of another server, answered here and now:
                         // replies keep their requests' order (§5), and the
                         // wait is bounded by `PEER_WAIT`.
@@ -1814,11 +1882,14 @@ async fn dispatch(
                             };
                             return finish(ws_tx, out).await;
                         }
-                        off_reactor(&ctx.core, move |c| c.msg(from, uid, text, guid, media)).await
+                        off_reactor(&ctx.core, move |c| {
+                            c.msg_signed(from, uid, text, guid, media, signed)
+                        })
+                        .await
                     }
                     (None, Some(login)) => {
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_login(from, &login, text, guid, media)
+                            c.msg_login_signed(from, &login, text, guid, media, signed)
                         })
                         .await
                     }
@@ -1881,6 +1952,15 @@ async fn dispatch(
                     Err(ChatError::Flooding) => {
                         reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
+                    Err(ChatError::Equivocation) => equivocation(req.id),
+                    Err(ChatError::SignedElsewhere) => {
+                        reply_err(req.id, "bad_signature", "Signed to someone else.")
+                    }
+                    Err(ChatError::NoIdentity) => reply_err(
+                        req.id,
+                        "bad_request",
+                        "That user proved no identity to sign a message to.",
+                    ),
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
                     // them can be told apart from outside.

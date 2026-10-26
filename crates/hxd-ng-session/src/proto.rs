@@ -30,6 +30,8 @@ pub struct LoginParams {
     pub password: String,
     pub nick: Option<String>,
     pub icon: Option<u16>,
+    /// Whether the client signs (`docs/e2e-messages.md` §4.6).
+    pub signs: Option<Signs>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +40,27 @@ pub struct ResumeParams {
     pub token: String,
     #[serde(default)]
     pub last_seq: u64,
+    pub signs: Option<Signs>,
+}
+
+/// `signs` on `login` and `resume`: any other value is `bad_request`,
+/// as a malformed `params` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Signs {
+    /// Signs public lines by default, which the roster shows.
+    Default,
+    /// Signs only where asked or required.
+    Able,
+}
+
+impl Signs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signs::Default => "default",
+            Signs::Able => "able",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +80,9 @@ pub struct ChatParams {
     /// the same guid into the same room, lately, it is the same line.
     #[serde(default)]
     pub guid: Option<String>,
+    /// The line's detached form, base64url (`docs/e2e-messages.md` §4.7).
+    #[serde(default)]
+    pub signed: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -99,6 +125,10 @@ pub struct MsgParams {
     /// all.
     #[serde(default)]
     pub media: Option<String>,
+    /// The message's detached form, base64url (`docs/e2e-messages.md`
+    /// §4.9).
+    #[serde(default)]
+    pub signed: Option<String>,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -589,13 +619,14 @@ impl serde::Serialize for UserOut<'_> {
             )?;
         }
         if let Some(id) = &u.transport.identity {
-            m.serialize_entry(
-                "identity",
-                &json!({
-                    "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
-                    "handle": id.handle,
-                }),
-            )?;
+            let mut identity = json!({
+                "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
+                "handle": id.handle,
+            });
+            if id.signs {
+                identity["signs"] = json!(true);
+            }
+            m.serialize_entry("identity", &identity)?;
         }
         m.end()
     }
@@ -631,6 +662,8 @@ struct ChatData<'a> {
     media: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guid: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -676,6 +709,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         at,
         media,
         guid,
+        signed,
     } = &se.event
     {
         let data = ChatData {
@@ -689,6 +723,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             id: *id,
             media: media.as_ref().map(crate::media::media_json),
             guid: guid.as_ref().map(|g| g.as_str()),
+            signed: signed.as_deref().map(b64url),
         };
         return serde_json::to_string(&EventOut {
             seq: se.seq,
@@ -717,6 +752,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             sent_at,
             queued,
             media,
+            signed,
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -742,6 +778,9 @@ pub fn event_json(se: &SeqEvent) -> String {
             // (`docs/inline-media.md` §9).
             if let Some(media) = media {
                 data["media"] = crate::media::media_json(media);
+            }
+            if let Some(signed) = signed {
+                data["signed"] = json!(b64url(signed));
             }
             ("msg", data)
         }
@@ -871,6 +910,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
             at,
             media,
             guid,
+            signed,
             ..
         } => {
             let data = ChatData {
@@ -884,6 +924,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
                 id: *id,
                 media: media.as_ref().map(crate::media::media_json),
                 guid: guid.as_ref().map(|g| g.as_str()),
+                signed: signed.as_deref().map(b64url),
             };
             (
                 "chat",
@@ -942,6 +983,9 @@ pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
     if deleted {
         value["deleted"] = json!(true);
     }
+    if let Some(signed) = &line.signed {
+        value["signed"] = json!(b64url(signed));
+    }
     if let Some(media) = &line.media {
         value["media"] = if deleted {
             json!({
@@ -963,7 +1007,7 @@ pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
             // metadata stands on its own: "[an image was here]" is worth
             // rendering and an empty line is not.
             if fetchable {
-                m["id"] = json!(media_handle(&media.id));
+                m["id"] = json!(b64url(&media.id));
             }
             m
         };
@@ -971,7 +1015,8 @@ pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
     value
 }
 
-fn media_handle(bytes: &[u8]) -> String {
+/// Base64url without padding, as a handle or a signed form is written.
+pub(crate) fn b64url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -998,6 +1043,9 @@ pub fn stored_msg_json(m: &hxd_core::StoredMessage, media: Option<&MediaRef>) ->
     if let Some(media) = media {
         value["media"] = crate::media::media_json(media);
     }
+    if let Some(signed) = &m.signed {
+        value["signed"] = json!(b64url(&signed.form));
+    }
     value
 }
 
@@ -1018,6 +1066,7 @@ mod tests {
                     device: [2; 32],
                     handle: Some("ann@example.org".into()),
                     quiet_until: None,
+                    signs: false,
                 }),
                 ..Default::default()
             },

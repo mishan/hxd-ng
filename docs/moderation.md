@@ -112,6 +112,11 @@ has to be typed.
 4. `Event::ChatRedacted { id }` to every session that reads public
    chat.
 
+A signed line's detached form goes with its words, into the audit
+row's `evidence_signed` (schema v24), and is scrubbed with them; the
+tombstone carries none (e2e-messages.md §4.12). `moderation_log` shows it
+as `signed`.
+
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an
 empty string by the sweeper, leaving the row. Moderators can read it
@@ -318,6 +323,23 @@ a report on its sender (`user`) with the text as `evidence`, which the
 server marks `verified: false` and the moderator sees. It is the
 reporter's word about a person, not a row the server can vouch for.
 
+**Signed evidence** (e2e-messages.md §4.12). A signed line or message
+keeps its detached form on its row, and a report of it copies the form
+in: for a line beside the line's text, which a redaction would
+otherwise take, as `target.text` and `target.signed`, and for an inbox
+message as `signed` beside `evidence`. Pasted evidence, for a public
+line or a private message, may carry `signed`, the detached form of
+what `evidence` pastes, or a whole private message with `evidence` left
+out and taken from its `text`. The server checks it with the
+certificate at `sent` alone, a line's scope against its own key and a
+message's against the reporter's identity, and refuses it
+`bad_signature` otherwise. The person the report names is then the
+certificate's identity: a `user` named must be that identity, and with
+none named, which pasted signed evidence alone may do, the server names
+it. Such a report stays `verified: false` and carries `signed`, which a
+moderator's tool checks for itself. hxd-ng does not yet accept a line
+signed under a linked server's key, which wants the keys links carry.
+
 ### 4.3 Images
 
 An image report is the one where timing matters: the handle expires in
@@ -389,7 +411,7 @@ Requests, all `access_denied` without `moderate` except `report`:
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox id), `user` (`uid` \| `login` \| `fingerprint`), `article` (id); `reason`; `evidence?` (text, for a PM with no row) | `{ "id", "outcome": "open" \| "removed", "follow_up" }` | `bad_request`, `no_such_target`, `rate_limited`, `not_available` |
+| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox id), `user` (`uid` \| `login` \| `fingerprint`), `article` (id), or none with `signed`; `reason`; `evidence?` (text, for a PM with no row); `signed?` (§4.2) | `{ "id", "outcome": "open" \| "removed", "follow_up" }` | `bad_request`, `bad_signature`, `no_such_target`, `rate_limited`, `not_available` |
 | `reports` | `status?` (`open` default \| `closed` \| `all`), `before?`, `limit?` (1–100) | `{ "reports": [ … ], "has_more" }` | |
 | `report_close` | `id`, `outcome` (`dismissed` \| `duplicate`), `note?`, `of?` (id, for duplicate) | `{}` | `no_such_report`, `own_report` |
 | `redact` | `id` (line), `reason` | `{}` | `no_such_line`, `protected` |
@@ -414,6 +436,7 @@ A `report` object:
   "by": { "login": "alice" },                // absent for a guest reporter
   "target": { "kind": "media", "media": "…", "from": { "login": "bob" } },
   "reason": "…", "evidence": "…",            // evidence for msg reports
+  "signed": "…",                             // a signed msg's, or pasted (§4.2)
   "closed": { "at": …, "by": "carol", "outcome": "removed", "note": "…" } }
 ```
 
