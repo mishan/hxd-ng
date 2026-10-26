@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, warn};
 
-use crate::history::{HistoryPage, HistoryQuery, LineFlags, NewLine, Signature};
+use crate::history::{HistoryPage, HistoryQuery, LineFlags, LineHome, NewLine, Signature};
 use crate::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     StoreError, StoredMessage,
@@ -1150,6 +1150,11 @@ impl Core {
                                 .as_ref()
                                 .and(s.info.remote.as_ref())
                                 .and_then(|r| r.server_key),
+                            home: s.info.remote.as_ref().map(|r| LineHome {
+                                name: r.home_name.clone(),
+                                tag: r.home_tag.clone(),
+                                tagged: r.tagged,
+                            }),
                         }
                     })
                     .collect();
@@ -3815,6 +3820,7 @@ mod tests {
         let id = log
             .append(&NewLine {
                 home_key: None,
+                home: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "alice".into(),

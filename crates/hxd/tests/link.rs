@@ -450,6 +450,20 @@ async fn show_tags_puts_the_home_servers_tag_in_every_ghosts_name() {
     bob.chat(b"hi").await.unwrap();
     let line = heard(&mut ann, ghost).await;
     assert_eq!(line, b"\rroberta-lo@bb:  hi");
+
+    // History names it as the live ng event does, the tag in `remote`.
+    let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
+        .await
+        .unwrap();
+    let page = ngc.request("history", json!({})).await.unwrap();
+    let hi = page["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["text"] == "hi")
+        .unwrap();
+    assert_eq!(hi["from"]["nick"], "roberta-long");
+    assert_eq!(hi["from"]["remote"]["tagged"], true);
 }
 
 /// The next public chat line `c` hears from `uid`.
@@ -886,6 +900,17 @@ async fn a_kick_with_purge_takes_a_ghosts_lines_here_and_spares_a_namesake() {
     let (mut ngc, _) = ng::Client::account(a.ng, "admin", "pw", "ngc")
         .await
         .unwrap();
+    // History tells the namesakes apart as the live event does.
+    let page = ngc.request("history", json!({})).await.unwrap();
+    let from = |want: &str| {
+        let lines = page["lines"].as_array().unwrap();
+        lines.iter().find(|l| l["text"] == want).unwrap()["from"].clone()
+    };
+    assert_eq!(
+        from("spam")["remote"],
+        json!({ "server": "bb server", "tag": "bb", "tagged": false })
+    );
+    assert!(from("mine").get("remote").is_none());
     let kicked = ngc
         .request(
             "kick",

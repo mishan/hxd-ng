@@ -92,6 +92,19 @@ pub struct NewLine {
     /// For a linked server's user's signed line, its home server's key,
     /// which the line's scope names (`docs/e2e-messages.md` §5).
     pub home_key: Option<[u8; 32]>,
+    /// For any linked server's user's line, where it was from when it was
+    /// heard, so a replay does not pass it off as a local user's.
+    pub home: Option<LineHome>,
+}
+
+/// A linked server's user's home server, as its line was logged
+/// (`docs/chat-history.md` §7.2): `tagged` is whether `from_nick` was
+/// logged with the tag in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineHome {
+    pub name: String,
+    pub tag: String,
+    pub tagged: bool,
 }
 
 /// A signed line's or message's detached form
@@ -153,6 +166,8 @@ pub struct LogLine {
     pub signed: Option<Vec<u8>>,
     /// [`NewLine::home_key`].
     pub home_key: Option<[u8; 32]>,
+    /// [`NewLine::home`]; none on a line logged before it was kept.
+    pub home: Option<LineHome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,8 +250,8 @@ pub trait ChatLog: Send + Sync + 'static {
         who: &Mailbox,
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError>;
-    /// Clear a line down to its tombstone: id and time stay, nick and
-    /// text go. `by` is who did it, the column's fast answer to what the
+    /// Clear a line down to its tombstone: id and time stay, nick, text
+    /// and home server go. `by` is who did it, the column's fast answer to what the
     /// moderation record says at length.
     fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError>;
     fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError>;
@@ -332,6 +347,7 @@ impl MemoryInner {
             media: None,
             signed: line.signed.as_ref().map(|s| s.form.clone()),
             home_key: line.home_key,
+            home: line.home.clone(),
         });
         if let Some(key) = line.ghost {
             self.ghosts.insert(id, key);
@@ -435,6 +451,7 @@ impl ChatLog for MemoryLog {
         line.from_nick.clear();
         line.text.clear();
         line.signed = None;
+        line.home = None;
         line.flags = line.flags.with(LineFlags::DELETED);
         inner.signed.retain(|_, at| at.id != id);
         // The public timestamp is the original receive time; who and
@@ -576,6 +593,7 @@ pub mod conformance {
     fn line(n: u64) -> NewLine {
         NewLine {
             home_key: None,
+            home: None,
             channel: 0,
             ghost: None,
             from_nick: format!("user-{n}"),
@@ -855,7 +873,7 @@ pub mod conformance {
     }
 
     /// A linked server's user's lines, by the key this server gave it, and
-    /// never another's, whatever the name.
+    /// never another's, whatever the name; each with its home server.
     fn a_ghosts_lines_are_found_by_its_key(log: Box<dyn ChatLog>) {
         for (n, ghost) in [
             (1, Some([7; 16])),
@@ -863,8 +881,29 @@ pub mod conformance {
             (3, Some([7; 16])),
             (4, None),
         ] {
-            log.append(&NewLine { ghost, ..line(n) }).unwrap();
+            let home = ghost.map(|g| LineHome {
+                name: "Far Away".into(),
+                tag: "far".into(),
+                tagged: g == [7; 16],
+            });
+            log.append(&NewLine {
+                ghost,
+                home,
+                ..line(n)
+            })
+            .unwrap();
         }
+        let home = |id| log.line(id).unwrap().unwrap().home;
+        assert_eq!(
+            home(1),
+            Some(LineHome {
+                name: "Far Away".into(),
+                tag: "far".into(),
+                tagged: true
+            })
+        );
+        assert!(!home(2).unwrap().tagged);
+        assert_eq!(home(4), None);
         let since = SystemTime::UNIX_EPOCH;
         let ids = |key| -> Vec<LineId> {
             log.lines_by_ghost(Some(0), key, since)

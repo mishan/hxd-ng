@@ -285,6 +285,12 @@ index over the column answers whether a key was ever one a line was
 checked against, which pasted evidence of a linked line may name
 (e2e-messages.md §4.12).
 
+Schema v27 adds `home_name`, `home_tag` and `home_tagged`: for every
+linked server's user's line, signed or not, its home server's name and
+tag and whether its nick was logged tagged, served as the rest of its
+`from.remote` (§7.2). A line logged before has none of them, and a
+tombstone keeps none.
+
 `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the spec's one
 guarantee: an id is never reused, so a client's cursor from last week
 still means what it meant. Plain `INTEGER PRIMARY KEY` can hand out a
@@ -470,8 +476,13 @@ id and time, and a `deleted` flag when tombstoned:
   "signed": "pmF2AWJpZFA…" }     // e2e-messages.md §4.7, when it was signed
 ```
 
-A linked server's user's signed line carries its home server's key in
-`from`: `"from": { "nick", "icon", "remote": { "server_key": "…" } }`.
+A linked server's user's line carries its `remote` in `from`, as the
+live `chat` event does: `"from": { "nick", "icon", "remote": { "server",
+"tag", "tagged", "server_key"? } }`, with `tagged` as it was when the
+line was logged and `server_key` only on a signed line. The log keeps a
+tagged line's nick as the classic wire shows it, `nick@tag`; `from.nick`
+is the bare nick, as live. A line logged before v27 carries `remote: {
+"server_key" }` if it was signed and no `remote` otherwise.
 
 No `uid` in `from`: the sender's uid was recycled minutes after they
 left, and a client that keyed anything on it would attribute old lines

@@ -713,6 +713,7 @@ fn a_room_id_is_never_drawn_again() {
     let log = Arc::new(MemoryLog::default());
     log.append(&NewLine {
         home_key: None,
+        home: None,
         channel: 77,
         ghost: None,
         from_nick: "old".into(),
@@ -981,6 +982,7 @@ fn a_topic_that_would_not_write_outlives_a_reload_and_is_written_later() {
 fn line_in(channel: u32, signed: bool) -> NewLine {
     NewLine {
         home_key: None,
+        home: None,
         channel,
         ghost: None,
         from_nick: "old".into(),
