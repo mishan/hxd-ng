@@ -9,24 +9,13 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
-import {
-  CAP_CHAT_GUID,
-  CAP_SIGNED,
-  bytesToHex,
-  fetchChallenge,
-  fetchDiscovery,
-  postAuth,
-  readSignedChat,
-  signChatRequest,
-  signLoginProof,
-} from '@hotline-ng/client';
+import { CAP_CHAT_GUID, CAP_SIGNED, fetchChallenge, readSignedChat, signChatRequest } from '@hotline-ng/client';
 
 import { connect } from './harness/client.mjs';
-import { hlid, startServer } from './harness/server.mjs';
+import { enrolledDevice, signingIdentity } from './harness/device.mjs';
+import { startServer } from './harness/server.mjs';
 
 const BOB = `name = "Bob"
 password = "s3cret"
@@ -46,18 +35,7 @@ describe('chat', () => {
     server = await startServer({
       // Identity with the hosts it signs challenges for, which is what
       // makes the server carry signed lines (e2e-messages.md §4.6).
-      config: (ports) => ({
-        history: { db: 'history.db' },
-        identity: {
-          key: 'identity-server.key',
-          hosts: [`127.0.0.1:${ports.ng}`],
-          new_accounts: 'guest',
-          unattested: 'guest',
-          // A key new here may not chat at once (identity-registrar.md
-          // §7.3), which is not what this file is about.
-          newcomer_delay: 0,
-        },
-      }),
+      config: (ports) => ({ history: { db: 'history.db' }, identity: signingIdentity(ports) }),
       accounts: { bob: BOB },
     });
   });
@@ -74,43 +52,6 @@ describe('chat', () => {
     const c = await connect(server, creds);
     open.push(c);
     return c;
-  }
-
-  /** A device as a browser holds one, certified by `hlid` for messages
-   *  as well as login, and the token-minting an identity login runs. */
-  async function enrolledDevice(name) {
-    const sign = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
-    const enc = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
-    const signPub = new Uint8Array(await crypto.subtle.exportKey('raw', sign.publicKey));
-    const encPub = new Uint8Array(await crypto.subtle.exportKey('raw', enc.publicKey));
-    const keygen = hlid(server.dir, ['keygen', 'identity', `${name}.key`]);
-    const fingerprint = /fingerprint: (\S+)/.exec(keygen)?.[1];
-    hlid(server.dir, [
-      'cert',
-      '--identity', `${name}.key`,
-      '--device-pub', bytesToHex(signPub),
-      '--device-enc-pub', bytesToHex(encPub),
-      '--caps', 'web',
-      '-o', `${name}.cert`,
-    ]);
-    hlid(server.dir, ['card', '--identity', `${name}.key`, '--name', name, '-o', `${name}.card`]);
-    const cert = new Uint8Array(readFileSync(join(server.dir, `${name}.cert`)));
-    const card = new Uint8Array(readFileSync(join(server.dir, `${name}.card`)));
-    const doc = await fetchDiscovery(server.httpBase);
-    const endpoint = (path) => new URL(path, server.httpBase).toString();
-    const getToken = async () => {
-      const challenge = await fetchChallenge(endpoint(doc.identity.endpoints.challenge));
-      const proof = await signLoginProof(sign.privateKey, {
-        challenge: challenge.challenge,
-        serverKey: challenge.serverKey,
-        host: challenge.host,
-        device: signPub,
-        time: Math.floor(Date.now() / 1000),
-      });
-      const auth = await postAuth(endpoint(doc.identity.endpoints.auth), { host: challenge.host, card, deviceCert: cert, proof });
-      return auth.token;
-    };
-    return { key: sign.privateKey, cert, fingerprint, getToken, challengeAt: endpoint(doc.identity.endpoints.challenge) };
   }
 
   test('a line reaches the room, and its sender', async () => {
@@ -179,7 +120,7 @@ describe('chat', () => {
   });
 
   test('a signed line is heard with its signature, and its guid makes a repeat the same line', async () => {
-    const device = await enrolledDevice('signer');
+    const device = await enrolledDevice(server, 'signer');
     const signer = await client({ nick: 'Signer', identity: { getToken: device.getToken, signs: () => 'default' } });
     assert.ok(signer.conn.hasCap(CAP_SIGNED) && signer.conn.hasCap(CAP_CHAT_GUID));
     assert.equal(signer.conn.signing, 'default', 'signs is echoed for a device whose certificate allows messages');
