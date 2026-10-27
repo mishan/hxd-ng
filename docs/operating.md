@@ -461,6 +461,78 @@ A registrar the server trusts (`[identity] registrar_keys` or
 here too: the server fetches its records at login and applies them
 ([identity-records.md](identity-records.md)).
 
+**Rotating the server key.** Clients pin the server key per host, and a
+new one warns every client that pinned the old and turns what was
+signed under it into "signed for elsewhere". A handover avoids both
+([server-key-handover.md](server-key-handover.md)): the old key signs
+over to a successor the server committed to in advance, and clients
+follow it. The successor's private key is the one a thief must not
+take with the server's, so the commands refuse to write it beside the
+config file or the server key. Write it to removable media, mounted
+only while a command runs and kept away from the server otherwise.
+
+Run both commands as the server's own user (`sudo -u hxd hxd identity
+handover` and so on), since the files they write are owner-only and a
+server key written by root is one the server cannot read, and from the
+server's working directory or with `--config`, since relative paths in
+the config resolve against the directory a command runs in. The startup
+and SIGHUP log lines say how many handovers are served and whether a
+successor is committed to, which shows a `next_key` written elsewhere.
+
+1. Commit to a successor, well before rotating, so that clients see
+   the commitment first:
+
+   ```sh
+   sudo -u hxd hxd identity successor /media/offline/hxd-successor.key
+   systemctl reload hxd     # or kill -HUP: challenges now commit to it
+   ```
+
+   Only its public key is written where the server reads it, at
+   `[identity] next_key`. A client that pins after this follows the
+   rotation; one that pinned before remembers no commitment, and warns
+   at the rotation.
+2. To rotate, stop the server and hand over, making the successor's
+   own successor in the same step so that the rotation after this one
+   is followed too:
+
+   ```sh
+   systemctl stop hxd
+   sudo -u hxd hxd identity handover /media/offline/hxd-successor.key \
+       --next /media/offline/hxd-successor-2.key
+   systemctl start hxd
+   ```
+
+   The server must be stopped: nothing detects one still running, which
+   keeps the old key in memory and serves it until it restarts. The
+   handover is signed and appended to `[identity] handovers`, which
+   keeps the latest 16 and which discovery serves; the successor
+   becomes the server key, and the old key is kept at
+   `<key>.old-<short fingerprint>`, for you to destroy once the new one
+   is serving. The successor's file is now a copy of the server key:
+   destroy it. Without `--next` nothing is committed, and the next
+   rotation warns. A handover cut short after it recorded the handover
+   leaves the server refusing to start, and the same command run again
+   finishes it. One cut short before that leaves only the `--next` file,
+   a successor nothing commits to: the command refuses until it is
+   deleted.
+
+If `[identity] next_key` is lost while the successor's private key is
+not, `hxd identity successor --from <path>` writes it again from that
+key, keeping the handovers, and nobody is warned; while handovers are
+kept, the last one's commitment stands for the lost file, so another
+key takes `--replace`. A successor whose
+private key is lost or exposed is replaced with `hxd identity successor
+--replace <path>` and SIGHUP: each client that remembered the old
+commitment warns once, and the handovers served until then, which end
+at it, are moved aside. So are they when a commitment is added after a
+handover made without `--next`: a client pinned at an earlier key
+warns at the next rotation either way, and one that pins after it takes
+no aliases for the earlier keys. A lost server key cannot hand over:
+with `[identity] handovers` moved aside, the server makes a new key at
+the next start, which every client warns of. The server refuses to
+start with handovers that do not end at its key and at the successor
+it commits to, and on SIGHUP keeps serving what it served.
+
 ### The registrar
 
 A server can also be an identity registrar: it lends keys handles like
@@ -629,6 +701,8 @@ row says otherwise; each is whatever its key names.
 | `news-blobs/` | `[news] blobs` | Every image attached to an article. |
 | `vapid.key` | `[push] vapid_key` | Every push subscription, which is bound to it: pushes are accepted by nobody and no client can tell why. The server refuses to start without it while devices are registered. |
 | `identity-server.key` | `[identity] key` | The server key discovery publishes and every login proof is bound to; a new one is made in its place. |
+| `identity-server.handovers` | `[identity] handovers` | The handovers that carry clients from earlier server keys to this one: a client pinned at an earlier key warns, and what was signed under it is signed for elsewhere. |
+| `identity-server.next` | `[identity] next_key` | The commitment to the successor. With handovers to serve, the server refuses to start until `hxd identity successor --from <path>` writes it again from the successor's private key, which warns nobody. That key is not in it, and is kept apart from the server's files. |
 | `identity-successors` | `[identity] successors` | The successor commitments the server holds, so a stolen identity key can rotate to a thief's key here, and the rotations it accepted, so a key rotated away from logs in again. |
 | `registrar.key` | `[registrar] key` | Every attestation the registrar signed stops verifying, and every server that lists the key must be given a new one. |
 | `registrar.db` | `[registrar] store` | Every handle, attestation and published record, and the invites. |
@@ -648,6 +722,7 @@ other key takes a restart.
 | Reloaded | What changes | A file that fails to load |
 |---|---|---|
 | `[identity] revoked_identities`, `revoked_devices`, from the config file | Sessions a newly revoked key holds, connected or detached, end | Lists unchanged |
+| `[identity] next_key` and `handovers` | Challenges commit to the successor `hxd identity successor` made, and discovery serves the handovers; a handover's new key takes a restart | Commitment and handovers unchanged |
 | Bans, from the database `hxd ban` writes | Sessions a new ban refuses end | Bans unchanged |
 | The account files of everyone logged in, and the roles file | Each session is told what its account now resolves to; the sessions of a removed account end | An account file that cannot be read is skipped; a roles file that does not load leaves the roles unchanged |
 | `[rooms] file` | New rooms are announced and given ids; an archived or removed room, or a narrowed gate, parts whom it no longer admits | Rooms unchanged |
@@ -969,6 +1044,11 @@ identity is and how it links to an account, and
 ```toml
 [identity]
 key = "identity-server.key"         # Ed25519 seed; generated on first run
+next_key = "identity-server.next"   # the successor's public key, which
+                                    # challenges commit to; `hxd identity
+                                    # successor` writes it
+handovers = "identity-server.handovers"  # the handovers discovery serves;
+                                    # `hxd identity handover` appends to it
 new_accounts = "guest"              # deny | guest | create
 unattested = "guest"                # deny | guest | allow
 min_attestation_age = 0             # seconds an attestation must have existed

@@ -26,6 +26,7 @@ pub mod banner;
 #[cfg(feature = "feeds")]
 pub mod feeds;
 pub mod files;
+pub mod handover;
 pub mod link;
 pub mod metrics;
 pub mod moderation;
@@ -1720,6 +1721,15 @@ pub struct IdentitySection {
     /// Where the server's Ed25519 seed lives; generated on first run.
     #[serde(default = "default_identity_key")]
     pub key: PathBuf,
+    /// The successor's public key, which every challenge commits to
+    /// (`docs/server-key-handover.md` §2); `hxd identity successor`
+    /// writes it. No file, no commitment.
+    #[serde(default = "default_next_key")]
+    pub next_key: PathBuf,
+    /// The handovers this server signed, oldest first (§4);
+    /// `hxd identity handover` appends to it.
+    #[serde(default = "default_handovers")]
+    pub handovers: PathBuf,
     /// `deny`, `guest`, or `create` (spec §8.1).
     #[serde(default = "default_new_accounts")]
     pub new_accounts: String,
@@ -1856,6 +1866,12 @@ fn default_enroll_per_address() -> usize {
 
 fn default_identity_key() -> PathBuf {
     "identity-server.key".into()
+}
+fn default_next_key() -> PathBuf {
+    "identity-server.next".into()
+}
+fn default_handovers() -> PathBuf {
+    "identity-server.handovers".into()
 }
 fn default_new_accounts() -> String {
     "guest".into()
@@ -3143,6 +3159,9 @@ fn build_identity(
         auth,
         core,
     );
+    state
+        .set_handovers(handover::load(section)?)
+        .map_err(|e| format!("[identity] handovers: {e}"))?;
     Ok(match registrars {
         Some(registrars) => state.with_registrars(registrars),
         None => state,

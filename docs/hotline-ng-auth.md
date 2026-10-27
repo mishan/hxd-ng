@@ -164,6 +164,12 @@ discovery (§5), signs every challenge the server issues and is bound
 into the login proof that answers it (§6.2), and is used by the
 federation spec to sign. It is not a TLS key.
 
+A server replaces it through a **handover**
+(`server-key-handover.md` §3): the old key's signature over the new
+one, to a successor the challenge committed to in advance (`next`,
+§6.2), so that a client follows the change without a warning and keeps
+the old key as an alias for what was signed under it.
+
 ## 5. Discovery
 
 `GET /.well-known/hotline` on the ng listener MUST be served without
@@ -174,6 +180,7 @@ authentication, as `application/json`:
   "v": 1,
   "name": "My Server",
   "server_key": "…base64url 32 bytes…",
+  "server_handovers": [ "…base64url handover…" ],
   "ng": { "ws": "/ng", "trtp": "/trtp", "htxf": "/htxf" },
   "identity": {
     "enabled": true,
@@ -203,6 +210,7 @@ This document owns:
 | `v` | `1`. |
 | `name` | The server's name. |
 | `server_key` | The server key (§4.3), base64url. MUST be present when `identity.enabled` is true. *hxd-ng* sends `null` when identity is disabled. Anyone can publish anyone's key; a client believes it of a host only once the challenge it signs has verified under it (§6.2). |
+| `server_handovers` | The handovers that led to `server_key` (§4.3), oldest first, each the CBOR the server signed, base64url, at most 16 (`server-key-handover.md` §4). Absent when there are none. Each is signed on its own, so plain HTTP cannot alter one. |
 | `ng.ws` | The path of the ng JSON protocol (§7.2). Present only when the listener serves it, which a relay (§10.2) need not. |
 | `ng.trtp` | The path of TRTP over WebSocket (§7.3). Present only when the server serves it. |
 | `ng.htxf` | The path of HTXF over WebSocket (§7.4). Present only when the server serves it, which is only beside `ng.trtp`. |

@@ -431,6 +431,58 @@ pub struct IdentityState {
     registrar: Option<Arc<hxd_registrar::Registrar>>,
     /// The registrars this server trusts, their keys and their records.
     registrars: Option<Arc<crate::registrars::Registrars>>,
+    handovers: Mutex<Arc<Handovers>>,
+}
+
+/// What the server commits to and has handed over
+/// (`docs/server-key-handover.md` §2, §4).
+#[derive(Debug, Clone, Default)]
+pub struct Handovers {
+    /// The commitment every challenge carries.
+    pub next: Option<[u8; 32]>,
+    /// The handovers served in discovery, oldest first, each as signed.
+    pub chain: Vec<Vec<u8>>,
+}
+
+/// Whether `h` is what a server under `key` may serve at `now`: a chain a
+/// first-pinning client takes whole (§5.1), which is only so when it ends
+/// at `key` and at the commitment the challenges carry.
+pub fn check_handovers(key: &PublicKey, h: &Handovers, now: u64) -> Result<(), String> {
+    use hl_identity::handover::{self, Handover, MAX_CHAIN};
+    if h.chain.len() > MAX_CHAIN {
+        return Err(format!("more than {MAX_CHAIN} handovers"));
+    }
+    let Some(last) = h.chain.last() else {
+        return Ok(());
+    };
+    let last = Handover::parse(last).map_err(|e| format!("the last handover: {e}"))?;
+    if &last.new != key {
+        return Err(format!(
+            "the last handover is to {}, not to the server key {}",
+            b64(&last.new),
+            b64(key)
+        ));
+    }
+    if last.next != h.next {
+        return Err("the last handover commits to another successor than the server does".into());
+    }
+    // Of a challenge, a client's chain check reads the key and `next`.
+    let challenge = hl_identity::ServerChallenge {
+        challenge: [0; 32],
+        server_key: *key,
+        host: String::new(),
+        expires: 0,
+        next: h.next,
+    };
+    if handover::pin(&h.chain, &challenge, now).len() != h.chain.len() {
+        return Err(
+            "the handovers do not form a chain: each must verify, be from the \
+             one before's new key to the key it committed to, later than it, and to \
+             a key not seen before"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
@@ -558,6 +610,7 @@ impl IdentityState {
             anchors,
             registrar: None,
             registrars: None,
+            handovers: Mutex::default(),
         };
         state.finish_rotations(None);
         state
@@ -588,6 +641,21 @@ impl IdentityState {
 
     pub fn server_key(&self) -> PublicKey {
         self.key.public()
+    }
+
+    pub fn handovers(&self) -> Arc<Handovers> {
+        self.handovers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Serve `h` from now on, if [`check_handovers`] passes it; otherwise
+    /// what was served stays.
+    pub fn set_handovers(&self, h: Handovers) -> Result<(), String> {
+        check_handovers(&self.key.public(), &h, self.clock.unix())?;
+        *self.handovers.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(h);
+        Ok(())
     }
 
     /// `POST /identity/challenge`. Expired challenges are swept here so a
@@ -639,7 +707,8 @@ impl IdentityState {
     pub fn sign_challenge(&self, challenge: &[u8; 32], host: Option<&str>) -> Option<Vec<u8>> {
         let host = host.filter(|h| self.answers_as(Some(h)))?;
         let expires = self.clock.unix() + TTL.as_secs();
-        hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires, None).ok()
+        let next = self.handovers().next;
+        hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires, next.as_ref()).ok()
     }
 
     /// `POST /identity/auth`, challenge binding: the spec's step list

@@ -55,7 +55,8 @@ fn init_tracing() {
     }
 }
 
-/// SIGHUP re-reads `[identity]`'s revocation lists, and — on a
+/// SIGHUP re-reads `[identity]`'s revocation lists and the server key's
+/// commitment and handovers, and — on a
 /// registrar — the names it reserves and its invites file, and nothing
 /// else (`docs/identity-registrar.md`): an operator locking out a stolen
 /// key should not have to restart the server and drop everyone else to
@@ -71,6 +72,7 @@ async fn reload_on_hangup(
     tls: Option<std::sync::Arc<hxd_session::LegacyTls>>,
     banner: Option<std::sync::Arc<hxd_session::Banner>>,
     hub: Option<hxd_link::Hub>,
+    identity: Option<std::sync::Arc<hxd_ng_session::IdentityState>>,
     path: PathBuf,
 ) {
     let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -88,6 +90,19 @@ async fn reload_on_hangup(
                 ended.len()
             ),
             Err(e) => tracing::error!("SIGHUP: {e}; the revocation lists are unchanged"),
+        }
+        // What `hxd identity successor` committed to meanwhile.
+        if let Some(id) = identity.as_deref() {
+            match hxd::handover::reload(id, &path) {
+                Ok((n, next)) => tracing::info!(
+                    "SIGHUP: {n} server key handovers served, {} successor committed to",
+                    if next { "a" } else { "no" }
+                ),
+                Err(e) => tracing::error!(
+                    "SIGHUP: [identity] {e}; the commitment and handovers served are \
+                     unchanged, and a new server key takes a restart"
+                ),
+            }
         }
         // What `hxd ban` placed or lifted meanwhile, and the sessions a
         // new ban now refuses.
@@ -196,6 +211,17 @@ enum Command {
         fingerprint: String,
         what: hxd::RevokeWhat,
         lift: bool,
+    },
+    /// `identity successor (<path> | --from <path>) [--replace]`.
+    IdentitySuccessor {
+        path: PathBuf,
+        existing: bool,
+        replace: bool,
+    },
+    /// `identity handover <successor> [--next <path>]`.
+    IdentityHandover {
+        successor: PathBuf,
+        next: Option<PathBuf>,
     },
     /// `registrar freeze <fingerprint> [--lift]`.
     RegistrarFreeze {
@@ -332,6 +358,8 @@ hxd [--config …] news-reindex\n  \
 hxd [--config …] news feeds\n  \
 hxd [--config …] push rekey\n  \
 hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n  \
+hxd [--config …] identity successor (<path> | --from <path>) [--replace]\n  \
+hxd [--config …] identity handover <successor-key> [--next <path>]\n  \
 hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
 hxd [--config …] registrar revoke <handle> --reason abuse|lapsed|unspecified\n  \
 hxd [--config …] registrar recover <handle> --identity <fingerprint> [--keep-age]\n  \
@@ -376,6 +404,16 @@ revoked_identities in the config file, or with --device a device's to\n\
 revoked_devices; --lift takes it out again. Nothing changes in a running\n\
 server until it is sent SIGHUP (`systemctl reload`), which ends every\n\
 session the key holds.\n\n\
+`identity successor` makes the key the server key will be handed over\n\
+to, writes its private key to <path>, which must not be beside the\n\
+config file or the server key, and the public key to [identity]\n\
+next_key, which a running server commits to on SIGHUP; --from writes\n\
+next_key again from the successor already at <path>, and --replace\n\
+commits to another when the committed one is lost. `identity handover`,\n\
+with the server stopped and as its user, signs the server key over to\n\
+that successor, given by its private key, which becomes the server key;\n\
+the old one is kept beside it. --next makes the successor's own\n\
+successor at <path>. Cut short, it finishes when run again.\n\n\
 `registrar freeze` publishes a signed freeze of an identity this\n\
 registrar attests (--lift publishes the lift); `revoke` withdraws the\n\
 attestations of a handle, and with --reason abuse keeps its holder from\n\
@@ -467,6 +505,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut position = None;
     let mut password = hxd::accounts::Password::None;
     let mut no_password = false;
+    let mut replace = false;
+    let mut next = None;
+    let mut from = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -564,6 +605,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             }
             "--no-password" => no_password = true,
             "--no-block" => no_block = true,
+            "--replace" => replace = true,
+            "--from" => from = Some(PathBuf::from(args.next().ok_or("--from needs a path")?)),
+            "--next" => next = Some(PathBuf::from(args.next().ok_or("--next needs a path")?)),
             "--all" => all = true,
             "--outcome" => {
                 outcome = Some(
@@ -698,6 +742,12 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if (identity.is_some() || keep_age) && !matches!(words[..], ["registrar", "recover", _]) {
         return Err("--identity and --keep-age belong to `registrar recover`".to_string());
     }
+    if (replace || from.is_some()) && !matches!(words[..], ["identity", "successor", ..]) {
+        return Err("--replace and --from belong to `identity successor`".into());
+    }
+    if next.is_some() && !matches!(words[..], ["identity", "handover", _]) {
+        return Err("--next belongs to `identity handover`".into());
+    }
     if add.is_some() && !matches!(words[..], ["registrar", "invites"]) {
         return Err("--add belongs to `registrar invites`".to_string());
     }
@@ -760,6 +810,23 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 hxd::RevokeWhat::Identity
             },
             lift,
+        },
+        ["identity", "successor" | "handover", ..] if fingerprint.is_some() || dry_run => {
+            return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string())
+        }
+        ["identity", "successor", out] if from.is_none() => Command::IdentitySuccessor {
+            path: PathBuf::from(out),
+            existing: false,
+            replace,
+        },
+        ["identity", "successor"] if from.is_some() => Command::IdentitySuccessor {
+            path: from.unwrap_or_default(),
+            existing: true,
+            replace,
+        },
+        ["identity", "handover", successor] => Command::IdentityHandover {
+            successor: PathBuf::from(successor),
+            next,
         },
         ["registrar", "freeze", fp] => Command::RegistrarFreeze {
             fingerprint: fp.to_string(),
@@ -960,6 +1027,22 @@ async fn main() {
             return Ok(());
         }
         match &command {
+            Command::IdentitySuccessor {
+                path,
+                existing,
+                replace,
+            } => {
+                let said =
+                    hxd::handover::successor(&config, &config_path, path, *existing, *replace)?;
+                println!("{said}");
+                return Ok(());
+            }
+            Command::IdentityHandover { successor, next } => {
+                let said =
+                    hxd::handover::hand_over(&config, &config_path, successor, next.as_deref())?;
+                println!("{said}");
+                return Ok(());
+            }
             Command::RegistrarFreeze { fingerprint, lift } => {
                 let seq = hxd::registrar::freeze(&config, fingerprint, *lift)?;
                 println!(
@@ -1516,6 +1599,7 @@ async fn main() {
             tls.as_ref().map(|t| t.tls.clone()),
             banner,
             hub.clone(),
+            ng_ctx.as_ref().and_then(|n| n.identity.clone()),
             config_path.clone(),
         ));
 
@@ -1530,8 +1614,15 @@ async fn main() {
             );
             if let Some(id) = ng_ctx.identity.as_ref() {
                 tracing::info!(
-                    "identity enabled (server key {}, TRTP tunnel {})",
+                    "identity enabled (server key {}, {} handovers, {} successor committed \
+                     to, TRTP tunnel {})",
                     hl_identity::Fingerprint::of(&id.server_key()).short(),
+                    id.handovers().chain.len(),
+                    if id.handovers().next.is_some() {
+                        "a"
+                    } else {
+                        "no"
+                    },
                     if id.config().trtp && ng_ctx.tunnel.is_some() {
                         "on"
                     } else {

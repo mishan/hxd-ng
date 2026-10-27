@@ -3,8 +3,9 @@
 Status: draft, 2026-10. Built in hl-identity (`handover`): the
 handover object (§3), the challenge's `next` (§2), and a client's
 checks (§5) as functions over what it remembers, with vectors (§10).
-Not built: a server serving `next` and `server_handovers`, and the
-tooling to make a successor and sign a handover (§6). A companion to
+Built in hxd-ng: a server serving `next` and `server_handovers`, and
+`hxd identity successor` and `handover` to make a successor and sign a
+handover (§6, `operating.md`). A companion to
 `e2e-messages.md`, whose §4.13 leaves rotating the server key to this
 document. It rests on `hotline-ng-auth.md` §4.3 (the server key), §5
 (discovery) and §6.2 (the `server_challenge` and `[identity] hosts`),
@@ -223,8 +224,13 @@ aliases, since the key itself did not change.
 - Serves `server_handovers` and the challenge's `next` as §2 and §4
   say.
 
-Tooling to make a successor and sign a handover is deferred: there is
-no `hxd` command for it yet.
+*hxd-ng* refuses to start with a chain that does not end at its server
+key and at the `next` it commits to, which a first-pinning client would
+take no aliases from (§5.1), and on SIGHUP keeps what it served. `hxd
+identity successor` makes a successor and writes its private key only
+where the operator names, away from the server's own files; `hxd
+identity handover` signs the handover to it, which takes a restart to
+serve. `operating.md` has the steps.
 
 ## 7. Across server links
 
@@ -241,9 +247,6 @@ Made:
 - `e2e-messages.md` §3.5 and §4.13: a reader's scope check accepts an
   alias a followed handover keeps (§5.5), where the server on ingest
   accepts the current key alone.
-
-Pending until a server serves them:
-
 - `hotline-ng-auth.md` §5: `server_handovers` in discovery (§4).
 - `hotline-ng-auth.md` §4.3: the handover object (§3), beside the
   server key it rotates.
