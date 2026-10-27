@@ -109,10 +109,9 @@ each one's `new` the next one's `old`, times strictly ascending, no key
 appearing twice, the last one's `new` the `server_key`, and at most 16.
 A server never hands over to a key it handed over from earlier, as from
 K1 back to K0 after K0 to K1, which would leave a key that is both the
-pin and an alias.
-A server keeps the latest 16 it has signed, and serves each as the
-bytes it signed, never a signature made again, which with a randomized
-signer would look like a fork.
+pin and an alias. A server keeps the latest 16 it has signed, and
+serves each as the bytes it signed, never a signature made again, which
+with a randomized signer would look like a fork.
 
 ## 5. What a client does
 
@@ -127,14 +126,13 @@ each connection, and so at every pin and every key change too.
 At first contact, or when the user accepts a warning and the client
 pins again, the client verifies the server challenge for the host
 (`hotline-ng-auth.md` §6.2) and takes its `next`, possibly absent, as
-the commitment it remembers. At first contact, the chain served then
-gives aliases only (§5.5), on trust on first use. It is checked as §5.3
-checks a chain,
-except that the first `new` is not matched against a commitment: the
-signatures, the links from each `next` to the following `new`, the
-times, no repeated key, and the last handover's `new` being the
-challenge's `server_key` and its `next` being the challenge's `next`
-all still apply. A chain that fails them, or that holds more than 16
+the commitment it remembers. The chain served at first contact gives
+aliases only (§5.5), on trust on first use. It is checked as §5.3
+checks a chain, except that the first `new` is not matched against a
+commitment: the signatures, the links from each `next` to the following
+`new`, the times, no repeated key, and the last handover's `new` being
+the challenge's `server_key` and its `next` being the challenge's
+`next` all still apply. A chain that fails them, or that holds more than 16
 handovers, gives no aliases, and the client pins with none.
 
 ### 5.2 Same key, later

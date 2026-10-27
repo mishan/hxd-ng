@@ -131,7 +131,7 @@ pub enum Warning {
     Chain(Broken),
 }
 
-/// Why a served chain cannot be followed, in the order it is checked.
+/// Why a served chain cannot be followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Broken {
     /// More than [`MAX_CHAIN`] handovers.
