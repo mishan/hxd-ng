@@ -259,6 +259,8 @@ generate() {
         echo "[identity]"
         echo "key = \"$DATA/identity-server.key\""
         echo "successors = \"$DATA/identity-successors\""
+        echo "next_key = \"$DATA/identity-server.next\""
+        echo "handovers = \"$DATA/identity-server.handovers\""
         str HXD_IDENTITY_NEW_ACCOUNTS new_accounts
         str HXD_IDENTITY_UNATTESTED unattested
         str HXD_IDENTITY_WEB web

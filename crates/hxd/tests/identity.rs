@@ -5568,3 +5568,199 @@ async fn a_tunnelled_newcomer_waits_and_one_that_links_its_account_does_not() {
     let answer = error(&t.recv_type(HDR_TASK).await);
     assert!(!answer.contains("new here"), "{answer}");
 }
+
+/// `docs/server-key-handover.md`: a config file in `dir` whose server
+/// answers as each of `hosts`.
+fn handover_config(dir: &Path, hosts: &[SocketAddr]) -> std::path::PathBuf {
+    let d = dir.display();
+    let hosts: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
+    let text = format!(
+        "[paths]\naccounts = \"{d}/accounts\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n\
+         [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\n\
+         next_key = \"{d}/server.next\"\nhandovers = \"{d}/server.handovers\"\n\
+         enroll = false\nhosts = [{}]\n",
+        hosts.join(", ")
+    );
+    let path = dir.join("hxd-ng.toml");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// A server built the way `hxd` builds one from `path`, or why not.
+fn build_from(path: &Path) -> Result<NgCtx, String> {
+    let config = hxd::Config::load(path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    hxd::build_ng_ctx(&config, &ctx, None, None, None).map(Option::unwrap)
+}
+
+/// A client's view of the server at `ng`: the chain discovery serves and
+/// the signed challenge, checked for the host it addressed.
+async fn served(ng: SocketAddr) -> (Vec<Vec<u8>>, ServerChallenge) {
+    let doc = http(ng, "GET", "/.well-known/hotline", &[], b"")
+        .await
+        .json();
+    let chain = doc["server_handovers"]
+        .as_array()
+        .map(|a| a.iter().map(|h| unb64(h.as_str().unwrap())).collect())
+        .unwrap_or_default();
+    let host = ng.to_string();
+    let (challenge, server_key, signed) = challenge_as(ng, &host).await;
+    let sc = ServerChallenge::parse(&signed.unwrap()).unwrap();
+    sc.check(&challenge, &server_key, &host, now(), 0).unwrap();
+    assert_eq!(doc["server_key"], b64(&server_key));
+    (chain, sc)
+}
+
+#[tokio::test]
+async fn a_server_key_handed_over_is_followed_without_a_warning() {
+    use hl_identity::handover::{self, commitment, Pinned, Verdict};
+    let dir = tempfile::tempdir().unwrap();
+    // Where the server cannot reach, as `identity successor` insists.
+    let offline = tempfile::tempdir().unwrap();
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ng1, ng2) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+    let path = handover_config(dir.path(), &[ng1, ng2]);
+    let config = hxd::Config::load(&path).unwrap();
+    let ctx = build_from(&path).unwrap();
+    let old = ctx.identity.clone().unwrap();
+    tokio::spawn(hxd_ng_session::serve(first, ctx));
+
+    let (chain, sc) = served(ng1).await;
+    assert!(chain.is_empty());
+    assert_eq!(sc.next, None);
+
+    let successor = offline.path().join("successor.key");
+    let again = offline.path().join("again.key");
+    let besides = dir.path().join("s.key");
+    assert!(hxd::handover::successor(&config, &path, &besides, false, false).is_err());
+    hxd::handover::successor(&config, &path, &successor, false, false).unwrap();
+    assert!(
+        hxd::handover::successor(&config, &path, &again, false, false).is_err(),
+        "a commitment is replaced only on purpose"
+    );
+    assert_eq!(hxd::handover::reload(&old, &path), Ok((0, true)));
+    let (chain, pinned) = served(ng1).await;
+    let s1 = ServerKey::from_seed(&read_seed(&successor)).public();
+    assert_eq!(pinned.next, Some(commitment(&s1)));
+    assert!(handover::pin(&chain, &pinned, now()).is_empty());
+
+    let stranger = offline.path().join("stranger.key");
+    std::fs::write(&stranger, "07".repeat(32)).unwrap();
+    let after = offline.path().join("after.key");
+    assert!(
+        hxd::handover::hand_over(&config, &path, &stranger, Some(&after)).is_err(),
+        "only to the committed successor"
+    );
+    assert!(!after.exists());
+    hxd::handover::hand_over(&config, &path, &successor, Some(&after)).unwrap();
+    let kept = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains("server.key.old-"))
+        .expect("the old key is kept aside, not deleted");
+
+    // Cut short before the key was swapped: refused at startup, and
+    // finished by running it again.
+    let key = dir.path().join("server.key");
+    let swapped = std::fs::read(&key).unwrap();
+    std::fs::write(&key, std::fs::read(&kept).unwrap()).unwrap();
+    let err = build_from(&path).err().expect("refused");
+    assert!(err.contains("not to the server key"), "{err}");
+    assert!(hxd::handover::hand_over(&config, &path, &stranger, Some(&after)).is_err());
+    assert!(hxd::handover::hand_over(&config, &path, &successor, Some(&stranger)).is_err());
+    hxd::handover::hand_over(&config, &path, &successor, Some(&after)).unwrap();
+    assert_eq!(std::fs::read(&key).unwrap(), swapped);
+    assert!(
+        hxd::handover::reload(&old, &path).is_err(),
+        "a running server keeps its key, so it serves no chain ending at another"
+    );
+    assert_eq!(served(ng1).await.1.next, pinned.next);
+
+    let ctx = build_from(&path).unwrap();
+    let new = ctx.identity.clone().unwrap();
+    tokio::spawn(hxd_ng_session::serve(second, ctx));
+    let (chain, sc) = served(ng2).await;
+    assert_eq!(chain.len(), 1);
+    assert_eq!(sc.server_key, s1);
+    let s2 = ServerKey::from_seed(&read_seed(&after)).public();
+    assert_eq!(sc.next, Some(commitment(&s2)));
+    let me = Pinned {
+        key: pinned.server_key,
+        commitment: pinned.next,
+        followed: &[],
+        dismissed: &[],
+    };
+    match handover::check(&me, &chain, &sc, now()) {
+        Verdict::Follow {
+            key,
+            commitment,
+            followed,
+        } => {
+            assert_eq!((key, commitment), (s1, sc.next));
+            assert_eq!(followed.len(), 1);
+            assert!(followed[0].covers(&pinned.server_key, now()));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        handover::pin(&chain, &sc, now()).len(),
+        1,
+        "a first pin's alias"
+    );
+
+    // A lost commitment file, restored from the successor's own key,
+    // keeps the chain that ends at it.
+    std::fs::remove_file(dir.path().join("server.next")).unwrap();
+    assert!(hxd::handover::reload(&new, &path).is_err());
+    assert!(
+        hxd::handover::successor(&config, &path, &again, false, false).is_err()
+            && hxd::handover::successor(&config, &path, &stranger, true, false).is_err(),
+        "the chain still commits to the successor"
+    );
+    hxd::handover::successor(&config, &path, &after, true, false).unwrap();
+    assert_eq!(hxd::handover::reload(&new, &path), Ok((1, true)));
+
+    // Committing to another moves the chain, which ends at the old one,
+    // aside.
+    let third = offline.path().join("third.key");
+    hxd::handover::successor(&config, &path, &third, false, true).unwrap();
+    assert_eq!(hxd::handover::reload(&new, &path), Ok((0, true)));
+    let (chain, sc) = served(ng2).await;
+    assert!(chain.is_empty());
+    let s3 = ServerKey::from_seed(&read_seed(&third)).public();
+    assert_eq!(sc.next, Some(commitment(&s3)));
+}
+
+fn read_seed(path: &Path) -> [u8; 32] {
+    let hex = std::fs::read_to_string(path).unwrap();
+    let hex = hex.trim();
+    (0..32)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_chain_that_does_not_end_at_the_server_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = handover_config(dir.path(), &["127.0.0.1:5700".parse().unwrap()]);
+    let (a, b) = (
+        ServerKey::from_seed(&[1; 32]),
+        ServerKey::from_seed(&[2; 32]),
+    );
+    let elsewhere = hl_identity::Handover {
+        old: a.public(),
+        new: b.public(),
+        next: None,
+        time: now(),
+    }
+    .sign(&a)
+    .unwrap();
+    std::fs::write(dir.path().join("server.handovers"), b64(&elsewhere)).unwrap();
+    let err = build_from(&path).err().expect("refused");
+    assert!(err.contains("not to the server key"), "{err}");
+}

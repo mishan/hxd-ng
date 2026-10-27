@@ -490,6 +490,29 @@ docker exec hxd-ng hxd-entrypoint identity revoke <fingerprint>
 docker kill -s HUP hxd-ng
 ```
 
+**Rotating the server key** ([operating.md](operating.md#portable-identity))
+keeps the successor's private key off the volume, so both steps run in a
+container of their own, with the volume and a directory of the offline
+media mounted, the server's own variables (here an `--env-file` of its
+`HXD_*` settings) or mounted config, and the server's container stopped
+for the handover:
+
+```sh
+docker run --rm --env-file hxd-ng.env -v hxd-ng:/var/lib/hxd-ng \
+  -v /media/offline:/offline ghcr.io/mishan/hxd-ng:latest \
+  identity successor /offline/successor.key
+docker kill -s HUP hxd-ng
+# later, to rotate
+docker stop hxd-ng
+docker run --rm --env-file hxd-ng.env -v hxd-ng:/var/lib/hxd-ng \
+  -v /media/offline:/offline ghcr.io/mishan/hxd-ng:latest \
+  identity handover /offline/successor.key --next /offline/successor-2.key
+docker start hxd-ng
+```
+
+The image runs as the server's own user, so what these write the server
+can read; the offline directory must be writable by uid 10001.
+
 Anything that is not a subcommand runs as given, so
 `docker run --rm hxd-ng hlid --help` works too. `docker stop` sends
 SIGTERM, which hxd handles; there is no need for `--init`.

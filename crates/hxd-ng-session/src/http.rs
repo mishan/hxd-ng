@@ -1432,7 +1432,7 @@ fn discovery(ctx: &NgCtx, host: Option<&str>) -> Resp {
     if serves_htxf(ctx) {
         ng["htxf"] = json!("/htxf");
     }
-    let doc = json!({
+    let mut doc = json!({
         "v": 1,
         "name": ctx.cfg.server_name,
         "server_key": ctx.identity.as_ref().map(|i| b64(&i.server_key())),
@@ -1440,6 +1440,10 @@ fn discovery(ctx: &NgCtx, host: Option<&str>) -> Resp {
         "identity": identity,
         "registrar": crate::registrar::discovery(ctx.registrar.as_deref(), host),
     });
+    let handovers = ctx.identity.as_ref().map(|i| i.handovers());
+    if let Some(h) = handovers.filter(|h| !h.chain.is_empty()) {
+        doc["server_handovers"] = h.chain.iter().map(|b| b64(b)).collect();
+    }
     json_resp(StatusCode::OK, doc)
 }
 

@@ -72,7 +72,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
-| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, the news feed poller (`feeds.rs`), `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd role` in `roles.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`, `hxd room` and the rooms file in `rooms.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
+| `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, the news feed poller (`feeds.rs`), `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd role` in `roles.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`, `hxd room` and the rooms file in `rooms.rs`, `hxd identity successor` and `handover` and the files the server key's handovers are served from in `handover.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
 
 `tools/ng-client.mjs` is an interactive ng test client (Node 22+, or
 `npm install` in tools/ for the `ws` fallback) — `/drop` exercises
@@ -307,7 +307,8 @@ Three layers, all `cargo test --workspace`:
   and a WS client on one server, chat and PMs crossing both wire eras,
   detach showing as the away color, resume replay), `identity.rs` (the
   identity endpoints, a login proof held to the host it was made for,
-  linking, the `/trtp` tunnel, anchors — a real
+  linking, the `/trtp` tunnel, anchors, a server key handed over by
+  `hxd identity handover` and followed as a client follows it — a real
   server per case with its own accounts directory), `media.rs` (inline
   media on both wires: the capability echo and its limits, single-shot
   and chunked upload, sliced downloads, a capable and a classic client
