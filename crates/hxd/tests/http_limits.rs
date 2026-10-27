@@ -730,8 +730,13 @@ async fn an_address_fetches_so_many_avatars_a_minute() {
     }
     let refused = http(server.ng, "GET", &path, b"").await;
     assert_eq!(refused.status, 429);
-    assert!(retry_after(&refused) <= 30);
+    let wait = retry_after(&refused);
+    assert!(wait <= 30);
     assert_eq!(refused.header("access-control-allow-origin"), Some("*"));
+    // The avatar routes' ng error shape, as their other refusals are.
+    let body = refused.json();
+    assert_eq!(body["error"]["code"], "rate_limited", "{body}");
+    assert_eq!(body["error"]["retry_after"], wait, "{body}");
 }
 
 #[tokio::test]
