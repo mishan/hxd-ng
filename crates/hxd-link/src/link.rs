@@ -721,9 +721,7 @@ impl Link<'_> {
             if quoted {
                 return Err(Reason::RefusedFields);
             }
-            let sealed_to = find(&fs, field::SEALED_TO)
-                .and_then(Field::fixed)
-                .ok_or(Reason::NoDeviceKeys)?;
+            let sealed_to = find(&fs, field::SEALED_TO).and_then(Field::fixed);
             let form = sealed.data.first().copied().unwrap_or(0);
             hl_identity::sealed::check_len(form, sealed.data.len())
                 .map_err(|_| Reason::RefusedFields)?;

@@ -345,7 +345,8 @@ pub async fn serve(listener: TcpListener, ctx: NgCtx) {
 }
 
 /// The periodic maintenance the binary runs: end detached sessions whose
-/// grace lapsed, and drop registry entries whose sessions are gone.
+/// grace lapsed, drop registry entries whose sessions are gone, and take
+/// the key flags from sessions whose certificates expired.
 pub async fn sweeper(
     core: Arc<Core>,
     registry: Arc<Registry>,
@@ -361,6 +362,7 @@ pub async fn sweeper(
             info!(ended, "detached sessions swept");
         }
         registry.prune(&core);
+        core.expire_device_keys();
         // Every mailbox call sweeps what it touches, so this is only for
         // a mailbox nobody is using — where the sessions would otherwise
         // sit until someone happened to open another.

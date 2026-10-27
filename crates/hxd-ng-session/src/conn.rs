@@ -733,7 +733,7 @@ async fn handle_login(
     // device rather than an account: decided here, at login, and kept
     // with the session so a resume cannot change it.
     let device = identity.map(crate::push::DeviceOnSocket::of);
-    let sealed = crate::sealed::device(device.as_ref(), p.sealed);
+    let sealed = crate::sealed::device(device.as_ref(), p.sealed, ctx.core.clock().unix());
     let attach = AttachInfo {
         account: Some(Box::new(account.clone())),
         nick,
@@ -1162,7 +1162,7 @@ async fn handle_resume(
     // Before the replay is taken, so what it holds sealed for a session
     // that no longer says it can open it is already the placeholder.
     let device = ctx.registry.device(&p.session);
-    let sealed = crate::sealed::device(device.as_ref(), p.sealed);
+    let sealed = crate::sealed::device(device.as_ref(), p.sealed, ctx.core.clock().unix());
     let signs = signs(ctx, device.as_ref(), p.signs);
     let marks = (signs == Some(Signs::Default), signs.is_some());
     let (events, replay) = match ctx
@@ -1563,14 +1563,18 @@ fn media_now(
 
 /// What a session that said `signs` is taken to do: nothing, unless the
 /// server carries signed messages and the session proved a device whose
-/// certificate allows them and is at most 512 bytes, the device it could
-/// also seal to (`docs/e2e-messages.md` §4.6).
+/// certificate allows them, is unexpired and is at most 512 bytes, the
+/// device it could also seal to (`docs/e2e-messages.md` §4.6).
 fn signs(
     ctx: &NgCtx,
     device: Option<&crate::push::DeviceOnSocket>,
     asked: Option<Signs>,
 ) -> Option<Signs> {
-    asked.filter(|_| device.is_some_and(|d| d.sealable.is_some()) && crate::signed::offered(ctx))
+    let now = ctx.core.clock().unix();
+    let may = device
+        .and_then(|d| d.sealable.as_ref())
+        .is_some_and(|d| d.expires > now);
+    asked.filter(|_| may && crate::signed::offered(ctx))
 }
 
 /// A signed line or message under an id its signer used for something
@@ -2427,7 +2431,7 @@ async fn dispatch(
                     None => reply_err(
                         req.id,
                         "bad_request",
-                        "This session proved no device that may sign: its certificate must allow messages and be at most 512 bytes.",
+                        "This session proved no device that may sign: its certificate must allow messages, be unexpired and be at most 512 bytes.",
                     ),
                 },
                 Err(_) => reply_err(req.id, "bad_request", "Malformed signs."),

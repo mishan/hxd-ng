@@ -221,6 +221,7 @@ impl TransportIdentity {
             quiet_until: self.quiet_until,
             signs: false,
             can_sign: false,
+            device_expires: self.device_expires,
             sealed: None,
         }
     }

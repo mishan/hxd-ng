@@ -258,6 +258,9 @@ pub struct IdentityTag {
     /// (§4.6). What a room that requires signing asks (§4.8). Not shown
     /// to anyone.
     pub can_sign: bool,
+    /// When the certificate of the device the session proved expires,
+    /// as unix seconds: `signs`, `can_sign` and `sealed` end with it.
+    pub device_expires: u64,
     /// The session can open sealed messages, with the device it proved
     /// (`docs/e2e-messages.md` §4.1): shown as `sealed`, and what a box
     /// to it must be sealed to.

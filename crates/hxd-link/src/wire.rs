@@ -63,16 +63,14 @@ pub mod field {
     pub const USER_TRANSPORT: u16 = 0x0645;
     /// The user keys draft's, reserved for it and not adopted: a user's
     /// identity fingerprint, a device certificate, a sealed message and
-    /// the key it was sealed to, a signed message's link form, and a
-    /// server's discovery key.
+    /// the key it was sealed to, a signed message's link form, a server's
+    /// discovery key, and what a user's client does with their key.
     pub const USER_KEY: u16 = 0x0642;
     pub const DEVICE_CERT: u16 = 0x0643;
     pub const SEALED: u16 = 0x0644;
     pub const SEALED_TO: u16 = 0x0646;
     pub const SIGNED: u16 = 0x0647;
     pub const DISCOVERY_KEY: u16 = 0x0648;
-    /// The draft's too, but only proposed there and not yet reserved:
-    /// what a user's client does with their key.
     pub const USER_KEY_FLAGS: u16 = 0x0649;
     pub use hxd_session::peer::field::{KEY_PROOF, SERVER_KEY};
 }
@@ -106,6 +104,7 @@ pub enum Reason {
     /// The user keys draft's.
     NoDeviceKeys = 13,
     BadSignature = 14,
+    SenderUnkeyed = 15,
     Shutdown = 16,
     Unlinked = 17,
     ProtocolError = 18,
@@ -136,6 +135,7 @@ impl Reason {
             12 => RefusedFields,
             13 => NoDeviceKeys,
             14 => BadSignature,
+            15 => SenderUnkeyed,
             16 => Shutdown,
             17 => Unlinked,
             18 => ProtocolError,

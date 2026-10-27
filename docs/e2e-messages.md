@@ -783,7 +783,9 @@ the outbox by the placeholder event (§4.4, without `sealed`, with
 message to this device was lost), never removed, since an outbox's seqs
 are gapless. A later `resume` with `"sealed": true`, proving a
 certificate that allows messages, regains `sealed`; what was replaced
-stays replaced.
+stays replaced. A session whose certificate expires loses `sealed` the
+same way, and `signs` (§4.6) with it, at the server's next sweep; a
+`resume` or a `signs` request made under it regains neither.
 
 ### 4.2 Fetching a certificate
 
@@ -1300,9 +1302,12 @@ session passes the time it received it as `at`. The sending server puts
 `msg`'s `cert` in the 905 as `DATA_LINK_SEALED_TO`, and the target's home
 server checks it as §4.3 does, refusing `NoDeviceKeys` for a target
 that cannot open sealed messages or whose current `device_enc` key is
-another; the sending server answers its client `cert_changed` or
-`not_sealed` to match. The check is needed because a ghost's ID
-promises no device: a link quarantines an old ID only for minutes, and
+another, and `SenderUnkeyed` before either when the sending ghost's group
+gives no fingerprint there; the sending server answers its client
+`cert_changed` or `not_sealed` to match, `not_sealed` saying for
+`SenderUnkeyed` that the sender's own key is not shown there. The check
+is needed because a ghost's ID promises no device: a link quarantines
+an old ID only for minutes, and
 a server hearing from a peer that restarted may re-use a ghost for any
 incoming user with the same home server, name and icon, who may be
 someone else on another device, so a 905 can reach whoever the ID
@@ -1425,11 +1430,13 @@ server said one (`DATA_LINK_USER_KEY`) over a link trying the draft, and a
 client checks a line's certificate against it; without one, its line is
 named by its certificate's fingerprint and the contact pinned to it, if
 any. Beside the fingerprint, the home server says
-`DATA_LINK_USER_KEY_FLAGS` (`0x0649`, proposed): `KEY_FLAG_SIGNS` while
+`DATA_LINK_USER_KEY_FLAGS` (`0x0649`): `KEY_FLAG_SIGNS` while
 the session's `signs` is `"default"` (§4.6), and `KEY_FLAG_SEALED` while
 it is `sealed` (§4.1), in Link User Update (902) again whenever either
-changes. A ghost's row carries `identity.signs` when its home server sets
-`KEY_FLAG_SIGNS` over a link trying the draft, the stripping check of §8
+changes. The certificate the session proved expiring ends both, on the
+session's own row as well. A ghost's row carries `identity.signs` when
+its home server sets `KEY_FLAG_SIGNS` over a link trying the draft, the
+stripping check of §8
 then applying to its lobby lines as to a local user's; `KEY_FLAG_SEALED`
 is not shown, since only 915's answer says a box can reach the ghost. A
 ghost whose row has no `server_key` cannot have its lines' scope
@@ -1463,8 +1470,11 @@ certificate is held, since certificates are kept by hash and one held
 may be another user's, and none is fetched for it. A line logged before its certificate came that
 fails once it does stays in history in its link form, unverified. A
 sealed message from a ghost whose home server said no fingerprint is
-refused `NoDeviceKeys`, since its recipient could not check who sealed
-it. A ghost's sealed `msg` event carries the fingerprint its home server
+refused `SenderUnkeyed` (reason 15, reserved for the draft), since its
+recipient could not check who sealed it; and since hxd-ng would refuse
+it so, it seals nothing over a link it says no fingerprints on
+(`[identity] login_proof_v1`), refusing the `msg` `not_sealed` at once.
+A ghost's sealed `msg` event carries the fingerprint its home server
 said as `from.fingerprint`.
 
 Rooms do not cross links yet (`chat-rooms.md` §8.1); when they do, a

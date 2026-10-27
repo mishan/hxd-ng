@@ -1639,13 +1639,17 @@ impl Hub {
     /// A server's own Link Device Keys over `peer`'s link: the certificate
     /// local user `uid` signed with, only where it signed (a lobby line,
     /// or a private message over this link), its fingerprint is said, and
-    /// the certificate is still unexpired.
+    /// the certificate is still unexpired. Only the requester goes
+    /// unchecked: a `uid` no user exported is `UnknownUser`.
     pub(crate) fn own_device_cert(&self, peer: &str, uid: Uid) -> Result<Vec<u8>, Reason> {
+        if !self.0.core.is_exported(uid) {
+            return Err(Reason::UnknownUser);
+        }
         let cert = self.0.state.lock().unwrap().seen.cert_for(uid, peer);
         let cert = cert
             .filter(|_| self.0.export_keys)
             .ok_or(Reason::NoDeviceKeys)?;
-        sendable(&cert)
+        sendable(&cert, self.0.core.clock().unix())
             .then(|| cert.to_vec())
             .ok_or(Reason::NoDeviceKeys)
     }
@@ -1667,23 +1671,29 @@ impl Hub {
             .core
             .ghost_device_cert(asker, of)
             .map_err(reason_of)?;
-        sendable(&cert).then_some(cert).ok_or(Reason::NoDeviceKeys)
+        sendable(&cert, self.0.core.clock().unix())
+            .then_some(cert)
+            .ok_or(Reason::NoDeviceKeys)
     }
 
     /// The link ghost `to` came over, if it tries the user keys draft, on
-    /// which a signed or sealed message may cross; one `from` signs over
-    /// it makes the certificate it was signed with answerable there.
+    /// which a signed message (`signed`) or a sealed one (`None`) may
+    /// cross; one `from` signs over it makes the certificate it was signed
+    /// with answerable there. A sealed one goes only where this server
+    /// says its users' fingerprints, as the far end refuses it otherwise.
     fn keyed_link(&self, to: Uid, signed: Option<(Uid, Arc<[u8]>)>) -> Result<(), PeerRefusal> {
         let mut state = self.0.state.lock().unwrap();
-        let name = state
+        let (name, terms) = state
             .links
             .iter()
             .find(|(_, l)| l.ghosts.values().any(|s| s.uid == to))
             .filter(|(_, l)| l.terms.user_keys)
-            .map(|(name, _)| name.clone())
+            .map(|(name, l)| (name.clone(), l.terms))
             .ok_or(PeerRefusal::CannotCross)?;
-        if let Some((from, cert)) = signed {
-            state.seen.saw(from, cert, Some(&name));
+        match signed {
+            Some((from, cert)) => state.seen.saw(from, cert, Some(&name)),
+            None if !terms.fingerprints => return Err(PeerRefusal::SenderUnkeyed),
+            None => {}
         }
         Ok(())
     }
@@ -1819,11 +1829,11 @@ fn unix_now() -> u64 {
 }
 
 /// Whether a certificate may be handed to a linked server (the draft's
-/// step 5): at most 512 bytes, allowing messages, and unexpired.
-fn sendable(cert: &[u8]) -> bool {
+/// step 5): at most 512 bytes, allowing messages, and unexpired at `now`.
+fn sendable(cert: &[u8], now: u64) -> bool {
     cert.len() <= hl_identity::message::CERT_MAX_BYTES
         && hl_identity::DeviceCert::parse(cert)
-            .is_ok_and(|c| c.allows(hl_identity::caps::MESSAGE) && c.expires > unix_now())
+            .is_ok_and(|c| c.allows(hl_identity::caps::MESSAGE) && c.expires > now)
 }
 
 /// The color a server's users are shown in when it suggests none: one of
@@ -2157,6 +2167,7 @@ fn refusal(error: bool, fields: &[Field]) -> Option<PeerRefusal> {
         Some(Some(Reason::UnknownBan)) => PeerRefusal::UnknownBan,
         Some(Some(Reason::NoDeviceKeys)) => PeerRefusal::NoDeviceKeys,
         Some(Some(Reason::BadSignature)) => PeerRefusal::BadSignature,
+        Some(Some(Reason::SenderUnkeyed)) => PeerRefusal::SenderUnkeyed,
         _ => PeerRefusal::Refused,
     })
 }
@@ -2174,6 +2185,7 @@ pub(crate) fn reason_of(why: PeerRefusal) -> Reason {
         PeerRefusal::UnknownBan => Reason::UnknownBan,
         PeerRefusal::NoDeviceKeys => Reason::NoDeviceKeys,
         PeerRefusal::BadSignature => Reason::BadSignature,
+        PeerRefusal::SenderUnkeyed => Reason::SenderUnkeyed,
     }
 }
 
@@ -2703,6 +2715,81 @@ mod tests {
             user_keys: false,
         });
         h
+    }
+
+    /// A hub whose peer `a` tries the user keys draft, saying its users'
+    /// fingerprints there as `export_keys` has it.
+    fn keyed_hub(export_keys: bool) -> Hub {
+        let peer = PeerEntry {
+            name: "a".into(),
+            dial: None,
+            key: [0; 32],
+            account: "link".into(),
+            features: 0,
+            ghosts: 10,
+            user_transport: false,
+            user_keys: true,
+        };
+        Hub::new(
+            &[1; 32],
+            HubConfig {
+                tag: "hx".into(),
+                name: "here".into(),
+                color: None,
+                show_tags: false,
+                max_ghosts: 100,
+                grace: std::time::Duration::from_secs(60),
+                peers: vec![peer],
+                discovery_key: None,
+                export_keys,
+            },
+            Arc::new(Core::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_sealed_message_goes_only_where_this_server_says_its_users_keys() {
+        for (export_keys, sent) in [(true, Ok(())), (false, Err(PeerRefusal::SenderUnkeyed))] {
+            let h = keyed_hub(export_keys);
+            linked(&h, 1, &[(5, "bob")]);
+            let bob = uids(&h)[0];
+            assert_eq!(h.keyed_link(bob, None), sent, "export_keys = {export_keys}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_servers_own_device_keys_tells_a_session_not_seen_to_sign_from_none() {
+        let h = keyed_hub(true);
+        linked(&h, 1, &[]);
+        let core = h.core();
+        let (ann, _rx) = core
+            .attach(hxd_core::roster::AttachInfo {
+                account: None,
+                nick: "ann".into(),
+                icon: 1,
+                admin: false,
+                access: Default::default(),
+                login: "ann".into(),
+                addr: None,
+                can_detach: false,
+                transport: Default::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        core.announce(ann);
+        for (uid, answer) in [(ann, Reason::NoDeviceKeys), (ann + 1, Reason::UnknownUser)] {
+            assert_eq!(h.own_device_cert("a", uid), Err(answer), "{uid}");
+        }
     }
 
     fn user(id: u16, home: u8) -> UserGroup {
