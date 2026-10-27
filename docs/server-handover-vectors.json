@@ -1,0 +1,1475 @@
+{
+ "challenge_rejects": [
+  {
+   "error": "BadField(\"next\")",
+   "hex": "a7617601637369675840dfb1141d3ea9f1d809940640e956e138360f9987f20c661e5d970dfaf3f849ba433090d4ca8bc8116d10eb612f675dd03893e50b9ac9a519a31016b8a9692a0564686f73746f686c2e6578616d706c653a35373030646e657874581fb0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff567657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "name": "a next that is not 32 bytes"
+  }
+ ],
+ "challenges": {
+  "c1": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "server_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "v": 1
+   },
+   "signature_hex": "3667ea12b70fc5e6a325d4c94dc27d99ac8bd7dd2258ba509110fe0196256aec28b35ca6cd025bc5c33fe237051a1cfe4905a2558e7fb7af2384b21020ee9806",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "signed_hex": "a76176016373696758403667ea12b70fc5e6a325d4c94dc27d99ac8bd7dd2258ba509110fe0196256aec28b35ca6cd025bc5c33fe237051a1cfe4905a2558e7fb7af2384b21020ee980664686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "signer": "k1",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+  },
+  "c16": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "48cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d",
+    "server_key": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+    "v": 1
+   },
+   "signature_hex": "42b5c191c0c4c8d778bba94f895fcb692016e0d51d49414ed897758778f302f7b98a72b14dacce0ac583b6d6af075066dfe63b00cb31618aac679e7f94a2cb08",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d67657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+   "signed_hex": "a761760163736967584042b5c191c0c4c8d778bba94f895fcb692016e0d51d49414ed897758778f302f7b98a72b14dacce0ac583b6d6af075066dfe63b00cb31618aac679e7f94a2cb0864686f73746f686c2e6578616d706c653a35373030646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d67657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+   "signer": "k16",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d67657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8"
+  },
+  "c17": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+    "server_key": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+    "v": 1
+   },
+   "signature_hex": "b95190dc0c274d760993f4dfd6405279c8351401942217436998b14057d36ecf3d5c516c22da8307ed71f0b0aa226cdd1fc477108ea8e747e90afbea3ffc1303",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e667657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+   "signed_hex": "a7617601637369675840b95190dc0c274d760993f4dfd6405279c8351401942217436998b14057d36ecf3d5c516c22da8307ed71f0b0aa226cdd1fc477108ea8e747e90afbea3ffc130364686f73746f686c2e6578616d706c653a35373030646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e667657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+   "signer": "k17",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e667657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b"
+  },
+  "c1_k3": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "server_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "v": 1
+   },
+   "signature_hex": "ab6dabedcf63fb51597b94af62cfc500cdcbf8bdedd1e3afb7313a3d429b5a481cb0bff1172366357809893b9ab74cb6fced8466bcc8e0d9cb165cebb7e36706",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "signed_hex": "a7617601637369675840ab6dabedcf63fb51597b94af62cfc500cdcbf8bdedd1e3afb7313a3d429b5a481cb0bff1172366357809893b9ab74cb6fced8466bcc8e0d9cb165cebb7e3670664686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "signer": "k1",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+  },
+  "c2": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "server_key": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "v": 1
+   },
+   "note": "A server challenge carrying `next` (§2), signed with it, beside hotline-ng-auth.md §6.2's own vector.",
+   "signature_hex": "f186ed784245ffe205b8b55f1d75549b0d41d881e20b9b88644b13aeb911f814a644cdfe8f0bc75a2f31bf36939e05a08aa1a3a5425b9276dbf01b2d66b49600",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signed_hex": "a7617601637369675840f186ed784245ffe205b8b55f1d75549b0d41d881e20b9b88644b13aeb911f814a644cdfe8f0bc75a2f31bf36939e05a08aa1a3a5425b9276dbf01b2d66b4960064686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signer": "k2",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc767657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21"
+  },
+  "c2_end": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "server_key": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "v": 1
+   },
+   "signature_hex": "53b2a486594c29eecca35f631be12cf841ed546ff6b6b219e8bda7efd6a533b93ee761bf5250068fd8c5f53a8788b101d996c85220e2f90416d6ce63551ddb02",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a561760164686f73746f686c2e6578616d706c653a3537303067657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signed_hex": "a661760163736967584053b2a486594c29eecca35f631be12cf841ed546ff6b6b219e8bda7efd6a533b93ee761bf5250068fd8c5f53a8788b101d996c85220e2f90416d6ce63551ddb0264686f73746f686c2e6578616d706c653a3537303067657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signer": "k2",
+   "unsigned_hex": "a561760164686f73746f686c2e6578616d706c653a3537303067657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21"
+  },
+  "c2_stray": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "0e6a6ec67d9a935b8ad276cefd36919b9d230e364e285e46e49f3989e7a68531",
+    "server_key": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "v": 1
+   },
+   "signature_hex": "cd94f814578b988dde7c5de62ebad6a4fbcd906d934cfc04081a93bfcd42f614c969fe003a3b4b3d02145ffd9bb7d0cf7a5500e3f1fe817fcfc574bbf18df30b",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e65787458200e6a6ec67d9a935b8ad276cefd36919b9d230e364e285e46e49f3989e7a6853167657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signed_hex": "a7617601637369675840cd94f814578b988dde7c5de62ebad6a4fbcd906d934cfc04081a93bfcd42f614c969fe003a3b4b3d02145ffd9bb7d0cf7a5500e3f1fe817fcfc574bbf18df30b64686f73746f686c2e6578616d706c653a35373030646e65787458200e6a6ec67d9a935b8ad276cefd36919b9d230e364e285e46e49f3989e7a6853167657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "signer": "k2",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e65787458200e6a6ec67d9a935b8ad276cefd36919b9d230e364e285e46e49f3989e7a6853167657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21"
+  },
+  "c_stray": {
+   "domain": "hl-identity/server-challenge/v1",
+   "fields": {
+    "challenge": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "expires": 1759708860,
+    "host": "hl.example:5700",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "server_key": "1ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+    "v": 1
+   },
+   "signature_hex": "5b5d93c1c34d1cf7b2964accfea599dd668d5d1de67ba80efe0d155781262f43178adddf950e0398012bef1e8db1e93bfe5b87a2b374ae849c24e14eee8b140f",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d6368616c6c656e67652f763100a661760164686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+   "signed_hex": "a76176016373696758405b5d93c1c34d1cf7b2964accfea599dd668d5d1de67ba80efe0d155781262f43178adddf950e0398012bef1e8db1e93bfe5b87a2b374ae849c24e14eee8b140f64686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+   "signer": "stray",
+   "unsigned_hex": "a661760164686f73746f686c2e6578616d706c653a35373030646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff53467657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b657958201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137"
+  }
+ },
+ "client": [
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "followed": [
+     "h0_1",
+     "h1_2"
+    ],
+    "key": "k2",
+    "outcome": "follow"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a chain of two, followed from the pinned key",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+   "dismissed": [],
+   "expect": {
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "followed": [
+     "h1_2"
+    ],
+    "key": "k2",
+    "outcome": "follow"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "the same chain served from before the pin, followed from the pinned key",
+   "pinned": "k1"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2_end"
+   ],
+   "challenge": "c2_end",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "commitment": null,
+    "followed": [
+     "h0_1",
+     "h1_2_end"
+    ],
+    "key": "k2",
+    "outcome": "follow"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "the last handover and the new challenge both lack next: accepted",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "dismissed": [],
+   "expect": {
+    "aliases": [
+     "h0_1",
+     "h1_2"
+    ],
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "pin",
+   "name": "a first pin takes the served chain as aliases"
+  },
+  {
+   "chain": [
+    "h1_2",
+    "h0_1"
+   ],
+   "challenge": "c2",
+   "dismissed": [],
+   "expect": {
+    "aliases": [],
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "pin",
+   "name": "a first pin of a chain that fails its checks gives no aliases"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16",
+    "h16_17"
+   ],
+   "challenge": "c17",
+   "dismissed": [],
+   "expect": {
+    "aliases": [],
+    "commitment": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "pin",
+   "name": "a first pin of more than 16 handovers gives no aliases"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16"
+   ],
+   "challenge": "c16",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "commitment": "48cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d",
+    "followed": [
+     "h0_1",
+     "h1_2",
+     "h2_3",
+     "h3_4",
+     "h4_5",
+     "h5_6",
+     "h6_7",
+     "h7_8",
+     "h8_9",
+     "h9_10",
+     "h10_11",
+     "h11_12",
+     "h12_13",
+     "h13_14",
+     "h14_15",
+     "h15_16"
+    ],
+    "key": "k16",
+    "outcome": "follow"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "exactly 16 handovers, followed",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1_edge"
+   ],
+   "challenge": "c1",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "followed": [
+     "h0_1_edge"
+    ],
+    "key": "k1",
+    "outcome": "follow"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a handover whose time is exactly now plus S, followed",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c_stray",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Commitment)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a handover to a key the commitment does not name",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c_stray",
+   "dismissed": [],
+   "expect": {
+    "aliases": [],
+    "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "repin",
+   "name": "re-pin after a commitment warning: the replaced key gets no alias"
+  },
+  {
+   "chain": [
+    "h0_1_later",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "dismissed": [],
+   "expect": {
+    "aliases": [],
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "repin",
+   "name": "re-pin after a second key-change warning: a key given up at the first one, signing a handover it never made, gets no alias"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c_stray",
+   "dismissed": [],
+   "expect": {
+    "handover": "h0_stray",
+    "outcome": "warn",
+    "reason": "Fork"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "repin",
+   "name": "re-pin of a chain that forks against a record warns in turn"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": null,
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Commitment)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a key change with no commitment remembered",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h1_2_same_time"
+   ],
+   "challenge": "c2",
+   "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Time)"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a followed handover no later than a record the client holds",
+   "pinned": "k1"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_3"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Link)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a mid-chain new that does not match the previous next",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "hstray_2"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Link)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "an old that is not the previous new",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": null,
+   "dismissed": [],
+   "expect": {
+    "outcome": "keep"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "same key: none remembered, one seen, no warning",
+   "pinned": "k2"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+   "dismissed": [],
+   "expect": {
+    "outcome": "keep"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "same key: the remembered commitment seen",
+   "pinned": "k2"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2_stray",
+   "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Recommitted"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "same key: one remembered, another seen, warns",
+   "pinned": "k2"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2_end",
+   "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Recommitted"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "same key: one remembered, none seen, warns",
+   "pinned": "k2"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2_by_new"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Bad(BadSignature))"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a handover signed by new rather than old",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "0e6a6ec67d9a935b8ad276cefd36919b9d230e364e285e46e49f3989e7a68531",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Commitment)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a first new that does not match the commitment",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1_end",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Link)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a handover after one with no next",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1_end"
+   ],
+   "challenge": "c2_end",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(ServerKey)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a last new that is not the challenge's server_key, both next absent",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(ServerKey)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a chain whose last new is not the server_key",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c1",
+   "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+   "dismissed": [],
+   "expect": {
+    "handover": "h0_stray",
+    "outcome": "warn",
+    "reason": "Fork"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a fork from one old to two keys",
+   "pinned": "k1"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c1",
+   "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+   "dismissed": [
+    "h0_stray"
+   ],
+   "expect": {
+    "outcome": "keep"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a fork the user accepted does not warn again",
+   "pinned": "k1"
+  },
+  {
+   "chain": [
+    "h0_1_later",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+   "dismissed": [],
+   "expect": {
+    "handover": "h0_1_later",
+    "outcome": "warn",
+    "reason": "Fork"
+   },
+   "followed": [
+    "h0_1",
+    "h1_2"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a fork with the same old and new at another time",
+   "pinned": "k2"
+  },
+  {
+   "chain": [
+    "h0_1_future"
+   ],
+   "challenge": "c1",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Time)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a handover whose time is past now plus S",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2_same_time"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Time)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a chain whose times are equal",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16",
+    "h16_17"
+   ],
+   "challenge": "c17",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(TooLong)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a list of more than 16 handovers",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16",
+    "h16_17"
+   ],
+   "challenge": "c17",
+   "commitment": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+   "dismissed": [],
+   "expect": {
+    "outcome": "keep"
+   },
+   "followed": [
+    "h0_1_later"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a list of more than 16 handovers at the same key is not verified, and forks nothing",
+   "pinned": "k17"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2_back",
+    "h2_1"
+   ],
+   "challenge": "c1_k3",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(RepeatedKey)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a chain that repeats a key",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2_stray",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Next)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a new key whose challenge next differs from the last followed handover's",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "HostMismatch"
+   },
+   "followed": [],
+   "host": "other.example",
+   "kind": "check",
+   "name": "the new key's challenge signed for another host",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16",
+    "h16_17"
+   ],
+   "challenge": "c17",
+   "commitment": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(NotServed)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a pinned key older than the 16 kept",
+   "pinned": "server"
+  }
+ ],
+ "handover_rejects": [
+  {
+   "error": "BadSignature",
+   "hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737637369675840f689a6cecdc3edd5ca6df97345805125271a824b58e321c4d1b74126e269cfe128bc6738ba27b93ba5a1a6314dd74d305d2fdb60148c050d0c8b483c44844c07646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "name": "signed by new rather than old"
+  },
+  {
+   "error": "BadField(\"new\")",
+   "hex": "a6617601636e65775820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758404473a195722076363922707d979bbd0db3947617946c95643a64dd3b74a769dc8aa4be3567fd68c4a4fb4f13ff6b83489a7e2df9f1e39c9c8f772d22652fa70d646e657874582010ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d6474696d651a68bccb00",
+   "name": "new equal to old"
+  },
+  {
+   "error": "Cbor(NotCanonical)",
+   "hex": "a661761801636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c637369675840690696b86e612b8e1da62f00e459952ee8b469bee24f556f3f6f74c7566171c35bf447ff1b11d15ac61481dd4da88252a0a0e370fb809cb8885e6a6cc97cc904646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "name": "a non-deterministic encoding"
+  },
+  {
+   "error": "UnsupportedVersion(2)",
+   "hex": "a6617602636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758408ae4a0d2fcae47d1e1807a5422a3e20729b73755dae717c69ffb48b7fa5b4426bfa3c524e04f1872b45faae622a989baeb2be7f2058b4ad1ca0d8e2670f48e0d646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "name": "v other than 1"
+  }
+ ],
+ "handovers": {
+  "h0_1": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1757203200,
+    "v": 1
+   },
+   "note": "A handover with `next` (§3): the file's server key hands over to k1 and commits to k2.",
+   "signature_hex": "690696b86e612b8e1da62f00e459952ee8b469bee24f556f3f6f74c7566171c35bf447ff1b11d15ac61481dd4da88252a0a0e370fb809cb8885e6a6cc97cc904",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "signed_hex": "a6617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c637369675840690696b86e612b8e1da62f00e459952ee8b469bee24f556f3f6f74c7566171c35bf447ff1b11d15ac61481dd4da88252a0a0e370fb809cb8885e6a6cc97cc904646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "signer": "server",
+   "unsigned_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00"
+  },
+  "h0_1_edge": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1759709400,
+    "v": 1
+   },
+   "signature_hex": "f29a70a395b88e6c7b239006a85506c717dc5de8b161f520b27ab96574984e068d5d70b8d37096af1b92fea97865ab078f489901a23a29db4875f34f5dfd0406",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d8",
+   "signed_hex": "a6617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c637369675840f29a70a395b88e6c7b239006a85506c717dc5de8b161f520b27ab96574984e068d5d70b8d37096af1b92fea97865ab078f489901a23a29db4875f34f5dfd0406646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d8",
+   "signer": "server",
+   "unsigned_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d8"
+  },
+  "h0_1_end": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1757203200,
+    "v": 1
+   },
+   "signature_hex": "2714b85a6797c4d2a7b5840acbee21db220a0e8640d7d7f3b4c42742b18e15304f4e9c7ad5afddf74382b079bcec5f2f6e3928d6e2a999c56e456646d1b86f0d",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a4617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6474696d651a68bccb00",
+   "signed_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758402714b85a6797c4d2a7b5840acbee21db220a0e8640d7d7f3b4c42742b18e15304f4e9c7ad5afddf74382b079bcec5f2f6e3928d6e2a999c56e456646d1b86f0d6474696d651a68bccb00",
+   "signer": "server",
+   "unsigned_hex": "a4617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6474696d651a68bccb00"
+  },
+  "h0_1_future": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1759709401,
+    "v": 1
+   },
+   "signature_hex": "0bbd8514dca69833f1a9e857fe380ed9df84ab61c0140c676cedc0cc08580b54c9c3674cba89a2153d34bde05afc1234bb31fb63451f6bf896fdf55f9c07680d",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d9",
+   "signed_hex": "a6617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758400bbd8514dca69833f1a9e857fe380ed9df84ab61c0140c676cedc0cc08580b54c9c3674cba89a2153d34bde05afc1234bb31fb63451f6bf896fdf55f9c07680d646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d9",
+   "signer": "server",
+   "unsigned_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68e308d9"
+  },
+  "h0_1_later": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1757203201,
+    "v": 1
+   },
+   "signature_hex": "5e6b6f3e24efcdcac2eba11e5d1556afeb3ca4daf3aed3f57e36cfcbeae28a28c4e343289789f866c6b9cc07467e345151fb988fc817b7d62d15ad439ec3f103",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb01",
+   "signed_hex": "a6617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758405e6b6f3e24efcdcac2eba11e5d1556afeb3ca4daf3aed3f57e36cfcbeae28a28c4e343289789f866c6b9cc07467e345151fb988fc817b7d62d15ad439ec3f103646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb01",
+   "signer": "server",
+   "unsigned_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb01"
+  },
+  "h0_stray": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "1ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+    "next": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+    "old": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "time": 1757203200,
+    "v": 1
+   },
+   "signature_hex": "2f5e2559d0380e915d82a99c3a5586d240f7207fc2a2bbb29a65e9739ed78b67775ec01f514a810e61d88a2d3ae8d85adc3b6e5aeed439b879b0a283d590d40a",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e657758201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "signed_hex": "a6617601636e657758201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6373696758402f5e2559d0380e915d82a99c3a5586d240f7207fc2a2bbb29a65e9739ed78b67775ec01f514a810e61d88a2d3ae8d85adc3b6e5aeed439b879b0a283d590d40a646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00",
+   "signer": "server",
+   "unsigned_hex": "a5617601636e657758201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137636f6c645820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c646e6578745820b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff5346474696d651a68bccb00"
+  },
+  "h10_11": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "1e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654",
+    "next": "00e008bb92b5f5175cc2872436c77d6f9bffc5d4bc3eda8c0f3fc0f0d48d1317",
+    "old": "64c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909",
+    "time": 1758067200,
+    "v": 1
+   },
+   "signature_hex": "4c679b6715a6dc93fc30892cd0c23a965f9ad0c2deb41955637ad9a3b73d194ebdf17ec539f03f089ee8203d19517793166ce741b656c404bad7da34f998d704",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e657758201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654636f6c64582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909646e657874582000e008bb92b5f5175cc2872436c77d6f9bffc5d4bc3eda8c0f3fc0f0d48d13176474696d651a68c9fa00",
+   "signed_hex": "a6617601636e657758201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654636f6c64582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a7769096373696758404c679b6715a6dc93fc30892cd0c23a965f9ad0c2deb41955637ad9a3b73d194ebdf17ec539f03f089ee8203d19517793166ce741b656c404bad7da34f998d704646e657874582000e008bb92b5f5175cc2872436c77d6f9bffc5d4bc3eda8c0f3fc0f0d48d13176474696d651a68c9fa00",
+   "signer": "k10",
+   "unsigned_hex": "a5617601636e657758201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654636f6c64582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909646e657874582000e008bb92b5f5175cc2872436c77d6f9bffc5d4bc3eda8c0f3fc0f0d48d13176474696d651a68c9fa00"
+  },
+  "h11_12": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28",
+    "next": "9a19fc9f345c9fde2858f0d175570612fed076877902cfe67d20e0f0a15b9d9f",
+    "old": "1e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654",
+    "time": 1758153600,
+    "v": 1
+   },
+   "signature_hex": "c75562e279cd474059536774b35c394c1f4c6b07bd4fe5d5130493c67e96348273e315d6db89d458c9e2e4ab1b705432cfd92ccdfed9e43cddeb737c65dc540e",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28636f6c6458201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654646e65787458209a19fc9f345c9fde2858f0d175570612fed076877902cfe67d20e0f0a15b9d9f6474696d651a68cb4b80",
+   "signed_hex": "a6617601636e65775820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28636f6c6458201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654637369675840c75562e279cd474059536774b35c394c1f4c6b07bd4fe5d5130493c67e96348273e315d6db89d458c9e2e4ab1b705432cfd92ccdfed9e43cddeb737c65dc540e646e65787458209a19fc9f345c9fde2858f0d175570612fed076877902cfe67d20e0f0a15b9d9f6474696d651a68cb4b80",
+   "signer": "k11",
+   "unsigned_hex": "a5617601636e65775820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28636f6c6458201e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654646e65787458209a19fc9f345c9fde2858f0d175570612fed076877902cfe67d20e0f0a15b9d9f6474696d651a68cb4b80"
+  },
+  "h12_13": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa",
+    "next": "bdb5540dbd9d9cd3cb39f5870a8311c65071a5a7af1b67447906faba9af5c823",
+    "old": "b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28",
+    "time": 1758240000,
+    "v": 1
+   },
+   "signature_hex": "8c0da958b465803e3a59c00b3d6902d4fa1a3c3d3771b24e50a29734853d6120e9d5333c6fef846dd8140677395b24c61431fecef0fbe84ab858a76694d86b0d",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa636f6c645820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28646e6578745820bdb5540dbd9d9cd3cb39f5870a8311c65071a5a7af1b67447906faba9af5c8236474696d651a68cc9d00",
+   "signed_hex": "a6617601636e65775820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa636f6c645820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc286373696758408c0da958b465803e3a59c00b3d6902d4fa1a3c3d3771b24e50a29734853d6120e9d5333c6fef846dd8140677395b24c61431fecef0fbe84ab858a76694d86b0d646e6578745820bdb5540dbd9d9cd3cb39f5870a8311c65071a5a7af1b67447906faba9af5c8236474696d651a68cc9d00",
+   "signer": "k12",
+   "unsigned_hex": "a5617601636e65775820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa636f6c645820b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28646e6578745820bdb5540dbd9d9cd3cb39f5870a8311c65071a5a7af1b67447906faba9af5c8236474696d651a68cc9d00"
+  },
+  "h13_14": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa",
+    "next": "1f5fe64ec2f8c901be3aad94a41d70c12d2f3a8f43755f902e665c96f41c87e3",
+    "old": "e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa",
+    "time": 1758326400,
+    "v": 1
+   },
+   "signature_hex": "b67ebd550f7b9e98124ebacaff3d855bbcb7b07d171732f050b643bda4cbb86e087efdfe8476575b81e156a56efaacca3b0ea12ccfdf2fc8c478049fed10f60e",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa636f6c645820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa646e65787458201f5fe64ec2f8c901be3aad94a41d70c12d2f3a8f43755f902e665c96f41c87e36474696d651a68cdee80",
+   "signed_hex": "a6617601636e65775820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa636f6c645820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa637369675840b67ebd550f7b9e98124ebacaff3d855bbcb7b07d171732f050b643bda4cbb86e087efdfe8476575b81e156a56efaacca3b0ea12ccfdf2fc8c478049fed10f60e646e65787458201f5fe64ec2f8c901be3aad94a41d70c12d2f3a8f43755f902e665c96f41c87e36474696d651a68cdee80",
+   "signer": "k13",
+   "unsigned_hex": "a5617601636e65775820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa636f6c645820e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa646e65787458201f5fe64ec2f8c901be3aad94a41d70c12d2f3a8f43755f902e665c96f41c87e36474696d651a68cdee80"
+  },
+  "h14_15": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "43046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de",
+    "next": "c6107c1842c20449a2e69adba9606b0780be1d0c9cdca5fd2fb771b388d2eadb",
+    "old": "acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa",
+    "time": 1758412800,
+    "v": 1
+   },
+   "signature_hex": "b3c4bd22622c489673434dfc7775af4b5d6fee6a3c94c74bc3bb03111994507b5bd2d0396cc4b65d149e3698080b50b8f24eaa068f2018fe6c7d63d0bcc08803",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de636f6c645820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa646e6578745820c6107c1842c20449a2e69adba9606b0780be1d0c9cdca5fd2fb771b388d2eadb6474696d651a68cf4000",
+   "signed_hex": "a6617601636e6577582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de636f6c645820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa637369675840b3c4bd22622c489673434dfc7775af4b5d6fee6a3c94c74bc3bb03111994507b5bd2d0396cc4b65d149e3698080b50b8f24eaa068f2018fe6c7d63d0bcc08803646e6578745820c6107c1842c20449a2e69adba9606b0780be1d0c9cdca5fd2fb771b388d2eadb6474696d651a68cf4000",
+   "signer": "k14",
+   "unsigned_hex": "a5617601636e6577582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de636f6c645820acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa646e6578745820c6107c1842c20449a2e69adba9606b0780be1d0c9cdca5fd2fb771b388d2eadb6474696d651a68cf4000"
+  },
+  "h15_16": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+    "next": "48cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d",
+    "old": "43046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de",
+    "time": 1758499200,
+    "v": 1
+   },
+   "signature_hex": "9d1a60d2d85bad488704bf17e0c537e65f9cacb2a422f4daf4a8a2cd1d7cb1350e05e99c11bf23606feb09a49f899d68233552c8626f6ff7c665eba0ed383106",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e657758204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8636f6c64582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d6474696d651a68d09180",
+   "signed_hex": "a6617601636e657758204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8636f6c64582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de6373696758409d1a60d2d85bad488704bf17e0c537e65f9cacb2a422f4daf4a8a2cd1d7cb1350e05e99c11bf23606feb09a49f899d68233552c8626f6ff7c665eba0ed383106646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d6474696d651a68d09180",
+   "signer": "k15",
+   "unsigned_hex": "a5617601636e657758204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8636f6c64582043046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de646e657874582048cca97f8993ffaebcac9728d7f94f7144f18090d329d9370a7dfc42db38d14d6474696d651a68d09180"
+  },
+  "h16_17": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+    "next": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+    "old": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+    "time": 1758585600,
+    "v": 1
+   },
+   "signature_hex": "760474163f4fab1daecfd4310076d0e6ce72b11218336b76c867be5030a88569104b8d1c7a728d31502e71f328b59d052be47980c67309ffd8f0c0b75b09e50f",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b636f6c6458204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e66474696d651a68d1e300",
+   "signed_hex": "a6617601636e65775820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b636f6c6458204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8637369675840760474163f4fab1daecfd4310076d0e6ce72b11218336b76c867be5030a88569104b8d1c7a728d31502e71f328b59d052be47980c67309ffd8f0c0b75b09e50f646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e66474696d651a68d1e300",
+   "signer": "k16",
+   "unsigned_hex": "a5617601636e65775820884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b636f6c6458204ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8646e65787458201325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e66474696d651a68d1e300"
+  },
+  "h1_2": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "4f25df9389f588f2e53850512974a02d1e48a4cef0b7eb95eece35e1b29623c242e1c22737af99d6f2436c8f0f5abccacf941791f988ec670a0c8b3abe427e0a",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signed_hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787376373696758404f25df9389f588f2e53850512974a02d1e48a4cef0b7eb95eece35e1b29623c242e1c22737af99d6f2436c8f0f5abccacf941791f988ec670a0c8b3abe427e0a646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signer": "k1",
+   "unsigned_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80"
+  },
+  "h1_2_back": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "next": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "46e0203848cafc49570d718aa62a357f2b138f1c5f73fe56bc839ef7d87f29b420265bd7f11f172811fd21a03bf5a35aa5928ceabcc0e35cfe55b198e108d90f",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582010ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d6474696d651a68be1c80",
+   "signed_hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873763736967584046e0203848cafc49570d718aa62a357f2b138f1c5f73fe56bc839ef7d87f29b420265bd7f11f172811fd21a03bf5a35aa5928ceabcc0e35cfe55b198e108d90f646e657874582010ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d6474696d651a68be1c80",
+   "signer": "k1",
+   "unsigned_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582010ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d6474696d651a68be1c80"
+  },
+  "h1_2_by_new": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "f689a6cecdc3edd5ca6df97345805125271a824b58e321c4d1b74126e269cfe128bc6738ba27b93ba5a1a6314dd74d305d2fdb60148c050d0c8b483c44844c07",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signed_hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737637369675840f689a6cecdc3edd5ca6df97345805125271a824b58e321c4d1b74126e269cfe128bc6738ba27b93ba5a1a6314dd74d305d2fdb60148c050d0c8b483c44844c07646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signer": "k2",
+   "unsigned_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80"
+  },
+  "h1_2_end": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "341e589ec189d2dc2f6b0938c5eb67962a35874b45e1c24fd595982171ec8f8afc1b0be0e66431e8998b9b0181c1d69e6b4d66aade55b92731850e49a0de9305",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a4617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787376474696d651a68be1c80",
+   "signed_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737637369675840341e589ec189d2dc2f6b0938c5eb67962a35874b45e1c24fd595982171ec8f8afc1b0be0e66431e8998b9b0181c1d69e6b4d66aade55b92731850e49a0de93056474696d651a68be1c80",
+   "signer": "k1",
+   "unsigned_hex": "a4617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787376474696d651a68be1c80"
+  },
+  "h1_2_same_time": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757203200,
+    "v": 1
+   },
+   "signature_hex": "44dcbc0a09fd2c4a46afda3ef4bcd7dbdaa4434bc6f2b42bcca903db3dafd162f39d1c606fdc7afbfeb560227149357815ca8b537d9f60c15992202215c91503",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bccb00",
+   "signed_hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873763736967584044dcbc0a09fd2c4a46afda3ef4bcd7dbdaa4434bc6f2b42bcca903db3dafd162f39d1c606fdc7afbfeb560227149357815ca8b537d9f60c15992202215c91503646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bccb00",
+   "signer": "k1",
+   "unsigned_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bccb00"
+  },
+  "h1_3": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633",
+    "next": "7300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec86",
+    "old": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "5aeb0f5f6daa1c9a42981ea5859878cd580d0a3bb27cd5ad402923528b8898549ff0f5987be4368f7621fb8d4c0695815c6f188d53b1f6c0711a801ae5365c0d",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68be1c80",
+   "signed_hex": "a6617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787376373696758405aeb0f5f6daa1c9a42981ea5859878cd580d0a3bb27cd5ad402923528b8898549ff0f5987be4368f7621fb8d4c0695815c6f188d53b1f6c0711a801ae5365c0d646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68be1c80",
+   "signer": "k1",
+   "unsigned_hex": "a5617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68be1c80"
+  },
+  "h2_1": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "old": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "time": 1757376000,
+    "v": 1
+   },
+   "signature_hex": "0b62c1e032b8c9cd2185c6bd61aecd8f0acf90fca09473590d9f6036a3ba98e696949ffc0705419c6f81674b6832dcf81cc2fb01cf524cc23346ff4afd6da908",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bf6e00",
+   "signed_hex": "a6617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c216373696758400b62c1e032b8c9cd2185c6bd61aecd8f0acf90fca09473590d9f6036a3ba98e696949ffc0705419c6f81674b6832dcf81cc2fb01cf524cc23346ff4afd6da908646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bf6e00",
+   "signer": "k2",
+   "unsigned_hex": "a5617601636e65775820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68bf6e00"
+  },
+  "h2_3": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633",
+    "next": "7300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec86",
+    "old": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "time": 1757376000,
+    "v": 1
+   },
+   "signature_hex": "dbefb7671a9812a67deb317d71ff82081f6ab0501f403a8a6a1a9ba9fffe7c799f517347f8c7705b1cd7caf55723b7d58898b92b9311a0fd74de217f5d095600",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68bf6e00",
+   "signed_hex": "a6617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21637369675840dbefb7671a9812a67deb317d71ff82081f6ab0501f403a8a6a1a9ba9fffe7c799f517347f8c7705b1cd7caf55723b7d58898b92b9311a0fd74de217f5d095600646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68bf6e00",
+   "signer": "k2",
+   "unsigned_hex": "a5617601636e6577582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633636f6c645820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21646e65787458207300c0ae1429cd153252736a781b78f404f4738f17db195dbef533b74a45ec866474696d651a68bf6e00"
+  },
+  "h3_4": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7",
+    "next": "d7e1e084be213b01e506852af8198b9980b43e03749c67d82dcd0903f4001c77",
+    "old": "66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633",
+    "time": 1757462400,
+    "v": 1
+   },
+   "signature_hex": "0a688e1e5a85a301c1acc3f12d232fe172bc6af13bb5f82cb90d7f93035aa5d54cd75a670b21f757f4c896a0c48c1d9ca0f8158b8c90d1a83a9de302132d7403",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7636f6c64582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633646e6578745820d7e1e084be213b01e506852af8198b9980b43e03749c67d82dcd0903f4001c776474696d651a68c0bf80",
+   "signed_hex": "a6617601636e6577582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7636f6c64582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf76336373696758400a688e1e5a85a301c1acc3f12d232fe172bc6af13bb5f82cb90d7f93035aa5d54cd75a670b21f757f4c896a0c48c1d9ca0f8158b8c90d1a83a9de302132d7403646e6578745820d7e1e084be213b01e506852af8198b9980b43e03749c67d82dcd0903f4001c776474696d651a68c0bf80",
+   "signer": "k3",
+   "unsigned_hex": "a5617601636e6577582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7636f6c64582066cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633646e6578745820d7e1e084be213b01e506852af8198b9980b43e03749c67d82dcd0903f4001c776474696d651a68c0bf80"
+  },
+  "h4_5": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da",
+    "next": "168c59a54a0d5b6c6286758f1577df67037dc54bedfd40096a9102cc3d3e3eaa",
+    "old": "20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7",
+    "time": 1757548800,
+    "v": 1
+   },
+   "signature_hex": "ac07b5f7e7719a657567eca7f2a1bdb96d2c230ec74ab5823db92afbe13f9591fcc3bdddb9b92eab5ace4ea641eefddffbfb1c4c81bde097d4a313c0ae01bb0d",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da636f6c64582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7646e6578745820168c59a54a0d5b6c6286758f1577df67037dc54bedfd40096a9102cc3d3e3eaa6474696d651a68c21100",
+   "signed_hex": "a6617601636e65775820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da636f6c64582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7637369675840ac07b5f7e7719a657567eca7f2a1bdb96d2c230ec74ab5823db92afbe13f9591fcc3bdddb9b92eab5ace4ea641eefddffbfb1c4c81bde097d4a313c0ae01bb0d646e6578745820168c59a54a0d5b6c6286758f1577df67037dc54bedfd40096a9102cc3d3e3eaa6474696d651a68c21100",
+   "signer": "k4",
+   "unsigned_hex": "a5617601636e65775820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da636f6c64582020828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7646e6578745820168c59a54a0d5b6c6286758f1577df67037dc54bedfd40096a9102cc3d3e3eaa6474696d651a68c21100"
+  },
+  "h5_6": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a",
+    "next": "e37abcd79efd08db94518a903952ffe9f8af7e8b4684b63591631cef8e8871c8",
+    "old": "d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da",
+    "time": 1757635200,
+    "v": 1
+   },
+   "signature_hex": "4e971f256612f5143408ce19612fe09384ba7fe80f9c6515cd821256a389da675e37837199f7de832235144cfe4f7b23de7c1a8757197ca050102634de25bc00",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a636f6c645820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da646e6578745820e37abcd79efd08db94518a903952ffe9f8af7e8b4684b63591631cef8e8871c86474696d651a68c36280",
+   "signed_hex": "a6617601636e65775820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a636f6c645820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da6373696758404e971f256612f5143408ce19612fe09384ba7fe80f9c6515cd821256a389da675e37837199f7de832235144cfe4f7b23de7c1a8757197ca050102634de25bc00646e6578745820e37abcd79efd08db94518a903952ffe9f8af7e8b4684b63591631cef8e8871c86474696d651a68c36280",
+   "signer": "k5",
+   "unsigned_hex": "a5617601636e65775820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a636f6c645820d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da646e6578745820e37abcd79efd08db94518a903952ffe9f8af7e8b4684b63591631cef8e8871c86474696d651a68c36280"
+  },
+  "h6_7": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc",
+    "next": "59b2ad6131a74d03b530f63212af0b0a62f2b0cde942bb45b10c12755a99a3d7",
+    "old": "511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a",
+    "time": 1757721600,
+    "v": 1
+   },
+   "signature_hex": "edb3d488fa93703f91adbd1b50d8dcb4f4e9eba902a5ba5298608b9003fc039f1c1cb1b1cc3f3ad77faa0a290921d3b18519cdf01a080c9460b36fad5586f40e",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc636f6c645820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a646e657874582059b2ad6131a74d03b530f63212af0b0a62f2b0cde942bb45b10c12755a99a3d76474696d651a68c4b400",
+   "signed_hex": "a6617601636e6577582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc636f6c645820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a637369675840edb3d488fa93703f91adbd1b50d8dcb4f4e9eba902a5ba5298608b9003fc039f1c1cb1b1cc3f3ad77faa0a290921d3b18519cdf01a080c9460b36fad5586f40e646e657874582059b2ad6131a74d03b530f63212af0b0a62f2b0cde942bb45b10c12755a99a3d76474696d651a68c4b400",
+   "signer": "k6",
+   "unsigned_hex": "a5617601636e6577582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc636f6c645820511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a646e657874582059b2ad6131a74d03b530f63212af0b0a62f2b0cde942bb45b10c12755a99a3d76474696d651a68c4b400"
+  },
+  "h7_8": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "53470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3",
+    "next": "138dfa227234ea5fcb4f525d998e3bed106cc777730c4a1d7b842e5fad090404",
+    "old": "31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc",
+    "time": 1757808000,
+    "v": 1
+   },
+   "signature_hex": "d0484a08df2a840090258bc2774b32e19cbd6ff6662944b606053d2207fea528ac009150af78aff8d5bd47bcf07fd1744669981bea2e39d132f6764744472909",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3636f6c64582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc646e6578745820138dfa227234ea5fcb4f525d998e3bed106cc777730c4a1d7b842e5fad0904046474696d651a68c60580",
+   "signed_hex": "a6617601636e6577582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3636f6c64582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc637369675840d0484a08df2a840090258bc2774b32e19cbd6ff6662944b606053d2207fea528ac009150af78aff8d5bd47bcf07fd1744669981bea2e39d132f6764744472909646e6578745820138dfa227234ea5fcb4f525d998e3bed106cc777730c4a1d7b842e5fad0904046474696d651a68c60580",
+   "signer": "k7",
+   "unsigned_hex": "a5617601636e6577582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3636f6c64582031debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc646e6578745820138dfa227234ea5fcb4f525d998e3bed106cc777730c4a1d7b842e5fad0904046474696d651a68c60580"
+  },
+  "h8_9": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "31f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f",
+    "next": "d92d542a589844dd3f1fcfd86038e0f9a0639cb7278a64da167d81f6af90a9d7",
+    "old": "53470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3",
+    "time": 1757894400,
+    "v": 1
+   },
+   "signature_hex": "52657d73b77d74f7ecbc542d249d0237ce6df6eae5a84a95d85efa682adcfc471db15c5e4e00755a3e5e2b9cc0c9fe60df9178acaba6cdbb2e7a3e67811c1a0c",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f636f6c64582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3646e6578745820d92d542a589844dd3f1fcfd86038e0f9a0639cb7278a64da167d81f6af90a9d76474696d651a68c75700",
+   "signed_hex": "a6617601636e6577582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f636f6c64582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f363736967584052657d73b77d74f7ecbc542d249d0237ce6df6eae5a84a95d85efa682adcfc471db15c5e4e00755a3e5e2b9cc0c9fe60df9178acaba6cdbb2e7a3e67811c1a0c646e6578745820d92d542a589844dd3f1fcfd86038e0f9a0639cb7278a64da167d81f6af90a9d76474696d651a68c75700",
+   "signer": "k8",
+   "unsigned_hex": "a5617601636e6577582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f636f6c64582053470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3646e6578745820d92d542a589844dd3f1fcfd86038e0f9a0639cb7278a64da167d81f6af90a9d76474696d651a68c75700"
+  },
+  "h9_10": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "64c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909",
+    "next": "51fb88a29a88ba4cbf3983ff16aa9e01b7acf049e1155d5811f20718f300fbfd",
+    "old": "31f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f",
+    "time": 1757980800,
+    "v": 1
+   },
+   "signature_hex": "88bbadbb4d6d088da98922646562ba153eb029e282f006d65c52be0770cde507f05c66d5268f89cdcb4ee8e2e629aa77c0ee51a06a8e4d8cedabbdb877d7400a",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e6577582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909636f6c64582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f646e657874582051fb88a29a88ba4cbf3983ff16aa9e01b7acf049e1155d5811f20718f300fbfd6474696d651a68c8a880",
+   "signed_hex": "a6617601636e6577582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909636f6c64582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f63736967584088bbadbb4d6d088da98922646562ba153eb029e282f006d65c52be0770cde507f05c66d5268f89cdcb4ee8e2e629aa77c0ee51a06a8e4d8cedabbdb877d7400a646e657874582051fb88a29a88ba4cbf3983ff16aa9e01b7acf049e1155d5811f20718f300fbfd6474696d651a68c8a880",
+   "signer": "k9",
+   "unsigned_hex": "a5617601636e6577582064c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909636f6c64582031f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f646e657874582051fb88a29a88ba4cbf3983ff16aa9e01b7acf049e1155d5811f20718f300fbfd6474696d651a68c8a880"
+  },
+  "hstray_2": {
+   "domain": "hl-identity/server-handover/v1",
+   "fields": {
+    "new": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+    "next": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "old": "1ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+    "time": 1757289600,
+    "v": 1
+   },
+   "signature_hex": "cc5dc38300557c1efe5ff6a3b4fdc1f7b0c6bf0b5f353d3a2d3fb2646ee6557d21fd970ef2124c4a877079a3e0939b4ae43b323ec47e96b29ad1bd5036e9190a",
+   "signature_input_hex": "686c2d6964656e746974792f7365727665722d68616e646f7665722f763100a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c6458201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signed_hex": "a6617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c6458201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137637369675840cc5dc38300557c1efe5ff6a3b4fdc1f7b0c6bf0b5f353d3a2d3fb2646ee6557d21fd970ef2124c4a877079a3e0939b4ae43b323ec47e96b29ad1bd5036e9190a646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80",
+   "signer": "stray",
+   "unsigned_hex": "a5617601636e65775820204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21636f6c6458201ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137646e657874582056fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc76474696d651a68be1c80"
+  }
+ },
+ "host": "hl.example:5700",
+ "keys": {
+  "k1": {
+   "public_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "k10": {
+   "public_hex": "64c30815ff26d5c4aff8e11274a38ed6dd0553049da4c10372a9575b7a776909",
+   "seed_hex": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+  },
+  "k11": {
+   "public_hex": "1e2a137c7fe2279f9d7f0644030a0e9c0b45f781dce71ae4519c0f4384031654",
+   "seed_hex": "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
+  },
+  "k12": {
+   "public_hex": "b4088cd3b8962e64a8ac3716fb86fc7e7ae1d025f1eb562155ab663611b2cc28",
+   "seed_hex": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c"
+  },
+  "k13": {
+   "public_hex": "e8da63a40ca687c87cfce05cb24a786c7e75cc49c70db5573f026f1c6a86ceaa",
+   "seed_hex": "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d"
+  },
+  "k14": {
+   "public_hex": "acdb0e29743f0ccb8686d0a104cb96e05abefec1538765e7595869f7dc8c49aa",
+   "seed_hex": "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e"
+  },
+  "k15": {
+   "public_hex": "43046bfe4092b3e94994eada15dcc20d8aaa07b658fd3954eb8e0efb8bdca5de",
+   "seed_hex": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+  },
+  "k16": {
+   "public_hex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+   "seed_hex": "2020202020202020202020202020202020202020202020202020202020202020"
+  },
+  "k17": {
+   "public_hex": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+   "seed_hex": "2121212121212121212121212121212121212121212121212121212121212121"
+  },
+  "k18": {
+   "public_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+   "seed_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "k2": {
+   "public_hex": "204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21",
+   "seed_hex": "1212121212121212121212121212121212121212121212121212121212121212"
+  },
+  "k3": {
+   "public_hex": "66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633",
+   "seed_hex": "1313131313131313131313131313131313131313131313131313131313131313"
+  },
+  "k4": {
+   "public_hex": "20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7",
+   "seed_hex": "1414141414141414141414141414141414141414141414141414141414141414"
+  },
+  "k5": {
+   "public_hex": "d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da",
+   "seed_hex": "1515151515151515151515151515151515151515151515151515151515151515"
+  },
+  "k6": {
+   "public_hex": "511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a",
+   "seed_hex": "1616161616161616161616161616161616161616161616161616161616161616"
+  },
+  "k7": {
+   "public_hex": "31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc",
+   "seed_hex": "1717171717171717171717171717171717171717171717171717171717171717"
+  },
+  "k8": {
+   "public_hex": "53470962558a6e0839022ae65c6b2723b32772e5c0c5f4776cb8e6a3e10ba2f3",
+   "seed_hex": "1818181818181818181818181818181818181818181818181818181818181818"
+  },
+  "k9": {
+   "public_hex": "31f3322d4923d36c41c109bdb0099193187bed99942096e4926a24c77efd0d2f",
+   "seed_hex": "1919191919191919191919191919191919191919191919191919191919191919"
+  },
+  "server": {
+   "public_hex": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+   "seed_hex": "0404040404040404040404040404040404040404040404040404040404040404"
+  },
+  "stray": {
+   "public_hex": "1ba4075b77c9e3fb3ecde15cdaf5221f3c10373e623f7b0e1ef76366b0af7137",
+   "seed_hex": "3030303030303030303030303030303030303030303030303030303030303030"
+  }
+ },
+ "notes": [
+  "The server key handover's vectors (server-key-handover.md §10), in identity-test-vectors.json's shape: byte strings are lowercase hex, signature_input_hex = domain || 0x00 || unsigned_hex, and signed_hex is the deterministic CBOR of the unsigned map plus `sig`. Each object names its `signer`.",
+  "`server` is identity-test-vectors.json's server key; the others are beyond it. `now` is the client's clock and `skew` is S. Every challenge is for `host`, with `challenge` and `expires` as its fields give them.",
+  "`handover_rejects` and `challenge_rejects` must fail to parse with `error`.",
+  "Each `client` case names handovers and a challenge by their keys here. A `check` is a later fetch of discovery (§5.2-§5.4) by a client pinned at `pinned`, remembering `commitment`, holding a fork record of each handover in `followed` (its old, the SHA-256 of its bytes, its time and its next), and having accepted the fork warning of each in `dismissed`; a `pin` is a first pin (§5.1), and a `repin` a pin again after a warning, which takes no aliases (§5.3). `chain` is server_handovers as served. A client checks `challenge` for `host` first (hotline-ng-auth.md §6.2), and one that fails warns with that error. `expect` is what it does: keep its pin, follow to `key` taking `commitment` and adding `followed` to its records, pin taking `commitment` and adding `aliases`, or warn, naming the conflicting `handover` of a fork. Everything in `expect` binds but a warning's `reason`, which names the check of this implementation that failed.",
+  "Each `scope` case asks whether a line or article whose in.server is `server` and whose `sent` is given is in scope under the alias the handover `alias` keeps (§5.5)."
+ ],
+ "now": 1759708800,
+ "scope": [
+  {
+   "alias": "h0_1",
+   "expect": true,
+   "name": "sent at the handover's time + S: in scope",
+   "sent": 1757203800,
+   "server": "server"
+  },
+  {
+   "alias": "h0_1",
+   "expect": false,
+   "name": "sent at time + S + 1: signed for elsewhere",
+   "sent": 1757203801,
+   "server": "server"
+  },
+  {
+   "alias": "h0_1",
+   "expect": false,
+   "name": "another server: not this alias",
+   "sent": 1757203200,
+   "server": "k1"
+  }
+ ],
+ "skew": 600
+}

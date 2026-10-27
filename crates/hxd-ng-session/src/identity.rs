@@ -639,7 +639,7 @@ impl IdentityState {
     pub fn sign_challenge(&self, challenge: &[u8; 32], host: Option<&str>) -> Option<Vec<u8>> {
         let host = host.filter(|h| self.answers_as(Some(h)))?;
         let expires = self.clock.unix() + TTL.as_secs();
-        hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires).ok()
+        hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires, None).ok()
     }
 
     /// `POST /identity/auth`, challenge binding: the spec's step list

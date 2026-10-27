@@ -312,6 +312,7 @@ the server key (§4.3):
 | `server_key` | bstr(32) | yes | The key that signs it. |
 | `host` | tstr | yes | The request's host, in the form below. |
 | `expires` | uint | yes | When the challenge expires. |
+| `next` | bstr(32) | no | SHA-256 of the key that will follow `server_key` (`server-key-handover.md` §2). Covered by `sig`; one that is not 32 bytes makes the challenge malformed, and it is refused. |
 | `sig` | bstr(64) | yes | |
 
 The server MUST sign it for the host the request was sent to, and MUST

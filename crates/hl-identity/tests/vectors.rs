@@ -350,7 +350,7 @@ fn server_challenge_vector() {
     let expires = u64_of(f, "expires");
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(
-        ServerChallenge::sign(&k.srv, &challenge, host, expires).unwrap(),
+        ServerChallenge::sign(&k.srv, &challenge, host, expires, None).unwrap(),
         signed
     );
     let c = ServerChallenge::parse(&signed).unwrap();

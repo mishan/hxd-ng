@@ -34,7 +34,7 @@ identity draft's classic one. It rests on the `server_challenge` and
 `[identity] hosts` of `hotline-ng-auth.md` §6.2, `hotline-ng.md`'s
 `chat_guid` (§4, §7.1, §7.3), and hl-identity's `verify_domain`, which
 refuses a key that does not re-encode to its own bytes (§3.1). Rotating
-the server key with a handover is left to a separate draft (§4.13).
+the server key with a handover is `server-key-handover.md`'s (§4.13).
 
 A user who logs in with a key can **sign** what they write with their
 device's key, so that no server can write a line in their name or alter
@@ -477,7 +477,9 @@ The signer is SHA-256 of `cert`'s identity key, never what a server
 says. A message that fails any step is **invalid**. One that passes is
 then checked against its scope: `to` against the identity the reader's
 session proved, `in` against the server and the room or category it is
-shown in. The server is this server's current key, or, for a lobby line
+shown in. The server is this server's current key, or, at a reader, an
+alias of it a followed handover keeps (`server-key-handover.md` §5.5),
+or, for a lobby line
 of a linked server's user, that user's home server's key, as the `chat`
 event's or the history line's `from.remote.server_key` gives it (§5), so
 a live line still verifies after its sender has left. A message that
@@ -1257,15 +1259,17 @@ hosts` (§1.1). At first contact over plain HTTP the pin is trust on
 first use, since a network attacker can then answer with a challenge
 it signed with a key of its own. A client signs nothing to a host
 whose key it could not pin, one that sends no `server_challenge`.
-Scope checks use the current key alone, at the server on ingest and at
-every reader.
+Scope checks use the current key alone at the server on ingest; at a
+reader, the current key or an alias a followed handover keeps
+([server-key-handover.md](server-key-handover.md) §5.5).
 
 A changed server key warns as any changed pin does, and makes what was
 signed under the old key "signed for elsewhere"; while that warning is
 unanswered the client signs nothing to that host, and a client that
 signed under the old key is refused `bad_signature` and signs again. A
 signed, pre-committed handover that carries the old key forward as an
-alias is specified separately, in a draft to follow.
+alias is specified separately, in
+[server-key-handover.md](server-key-handover.md).
 
 ## 5. Across server links
 
@@ -1520,7 +1524,8 @@ read-only to a classic client (§4.8).
 - **Show every line, message and article in exactly one of these
   states**, and never as verifiably from its sender unless it is the
   first or the sixth; an unsigned one is shown by its nick, as today:
-  1. **Verified**: valid by §3.5, its scope this server and this room,
+  1. **Verified**: valid by §3.5, its scope this server (its key or an
+     alias, §3.5) and this room,
      category, parent or recipient, and its signer the fingerprint the
      server names for the sender: the roster's for a live line or
      message from a local uid, the article's `from.fingerprint`, and for
