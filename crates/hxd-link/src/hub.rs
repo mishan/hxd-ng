@@ -28,7 +28,7 @@ use crate::key::{check_public, verify_proof, LinkKey, Role};
 use crate::keys::{Certs, Checked, Seen, Unchecked};
 use crate::link::Terms;
 use crate::server::{same_tag, ServerGroup, ServerId};
-use crate::users::{flag, UserGroup};
+use crate::users::{flag, key_flag, UserGroup};
 use crate::wire::{feature, field, find, tx, Field, Hello, Reason, VERSION};
 use hl_identity::message::{link_cert_sha256, ChatLine, PrivateMessage, Signed};
 use hxd_core::history::Signature;
@@ -1424,6 +1424,7 @@ impl Hub {
                 // A statement of the user keys draft, read only from a
                 // peer trying it, as the transport is.
                 fingerprint: g.key.filter(|_| live.terms.user_keys),
+                signs: live.terms.user_keys && g.key_flags & key_flag::SIGNS != 0,
                 server_key: home.discovery_key().filter(|_| live.terms.user_keys),
             },
             visible: !g.exclude.contains(&self.server_id()),
@@ -2524,6 +2525,8 @@ mod tests {
             exclude: vec![],
             encrypted: None,
             fingerprint: None,
+            signs: false,
+            sealed: false,
         };
         UserGroup::parse(&crate::users::of_local(
             &local,
@@ -2712,6 +2715,8 @@ mod tests {
             exclude: vec![],
             encrypted: None,
             fingerprint: None,
+            signs: false,
+            sealed: false,
         };
         UserGroup::parse(&crate::users::of_local(
             &local,

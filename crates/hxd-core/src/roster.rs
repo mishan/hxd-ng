@@ -250,9 +250,8 @@ pub struct IdentityTag {
     /// For a key nobody here answers for: unix seconds before which it
     /// may not chat, message or post (`identity-registrar.md` §7.3).
     pub quiet_until: Option<u64>,
-    /// The client signs public lines by default
-    /// (`docs/e2e-messages.md` §4.6): a hint to readers, set by the
-    /// client and so nothing more.
+    /// The client signs every lobby line (`docs/e2e-messages.md`
+    /// §4.6): a hint to readers, set by the client and so nothing more.
     pub signs: bool,
     /// The session can sign: it said `signs`, either way, on a device
     /// whose certificate allows messages, to a server that carries them
@@ -1118,6 +1117,36 @@ pub(crate) struct RosterInner {
 }
 
 impl RosterInner {
+    /// [`Core::set_signs`] without telling anyone of the row: whether
+    /// it changed. A change to `can_sign` is told at once.
+    pub(crate) fn set_signs(&mut self, uid: Uid, signs: bool, can_sign: bool) -> bool {
+        let before = self.room_shown(None, Some(&[uid]));
+        let Some(id) = self
+            .users
+            .get_mut(&uid)
+            .and_then(|s| s.info.transport.identity.as_mut())
+        else {
+            return false;
+        };
+        let was = (id.signs, id.can_sign);
+        id.signs = signs;
+        id.can_sign = can_sign;
+        if was.1 != can_sign {
+            self.room_announce(before, None, Some(&[uid]));
+        }
+        was.0 != signs
+    }
+
+    /// `uid`'s row changed: told to everyone who sees it, and the links.
+    pub(crate) fn row_changed(&mut self, uid: Uid) {
+        let Some(sess) = self.users.get(&uid).filter(|s| s.visible) else {
+            return;
+        };
+        let ev = Event::Changed(sess.info.clone());
+        self.broadcast(&ev, None);
+        self.export_changed(uid);
+    }
+
     pub(crate) fn next_uid(&mut self) -> Option<Uid> {
         self.next_uid_at(Instant::now())
     }
@@ -2062,37 +2091,16 @@ impl Core {
         changed
     }
 
-    /// Whether `uid`'s client says it signs public lines by default, and
-    /// whether it can sign at all, as a `resume` says them again
+    /// Whether `uid`'s client says it signs every lobby line, and
+    /// whether it can sign at all, as a `resume` or `signs` says them again
     /// (`docs/e2e-messages.md` §4.6); a change to the first is told as
     /// any change to the row is, and to the second as the change to
     /// `may_post` it makes in a room that requires signing (§4.8). A
     /// session that proved no identity has no row to say it on.
     pub fn set_signs(&self, uid: Uid, signs: bool, can_sign: bool) {
         let mut r = self.roster.lock().unwrap();
-        let before = r.room_shown(None, Some(&[uid]));
-        let Some(sess) = r.users.get_mut(&uid) else {
-            return;
-        };
-        let Some(id) = sess.info.transport.identity.as_mut() else {
-            return;
-        };
-        let was = (id.signs, id.can_sign);
-        id.signs = signs;
-        id.can_sign = can_sign;
-        if was.1 != can_sign {
-            r.room_announce(before, None, Some(&[uid]));
-        }
-        if was.0 == signs {
-            return;
-        }
-        let Some(sess) = r.users.get(&uid) else {
-            return;
-        };
-        if sess.visible {
-            let ev = Event::Changed(sess.info.clone());
-            r.broadcast(&ev, None);
-            r.export_changed(uid);
+        if r.set_signs(uid, signs, can_sign) {
+            r.row_changed(uid);
         }
     }
 

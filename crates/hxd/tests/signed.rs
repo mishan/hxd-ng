@@ -879,25 +879,105 @@ async fn a_redaction_moves_the_signature_into_the_evidence() {
     assert_eq!(again["id"], id);
 }
 
+/// A resume that leaves out `signs` and `sealed` takes both off the row
+/// in one change, replayed rather than resynced whether it takes over a
+/// live connection or comes back to a detached session.
 #[tokio::test]
 async fn a_resume_that_does_not_say_it_signs_loses_the_mark() {
+    for (takeover, login) in [
+        (true, json!({ "signs": "default" })),
+        (false, json!({ "signs": "default", "sealed": true })),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = start(dir.path()).await;
+        let alice = person(1, "alice");
+        let (mut a, _) = login_as(server.ng, &alice, login).await;
+        let (mut d, _) = Client::account(server.ng, "dave", "pw", "dave")
+            .await
+            .unwrap();
+        let fp = fingerprint(&alice).to_string();
+        let alices = |e: &Value| e["user"]["identity"]["fingerprint"] == fp;
+        a.event_where("user_joined", |e| e["user"]["nick"] == "dave")
+            .await
+            .unwrap();
+        let (session, seq) = (a.session.clone().unwrap(), a.rx.last_seq);
+        let _old = if takeover {
+            Some(a)
+        } else {
+            a.close().await.unwrap();
+            let detached = d
+                .event_where("user_changed", |e| {
+                    alices(e) && e["user"]["status"] == "detached"
+                })
+                .await
+                .unwrap();
+            assert_eq!(detached.data["user"]["identity"]["signs"], true);
+            None
+        };
+        let (mut resumed, how) = Client::resume(server.ng, session, seq, Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            matches!(how, hxd_testclient::ng::Resumed::Replayed(_)),
+            "takeover {takeover}: {how:?}"
+        );
+        ok(&mut resumed, "nick", json!({ "icon": 77 })).await;
+        let mut told = Vec::new();
+        loop {
+            let e = d.event_where("user_changed", alices).await.unwrap().data;
+            if e["user"]["icon"] == 77 {
+                break;
+            }
+            told.push(e);
+        }
+        assert_eq!(told.len(), 1, "takeover {takeover}: {told:?}");
+        let identity = &told[0]["user"]["identity"];
+        assert!(
+            identity.get("signs").is_none() && identity.get("sealed").is_none(),
+            "takeover {takeover}: {identity}"
+        );
+        assert_eq!(told[0]["user"]["status"], "active");
+    }
+}
+
+#[tokio::test]
+async fn the_signs_request_changes_the_mark_until_a_resume_says_again() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path()).await;
     let alice = person(1, "alice");
-    let (a, _) = login_as(server.ng, &alice, json!({ "signs": "default" })).await;
+    // Saying nothing at login does not keep a device that may sign from it.
+    let (mut a, _) = login_as(server.ng, &alice, json!({})).await;
     let (mut d, _) = Client::account(server.ng, "dave", "pw", "dave")
         .await
         .unwrap();
+    let fp = fingerprint(&alice).to_string();
+    for (signs, shown) in [("default", true), ("able", false), ("default", true)] {
+        assert_eq!(
+            ok(&mut a, "signs", json!({ "signs": signs })).await,
+            json!({})
+        );
+        let changed = d
+            .event_where("user_changed", |e| {
+                e["user"]["identity"]["fingerprint"] == fp
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            changed.data["user"]["identity"].get("signs").is_some(),
+            shown,
+            "{signs}: {}",
+            changed.data
+        );
+    }
+    let (code, _) = refused(&mut d, "signs", json!({ "signs": "default" })).await;
+    assert_eq!(code, "bad_request", "a session with no device");
+    for params in [json!({ "signs": "always" }), json!({})] {
+        let (code, _) = refused(&mut a, "signs", params.clone()).await;
+        assert_eq!(code, "bad_request", "{params}");
+    }
+
     let (session, seq) = (a.session.clone().unwrap(), a.rx.last_seq);
     a.close().await.unwrap();
-    let fp = fingerprint(&alice).to_string();
-    let detached = d
-        .event_where("user_changed", |e| {
-            e["user"]["identity"]["fingerprint"] == fp && e["user"]["status"] == "detached"
-        })
-        .await
-        .unwrap();
-    assert_eq!(detached.data["user"]["identity"]["signs"], true);
     let (_a, _) = Client::resume(server.ng, session, seq, Vec::new())
         .await
         .unwrap();

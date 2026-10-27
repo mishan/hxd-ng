@@ -5636,6 +5636,7 @@ mod tests {
                 refuses_msgs: true,
                 transport: None,
                 fingerprint: None,
+                signs: false,
                 server_key: None,
             }),
         };

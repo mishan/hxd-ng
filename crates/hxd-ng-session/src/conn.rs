@@ -34,8 +34,9 @@ use crate::proto::{
     reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
     stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
     ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, Signs, VideoStartParams, VideoStateParams, VideoStopParams,
-    VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams, VoiceRoomParams,
+    ReqEnvelope, ResumeParams, Signs, SignsParams, VideoStartParams, VideoStateParams,
+    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
+    VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -63,6 +64,7 @@ fn req_label(req: &str) -> &'static str {
         "ping",
         "resume",
         "rooms",
+        "signs",
         "sync",
         "unblock",
         "video_start",
@@ -106,7 +108,7 @@ fn request_weight(req: &str) -> u32 {
     match req {
         "logout" => 0,
         "voice_ice" => 1,
-        "chat" | "msg" | "nick" | "block" | "unblock" | "msg_read" | "avatar_clear"
+        "chat" | "msg" | "nick" | "signs" | "block" | "unblock" | "msg_read" | "avatar_clear"
         | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
@@ -760,7 +762,7 @@ async fn handle_login(
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
             identity: identity.map(|i| {
-                let signs = signs(ctx, Some(i.may_message()), p.signs);
+                let signs = signs(ctx, device.as_ref(), p.signs);
                 hxd_core::IdentityTag {
                     signs: signs == Some(Signs::Default),
                     can_sign: signs.is_some(),
@@ -983,7 +985,7 @@ async fn handle_login(
         "caps": caps,
         "seq": 0,
     });
-    if let Some(signs) = signs(ctx, identity.map(TransportIdentity::may_message), p.signs) {
+    if let Some(signs) = signs(ctx, device.as_ref(), p.signs) {
         ok["signs"] = json!(signs.as_str());
     }
     if sealed.is_some() {
@@ -1161,7 +1163,12 @@ async fn handle_resume(
     // that no longer says it can open it is already the placeholder.
     let device = ctx.registry.device(&p.session);
     let sealed = crate::sealed::device(device.as_ref(), p.sealed);
-    let (events, replay) = match ctx.core.resume_sealed(uid, p.last_seq, sealed.clone()) {
+    let signs = signs(ctx, device.as_ref(), p.signs);
+    let marks = (signs == Some(Signs::Default), signs.is_some());
+    let (events, replay) = match ctx
+        .core
+        .resume_sealed(uid, p.last_seq, sealed.clone(), marks)
+    {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
         Resume::Gone => {
@@ -1193,9 +1200,6 @@ async fn handle_resume(
     .ok()
     .flatten()
     .map(|account| account.masked(&mask));
-    let signs = signs(ctx, device.as_ref().map(|d| d.may_message), p.signs);
-    ctx.core
-        .set_signs(uid, signs == Some(Signs::Default), signs.is_some());
     let state = SessState {
         uid,
         session_id: p.session.clone(),
@@ -1559,9 +1563,14 @@ fn media_now(
 
 /// What a session that said `signs` is taken to do: nothing, unless the
 /// server carries signed messages and the session proved a device whose
-/// certificate allows them (`docs/e2e-messages.md` §4.6).
-fn signs(ctx: &NgCtx, may_message: Option<bool>, asked: Option<Signs>) -> Option<Signs> {
-    asked.filter(|_| may_message == Some(true) && crate::signed::offered(ctx))
+/// certificate allows them and is at most 512 bytes, the device it could
+/// also seal to (`docs/e2e-messages.md` §4.6).
+fn signs(
+    ctx: &NgCtx,
+    device: Option<&crate::push::DeviceOnSocket>,
+    asked: Option<Signs>,
+) -> Option<Signs> {
+    asked.filter(|_| device.is_some_and(|d| d.sealable.is_some()) && crate::signed::offered(ctx))
 }
 
 /// A signed line or message under an id its signer used for something
@@ -1589,9 +1598,10 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// price and under its type: `chat` for its Chat and `msg` for its
 /// Message, 2 each; `room_topic` for Set Chat Subject, 2, and
 /// `room_join` and `room_part` for Join and Leave Chat, 2 and 1; `nick` for
-/// User Change, 20; and the news writes for
-/// the 1.5 transactions they are, `news_post` a threaded post, 10 each
-/// as the table's default prices every one of them. (Its 20 for a post
+/// User Change, 20, and `signs` too, since it is told as one; and the
+/// news writes for the 1.5 transactions they are, `news_post` a
+/// threaded post, 10 each as the table's default prices every one of
+/// them. (Its 20 for a post
 /// is the 1.2 flat one's, which an ng post is not, and at that price an
 /// editor who files a few replies in as many seconds is banned for
 /// it.) The file-area changes are its Delete File, New Folder, Set File
@@ -1607,7 +1617,7 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "room_topic" => Some((0x78, 2)),
         "room_join" => Some((0x73, 2)),
         "room_part" => Some((0x74, 1)),
-        "nick" => Some((0x130, 20)),
+        "nick" | "signs" => Some((0x130, 20)),
         "news_post" => Some((0x19a, 10)),
         "news_delete" => Some((0x19b, 10)),
         "news_node_create" => Some((0x17e, 10)),
@@ -2404,6 +2414,25 @@ async fn dispatch(
         }
 
         "login" | "resume" => reply_err(req.id, "bad_request", "Already logged in."),
+
+        // Its user turned signing every lobby line on or off
+        // (`docs/e2e-messages.md` §4.6).
+        "signs" if crate::signed::offered(ctx) => {
+            match serde_json::from_value::<SignsParams>(req.params.clone()) {
+                Ok(p) => match signs(ctx, state.device.as_ref(), Some(p.signs)) {
+                    Some(signs) => {
+                        ctx.core.set_signs(state.uid, signs == Signs::Default, true);
+                        reply_ok(req.id, json!({}))
+                    }
+                    None => reply_err(
+                        req.id,
+                        "bad_request",
+                        "This session proved no device that may sign: its certificate must allow messages and be at most 512 bytes.",
+                    ),
+                },
+                Err(_) => reply_err(req.id, "bad_request", "Malformed signs."),
+            }
+        }
 
         "avatar_clear" if ctx.core.avatar_policy().is_some() => {
             let uid = state.uid;

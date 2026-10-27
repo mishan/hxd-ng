@@ -781,39 +781,46 @@ async fn ask(ws: &mut Ws, id: u64, req: &str, params: Value) -> Value {
 
 /// A nick change on the ng wire costs what mhxd charges a User Change,
 /// 20 points, so a guest renaming itself at socket speed is banned
-/// rather than telling everyone present each time.
+/// rather than telling everyone present each time; and so does `signs`,
+/// which everyone is told of as one, charged before it is refused as a
+/// rename is.
 #[tokio::test]
 async fn an_ng_nick_flood_spends_spam_points_and_is_banned() {
-    let td = tempfile::tempdir().unwrap();
-    let server = start(
-        td.path(),
-        "connections_per_addr = 0\nreconnect_seconds = 0\n\
-         spam_points = 100\nspam_seconds = 60\n[server]\nban_time = 60",
-    )
-    .await;
-    let (mut watcher, _) = ng_guest(server.ng, "watcher").await;
-    let (mut renamer, _) = ng_guest(server.ng, "renamer").await;
-    for id in 2..=5 {
-        let ok = ask(
-            &mut renamer,
-            id,
-            "nick",
-            json!({ "nick": format!("n{id}") }),
+    let rename = |id: u64| json!({ "nick": format!("n{id}") });
+    let signs = |_: u64| json!({ "signs": "default" });
+    for (req, params, answered, banned) in [
+        ("nick", &rename as &dyn Fn(u64) -> Value, None, "n5"),
+        ("signs", &signs, Some("unknown_method"), "renamer"),
+    ] {
+        let td = tempfile::tempdir().unwrap();
+        let server = start(
+            td.path(),
+            "connections_per_addr = 0\nreconnect_seconds = 0\n\
+             spam_points = 100\nspam_seconds = 60\n[server]\nban_time = 60",
         )
         .await;
-        assert!(ok.get("ok").is_some(), "{ok}");
+        let (mut watcher, _) = ng_guest(server.ng, "watcher").await;
+        let (mut renamer, _) = ng_guest(server.ng, "renamer").await;
+        for id in 2..=5 {
+            let reply = ask(&mut renamer, id, req, params(id)).await;
+            assert_eq!(reply["error"]["code"].as_str(), answered, "{req}: {reply}");
+        }
+        let refused = ask(&mut renamer, 6, req, params(6)).await;
+        assert_eq!(refused["error"]["code"], "flooding", "{req}: {refused}");
+        event(&mut renamer, "kicked", |_| true).await;
+        let notice = event(&mut watcher, "notice", |d| {
+            d["text"].as_str().is_some_and(|t| t.contains("spam_max"))
+        })
+        .await;
+        assert_eq!(
+            notice["text"],
+            format!(
+                "{banned} has been banned by {banned}: spam_max exceeded: 100 >= 100, \
+                 last transaction: 0x130"
+            ),
+            "{req}"
+        );
     }
-    let refused = ask(&mut renamer, 6, "nick", json!({ "nick": "n6" })).await;
-    assert_eq!(refused["error"]["code"], "flooding", "{refused}");
-    event(&mut renamer, "kicked", |_| true).await;
-    let notice = event(&mut watcher, "notice", |d| {
-        d["text"].as_str().is_some_and(|t| t.contains("spam_max"))
-    })
-    .await;
-    assert_eq!(
-        notice["text"],
-        "n5 has been banned by n5: spam_max exceeded: 100 >= 100, last transaction: 0x130"
-    );
 }
 
 /// A nick or icon change that changes nothing tells nobody, on either

@@ -48,12 +48,18 @@ pub struct ResumeParams {
     pub sealed: bool,
 }
 
-/// `signs` on `login` and `resume`: any other value is `bad_request`,
-/// as a malformed `params` is.
+/// The `signs` request: the session's `signs` changed.
+#[derive(Debug, Deserialize)]
+pub struct SignsParams {
+    pub signs: Signs,
+}
+
+/// `signs` on `login`, `resume` and its own request: any other value is
+/// `bad_request`, as a malformed `params` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Signs {
-    /// Signs public lines by default, which the roster shows.
+    /// Signs every lobby line, which the roster shows.
     Default,
     /// Signs only where asked or required.
     Able,
@@ -628,12 +634,14 @@ impl serde::Serialize for UserOut<'_> {
         if let Some(r) = &u.remote {
             m.serialize_entry("remote", &remote_json(r))?;
             // As its home server says, over a link trying the user keys
-            // draft; nothing more of an identity crosses.
+            // draft; nothing more of an identity is shown.
             if let Some(fp) = r.fingerprint {
-                m.serialize_entry(
-                    "identity",
-                    &json!({ "fingerprint": hl_identity::Fingerprint(fp).to_string() }),
-                )?;
+                let mut identity =
+                    json!({ "fingerprint": hl_identity::Fingerprint(fp).to_string() });
+                if r.signs {
+                    identity["signs"] = json!(true);
+                }
+                m.serialize_entry("identity", &identity)?;
             }
         }
         if let Some(id) = &u.transport.identity {

@@ -71,21 +71,35 @@ impl Core {
         self
     }
 
-    /// [`Core::resume`], with whether `uid` can open sealed messages, as
-    /// the `resume` says again (§4.1), set under the same lock, so of two
-    /// resumes racing the one attached last has its own mark. Losing it
-    /// changes the roster row, and every sealed message held for the
-    /// session becomes the placeholder, in place, so the outbox keeps its
-    /// seqs.
+    /// [`Core::resume`], with whether `uid` can open sealed messages and
+    /// its `signs` ([`Core::set_signs`]), as the `resume` says them again
+    /// (§4.1, §4.6), set under the same lock, so of two resumes racing
+    /// the one attached last has its own marks, and a change to either
+    /// told as one change to the row. Losing `sealed` makes every sealed
+    /// message held for the session the placeholder, in place, so the
+    /// outbox keeps its seqs.
     pub fn resume_sealed(
         &self,
         uid: Uid,
         last_seq: u64,
         sealed: Option<SealedDevice>,
+        (signs, can_sign): (bool, bool),
     ) -> crate::Resume {
         let mut r = self.roster.lock().unwrap();
-        set_sealed(&mut r, uid, sealed);
-        self.resume_locked(&mut r, uid, last_seq)
+        // `|`, not `||`: both are set whatever the first did.
+        let changed = set_sealed(&mut r, uid, sealed) | r.set_signs(uid, signs, can_sign);
+        let was_active = r
+            .users
+            .get(&uid)
+            .is_some_and(|s| s.info.status == crate::roster::SessionStatus::Active);
+        let resumed = self.resume_locked(&mut r, uid, last_seq);
+        // Told once the new connection holds the session, so a takeover's
+        // seqs still meet and a resume refused tells nothing; a session
+        // coming back from detached is told the row in its status change.
+        if changed && was_active && !matches!(resumed, crate::Resume::Gone) {
+            r.row_changed(uid);
+        }
+        resumed
     }
 
     /// The certificate of the device `of`'s session proves now, for a
@@ -233,26 +247,23 @@ impl Core {
     }
 }
 
-fn set_sealed(r: &mut crate::roster::RosterInner, uid: Uid, sealed: Option<SealedDevice>) {
+/// Whether the row changed.
+fn set_sealed(r: &mut crate::roster::RosterInner, uid: Uid, sealed: Option<SealedDevice>) -> bool {
     let Some(sess) = r.users.get_mut(&uid) else {
-        return;
+        return false;
     };
     let Some(id) = sess.info.transport.identity.as_mut() else {
-        return;
+        return false;
     };
     if id.sealed.as_deref() == sealed.as_ref() {
-        return;
+        return false;
     }
     let lost = sealed.is_none();
     id.sealed = sealed.map(Arc::new);
     if lost {
         sess.outbox.lose_sealed();
     }
-    if sess.visible {
-        let ev = Event::Changed(sess.info.clone());
-        r.broadcast(&ev, None);
-        r.export_changed(uid);
-    }
+    true
 }
 
 pub(crate) fn sealed_of(sess: &crate::roster::UserSession) -> Option<&SealedDevice> {

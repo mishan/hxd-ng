@@ -180,7 +180,7 @@ over them.
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
-| `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
+| `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
 - A login reply block is present exactly when its capability is, except
@@ -310,7 +310,7 @@ hotline-ng-identity.md §8.1 says.
 | `detach` | §2. |
 | `caps` | §4. |
 | `seq` | The seq the client is at: 0 for a new session. |
-| `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
+| `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -648,6 +648,7 @@ family document. Each family of §4 adds its own.
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
+| `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
@@ -709,6 +710,10 @@ family document. Each family of §4 adds its own.
   To a user of a linked server, both go by its home server, which checks
   the key a box was sealed to (e2e-messages.md §5), over a link trying
   the user keys draft and no other.
+- **`signs`**, with the `signed` capability, changes the session's
+  `signs` (§6.1) when its user turns signing every lobby line on or
+  off, under the login's condition, which a session that does not meet
+  it is refused `bad_request` for (e2e-messages.md §4.6).
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -802,7 +807,7 @@ counts in §3's sequence.
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
 | `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged, server_key?}`, the home server's name and tag, whether this server puts the tag in its users' names, and the home server's discovery key, base64url, when it said one over a link trying the user keys draft (server-link.md §7.7), which its signed lines are scoped to (e2e-messages.md §5). A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
-| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}` alone, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs public lines by default (e2e-messages.md §4.6), and `sealed: true` that it can open sealed messages (§4.1). |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}`, and `signs` when that server says it, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs every lobby line (e2e-messages.md §4.6, §5), and `sealed: true` that it can open sealed messages (§4.1). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
@@ -864,8 +869,8 @@ news body is different: it declares its own type (news.md §5).
   bucket (`[limits] ng_requests` in `ng_request_seconds`, a burst of 40
   and then 20 a second by default) that every request after the
   handshake spends its weight from. A write, or a request others hear
-  of, costs 2: `chat`, `msg`, `nick`, `block`, `unblock`, `msg_read`,
-  `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
+  of, costs 2: `chat`, `msg`, `nick`, `signs`, `block`, `unblock`,
+  `msg_read`, `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
   `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
   `push_unregister`, `files_download`, `files_mkdir`, `files_delete`,
   `files_move`, `files_comment`, `report_close`, `redact`, `revoke` and
@@ -933,8 +938,9 @@ news body is different: it declares its own type (news.md §5).
   multi-line `text` counted, and so many spam points, which a request
   that stands for a classic transaction spends at the price mhxd
   charges that one: `chat` and `msg` its Chat and Message, `nick` its
-  User Change, the news writes their 1.5 transactions, `news_post`
-  a threaded post, and the file-area changes their Delete File, New
+  User Change, and `signs` too, being told as one, the news writes
+  their 1.5 transactions, `news_post` a threaded post, and the
+  file-area changes their Delete File, New
   Folder, Set File Info and Move File. Past the first the session is kicked and its room told;
   past the second it is kicked and banned for `[server] ban_time` —
   its account's login or its identity, and its address unless

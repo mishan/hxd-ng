@@ -38,6 +38,9 @@ pub struct RemoteRef {
     /// The identity fingerprint its home server says it proved
     /// (`DATA_LINK_USER_KEY`).
     pub fingerprint: Option<[u8; 32]>,
+    /// Its home server says it signs every lobby line
+    /// (`KEY_FLAG_SIGNS`), beside a fingerprint.
+    pub signs: bool,
     /// Its home server's discovery key (`DATA_LINK_DISCOVERY_KEY`), which
     /// that server's signed lines are scoped to.
     pub server_key: Option<[u8; 32]>,
@@ -327,10 +330,15 @@ pub struct LocalUser {
     /// The identity the user's connection proved here, never an
     /// account's that a password logged in to.
     pub fingerprint: Option<[u8; 32]>,
+    /// The user signs every lobby line (`docs/e2e-messages.md` §4.6).
+    pub signs: bool,
+    /// The user's client can open sealed messages (§4.1).
+    pub sealed: bool,
 }
 
 impl LocalUser {
     fn of(sess: &UserSession) -> LocalUser {
+        let id = sess.info.transport.identity.as_ref();
         LocalUser {
             uid: sess.info.uid,
             nick: sess.info.nick.clone(),
@@ -342,7 +350,9 @@ impl LocalUser {
             // itself declared cleartext is cleartext whatever is in front.
             encrypted: (!sess.info.transport.assumed || !sess.info.transport.encrypted)
                 .then_some(sess.info.transport.encrypted),
-            fingerprint: sess.info.transport.identity.as_ref().map(|i| i.fingerprint),
+            fingerprint: id.map(|i| i.fingerprint),
+            signs: id.is_some_and(|i| i.signs),
+            sealed: id.is_some_and(|i| i.sealed.is_some()),
         }
     }
 }
@@ -1269,6 +1279,7 @@ mod tests {
                 refuses_msgs: true,
                 transport: None,
                 fingerprint: None,
+                signs: false,
                 server_key: None,
             },
             visible,
