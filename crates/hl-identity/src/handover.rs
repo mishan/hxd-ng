@@ -147,7 +147,8 @@ pub enum Broken {
     /// `new` does not match the previous one's `next`, which includes
     /// one after a handover with no `next`.
     Link,
-    /// Times not strictly ascending, or one past now plus `S`.
+    /// Times not strictly ascending, from after every record the client
+    /// holds, or one past now plus `S`.
     Time,
     RepeatedKey,
     /// The last `new` is not the challenge's `server_key`.
@@ -158,14 +159,18 @@ pub enum Broken {
 
 type Served = (Result<Handover, Error>, [u8; 32]);
 
-fn serve<B: AsRef<[u8]>>(chain: &[B]) -> Vec<Served> {
-    chain
-        .iter()
-        .map(|b| {
-            let b = b.as_ref();
-            (Handover::parse(b), Sha256::digest(b).into())
-        })
-        .collect()
+/// `None` for a list longer than §4 allows, which is never verified, so
+/// that its length costs nothing: it forks nothing, gives no aliases and
+/// cannot be followed.
+fn serve<B: AsRef<[u8]>>(chain: &[B]) -> Option<Vec<Served>> {
+    if chain.len() > MAX_CHAIN {
+        return None;
+    }
+    let served = chain.iter().map(|b| {
+        let b = b.as_ref();
+        (Handover::parse(b), Sha256::digest(b).into())
+    });
+    Some(served.collect())
 }
 
 /// §5.4. A handover that does not verify names no `old` worth believing,
@@ -226,34 +231,26 @@ fn walk(chain: &[Served], challenge: &ServerChallenge, now: u64) -> Result<Vec<F
     Ok(followed)
 }
 
-/// A pin, at first contact or after the user accepted a warning (§5.1):
-/// the aliases `chain` gives, to add to the client's records, none if it
-/// fails, or a fork warning. The client pins `challenge`'s key and
+/// A first pin (§5.1): the aliases `chain` gives, to become the client's
+/// records, none if it fails. The client pins `challenge`'s key and
 /// remembers its `next`; `challenge` is one [`ServerChallenge::check`]
-/// has passed for the host. Handovers from an `old` the client already
-/// holds a record of are left out, and so is one from `replaced`, the
-/// key a warning made the client give up, which must not come back as an
-/// alias through a handover it refused (§5.3).
-pub fn pin<B: AsRef<[u8]>>(
-    chain: &[B],
-    challenge: &ServerChallenge,
-    followed: &[Followed],
-    dismissed: &[[u8; 32]],
-    replaced: Option<&PublicKey>,
-    now: u64,
-) -> Result<Vec<Followed>, Warning> {
-    let served = serve(chain);
-    forks(&served, followed, dismissed)?;
-    if served.len() > MAX_CHAIN {
-        return Ok(Vec::new());
-    }
-    let mut aliases = walk(&served, challenge, now).unwrap_or_default();
-    aliases.retain(|a| Some(&a.old) != replaced && !recorded(followed, a));
-    Ok(aliases)
+/// has passed for the host.
+pub fn pin<B: AsRef<[u8]>>(chain: &[B], challenge: &ServerChallenge, now: u64) -> Vec<Followed> {
+    serve(chain)
+        .and_then(|served| walk(&served, challenge, now).ok())
+        .unwrap_or_default()
 }
 
-fn recorded(followed: &[Followed], f: &Followed) -> bool {
-    followed.iter().any(|r| r.old == f.old)
+/// A pin again after the user accepted a warning (§5.1, §5.3): only the
+/// fork check, since it takes no aliases. A key given up at an earlier
+/// warning would otherwise come back as an alias through a handover
+/// signed by whoever holds it now.
+pub fn repin<B: AsRef<[u8]>>(
+    chain: &[B],
+    followed: &[Followed],
+    dismissed: &[[u8; 32]],
+) -> Result<(), Warning> {
+    forks(&serve(chain).unwrap_or_default(), followed, dismissed)
 }
 
 /// Every later fetch of discovery (§5.2–§5.4): `chain` as served, and
@@ -265,7 +262,8 @@ pub fn check<B: AsRef<[u8]>>(
     now: u64,
 ) -> Verdict {
     let served = serve(chain);
-    if let Err(w) = forks(&served, pinned.followed, pinned.dismissed) {
+    let listed = served.as_deref().unwrap_or_default();
+    if let Err(w) = forks(listed, pinned.followed, pinned.dismissed) {
         return Verdict::Warn(w);
     }
     if challenge.server_key == pinned.key {
@@ -275,9 +273,7 @@ pub fn check<B: AsRef<[u8]>>(
         return Verdict::Warn(Warning::Recommitted);
     }
     let follow = || {
-        if served.len() > MAX_CHAIN {
-            return Err(Broken::TooLong);
-        }
+        let served = served.as_deref().ok_or(Broken::TooLong)?;
         let (from, first) = served
             .iter()
             .enumerate()
@@ -289,8 +285,11 @@ pub fn check<B: AsRef<[u8]>>(
         if pinned.commitment != Some(commitment(&first.new)) {
             return Err(Broken::Commitment);
         }
+        if pinned.followed.iter().any(|f| f.time >= first.time) {
+            return Err(Broken::Time);
+        }
         let mut followed = walk(&served[from..], challenge, now)?;
-        followed.retain(|f| !recorded(pinned.followed, f));
+        followed.retain(|f| !pinned.followed.iter().any(|r| r.old == f.old));
         Ok(followed)
     };
     match follow() {

@@ -185,7 +185,7 @@ fn warn(reason: &str) -> Json {
 /// unless `case` says otherwise.
 fn case(mut case: Json) -> Json {
     let defaults = json!({
-        "kind": "check", "followed": [], "dismissed": [], "replaced": null, "host": HOST,
+        "kind": "check", "followed": [], "dismissed": [], "host": HOST,
     });
     for (k, v) in defaults.as_object().unwrap() {
         if case.get(k).is_none() {
@@ -304,8 +304,28 @@ fn generate() {
         }),
         json!({
             "name": "re-pin after a commitment warning: the replaced key gets no alias",
-            "kind": "pin", "replaced": "server", "chain": ["h0_stray"], "challenge": "c_stray",
+            "kind": "repin", "chain": ["h0_stray"], "challenge": "c_stray",
             "expect": { "outcome": "pin", "commitment": c("k2"), "aliases": [] },
+        }),
+        json!({
+            "name": "re-pin after a second key-change warning: a key given up at the first one, signing a handover it never made, gets no alias",
+            "kind": "repin", "chain": ["h0_1_later", "h1_2"], "challenge": "c2",
+            "expect": { "outcome": "pin", "commitment": c("k3"), "aliases": [] },
+        }),
+        json!({
+            "name": "re-pin of a chain that forks against a record warns in turn",
+            "kind": "repin", "followed": ["h0_1"], "chain": ["h0_stray"], "challenge": "c_stray",
+            "expect": fork("h0_stray"),
+        }),
+        json!({
+            "name": "a key change with no commitment remembered",
+            "pinned": "server", "commitment": null, "chain": two, "challenge": "c2",
+            "expect": warn("Chain(Commitment)"),
+        }),
+        json!({
+            "name": "a followed handover no later than a record the client holds",
+            "pinned": "k1", "commitment": c("k2"), "followed": ["h0_1"], "chain": ["h1_2_same_time"], "challenge": "c2",
+            "expect": warn("Chain(Time)"),
         }),
         json!({
             "name": "a mid-chain new that does not match the previous next",
@@ -391,6 +411,11 @@ fn generate() {
             "expect": warn("Chain(TooLong)"),
         }),
         json!({
+            "name": "a list of more than 16 handovers at the same key is not verified, and forks nothing",
+            "pinned": "k17", "commitment": c("k18"), "followed": ["h0_1_later"], "chain": long, "challenge": "c17",
+            "expect": keep,
+        }),
+        json!({
             "name": "a chain that repeats a key",
             "pinned": "server", "commitment": c("k1"), "chain": ["h0_1", "h1_2_back", "h2_1"], "challenge": "c1_k3",
             "expect": warn("Chain(RepeatedKey)"),
@@ -473,13 +498,29 @@ fn generate() {
             "UnsupportedVersion(2)",
         ),
     ];
+    let short_next = {
+        let unsigned = map(vec![
+            ("v", Some(Value::Uint(1))),
+            ("challenge", bytes(&NONCE)),
+            ("server_key", bytes(&pk("k1"))),
+            ("host", Some(Value::Text(HOST.into()))),
+            ("expires", Some(Value::Uint(NOW + 60))),
+            ("next", bytes(&commit("k2")[..31])),
+        ]);
+        entry(proof::SERVER_DOMAIN, json!({}), unsigned, "k1")
+    };
+    let challenge_rejects = vec![reject(
+        "a next that is not 32 bytes",
+        str_of(&short_next, "signed_hex"),
+        "BadField(\"next\")",
+    )];
 
     let doc = json!({
         "notes": [
             "The server key handover's vectors (server-key-handover.md §10), in identity-test-vectors.json's shape: byte strings are lowercase hex, signature_input_hex = domain || 0x00 || unsigned_hex, and signed_hex is the deterministic CBOR of the unsigned map plus `sig`. Each object names its `signer`.",
             "`server` is identity-test-vectors.json's server key; the others are beyond it. `now` is the client's clock and `skew` is S. Every challenge is for `host`, with `challenge` and `expires` as its fields give them.",
-            "`handover_rejects` must fail to parse with `error`.",
-            "Each `client` case names handovers and a challenge by their keys here. A `check` is a later fetch of discovery (§5.2-§5.4) by a client pinned at `pinned`, remembering `commitment`, holding a fork record of each handover in `followed` (its old, the SHA-256 of its bytes, its time and its next), and having accepted the fork warning of each in `dismissed`; a `pin` is a first pin (§5.1). `chain` is server_handovers as served. A client checks `challenge` for `host` first (hotline-ng-auth.md §6.2), and one that fails warns with that error. A `pin` names the key a warning made the client give up, if any, as `replaced`. `expect` is what it does: keep its pin, follow to `key` taking `commitment` and adding `followed` to its records, pin taking `commitment` and adding `aliases`, or warn, naming the conflicting `handover` of a fork. Everything in `expect` binds but a warning's `reason`, which names the check of this implementation that failed.",
+            "`handover_rejects` and `challenge_rejects` must fail to parse with `error`.",
+            "Each `client` case names handovers and a challenge by their keys here. A `check` is a later fetch of discovery (§5.2-§5.4) by a client pinned at `pinned`, remembering `commitment`, holding a fork record of each handover in `followed` (its old, the SHA-256 of its bytes, its time and its next), and having accepted the fork warning of each in `dismissed`; a `pin` is a first pin (§5.1), and a `repin` a pin again after a warning, which takes no aliases (§5.3). `chain` is server_handovers as served. A client checks `challenge` for `host` first (hotline-ng-auth.md §6.2), and one that fails warns with that error. `expect` is what it does: keep its pin, follow to `key` taking `commitment` and adding `followed` to its records, pin taking `commitment` and adding `aliases`, or warn, naming the conflicting `handover` of a fork. Everything in `expect` binds but a warning's `reason`, which names the check of this implementation that failed.",
             "Each `scope` case asks whether a line or article whose in.server is `server` and whose `sent` is given is in scope under the alias the handover `alias` keeps (§5.5).",
         ],
         "now": NOW,
@@ -489,6 +530,7 @@ fn generate() {
         "handovers": handovers,
         "challenges": challenges,
         "handover_rejects": rejects,
+        "challenge_rejects": challenge_rejects,
         "client": client,
         "scope": scope,
     });
@@ -592,10 +634,19 @@ fn challenge_objects() {
 }
 
 #[test]
-fn handover_rejects() {
+fn rejects() {
     let v = vectors();
     for r in v["handover_rejects"].as_array().unwrap() {
         let err = Handover::parse(&unhex(str_of(r, "hex"))).unwrap_err();
+        assert_eq!(
+            format!("{err:?}"),
+            str_of(r, "error"),
+            "{}",
+            str_of(r, "name")
+        );
+    }
+    for r in v["challenge_rejects"].as_array().unwrap() {
+        let err = ServerChallenge::parse(&unhex(str_of(r, "hex"))).unwrap_err();
         assert_eq!(
             format!("{err:?}"),
             str_of(r, "error"),
@@ -684,26 +735,29 @@ fn decide(v: &Json, case: &Json) -> Json {
     };
     let fork = |sha256: &[u8; 32]| json!({ "outcome": "warn", "reason": "Fork", "handover": named(sha256) });
     let hex32 = |c: Option<[u8; 32]>| c.map(|c| hex(&c));
-    if str_of(case, "kind") == "pin" {
-        let replaced = case["replaced"]
-            .as_str()
-            .map(|k| unhex32(str_of(&v["keys"][k], "public_hex")));
-        return match handover::pin(
-            &chain,
-            &challenge,
-            &followed,
-            &dismissed,
-            replaced.as_ref(),
-            now,
-        ) {
-            Ok(aliases) => json!({
-                "outcome": "pin",
-                "commitment": hex32(challenge.next),
-                "aliases": handover_names(&aliases),
-            }),
-            Err(Warning::Fork { sha256 }) => fork(&sha256),
-            Err(w) => panic!("a pin warns only of a fork: {w:?}"),
-        };
+    let pinned_as = |aliases: &[Followed]| {
+        json!({
+            "outcome": "pin",
+            "commitment": hex32(challenge.next),
+            "aliases": handover_names(aliases),
+        })
+    };
+    match str_of(case, "kind") {
+        "pin" => {
+            assert!(
+                followed.is_empty() && dismissed.is_empty(),
+                "a first pin holds no records"
+            );
+            return pinned_as(&handover::pin(&chain, &challenge, now));
+        }
+        "repin" => {
+            return match handover::repin(&chain, &followed, &dismissed) {
+                Ok(()) => pinned_as(&[]),
+                Err(Warning::Fork { sha256 }) => fork(&sha256),
+                Err(w) => panic!("a re-pin warns only of a fork: {w:?}"),
+            };
+        }
+        _ => {}
     }
     let pinned = Pinned {
         key: unhex32(str_of(&v["keys"][str_of(case, "pinned")], "public_hex")),

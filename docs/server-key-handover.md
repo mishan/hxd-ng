@@ -107,6 +107,9 @@ handover's CBOR, and is absent when there are none. Each is signed on
 its own, so plain HTTP cannot alter one. The array is oldest first,
 each one's `new` the next one's `old`, times strictly ascending, no key
 appearing twice, the last one's `new` the `server_key`, and at most 16.
+A server never hands over to a key it handed over from earlier, as from
+K1 back to K0 after K0 to K1, which would leave a key that is both the
+pin and an alias.
 A server keeps the latest 16 it has signed, and serves each as the
 bytes it signed, never a signature made again, which with a randomized
 signer would look like a fork.
@@ -124,8 +127,9 @@ each connection, and so at every pin and every key change too.
 At first contact, or when the user accepts a warning and the client
 pins again, the client verifies the server challenge for the host
 (`hotline-ng-auth.md` §6.2) and takes its `next`, possibly absent, as
-the commitment it remembers. The chain served then gives aliases only
-(§5.5), on trust on first use. It is checked as §5.3 checks a chain,
+the commitment it remembers. At first contact, the chain served then
+gives aliases only (§5.5), on trust on first use. It is checked as §5.3
+checks a chain,
 except that the first `new` is not matched against a commitment: the
 signatures, the links from each `next` to the following `new`, the
 times, no repeated key, and the last handover's `new` being the
@@ -157,7 +161,8 @@ the handovers it follows, from that one on (that the whole list keeps
   later one's `old` is the previous one's `new` and its `new` hashes to
   the previous one's `next`; a handover with no `next` ends what can be
   followed, and a handover after it fails;
-- times strictly ascend, and none is later than now plus `S`;
+- times strictly ascend, the first later than that of every handover
+  the client holds a record of, and none is later than now plus `S`;
 - no key repeats, and the list holds at most 16;
 - the new key's server challenge verifies for the host;
 - the last followed handover's `new` is that challenge's `server_key`,
@@ -167,9 +172,10 @@ the handovers it follows, from that one on (that the whole list keeps
 Anything else warns, as a changed pin. On success the client moves the
 pin without a warning, keeps the old keys as aliases, and takes the
 challenge's `next` as its commitment. A client pinned at a key older
-than the 16 kept warns. When the user accepts a key-change warning, the
-client pins the new key as at first contact (§5.1); the key it replaced
-does not become an alias.
+than the 16 kept warns. When the user accepts any warning, the client
+pins as in §5.1 but takes no aliases from the chain served then, since
+a key it gave up at an earlier warning could otherwise come back as an
+alias, through a handover signed by whoever holds that key now.
 
 ### 5.4 Forks
 
@@ -180,7 +186,8 @@ differ from the record's, is a fork, whether it names another `new` or
 the same one at another time: the client warns and keeps the one it
 holds. (Two from one `old` in one served list already break §4, and
 warn as a chain that cannot be followed.) A served handover that does not
-verify forks nothing, since its `old` is not to be believed. If the user
+verify forks nothing, since its `old` is not to be believed, and nor
+does a list of more than 16, which is not verified at all. If the user
 accepts that warning, the client keeps its record, takes no alias from
 the conflicting handover, and remembers that handover's SHA-256 so as
 not to warn of it again. Pinning again after a warning
@@ -260,7 +267,8 @@ Everything a case expects binds but a warning's `reason`, which names
 the check of that implementation that failed. They are:
 
 - a server challenge carrying `next`, signed with it, beside
-  `hotline-ng-auth.md` §6.2's own vectors;
+  `hotline-ng-auth.md` §6.2's own vectors, and one whose `next` is not
+  32 bytes, refused;
 - a handover with `next`, and a chain of two; the same chain served
   from before the pin, followed from the pinned key; the alias
   boundary, a line with `sent` at the handover's `time + S` in scope
@@ -271,12 +279,20 @@ the check of that implementation that failed. They are:
   seen (warning);
 - boundaries accepted: exactly 16 handovers followed, and a handover
   whose `time` is exactly now plus `S`;
-- first pins that give no aliases: a chain that fails its checks, one
-  of more than 16 handovers, and a pin again after a commitment warning,
-  where the replaced key's handover gives no alias (§5.3);
+- first pins that give no aliases: a chain that fails its checks, and
+  one of more than 16 handovers;
+- pins again after a warning, which give no aliases (§5.3): after a
+  commitment warning, where the replaced key's handover gives none;
+  after a second key-change warning, where a key given up at the first
+  signs a handover it never made and gives none; and one whose chain
+  forks against a record, which warns in turn (§5.4);
+- a list of more than 16 handovers at the same key, which is not
+  verified and forks nothing;
 - rejects: a handover signed by `new` rather than `old`; one whose
   `new` equals its `old`; one whose `new` does not match the
-  commitment; a later `new` that does not match the previous `next`; a
+  commitment; a key change with no commitment remembered (§5.2); a
+  followed handover no later than a record the client holds; a later
+  `new` that does not match the previous `next`; a
   later `old` that is not the previous `new`; a handover after one with
   no `next`; a last `new` that is
   not the new challenge's `server_key`, with both `next`s absent; a

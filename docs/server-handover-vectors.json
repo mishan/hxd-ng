@@ -1,4 +1,11 @@
 {
+ "challenge_rejects": [
+  {
+   "error": "BadField(\"next\")",
+   "hex": "a7617601637369675840dfb1141d3ea9f1d809940640e956e138360f9987f20c661e5d970dfaf3f849ba433090d4ca8bc8116d10eb612f675dd03893e50b9ac9a519a31016b8a9692a0564686f73746f686c2e6578616d706c653a35373030646e657874581fb0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff567657870697265731a68e306bc696368616c6c656e67655820c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c46a7365727665725f6b65795820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+   "name": "a next that is not 32 bytes"
+  }
+ ],
  "challenges": {
   "c1": {
    "domain": "hl-identity/server-challenge/v1",
@@ -151,8 +158,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a chain of two, followed from the pinned key",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -176,8 +182,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "the same chain served from before the pin, followed from the pinned key",
-   "pinned": "k1",
-   "replaced": null
+   "pinned": "k1"
   },
   {
    "chain": [
@@ -200,8 +205,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "the last handover and the new challenge both lack next: accepted",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -221,8 +225,7 @@
    "followed": [],
    "host": "hl.example:5700",
    "kind": "pin",
-   "name": "a first pin takes the served chain as aliases",
-   "replaced": null
+   "name": "a first pin takes the served chain as aliases"
   },
   {
    "chain": [
@@ -239,8 +242,7 @@
    "followed": [],
    "host": "hl.example:5700",
    "kind": "pin",
-   "name": "a first pin of a chain that fails its checks gives no aliases",
-   "replaced": null
+   "name": "a first pin of a chain that fails its checks gives no aliases"
   },
   {
    "chain": [
@@ -272,8 +274,7 @@
    "followed": [],
    "host": "hl.example:5700",
    "kind": "pin",
-   "name": "a first pin of more than 16 handovers gives no aliases",
-   "replaced": null
+   "name": "a first pin of more than 16 handovers gives no aliases"
   },
   {
    "chain": [
@@ -324,8 +325,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "exactly 16 handovers, followed",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -346,8 +346,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a handover whose time is exactly now plus S, followed",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -364,8 +363,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a handover to a key the commitment does not name",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -380,9 +378,80 @@
    },
    "followed": [],
    "host": "hl.example:5700",
-   "kind": "pin",
-   "name": "re-pin after a commitment warning: the replaced key gets no alias",
-   "replaced": "server"
+   "kind": "repin",
+   "name": "re-pin after a commitment warning: the replaced key gets no alias"
+  },
+  {
+   "chain": [
+    "h0_1_later",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "dismissed": [],
+   "expect": {
+    "aliases": [],
+    "commitment": "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7",
+    "outcome": "pin"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "repin",
+   "name": "re-pin after a second key-change warning: a key given up at the first one, signing a handover it never made, gets no alias"
+  },
+  {
+   "chain": [
+    "h0_stray"
+   ],
+   "challenge": "c_stray",
+   "dismissed": [],
+   "expect": {
+    "handover": "h0_stray",
+    "outcome": "warn",
+    "reason": "Fork"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "repin",
+   "name": "re-pin of a chain that forks against a record warns in turn"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2"
+   ],
+   "challenge": "c2",
+   "commitment": null,
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Commitment)"
+   },
+   "followed": [],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a key change with no commitment remembered",
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h1_2_same_time"
+   ],
+   "challenge": "c2",
+   "commitment": "b0066359d64f97eb279947feeb083a96343d5f5a0a2c9cf82842f6f4749ff534",
+   "dismissed": [],
+   "expect": {
+    "outcome": "warn",
+    "reason": "Chain(Time)"
+   },
+   "followed": [
+    "h0_1"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a followed handover no later than a record the client holds",
+   "pinned": "k1"
   },
   {
    "chain": [
@@ -400,8 +469,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a mid-chain new that does not match the previous next",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -419,8 +487,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "an old that is not the previous new",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -437,8 +504,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "same key: none remembered, one seen, no warning",
-   "pinned": "k2",
-   "replaced": null
+   "pinned": "k2"
   },
   {
    "chain": [
@@ -455,8 +521,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "same key: the remembered commitment seen",
-   "pinned": "k2",
-   "replaced": null
+   "pinned": "k2"
   },
   {
    "chain": [
@@ -474,8 +539,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "same key: one remembered, another seen, warns",
-   "pinned": "k2",
-   "replaced": null
+   "pinned": "k2"
   },
   {
    "chain": [
@@ -493,8 +557,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "same key: one remembered, none seen, warns",
-   "pinned": "k2",
-   "replaced": null
+   "pinned": "k2"
   },
   {
    "chain": [
@@ -512,8 +575,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a handover signed by new rather than old",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -531,8 +593,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a first new that does not match the commitment",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -550,8 +611,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a handover after one with no next",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -568,8 +628,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a last new that is not the challenge's server_key, both next absent",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -586,8 +645,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a chain whose last new is not the server_key",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -607,8 +665,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a fork from one old to two keys",
-   "pinned": "k1",
-   "replaced": null
+   "pinned": "k1"
   },
   {
    "chain": [
@@ -628,8 +685,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a fork the user accepted does not warn again",
-   "pinned": "k1",
-   "replaced": null
+   "pinned": "k1"
   },
   {
    "chain": [
@@ -651,8 +707,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a fork with the same old and new at another time",
-   "pinned": "k2",
-   "replaced": null
+   "pinned": "k2"
   },
   {
    "chain": [
@@ -669,8 +724,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a handover whose time is past now plus S",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -688,8 +742,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a chain whose times are equal",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -722,8 +775,41 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a list of more than 16 handovers",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
+  },
+  {
+   "chain": [
+    "h0_1",
+    "h1_2",
+    "h2_3",
+    "h3_4",
+    "h4_5",
+    "h5_6",
+    "h6_7",
+    "h7_8",
+    "h8_9",
+    "h9_10",
+    "h10_11",
+    "h11_12",
+    "h12_13",
+    "h13_14",
+    "h14_15",
+    "h15_16",
+    "h16_17"
+   ],
+   "challenge": "c17",
+   "commitment": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+   "dismissed": [],
+   "expect": {
+    "outcome": "keep"
+   },
+   "followed": [
+    "h0_1_later"
+   ],
+   "host": "hl.example:5700",
+   "kind": "check",
+   "name": "a list of more than 16 handovers at the same key is not verified, and forks nothing",
+   "pinned": "k17"
   },
   {
    "chain": [
@@ -742,8 +828,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a chain that repeats a key",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -761,8 +846,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a new key whose challenge next differs from the last followed handover's",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -780,8 +864,7 @@
    "host": "other.example",
    "kind": "check",
    "name": "the new key's challenge signed for another host",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   },
   {
    "chain": [
@@ -813,8 +896,7 @@
    "host": "hl.example:5700",
    "kind": "check",
    "name": "a pinned key older than the 16 kept",
-   "pinned": "server",
-   "replaced": null
+   "pinned": "server"
   }
  ],
  "handover_rejects": [
@@ -1361,8 +1443,8 @@
  "notes": [
   "The server key handover's vectors (server-key-handover.md §10), in identity-test-vectors.json's shape: byte strings are lowercase hex, signature_input_hex = domain || 0x00 || unsigned_hex, and signed_hex is the deterministic CBOR of the unsigned map plus `sig`. Each object names its `signer`.",
   "`server` is identity-test-vectors.json's server key; the others are beyond it. `now` is the client's clock and `skew` is S. Every challenge is for `host`, with `challenge` and `expires` as its fields give them.",
-  "`handover_rejects` must fail to parse with `error`.",
-  "Each `client` case names handovers and a challenge by their keys here. A `check` is a later fetch of discovery (§5.2-§5.4) by a client pinned at `pinned`, remembering `commitment`, holding a fork record of each handover in `followed` (its old, the SHA-256 of its bytes, its time and its next), and having accepted the fork warning of each in `dismissed`; a `pin` is a first pin (§5.1). `chain` is server_handovers as served. A client checks `challenge` for `host` first (hotline-ng-auth.md §6.2), and one that fails warns with that error. A `pin` names the key a warning made the client give up, if any, as `replaced`. `expect` is what it does: keep its pin, follow to `key` taking `commitment` and adding `followed` to its records, pin taking `commitment` and adding `aliases`, or warn, naming the conflicting `handover` of a fork. Everything in `expect` binds but a warning's `reason`, which names the check of this implementation that failed.",
+  "`handover_rejects` and `challenge_rejects` must fail to parse with `error`.",
+  "Each `client` case names handovers and a challenge by their keys here. A `check` is a later fetch of discovery (§5.2-§5.4) by a client pinned at `pinned`, remembering `commitment`, holding a fork record of each handover in `followed` (its old, the SHA-256 of its bytes, its time and its next), and having accepted the fork warning of each in `dismissed`; a `pin` is a first pin (§5.1), and a `repin` a pin again after a warning, which takes no aliases (§5.3). `chain` is server_handovers as served. A client checks `challenge` for `host` first (hotline-ng-auth.md §6.2), and one that fails warns with that error. `expect` is what it does: keep its pin, follow to `key` taking `commitment` and adding `followed` to its records, pin taking `commitment` and adding `aliases`, or warn, naming the conflicting `handover` of a fork. Everything in `expect` binds but a warning's `reason`, which names the check of this implementation that failed.",
   "Each `scope` case asks whether a line or article whose in.server is `server` and whose `sent` is given is in scope under the alias the handover `alias` keeps (§5.5)."
  ],
  "now": 1759708800,
