@@ -165,4 +165,47 @@ describe('chat', () => {
       'verified',
     );
   });
+
+  test('a row says signs while its session signs every lobby line, as the request and each resume say', async () => {
+    const device = await enrolledDevice(server, 'switcher');
+    // An account with a password, so the session may detach and resume.
+    server.account('sally', `${BOB.replace('"Bob"', '"Sally"')}[identity]\nfingerprint = "${device.fingerprint}"\n`);
+    const signer = await client({ nick: 'Switcher', identity: { getToken: device.getToken, signs: () => 'able' } });
+    assert.equal(signer.conn.signing, 'able');
+    const uid = signer.conn.self.uid;
+    const watcher = await client({ login: 'bob', password: 's3cret', nick: 'Watcher' });
+    const row = watcher.conn.login.users.find((u) => u.uid === uid);
+    assert.equal(row.identity.fingerprint, device.fingerprint);
+    assert.equal(row.identity.signs, undefined, '"able" is not shown');
+
+    const change = async (signs) => {
+      const since = watcher.mark();
+      await signer.conn.setSigns(signs);
+      return watcher.waitFor('user_changed', (d) => d.user.uid === uid, { since });
+    };
+    assert.equal((await change('default')).data.user.identity.signs, true);
+    assert.equal(signer.conn.signing, 'default');
+    const able = await change('able');
+    assert.equal(able.data.user.identity.signs, undefined);
+    assert.equal(able.data.user.identity.fingerprint, device.fingerprint);
+    assert.equal((await change('default')).data.user.identity.signs, true);
+
+    // The login said "able"; the resume says the choice since.
+    const [mark, watching] = [signer.mark(), watcher.mark()];
+    signer.conn.drop();
+    await watcher.waitFor('user_changed', (d) => d.user.uid === uid && d.user.status === 'detached', { since: watching });
+    // Replayed or resynced, as the drop fell against the last change's
+    // own echo: either way the resume took its `signs`.
+    await signer.waitForState('online', { since: mark, timeout: 20_000 });
+    assert.equal(signer.seen('req', 'resume').at(-1).data.signs, 'default');
+    assert.equal(signer.conn.signing, 'default');
+    const back = await watcher.waitFor('user_changed', (d) => d.user.uid === uid && d.user.status !== 'detached', { since: watching });
+    assert.equal(back.data.user.identity.signs, true);
+  });
+
+  test('a session that proved no device is refused signs', async () => {
+    const plain = await client({ login: 'bob', password: 's3cret', nick: 'Plain' });
+    assert.equal(plain.conn.signing, null);
+    assert.equal(await plain.conn.setSigns('default').then(() => 'ok', (e) => e.wire.code), 'bad_request');
+  });
 });
