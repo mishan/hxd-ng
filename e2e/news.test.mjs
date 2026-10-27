@@ -14,9 +14,20 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
-import { markedSpans, newsScopeOf, referenceSpans } from '@hotline-ng/client';
+import {
+  BAD_SIGNATURE,
+  base64urlToBytes,
+  fetchChallenge,
+  fingerprintFromString,
+  markedSpans,
+  newsScopeOf,
+  readSignedArticle,
+  referenceSpans,
+  signNewsPost,
+} from '@hotline-ng/client';
 
 import { fleet } from './harness/client.mjs';
+import { enrolledDevice, signingIdentity } from './harness/device.mjs';
 import { pngBlob } from './harness/png.mjs';
 import { startFailing, startServer } from './harness/server.mjs';
 
@@ -47,7 +58,8 @@ describe('threaded news', () => {
       // can see being honored.
       // `[news.notify]` empty: subscriptions on, every key its default,
       // which is itself something only a real config file can say.
-      config: { inbox: { db: 'server.sqlite' }, news: { max_depth: 2, notify: {} } },
+      // `[identity]` with its hosts, so the server carries signed articles.
+      config: (ports) => ({ inbox: { db: 'server.sqlite' }, news: { max_depth: 2, notify: {} }, identity: signingIdentity(ports) }),
       accounts: {
         editor: account('editor', EDITOR),
         alice: account('alice', 'read_news = true\npost_news = true\n'),
@@ -281,6 +293,61 @@ describe('threaded news', () => {
     assert.deepEqual(await asker.conn.newsSeen({ thread: root }, answer), { unread: 0 });
     const again = await login('asker');
     assert.equal(again.conn.news.unread, 0, 'the badge on the first frame agrees');
+  });
+
+  test('a signed article is posted, listed and read back as signed, and signed again it is the same article', async () => {
+    const author = await enrolledDevice(server, 'news-author');
+    server.account('scribe', `${account('scribe', 'read_news = true\npost_news = true\n')}[identity]\nfingerprint = "${author.fingerprint}"\n`);
+    const scribe = await crew.connect({ nick: 'Scribe', identity: { getToken: author.getToken, signs: () => 'able' } });
+    assert.equal(scribe.conn.signing, 'able');
+    const editor = await login('editor');
+    const reader = await login('reader');
+    const { node } = await editor.conn.newsNodeCreate({ kind: 'category', name: 'Signed' });
+    const category = base64urlToBytes(node.guid);
+    assert.equal(category.length, 16, 'a node carries its guid on a server that offers signed');
+    const { serverKey } = await fetchChallenge(author.challengeAt);
+    const by = fingerprintFromString(author.fingerprint);
+
+    const sign = (over) =>
+      signNewsPost(author.key, { cert: author.cert, server: serverKey, category, subject: 'In ink', body: 'Signed **here**.', mime: 'text/markdown', ...over });
+    const post = (p, parent) =>
+      scribe.conn.newsPost({ category: node.id, ...(parent ? { parent } : {}), subject: p.subject, body: p.body, mime: p.mime, signed: p.signed });
+    const starter = await sign({});
+    const { id } = await post(starter);
+    const reply = await sign({ subject: 'Re: In ink', body: 'Countersigned.', parent: { article: id, signed: { id: starter.id, by } } });
+    const { id: answer } = await post(reply, id);
+
+    // Read back as the reader is shown each: the starter in its category's
+    // listing and on its own, the reply in the thread under it.
+    const read = (a, parent) =>
+      readSignedArticle(a.signed, a, { at: a.at, sender: { named: a.from.fingerprint }, scope: { server: serverKey, category, parent } });
+    const verified = { state: 'verified', signer: author.fingerprint, sentApart: false };
+    const listed = (await reader.conn.newsThreads({ category: node.id })).threads.find((t) => t.article.id === id).article;
+    assert.equal(listed.signed, starter.signed);
+    assert.deepEqual((await read(listed, null)).outcome, verified);
+    assert.deepEqual((await read(await reader.conn.newsArticle(id), null)).outcome, verified);
+    const thread = await reader.conn.newsThread({ root: id });
+    const replied = thread.articles.find((a) => a.id === answer);
+    assert.equal(replied.signed, reply.signed);
+    assert.deepEqual((await read(replied, { article: id, signed: { id: starter.id, by } })).outcome, verified);
+
+    // The same post signed again under its id is answered as the article
+    // it is (e2e-messages.md §4.10); other words under it are refused.
+    const sent = Math.floor(Date.now() / 1000) - 5;
+    const again = await signNewsPost(
+      author.key,
+      { id: starter.id, cert: author.cert, server: serverKey, category, subject: 'In ink', body: 'Signed **here**.', mime: 'text/markdown' },
+      sent,
+    );
+    assert.notEqual(again.signed, starter.signed);
+    assert.equal((await post(again)).id, id);
+    const other = await sign({ id: starter.id, body: 'Signed elsewhere.' });
+    const refused = await post(other).then(
+      () => 'ok',
+      (e) => e.wire?.code ?? String(e),
+    );
+    assert.equal(refused, BAD_SIGNATURE);
+    assert.equal((await reader.conn.newsThreads({ category: node.id })).threads.length, 1, 'nothing more was posted');
   });
 });
 
