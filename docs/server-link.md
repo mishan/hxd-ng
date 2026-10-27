@@ -191,13 +191,10 @@ from, and each frontend renders them.
   `admin` is always false.
 - `Event::Msg` gains `from_remote: Option<RemoteRef>`, since it carries a
   sender's name as a string rather than a `UserInfo`.
-- The chat log stores, for a ghost line, its own name, its home server's
-  ID and tag at the time, the ghost's serial and this server's epoch (the
-  next schema version), so a replay renders it the way a live line would,
-  a later change of `show_tags` applies to history too, and a purge can
-  name the ghost exactly (§6.3). Rendering takes the tag, name and color
-  from a server table the hub keeps in the core (`peer_servers`), and
-  falls back to the stored tag for a server no longer reachable.
+- The chat log stores, for a ghost line, its name as shown, its home
+  server's name and tag and whether it was tagged, as they were when it
+  was said, so a replay renders it the way the live line was, and the
+  ghost's key, so a purge can name the ghost exactly (§6.3).
 
 **The classic frontend** renders `name@tag` when `[link] show_tags` is on:
 the name is cut to leave room for the tag within the 31-byte nick cap, so
@@ -381,9 +378,8 @@ Where the line is shown:
   regardless, as the extension requires);
 - the per-ghost rate limit decides display only, for the same reason;
 - history records it with the ghost's name as shown (`name@tag` when
-  tagged) and icon, and no login or fingerprint. Each server's history is the chat it saw. The home server
-  and the line ID join it with the next schema version, as purge needs
-  (§6.3).
+  tagged), icon and home server's name and tag, served as its
+  `from.remote`, and no login or fingerprint. Each server's history is the chat it saw.
 
 **Two consequences, stated.** A batch that fails to commit drops its ghost
 lines locally without a trace, as it drops local ones. And `ghost_part`

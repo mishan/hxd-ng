@@ -656,8 +656,12 @@ impl serde::Serialize for UserOut<'_> {
 /// Where a ghost is from (`docs/server-link.md` §5), with its home
 /// server's key when that server gave one (`docs/e2e-messages.md` §5).
 fn remote_json(r: &hxd_core::server_link::RemoteRef) -> Value {
-    let mut v = json!({ "server": r.home_name, "tag": r.home_tag, "tagged": r.tagged });
-    if let Some(key) = r.server_key {
+    home_json(&r.home_name, &r.home_tag, r.tagged, r.server_key)
+}
+
+fn home_json(server: &str, tag: &str, tagged: bool, server_key: Option<[u8; 32]>) -> Value {
+    let mut v = json!({ "server": server, "tag": tag, "tagged": tagged });
+    if let Some(key) = server_key {
         v["server_key"] = json!(b64url(&key));
     }
     v
@@ -1036,12 +1040,24 @@ pub fn history_line_json(line: &LogLine, fetchable: bool) -> Value {
     let mut value = json!({
         "id": line.id,
         "at": unix(line.at),
-        "from": match (deleted, line.home_key) {
-            (true, _) => json!({ "icon": line.icon }),
-            (false, None) => json!({ "nick": line.from_nick, "icon": line.icon }),
-            // The key a linked line's scope names, kept beside it
+        "from": match (deleted, &line.home, line.home_key) {
+            (true, _, _) => json!({ "icon": line.icon }),
+            (false, None, None) => json!({ "nick": line.from_nick, "icon": line.icon }),
+            // Logged as the classic wire shows it; the live event's nick
+            // is the bare one, with the tag in `remote`.
+            (false, Some(home), server_key) => json!({
+                "nick": home
+                    .tagged
+                    .then(|| line.from_nick.strip_suffix(&format!("@{}", home.tag)))
+                    .flatten()
+                    .unwrap_or(&line.from_nick),
+                "icon": line.icon,
+                "remote": home_json(&home.name, &home.tag, home.tagged, server_key),
+            }),
+            // A signed line logged before its home server's name was
+            // kept: the key its scope names is all there is
             // (`docs/e2e-messages.md` §5).
-            (false, Some(key)) => json!({
+            (false, None, Some(key)) => json!({
                 "nick": line.from_nick,
                 "icon": line.icon,
                 "remote": { "server_key": b64url(&key) },

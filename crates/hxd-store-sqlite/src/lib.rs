@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
-    Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineId, LogLine, MediaMeta, NewLine,
-    Retention, Signature, SignedAt,
+    Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineHome, LineId, LogLine, MediaMeta,
+    NewLine, Retention, Signature, SignedAt,
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
@@ -73,7 +73,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -676,6 +676,15 @@ ALTER TABLE chat_line ADD COLUMN home_key BLOB;
 CREATE INDEX chat_line_home_key ON chat_line (home_key) WHERE home_key IS NOT NULL;
 ";
 
+/// Every linked server's user's line keeps its home server's name and tag,
+/// and whether its nick was logged tagged, which `history` serves as the
+/// line's `remote` (`docs/chat-history.md` §4.1).
+const SCHEMA_V27: &str = "
+ALTER TABLE chat_line ADD COLUMN home_name TEXT;
+ALTER TABLE chat_line ADD COLUMN home_tag TEXT;
+ALTER TABLE chat_line ADD COLUMN home_tagged INTEGER;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -723,8 +732,8 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
         .prepare_cached(
             "INSERT INTO chat_line
            (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from,
-            signed, signed_content, home_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            signed, signed_content, home_key, home_name, home_tag, home_tagged)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
         )
         .and_then(|mut stmt| {
@@ -743,6 +752,9 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
                 line.signed.as_ref().map(|s| &s.form),
                 line.signed.as_ref().map(|s| &s.content[..]),
                 line.home_key.as_ref().map(|k| &k[..]),
+                line.home.as_ref().map(|h| &h.name),
+                line.home.as_ref().map(|h| &h.tag),
+                line.home.as_ref().map(|h| h.tagged),
             ])
         })
         .map_err(StoreError::new)?;
@@ -1395,6 +1407,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 26 {
         steps.push_str(SCHEMA_V26);
+    }
+    if version < 27 {
+        steps.push_str(SCHEMA_V27);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2226,7 +2241,7 @@ fn clamp_id(id: MessageId) -> i64 {
 
 const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
                                media_id, media_type, media_w, media_h, media_bytes, signed, \
-                               home_key";
+                               home_key, home_name, home_tag, home_tagged";
 
 fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -2241,6 +2256,11 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let media = media_columns(r, 9)?;
     let signed: Option<Vec<u8>> = r.get(14)?;
     let home_key: Option<Vec<u8>> = r.get(15)?;
+    let home: (Option<String>, Option<String>, Option<bool>) = (r.get(16)?, r.get(17)?, r.get(18)?);
+    let home = match home {
+        (Some(name), Some(tag), Some(tagged)) => Some(LineHome { name, tag, tagged }),
+        _ => None,
+    };
     Ok((|| {
         let media = media?;
         Ok(LogLine {
@@ -2265,6 +2285,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
                 .map(|k| k.try_into())
                 .transpose()
                 .map_err(|_| StoreError::new("a chat line's home key is not 32 bytes"))?,
+            home,
         })
     })())
 }
@@ -2434,6 +2455,7 @@ impl ChatLog for SqliteStore {
             .execute(
                 "UPDATE chat_line
                     SET nick = '', body = '', signed = NULL, signed_content = NULL,
+                        home_name = NULL, home_tag = NULL, home_tagged = NULL,
                         flags = flags | ?1,
                         deleted_at = IFNULL(deleted_at, ?2),
                         deleted_by = IFNULL(deleted_by, ?3)
@@ -2686,6 +2708,7 @@ mod tests {
             store
                 .append(&NewLine {
                     home_key: None,
+                    home: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -2756,6 +2779,7 @@ mod tests {
             store
                 .append(&NewLine {
                     home_key: None,
+                    home: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -2798,6 +2822,7 @@ mod tests {
                 .unwrap();
         let line = || NewLine {
             home_key: None,
+            home: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -2930,6 +2955,7 @@ mod tests {
         held.wait();
         let line = NewLine {
             home_key: None,
+            home: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
