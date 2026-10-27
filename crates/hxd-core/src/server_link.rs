@@ -127,6 +127,10 @@ pub enum PeerRefusal {
     NoDeviceKeys,
     /// The target's home server checked the signature, and it failed.
     BadSignature,
+    /// A sealed message from a sender whose fingerprint the target's home
+    /// server is not shown, so its recipient could not tell who sealed
+    /// it; refused here too, over a link this server says none on.
+    SenderUnkeyed,
 }
 
 /// How long an act on a ghost waits for its answer before the client is
@@ -162,6 +166,9 @@ impl PeerRefusal {
                 "That user's device cannot open sealed messages, or is not the one you sealed to."
             }
             PeerRefusal::BadSignature => "That user's server found the signature does not verify.",
+            PeerRefusal::SenderUnkeyed => {
+                "Your key is not shown to that user's server, so it cannot say who sealed this."
+            }
         }
     }
 }
@@ -784,15 +791,16 @@ impl Core {
     }
 
     /// A sealed message from ghost `from` to local user `to`, sealed to
-    /// the `device_enc` key `sealed_to` hashes: delivered as a local one
-    /// is, live or held for a detached session, and never stored. The
-    /// box's sender is the fingerprint the ghost's group gives.
+    /// the `device_enc` key `sealed_to` hashes, if the 905 named one:
+    /// delivered as a local one is, live or held for a detached session,
+    /// and never stored. The box's sender is the fingerprint the ghost's
+    /// group gives.
     pub fn ghost_sealed(
         &self,
         from: Uid,
         to: Uid,
         sealed: Vec<u8>,
-        sealed_to: [u8; 32],
+        sealed_to: Option<[u8; 32]>,
     ) -> Result<(), PeerRefusal> {
         let limits = self.flood_limits;
         let now = self.clock.unix();
@@ -810,19 +818,21 @@ impl Core {
         if target.blocked_ghosts.contains(&(from, g.key)) {
             return Err(PeerRefusal::RefusesMessages);
         }
-        let device = crate::sealed::sealed_of(target)
-            .filter(|d| d.expires > now)
-            .ok_or(PeerRefusal::NoDeviceKeys)?;
-        if <[u8; 32]>::from(sha2::Sha256::digest(device.enc)) != sealed_to {
-            return Err(PeerRefusal::NoDeviceKeys);
-        }
         // Who sealed it is what the recipient checks the box against.
+        // Before the device's checks: fetching the certificate again,
+        // which those tell the sender to do, does not help with this.
         let from_fingerprint = g
             .info
             .remote
             .as_ref()
             .and_then(|r| r.fingerprint)
+            .ok_or(PeerRefusal::SenderUnkeyed)?;
+        let device = crate::sealed::sealed_of(target)
+            .filter(|d| d.expires > now)
             .ok_or(PeerRefusal::NoDeviceKeys)?;
+        if Some(<[u8; 32]>::from(sha2::Sha256::digest(device.enc))) != sealed_to {
+            return Err(PeerRefusal::NoDeviceKeys);
+        }
         if let Some((mine, all)) = target.outbox.sealed_held(&from_fingerprint) {
             let holds = self.sealed_holds;
             if mine + sealed.len() > holds.per_sender || all + sealed.len() > holds.all {
@@ -845,6 +855,12 @@ impl Core {
             },
         );
         Ok(())
+    }
+
+    /// Whether local user `uid` is one a link shows.
+    pub fn is_exported(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).is_some_and(exported)
     }
 
     /// The identity a local user's messages are signed to

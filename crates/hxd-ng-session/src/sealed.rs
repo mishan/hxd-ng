@@ -16,9 +16,18 @@ use crate::push::DeviceOnSocket;
 use crate::NgCtx;
 
 /// What a session that said `sealed` can open them with: the device it
-/// proved, if its certificate allows it (§4.1).
-pub(crate) fn device(device: Option<&DeviceOnSocket>, asked: bool) -> Option<SealedDevice> {
-    device.filter(|_| asked)?.sealable.clone()
+/// proved, if its certificate allows it and has not expired by `now`
+/// (§4.1).
+pub(crate) fn device(
+    device: Option<&DeviceOnSocket>,
+    asked: bool,
+    now: u64,
+) -> Option<SealedDevice> {
+    device
+        .filter(|_| asked)?
+        .sealable
+        .clone()
+        .filter(|d| d.expires > now)
 }
 
 fn refused(id: u64, e: SealedError) -> String {
@@ -68,6 +77,7 @@ fn across_link(id: u64, why: PeerRefusal) -> String {
             "not_sealed",
             "Sealed messages do not cross the link to that user's server.",
         ),
+        PeerRefusal::SenderUnkeyed => reply_err(id, "not_sealed", why.text()),
         why => reply_err(id, "not_delivered", why.text()),
     }
 }

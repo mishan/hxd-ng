@@ -860,9 +860,13 @@ wire.
   `/trtp` tunnel under one; never the identity of an account a password
   logged in to), and only while `[identity] login_proof_v1` is off, as
   `e2e-messages.md` §5 explains; and beside it, when either is set,
-  `DATA_LINK_USER_KEY_FLAGS` (`0x0649`, proposed): `KEY_FLAG_SIGNS` for a
+  `DATA_LINK_USER_KEY_FLAGS` (`0x0649`): `KEY_FLAG_SIGNS` for a
   session whose `signs` is `"default"`, `KEY_FLAG_SEALED` for a `sealed`
-  one, sent again in 902 when they change.
+  one, sent again in 902 when they change, as when the certificate the
+  session proved expires and takes both with it (the ng sweeper).
+  A **sealed message** goes only over a link where this server says its
+  users' fingerprints, and is refused at once with `SenderUnkeyed`
+  otherwise, since the target's home server would refuse it so.
 - **A signed lobby line** goes out as Link Chat with `DATA_LINK_SIGNED`
   (`0x0647`), its link form; **a signed private message** to a ghost as
   905 with it; **a sealed one** as 905 with `DATA_LINK_SEALED`
@@ -884,13 +888,16 @@ wire.
 without `DATA_LINK_USER_ID` is a server's own, answered only for a
 session seen to sign (a lobby line, or a private message over that
 link; `keys.rs`'s `Seen`, in the hub), with the certificate it signed
-with; a user's is answered by the draft's step 5 (a current ghost of the
-link asking about a user exported over it and not blocking it, which can
+with, and `NoDeviceKeys` for one exported and not seen to sign, as the
+draft has it; a user's is answered by the draft's step 5 (a current
+ghost of the link asking about a user exported over it and not blocking
+it, which can
 open sealed messages, its certificate unexpired), spending a line of the
 ghost's chat allowance as a message does. Either way the certificate is
 at most 512 bytes, allows messages and is unexpired, and the user's
-fingerprint is said; `NoDeviceKeys` (13) otherwise. This server answers
-at most 60 a minute over one link. A request about a ghost goes on
+fingerprint is said; `NoDeviceKeys` (13) otherwise. A target that is no
+user exported over the link is `UnknownUser` either way. This server
+answers at most 60 a minute over one link. A request about a ghost goes on
 toward its home as 906 does, its IDs translated, over links that
 negotiated bit 4.
 
@@ -908,11 +915,13 @@ up to 2.0.28 answers `UnknownUser` to every server's own request.
 
 **A sealed 905** to a local user is checked here as `e2e-messages.md`
 §5 says, `DATA_LINK_SEALED_TO` against the target's current `device_enc`
-key, and refused `NoDeviceKeys` when it differs or is missing, when the
-target cannot open sealed messages, or when the sending ghost has no
-fingerprint; one whose size is not a box's is `RefusedFields`. It is
-delivered as a local sealed message is, held for a detached session
-within `[sealed]` and never stored. A signed 905 that fails its check,
+key, and refused `NoDeviceKeys` when it differs or is missing, or when the
+target cannot open sealed messages; one from a ghost with no fingerprint
+here is refused `SenderUnkeyed` (15) before any of those, since fetching
+the certificate again would not help, and one whose size is not a box's
+is `RefusedFields`. It is delivered as a local sealed message is, held
+for a detached session within `[sealed]` and never stored. A signed 905
+that fails its check,
 carries `FieldQuotingMsg`, or whose `FieldOptions` says otherwise than
 its signature whether it is an automatic response, is refused
 `BadSignature` (14), and a sealed one carrying `FieldQuotingMsg`

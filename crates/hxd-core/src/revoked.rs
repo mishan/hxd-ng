@@ -238,6 +238,7 @@ mod tests {
             quiet_until: None,
             signs: false,
             can_sign: false,
+            device_expires: u64::MAX,
             sealed: None,
         }
     }

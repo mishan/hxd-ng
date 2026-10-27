@@ -23,6 +23,7 @@ struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
     hub: hxd_link::Hub,
+    core: Arc<hxd_core::Core>,
     config: std::path::PathBuf,
 }
 
@@ -113,6 +114,7 @@ async fn start(
         legacy: legacy.local_addr().unwrap(),
         ng,
         hub: hub.clone(),
+        core: ctx.core.clone(),
         config: path,
     };
     tokio::spawn(hxd_session::serve(legacy, ctx.clone()));
@@ -962,13 +964,15 @@ async fn chain() -> (Server, Server, Server, [tempfile::TempDir; 3]) {
 
 /// [`chain`], `cc`'s link to `bb` offering only `cc_offers`.
 async fn chain_offering(cc_offers: &str) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
-    chain_trying(cc_offers, "").await
+    chain_trying(cc_offers, "", "").await
 }
 
-/// [`chain_offering`], every link trying `drafts` as well.
+/// [`chain_offering`], `aa`'s link trying `drafts` as well and `cc`'s
+/// `cc_drafts`.
 async fn chain_trying(
     cc_offers: &str,
     drafts: &str,
+    cc_drafts: &str,
 ) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
     const TRANSIT: &str = r#"["chat", "msgs", "info", "transit"]"#;
     let dirs = [
@@ -978,24 +982,25 @@ async fn chain_trying(
     ];
     let b_tls = bind().await;
     let b_addr = b_tls.local_addr().unwrap();
-    let accept = |name: &str, seed: u8| {
+    let accept = |name: &str, seed: u8, drafts: &str| {
         format!(
             "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
              key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n{drafts}\n",
             public(seed)
         )
     };
-    let dial = |name: &str| {
+    let dial = |name: &str, drafts: &str| {
         format!(
             "[[link.peer]]\nname = \"bb\"\ndial = \"{b_addr}\"\nprotection = \"key\"\n\
              key = \"{}\"\naccount = \"link-{name}\"\nfeatures = {TRANSIT}\n{drafts}\n",
             public(2)
         )
     };
-    let peers = accept("aa", 1) + &accept("cc", 3);
+    let peers = accept("aa", 1, drafts) + &accept("cc", 3, cc_drafts);
     let b = start(dirs[1].path(), 2, "bb", "", &peers, b_tls).await;
-    let a = start(dirs[0].path(), 1, "aa", "", &dial("aa"), bind().await).await;
-    let c_peer = dial("cc").replace(
+    let a_peer = dial("aa", drafts);
+    let a = start(dirs[0].path(), 1, "aa", "", &a_peer, bind().await).await;
+    let c_peer = dial("cc", cc_drafts).replace(
         &format!("features = {TRANSIT}"),
         &format!("features = {cc_offers}"),
     );
@@ -1562,7 +1567,12 @@ async fn a_ghosts_keys_are_not_read_from_a_peer_not_tried_with() {
 
 #[tokio::test]
 async fn a_server_in_the_middle_passes_signed_lines_and_their_fetches_on() {
-    let (a, _b, c, _dirs) = chain_trying(r#"["chat", "msgs", "info", "transit"]"#, USER_KEYS).await;
+    let (a, _b, c, _dirs) = chain_trying(
+        r#"["chat", "msgs", "info", "transit"]"#,
+        USER_KEYS,
+        USER_KEYS,
+    )
+    .await;
     let (alice, carol) = (person(1), person(3));
     let (mut on_a, _) = keyed(&a, &alice).await;
     let (mut on_c, c_hello) = keyed(&c, &carol).await;
@@ -1759,4 +1769,113 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
         matches!(&wrong, Err(hxd_testclient::Error::Refused { code, .. }) if code == "cert_changed"),
         "{wrong:?}"
     );
+}
+
+/// A sealed message whose sender's fingerprint its recipient's home
+/// server is not shown is refused there, before the key it was sealed to
+/// is looked at, since fetching the certificate again would not help:
+/// `cc` reads no fingerprints from `bb`, which it does not try the draft
+/// with.
+#[tokio::test]
+async fn a_sealed_message_from_a_sender_unkeyed_where_it_arrives_is_refused() {
+    let (a, _b, c, _dirs) =
+        chain_trying(r#"["chat", "msgs", "info", "transit"]"#, USER_KEYS, "").await;
+    let (alice, carol) = (person(1), person(3));
+    let (mut on_a, a_hello) = keyed(&a, &alice).await;
+    let (_on_c, _) = keyed(&c, &carol).await;
+    let carol_here = ghost_row(&mut on_a, &a_hello, |u| u["nick"] == "carol").await["uid"].clone();
+    let m = PrivateMessage {
+        id: [8; 16],
+        sent: now(),
+        to: fingerprint(&carol),
+        cert: alice.cert.clone(),
+        text: "only you".into(),
+        quote: None,
+        auto: false,
+    };
+    let carols = DeviceCert::parse(&carol.cert).unwrap();
+    let sealed = seal_to(&m, &alice.dev, &carols, false).unwrap();
+    // Named by a key not carol's, which alone would be `cert_changed`.
+    let refused = on_a
+        .request(
+            "msg",
+            json!({ "to": carol_here, "sealed": B64.encode(&sealed), "cert": key_hash(&alice.cert) }),
+        )
+        .await;
+    let unkeyed = hxd_core::server_link::PeerRefusal::SenderUnkeyed.text();
+    assert!(
+        matches!(&refused, Err(hxd_testclient::Error::Refused { code, text })
+            if code == "not_sealed" && text == unkeyed),
+        "{refused:?}"
+    );
+}
+
+/// A certificate that expires takes `sealed` and `signs` with it: from
+/// its session's row here, and from its ghost's key flags over the link;
+/// and neither `signs` nor a resume gives them back.
+#[tokio::test]
+async fn an_expired_certificate_takes_its_sessions_key_flags_with_it() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (alice, bob, carol) = (person(1), person(2), person(3));
+    let (mut on_a, _) = keyed(&a, &alice).await;
+    let (mut carol_on_a, carol_hello) = keyed(&a, &carol).await;
+    let (mut on_b, b_hello) = keyed(&b, &bob).await;
+    let fp = fingerprint(&alice).to_string();
+    let local = carol_hello["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["identity"]["fingerprint"] == fp)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&local["identity"]["sealed"], &local["identity"]["signs"]),
+        (&json!(true), &json!(true)),
+        "{local}"
+    );
+    let ghost = identity_row(&mut on_b, &b_hello, &alice).await;
+    assert_eq!(ghost["identity"]["signs"], true, "{ghost}");
+
+    a.core
+        .clock()
+        .advance(Duration::from_secs(cert::RECOMMENDED_LIFETIME));
+    a.core.expire_device_keys();
+    let alices_without = |flag: &'static str| {
+        let fp = fp.clone();
+        move |d: &Value| {
+            let id = &d["user"]["identity"];
+            id["fingerprint"] == fp && id.get(flag).is_none()
+        }
+    };
+    let local = carol_on_a
+        .event_where("user_changed", alices_without("sealed"))
+        .await
+        .unwrap()
+        .data;
+    assert!(local["user"]["identity"].get("signs").is_none(), "{local}");
+    on_b.event_where("user_changed", alices_without("signs"))
+        .await
+        .unwrap();
+
+    let refused = on_a.request("signs", json!({ "signs": "default" })).await;
+    assert!(
+        matches!(&refused, Err(hxd_testclient::Error::Refused { code, .. }) if code == "bad_request"),
+        "{refused:?}"
+    );
+    let (session, seq) = (on_a.session.clone().unwrap(), on_a.rx.last_seq);
+    on_a.close().await.unwrap();
+    let mut again = ng::Client::connect(a.ng).await.unwrap();
+    again.rx.last_seq = seq;
+    let resumed = again
+        .request(
+            "resume",
+            json!({ "session": session.0, "token": session.1, "last_seq": seq,
+                    "sealed": true, "signs": "default" }),
+        )
+        .await
+        .unwrap();
+    let (r, id) = (&resumed, &resumed["self"]["identity"]);
+    let flags = [&r["sealed"], &r["signs"], &id["sealed"], &id["signs"]];
+    assert!(flags.iter().all(|v| v.is_null()), "{resumed}");
 }

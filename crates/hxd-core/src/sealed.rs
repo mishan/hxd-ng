@@ -102,6 +102,30 @@ impl Core {
         resumed
     }
 
+    /// Take `sealed` and `signs` from every session whose certificate has
+    /// expired, as a resume without them would: nothing can be sealed to
+    /// it or signed with it any more, and its row and the links say so
+    /// once. Run by the ng sweeper.
+    pub fn expire_device_keys(&self) {
+        let now = self.clock.unix();
+        let mut r = self.roster.lock().unwrap();
+        let expired: Vec<Uid> = r
+            .users
+            .values()
+            .filter(|s| {
+                s.info.transport.identity.as_ref().is_some_and(|id| {
+                    id.device_expires <= now && (id.sealed.is_some() || id.can_sign)
+                })
+            })
+            .map(|s| s.info.uid)
+            .collect();
+        for uid in expired {
+            if set_sealed(&mut r, uid, None) | r.set_signs(uid, false, false) {
+                r.row_changed(uid);
+            }
+        }
+    }
+
     /// The certificate of the device `of`'s session proves now, for a
     /// session that can open sealed messages to seal to (§4.2).
     pub fn device_cert(&self, asker: Uid, of: Uid) -> Result<Vec<u8>, SealedError> {
