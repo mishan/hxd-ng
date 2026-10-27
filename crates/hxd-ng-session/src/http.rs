@@ -391,7 +391,7 @@ async fn route(
                     Ok(()) => boxed(crate::avatar::download(id, req, &ctx).await),
                     Err(wait) => {
                         hxd_core::instrument::throttled("fetch");
-                        slow_down(wait, "too many avatar fetches")
+                        slow_down_ng(wait, "too many avatar fetches")
                     }
                 }
             }
@@ -2170,6 +2170,20 @@ fn slow_down(wait: Duration, text: &str) -> Resp {
     let mut resp = json_resp(
         StatusCode::TOO_MANY_REQUESTS,
         json!({ "error": "rate_limited", "text": text, "retry_after": secs }),
+    );
+    resp.headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from(secs));
+    resp
+}
+
+/// [`slow_down`] in the ng error shape the media routes answer in
+/// (`docs/inline-media.md` §8.2), for a route whose other refusals use
+/// it, so a client has one parser for all of them.
+fn slow_down_ng(wait: Duration, text: &str) -> Resp {
+    let secs = retry_secs(wait);
+    let mut resp = json_resp(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({ "error": { "code": "rate_limited", "text": text, "retry_after": secs } }),
     );
     resp.headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(secs));
