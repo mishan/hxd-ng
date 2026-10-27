@@ -17,6 +17,12 @@ pub mod flag {
     pub const REFUSES_CHAT: u16 = 1 << 3;
 }
 
+/// `DATA_LINK_USER_KEY_FLAGS`, the user keys draft's.
+pub mod key_flag {
+    pub const SIGNS: u16 = 1 << 0;
+    pub const SEALED: u16 = 1 << 1;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserGroup {
     /// The user's ID as the sender of the group uses it.
@@ -33,6 +39,9 @@ pub struct UserGroup {
     /// `DATA_LINK_USER_KEY`: the identity fingerprint the user's home
     /// server says they proved.
     pub key: Option<[u8; 32]>,
+    /// `DATA_LINK_USER_KEY_FLAGS`'s known bits, all clear when absent or
+    /// beside no fingerprint.
+    pub key_flags: u16,
     /// The group as it arrived, every field in order.
     pub fields: Vec<Field>,
 }
@@ -79,6 +88,11 @@ pub fn of_local(user: &LocalUser, home: ServerId, transport: bool, keys: bool) -
     }
     if let Some(fp) = user.fingerprint.filter(|_| keys) {
         f.push(Field::new(field::USER_KEY, fp));
+        let flags = if user.signs { key_flag::SIGNS } else { 0 }
+            | if user.sealed { key_flag::SEALED } else { 0 };
+        if flags != 0 {
+            f.push(Field::u16(field::USER_KEY_FLAGS, flags));
+        }
     }
     f
 }
@@ -100,6 +114,7 @@ impl UserGroup {
         let mut exclude = Vec::new();
         let mut transport = None;
         let mut key = None;
+        let mut key_flags = 0;
         let mut extra = Vec::new();
         let mut kept = vec![first.clone()];
         let malformed = |f: &Field| UserGroupError::Malformed(f.id);
@@ -154,6 +169,10 @@ impl UserGroup {
                     key = f.fixed();
                     extra.push(f.clone())
                 }
+                field::USER_KEY_FLAGS => {
+                    key_flags = f.uint().map_or(0, |n| n as u16);
+                    extra.push(f.clone())
+                }
                 _ => extra.push(f.clone()),
             }
             kept.push(f.clone());
@@ -172,6 +191,11 @@ impl UserGroup {
             color,
             exclude,
             transport,
+            key_flags: if key.is_some() {
+                key_flags & (key_flag::SIGNS | key_flag::SEALED)
+            } else {
+                0
+            },
             key,
             fields: kept,
         })
@@ -203,6 +227,8 @@ mod tests {
             exclude: vec![],
             encrypted: None,
             fingerprint: None,
+            signs: false,
+            sealed: false,
         }
     }
 
@@ -279,6 +305,51 @@ mod tests {
         assert_eq!(read(&of_local(&keyed, home, false, true)), Some([9; 32]));
         assert_eq!(read(&of_local(&keyed, home, false, false)), None);
         assert_eq!(read(&of_local(&local(3, "ann"), home, false, true)), None);
+    }
+
+    #[test]
+    fn key_flags_cross_beside_a_key_and_only_their_bits_are_read() {
+        let home = ServerId([5; 8]);
+        let keyed = |signs, sealed| LocalUser {
+            fingerprint: Some([9; 32]),
+            signs,
+            sealed,
+            ..local(3, "ann")
+        };
+        let sent = |fields: &[Field]| {
+            fields
+                .iter()
+                .find(|f| f.id == field::USER_KEY_FLAGS)
+                .map(|f| f.data.clone())
+        };
+        for (signs, sealed, data) in [
+            (false, false, None),
+            (true, false, Some(vec![0, 1])),
+            (false, true, Some(vec![0, 2])),
+            (true, true, Some(vec![0, 3])),
+        ] {
+            let fields = of_local(&keyed(signs, sealed), home, false, true);
+            assert_eq!(sent(&fields), data, "{signs} {sealed}");
+            let read = UserGroup::parse(&fields).unwrap().key_flags;
+            assert_eq!(read, data.map_or(0, |d| u16::from_be_bytes([d[0], d[1]])));
+            // Not where the draft is not tried.
+            assert_eq!(
+                sent(&of_local(&keyed(signs, sealed), home, false, false)),
+                None
+            );
+        }
+        for (user, flags, expect) in [
+            (keyed(false, false), 0xfffd, key_flag::SIGNS),
+            (local(3, "ann"), 0x0003, 0),
+        ] {
+            let mut fields = of_local(&user, home, false, true);
+            fields.push(Field::u16(field::USER_KEY_FLAGS, flags));
+            assert_eq!(
+                UserGroup::parse(&fields).unwrap().key_flags,
+                expect,
+                "{flags:#x}"
+            );
+        }
     }
 
     #[test]

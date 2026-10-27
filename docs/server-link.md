@@ -859,7 +859,10 @@ wire.
   fingerprint the user's connection proved (an identity login, or a
   `/trtp` tunnel under one; never the identity of an account a password
   logged in to), and only while `[identity] login_proof_v1` is off, as
-  `e2e-messages.md` §5 explains.
+  `e2e-messages.md` §5 explains; and beside it, when either is set,
+  `DATA_LINK_USER_KEY_FLAGS` (`0x0649`, proposed): `KEY_FLAG_SIGNS` for a
+  session whose `signs` is `"default"`, `KEY_FLAG_SEALED` for a `sealed`
+  one, sent again in 902 when they change.
 - **A signed lobby line** goes out as Link Chat with `DATA_LINK_SIGNED`
   (`0x0647`), its link form; **a signed private message** to a ghost as
   905 with it; **a sealed one** as 905 with `DATA_LINK_SEALED`
@@ -868,7 +871,8 @@ wire.
   signature, one that does not try the draft included, which passes it
   on as a field it does not know; a signed or sealed message to a user
   behind such a peer is refused at once.
-- **Read** from a peer trying it: the fingerprints and discovery keys,
+- **Read** from a peer trying it: the fingerprints, `KEY_FLAG_SIGNS`
+  beside one, and the discovery keys,
   statements this server takes only where they were agreed, as the
   transport is. Read from any peer: a signature or a sealed message,
   since leaving it out would strip a signature or garble a message, and

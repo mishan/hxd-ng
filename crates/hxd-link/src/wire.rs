@@ -71,6 +71,9 @@ pub mod field {
     pub const SEALED_TO: u16 = 0x0646;
     pub const SIGNED: u16 = 0x0647;
     pub const DISCOVERY_KEY: u16 = 0x0648;
+    /// The draft's too, but only proposed there and not yet reserved:
+    /// what a user's client does with their key.
+    pub const USER_KEY_FLAGS: u16 = 0x0649;
     pub use hxd_session::peer::field::{KEY_PROOF, SERVER_KEY};
 }
 

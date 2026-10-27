@@ -748,7 +748,7 @@ and replay are §3.10's, on the same memory. What passes is shown in
 ## 4. On a Hotline-ng server
 
 These add to `hotline-ng.md`: the `signed` capability, the login
-parameters `sealed` and `signs`, a request, parameters on `msg`, `chat`
+parameters `sealed` and `signs`, two requests, parameters on `msg`, `chat`
 and `news_post`, fields on events, listings and the `user` object, and
 the error codes `not_sealed`, `cert_changed`, `bad_signature` and
 `signature_required`, registered there when they are built.
@@ -913,17 +913,34 @@ would relay the text unsigned, and the sender would never know.
 
 A client that can sign sends `signs` in `login` and in every `resume`,
 and only if its session proves a device key whose certificate allows
-messages and is at most 512 bytes: `"default"` when its user signs
-public lines by default, `"able"` when it signs only where asked or
-required. The roster row's `identity` gains `"signs": true` for
-`"default"` alone; a resume that drops it loses it (`user_changed`). On
-the roster it says what the client does by default, not that every
-line will be signed, and the server sets it, so it is a hint to the
-stripping check of §8 and nothing more. To the server, either value
-says the session can sign, which a room that requires signing asks
-(§4.8). Any other value is `bad_request`. The login reply echoes
-`signs`, with the client's own string, when the server will carry
-signed messages, as it echoes `sealed`.
+messages and is at most 512 bytes: `"default"` when its user has
+chosen to sign every lobby line, `"able"` when it signs only where
+asked or required. A client saying `"default"` signs every lobby line it
+sends, and does not send one it cannot sign until its user turns the
+choice off. The roster row's `identity` gains `"signs": true` for
+`"default"` alone; a resume that drops it loses it (`user_changed`).
+The server sets it from what the client says and does not hold the
+client to it, so it is a hint to the stripping check of §8 and nothing
+more; but an unsigned lobby line from such a session is one its client
+did not mean to send, or one a server stripped. To the server, either value says
+the session can sign, which a room that requires signing asks (§4.8).
+Any other value is `bad_request`. The login reply echoes `signs`, with
+the client's own string, when the server will carry signed messages, as
+it echoes `sealed`.
+
+When the user changes the choice, the client says so at once:
+
+```
+→ { "req": "signs", "params": { "signs": "default" } }
+← { "ok": {} }
+```
+
+It is under the `signed` capability, and takes the values `signs` takes
+at login, under the same condition; a session that does not meet it,
+whose `signs` a login would ignore, or any other value, is refused
+`bad_request`. It sets the session's `signs` as a login would, a
+change to the row announced as `user_changed`, and a later `resume`
+says it again and replaces it, as a resume replaces the login's.
 
 A reader that does not log in with a key can still pin a server's key:
 it asks `challenge` (`hotline-ng-auth.md` §6.2) for the
@@ -1407,7 +1424,15 @@ line by line. A ghost's row carries `identity.fingerprint` when its home
 server said one (`DATA_LINK_USER_KEY`) over a link trying the draft, and a
 client checks a line's certificate against it; without one, its line is
 named by its certificate's fingerprint and the contact pinned to it, if
-any. A ghost whose row has no `server_key` cannot have its lines' scope
+any. Beside the fingerprint, the home server says
+`DATA_LINK_USER_KEY_FLAGS` (`0x0649`, proposed): `KEY_FLAG_SIGNS` while
+the session's `signs` is `"default"` (§4.6), and `KEY_FLAG_SEALED` while
+it is `sealed` (§4.1), in Link User Update (902) again whenever either
+changes. A ghost's row carries `identity.signs` when its home server sets
+`KEY_FLAG_SIGNS` over a link trying the draft, the stripping check of §8
+then applying to its lobby lines as to a local user's; `KEY_FLAG_SEALED`
+is not shown, since only 915's answer says a box can reach the ghost. A
+ghost whose row has no `server_key` cannot have its lines' scope
 checked: they are shown as unverified (§8), which is not the same as
 failing, and a receiving server neither drops them nor counts them
 invalid.
@@ -1514,7 +1539,8 @@ read-only to a classic client (§4.8).
   SHOULD leave the lobby and rooms unsigned by default, for §1.3's
   reason, except a room that requires it, where it says so before the
   user sends. Once on in a scope, it signs every line there, so that an
-  unsigned one stands out.
+  unsigned one stands out, and for the lobby says so with `signs`
+  (§4.6).
 - **Pin each server's key.** A client remembers the `server_key` a host
   proved to it the first time, by its `server_challenge` (§4.13), and
   warns when the host later gives another. Every line it signs there
@@ -1567,8 +1593,10 @@ read-only to a classic client (§4.8).
   Marks go on top of a state: **sent at another time**, on 1, 2 or 6,
   when `sent` is more than `S` from `at`, with the signed time shown;
   and **signature expected**, on 5, when it comes from a fingerprint
-  the client has seen sign in this scope, or whose row says `signs`,
-  with a warning that a signature may have been removed, and on every
+  the client has seen sign in this scope, with a warning that a
+  signature may have been removed; on a lobby line whose sender's row
+  says `signs`, which says that sender signs every one, with that
+  warning given with confidence; and on every
   unsigned line in a room that requires signing (§4.8); a client
   remembers a room's mark as it remembers a server key. An attachment on a
   signed line or article is shown as not covered.

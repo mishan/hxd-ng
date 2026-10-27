@@ -1263,9 +1263,13 @@ async fn http_json(addr: SocketAddr, path: &str) -> Value {
     serde_json::from_slice(&raw[split + 4..]).unwrap()
 }
 
-/// `p` logged in to `server`'s ng port with their key, saying it can sign
-/// and open sealed messages, and its login reply.
+/// `p` logged in to `server`'s ng port with their key, saying it signs
+/// every lobby line and can open sealed messages, and its login reply.
 async fn keyed(server: &Server, p: &Person) -> (ng::Client, Value) {
+    keyed_saying(server, p, json!({ "signs": "default", "sealed": true })).await
+}
+
+async fn keyed_saying(server: &Server, p: &Person, login: Value) -> (ng::Client, Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let addr = server.ng;
     let ch = http_json(addr, "/identity/challenge").await;
@@ -1294,10 +1298,7 @@ async fn keyed(server: &Server, p: &Person) -> (ng::Client, Value) {
     let mut c = ng::Client::over(Box::new(tcp), &format!("ws://{addr}/ng?token={token}"))
         .await
         .unwrap();
-    let hello = c
-        .login(json!({ "signs": "default", "sealed": true }))
-        .await
-        .unwrap();
+    let hello = c.login(login).await.unwrap();
     assert!(hello["caps"].as_array().unwrap().contains(&json!("signed")));
     (c, hello)
 }
@@ -1492,12 +1493,81 @@ async fn a_signed_lobby_line_crosses_both_ways_and_verifies_where_it_is_heard() 
 }
 
 #[tokio::test]
+async fn a_ghost_says_it_signs_while_its_user_signs_every_lobby_line() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (alice, bob) = (person(1), person(2));
+    let (mut on_a, _) = keyed_saying(&a, &alice, json!({ "signs": "able" })).await;
+    let (mut on_b, b_hello) = keyed(&b, &bob).await;
+    let row = identity_row(&mut on_b, &b_hello, &alice).await;
+    assert!(row["identity"].get("signs").is_none(), "{row}");
+    let fp = fingerprint(&alice).to_string();
+    let alices = |d: &Value| d["user"]["identity"]["fingerprint"] == fp;
+
+    // Signing a line is a choice made for that line, not every one.
+    let (guid, signed) = signed_line(&alice, 1, 1, "once");
+    on_a.request(
+        "chat",
+        json!({ "text": "once", "guid": guid, "signed": signed }),
+    )
+    .await
+    .unwrap();
+    on_b.event_where("chat", |d| d["text"] == "once")
+        .await
+        .unwrap();
+    on_a.request("nick", json!({ "icon": 77 })).await.unwrap();
+    let changed = on_b.event_where("user_changed", alices).await.unwrap().data;
+    assert_eq!(changed["user"]["icon"], 77, "{changed}");
+    assert!(
+        changed["user"]["identity"].get("signs").is_none(),
+        "{changed}"
+    );
+
+    for (signs, shown) in [("default", true), ("able", false), ("default", true)] {
+        on_a.request("signs", json!({ "signs": signs }))
+            .await
+            .unwrap();
+        let changed = on_b.event_where("user_changed", alices).await.unwrap().data;
+        assert_eq!(
+            changed["user"]["identity"].get("signs").is_some(),
+            shown,
+            "{signs}: {changed}"
+        );
+    }
+
+    // A resume that leaves it out takes it off over the link too.
+    let (session, seq) = (on_a.session.clone().unwrap(), on_a.rx.last_seq);
+    on_a.close().await.unwrap();
+    let (_on_a, _) = ng::Client::resume(a.ng, session, seq, Vec::new())
+        .await
+        .unwrap();
+    on_b.event_where("user_changed", |d| {
+        alices(d) && d["user"]["identity"].get("signs").is_none()
+    })
+    .await
+    .unwrap();
+}
+
+/// What a peer says of its users' keys is read only where this server
+/// tries the draft with it too.
+#[tokio::test]
+async fn a_ghosts_keys_are_not_read_from_a_peer_not_tried_with() {
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, "").await;
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let (_on_a, _) = keyed(&a, &person(1)).await;
+    let (mut on_b, b_hello) = keyed(&b, &person(2)).await;
+    let row = ghost_row(&mut on_b, &b_hello, |u| u["nick"] == "alice").await;
+    assert!(row.get("identity").is_none(), "{row}");
+}
+
+#[tokio::test]
 async fn a_server_in_the_middle_passes_signed_lines_and_their_fetches_on() {
     let (a, _b, c, _dirs) = chain_trying(r#"["chat", "msgs", "info", "transit"]"#, USER_KEYS).await;
     let (alice, carol) = (person(1), person(3));
     let (mut on_a, _) = keyed(&a, &alice).await;
     let (mut on_c, c_hello) = keyed(&c, &carol).await;
-    identity_row(&mut on_c, &c_hello, &alice).await;
+    let row = identity_row(&mut on_c, &c_hello, &alice).await;
+    assert_eq!(row["identity"]["signs"], true, "key flags passed on: {row}");
     signed_lines_cross(&mut on_a, &alice, 1, &mut on_c, 1).await;
 }
 
