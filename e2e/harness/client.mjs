@@ -44,14 +44,16 @@ for (const global of ['window', 'document', 'sessionStorage', 'localStorage', 'l
 class TimeoutError extends Error {}
 
 /** One thing that happened, in one flat stream so `waitFor` has a single
- *  thing to scan. `kind` is `ev` | `reply` | `req` | `state` | `hook`. */
+ *  thing to scan. `kind` is `ev` | `reply` | `req` | `state` | `hook`;
+ *  `id` ties a `reply` to its `req`. */
 class Record {
-  constructor(n, kind, name, data, seq) {
+  constructor(n, kind, name, data, seq, id) {
     this.n = n;
     this.kind = kind;
     this.name = name;
     this.data = data;
     this.seq = seq;
+    this.id = id;
   }
 }
 
@@ -128,17 +130,17 @@ export class TestClient {
     } catch {
       return this.push('raw', t.kind, { raw: t.raw });
     }
-    if (t.dir === 'out') return this.push('req', frame.req ?? t.kind, frame.params ?? {});
+    if (t.dir === 'out') return this.push('req', frame.req ?? t.kind, frame.params ?? {}, undefined, frame.id);
     if (t.kind.startsWith('ev:')) {
       return this.push('ev', frame.ev, frame.data ?? {}, frame.seq);
     }
     // `reply:ok` or `reply:<code>`; the name is the outcome, so a test
     // can wait for a specific refusal.
-    return this.push('reply', t.kind.slice('reply:'.length), frame.ok ?? frame.error ?? {});
+    return this.push('reply', t.kind.slice('reply:'.length), frame.ok ?? frame.error ?? {}, undefined, frame.reply);
   }
 
-  push(kind, name, data, seq) {
-    const rec = new Record(this.n++, kind, name, data, seq);
+  push(kind, name, data, seq, id) {
+    const rec = new Record(this.n++, kind, name, data, seq, id);
     this.log.push(rec);
     for (const w of [...this.waiters]) {
       if (w.settle(rec)) this.waiters.splice(this.waiters.indexOf(w), 1);

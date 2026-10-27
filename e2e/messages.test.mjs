@@ -4,13 +4,28 @@
  * The durable side — mail that waits for someone — is `inbox.test.mjs`.
  * This file is about the live path and the rules around addressing it,
  * which are mostly rules about what the server declines to tell you, and
- * about a signed message, live and waiting, checked by its recipient.
+ * about a signed message, live and waiting, checked by its recipient,
+ * and a sealed one, live and held, opened by the device it was sealed to.
  */
 
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
 
-import { BAD_SIGNATURE, bytesToHex, fingerprintFromString, hexToBytes, readSignedMessage, signMsgRequest } from '@hotline-ng/client';
+import {
+  BAD_SIGNATURE,
+  CERT_CHANGED,
+  MemorySealedReplay,
+  base64urlToBytes,
+  bytesToBase64url,
+  bytesToHex,
+  decodeDeviceCert,
+  fingerprintFromString,
+  hexToBytes,
+  openSealed,
+  readSignedMessage,
+  sealMsgRequest,
+  signMsgRequest,
+} from '@hotline-ng/client';
 
 import { fleet } from './harness/client.mjs';
 import { enrolledDevice, signingIdentity } from './harness/device.mjs';
@@ -195,5 +210,110 @@ describe('private messages', () => {
     assert.equal(rows.length, 1, 'stored once');
     assert.equal(rows[0].signed, later.signed);
     assert.deepEqual((await read(rows[0], 'certificate')).outcome, verified);
+  });
+
+  test('a sealed message reaches the device it was sealed to, signed or deniably, live and held, and opens once', async () => {
+    const sender = await enrolledDevice(server, 'seal-sender');
+    const recipient = await enrolledDevice(server, 'seal-recipient');
+    // Accounts with passwords, so the recipient may detach and be held for.
+    const linked = (who, device) => server.account(who, `${account(who)}[identity]\nfingerprint = "${device.fingerprint}"\n`);
+    linked('selma', recipient);
+    linked('sven', sender);
+    const sealing = (device) => ({ getToken: device.getToken, signs: () => 'able', sealed: () => true });
+    const reader = await crew.connect({ nick: 'Selma', identity: sealing(recipient) });
+    const writer = await crew.connect({ nick: 'Sven', identity: sealing(sender) });
+    const uid = reader.conn.self.uid;
+    assert.equal(reader.conn.sealing, true, 'sealed is echoed for a device whose certificate allows messages');
+    assert.equal(writer.conn.sealing, true);
+    assert.equal(reader.conn.self.identity.sealed, true);
+
+    // Sealed to the identity the writer's roster shows, and to the
+    // certificate device_cert answers, which is the reader's own.
+    const row = writer.conn.login.users.find((u) => u.uid === uid);
+    assert.equal(row.identity.sealed, true);
+    assert.equal(row.identity.fingerprint, recipient.fingerprint);
+    const cert = base64urlToBytes((await writer.conn.deviceCert(uid)).cert);
+    assert.deepEqual(cert, recipient.cert);
+    const keys = { sign: sender.key, enc: sender.enc };
+    const to = fingerprintFromString(row.identity.fingerprint);
+    const seal = (text, deniable = false) => sealMsgRequest(keys, { cert: sender.cert, to, text }, cert, deniable);
+
+    // Opened as the reader's client opens one: by its own device key, as
+    // from the fingerprint its roster shows for the sender's uid, with
+    // one memory of what it accepted.
+    const joined = await reader.waitFor('user_joined', (d) => d.user.uid === writer.conn.self.uid);
+    const named = { named: joined.data.user.identity.fingerprint };
+    const replay = new MemorySealedReplay();
+    const open = (d) =>
+      openSealed(base64urlToBytes(d.sealed), recipient.enc, { now: Math.floor(Date.now() / 1000), at: d.at, reader: recipient.fingerprint, sender: named }, replay);
+    const delivered = async (req, since = 0) => {
+      const got = await reader.waitFor('msg', (d) => d.sealed === req.sealed, { since });
+      assert.equal(got.data.text, '[Encrypted message]');
+      assert.equal(got.data.queued, false);
+      assert.equal(got.data.id, undefined, 'never stored');
+      assert.equal(got.data.from.fingerprint, sender.fingerprint);
+      return got.data;
+    };
+
+    const signed = await seal('sealed and signed');
+    assert.deepEqual(await writer.conn.msg({ to: uid, ...signed }), { queued: false });
+    const opened = await open(await delivered(signed));
+    assert.equal(opened.state, 'verified');
+    assert.equal(opened.signer, sender.fingerprint);
+    assert.equal(opened.message.message.text, 'sealed and signed');
+
+    const deniable = await seal('sealed deniably', true);
+    assert.deepEqual(await writer.conn.msg({ to: uid, ...deniable }), { queued: false });
+    const denied = await open(await delivered(deniable));
+    assert.equal(denied.state, 'deniable');
+    assert.equal(denied.signer, sender.fingerprint);
+    assert.deepEqual(denied.senderEnc, decodeDeviceCert(sender.cert).deviceEnc, 'opened under the key its certificate names');
+    assert.equal(denied.message.text, 'sealed deniably');
+
+    // The same box again is carried again, and opened by nobody twice.
+    const again = reader.mark();
+    await writer.conn.msg({ to: uid, ...signed });
+    assert.equal((await open(await delivered(signed, again))).state, 'dropped');
+
+    // A key the target does not hold is the sender's to fetch again.
+    const otherKey = bytesToBase64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(32))));
+    const refused = await writer.conn
+      .msg({ to: uid, sealed: signed.sealed, cert: otherKey })
+      .then(() => null)
+      .catch((e) => e.wire.code);
+    assert.equal(refused, CERT_CHANGED);
+
+    // Away, a box is held for the session and handed over at its resume,
+    // which says sealed again.
+    const held = await seal('while you were away');
+    const [mark, watching] = [reader.mark(), writer.mark()];
+    // The reader stays away until the box is sent, however slow the
+    // sending, so the box can only have been held.
+    let release;
+    const away = new Promise((resolve) => (release = resolve));
+    const attach = reader.conn.attach;
+    reader.conn.attach = async function () {
+      await away;
+      return attach.call(this);
+    };
+    reader.conn.drop();
+    await writer.waitFor('user_changed', (d) => d.user.uid === uid && d.user.status === 'detached', { since: watching });
+    assert.deepEqual(await writer.conn.msg({ to: uid, ...held }), { queued: false });
+    release();
+    const resumed = await reader.waitForHook('onResumed', () => true, { since: mark, timeout: 20_000 });
+    const asked = reader.seen('req', 'resume').at(-1);
+    assert.equal(asked.data.sealed, true);
+    assert.equal(reader.conn.sealing, true);
+    const back = await open(await delivered(held, mark));
+    assert.equal(back.state, 'verified');
+    assert.equal(back.message.message.text, 'while you were away');
+    // Handed over in the resume: one of the events it replayed, which
+    // follow its reply.
+    const answered = reader.log.find((r) => r.kind === 'reply' && r.id === asked.id);
+    const replayed = reader.log.filter((r) => r.kind === 'ev' && r.n > answered.n).slice(0, resumed.data.replay);
+    assert.ok(
+      replayed.some((r) => r.name === 'msg' && r.data.sealed === held.sealed),
+      `expected the box among the ${resumed.data.replay} events the resume replayed`,
+    );
   });
 });

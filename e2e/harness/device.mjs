@@ -10,8 +10,8 @@ import { bytesToHex, fetchChallenge, fetchDiscovery, postAuth, signLoginProof } 
 import { hlid } from './server.mjs';
 
 /** A device certified by `hlid` for messages as well as login, under an
- *  identity of its own named `name` in `server`'s directory, and the
- *  token-minting an identity login runs. */
+ *  identity of its own named `name` in `server`'s directory, both its
+ *  private keys, and the token-minting an identity login runs. */
 export async function enrolledDevice(server, name) {
   const sign = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
   const enc = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
@@ -44,7 +44,7 @@ export async function enrolledDevice(server, name) {
     const auth = await postAuth(endpoint(doc.identity.endpoints.auth), { host: challenge.host, card, deviceCert: cert, proof });
     return auth.token;
   };
-  return { key: sign.privateKey, cert, fingerprint, getToken, challengeAt: endpoint(doc.identity.endpoints.challenge) };
+  return { key: sign.privateKey, enc: enc.privateKey, cert, fingerprint, getToken, challengeAt: endpoint(doc.identity.endpoints.challenge) };
 }
 
 /** The `[identity]` a file's server signs with: its hosts, which make it
