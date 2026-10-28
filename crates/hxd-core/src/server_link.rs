@@ -1248,6 +1248,12 @@ impl Core {
         self.roster.lock().unwrap().ghosts.len()
     }
 
+    /// The ghosts the user list shows, for a listing's count of them.
+    pub fn ghosts_shown(&self) -> usize {
+        let r = self.roster.lock().unwrap();
+        r.ghosts.values().filter(|g| g.visible).count()
+    }
+
     /// The user list: visible sessions and visible ghosts, in uid order.
     /// For the lists a client is shown (300, the ng roster) and nothing
     /// else; counts and every act on a user stay with the sessions.
@@ -1326,7 +1332,13 @@ mod tests {
             drain(&mut rx).is_empty(),
             "an excluded ghost is never shown"
         );
+        assert_eq!(
+            core.ghosts_shown(),
+            0,
+            "a tracker is told only who is shown"
+        );
         core.ghost_update(g, ghost("bob", true));
+        assert_eq!(core.ghosts_shown(), 1);
         core.ghost_update(g, ghost("robert", true));
         core.ghost_update(g, ghost("robert", false));
         core.ghost_update(g, ghost("robert", true));

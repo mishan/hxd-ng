@@ -203,13 +203,18 @@ impl TrackerSection {
                     protocol_version: 0,
                     inline_media: true,
                     voice: true,
+                    video: true,
                     large_files: true,
                 };
                 let base = build_v3(
                     &advertisement,
                     &self.v3,
                     1,
-                    0,
+                    Live {
+                        users: 0,
+                        linked_users: 1,
+                        linking: true,
+                    },
                     target.password.as_deref(),
                     None,
                     None,
@@ -386,9 +391,21 @@ pub struct Advertisement {
     pub protocol_version: u16,
     pub inline_media: bool,
     pub voice: bool,
+    pub video: bool,
     /// 64-bit transfers, on exactly the condition both wires echo the
     /// large-file capability: a Files service was built.
     pub large_files: bool,
+}
+
+/// What a heartbeat reports that changes while the server runs.
+#[derive(Debug, Clone, Copy, Default)]
+struct Live {
+    users: u16,
+    /// Ghosts shown here, which `users` leaves out: a user is counted by
+    /// the one server they are connected to.
+    linked_users: u16,
+    /// A peer is configured, so other servers' users can appear here.
+    linking: bool,
 }
 
 /// Running per-target registration tasks.
@@ -428,6 +445,7 @@ pub fn start(
     section: &TrackerSection,
     advertisement: Advertisement,
     core: Arc<Core>,
+    hub: Option<hxd_link::Hub>,
 ) -> Result<RegistrationService, String> {
     let mut pass_id_bytes = [0u8; 4];
     OsRng
@@ -459,6 +477,7 @@ pub fn start(
         let advertisement = advertisement.clone();
         let metadata = section.v3.clone();
         let core = core.clone();
+        let hub = hub.clone();
         let interval = Duration::from_secs(section.interval);
         let ack_timeout = Duration::from_millis(section.ack_timeout_ms);
         tasks.push(tokio::spawn(run_target(
@@ -466,6 +485,7 @@ pub fn start(
             advertisement,
             metadata,
             core,
+            hub,
             pass_id,
             interval,
             ack_timeout,
@@ -481,6 +501,7 @@ async fn run_target(
     advertisement: Advertisement,
     metadata: TrackerV3Metadata,
     core: Arc<Core>,
+    hub: Option<hxd_link::Hub>,
     pass_id: u32,
     configured_interval: Duration,
     ack_timeout: Duration,
@@ -504,6 +525,11 @@ async fn run_target(
             .filter(|u| !u.system)
             .count()
             .min(u16::MAX as usize) as u16;
+        let live = Live {
+            users,
+            linked_users: core.ghosts_shown().min(u16::MAX as usize) as u16,
+            linking: hub.as_ref().is_some_and(|hub| !hub.report().is_empty()),
+        };
         let heartbeat = tokio::select! {
             result = send_heartbeat(
                 &address,
@@ -511,7 +537,7 @@ async fn run_target(
                 &advertisement,
                 &metadata,
                 pass_id,
-                users,
+                live,
                 token.as_deref(),
                 ack_timeout,
             ) => result,
@@ -634,17 +660,22 @@ async fn send_heartbeat(
     advertisement: &Advertisement,
     metadata: &TrackerV3Metadata,
     pass_id: u32,
-    users: u16,
+    live: Live,
     token: Option<&[u8]>,
     ack_timeout: Duration,
 ) -> Result<Option<Ack>, String> {
     let packet = match target.protocol {
-        TrackerProtocol::V1 => build_v1(advertisement, pass_id, users, target.password.as_deref())?,
+        TrackerProtocol::V1 => build_v1(
+            advertisement,
+            pass_id,
+            live.users,
+            target.password.as_deref(),
+        )?,
         TrackerProtocol::V3 => build_v3(
             advertisement,
             metadata,
             pass_id,
-            users,
+            live,
             target.password.as_deref(),
             target.hmac_secret.as_deref(),
             token,
@@ -660,7 +691,7 @@ async fn send_heartbeat(
         target: "tracker",
         tracker = %target.address,
         protocol = ?target.protocol,
-        users,
+        users = live.users,
         "sent tracker registration"
     );
     if target.protocol == TrackerProtocol::V1 {
@@ -690,7 +721,7 @@ async fn send_deregister(
         advertisement,
         metadata,
         pass_id,
-        0,
+        Live::default(),
         target.password.as_deref(),
         target.hmac_secret.as_deref(),
         token,
@@ -730,7 +761,7 @@ fn build_v3(
     advertisement: &Advertisement,
     metadata: &TrackerV3Metadata,
     pass_id: u32,
-    users: u16,
+    live: Live,
     password: Option<&str>,
     hmac_secret: Option<&str>,
     token: Option<&[u8]>,
@@ -742,13 +773,13 @@ fn build_v3(
             .push_flag(id::DEREGISTER)
             .map_err(|error| error.to_string())?;
     } else {
-        advertised_meta(advertisement, metadata)
+        advertised_meta(advertisement, metadata, live)
             .encode(&mut fields)
             .map_err(|error| error.to_string())?;
     }
     let registration = Registration {
         port: advertisement.port,
-        users,
+        users: live.users,
         pass_id,
         name: advertisement.name.as_bytes(),
         description: advertisement.description.as_bytes(),
@@ -780,7 +811,11 @@ fn build_v3(
 
 /// The v3 fields this server advertises: what the running server knows
 /// about itself, plus what the operator declared.
-fn advertised_meta(advertisement: &Advertisement, metadata: &TrackerV3Metadata) -> TrackerMeta {
+fn advertised_meta(
+    advertisement: &Advertisement,
+    metadata: &TrackerV3Metadata,
+    live: Live,
+) -> TrackerMeta {
     let uptime = Instant::now()
         .duration_since(process_start())
         .as_secs()
@@ -793,7 +828,10 @@ fn advertised_meta(advertisement: &Advertisement, metadata: &TrackerV3Metadata) 
         tls_port: advertisement.tls_port,
         supports_inline_media: advertisement.inline_media,
         supports_voice: advertisement.voice,
+        supports_video: advertisement.video,
         supports_large_files: advertisement.large_files,
+        linked_users: Some(live.linked_users).filter(|n| *n > 0),
+        supports_server_linking: live.linking,
 
         ipv6: metadata.ipv6.map(|address| address.octets()),
         supports_ipv6: metadata.ipv6.is_some(),
@@ -856,7 +894,15 @@ mod tests {
             protocol_version: 254,
             inline_media: true,
             voice: false,
+            video: false,
             large_files: true,
+        }
+    }
+
+    fn users(users: u16) -> Live {
+        Live {
+            users,
+            ..Live::default()
         }
     }
 
@@ -893,7 +939,7 @@ mod tests {
             &advertisement(),
             &metadata,
             0xcafe_babe,
-            12,
+            users(12),
             None,
             Some("secret"),
             Some(b"token"),
@@ -923,7 +969,7 @@ mod tests {
             &advertisement(),
             &TrackerV3Metadata::default(),
             0xcafe_babe,
-            0,
+            Live::default(),
             None,
             Some("secret"),
             Some(b"token"),
@@ -949,7 +995,7 @@ mod tests {
             &plain,
             &TrackerV3Metadata::default(),
             1,
-            2,
+            users(2),
             None,
             None,
             None,
@@ -959,6 +1005,49 @@ mod tests {
         let ids: Vec<u16> = packet_tlvs(&packet).into_iter().map(|(id, _)| id).collect();
         assert!(!ids.contains(&id::SUPPORTS_TLS));
         assert!(!ids.contains(&id::TLS_PORT));
+    }
+
+    #[test]
+    fn v3_reports_linked_users_apart_from_the_user_count() {
+        let linked = |linked_users| Live {
+            users: 2,
+            linked_users,
+            linking: true,
+        };
+        for (live, video, linked_users, linking) in [
+            (users(2), false, None, false),
+            (linked(0), true, None, true),
+            (linked(7), true, Some(7u16.to_be_bytes().to_vec()), true),
+        ] {
+            let advertisement = Advertisement {
+                voice: video,
+                video,
+                ..advertisement()
+            };
+            let packet = build_v3(
+                &advertisement,
+                &TrackerV3Metadata::default(),
+                1,
+                live,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            assert_eq!(&packet[4..6], &2u16.to_be_bytes(), "{live:?}");
+            let fields: BTreeMap<_, _> = packet_tlvs(&packet)
+                .into_iter()
+                .map(|(id, value)| (id, value.to_vec()))
+                .collect();
+            assert_eq!(fields.get(&id::LINKED_USERS), linked_users.as_ref());
+            assert_eq!(
+                fields.contains_key(&id::SUPPORTS_SERVER_LINKING),
+                linking,
+                "{live:?}"
+            );
+            assert_eq!(fields.contains_key(&id::SUPPORTS_VIDEO), video, "{live:?}");
+        }
     }
 
     #[test]
@@ -984,7 +1073,17 @@ mod tests {
             listing_category: Some(10),
             listing_language_strict: true,
         };
-        let packet = build_v3(&advertisement(), &metadata, 1, 2, None, None, None, false).unwrap();
+        let packet = build_v3(
+            &advertisement(),
+            &metadata,
+            1,
+            users(2),
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         let fields: BTreeMap<_, _> = packet_tlvs(&packet)
             .into_iter()
             .map(|(id, value)| (id, value.to_vec()))
@@ -1155,7 +1254,7 @@ mod tests {
             })
             .unwrap();
         core.announce(uid);
-        let service = start(&section, advertisement(), core).unwrap();
+        let service = start(&section, advertisement(), core, None).unwrap();
         let mut buf = [0u8; 1024];
         let v1_len = tokio::time::timeout(Duration::from_secs(1), v1_receiver.recv(&mut buf))
             .await

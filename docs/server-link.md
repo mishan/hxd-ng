@@ -95,7 +95,8 @@ What does see them opts in, through lookups of its own:
 
 Counts stay local: the tracker counts with `snapshot()` (local-only), and
 `census()` and metrics count `users`, as the extension asks of tracker
-listings and the info port. Ghosts have a gauge of their own,
+listings and the info port. A v3 listing is told the ghosts shown apart,
+as `LINKED_USERS`. Ghosts have a gauge of their own,
 `hxd_ghosts` (`docs/metrics.md`).
 
 **Joins and parts for ghosts are the core's**: attaching a visible ghost

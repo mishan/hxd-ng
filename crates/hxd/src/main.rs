@@ -1459,6 +1459,7 @@ async fn main() {
             None => None,
         };
 
+        let hub = hxd::link::build(&config, ctx.core.clone())?;
         let tracker = match &config.tracker {
             Some(section) => {
                 let advertised_port = section
@@ -1482,9 +1483,11 @@ async fn main() {
                         protocol_version: config.server.version,
                         inline_media: config.media.is_some() && cfg!(feature = "media"),
                         voice: voice.is_some(),
+                        video: voice.is_some() && hxd::video_enabled(&config),
                         large_files: files.is_some(),
                     },
                     ctx.core.clone(),
+                    hub.clone(),
                 )?)
             }
             None => None,
@@ -1580,7 +1583,6 @@ async fn main() {
         }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
-        let hub = hxd::link::build(&config, ctx.core.clone())?;
         let link_status = config.link.as_ref().map(hxd::link::status_path);
         let status_writer = match (&hub, &link_status) {
             (Some(hub), Some(path)) => {
