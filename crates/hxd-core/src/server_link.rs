@@ -498,6 +498,7 @@ impl RosterInner {
             color: Some(g.color),
             remote: Some(g.remote.clone()),
             roles: Vec::new(),
+            role_color: None,
         }
     }
 }

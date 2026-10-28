@@ -340,7 +340,8 @@ Three layers, all `cargo test --workspace`:
   Nicknames: a client that sends a color is sent everyone's, in rows,
   changes, self-info and private chat joins, one that never did is sent
   nothing new, a color masked to RGB and one of the wrong size ignored,
-  and an ng client sees a classic user's color), `banner.rs` (the banner push after the agreement, and a
+  an ng client sees a classic user's color, and a user who chose none
+  drawn in their highest colored role's), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
   blocks, retention, the sender's daily quota refusing only

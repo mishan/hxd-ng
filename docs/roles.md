@@ -7,6 +7,8 @@ rule for giving and taking roles, the info line and the commands of
 is built. G4 is built: a room's gates take `@role` (§10), a role a
 gate names is a privilege (§5), and it is not deleted while the gate
 names it, `role_in_use` on the ng wire and refused by `hxd role rm`.
+Of G5, the server's half of §8 is built: a role's color as the nick
+color of a user who chose none, on the classic wire.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -504,11 +506,14 @@ holders as `account_changed`, and nobody else needs it.
   highest role, in position order, as Discord's member list does.
 - **Color.** A role's color is a **default**, not an override: a user
   who chose a nick color (Colored Nicknames) keeps it, and one who did
-  not is drawn in the color of their highest colored role. The server
-  sends that color as the user's color on both wires, so a classic
-  client that negotiated Colored Nicknames draws it without knowing
-  roles exist. On ng the client works it out from `user.roles` and
-  `roles_changed`, so a color change reaches nobody as a burst (§4).
+  not is drawn in the color of their highest colored role. On the
+  classic wire the server sends that color as the user's, so a client
+  that negotiated Colored Nicknames draws it without knowing roles
+  exist. On ng `user.color` is only ever the one the user chose, and
+  the client works the rest out from `user.roles` and `roles_changed`.
+  Either way a color change reaches nobody as a burst (§4). `everyone`'s
+  color colors nobody: it says nothing about anyone, as its title is
+  left out of the info line.
 - The administrator affordance (`admin` on the roster, red in a 1.x
   user list) stays bit 22, however the bit was granted.
 

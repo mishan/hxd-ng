@@ -1035,8 +1035,12 @@ fn wire_color(u: &UserInfo, mark_cleartext: bool) -> u16 {
 
 /// A user's nick color as the wire carries it, `NO_NICK_COLOR` included,
 /// so a client is told when a color is cleared, not only when it is set.
+/// One the user chose wins over their role's (`docs/roles.md` §8).
 fn nick_color(u: &UserInfo) -> [u8; 4] {
-    u.color.unwrap_or(NICK_COLOR_NONE).to_be_bytes()
+    u.color
+        .or(u.role_color)
+        .unwrap_or(NICK_COLOR_NONE)
+        .to_be_bytes()
 }
 
 /// The `HTLS_DATA_USER_LIST` payload: uid, icon, color, nlen (all u16 BE),
@@ -3543,7 +3547,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 // rows, and would show a 301 for a user it has not listed
                 // yet as that user joining.
                 if sess.listed {
-                    for u in ctx.core.roster_rows().iter().filter(|u| u.color.is_some()) {
+                    for u in ctx
+                        .core
+                        .roster_rows()
+                        .iter()
+                        .filter(|u| u.color.or(u.role_color).is_some())
+                    {
                         push(
                             tx,
                             hdr::USER_CHANGE,
@@ -5658,6 +5667,7 @@ mod tests {
                 server_key: None,
             }),
             roles: Vec::new(),
+            role_color: None,
         };
         let long = "\u{3042}".repeat(12);
         for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {

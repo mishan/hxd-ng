@@ -184,6 +184,8 @@ impl Core {
         let role = admin.write_role(edit, create, &|before, after, now, then| {
             role_may(admin, &login, before, after, now, then)
         })?;
+        // Before any holder is told: a color never travels as their rows.
+        self.refresh_role_colors();
         // A change to what it looks like alone is told as `roles_changed`,
         // not to each holder as though what they may do had changed. A
         // new one may already be listed by accounts waiting for it.
@@ -217,6 +219,7 @@ impl Core {
             role_may(admin, &login, before, after, now, then)
         });
         // Even one cut short may have taken it from some of its holders.
+        self.refresh_role_colors();
         self.reapply(|a| a.roles.iter().any(|r| r == name));
         deleted?;
         self.roles_changed();
@@ -244,6 +247,19 @@ impl Core {
             .filter_map(|login| Some((login.clone(), admin.read_account(&login).ok()?)))
             .collect();
         self.apply_accounts(|l| accounts.get(l));
+    }
+
+    /// Give every session the color its roles now give it, telling nobody:
+    /// a role's color reaches a classic client with its holders' next
+    /// change or login, never as a burst of its own (`docs/roles.md` §4).
+    fn refresh_role_colors(&self) {
+        let roles = self.roles_shown();
+        let mut r = self.roster.lock().unwrap();
+        for s in r.users.values_mut() {
+            if let Some(account) = &s.account {
+                s.info.role_color = role_color(&roles, &account.roles);
+            }
+        }
     }
 
     /// Tell every session that shows roles what they now are, or, if one
@@ -449,6 +465,10 @@ impl Core {
         if let Err(e) = admin.reload() {
             tracing::error!("account reload: {e}");
         }
+        // A role recolored by hand: its holders' classic rows take it
+        // silently, and ng clients redraw from `roles_changed`.
+        self.refresh_role_colors();
+        self.roles_changed();
         let mut logins: Vec<String> = {
             let r = self.roster.lock().unwrap();
             r.users
@@ -503,6 +523,7 @@ impl Core {
 
     /// Give every session whose login `account_of` answers that account.
     fn apply_accounts<'a>(&self, account_of: impl Fn(&str) -> Option<&'a Account>) -> usize {
+        let roles = self.roles_shown();
         let mut r = self.roster.lock().unwrap();
         let told: Vec<(Uid, &Account)> = r
             .users
@@ -514,7 +535,7 @@ impl Core {
         let listed_before = r.room_shown(None, Some(&uids));
         let rows: Vec<Row> = told
             .iter()
-            .filter_map(|&(uid, account)| give_account(&mut r, uid, account))
+            .filter_map(|&(uid, account)| give_account(&mut r, uid, account, &roles))
             .collect();
         announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         // What it may read may have narrowed (docs/chat-rooms.md §5).
@@ -528,6 +549,7 @@ impl Core {
     /// `false` when there is no such session, or no account behind it to
     /// derive what is left from.
     pub fn set_session_mask(&self, uid: Uid, mask: DenyMask) -> bool {
+        let roles = self.roles_shown();
         let mut r = self.roster.lock().unwrap();
         let Some(s) = r.users.get_mut(&uid) else {
             return false;
@@ -537,7 +559,9 @@ impl Core {
         };
         s.mask = mask;
         let listed_before = r.room_shown(None, Some(&[uid]));
-        let rows = give_account(&mut r, uid, &account).into_iter().collect();
+        let rows = give_account(&mut r, uid, &account, &roles)
+            .into_iter()
+            .collect();
         announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         r.room_reconcile();
         r.room_announce(listed_before, None, Some(&[uid]));
@@ -604,9 +628,23 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     }
 }
 
+/// The color of the highest colored role of `listed` that exists, from
+/// `roles`, highest first (`docs/roles.md` §8).
+pub(crate) fn role_color(roles: &[RoleView], listed: &[String]) -> Option<u32> {
+    roles
+        .iter()
+        .filter(|r| listed.contains(&r.name))
+        .find_map(|r| r.color)
+}
+
 /// Give session `uid` `account` as its mask leaves it, and tell it.
 /// Answers its roster row if that changed, for the caller to announce.
-fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) -> Option<Row> {
+fn give_account(
+    r: &mut RosterInner,
+    uid: Uid,
+    account: &Account,
+    roles: &[RoleView],
+) -> Option<Row> {
     let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
     s.account = Some(Box::new(account.clone()));
@@ -628,9 +666,12 @@ fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) -> Option<Row>
     s.manage_rooms = effective.manage_rooms;
     s.set_subject = effective.set_subject;
     s.is_person = effective.is_person();
-    let mut shown = s.info.admin != admin;
+    let role_color = role_color(roles, &account.roles);
+    // A color a classic client draws, so not a change of roles alone.
+    let mut shown = s.info.admin != admin || s.info.role_color != role_color;
     let roles_changed = s.info.roles != account.roles;
     s.info.admin = admin;
+    s.info.role_color = role_color;
     s.info.roles.clone_from(&account.roles);
     let renamed = name.as_ref().is_some_and(|n| s.info.nick != *n);
     if let Some(name) = name {
