@@ -1,8 +1,9 @@
 # Roles: permissions shared by name
 
-Status: G1 is built (§14): the roles file, resolution, `everyone`,
-reload, §6.1's minimal overrides and the command line. Its `@` login
-reservation is built on its own.
+Status: G1 and G2 are built (§14): the roles file, resolution,
+`everyone`, reload, §6.1's minimal overrides and the command line, §5's
+rule for giving and taking roles, the info line and the commands of
+§6.2 and §6.3. Its `@` login reservation is built on its own.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -332,9 +333,10 @@ exactly these bits":
 
 The cost: an override pins its bit against later role edits. That is
 what the administrator asked for, and easy to forget. And 353 carries
-the bitmap as it stood at 352, so a role narrowed, or the account's
-roles changed, between opening and saving is written back as an
-override; remembering the configuration a session opened is G2's. `hxd account
+the bitmap as it stood at 352, so the session remembers what 352
+showed, and a bit the save leaves as shown keeps what the account has
+now: a role narrowed, or the account's roles changed, between opening
+and saving is not written back as an override. `hxd account
 show`, the ng editor and §6.3's `/role` show overrides apart from what
 roles give, so they can be found and cleared.
 
@@ -362,8 +364,12 @@ checks:
 | Command | Does | Needs |
 |---|---|---|
 | `/roles` | Lists the roles, highest first, with their holders' count | `read_users` |
-| `/role <who>` | The account's roles and its overrides | `read_users` |
-| `/role add <who> <role>`, `/role remove <who> <role>` | Assigns or takes away a role | §5 |
+| `/role <login>` | The account's roles and its overrides | `read_users` |
+| `/role add <login> <role>`, `/role remove <login> <role>` | Assigns or takes away a role | §5 |
+
+An account is named by its login, never by a nick: anyone can take a
+nick that names someone else, and a role given to the wrong account is
+a privilege given away.
 
 A role's own grants are edited as §6.4's pseudo-account, from the ng
 wire, or from the command line. Restrictions are applied with
@@ -999,13 +1005,19 @@ the room. Both should exist.
    tests: saving unchanged writes nothing, unchecking a role's bit
    writes `false`, re-checking clears it. No wire changes: a role's
    grants are simply there, in SELFINFO and on every gate.
-2. **G2 — who may, and the classic editor.** §5's checks in
-   `hxd_core::admin`, §6.2's info line, §6.3's commands. E2E in
-   `accounts.rs`: a moderator refused a role that
-   grants what it lacks; a role edit refused while an administrator
-   holds the role; a role granting `manage_rooms` refused to someone
-   without it; a role edit reaching a holder's session on both wires.
-3. **G3 — the ng wire.** §7 whole, without `kind` until G7.
+2. **G2 — who may, and the classic editor.** §5's checks on giving and
+   taking roles in `hxd_core::admin`, §6.2's info line, §6.3's
+   commands, and §6.1's save remembering what 352 showed. E2E in
+   `accounts.rs`: a moderator refused a role that grants what it lacks,
+   and refused taking it from someone who holds it; a role granting
+   `manage_rooms` refused to someone without it; a role given reaching
+   the holder's sessions on both wires; a role changed while the editor
+   was open not saved over. Holding a gated role as a privilege waits
+   for `@role` gate entries (G4).
+3. **G3 — the ng wire.** §7 whole, without `kind` until G7, and §5's
+   checks on creating, editing and deleting a role, which nothing but
+   `hxd role` can do before it. E2E: a role edit refused while an
+   administrator holds the role.
 4. **G4 — gates.** §10, on chat-rooms.md's R1 and R2.
 5. **G5 — display.** §8's colors on both wires, user lists grouped by
    role in hx-ng.

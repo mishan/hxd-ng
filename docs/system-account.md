@@ -2,7 +2,7 @@
 
 Status: partial. Built: the account on the roster, the reserved login,
 the command line and `/help`, `/msg`, `/report`, `/block`, `/unblock`,
-`/blocks`, `/stop`, `/rooms`, `/join` and `/part`, the rate limit,
+`/blocks`, `/stop`, `/rooms`, `/join`, `/part`, `/roles` and `/role`, the rate limit,
 `[system]`, and moderation's report lines to legacy moderators. Not
 built: `/vouch`, which waits on vouching, and §4's queued-mail option,
 which is not to be defaulted on before it has been seen on a real 1.5
@@ -113,6 +113,7 @@ has.
 | `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |
 | `/rooms [word]` | The rooms this session may join, one a line, its own first, or those whose name or topic holds the word: [chat-rooms.md](chat-rooms.md) §6.1 | — |
 | `/join <room>`, `/part <room>` | Invites this session into a room, which a period client joins with 115, or leaves one: chat-rooms.md §6.1–§6.2. A room it may not see is `error: no such room` | the room's gates |
+| `/roles`, `/role <login>`, `/role add <login> <role>`, `/role remove <login> <role>` | The roles and how many accounts hold each, an account's roles and overrides, and giving or taking a role, by login and never by nick: [roles.md](roles.md) §6.3 | `read_users`; giving and taking, `modify_users` under roles.md §5 |
 | `/vouch <who>`, `/unvouch <who>`, `/vouches` *(not built)* | `identity-vouch.md` §3.2, by nick: the roster session's identity fingerprint is what gets vouched for, so a period client can vouch for the person it can see | `[extra] vouch` |
 
 Every command runs **as the session that sent it**, with that session's

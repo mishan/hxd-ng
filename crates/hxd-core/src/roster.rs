@@ -314,6 +314,8 @@ pub struct UserDetails {
     pub login: String,
     pub addr: Option<IpAddr>,
     pub connected_at: Instant,
+    /// The roles its account lists.
+    pub roles: Vec<String>,
 }
 
 /// A domain event, delivered on session channels. The session layer encodes
@@ -2386,6 +2388,10 @@ impl Core {
                 login: s.login.clone(),
                 addr: s.addr,
                 connected_at: s.connected_at,
+                roles: s
+                    .account
+                    .as_ref()
+                    .map_or_else(Vec::new, |a| a.roles.clone()),
             })
     }
 

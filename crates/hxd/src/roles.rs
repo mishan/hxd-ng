@@ -4,11 +4,11 @@
 //! session is told what its account now resolves to.
 
 use hxd_auth_file::roles::{self, valid_name};
-use hxd_auth_file::{named_bit, Role, Roles, EVERYONE};
+use hxd_auth_file::{edit_listed, named_bit, Role, Roles, EVERYONE};
 use hxd_core::access;
 use hxd_core::AccountAdmin;
 
-use crate::accounts::{backend, edit_listed, parse_change};
+use crate::accounts::{backend, parse_change};
 use crate::Config;
 
 fn load(config: &Config) -> Result<Roles, String> {

@@ -16,8 +16,13 @@
 //! An edit made beside the server reaches them on SIGHUP.
 
 use crate::access::bit;
-use crate::account::{Account, AccountAdmin, AccountEdit, AdminError, DenyMask, FIELD_MAX_CHARS};
+use crate::account::{
+    Account, AccountAdmin, AccountEdit, AdminError, DenyMask, RoleView, FIELD_MAX_CHARS,
+};
 use crate::roster::{Core, Event, RosterInner, Uid};
+
+/// The role every account holds (`docs/roles.md` §2.2).
+pub const EVERYONE: &str = "everyone";
 
 /// What [`Core::account_write`] may do about whether the account exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +82,44 @@ impl Core {
     pub fn account_read(&self, uid: Uid, login: &str) -> Result<Account, AdminError> {
         self.admin_backend(uid, bit::READ_USERS)?
             .read_account(login)
+    }
+
+    /// Every role, highest first, with how many accounts hold it, for a
+    /// session holding read-users.
+    pub fn role_list(&self, uid: Uid) -> Result<Vec<(RoleView, usize)>, AdminError> {
+        let admin = self.admin_backend(uid, bit::READ_USERS)?;
+        let accounts = admin.list_accounts()?;
+        Ok(admin
+            .roles()
+            .into_iter()
+            .map(|role| {
+                let held = accounts
+                    .iter()
+                    .filter(|a| role.name == EVERYONE || a.roles.contains(&role.name))
+                    .count();
+                (role, held)
+            })
+            .collect())
+    }
+
+    /// The titles of the roles `listed` names that exist, highest first,
+    /// for display. `everyone` is left out: it says nothing about anyone.
+    pub fn role_titles(&self, listed: &[String]) -> Vec<String> {
+        let Some(admin) = self.admin.as_deref() else {
+            return Vec::new();
+        };
+        admin
+            .roles()
+            .into_iter()
+            .filter(|role| role.name != EVERYONE && listed.contains(&role.name))
+            .map(|role| role.title)
+            .collect()
+    }
+
+    /// The keys the account `login` names sets over its roles, for a
+    /// session holding read-users.
+    pub fn account_own_keys(&self, uid: Uid, login: &str) -> Result<Vec<String>, AdminError> {
+        self.admin_backend(uid, bit::READ_USERS)?.own_keys(login)
     }
 
     /// Every account, for a session holding read-users.

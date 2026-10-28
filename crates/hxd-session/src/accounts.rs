@@ -42,8 +42,22 @@ pub(crate) fn editor_tier(version: Option<u16>) -> u8 {
     }
 }
 
+/// What Open User showed, by login: the bits as the account had them.
+/// Set User carries the bitmap as it stood then, so a role changed while
+/// the editor was open would otherwise be saved over (`docs/roles.md`
+/// §6.1). Keyed, because a period client can have several accounts open.
+pub(crate) type Opened = std::collections::HashMap<String, AccessBits>;
+
+/// The most accounts remembered as open at once: past it a client is
+/// forgetting to save, and its oldest saves fall back to writing the
+/// bitmap as sent.
+const OPENED_MAX: usize = 16;
+
+type Fields = Vec<(u16, Vec<u8>)>;
+
 /// Answer one request for session `uid`, whose editor shows the access
-/// bits up to `tier`: the reply's fields, or the task error's text.
+/// bits up to `tier` and has `opened` open: the reply's fields, or the
+/// task error's text.
 pub(crate) fn transaction(
     core: &Core,
     uid: Uid,
@@ -51,13 +65,18 @@ pub(crate) fn transaction(
     tier: u8,
     ty: u32,
     fields: &[(u16, Vec<u8>)],
-) -> Result<Vec<(u16, Vec<u8>)>, String> {
+    opened: &mut Opened,
+) -> Result<Fields, String> {
     let field = |want: u16| fields.iter().find(|(t, _)| *t == want).map(|(_, d)| &d[..]);
     let text = |bytes: &[u8]| enc.decode_chars(bytes, FIELD_MAX_CHARS);
     let obfuscated = |bytes: &[u8]| text(&bytes.iter().map(|b| !b).collect::<Vec<_>>());
     let login = field(tag::LOGIN).unwrap_or_default();
     if ty == ClientHdr::AccountRead.as_u32() {
         let account = core.account_read(uid, &text(login)).map_err(err_text)?;
+        if opened.len() >= OPENED_MAX {
+            opened.clear();
+        }
+        opened.insert(account.login.clone(), account.access);
         return Ok(vec![
             (tag::NAME, enc.encode_capped(&account.name, FIELD_MAX_CHARS)),
             (
@@ -71,8 +90,13 @@ pub(crate) fn transaction(
     let login = obfuscated(login);
     if ty == ACCOUNT_DELETE {
         core.account_delete(uid, &login).map_err(err_text)?;
+        opened.remove(&login.to_ascii_lowercase());
         return Ok(Vec::new());
     }
+    let shown = match ty {
+        ACCOUNT_CREATE => None,
+        _ => opened.get(&login.to_ascii_lowercase()).copied(),
+    };
     let edit = AccountEdit {
         login,
         name: field(tag::NAME).filter(|n| !n.is_empty()).map(text),
@@ -86,6 +110,8 @@ pub(crate) fn transaction(
             .and_then(|a| a.get(..8))
             .map(|a| AccessBits::from_wire(a.try_into().expect("eight bytes"))),
         editor_tier: Some(tier),
+        shown,
+        roles: Vec::new(),
     };
     let mode = if ty == ACCOUNT_CREATE {
         WriteMode::Create
@@ -93,6 +119,7 @@ pub(crate) fn transaction(
         WriteMode::CreateOrModify
     };
     core.account_write(uid, &edit, mode).map_err(err_text)?;
+    opened.remove(&edit.login.to_ascii_lowercase());
     Ok(Vec::new())
 }
 

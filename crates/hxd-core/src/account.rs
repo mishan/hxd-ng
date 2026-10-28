@@ -503,6 +503,29 @@ pub struct AccountEdit {
     /// the account keeps them as its file has them, so a bit it never
     /// named goes on following its roles, or, for bit 56, `read_chat`.
     pub editor_tier: Option<u8>,
+    /// The bits the editor was shown when it opened the account. A bit
+    /// `access` leaves as it was shown is not this edit's to say either:
+    /// it keeps what the account has now, so a role changed while the
+    /// editor was open is not written back as an override.
+    pub shown: Option<AccessBits>,
+    /// Roles to give or take away, by name (`docs/roles.md` §5).
+    pub roles: Vec<RoleChange>,
+}
+
+/// One role given to an account, or taken from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleChange {
+    Add(String),
+    Remove(String),
+}
+
+/// A role as an administrator lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleView {
+    pub name: String,
+    pub title: String,
+    /// Display order, highest first.
+    pub position: i64,
 }
 
 /// Why an account was not read, written or deleted.
@@ -514,6 +537,9 @@ pub enum AdminError {
     /// session's account may not.
     Outranked,
     NoSuchAccount,
+    /// An edit gave a role there is none of, or `everyone`, which every
+    /// account holds already, or took one the account does not list.
+    NoSuchRole,
     /// A create named a login an account already has.
     Exists,
     /// Not a login this backend can store, or one reserved for the
@@ -533,6 +559,7 @@ impl std::fmt::Display for AdminError {
                 "That account may do, or would be allowed to do, something you may not."
             }
             AdminError::NoSuchAccount => "There is no such account.",
+            AdminError::NoSuchRole => "There is no such role.",
             AdminError::Exists => "That account already exists.",
             AdminError::InvalidLogin => {
                 "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."
@@ -575,6 +602,17 @@ pub trait AccountAdmin: Send + Sync + 'static {
         login: &str,
         check: &dyn Fn(&Account) -> Result<(), AdminError>,
     ) -> Result<(), AdminError>;
+
+    /// Every role, highest position first.
+    fn roles(&self) -> Vec<RoleView> {
+        Vec::new()
+    }
+
+    /// The keys `login`'s own record sets over its roles, as `key=value`
+    /// (`extra.` before an `[extra]` key's name).
+    fn own_keys(&self, login: &str) -> Result<Vec<String>, AdminError> {
+        self.read_account(login).map(|_| Vec::new())
+    }
 
     /// Read again what the backend keeps beside the accounts, such as
     /// roles, for [`crate::Core::reload_accounts`]. On failure what it

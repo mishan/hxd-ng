@@ -323,6 +323,17 @@ impl Core {
                 self.command_report(from, who, &reason)
             }
             "stop" => self.command_stop(from, words.next()),
+            "roles" if self.accounts_enabled() => self.command_roles(from),
+            "role" if self.accounts_enabled() => {
+                let words: Vec<&str> = words.collect();
+                match words[..] {
+                    [verb @ ("add" | "remove"), login, role] => {
+                        self.command_role_change(from, login, role, verb == "add")
+                    }
+                    [login] if !matches!(login, "add" | "remove") => self.command_role(from, login),
+                    _ => "error: /role <login>, or /role add|remove <login> <role>".into(),
+                }
+            }
             "rooms" if self.rooms_enabled() => self.command_rooms(from, words.next()),
             "join" | "part" if self.rooms_enabled() => match words.next() {
                 Some(name) => self.command_join_part(from, name, command == "join"),
@@ -350,7 +361,73 @@ impl Core {
                  /join <room>, /part <room> — join a room, or leave one",
             );
         }
+        if self.accounts_enabled() {
+            help.push_str(
+                "\n/roles, /role <login>, /role add|remove <login> <role> — for administrators",
+            );
+        }
         help
+    }
+
+    /// `/roles` (`docs/roles.md` §6.3).
+    fn command_roles(&self, from: Uid) -> String {
+        match self.role_list(from) {
+            Ok(roles) => {
+                let lines: Vec<String> = roles
+                    .iter()
+                    .map(|(role, held)| match role.title == role.name {
+                        true => format!("{}: {held}", role.name),
+                        false => format!("{} ({}): {held}", role.title, role.name),
+                    })
+                    .collect();
+                format!("ok: roles and their holders\n{}", lines.join("\n"))
+            }
+            Err(e) => admin_refused(e),
+        }
+    }
+
+    /// `/role <login>`. By login alone, never by nick, as an account
+    /// edit is: anyone can take a nick that names someone else.
+    fn command_role(&self, from: Uid, login: &str) -> String {
+        let (account, own) = match self
+            .account_read(from, login)
+            .and_then(|a| Ok((a, self.account_own_keys(from, login)?)))
+        {
+            Ok(found) => found,
+            Err(e) => return admin_refused(e),
+        };
+        let list = |v: &[String]| match v {
+            [] => "none".to_owned(),
+            v => v.join(" "),
+        };
+        format!(
+            "ok: {} — roles {}; overrides {}",
+            account.login,
+            list(&account.roles),
+            list(&own)
+        )
+    }
+
+    /// `/role add` and `/role remove`: an account edit, under the rule
+    /// every account edit is held to (`docs/roles.md` §5).
+    fn command_role_change(&self, from: Uid, login: &str, role: &str, add: bool) -> String {
+        let role = role.trim_start_matches('@').to_ascii_lowercase();
+        let edit = crate::AccountEdit {
+            login: login.to_owned(),
+            roles: vec![match add {
+                true => crate::RoleChange::Add(role.clone()),
+                false => crate::RoleChange::Remove(role.clone()),
+            }],
+            ..Default::default()
+        };
+        match self.account_write(from, &edit, crate::admin::WriteMode::Modify) {
+            Ok(account) if add => format!("ok: {} holds {role}", account.login),
+            Ok(account) => format!("ok: {} does not hold {role}", account.login),
+            Err(crate::AdminError::NoSuchRole) if !add => {
+                format!("error: {login} does not hold {role}")
+            }
+            Err(e) => admin_refused(e),
+        }
     }
 
     /// `/rooms`: one line a room, the session's own first, cut to one
@@ -653,6 +730,17 @@ impl Core {
                 signed: None,
             },
         );
+    }
+}
+
+/// An account command's refusal, as a sentence.
+fn admin_refused(e: crate::AdminError) -> String {
+    match e {
+        crate::AdminError::Backend(e) => {
+            tracing::warn!("account administration failed: {e}");
+            "error: that did not work".into()
+        }
+        e => format!("error: {e}"),
     }
 }
 

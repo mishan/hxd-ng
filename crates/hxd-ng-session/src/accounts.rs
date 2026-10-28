@@ -46,6 +46,7 @@ fn admin_err(e: AdminError) -> (&'static str, String) {
         AdminError::NotAllowed => "access_denied",
         AdminError::Outranked => "outranked",
         AdminError::NoSuchAccount => "no_such_account",
+        AdminError::NoSuchRole => "no_such_role",
         AdminError::Exists => "already_exists",
         AdminError::InvalidLogin => "invalid_login",
         AdminError::Unsupported => "not_available",
@@ -113,7 +114,7 @@ impl EditParams {
             name: self.name.filter(|n| !n.is_empty()),
             password: self.password,
             access,
-            editor_tier: None,
+            ..Default::default()
         })
     }
 }
