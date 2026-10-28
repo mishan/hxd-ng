@@ -3,7 +3,7 @@
 //! server reads the file again on SIGHUP, with the accounts, and every
 //! session is told what its account now resolves to.
 
-use hxd_auth_file::roles::{self, valid_name};
+use hxd_auth_file::roles::{self, role_table, roles_table, valid_name};
 use hxd_auth_file::{edit_listed, named_bit, Role, Roles, EVERYONE};
 use hxd_core::access;
 use hxd_core::AccountAdmin;
@@ -13,34 +13,6 @@ use crate::Config;
 
 fn load(config: &Config) -> Result<Roles, String> {
     Roles::load(&config.roles.file)
-}
-
-/// The `[role]` table, made if the file has none.
-fn roles_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut dyn toml_edit::TableLike, String> {
-    doc.entry("role")
-        .or_insert_with(|| {
-            let mut t = toml_edit::Table::new();
-            t.set_implicit(true);
-            toml_edit::Item::Table(t)
-        })
-        .as_table_like_mut()
-        .ok_or_else(|| "role is not a table".to_string())
-}
-
-/// Role `name`'s table: `everyone`'s is made if the file has none, since
-/// that role exists whether the file says so or not.
-fn role_table<'a>(
-    doc: &'a mut toml_edit::DocumentMut,
-    name: &str,
-) -> Result<&'a mut dyn toml_edit::TableLike, String> {
-    let table = roles_table(doc)?;
-    if name == EVERYONE && !table.contains_key(name) {
-        table.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    table
-        .get_mut(name)
-        .and_then(|item| item.as_table_like_mut())
-        .ok_or_else(|| format!("there is no role {name:?}"))
 }
 
 /// Turn each `key=on|off` of `changes` in role `name`'s `table` (`access`
@@ -269,4 +241,15 @@ pub fn remove(config: &Config, name: &str) -> Result<String, String> {
     Ok(format!(
         "deleted role {name}; {held} accounts listed it and no longer do"
     ))
+}
+
+/// A `roles_changed` held back so as not to follow another too closely
+/// goes once it may (`hxd_core::admin::ROLES_CHANGED_EVERY`).
+pub async fn roles_flusher(core: std::sync::Arc<hxd_core::Core>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        core.flush_roles_changed();
+    }
 }

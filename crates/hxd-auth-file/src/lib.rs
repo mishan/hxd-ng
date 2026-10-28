@@ -39,11 +39,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use hxd_core::access::{self, bit, AccessBits, NAMES};
+use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::inbox::Mailbox;
 use hxd_core::{
     Account, AccountAdmin, AccountConfig, AccountDirectory, AccountEdit, AdminError, AuthBackend,
-    AuthError, Extras, IdentityLink, LinkOutcome, Proof, RoleChange, RoleView, UnlinkOutcome,
-    WriteCheck,
+    AuthError, Extras, IdentityLink, LinkOutcome, Proof, RoleChange, RoleCheck, RoleEdit, RoleView,
+    UnlinkOutcome, WriteCheck,
 };
 use serde::Deserialize;
 
@@ -913,19 +914,7 @@ impl AccountAdmin for FileAuth {
     }
 
     fn roles(&self) -> Vec<RoleView> {
-        let mut all: Vec<RoleView> = self
-            .roles()
-            .iter()
-            .map(|r| RoleView {
-                name: r.name.clone(),
-                title: r.title.clone(),
-                color: r.color,
-                position: r.position,
-                mentionable: r.mentionable,
-                access: r.access,
-                extra: r.extra_names(),
-            })
-            .collect();
+        let mut all: Vec<RoleView> = self.roles().iter().map(Role::view).collect();
         all.sort_by(|a, b| b.position.cmp(&a.position).then(a.name.cmp(&b.name)));
         all
     }
@@ -946,6 +935,116 @@ impl AccountAdmin for FileAuth {
             }
         }
         Ok(own)
+    }
+
+    fn write_role(
+        &self,
+        edit: &RoleEdit,
+        create: bool,
+        check: RoleCheck<'_>,
+    ) -> Result<RoleView, AdminError> {
+        let path = self.roles_file.as_ref().ok_or(AdminError::Unsupported)?;
+        if !roles::valid_name(&edit.name) {
+            return Err(AdminError::BadRole(
+                "A role's name is 1 to 30 lowercase letters, digits, - and _, \
+                 starting with a letter or digit.",
+            ));
+        }
+        if edit
+            .extra
+            .iter()
+            .flatten()
+            .any(|k| !roles::EXTRA_KEYS.contains(&k.as_str()))
+        {
+            return Err(AdminError::BadRole(
+                "A role grants only the [extra] keys that say what an account may do.",
+            ));
+        }
+        if edit
+            .title
+            .as_ref()
+            .is_some_and(|t| t.is_empty() || t.chars().count() > FIELD_MAX_CHARS)
+        {
+            return Err(AdminError::BadRole("A title is 1 to 31 characters."));
+        }
+        if edit.color.flatten().is_some_and(|c| c > 0xff_ffff) {
+            return Err(AdminError::BadRole("A color is 0xRRGGBB."));
+        }
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        // The file as it is on disk, which `hxd role` may have changed
+        // since it was read: what an edit is checked against and applied
+        // to.
+        let (_, now) = roles::prepare(path, |_| Ok(())).map_err(AdminError::Backend)?;
+        let before = now.get(&edit.name).map(Role::view);
+        match (&before, create) {
+            (Some(_), true) => return Err(AdminError::Exists),
+            (None, false) => return Err(AdminError::NoSuchRole),
+            _ => {}
+        }
+        let (text, after) = roles::prepare(path, |doc| {
+            if create {
+                roles::roles_table(doc)?
+                    .insert(&edit.name, toml_edit::Item::Table(toml_edit::Table::new()));
+            }
+            roles::apply(roles::role_table(doc, &edit.name)?, edit)
+        })
+        .map_err(AdminError::Backend)?;
+        let role = after
+            .get(&edit.name)
+            .map(Role::view)
+            .ok_or_else(|| AdminError::Backend("the role is gone".into()))?;
+        // Its holders as they read now, and as the edit would leave them:
+        // a bit it grants may bring others that derive from it.
+        check(
+            before.as_ref(),
+            Some(&role),
+            &self.holders(&edit.name, &now)?,
+            &self.holders(&edit.name, &after)?,
+        )?;
+        write_atomic(path, &text)
+            .map_err(|e| AdminError::Backend(format!("{}: {e}", path.display())))?;
+        *self.roles.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(after);
+        Ok(role)
+    }
+
+    fn delete_role(&self, name: &str, check: RoleCheck<'_>) -> Result<(), AdminError> {
+        let path = self.roles_file.as_ref().ok_or(AdminError::Unsupported)?;
+        if name == EVERYONE {
+            return Err(AdminError::BadRole(
+                "everyone is every account, and cannot be deleted.",
+            ));
+        }
+        let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
+        // The roles file read and its new text made before any account
+        // is touched, so one that does not parse refuses the delete whole.
+        let (_, now) = roles::prepare(path, |_| Ok(())).map_err(AdminError::Backend)?;
+        let role = now
+            .get(name)
+            .map(Role::view)
+            .ok_or(AdminError::NoSuchRole)?;
+        let (text, after) = roles::prepare(path, |doc| {
+            roles::roles_table(doc)?.remove(name);
+            Ok(())
+        })
+        .map_err(AdminError::Backend)?;
+        let holders = self.holders(name, &now)?;
+        // Taking a role away brings nothing with it, so there is nobody to
+        // check as the delete leaves them.
+        check(Some(&role), None, &holders, &[])?;
+        // The accounts first, so that a delete cut short leaves a role
+        // nobody holds rather than accounts listing one that is gone.
+        for account in &holders {
+            let path = self.dir.join(format!("{}.toml", account.login));
+            let failed =
+                |e: &dyn std::fmt::Display| AdminError::Backend(format!("{}: {e}", path.display()));
+            let mut doc = self.document(&account.login)?;
+            edit_listed(&mut doc, |listed| listed.retain(|n| n != name));
+            write_atomic(&path, &doc.to_string()).map_err(|e| failed(&e))?;
+        }
+        write_atomic(path, &text)
+            .map_err(|e| AdminError::Backend(format!("{}: {e}", path.display())))?;
+        *self.roles.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(after);
+        Ok(())
     }
 
     fn reload(&self) -> Result<(), String> {
@@ -971,6 +1070,21 @@ impl AccountAdmin for FileAuth {
             std::io::ErrorKind::NotFound => AdminError::NoSuchAccount,
             _ => AdminError::Backend(format!("{}: {e}", path.display())),
         })
+    }
+}
+
+impl FileAuth {
+    /// Every account holding role `name`, all of them for `everyone`, as
+    /// `roles` resolves them.
+    fn holders(&self, name: &str, roles: &Roles) -> Result<Vec<Account>, AdminError> {
+        Ok(self
+            .entries()
+            .map_err(admin_error)?
+            .into_iter()
+            .filter(|(login, _)| !self.is_reserved(login))
+            .filter_map(|(login, _)| Some(self.load(&login).ok()?.into_account(login, roles)))
+            .filter(|a| name == EVERYONE || a.roles.iter().any(|r| r == name))
+            .collect())
     }
 }
 

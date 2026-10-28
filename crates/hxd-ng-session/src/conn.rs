@@ -113,7 +113,8 @@ fn request_weight(req: &str) -> u32 {
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
         | "report_close" | "redact" | "revoke" | "kick" | "account_get" | "account_create"
-        | "account_update" | "account_delete" | "room_topic" | "room_join" | "room_part" => 2,
+        | "account_update" | "account_delete" | "role_create" | "role_update" | "role_delete"
+        | "room_topic" | "room_join" | "room_part" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
@@ -1624,7 +1625,8 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// it.) The file-area changes are its Delete File, New Folder, Set File
 /// Info and Move File, 7 each, an upload its Upload File, 3, and the
 /// account requests its New, Delete,
-/// Open and Set User, 20 each but Open's 10. Whatever else this wire asks
+/// Open and Set User, 20 each but Open's 10, and the role writes Set
+/// User's. Whatever else this wire asks
 /// for, it has no classic counterpart to be priced by, and is held to the
 /// request limit instead. As `(type, points)`.
 fn spam_charge(req: &str) -> Option<(u32, u32)> {
@@ -1648,6 +1650,8 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "account_delete" => Some((0x15f, 20)),
         "account_get" => Some((0x160, 10)),
         "account_update" => Some((0x161, 20)),
+        // A role edit is an edit of every account holding it: Set User.
+        "role_create" | "role_update" | "role_delete" => Some((0x161, 20)),
         _ => None,
     }
 }

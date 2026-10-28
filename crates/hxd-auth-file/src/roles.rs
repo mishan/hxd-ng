@@ -59,6 +59,19 @@ impl Role {
             .collect()
     }
 
+    /// As an administrator lists it.
+    pub fn view(&self) -> hxd_core::RoleView {
+        hxd_core::RoleView {
+            name: self.name.clone(),
+            title: self.title.clone(),
+            color: self.color,
+            position: self.position,
+            mentionable: self.mentionable,
+            access: self.access,
+            extra: self.extra_names(),
+        }
+    }
+
     fn empty(name: &str) -> Role {
         Role {
             name: name.to_owned(),
@@ -274,6 +287,17 @@ pub fn edit(
     path: &Path,
     f: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) -> Result<Roles, String> {
+    let (text, roles) = prepare(path, f)?;
+    crate::write_atomic(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(roles)
+}
+
+/// What [`edit`] would write, and the roles it would read as, for a
+/// caller that decides between the two whether to write it.
+pub(crate) fn prepare(
+    path: &Path,
+    f: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(String, Roles), String> {
     let failed = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     let old = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
@@ -291,6 +315,98 @@ pub fn edit(
         None => format!("{HEADER}\n{doc}"),
     };
     let roles = Roles::parse(&text).map_err(|e| failed(&e))?;
-    crate::write_atomic(path, &text).map_err(|e| failed(&e))?;
-    Ok(roles)
+    Ok((text, roles))
+}
+
+/// The `[role]` table, made if the file has none.
+pub fn roles_table(
+    doc: &mut toml_edit::DocumentMut,
+) -> Result<&mut dyn toml_edit::TableLike, String> {
+    doc.entry("role")
+        .or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            toml_edit::Item::Table(t)
+        })
+        .as_table_like_mut()
+        .ok_or_else(|| "role is not a table".to_string())
+}
+
+/// Role `name`'s table: `everyone`'s is made if the file has none, since
+/// that role exists whether the file says so or not.
+pub fn role_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    name: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, String> {
+    let table = roles_table(doc)?;
+    if name == EVERYONE && !table.contains_key(name) {
+        table.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    table
+        .get_mut(name)
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or_else(|| format!("there is no role {name:?}"))
+}
+
+/// Make role `name`'s table say what `edit` changes: each field it names
+/// replaced, and what a role leaves out by not granting it removed.
+pub(crate) fn apply(
+    role: &mut dyn toml_edit::TableLike,
+    edit: &hxd_core::RoleEdit,
+) -> Result<(), String> {
+    if let Some(title) = &edit.title {
+        role.insert("title", toml_edit::value(title.as_str()));
+    }
+    match edit.color {
+        Some(Some(color)) => {
+            let hex: toml_edit::Value = format!("0x{color:06x}")
+                .parse()
+                .map_err(|e| format!("{e}"))?;
+            role.insert("color", toml_edit::value(hex));
+        }
+        Some(None) => {
+            role.remove("color");
+        }
+        None => {}
+    }
+    if let Some(position) = edit.position {
+        role.insert("position", toml_edit::value(position));
+    }
+    match edit.mentionable {
+        Some(true) => {
+            role.insert("mentionable", toml_edit::value(true));
+        }
+        Some(false) => {
+            role.remove("mentionable");
+        }
+        None => {}
+    }
+    if let Some(access) = edit.access {
+        let (names, raw) = hxd_core::access::names_of(access);
+        let mut grants = toml_edit::InlineTable::new();
+        for name in names {
+            grants.insert(name, true.into());
+        }
+        if !raw.is_empty() {
+            let raw: toml_edit::Array = raw.into_iter().map(i64::from).collect();
+            grants.insert("raw_bits", raw.into());
+        }
+        set_or_remove(role, "access", grants);
+    }
+    if let Some(extra) = &edit.extra {
+        let mut grants = toml_edit::InlineTable::new();
+        for key in extra {
+            grants.insert(key, true.into());
+        }
+        set_or_remove(role, "extra", grants);
+    }
+    Ok(())
+}
+
+fn set_or_remove(role: &mut dyn toml_edit::TableLike, key: &str, grants: toml_edit::InlineTable) {
+    if grants.is_empty() {
+        role.remove(key);
+    } else {
+        role.insert(key, toml_edit::value(grants));
+    }
 }

@@ -1581,6 +1581,9 @@ async fn main() {
         if ctx.core.rooms_enabled() {
             tokio::spawn(hxd::rooms::topic_flusher(ctx.core.clone()));
         }
+        if ctx.core.accounts_enabled() {
+            tokio::spawn(hxd::roles::roles_flusher(ctx.core.clone()));
+        }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
         let link_status = config.link.as_ref().map(hxd::link::status_path);

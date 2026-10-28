@@ -523,6 +523,33 @@ pub enum RoleChange {
     Remove(String),
 }
 
+/// An administrator's change to one role. `None` keeps what the role
+/// has; a new role takes its name as its title and grants nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleEdit {
+    pub name: String,
+    pub title: Option<String>,
+    /// `Some(None)` clears it.
+    pub color: Option<Option<u32>>,
+    pub position: Option<i64>,
+    pub mentionable: Option<bool>,
+    /// Replaces the bits it grants.
+    pub access: Option<AccessBits>,
+    /// Replaces the `[extra]` keys it grants, by name.
+    pub extra: Option<Vec<String>>,
+}
+
+/// What a role write asks before it lands: the role as it is (`None`
+/// when there is none), as the write would leave it (`None` for a
+/// delete), and every account holding it as they read now and as the
+/// write would leave them. Run by the backend with its writes held.
+pub type RoleCheck<'a> = &'a dyn Fn(
+    Option<&RoleView>,
+    Option<&RoleView>,
+    &[Account],
+    &[Account],
+) -> Result<(), AdminError>;
+
 /// A role as an administrator lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleView {
@@ -551,6 +578,8 @@ pub enum AdminError {
     /// An edit gave a role there is none of, or `everyone`, which every
     /// account holds already, or took one the account does not list.
     NoSuchRole,
+    /// A role write this backend will not make, and why.
+    BadRole(&'static str),
     /// A create named a login an account already has.
     Exists,
     /// Not a login this backend can store, or one reserved for the
@@ -571,6 +600,7 @@ impl std::fmt::Display for AdminError {
             }
             AdminError::NoSuchAccount => "There is no such account.",
             AdminError::NoSuchRole => "There is no such role.",
+            AdminError::BadRole(why) => why,
             AdminError::Exists => "That account already exists.",
             AdminError::InvalidLogin => {
                 "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."
@@ -623,6 +653,27 @@ pub trait AccountAdmin: Send + Sync + 'static {
     /// (`extra.` before an `[extra]` key's name).
     fn own_keys(&self, login: &str) -> Result<Vec<String>, AdminError> {
         self.read_account(login).map(|_| Vec::new())
+    }
+
+    /// Make the role `edit` names, or change it, once `check` has passed;
+    /// refusing is `check`'s. Answers the role as it now reads. A create
+    /// of a role that exists is [`AdminError::Exists`], a change of one
+    /// that does not [`AdminError::NoSuchRole`].
+    fn write_role(
+        &self,
+        edit: &RoleEdit,
+        create: bool,
+        check: RoleCheck<'_>,
+    ) -> Result<RoleView, AdminError> {
+        let _ = (edit, create, check);
+        Err(AdminError::Unsupported)
+    }
+
+    /// Delete the role `name`, taking it out of every account listing
+    /// it, once `check` has passed.
+    fn delete_role(&self, name: &str, check: RoleCheck<'_>) -> Result<(), AdminError> {
+        let _ = (name, check);
+        Err(AdminError::Unsupported)
     }
 
     /// Read again what the backend keeps beside the accounts, such as
