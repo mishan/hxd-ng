@@ -235,6 +235,11 @@ impl AccountFile {
             extra: own.zip_with(granted, |own, role| own.or(role.then_some(true))),
             grant,
             deny,
+            roles: roles
+                .held(&self.roles)
+                .filter(|r| r.name != EVERYONE)
+                .map(|r| r.name.clone())
+                .collect(),
         }
     }
 

@@ -217,6 +217,11 @@ pub struct AccountConfig {
     pub grant: AccessBits,
     /// The bits the account's own file withholds, whatever its roles do.
     pub deny: AccessBits,
+    /// The roles it holds that exist, `everyone` aside: what a gate's
+    /// `@role` asks (`docs/roles.md` §10). A name with no role behind it
+    /// admits nobody, so recreating a role does not let its old holders
+    /// back in by a list nobody looked at.
+    pub roles: Vec<String>,
 }
 
 /// What a session is denied whatever its account says: probation's and

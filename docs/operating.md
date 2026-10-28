@@ -309,7 +309,7 @@ no roles file there are no roles.
 ### Curated rooms
 
 Rooms beside the lobby, persistent and gated by `read` and `post` lists
-of logins, are on unless `[rooms] enabled = false`; the rooms themselves
+of logins and `@role`s, are on unless `[rooms] enabled = false`; the rooms themselves
 are in `[rooms] file`, managed by hand, by `hxd room` and by an ng
 client's room requests ([chat-rooms.md](chat-rooms.md)). Their lines are
 logged where `[history]` logs the lobby's.

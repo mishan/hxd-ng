@@ -488,7 +488,7 @@ fn a_room_is_entered_and_spoken_in_as_its_gates_allow() {
                 ..named("roles")
             }
         ),
-        Err(RoomError::Invalid(_))
+        Err(RoomError::NoSuchRole)
     ));
 }
 

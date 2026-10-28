@@ -717,8 +717,8 @@ else, who is admitted is not their business.
 | `room_topic` | `room`, `topic` | `{}` | `no_such_room`, `access_denied` |
 | `chat` | gains `room?` | as now | gains `no_such_room`, `not_a_member`, `read_only`, `signature_required` |
 | `history` | gains `room?` | as now | gains `no_such_room`, `encryption_required` |
-| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `signed?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request` |
-| `room_edit` | `room`, then any of `room_create`'s fields | `{ "room": {…} }` | `access_denied`, `no_such_room`, `name_taken`, `bad_request` |
+| `room_create` | `name`, `topic?`, `position?`, `read?`, `post?`, `secure?`, `signed?`, `max_lines?`, `max_days?` | `{ "room": {…} }` | `access_denied`, `name_taken`, `rooms_full`, `bad_request`, `no_such_role` |
+| `room_edit` | `room`, then any of `room_create`'s fields | `{ "room": {…} }` | `access_denied`, `no_such_room`, `name_taken`, `bad_request`, `no_such_role` |
 | `room_archive` / `room_unarchive` | `room` | `{}` | `access_denied`, `no_such_room` |
 
 - `no_such_room` covers a room this session may not see as well as one
@@ -740,7 +740,8 @@ else, who is admitted is not their business.
 - In `room_create` and `room_edit`, `read` and `post` replace the list
   when present and leave it when absent; `[]` clears it. An entry that
   is neither a login nor `@role`, or that names `@everyone`, is
-  `bad_request`.
+  `bad_request`, and one naming a role there is none of is
+  `no_such_role`.
 - `room_create`, `room_edit` and the archive requests need
   `manage_rooms`. Delete is the CLI's alone (§2.4).
 - **Weights** (`request_weight`, `conn.rs`): `rooms` light, since
@@ -1005,9 +1006,6 @@ Docker's entrypoint keeps the file in its data directory, and gains
    member's plain session; an ng session resumed through a tunnel that
    declared its downstream cleartext parted with `insecure`; `secure`
    set on a room parting its plain members.
-
-`@role` gate entries arrive with roles.md's G4. Until then a gate holds
-logins.
 
 ## 14. Open questions
 

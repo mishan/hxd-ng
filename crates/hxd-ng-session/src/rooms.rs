@@ -120,6 +120,7 @@ pub(crate) fn room_err(id: u64, e: RoomError) -> String {
         RoomError::TooManyRooms => ("too_many_rooms", "You are in as many rooms as you may be."),
         RoomError::RoomsFull => ("rooms_full", "This server has as many rooms as it may."),
         RoomError::NameTaken => ("name_taken", "A room has that name already."),
+        RoomError::NoSuchRole => ("no_such_role", "A gate names a role there is none of."),
         RoomError::Invalid(why) => ("bad_request", why),
         RoomError::AccessDenied => ("access_denied", "You are not allowed to do that."),
         RoomError::Disabled => ("not_available", "This server has no rooms."),
