@@ -68,6 +68,12 @@ async fn start() -> Running {
 /// With `roles`, accounts resolve with that roles file, kept beside them,
 /// and the system account takes commands.
 async fn start_with(roles: Option<&str>) -> Running {
+    start_bulk(roles, hxd_core::admin::BULK_ROWS).await
+}
+
+/// As [`start_with`], sending `user_changed` for at most `bulk_rows`
+/// rows one change alters.
+async fn start_bulk(roles: Option<&str>, bulk_rows: usize) -> Running {
     let accounts = tempfile::tempdir().unwrap();
     std::fs::write(
         accounts.path().join("guest.toml"),
@@ -82,7 +88,7 @@ async fn start_with(roles: Option<&str>) -> Running {
         );
     }
     let mut files = hxd_auth_file::FileAuth::new(accounts.path());
-    let mut core = Core::new();
+    let mut core = Core::new().with_bulk_rows(bulk_rows);
     if let Some(roles) = roles {
         let path = accounts.path().join("roles.toml");
         std::fs::write(&path, roles).unwrap();
@@ -1504,4 +1510,158 @@ async fn a_role_is_made_and_changed_only_within_what_its_editor_holds() {
         refused_ng(boss.request("role_get", json!({ "name": "staff" })).await),
         "no_such_role"
     );
+}
+
+#[tokio::test]
+async fn an_ng_editor_gives_roles_and_writes_the_overrides_as_given() {
+    let server = start_with(Some(ROLES)).await;
+    let (mut admin, _) = ng::Client::account(server.ng, "admin", "pw", "root")
+        .await
+        .unwrap();
+
+    // Made with a role and nothing of its own, it has what the role grants.
+    let made = admin
+        .request(
+            "account_create",
+            json!({ "login": "nia", "password": "pw", "roles": ["staff"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(made["account"]["access"], json!(["get_user_info"]));
+    assert_eq!(made["account"]["roles"], json!(["staff"]));
+    assert_eq!(made["account"]["grant"], json!([]));
+    assert_eq!(made["account"]["deny"], json!([]));
+    assert!(!std::fs::read_to_string(server.file("nia"))
+        .unwrap()
+        .contains("get_user_info"));
+
+    write(
+        server.accounts.path(),
+        "tess",
+        "password = \"pw\"\nroles = [\"gone\"]\n[access]\nread_chat = true\n\
+         send_chat = true # said by hand\n",
+    );
+    let (mut tess, _) = ng::Client::account(server.ng, "tess", "pw", "tess")
+        .await
+        .unwrap();
+    // The list replaced, a name no role has kept because the file had it,
+    // and the account's own keys exactly as sent.
+    let updated = admin
+        .request(
+            "account_update",
+            json!({ "login": "tess", "roles": ["gone", "staff", "editors"],
+                    "grant": ["send_chat"], "deny": ["get_user_info"] }),
+        )
+        .await
+        .unwrap();
+    let a = &updated["account"];
+    assert_eq!(a["roles"], json!(["gone", "staff", "editors"]));
+    assert_eq!(a["access"], json!(["send_chat", "read_users"]));
+    assert_eq!(
+        (&a["grant"], &a["deny"], &a["raw_grant"], &a["raw_deny"]),
+        (
+            &json!(["send_chat"]),
+            &json!(["get_user_info"]),
+            &json!([]),
+            &json!([])
+        )
+    );
+    let file = std::fs::read_to_string(server.file("tess")).unwrap();
+    assert!(file.contains("send_chat = true # said by hand"), "{file}");
+    assert!(file.contains("get_user_info = false"), "{file}");
+    assert!(!file.contains("read_chat"), "{file}");
+    let told = tess
+        .event_where("account_changed", |d| {
+            d["access"] == json!(["send_chat", "read_users"])
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    // Roles alone leave the account's own keys as they are.
+    admin
+        .request(
+            "account_update",
+            json!({ "login": "tess", "roles": ["editors"] }),
+        )
+        .await
+        .unwrap();
+    let file = std::fs::read_to_string(server.file("tess")).unwrap();
+    assert!(file.contains("get_user_info = false"), "{file}");
+
+    for (params, code) in [
+        (
+            json!({ "login": "tess", "access": ["read_chat"], "grant": ["read_chat"] }),
+            "bad_request",
+        ),
+        (
+            json!({ "login": "tess", "grant": ["read_chat"], "deny": ["read_chat"] }),
+            "bad_request",
+        ),
+        (json!({ "login": "tess", "raw_deny": [64] }), "bad_request"),
+        (
+            json!({ "login": "tess", "roles": ["nobody"] }),
+            "no_such_role",
+        ),
+        (
+            json!({ "login": "tess", "roles": ["everyone"] }),
+            "no_such_role",
+        ),
+        // Keepers grants manage_rooms, which the administrator may not.
+        (
+            json!({ "login": "tess", "roles": ["keepers"] }),
+            "outranked",
+        ),
+    ] {
+        assert_eq!(
+            refused_ng(admin.request("account_update", params.clone()).await),
+            code,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn past_bulk_rows_an_ng_client_syncs_and_a_classic_one_hears_each_row() {
+    let server = start_bulk(None, 1).await;
+    let dir = server.accounts.path();
+    for login in ["ann", "ben"] {
+        write(
+            dir,
+            login,
+            "password = \"pw\"\n[access]\nread_chat = true\n",
+        );
+    }
+    let mut watcher = classic(&server, "deputy", "pw").await;
+    let (mut ng_watcher, _) = ng::Client::account(server.ng, "editor", "pw", "ed")
+        .await
+        .unwrap();
+    let ann = classic(&server, "ann", "pw").await;
+    let ben = classic(&server, "ben", "pw").await;
+    let uids = [ann.uid.unwrap(), ben.uid.unwrap()];
+
+    for login in ["ann", "ben"] {
+        write(
+            dir,
+            login,
+            "password = \"pw\"\n[access]\nread_chat = true\ndisconnect_users = true\n",
+        );
+    }
+    server.core.reload_accounts();
+    for uid in uids {
+        let told = watcher
+            .recv_where(|f| f.ty == push::USER_CHANGE && f.uint(tag::UID) == Some(uid.into()))
+            .await;
+        assert!(told.is_ok(), "{told:?}");
+    }
+    assert!(ng_watcher.event("roster_stale").await.is_ok());
+    let synced = ng_watcher.request("sync", json!({})).await.unwrap();
+    for uid in uids {
+        let row = synced["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["uid"] == uid)
+            .unwrap();
+        assert_eq!(row["admin"], json!(true), "{row}");
+    }
 }

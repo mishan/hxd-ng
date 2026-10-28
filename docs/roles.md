@@ -4,11 +4,8 @@ Status: G1 and G2 are built (§14): the roles file, resolution,
 `everyone`, reload, §6.1's minimal overrides and the command line, §5's
 rule for giving and taking roles, the info line and the commands of
 §6.2 and §6.3. Its `@` login reservation is built on its own. Of G3,
-§7 is built but for `roles` and the overrides in `account_create` and
-`account_update`, and `role_in_use`, which nothing can call for until
-gates take roles (G4) and restrictions exist (G7). §4's `bulk_rows` is
-not, so a change to many holders still sends a `user_changed` per
-holder.
+§7 is built but for `role_in_use`, which nothing can call for until
+gates take roles (G4) and restrictions exist (G7).
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -251,8 +248,10 @@ seconds, and clients redraw from it: nobody is sent a `user_changed`
 per holder for a display change. A change that does alter holders'
 roster rows (bit 22's administrator flag, or who holds the role)
 sends `user_changed` per holder while there are few. Past `[roles]
-bulk_rows` holders, an ng session is sent one `roster_stale` instead,
-and answers it with `sync`. A classic session gets its 301s through
+bulk_rows` rows changed at once, by any account change, a role edit
+or a reload, an ng session is sent one `roster_stale` instead,
+and answers it with `sync`. Each sync costs a whole roster, so the
+threshold sits where that is cheaper than the rows. A classic session gets its 301s through
 its writer's byte budget like any other burst. A role's color
 reaches classic clients as each holder's next 301 or login, not as a
 burst of its own.
@@ -492,7 +491,7 @@ does.
 |---|---|---|
 | `roles_changed` | `{ "list": […] }`, as in the login reply | A role was created or deleted, or its title, color, position or mentionability changed. To every session, coalesced (§4). Clients redraw names and colors from it |
 | `user_changed` | as now | The roles a user holds changed, or a role edit changed their roster row (§4) |
-| `roster_stale` | `{}` | A role edit changed more roster rows than `[roles] bulk_rows`. The client sends `sync` |
+| `roster_stale` | `{}` | One change, a role edit or a reload most often, changed more roster rows than `[roles] bulk_rows`. The client sends `sync` |
 | `account_changed` | as now | This session's effective access changed, by a role, the account, or the mask |
 
 A change to a role's grants alone is not `roles_changed`. It reaches

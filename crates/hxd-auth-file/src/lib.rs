@@ -870,6 +870,21 @@ impl AccountAdmin for FileAuth {
                         return Err(AdminError::NoSuchRole)
                     }
                     RoleChange::Remove(name) => listed.retain(|n| n != name),
+                    // A name no role has any more can stay, but only one
+                    // the file already lists.
+                    RoleChange::Set(names) => {
+                        if names.iter().any(|name| {
+                            name == EVERYONE || roles.get(name).is_none() && !listed.contains(name)
+                        }) {
+                            return Err(AdminError::NoSuchRole);
+                        }
+                        listed.clear();
+                        for name in names {
+                            if !listed.contains(name) {
+                                listed.push(name.clone());
+                            }
+                        }
+                    }
                 }
             }
             edit_listed(&mut doc, |l| *l = listed.clone());
@@ -885,17 +900,18 @@ impl AccountAdmin for FileAuth {
             }
             (access, ..) => access,
         };
-        if old.is_none() || access.is_some() {
+        if let Some((grant, deny)) = edit.overrides {
             let table = doc["access"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
             let table = table
                 .as_table_like_mut()
                 .ok_or_else(|| failed(&"access is not a table"))?;
-            write_access(
-                table,
-                access.unwrap_or_default(),
-                roles.granted(&listed),
-                edit.editor_tier,
-            );
+            write_overrides(table, grant, deny);
+        } else if let Some(access) = access {
+            let table = doc["access"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+            let table = table
+                .as_table_like_mut()
+                .ok_or_else(|| failed(&"access is not a table"))?;
+            write_access(table, access, roles.granted(&listed), edit.editor_tier);
         }
         let text = doc.to_string();
         // Also what makes sure no file is left behind that the next login
@@ -1201,6 +1217,32 @@ fn write_access(
     )));
     set_numbers(table, "raw_bits", raw);
     set_numbers(table, "raw_deny", deny);
+}
+
+/// Make an `[access]` table set exactly `grant` and withhold exactly
+/// `deny` over its roles, keeping the comment on a key that stays.
+fn write_overrides(table: &mut dyn toml_edit::TableLike, grant: AccessBits, deny: AccessBits) {
+    if let Some(old) = table.remove("chat_history") {
+        if !table.contains_key("read_chat_history") {
+            table.insert("read_chat_history", old);
+        }
+    }
+    for (key, b) in NAMES {
+        if grant.has(*b) || deny.has(*b) {
+            set_bool(table, key, grant.has(*b));
+        } else {
+            table.remove(key);
+        }
+    }
+    let unnamed = |bits: AccessBits| {
+        access::names_of(bits)
+            .1
+            .into_iter()
+            .map(i64::from)
+            .collect()
+    };
+    set_numbers(table, "raw_bits", unnamed(grant));
+    set_numbers(table, "raw_deny", unnamed(deny));
 }
 
 /// Set `key` to `on`, keeping the comment on a value already there.
@@ -2721,6 +2763,78 @@ mod tests {
         write(td.path(), "roles.toml", "");
         auth.reload().unwrap();
         assert!(!auth.lookup("al").unwrap().access.has(bit::SEND_MEDIA));
+    }
+
+    #[test]
+    fn a_new_account_sent_no_access_has_what_everyone_grants() {
+        let td = tempfile::tempdir().unwrap();
+        write(
+            td.path(),
+            "roles.toml",
+            "[role.everyone]\naccess = { read_chat = true }\n",
+        );
+        let auth = FileAuth::new(td.path())
+            .with_roles(td.path().join("roles.toml"))
+            .unwrap();
+        let edit = AccountEdit {
+            login: "al".into(),
+            ..Default::default()
+        };
+        let made = auth.write_account(&edit, &|_, _| Ok(())).unwrap();
+        assert!(made.access.has(bit::READ_CHAT));
+        let text = std::fs::read_to_string(td.path().join("al.toml")).unwrap();
+        assert!(!text.contains("read_chat"), "{text}");
+    }
+
+    #[test]
+    fn own_keys_are_written_as_sent() {
+        use bit::{CHAT_HISTORY as HISTORY, READ_CHAT as READ, SEND_CHAT as SEND};
+        let bits = |b: &[u8]| b.iter().fold(AccessBits::empty(), |a, b| a.with(*b));
+        // The file, what is granted and denied, and text the save keeps.
+        type Row<'a> = (&'a str, &'a [u8], &'a [u8], &'a [&'a str]);
+        let rows: &[Row] = &[
+            (
+                "password = \"pw\"\n[access]\nread_chat = true # mine\nsend_chat = true\n\
+                 raw_bits = [41]\nraw_deny = [42]\n",
+                &[READ, 43],
+                &[44],
+                &["read_chat = true # mine"],
+            ),
+            (
+                "password = \"pw\"\n[access]\nchat_history = false # old\n",
+                &[],
+                &[HISTORY],
+                &["read_chat_history = false # old"],
+            ),
+            ("password = \"pw\"\n", &[SEND, 41], &[42], &[]),
+            (
+                "password = \"pw\"\naccess = { read_chat = true }\n",
+                &[],
+                &[READ],
+                &[],
+            ),
+        ];
+        for (before, grant, deny, kept) in rows {
+            let td = tempfile::tempdir().unwrap();
+            write(td.path(), "al.toml", before);
+            let auth = FileAuth::new(td.path());
+            let edit = AccountEdit {
+                login: "al".into(),
+                overrides: Some((bits(grant), bits(deny))),
+                ..Default::default()
+            };
+            auth.write_account(&edit, &|_, _| Ok(())).unwrap();
+            let config = auth.read_account("al").unwrap().config;
+            assert_eq!(
+                (config.grant, config.deny),
+                (bits(grant), bits(deny)),
+                "{before}"
+            );
+            let text = std::fs::read_to_string(td.path().join("al.toml")).unwrap();
+            for k in kept.iter() {
+                assert!(text.contains(k), "{before} -> {text}");
+            }
+        }
     }
 
     #[test]

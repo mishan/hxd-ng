@@ -886,6 +886,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             }
             ("account_changed", data)
         }
+        Event::RosterStale => ("roster_stale", json!({})),
         Event::RolesChanged(list) => (
             "roles_changed",
             json!({ "list": list.iter().map(crate::accounts::role_shown_json).collect::<Vec<_>>() }),

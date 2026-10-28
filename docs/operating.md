@@ -967,6 +967,9 @@ accounts = "accounts"
 [roles]
 file = "roles.toml"     # grants accounts share by name (roles.md);
                         # no file there means no roles
+bulk_rows = 64          # past this many roster rows changed at once, an
+                        # ng client is told to sync rather than sent each;
+                        # 0 tells it so for every change
 ```
 
 ### `[ng]`

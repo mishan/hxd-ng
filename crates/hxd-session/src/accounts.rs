@@ -111,6 +111,7 @@ pub(crate) fn transaction(
             .map(|a| AccessBits::from_wire(a.try_into().expect("eight bytes"))),
         editor_tier: Some(tier),
         shown,
+        overrides: None,
         roles: Vec::new(),
     };
     let mode = if ty == ACCOUNT_CREATE {

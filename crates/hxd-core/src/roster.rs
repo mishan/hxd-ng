@@ -235,8 +235,9 @@ pub struct Transport {
     /// (`docs/chat-rooms.md` §6.1). The ng frontend sets it.
     pub joins_rooms: bool,
     /// This link shows the roles a user holds (`docs/roles.md` §7.1), so
-    /// a change to them alone is worth telling it. A classic client's row
-    /// has nowhere to put them, and the frontend sets it only for ng.
+    /// a change to them alone is worth telling it, and can fetch the
+    /// roster again when told it is stale. A classic client's row has
+    /// nowhere to put them, and the frontend sets it only for ng.
     pub roles: bool,
 }
 
@@ -484,6 +485,10 @@ pub enum Event {
     /// one was made, deleted, or shown differently (`docs/roles.md` §7.3).
     /// Only to sessions whose transport shows roles.
     RolesChanged(Arc<[crate::RoleView]>),
+    /// Too many roster rows changed at once to send each
+    /// (`docs/roles.md` §4): the client fetches the roster with `sync`.
+    /// Only to sessions whose transport shows roles.
+    RosterStale,
     /// A public line was redacted (`docs/moderation.md` §3.1). Delivered
     /// to every session that reads public chat; a client that rendered
     /// the line blanks it in place, and one that has not never sees it
@@ -720,6 +725,7 @@ impl Event {
             Event::Kicked => "kicked",
             Event::AccountChanged(..) => "account_changed",
             Event::RolesChanged(..) => "roles_changed",
+            Event::RosterStale => "roster_stale",
             Event::ChatRedacted { .. } => "chat_redacted",
             Event::ChatPurged { .. } => "chat_purged",
             Event::Report(..) => "report",
@@ -1479,6 +1485,10 @@ pub struct Core {
     pub(crate) account_epoch: std::sync::atomic::AtomicU64,
     /// When `roles_changed` was last sent, and whether one waits to be.
     pub(crate) roles_note: Mutex<(Option<Instant>, bool)>,
+    /// How many roster rows one change sends a `user_changed` for before
+    /// a wire that can sync is sent `roster_stale` instead; `None` for
+    /// [`crate::admin::BULK_ROWS`].
+    pub(crate) bulk_rows: Option<usize>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
@@ -1723,6 +1733,13 @@ impl Core {
     /// `bytes` rather than [`crate::QUEUE_BUDGET`].
     pub fn with_queue_budget(mut self, bytes: usize) -> Self {
         self.queue_budget = crate::budget::QueueBudget::new(bytes);
+        self
+    }
+
+    /// Send `user_changed` for at most `n` roster rows one change alters
+    /// rather than [`crate::admin::BULK_ROWS`].
+    pub fn with_bulk_rows(mut self, n: usize) -> Self {
+        self.bulk_rows = Some(n);
         self
     }
 
@@ -2500,6 +2517,16 @@ pub(crate) fn is_live(sess: &UserSession) -> bool {
 
 #[cfg(test)]
 pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, Events) {
+    test_attach_on(core, nick, access, Transport::default())
+}
+
+#[cfg(test)]
+pub(crate) fn test_attach_on(
+    core: &Core,
+    nick: &str,
+    access: AccessBits,
+    transport: Transport,
+) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
             account: None,
@@ -2510,7 +2537,7 @@ pub(crate) fn test_attach(core: &Core, nick: &str, access: AccessBits) -> (Uid, 
             login: nick.to_string(),
             addr: None,
             can_detach: false,
-            transport: Transport::default(),
+            transport,
             has_inbox: false,
             attach_news: false,
             set_avatar: false,
