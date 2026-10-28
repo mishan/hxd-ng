@@ -42,7 +42,8 @@ use hxd_core::access::{self, bit, AccessBits, NAMES};
 use hxd_core::inbox::Mailbox;
 use hxd_core::{
     Account, AccountAdmin, AccountConfig, AccountDirectory, AccountEdit, AdminError, AuthBackend,
-    AuthError, Extras, IdentityLink, LinkOutcome, Proof, UnlinkOutcome, WriteCheck,
+    AuthError, Extras, IdentityLink, LinkOutcome, Proof, RoleChange, RoleView, UnlinkOutcome,
+    WriteCheck,
 };
 use serde::Deserialize;
 
@@ -195,21 +196,22 @@ impl AccountFile {
             },
         );
         let mut history_named = access.has(bit::CHAT_HISTORY);
+        let (mut grant, mut deny) = (AccessBits::empty(), AccessBits::empty());
         for (key, on) in &self.access.named {
             if let Some(b) = named_bit(key) {
-                access = if *on {
-                    access.with(b)
+                (access, grant, deny) = if *on {
+                    (access.with(b), grant.with(b), deny.without(b))
                 } else {
-                    access.without(b)
+                    (access.without(b), grant.without(b), deny.with(b))
                 };
                 history_named |= b == bit::CHAT_HISTORY;
             }
         }
         for b in &self.access.raw_bits {
-            access = access.with(*b);
+            (access, grant, deny) = (access.with(*b), grant.with(*b), deny.without(*b));
         }
         for b in &self.access.raw_deny {
-            access = access.without(*b);
+            (access, grant, deny) = (access.without(*b), grant.without(*b), deny.with(*b));
             history_named |= *b == bit::CHAT_HISTORY;
         }
         let x = &self.extra;
@@ -230,6 +232,8 @@ impl AccountFile {
             access,
             history_named,
             extra: own.zip_with(granted, |own, role| own.or(role.then_some(true))),
+            grant,
+            deny,
         }
     }
 
@@ -850,17 +854,45 @@ impl AccountAdmin for FileAuth {
             Some(password) => doc["password"] = toml_edit::value(password),
             None => {}
         }
-        if old.is_none() || edit.access.is_some() {
+        let mut listed = existing.as_ref().map_or_else(Vec::new, |a| a.roles.clone());
+        if !edit.roles.is_empty() {
+            for change in &edit.roles {
+                match change {
+                    RoleChange::Add(name) if name == EVERYONE || roles.get(name).is_none() => {
+                        return Err(AdminError::NoSuchRole)
+                    }
+                    RoleChange::Add(name) if !listed.contains(name) => listed.push(name.clone()),
+                    RoleChange::Add(_) => {}
+                    // A name no role has any more can still be taken
+                    // away, but only one the file lists.
+                    RoleChange::Remove(name) if !listed.contains(name) => {
+                        return Err(AdminError::NoSuchRole)
+                    }
+                    RoleChange::Remove(name) => listed.retain(|n| n != name),
+                }
+            }
+            edit_listed(&mut doc, |l| *l = listed.clone());
+        }
+        // A bit the editor sends as it was shown keeps what the account
+        // has now, which may have moved under the editor.
+        let access = match (edit.access, edit.shown, &existing) {
+            (Some(sent), Some(shown), Some(now)) => {
+                let changed = sent.raw() ^ shown.raw();
+                Some(AccessBits::from_raw(
+                    now.access.raw() & !changed | sent.raw() & changed,
+                ))
+            }
+            (access, ..) => access,
+        };
+        if old.is_none() || access.is_some() {
             let table = doc["access"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
             let table = table
                 .as_table_like_mut()
                 .ok_or_else(|| failed(&"access is not a table"))?;
-            let listed = existing.as_ref().map_or(&[][..], |a| &a.roles[..]);
-            let baseline = roles.granted(listed);
             write_access(
                 table,
-                edit.access.unwrap_or_default(),
-                baseline,
+                access.unwrap_or_default(),
+                roles.granted(&listed),
                 edit.editor_tier,
             );
         }
@@ -878,6 +910,42 @@ impl AccountAdmin for FileAuth {
             write_atomic(&path, &text).map_err(|e| failed(&e))?;
         }
         Ok(after)
+    }
+
+    fn roles(&self) -> Vec<RoleView> {
+        let mut all: Vec<RoleView> = self
+            .roles()
+            .iter()
+            .map(|r| RoleView {
+                name: r.name.clone(),
+                title: r.title.clone(),
+                color: r.color,
+                position: r.position,
+                mentionable: r.mentionable,
+                access: r.access,
+                extra: r.extra_names(),
+            })
+            .collect();
+        all.sort_by(|a, b| b.position.cmp(&a.position).then(a.name.cmp(&b.name)));
+        all
+    }
+
+    fn own_keys(&self, login: &str) -> Result<Vec<String>, AdminError> {
+        let doc = self.document(login)?;
+        let mut own = Vec::new();
+        for (table, prefix) in [("access", ""), ("extra", "extra.")] {
+            let Some(table) = doc.get(table).and_then(|t| t.as_table_like()) else {
+                continue;
+            };
+            for (key, item) in table.iter() {
+                if let Some(v) = item.as_value() {
+                    let mut v = v.clone();
+                    v.decor_mut().clear();
+                    own.push(format!("{prefix}{key}={v}"));
+                }
+            }
+        }
+        Ok(own)
     }
 
     fn reload(&self) -> Result<(), String> {
@@ -903,6 +971,25 @@ impl AccountAdmin for FileAuth {
             std::io::ErrorKind::NotFound => AdminError::NoSuchAccount,
             _ => AdminError::Backend(format!("{}: {e}", path.display())),
         })
+    }
+}
+
+/// Change the roles an account file lists with `f`.
+pub fn edit_listed(doc: &mut toml_edit::DocumentMut, f: impl FnOnce(&mut Vec<String>)) {
+    let mut listed: Vec<String> = doc
+        .get("roles")
+        .and_then(|item| item.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    f(&mut listed);
+    if listed.is_empty() {
+        doc.remove("roles");
+    } else {
+        doc["roles"] = toml_edit::value(listed.into_iter().collect::<toml_edit::Array>());
     }
 }
 

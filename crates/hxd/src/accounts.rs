@@ -8,7 +8,7 @@
 //! The operator is above the rule a session is held to: any account may
 //! be given anything.
 
-use hxd_auth_file::{FileAuth, EVERYONE};
+use hxd_auth_file::{edit_listed, FileAuth, EVERYONE};
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::{Account, AccountAdmin, AccountEdit, AdminError};
@@ -97,25 +97,6 @@ fn drop_number(table: &mut dyn toml_edit::TableLike, key: &str, b: u8) {
     }
 }
 
-/// Change the roles an account file lists with `f`.
-pub(crate) fn edit_listed(doc: &mut toml_edit::DocumentMut, f: impl FnOnce(&mut Vec<String>)) {
-    let mut listed: Vec<String> = doc
-        .get("roles")
-        .and_then(|item| item.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    f(&mut listed);
-    if listed.is_empty() {
-        doc.remove("roles");
-    } else {
-        doc["roles"] = toml_edit::value(listed.into_iter().collect::<toml_edit::Array>());
-    }
-}
-
 fn refused(login: &str, e: AdminError) -> String {
     match e {
         AdminError::NoSuchAccount => format!("there is no account {login:?}"),
@@ -194,20 +175,7 @@ pub fn list(config: &Config) -> Result<String, String> {
 pub fn show(config: &Config, login: &str) -> Result<String, String> {
     let auth = backend(config)?;
     let account = auth.read_account(login).map_err(|e| refused(login, e))?;
-    let doc = auth.document(login).map_err(|e| refused(login, e))?;
-    let mut own = Vec::new();
-    for (table, prefix) in [("access", ""), ("extra", "extra.")] {
-        let Some(table) = doc.get(table).and_then(|t| t.as_table_like()) else {
-            continue;
-        };
-        for (key, item) in table.iter() {
-            if let Some(v) = item.as_value() {
-                let mut v = v.clone();
-                v.decor_mut().clear();
-                own.push(format!("{prefix}{key}={v}"));
-            }
-        }
-    }
+    let mut own = auth.own_keys(login).map_err(|e| refused(login, e))?;
     if own.is_empty() {
         own.push("none".into());
     }
@@ -244,7 +212,7 @@ pub fn add(
         name,
         password: password.read()?,
         access: Some(access),
-        editor_tier: None,
+        ..Default::default()
     };
     let mut account = auth
         .write_account(&edit, &|existing, _| match existing {

@@ -905,6 +905,7 @@ async fn upgrade(
                     // way to.
                     redactions: false,
                     joins_rooms: false,
+                    roles: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`

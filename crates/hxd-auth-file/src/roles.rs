@@ -25,7 +25,7 @@ use crate::{named_bit, AccessTable};
 
 /// The role every account holds, the guest included. It always exists,
 /// granting nothing until the file says otherwise.
-pub const EVERYONE: &str = "everyone";
+pub use hxd_core::admin::EVERYONE;
 
 /// What a new roles file starts with: the warning `everyone` needs.
 const HEADER: &str = "# Roles on this server (docs/roles.md). `hxd role` edits this file.\n\

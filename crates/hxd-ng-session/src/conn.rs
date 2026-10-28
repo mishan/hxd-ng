@@ -80,7 +80,7 @@ fn req_label(req: &str) -> &'static str {
     if let Some(k) = KNOWN.iter().find(|k| **k == req) {
         return k;
     }
-    for family in ["news_", "push_", "files_", "account_", "room_"] {
+    for family in ["news_", "push_", "files_", "account_", "role_", "room_"] {
         if req.starts_with(family) {
             return family.trim_end_matches('_');
         }
@@ -117,8 +117,8 @@ fn request_weight(req: &str) -> u32 {
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
-        | "account_list" | "files_preview" | "room_create" | "room_edit" | "room_archive"
-        | "room_unarchive" | "device_cert" => 4,
+        | "account_list" | "role_list" | "role_get" | "files_preview" | "room_create"
+        | "room_edit" | "room_archive" | "room_unarchive" | "device_cert" => 4,
         _ => 1,
     }
 }
@@ -759,6 +759,7 @@ async fn handle_login(
             // Blanking a rendered line is part of this wire.
             redactions: true,
             joins_rooms: true,
+            roles: true,
             encrypted: !identity.is_some_and(|i| i.downstream_cleartext),
             assumed: true,
             identity: identity.map(|i| {
@@ -952,9 +953,14 @@ async fn handle_login(
     if ctx.core.avatar_policy().is_some() && !caps.iter().any(|c| c == "avatars") {
         caps.push("avatars".into());
     }
-    // And `accounts`, whenever accounts can be administered here.
+    // And `accounts`, whenever accounts can be administered here, and
+    // `roles` with it: the roles file is always configured, and an absent
+    // one is `everyone` granting nothing.
     if ctx.core.accounts_enabled() && !caps.iter().any(|c| c == "accounts") {
         caps.push("accounts".into());
+    }
+    if ctx.core.accounts_enabled() && !caps.iter().any(|c| c == "roles") {
+        caps.push("roles".into());
     }
     // And `rooms`, unless `[rooms] enabled = false`.
     if ctx.core.rooms_enabled() && !caps.iter().any(|c| c == "rooms") {
@@ -1060,6 +1066,9 @@ async fn handle_login(
     // What this session may do, for a client deciding what to offer.
     if ctx.core.accounts_enabled() {
         ok["accounts"] = crate::accounts::access_json(account.access);
+    }
+    if let Some(roles) = crate::accounts::roles_block(&ctx.core, uid) {
+        ok["roles"] = roles;
     }
     // Open reports, for a moderator's badge (docs/moderation.md §4.5).
     let moderation = off_reactor(&ctx.core, move |c| crate::moderation::login_json(c, uid))
@@ -1530,6 +1539,10 @@ async fn handle_sync(
         if ctx.core.is_moderator(state.uid) {
             ok["accounts"]["moderator"] = json!(true);
         }
+    }
+    // The roles as they stand now, which the gap may have changed.
+    if let Some(roles) = crate::accounts::roles_block(&ctx.core, state.uid) {
+        ok["roles"] = roles;
     }
     // The rooms it is in and how far each has got, for a client to catch
     // up on each with `history` (docs/chat-rooms.md §7.4).

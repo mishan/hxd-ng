@@ -234,6 +234,10 @@ pub struct Transport {
     /// once where a classic client is sent an invite to answer
     /// (`docs/chat-rooms.md` §6.1). The ng frontend sets it.
     pub joins_rooms: bool,
+    /// This link shows the roles a user holds (`docs/roles.md` §7.1), so
+    /// a change to them alone is worth telling it. A classic client's row
+    /// has nowhere to put them, and the frontend sets it only for ng.
+    pub roles: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -305,6 +309,8 @@ pub struct UserInfo {
     /// Where a ghost is from (`docs/server-link.md` §3.4); `None` for
     /// this server's own users.
     pub remote: Option<crate::server_link::RemoteRef>,
+    /// The roles the session's account lists (`docs/roles.md` §7.1).
+    pub roles: Vec<String>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -314,6 +320,8 @@ pub struct UserDetails {
     pub login: String,
     pub addr: Option<IpAddr>,
     pub connected_at: Instant,
+    /// The roles its account lists.
+    pub roles: Vec<String>,
 }
 
 /// A domain event, delivered on session channels. The session layer encodes
@@ -664,6 +672,7 @@ impl Event {
                     + u.remote
                         .as_ref()
                         .map_or(0, |r| r.home_tag.len() + r.home_name.len())
+                    + u.roles.iter().map(String::len).sum::<usize>()
             }
             Event::AccountChanged(a) => {
                 std::mem::size_of::<crate::Account>() + a.login.len() + a.name.len()
@@ -1968,6 +1977,10 @@ impl Core {
         r.last_serial += 1;
         let serial = r.last_serial;
         let (tx, conn, rx) = Events::channel(&self.queue_budget);
+        let roles = info
+            .account
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.roles.clone());
         r.users.insert(
             uid,
             UserSession {
@@ -1983,6 +1996,7 @@ impl Core {
                     avatar: None,
                     color: None,
                     remote: None,
+                    roles,
                 },
                 access: info.access,
                 login: info.login,
@@ -2386,6 +2400,10 @@ impl Core {
                 login: s.login.clone(),
                 addr: s.addr,
                 connected_at: s.connected_at,
+                roles: s
+                    .account
+                    .as_ref()
+                    .map_or_else(Vec::new, |a| a.roles.clone()),
             })
     }
 

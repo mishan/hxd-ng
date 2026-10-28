@@ -1527,6 +1527,8 @@ struct Session {
     /// The highest access bit this client's user editor can show
     /// ([`accounts::editor_tier`]).
     editor_tier: u8,
+    /// The accounts the user editor has open, and the bits it showed.
+    opened: accounts::Opened,
 }
 
 impl Session {
@@ -2604,6 +2606,7 @@ async fn login_phase(
         banner_image: None,
         told_read_only: Vec::new(),
         editor_tier: accounts::editor_tier(req.clientversion),
+        opened: Default::default(),
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -4854,8 +4857,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 return;
             };
             let secs = d.connected_at.elapsed().as_secs();
+            // The one place a period client sees a role (`docs/roles.md`
+            // §6.2).
+            let roles = match ctx.core.role_titles(&d.roles)[..] {
+                [] => String::new(),
+                ref titles => format!("   roles: {}\r", titles.join(", ")),
+            };
             let info = format!(
-                "    name: {}\r   login: {}\r address: {}\r  online: {}h {}m {}s\r",
+                "    name: {}\r   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
                 d.info.nick,
                 d.login,
                 d.addr.map_or_else(|| "-".into(), |a| a.to_string()),
@@ -5401,11 +5410,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         t if accounts::handles(t) => {
             let fields: Vec<_> = f.chunks().map(|c| (c.tag, c.data.to_vec())).collect();
             let (uid, enc, tier) = (sess.uid, sess.enc, sess.editor_tier);
+            let mut opened = std::mem::take(&mut sess.opened);
             // The account store is file I/O.
             let done = off_reactor(&ctx.core, move |c| {
-                accounts::transaction(c, uid, enc, tier, t, &fields)
+                let done = accounts::transaction(c, uid, enc, tier, t, &fields, &mut opened);
+                (done, opened)
             })
-            .await;
+            .await
+            .map(|(done, opened)| {
+                sess.opened = opened;
+                done
+            });
             match done {
                 Some(Ok(chunks)) => reply(tx, f.trans, chunks),
                 Some(Err(msg)) => reply_error(tx, f.trans, &msg),
@@ -5639,6 +5654,7 @@ mod tests {
                 signs: false,
                 server_key: None,
             }),
+            roles: Vec::new(),
         };
         let long = "\u{3042}".repeat(12);
         for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {
