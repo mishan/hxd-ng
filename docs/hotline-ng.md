@@ -987,6 +987,7 @@ news body is different: it declares its own type (news.md §5).
 | `too_many_rooms` | `room_join` | This session is in as many rooms as it may be. |
 | `rooms_full` | `room_create` | The server holds as many rooms as it may. |
 | `name_taken` | `room_create`, `room_edit` | A room has that name already. |
+| `no_such_role` | `room_create`, `room_edit`, `account_create`, `account_update`, `role_get`, `role_update`, `role_delete` | A gate or an edit names a role there is none of. |
 | `no_such_user` | `msg`, `block`, `unblock`, `device_cert` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap, or for a sealed message, the detached recipient holds as many as it may (e2e-messages.md §4.3; *hxd-ng:* `[sealed]`). |

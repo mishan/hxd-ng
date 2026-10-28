@@ -48,8 +48,8 @@ pub struct Room {
     pub name: String,
     pub topic: Topic,
     pub position: i64,
-    /// Who may see, join and read it: logins, or none for everyone the
-    /// access bits let in. `@role` entries name nobody until roles exist.
+    /// Who may see, join and read it: logins and `@role`s, or none for
+    /// everyone the access bits let in.
     pub read: Vec<String>,
     /// Who may send in it, the same way.
     pub post: Vec<String>,
@@ -155,6 +155,8 @@ pub enum RoomError {
     /// The file holds `[rooms] max_rooms` entries.
     RoomsFull,
     NameTaken,
+    /// A gate names `@role`, and no role has that name.
+    NoSuchRole,
     /// A field no room may have; says which rule it broke.
     Invalid(&'static str),
     AccessDenied,
@@ -171,6 +173,7 @@ impl std::fmt::Display for RoomError {
             RoomError::TooManyRooms => "in as many rooms as a session may be",
             RoomError::RoomsFull => "the server has as many rooms as it may",
             RoomError::NameTaken => "a room has that name already",
+            RoomError::NoSuchRole => "a gate names a role there is none of",
             RoomError::Invalid(why) => why,
             RoomError::AccessDenied => "not allowed",
             RoomError::Disabled => "this server keeps no rooms",
@@ -243,11 +246,12 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
-/// A gate entry is a login, or `@role`, which names nobody until roles
-/// exist and cannot be written before then.
-fn valid_entry(entry: &str, writing: bool) -> bool {
+/// A gate entry is a login, or `@role`. Never `@everyone`: it would admit
+/// the guest while looking restrictive, where an empty gate says everyone
+/// (roles.md §10).
+fn valid_entry(entry: &str) -> bool {
     match entry.strip_prefix('@') {
-        Some(role) => !writing && valid_name(role),
+        Some(role) => valid_name(role) && role != "everyone",
         None => {
             (1..=31).contains(&entry.len())
                 && !entry.starts_with('.')
@@ -302,9 +306,9 @@ impl RoomEdit {
         }
         for (list, gate) in [(self.read, &mut room.read), (self.post, &mut room.post)] {
             if let Some(list) = list {
-                if !list.iter().all(|e| valid_entry(e, true)) {
+                if !list.iter().all(|e| valid_entry(e)) {
                     return Err(RoomError::Invalid(
-                        "a gate names logins; @roles arrive with roles",
+                        "a gate names logins and @roles, never @everyone",
                     ));
                 }
                 *gate = list;
@@ -369,10 +373,22 @@ pub(crate) type Announced = (String, Option<[u8; 32]>, Option<std::net::IpAddr>)
 /// older than a day are let go, and then the oldest.
 const ANNOUNCED_KEPT: usize = 4096;
 
-/// Does `list` name this session's account? `@role` names nobody yet.
+/// Does `list` name this session's account, or a role it holds? A role
+/// admits only an account that is one person: one the guest's file or
+/// another shared login lists would let in whoever logs in as it, which
+/// `@everyone` is refused for (roles.md §10). A gate names a shared
+/// login by its login.
 fn named(list: &[String], sess: &UserSession) -> bool {
-    list.iter()
-        .any(|e| !e.starts_with('@') && e.eq_ignore_ascii_case(&sess.login))
+    list.iter().any(|e| match e.strip_prefix('@') {
+        Some(role) => {
+            sess.is_person
+                && sess
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| a.config.roles.iter().any(|r| r == role))
+        }
+        None => e.eq_ignore_ascii_case(&sess.login),
+    })
 }
 
 /// May `sess` read `room` by its bits and the room's `read` gate?
@@ -1055,7 +1071,7 @@ impl Core {
         }
         let room = self.room_write(uid, None, |room, by, now| {
             room.signed = signed;
-            edit.apply(room, by, now)
+            self.apply_gated(edit, room, by, now)
         })?;
         // A mark that would not keep is kept at the next start, whose log
         // holds nothing unsigned of a room this new.
@@ -1076,7 +1092,36 @@ impl Core {
     /// Change a room, for a session that may manage rooms. A narrowed
     /// gate parts whoever it no longer admits.
     pub fn room_edit(&self, uid: Uid, id: u32, edit: RoomEdit) -> Result<Room, RoomError> {
-        self.room_write(uid, Some(id), |room, by, now| edit.apply(room, by, now))
+        self.room_write(uid, Some(id), |room, by, now| {
+            self.apply_gated(edit, room, by, now)
+        })
+    }
+
+    /// `edit.apply`, refusing a gate that names a role there is none of:
+    /// no write from a client or `hxd room` leaves one. Under the
+    /// rooms-write lock.
+    fn apply_gated(
+        &self,
+        edit: RoomEdit,
+        room: &mut Room,
+        by: &str,
+        now: SystemTime,
+    ) -> Result<(), RoomError> {
+        let named: Vec<String> = [&edit.read, &edit.post]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.strip_prefix('@').map(String::from))
+            .collect();
+        edit.apply(room, by, now)?;
+        if named.is_empty() {
+            return Ok(());
+        }
+        let roles = self.admin.as_deref().map(|a| a.roles()).unwrap_or_default();
+        match named.iter().all(|n| roles.iter().any(|r| r.name == *n)) {
+            true => Ok(()),
+            false => Err(RoomError::NoSuchRole),
+        }
     }
 
     /// Archive a room, parting its members, or bring one back.
@@ -1445,14 +1490,9 @@ fn check_file(file: &RoomFile) -> Result<(), String> {
         if !names.insert(room.name.as_str()) {
             return Err(format!("two rooms are named {:?}", room.name));
         }
-        if let Some(bad) = room
-            .read
-            .iter()
-            .chain(&room.post)
-            .find(|e| !valid_entry(e, false))
-        {
+        if let Some(bad) = room.read.iter().chain(&room.post).find(|e| !valid_entry(e)) {
             return Err(format!(
-                "room {}: {bad:?} is not a login or @role",
+                "room {}: {bad:?} is not a login or @role, or is @everyone",
                 room.name
             ));
         }

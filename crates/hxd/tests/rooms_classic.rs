@@ -84,8 +84,14 @@ async fn start(dir: &Path, system: Option<SystemPolicy>, config: &str) -> Server
         toml::from_str(&config.replace("[rooms]", &format!("[rooms]\nfile = {path:?}"))).unwrap();
 
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
-    let auth: Arc<dyn hxd_core::AuthBackend> =
-        Arc::new(hxd_auth_file::FileAuth::new(accounts).reserving("server"));
+    let roles = dir.join("roles.toml");
+    std::fs::write(&roles, "[role.crew]\n").unwrap();
+    let auth: Arc<dyn hxd_core::AuthBackend> = Arc::new(
+        hxd_auth_file::FileAuth::new(accounts)
+            .with_roles(roles)
+            .unwrap()
+            .reserving("server"),
+    );
     let core = Core::new()
         .with_voice(Arc::new(RecordingMedia::new()), 8)
         .with_history(
@@ -746,4 +752,38 @@ async fn a_client_that_never_joins_hears_nothing_of_rooms() {
         .map(body)
         .collect();
     assert_eq!(lobby, ["\r        alice:  in the lobby"]);
+}
+
+/// A gate naming `@crew` lets a period client holding it join, and is a
+/// room that does not exist to one that does not hold it.
+#[tokio::test]
+async fn a_role_in_a_gate_admits_a_period_client_holding_it() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_default(td.path()).await;
+    std::fs::write(
+        td.path().join("accounts").join("dave.toml"),
+        format!("name = \"dave\"\npassword = \"pw\"\nroles = [\"crew\"]\n[access]\n{MEMBER}"),
+    )
+    .unwrap();
+    s.rooms
+        .put(&Room {
+            read: vec!["@crew".into()],
+            ..s.room("lounge")
+        })
+        .unwrap();
+    s.core.reload_rooms().unwrap();
+
+    let mut dave = classic(&s, "dave").await;
+    assert_eq!(
+        command(&mut dave, s.system(), "/join #lounge").await,
+        "ok: invited to #lounge"
+    );
+    let mut bob = classic(&s, "bob").await;
+    assert_eq!(
+        command(&mut bob, s.system(), "/join lounge").await,
+        command(&mut bob, s.system(), "/join nowhere").await,
+    );
+    assert!(!command(&mut bob, s.system(), "/rooms")
+        .await
+        .contains("lounge"));
 }

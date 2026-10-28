@@ -3,9 +3,10 @@
 Status: G1 and G2 are built (§14): the roles file, resolution,
 `everyone`, reload, §6.1's minimal overrides and the command line, §5's
 rule for giving and taking roles, the info line and the commands of
-§6.2 and §6.3. Its `@` login reservation is built on its own. Of G3,
-§7 is built but for `role_in_use`, which nothing can call for until
-gates take roles (G4) and restrictions exist (G7).
+§6.2 and §6.3. Its `@` login reservation is built on its own. G3, §7,
+is built but for `role_in_use`. Of G4, a room's gates take `@role`
+(§10), but holding a gated role is not yet a privilege (§5), and a role
+a gate names can still be deleted.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -636,7 +637,11 @@ access bit already passes.
 
 - A gate may not name `@everyone`, which would admit the guest while
   looking restrictive; an empty list already means everyone. It may not
-  name a restriction.
+  name a restriction, or a role there is none of.
+- A role passes a gate only for an account that is one person: one
+  with a password or a linked identity. The guest, or another login
+  people share, holding one is not let in by it: a gate names such a
+  login by its login.
 - Passing a gate is decided from configuration: the roles the account
   holds and its login. A restriction narrows what a member may *do*
   (a muted member of `#staff` may read it but not post), not which

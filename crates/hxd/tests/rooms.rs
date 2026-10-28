@@ -47,9 +47,20 @@ async fn start_with_core(dir: &Path) -> (SocketAddr, Arc<Core>) {
     account("boss", "[extra]\nmanage_rooms = true\nset_subject = true\n");
     // The kick bit makes a moderator.
     account("carol", "disconnect_users = true\n");
+    std::fs::write(
+        accounts.join("frank.toml"),
+        format!("name = \"frank\"\npassword = \"pw\"\nroles = [\"staff\"]\n[access]\n{MEMBER}"),
+    )
+    .unwrap();
+    let roles = dir.join("roles.toml");
+    std::fs::write(&roles, "[role.staff]\ntitle = \"Staff\"\n").unwrap();
 
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
-    let auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
+    let auth = Arc::new(
+        hxd_auth_file::FileAuth::new(accounts)
+            .with_roles(roles)
+            .unwrap(),
+    );
     let core = Core::new()
         .with_admin(auth.clone())
         .with_voice(Arc::new(RecordingMedia::new()), 8)
@@ -850,4 +861,109 @@ async fn awareness_survives_a_resume() {
         room
     );
     no_seq_faults(&alice);
+}
+
+/// A gate naming `@staff` admits whoever holds it and nobody else, on
+/// every request, and an account that stops holding it is parted on the
+/// reload that says so.
+#[tokio::test]
+async fn a_role_in_a_gate_admits_its_holders_until_they_stop_holding_it() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_with_core(td.path()).await;
+    let (mut boss, _) = login(addr, "boss").await;
+    assert_eq!(
+        refused(
+            &mut boss,
+            "room_create",
+            json!({ "name": "x", "read": ["@nobody"] })
+        )
+        .await,
+        "no_such_role"
+    );
+    let staff = create(&mut boss, json!({ "name": "staff", "read": ["@staff"] })).await;
+    let briefing = create(&mut boss, json!({ "name": "briefing", "post": ["@staff"] })).await;
+    assert_eq!(
+        refused(
+            &mut boss,
+            "room_edit",
+            json!({ "room": briefing, "post": ["@nobody"] })
+        )
+        .await,
+        "no_such_role"
+    );
+
+    let (mut frank, hello) = login(addr, "frank").await;
+    let listed = |hello: &Value| -> Vec<u64> {
+        hello["rooms"]["list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect()
+    };
+    assert!(listed(&hello).contains(&staff));
+    ok(&mut frank, "room_join", json!({ "room": staff })).await;
+    ok(&mut frank, "chat", json!({ "room": staff, "text": "hi" })).await;
+    let joined = ok(&mut frank, "room_join", json!({ "room": briefing })).await;
+    assert_eq!(joined["may_post"], true);
+
+    let (mut eve, hello) = login(addr, "eve").await;
+    assert!(!listed(&hello).contains(&staff));
+    assert_eq!(
+        refused(&mut eve, "room_join", json!({ "room": staff })).await,
+        "no_such_room"
+    );
+    let joined = ok(&mut eve, "room_join", json!({ "room": briefing })).await;
+    assert_eq!(joined["may_post"], false);
+    // A login with no password is shared by whoever knows it, and a role
+    // it lists lets none of them in.
+    std::fs::write(
+        td.path().join("accounts").join("lobby.toml"),
+        format!("name = \"lobby\"\nroles = [\"staff\"]\n[access]\n{MEMBER}"),
+    )
+    .unwrap();
+    let (mut shared, hello) = Client::account(addr, "lobby", "", "lobby").await.unwrap();
+    assert!(!listed(&hello).contains(&staff));
+    assert_eq!(
+        refused(&mut shared, "room_join", json!({ "room": staff })).await,
+        "no_such_room"
+    );
+    sent(&mut frank).await;
+
+    // The role gone from the roles file by hand, frank's file still
+    // listing it: a name with no role behind it passes no gate.
+    std::fs::write(td.path().join("roles.toml"), "").unwrap();
+    core.reload_accounts();
+    let heard: Vec<(String, Value)> = sent(&mut frank)
+        .await
+        .into_iter()
+        .filter(|e| e.ev.starts_with("room_"))
+        .map(|e| (e.ev, e.data))
+        .collect();
+    assert!(
+        heard.contains(&(
+            "room_member_parted".into(),
+            json!({ "room": staff, "uid": frank.uid, "reason": "access" })
+        )),
+        "{heard:?}"
+    );
+    assert!(heard.contains(&("room_removed".into(), json!({ "room": staff }))));
+    assert!(
+        heard.iter().any(|(ev, d)| ev == "room_changed"
+            && d["room"]["id"] == briefing
+            && d["room"]["may_post"] == false),
+        "{heard:?}"
+    );
+    assert_eq!(
+        refused(
+            &mut frank,
+            "chat",
+            json!({ "room": briefing, "text": "hi" })
+        )
+        .await,
+        "read_only"
+    );
+    for c in [&frank, &eve] {
+        no_seq_faults(c);
+    }
 }

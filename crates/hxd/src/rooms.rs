@@ -196,7 +196,7 @@ fn topic(text: Option<String>, by: Option<String>, when: Option<u64>) -> Topic {
 
 const USAGE: &str = "usage:\n  \
 hxd [--config …] room list [--archived]\n  \
-hxd [--config …] room create <name> [--topic T] [--read LOGIN,…] [--post LOGIN,…] [--position N]\n    \
+hxd [--config …] room create <name> [--topic T] [--read LOGIN|@ROLE,…] [--post …] [--position N]\n    \
 [--max-lines N|default] [--max-days N|default] [--signed]\n  \
 hxd [--config …] room edit <name> [--name NEW] [the same flags as create, but --signed]\n  \
 hxd [--config …] room archive|unarchive <name>\n  \
@@ -440,6 +440,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
         }
     }
     let editing = edit != RoomEdit::default();
+    gate_roles_exist(config, &edit)?;
     // Only a delete is an act with a reason, and only a delete purges.
     if reason.is_some() && !purge {
         return Err(USAGE.into());
@@ -582,6 +583,25 @@ fn listing(file: &RoomFile, archived: bool) -> String {
         .join("\n")
 }
 
+/// Refuse a gate naming a role the roles file has none of, as the server
+/// refuses one sent from a client.
+fn gate_roles_exist(config: &Config, edit: &RoomEdit) -> Result<(), String> {
+    let named: Vec<&str> = [&edit.read, &edit.post]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.strip_prefix('@'))
+        .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let roles = hxd_auth_file::Roles::load(&config.roles.file)?;
+    match named.into_iter().find(|n| roles.get(n).is_none()) {
+        Some(n) => Err(format!("there is no role {n:?}")),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +683,35 @@ mod tests {
             assert!(refused.is_err(), "{bad:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
         }
+    }
+
+    #[test]
+    fn a_gate_names_only_a_role_the_roles_file_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.rooms.file = dir.path().join("rooms.toml");
+        config.roles.file = dir.path().join("roles.toml");
+        std::fs::write(&config.roles.file, "[role.staff]\n").unwrap();
+        let run = |words: &str| {
+            let args: Vec<String> = words.split(' ').map(String::from).collect();
+            command(&config, &args)
+        };
+        // What is run, and the refusal it gets, if it is one.
+        for (words, refusal) in [
+            ("create den --read @nobody", Some("no role \"nobody\"")),
+            ("create den --post @everyone", Some("everyone")),
+            ("create den --read @staff,carol --post @staff", None),
+            ("edit den --post @nobody", Some("no role \"nobody\"")),
+        ] {
+            match (run(words), refusal) {
+                (Err(e), Some(why)) => assert!(e.contains(why), "{words}: {e}"),
+                (Ok(_), None) => {}
+                (said, _) => panic!("{words}: {said:?}"),
+            }
+        }
+        let file = FileRooms::new(&config.rooms.file).load().unwrap();
+        assert_eq!(file.rooms[0].read, ["@staff", "carol"]);
+        assert_eq!(file.rooms[0].post, ["@staff"]);
     }
 
     /// `hxd room` beside a server: an entry without an id until the server
