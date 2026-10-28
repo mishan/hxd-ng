@@ -905,7 +905,10 @@ async fn a_role_grants_its_holders_and_an_edit_reaches_them_on_reload() {
     let path = td.path().join("hxd-ng.toml");
     std::fs::write(
         &path,
-        format!("[paths]\naccounts = \"{d}/accounts\"\n[roles]\nfile = \"{d}/roles.toml\"\n"),
+        format!(
+            "[paths]\naccounts = \"{d}/accounts\"\n[roles]\nfile = \"{d}/roles.toml\"\n\
+             [rooms]\nfile = \"{d}/rooms.toml\"\n"
+        ),
     )
     .unwrap();
     let config = hxd::Config::load(&path).unwrap();
@@ -984,8 +987,13 @@ async fn a_role_grants_its_holders_and_an_edit_reaches_them_on_reload() {
     let added = hxd::accounts::add(&config, "sam", None, Some("rita"), None, &password).unwrap();
     assert!(added.contains("roles: staff"), "{added}");
 
-    // A removed role is taken out of the accounts listing it, and with it
-    // what it granted.
+    // Not while a room's gate names it; then taken out of the accounts
+    // listing it, and with it what it granted.
+    let rooms = td.path().join("rooms.toml");
+    std::fs::write(&rooms, "[[room]]\nname = \"den\"\nread = [\"@staff\"]\n").unwrap();
+    let refused = hxd::roles::remove(&config, "staff").unwrap_err();
+    assert!(refused.contains("#den"), "{refused}");
+    std::fs::write(&rooms, "").unwrap();
     let said = hxd::roles::remove(&config, "staff").unwrap();
     assert!(said.contains("2 accounts"), "{said}");
     assert!(

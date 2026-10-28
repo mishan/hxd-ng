@@ -27,7 +27,8 @@ grants beside them — `moderate`, `can_spam`, `set_subject`,
 `attach_news`, `file_list`, `file_getinfo`, `manage_roles`,
 `manage_rooms` — whether said in `[extra]`, granted by a role
 (roles.md) or derived, since a new account given the kick bit moderates
-by default. Not `can_detach`, `inbox` or `set_avatar`: those follow from a
+by default — and holding a role a room's gate names, unless the session
+holds it too or `manage_roles` (roles.md §5). Not `can_detach`, `inbox` or `set_avatar`: those follow from a
 password and say an account is one person, not what it may do to
 anyone else, so a password-less administrator may still give an account
 a password. Without that, `modify_users` is every privilege there is,
@@ -187,7 +188,7 @@ the server.
 | Code | Meaning |
 |---|---|
 | `access_denied` | The session lacks the bit the request needs. |
-| `outranked` | The account may do, or would be left able to do, something the session's own account may not: an access bit or the `[extra]` policy of §1. |
+| `outranked` | The account may do, or would be left able to do, something the session's own account may not: an access bit, the `[extra]` policy of §1, or a role a gate names (roles.md §5). |
 | `no_such_account` | `account_get`, `account_update`, `account_delete` of a login with no account. |
 | `already_exists` | `account_create` of a login that has one. |
 | `no_such_role` | `roles` naming `everyone`, or a role there is none of that the account does not already list. |

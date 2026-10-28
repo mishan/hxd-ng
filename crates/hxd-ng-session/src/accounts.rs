@@ -102,6 +102,7 @@ fn admin_err(e: AdminError) -> (&'static str, String) {
         AdminError::NoSuchAccount => "no_such_account",
         AdminError::NoSuchRole => "no_such_role",
         AdminError::BadRole(_) => "bad_request",
+        AdminError::RoleInUse => "role_in_use",
         AdminError::Exists => "already_exists",
         AdminError::InvalidLogin => "invalid_login",
         AdminError::Unsupported => "not_available",
