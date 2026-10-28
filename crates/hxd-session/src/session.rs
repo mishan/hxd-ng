@@ -3149,7 +3149,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         | Event::NewsNotify(_) => {}
         // Sent only where the transport shows roles, which this one does
         // not.
-        Event::RolesChanged(_) => {}
+        Event::RolesChanged(_) | Event::RosterStale => {}
         Event::Kicked => return false,
         Event::AccountChanged(account) => {
             sess.account = *account;

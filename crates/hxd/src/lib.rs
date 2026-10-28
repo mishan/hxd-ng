@@ -2002,14 +2002,23 @@ pub struct RolesSection {
     /// The roles file (`docs/roles.md` §2.3), edited by `hxd role`.
     #[serde(default = "default_roles_file")]
     pub file: PathBuf,
+    /// How many roster rows one change sends `user_changed` for before an
+    /// ng client is sent `roster_stale` instead (`docs/roles.md` §4).
+    #[serde(default = "default_bulk_rows")]
+    pub bulk_rows: usize,
 }
 
 impl Default for RolesSection {
     fn default() -> Self {
         RolesSection {
             file: default_roles_file(),
+            bulk_rows: default_bulk_rows(),
         }
     }
+}
+
+fn default_bulk_rows() -> usize {
+    hxd_core::admin::BULK_ROWS
 }
 
 fn default_roles_file() -> PathBuf {
@@ -4243,6 +4252,7 @@ pub fn build_ctx(
             .with_logins_in_flight(config.server.logins_in_flight),
     };
 
+    let core = core.with_bulk_rows(config.roles.bulk_rows);
     let core = core.with_sealed_holds(hxd_core::SealedHolds {
         per_sender: config.sealed.held_per_sender_kb.saturating_mul(1024),
         all: config.sealed.held_kb.saturating_mul(1024),

@@ -78,6 +78,10 @@ fn grants_beyond(actor: &Account, role: &RoleView) -> bool {
 /// makes, not one a field (`docs/roles.md` §4).
 pub const ROLES_CHANGED_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How many roster rows one change sends a `user_changed` for, by
+/// default, before `roster_stale` goes instead (`docs/roles.md` §4).
+pub const BULK_ROWS: usize = 64;
+
 /// The account `login` names, as its file reads now — inside the
 /// backend's writes, so it is not demoted between this and the write —
 /// holding `need` there as well as on the roster. What an account it
@@ -488,9 +492,11 @@ impl Core {
             .collect();
         let uids: Vec<Uid> = told.iter().map(|(u, _)| *u).collect();
         let listed_before = r.room_shown(None, Some(&uids));
-        for &(uid, account) in &told {
-            give_account(&mut r, uid, account);
-        }
+        let rows: Vec<Row> = told
+            .iter()
+            .filter_map(|&(uid, account)| give_account(&mut r, uid, account))
+            .collect();
+        announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         // What it may read may have narrowed (docs/chat-rooms.md §5).
         r.room_reconcile();
         r.room_announce(listed_before, None, Some(&uids));
@@ -511,7 +517,8 @@ impl Core {
         };
         s.mask = mask;
         let listed_before = r.room_shown(None, Some(&[uid]));
-        give_account(&mut r, uid, &account);
+        let rows = give_account(&mut r, uid, &account).into_iter().collect();
+        announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         r.room_reconcile();
         r.room_announce(listed_before, None, Some(&[uid]));
         true
@@ -556,11 +563,30 @@ fn role_may(
     Ok(())
 }
 
+/// A roster row an account change altered, for [`announce`]: the row,
+/// and whether only its roles changed.
+type Row = (crate::UserInfo, bool);
+
+/// Tell everyone of `rows`, or, past `bulk` of them, tell a wire that can
+/// sync that its roster is stale rather than send it each one: one change
+/// may not push a session near its queue's cap.
+fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
+    let stale = rows.len() > bulk;
+    if stale {
+        r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
+    }
+    for (info, only_roles) in rows {
+        r.broadcast_where(&Event::Changed(info), None, |s| {
+            let syncs = s.info.transport.roles;
+            !(stale && syncs) && (!only_roles || syncs)
+        });
+    }
+}
+
 /// Give session `uid` `account` as its mask leaves it, and tell it.
-fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) {
-    let Some(s) = r.users.get_mut(&uid) else {
-        return;
-    };
+/// Answers its roster row if that changed, for the caller to announce.
+fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) -> Option<Row> {
+    let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
     s.account = Some(Box::new(account.clone()));
     let admin = effective.access.has(bit::DISCONNECT_USERS);
@@ -594,15 +620,11 @@ fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) {
     let only_roles = !shown && roles_changed;
     let shown = ((shown || roles_changed) && s.visible).then(|| s.info.clone());
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
-    if let Some(info) = shown {
-        r.broadcast_where(&Event::Changed(info), None, |s| {
-            !only_roles || s.info.transport.roles
-        });
-        // The admin bit never crosses a link; only the name does.
-        if renamed {
-            r.export_changed(uid);
-        }
+    // The admin bit never crosses a link; only the name does.
+    if shown.is_some() && renamed {
+        r.export_changed(uid);
     }
+    shown.map(|info| (info, only_roles))
 }
 
 #[cfg(test)]
@@ -612,7 +634,7 @@ mod tests {
 
     use super::*;
     use crate::account::{AccountConfig, IdentityLink, WriteCheck};
-    use crate::roster::test_attach;
+    use crate::roster::{test_attach, test_attach_on};
     use crate::AccessBits;
 
     /// Accounts in a map, for what this module decides apart from files.
@@ -751,6 +773,65 @@ mod tests {
         let r = core.roster.lock().unwrap();
         let s = &r.users[&uid];
         (s.access, s.attach_news, told)
+    }
+
+    #[test]
+    fn past_bulk_rows_a_wire_that_syncs_is_told_its_roster_is_stale() {
+        let ng = crate::Transport {
+            roles: true,
+            ..Default::default()
+        };
+        // How many accounts change, whether only their roles do, and what
+        // each wire hears: user_changed and roster_stale on ng, then
+        // user_changed on classic.
+        for (n, only_roles, heard) in [
+            (2, false, (2, 0, 2)),
+            (3, false, (0, 1, 3)),
+            (2, true, (2, 0, 0)),
+            (3, true, (0, 1, 0)),
+        ] {
+            let accounts = Arc::new(Accounts::default());
+            let core = Core::new().with_admin(accounts.clone()).with_bulk_rows(2);
+            let logins: Vec<String> = (0..n).map(|i| format!("u{i}")).collect();
+            for login in logins.iter().map(String::as_str).chain(["ng", "classic"]) {
+                let a = account(login, AccessBits::empty());
+                accounts.0.lock().unwrap().insert(a.login.clone(), a);
+            }
+            let (_, mut on_ng) = test_attach_on(&core, "ng", AccessBits::empty(), ng.clone());
+            let (_, mut on_classic) = test_attach(&core, "classic", AccessBits::empty());
+            for login in &logins {
+                test_attach(&core, login, AccessBits::empty());
+                let mut a = account(login, AccessBits::empty());
+                if only_roles {
+                    a.roles = vec!["r".into()];
+                } else {
+                    a = account(login, bits(&[bit::DISCONNECT_USERS]));
+                }
+                accounts.0.lock().unwrap().insert(a.login.clone(), a);
+            }
+            crate::roster::drain(&mut on_ng);
+            crate::roster::drain(&mut on_classic);
+            core.reload_accounts();
+            let count = |events: &[Event]| {
+                let changed = events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Changed(_)))
+                    .count();
+                let stale = events
+                    .iter()
+                    .filter(|e| matches!(e, Event::RosterStale))
+                    .count();
+                (changed, stale)
+            };
+            let (ng_changed, ng_stale) = count(&crate::roster::drain(&mut on_ng));
+            let (classic_changed, classic_stale) = count(&crate::roster::drain(&mut on_classic));
+            assert_eq!(classic_stale, 0);
+            assert_eq!(
+                (ng_changed, ng_stale, classic_changed),
+                heard,
+                "{n} {only_roles}"
+            );
+        }
     }
 
     #[test]

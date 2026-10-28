@@ -178,7 +178,7 @@ over them.
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
 | `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
-| `roles` | Roles: `roles` on the `user` and account objects, `role_list`, `role_get`, `role_create`, `role_update`, `role_delete`, and `roles_changed` | roles.md §7 | `roles`, and in `sync`'s reply |
+| `roles` | Roles: `roles` on the `user` and account objects, `role_list`, `role_get`, `role_create`, `role_update`, `role_delete`, `roles_changed` and `roster_stale` | roles.md §7 | `roles`, and in `sync`'s reply |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |

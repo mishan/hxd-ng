@@ -68,6 +68,12 @@ async fn start() -> Running {
 /// With `roles`, accounts resolve with that roles file, kept beside them,
 /// and the system account takes commands.
 async fn start_with(roles: Option<&str>) -> Running {
+    start_bulk(roles, hxd_core::admin::BULK_ROWS).await
+}
+
+/// As [`start_with`], sending `user_changed` for at most `bulk_rows`
+/// rows one change alters.
+async fn start_bulk(roles: Option<&str>, bulk_rows: usize) -> Running {
     let accounts = tempfile::tempdir().unwrap();
     std::fs::write(
         accounts.path().join("guest.toml"),
@@ -82,7 +88,7 @@ async fn start_with(roles: Option<&str>) -> Running {
         );
     }
     let mut files = hxd_auth_file::FileAuth::new(accounts.path());
-    let mut core = Core::new();
+    let mut core = Core::new().with_bulk_rows(bulk_rows);
     if let Some(roles) = roles {
         let path = accounts.path().join("roles.toml");
         std::fs::write(&path, roles).unwrap();
@@ -1611,5 +1617,51 @@ async fn an_ng_editor_gives_roles_and_writes_the_overrides_as_given() {
             code,
             "{params}"
         );
+    }
+}
+
+#[tokio::test]
+async fn past_bulk_rows_an_ng_client_syncs_and_a_classic_one_hears_each_row() {
+    let server = start_bulk(None, 1).await;
+    let dir = server.accounts.path();
+    for login in ["ann", "ben"] {
+        write(
+            dir,
+            login,
+            "password = \"pw\"\n[access]\nread_chat = true\n",
+        );
+    }
+    let mut watcher = classic(&server, "deputy", "pw").await;
+    let (mut ng_watcher, _) = ng::Client::account(server.ng, "editor", "pw", "ed")
+        .await
+        .unwrap();
+    let ann = classic(&server, "ann", "pw").await;
+    let ben = classic(&server, "ben", "pw").await;
+    let uids = [ann.uid.unwrap(), ben.uid.unwrap()];
+
+    for login in ["ann", "ben"] {
+        write(
+            dir,
+            login,
+            "password = \"pw\"\n[access]\nread_chat = true\ndisconnect_users = true\n",
+        );
+    }
+    server.core.reload_accounts();
+    for uid in uids {
+        let told = watcher
+            .recv_where(|f| f.ty == push::USER_CHANGE && f.uint(tag::UID) == Some(uid.into()))
+            .await;
+        assert!(told.is_ok(), "{told:?}");
+    }
+    assert!(ng_watcher.event("roster_stale").await.is_ok());
+    let synced = ng_watcher.request("sync", json!({})).await.unwrap();
+    for uid in uids {
+        let row = synced["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["uid"] == uid)
+            .unwrap();
+        assert_eq!(row["admin"], json!(true), "{row}");
     }
 }

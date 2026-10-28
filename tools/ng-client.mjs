@@ -143,6 +143,16 @@ function handleEvent({ seq, ev, data }) {
       roster.set(data.user.uid, data.user);
       say(`--- ${showUser(data.user)} changed`);
       break;
+    case "roster_stale":
+      // Too many rows changed at once to be sent each; the roster comes whole.
+      request("sync")
+        .then((r) => {
+          lastSeq = r.seq;
+          rosterReset(r.users);
+          say(`--- roster refreshed: ${r.users.length} users`);
+        })
+        .catch((e) => say("error:", e?.code ?? e, e?.text ?? ""));
+      break;
     case "user_parted":
       roster.delete(data.uid);
       say(`<-- uid ${data.uid} left`);
