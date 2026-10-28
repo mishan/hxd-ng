@@ -4,10 +4,11 @@ Status: G1 and G2 are built (§14): the roles file, resolution,
 `everyone`, reload, §6.1's minimal overrides and the command line, §5's
 rule for giving and taking roles, the info line and the commands of
 §6.2 and §6.3. Its `@` login reservation is built on its own. Of G3,
-§7's reading is built: the capability, the `roles` block, `roles` on
-the user and account objects, `role_list` and `role_get`. §4's
-`bulk_rows` is not, so a change to many holders' roles still sends a
-`user_changed` per holder.
+§7 is built but for `roles` and the overrides in `account_create` and
+`account_update`, and `role_in_use`, which nothing can call for until
+gates take roles (G4) and restrictions exist (G7). §4's `bulk_rows` is
+not, so a change to many holders still sends a `user_changed` per
+holder.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -172,12 +173,13 @@ send_media = false      # an override: regulars may, Alice may not
   written for them is never read as granting what it meant to withhold.
 - **`false` in a role means nothing**, so `hxd role access … KEY=off`
   removes the key rather than writing it.
-- **Writes are serialized** under a roles-write lock held across the
-  file write and its application, as rooms' are (chat-rooms.md §4).
-  The account-write lock is taken first, then roles, then rooms, by
-  every operation that needs more than one. The file is written whole
-  and renamed into place. Until the server writes it (G3), only `hxd
-  role` does, beside it, and there is no lock to take.
+- **Writes are serialized** under the account-write lock, held from
+  the file write through telling the last holder, as an account edit
+  holds it. The file is written whole and renamed into place. `hxd
+  role` writes it beside a running server without the lock: the server
+  reads the file as it is on disk just before changing it, so an edit
+  made since is kept, and it is what new logins resolve with from then
+  on. Sessions already logged in are given a hand edit by SIGHUP.
 
 ## 3. Resolving an account
 

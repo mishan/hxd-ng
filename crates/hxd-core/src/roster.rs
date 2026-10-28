@@ -480,6 +480,10 @@ pub enum Event {
     /// it, for a frontend that keeps its own copy of what the session may
     /// do. The roster's copy has already changed.
     AccountChanged(Box<crate::Account>),
+    /// The roles as a user list is drawn with them, highest first, after
+    /// one was made, deleted, or shown differently (`docs/roles.md` §7.3).
+    /// Only to sessions whose transport shows roles.
+    RolesChanged(Arc<[crate::RoleView]>),
     /// A public line was redacted (`docs/moderation.md` §3.1). Delivered
     /// to every session that reads public chat; a client that rendered
     /// the line blanks it in place, and one that has not never sees it
@@ -677,6 +681,10 @@ impl Event {
             Event::AccountChanged(a) => {
                 std::mem::size_of::<crate::Account>() + a.login.len() + a.name.len()
             }
+            Event::RolesChanged(list) => list
+                .iter()
+                .map(|r| std::mem::size_of::<crate::RoleView>() + r.name.len() + r.title.len())
+                .sum(),
             Event::ChatPurged { ids } => ids.len() * std::mem::size_of::<crate::history::LineId>(),
             Event::NewsPurged { articles } => {
                 articles.len()
@@ -711,6 +719,7 @@ impl Event {
             Event::Broadcast { .. } => "broadcast",
             Event::Kicked => "kicked",
             Event::AccountChanged(..) => "account_changed",
+            Event::RolesChanged(..) => "roles_changed",
             Event::ChatRedacted { .. } => "chat_redacted",
             Event::ChatPurged { .. } => "chat_purged",
             Event::Report(..) => "report",
@@ -1468,6 +1477,8 @@ pub struct Core {
     /// before authenticating can tell an edit landed before its session
     /// was on the roster to be told (`Core::account_settled`).
     pub(crate) account_epoch: std::sync::atomic::AtomicU64,
+    /// When `roles_changed` was last sent, and whether one waits to be.
+    pub(crate) roles_note: Mutex<(Option<Instant>, bool)>,
     pub(crate) inbox_policy: InboxPolicy,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].

@@ -1273,3 +1273,235 @@ async fn an_ng_client_reads_the_roles_and_who_holds_them() {
         .await;
     assert!(told.is_ok(), "{told:?}");
 }
+
+#[tokio::test]
+async fn a_role_is_made_and_changed_only_within_what_its_editor_holds() {
+    let server = start_with(Some(&format!("# kept across a server's edit\n{ROLES}"))).await;
+    let dir = server.accounts.path();
+    write(dir, "tess", "password = \"pw\"\nroles = [\"staff\"]\n");
+    write(
+        dir,
+        "boss",
+        "password = \"pw\"\n[access]\nread_users = true\nget_user_info = true\n\
+         [extra]\nmanage_roles = true\n",
+    );
+    write(
+        dir,
+        "plain",
+        "password = \"pw\"\n[access]\nread_users = true\n",
+    );
+    let mut tess = classic(&server, "tess", "pw").await;
+    let (mut modern_tess, _) = ng::Client::account(server.ng, "tess", "pw", "tess-ng")
+        .await
+        .unwrap();
+    let (mut boss, _) = ng::Client::account(server.ng, "boss", "pw", "boss")
+        .await
+        .unwrap();
+    let (mut plain, _) = ng::Client::account(server.ng, "plain", "pw", "plain")
+        .await
+        .unwrap();
+    // May kick, but the operator kept the flood exemption from lead,
+    // which the kick bit would otherwise bring.
+    write(
+        dir,
+        "lead",
+        "password = \"pw\"\n[access]\nread_users = true\nget_user_info = true\n\
+         disconnect_users = true\n[extra]\nmanage_roles = true\ncan_spam = false\n",
+    );
+    let (mut lead, _) = ng::Client::account(server.ng, "lead", "pw", "lead")
+        .await
+        .unwrap();
+
+    // Who asks, what, and the refusal, if it is one. In order.
+    for (asker, req, params, refusal) in [
+        (
+            "plain",
+            "role_create",
+            json!({ "name": "helpers" }),
+            Some("access_denied"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "helpers", "access": ["disconnect_users"] }),
+            Some("outranked"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "helpers", "title": "Helpers", "color": 0x11_2233,
+                    "access": ["read_users"] }),
+            None,
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "helpers" }),
+            Some("already_exists"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "everyone" }),
+            Some("already_exists"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "Bad Name" }),
+            Some("bad_request"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "x", "extra": ["can_detach"] }),
+            Some("bad_request"),
+        ),
+        (
+            "boss",
+            "role_create",
+            json!({ "name": "x", "kind": "restriction" }),
+            Some("bad_request"),
+        ),
+        (
+            "boss",
+            "role_update",
+            json!({ "name": "nobody", "title": "N" }),
+            Some("no_such_role"),
+        ),
+        // Keepers grants manage_rooms, which boss may not.
+        (
+            "boss",
+            "role_update",
+            json!({ "name": "keepers", "title": "K" }),
+            Some("outranked"),
+        ),
+        (
+            "boss",
+            "role_update",
+            json!({ "name": "staff", "access": ["get_user_info", "read_users"] }),
+            None,
+        ),
+        (
+            "boss",
+            "role_delete",
+            json!({ "name": "everyone" }),
+            Some("bad_request"),
+        ),
+        (
+            "boss",
+            "role_update",
+            json!({ "name": "helpers", "title": "" }),
+            Some("bad_request"),
+        ),
+        // Every bit lead may give, but the kick bit would bring its
+        // holder the flood exemption lead was kept from.
+        (
+            "lead",
+            "role_update",
+            json!({ "name": "staff",
+                    "access": ["get_user_info", "read_users", "disconnect_users"] }),
+            Some("outranked"),
+        ),
+    ] {
+        let client = match asker {
+            "boss" => &mut boss,
+            "lead" => &mut lead,
+            _ => &mut plain,
+        };
+        let said = client.request(req, params.clone()).await;
+        match refusal {
+            Some(code) => assert_eq!(refused_ng(said), code, "{req} {params}"),
+            None => assert!(said.is_ok(), "{req} {params}: {said:?}"),
+        }
+    }
+    let told = boss
+        .event_where("roles_changed", |d| {
+            d["list"].as_array().is_some_and(|l| {
+                l.iter()
+                    .any(|r| r["name"] == "helpers" && r["color"] == 0x11_2233)
+            })
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+    // Staff's holder hears it on both wires.
+    let told = tess
+        .recv_where(|f| self_access(f, bit::READ_USERS, true))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+    let told = modern_tess
+        .event_where("account_changed", |d| {
+            d["access"]
+                .as_array()
+                .is_some_and(|a| a.contains(&json!("read_users")))
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+    let roles = std::fs::read_to_string(dir.join("roles.toml")).unwrap();
+    assert!(
+        roles.starts_with("# kept across a server's edit\n"),
+        "{roles}"
+    );
+
+    // A second change to how roles look so soon after the first waits,
+    // and goes once it may.
+    boss.request(
+        "role_update",
+        json!({ "name": "helpers", "title": "Aides" }),
+    )
+    .await
+    .unwrap();
+    server.core.clock().advance(Duration::from_secs(3));
+    server.core.flush_roles_changed();
+    let told = boss
+        .event_where("roles_changed", |d| {
+            d["list"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|r| r["title"] == "Aides"))
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+
+    // A role written beside the server is there to the server's next
+    // write, not made over.
+    std::fs::write(dir.join("roles.toml"), format!("{roles}[role.beside]\n")).unwrap();
+    assert_eq!(
+        refused_ng(
+            boss.request("role_create", json!({ "name": "beside" }))
+                .await
+        ),
+        "already_exists"
+    );
+
+    // An administrator holds staff now, so boss may not touch it.
+    let mut admin = classic(&server, "admin", "pw").await;
+    assert!(command(&server, &mut admin, "/role add admin staff")
+        .await
+        .starts_with("ok"));
+    assert_eq!(
+        refused_ng(
+            boss.request("role_update", json!({ "name": "staff", "title": "S" }))
+                .await
+        ),
+        "outranked"
+    );
+    assert!(command(&server, &mut admin, "/role remove admin staff")
+        .await
+        .starts_with("ok"));
+
+    // Deleted, it is taken from its holders and what it gave with it.
+    boss.request("role_delete", json!({ "name": "staff" }))
+        .await
+        .unwrap();
+    assert!(!std::fs::read_to_string(server.file("tess"))
+        .unwrap()
+        .contains("staff"));
+    let told = tess
+        .recv_where(|f| self_access(f, bit::GET_USER_INFO, false))
+        .await;
+    assert!(told.is_ok(), "{told:?}");
+    assert_eq!(
+        refused_ng(boss.request("role_get", json!({ "name": "staff" })).await),
+        "no_such_role"
+    );
+}

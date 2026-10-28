@@ -8,7 +8,7 @@
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::admin::WriteMode;
-use hxd_core::{Account, AccountEdit, AdminError, RoleView};
+use hxd_core::{Account, AccountEdit, AdminError, RoleEdit, RoleView};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -26,6 +26,9 @@ pub(crate) fn handles(req: &str) -> bool {
             | "account_delete"
             | "role_list"
             | "role_get"
+            | "role_create"
+            | "role_update"
+            | "role_delete"
     )
 }
 
@@ -57,7 +60,7 @@ fn account_json(a: &Account) -> Value {
 }
 
 /// A role as the login block lists it: what a user list is drawn with.
-fn role_shown_json(r: &RoleView) -> Value {
+pub(crate) fn role_shown_json(r: &RoleView) -> Value {
     let mut v = json!({ "name": r.name, "title": r.title, "position": r.position });
     if let Some(color) = r.color {
         v["color"] = json!(color);
@@ -98,6 +101,7 @@ fn admin_err(e: AdminError) -> (&'static str, String) {
         AdminError::Outranked => "outranked",
         AdminError::NoSuchAccount => "no_such_account",
         AdminError::NoSuchRole => "no_such_role",
+        AdminError::BadRole(_) => "bad_request",
         AdminError::Exists => "already_exists",
         AdminError::InvalidLogin => "invalid_login",
         AdminError::Unsupported => "not_available",
@@ -170,6 +174,79 @@ impl EditParams {
     }
 }
 
+/// A field that is there, `null` or not, as `Some`: so `color: null`
+/// clears where an absent `color` keeps.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+struct RoleParams {
+    name: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    color: Option<Value>,
+    #[serde(default)]
+    position: Option<i64>,
+    #[serde(default)]
+    mentionable: Option<bool>,
+    #[serde(default)]
+    access: Option<Vec<String>>,
+    #[serde(default)]
+    raw_bits: Option<Vec<u8>>,
+    #[serde(default)]
+    extra: Option<Vec<String>>,
+    // A restriction's, read only to refuse it.
+    #[serde(default, deserialize_with = "present")]
+    kind: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    deny: Option<Value>,
+}
+
+impl RoleParams {
+    fn edit(self) -> Result<RoleEdit, &'static str> {
+        if self.kind.is_some() || self.deny.is_some() {
+            return Err("This server has no restrictions yet.");
+        }
+        let color = match self.color {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(v) => Some(Some(
+                v.as_u64()
+                    .and_then(|c| u32::try_from(c).ok())
+                    .ok_or("A color is 0xRRGGBB.")?,
+            )),
+        };
+        let access = match (self.access, self.raw_bits) {
+            (None, None) => None,
+            (None, Some(_)) => return Err("raw_bits goes with access."),
+            (Some(names), raw) => {
+                let mut a = AccessBits::empty();
+                for name in &names {
+                    a = a.with(access::named(name).ok_or("No such access name.")?);
+                }
+                for b in raw.unwrap_or_default() {
+                    if b >= 64 {
+                        return Err("raw_bits are 0 to 63.");
+                    }
+                    a = a.with(b);
+                }
+                Some(a)
+            }
+        };
+        Ok(RoleEdit {
+            name: self.name,
+            title: self.title,
+            color,
+            position: self.position,
+            mentionable: self.mentionable,
+            access,
+            extra: self.extra,
+        })
+    }
+}
+
 /// Answer one `accounts` request.
 pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) -> String {
     let (id, uid) = (req.id, state.uid);
@@ -215,6 +292,34 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             off_reactor(&ctx.core, move |c| {
                 c.role_get(uid, &p.name)
                     .map(|(role, holders)| json!({ "role": role_json(&role), "holders": holders }))
+            })
+            .await
+        }
+        "role_create" | "role_update" => {
+            let Ok(p) = serde_json::from_value::<RoleParams>(params) else {
+                return bad("Malformed role request.");
+            };
+            let edit = match p.edit() {
+                Ok(edit) => edit,
+                Err(text) => return bad(text),
+            };
+            let create = req.req == "role_create";
+            off_reactor(&ctx.core, move |c| {
+                c.role_write(uid, &edit, create)
+                    .map(|role| json!({ "role": role_json(&role) }))
+            })
+            .await
+        }
+        "role_delete" => {
+            #[derive(Deserialize)]
+            struct NameParams {
+                name: String,
+            }
+            let Ok(p) = serde_json::from_value::<NameParams>(params) else {
+                return bad("Malformed role request.");
+            };
+            off_reactor(&ctx.core, move |c| {
+                c.role_delete(uid, &p.name).map(|()| json!({}))
             })
             .await
         }

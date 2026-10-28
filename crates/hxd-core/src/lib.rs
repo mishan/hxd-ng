@@ -40,7 +40,7 @@ pub use access::AccessBits;
 pub use account::{
     Account, AccountAdmin, AccountConfig, AccountDirectory, AccountEdit, AdminError, AuthBackend,
     AuthError, DenyMask, Extras, IdentityLink, LinkAuthority, LinkOutcome, Proof, RoleChange,
-    RoleView, UnlinkOutcome, WriteCheck,
+    RoleCheck, RoleEdit, RoleView, UnlinkOutcome, WriteCheck,
 };
 pub use avatar::{
     Avatar, AvatarId, AvatarImages, AvatarLimits, AvatarOwner, AvatarPolicy, AvatarRef,

@@ -17,7 +17,7 @@
 
 use crate::access::bit;
 use crate::account::{
-    Account, AccountAdmin, AccountEdit, AdminError, DenyMask, RoleView, FIELD_MAX_CHARS,
+    Account, AccountAdmin, AccountEdit, AdminError, DenyMask, RoleEdit, RoleView, FIELD_MAX_CHARS,
 };
 use crate::roster::{Core, Event, RosterInner, Uid};
 
@@ -56,6 +56,27 @@ fn beyond(actor: &Account, target: &Account) -> bool {
         .iter()
         .any(|(t, a)| *t && !*a)
 }
+
+/// Does `role` grant anything `actor` may not do (`docs/roles.md` §5)?
+fn grants_beyond(actor: &Account, role: &RoleView) -> bool {
+    role.access.raw() & !actor.access.raw() != 0
+        || role.extra.iter().any(|key| !match *key {
+            "set_subject" => actor.set_subject,
+            "file_list" => actor.file_list,
+            "file_getinfo" => actor.file_getinfo,
+            "attach_news" => actor.attach_news,
+            "moderate" => actor.moderate,
+            "can_spam" => actor.can_spam,
+            "manage_roles" => actor.manage_roles,
+            "manage_rooms" => actor.manage_rooms,
+            _ => false,
+        })
+}
+
+/// How long `roles_changed` waits after one before another may go: an
+/// administrator editing a role field by field is one redraw a client
+/// makes, not one a field (`docs/roles.md` §4).
+pub const ROLES_CHANGED_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The account `login` names, as its file reads now — inside the
 /// backend's writes, so it is not demoted between this and the write —
@@ -133,6 +154,119 @@ impl Core {
             .get(&uid)
             .and_then(|s| s.account.as_ref().map(|a| a.masked(&s.mask)))
             .is_some_and(|a| a.manage_roles)
+    }
+
+    /// Make or change a role for session `uid`, which must manage roles
+    /// and may give out through it nothing it may not do, nor touch a
+    /// role anyone it could not edit holds (`docs/roles.md` §5).
+    pub fn role_write(
+        &self,
+        uid: Uid,
+        edit: &RoleEdit,
+        create: bool,
+    ) -> Result<RoleView, AdminError> {
+        let admin = self.admin.as_deref().ok_or(AdminError::Unsupported)?;
+        if !self.manages_roles(uid) {
+            return Err(AdminError::NotAllowed);
+        }
+        let login = self.login_of(uid)?;
+        let _writing = self.begin_account_write();
+        let shown_before = admin.roles().into_iter().find(|r| r.name == edit.name);
+        let role = admin.write_role(edit, create, &|before, after, now, then| {
+            role_may(admin, &login, before, after, now, then)
+        })?;
+        // A change to what it looks like alone is told as `roles_changed`,
+        // not to each holder as though what they may do had changed. A
+        // new one may already be listed by accounts waiting for it.
+        let grants = |r: &RoleView| (r.access, r.extra.clone());
+        if shown_before.as_ref().map(grants) != Some(grants(&role)) {
+            let name = role.name.clone();
+            self.reapply(|a| name == EVERYONE || a.roles.contains(&name));
+        }
+        let shown = |r: &RoleView| (r.title.clone(), r.color, r.position, r.mentionable);
+        if shown_before.as_ref().map(shown) != Some(shown(&role)) {
+            self.roles_changed();
+        }
+        Ok(role)
+    }
+
+    /// Delete a role for session `uid`, under [`Core::role_write`]'s rule.
+    pub fn role_delete(&self, uid: Uid, name: &str) -> Result<(), AdminError> {
+        let admin = self.admin.as_deref().ok_or(AdminError::Unsupported)?;
+        if !self.manages_roles(uid) {
+            return Err(AdminError::NotAllowed);
+        }
+        let login = self.login_of(uid)?;
+        let _writing = self.begin_account_write();
+        let deleted = admin.delete_role(name, &|before, after, now, then| {
+            role_may(admin, &login, before, after, now, then)
+        });
+        // Even one cut short may have taken it from some of its holders.
+        self.reapply(|a| a.roles.iter().any(|r| r == name));
+        deleted?;
+        self.roles_changed();
+        Ok(())
+    }
+
+    /// Read again the accounts of the sessions `holds` picks, and give
+    /// each what it now says. Under the account-write lock.
+    fn reapply(&self, holds: impl Fn(&Account) -> bool) {
+        let Some(admin) = self.admin.as_deref() else {
+            return;
+        };
+        let mut logins: Vec<String> = {
+            let r = self.roster.lock().unwrap();
+            r.users
+                .values()
+                .filter(|s| !s.system && s.account.as_ref().is_some_and(|a| holds(a)))
+                .map(|s| s.login.clone())
+                .collect()
+        };
+        logins.sort();
+        logins.dedup();
+        let accounts: std::collections::HashMap<String, Account> = logins
+            .into_iter()
+            .filter_map(|login| Some((login.clone(), admin.read_account(&login).ok()?)))
+            .collect();
+        self.apply_accounts(|l| accounts.get(l));
+    }
+
+    /// Tell every session that shows roles what they now are, or, if one
+    /// was told too recently, leave it for [`Core::flush_roles_changed`].
+    fn roles_changed(&self) {
+        let mut note = self.roles_note.lock().unwrap();
+        let now = self.clock.now();
+        if note
+            .0
+            .is_some_and(|at| now.duration_since(at) < ROLES_CHANGED_EVERY)
+        {
+            note.1 = true;
+            return;
+        }
+        *note = (Some(now), false);
+        drop(note);
+        self.send_roles_changed();
+    }
+
+    /// Send a `roles_changed` held back by [`ROLES_CHANGED_EVERY`] once
+    /// it has passed. Called every second by the binary.
+    pub fn flush_roles_changed(&self) {
+        let mut note = self.roles_note.lock().unwrap();
+        let now = self.clock.now();
+        match *note {
+            (Some(at), true) if now.duration_since(at) >= ROLES_CHANGED_EVERY => {
+                *note = (Some(now), false);
+            }
+            _ => return,
+        }
+        drop(note);
+        self.send_roles_changed();
+    }
+
+    fn send_roles_changed(&self) {
+        let list: std::sync::Arc<[RoleView]> = self.roles_shown().into();
+        let mut r = self.roster.lock().unwrap();
+        r.broadcast_where(&Event::RolesChanged(list), None, |s| s.info.transport.roles);
     }
 
     /// The titles of the roles `listed` names that exist, highest first,
@@ -388,6 +522,38 @@ impl Core {
         let r = self.roster.lock().unwrap();
         r.users.get(&uid).map(|s| s.mask).unwrap_or_default()
     }
+}
+
+/// May the account `login` names make a role `before` into `after`,
+/// with its holders reading as `now` and then as `then`: it manages
+/// roles, the role grants nothing it lacks either side of the edit, and
+/// every holder is one it could edit and could have made so, as
+/// account-admin.md §1 has it for an account. Read inside the backend's
+/// writes, as [`actor`] is.
+fn role_may(
+    admin: &dyn AccountAdmin,
+    login: &str,
+    before: Option<&RoleView>,
+    after: Option<&RoleView>,
+    now: &[Account],
+    then: &[Account],
+) -> Result<(), AdminError> {
+    let actor = admin.read_account(login).map_err(|e| match e {
+        AdminError::NoSuchAccount => AdminError::NotAllowed,
+        e => e,
+    })?;
+    if !actor.manage_roles {
+        return Err(AdminError::NotAllowed);
+    }
+    if before
+        .into_iter()
+        .chain(after)
+        .any(|r| grants_beyond(&actor, r))
+        || now.iter().chain(then).any(|h| beyond(&actor, h))
+    {
+        return Err(AdminError::Outranked);
+    }
+    Ok(())
 }
 
 /// Give session `uid` `account` as its mask leaves it, and tell it.

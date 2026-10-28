@@ -886,6 +886,10 @@ pub fn event_json(se: &SeqEvent) -> String {
             }
             ("account_changed", data)
         }
+        Event::RolesChanged(list) => (
+            "roles_changed",
+            json!({ "list": list.iter().map(crate::accounts::role_shown_json).collect::<Vec<_>>() }),
+        ),
         // A client blanks the line in place (moderation.md §5); history
         // already answers it as the tombstone.
         Event::ChatRedacted { id } => ("chat_redacted", json!({ "id": id })),
