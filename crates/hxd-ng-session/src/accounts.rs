@@ -8,7 +8,7 @@
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::admin::WriteMode;
-use hxd_core::{Account, AccountEdit, AdminError};
+use hxd_core::{Account, AccountEdit, AdminError, RoleView};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,7 +19,13 @@ use crate::NgCtx;
 pub(crate) fn handles(req: &str) -> bool {
     matches!(
         req,
-        "account_list" | "account_get" | "account_create" | "account_update" | "account_delete"
+        "account_list"
+            | "account_get"
+            | "account_create"
+            | "account_update"
+            | "account_delete"
+            | "role_list"
+            | "role_get"
     )
 }
 
@@ -30,6 +36,8 @@ pub fn access_json(a: AccessBits) -> Value {
     json!({ "access": names, "raw_bits": raw })
 }
 
+/// An account's configuration, never its mask (`docs/roles.md` §7.2),
+/// and the keys its own record sets over its roles.
 fn account_json(a: &Account) -> Value {
     let mut v = access_json(a.access);
     v["login"] = json!(a.login);
@@ -38,7 +46,50 @@ fn account_json(a: &Account) -> Value {
     if let Some(fp) = &a.identity.fingerprint {
         v["identity"] = json!(hl_identity::Fingerprint(*fp).to_string());
     }
+    v["roles"] = json!(a.roles);
+    let (grant, raw_grant) = access::names_of(a.config.grant);
+    let (deny, raw_deny) = access::names_of(a.config.deny);
+    v["grant"] = json!(grant);
+    v["deny"] = json!(deny);
+    v["raw_grant"] = json!(raw_grant);
+    v["raw_deny"] = json!(raw_deny);
     v
+}
+
+/// A role as the login block lists it: what a user list is drawn with.
+fn role_shown_json(r: &RoleView) -> Value {
+    let mut v = json!({ "name": r.name, "title": r.title, "position": r.position });
+    if let Some(color) = r.color {
+        v["color"] = json!(color);
+    }
+    if r.mentionable {
+        v["mentionable"] = json!(true);
+    }
+    v
+}
+
+/// A role with its grants, for `role_list` and `role_get`.
+fn role_json(r: &RoleView) -> Value {
+    let mut v = role_shown_json(r);
+    let access = access_json(r.access);
+    v["access"] = access["access"].clone();
+    v["raw_bits"] = access["raw_bits"].clone();
+    v["extra"] = json!(r.extra);
+    v
+}
+
+/// The login reply's and `sync`'s `roles` block, when the server
+/// administers accounts (`docs/roles.md` §7.1).
+pub(crate) fn roles_block(core: &hxd_core::Core, uid: hxd_core::Uid) -> Option<Value> {
+    if !core.accounts_enabled() {
+        return None;
+    }
+    let list: Vec<Value> = core.roles_shown().iter().map(role_shown_json).collect();
+    let mut v = json!({ "list": list });
+    if core.manages_roles(uid) {
+        v["manage_roles"] = json!(true);
+    }
+    Some(v)
 }
 
 fn admin_err(e: AdminError) -> (&'static str, String) {
@@ -134,6 +185,36 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                         .collect();
                     json!({ "accounts": listed })
                 })
+            })
+            .await
+        }
+        "role_list" => {
+            off_reactor(&ctx.core, move |c| {
+                c.role_list(uid).map(|all| {
+                    let listed: Vec<Value> = all
+                        .iter()
+                        .map(|(role, held)| {
+                            let mut v = role_json(role);
+                            v["holder_count"] = json!(held);
+                            v
+                        })
+                        .collect();
+                    json!({ "roles": listed })
+                })
+            })
+            .await
+        }
+        "role_get" => {
+            #[derive(Deserialize)]
+            struct NameParams {
+                name: String,
+            }
+            let Ok(p) = serde_json::from_value::<NameParams>(params) else {
+                return bad("Malformed role request.");
+            };
+            off_reactor(&ctx.core, move |c| {
+                c.role_get(uid, &p.name)
+                    .map(|(role, holders)| json!({ "role": role_json(&role), "holders": holders }))
             })
             .await
         }

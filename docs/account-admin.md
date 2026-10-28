@@ -165,8 +165,13 @@ data of `account_changed`.
 ```jsonc
 { "login": "eve", "name": "Eve", "password": true,
   "access": ["read_chat", "send_chat"], "raw_bits": [41],
-  "identity": "6htgz65…" }   // absent unless the account links one
+  "identity": "6htgz65…",    // absent unless the account links one
+  "roles": [], "grant": ["read_chat", "send_chat"],
+  "deny": ["read_chat_history"], "raw_grant": [41], "raw_deny": [] }
 ```
+
+`roles`, `grant`, `deny`, `raw_grant` and `raw_deny` are roles.md §7.2's:
+the account's roles, and the keys its own record sets over them.
 
 `password` says whether one is set; the password itself never leaves
 the server.
@@ -187,13 +192,14 @@ the server.
 
 | `ev` | `data` | Sent when |
 |---|---|---|
-| `account_changed` | `{ "access", "raw_bits", "manage_rooms"?, "moderator"? }` (§5.1) | An administrator changed the account this session is logged in as (§3). |
+| `account_changed` | `{ "access", "raw_bits", "manage_rooms"?, "moderator"?, "manage_roles"? }` (§5.1) | An administrator changed the account this session is logged in as (§3). |
 
 `manage_rooms` is present and true when the session may manage rooms,
 on a server that keeps rooms (chat-rooms.md §7.1), and `moderator` when
 it moderates (moderation.md §2): the login reply's `self` says the
-same. Neither is a bit, so a session that loses one is told by its
-absence.
+same. `manage_roles` is present when it may create and edit roles, as
+the `roles` block says (roles.md §7.1). None is a bit, so a session
+that loses one is told by its absence.
 
 The `sync` reply carries the §5.1 block too (hotline-ng.md §6.3), with
 `manage_rooms` and `moderator` as here, since an `account_changed` may

@@ -635,11 +635,13 @@ async fn an_ng_administrator_keeps_accounts_and_its_target_hears() {
         .await
         .unwrap();
     // Exactly what was asked: history named off, since read-chat alone
-    // would otherwise carry it.
+    // would otherwise carry it, and all of it the account's own keys.
     assert_eq!(
         made["account"],
         json!({ "login": "eve", "name": "Eve", "password": true,
-                "access": ["read_chat", "send_chat"], "raw_bits": [41] })
+                "access": ["read_chat", "send_chat"], "raw_bits": [41], "roles": [],
+                "grant": ["read_chat", "send_chat"], "raw_grant": [41],
+                "deny": ["read_chat_history"], "raw_deny": [] })
     );
     assert_eq!(
         refused_ng(
@@ -1196,4 +1198,78 @@ async fn a_save_keeps_a_role_changed_while_the_editor_was_open() {
     assert!(!file.contains("get_user_info"), "{file}");
     assert!(!file.contains("read_chat"), "{file}");
     assert!(file.contains("send_chat = true"), "{file}");
+}
+
+#[tokio::test]
+async fn an_ng_client_reads_the_roles_and_who_holds_them() {
+    let server = start_with(Some(ROLES)).await;
+    write(
+        server.accounts.path(),
+        "tess",
+        "password = \"pw\"\nroles = [\"staff\"]\n[access]\nsend_chat = false\nraw_bits = [41]\n",
+    );
+    write(
+        server.accounts.path(),
+        "boss",
+        "password = \"pw\"\n[access]\nread_users = true\n[extra]\nmanage_roles = true\n",
+    );
+    let (mut tess, hello) = ng::Client::account(server.ng, "tess", "pw", "tess")
+        .await
+        .unwrap();
+    assert!(hello["caps"].as_array().unwrap().contains(&json!("roles")));
+    assert_eq!(
+        hello["roles"]["list"][0],
+        json!({ "name": "editors", "title": "Editors", "position": 20 })
+    );
+    assert!(hello["roles"].get("manage_roles").is_none(), "{hello}");
+    assert_eq!(hello["self"]["roles"], json!(["staff"]));
+    let (mut boss, hello) = ng::Client::account(server.ng, "boss", "pw", "boss")
+        .await
+        .unwrap();
+    assert_eq!(hello["roles"]["manage_roles"], json!(true));
+
+    assert_eq!(
+        refused_ng(tess.request("role_list", json!({})).await),
+        "access_denied"
+    );
+    let listed = boss.request("role_list", json!({})).await.unwrap();
+    let staff = listed["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "staff")
+        .unwrap();
+    assert_eq!(staff["holder_count"], 1);
+    assert_eq!(staff["access"], json!(["get_user_info"]));
+    let got = boss
+        .request("role_get", json!({ "name": "keepers" }))
+        .await
+        .unwrap();
+    assert_eq!(got["role"]["extra"], json!(["manage_rooms"]));
+    assert_eq!(got["holders"], json!([]));
+    assert_eq!(
+        refused_ng(boss.request("role_get", json!({ "name": "nobody" })).await),
+        "no_such_role"
+    );
+    // The account as configured, and what its own file says over its roles.
+    let tess_account = boss
+        .request("account_get", json!({ "login": "tess" }))
+        .await
+        .unwrap();
+    let a = &tess_account["account"];
+    assert_eq!(a["roles"], json!(["staff"]));
+    assert_eq!(a["grant"], json!([]));
+    assert_eq!(a["raw_grant"], json!([41]));
+    assert_eq!(a["deny"], json!(["send_chat"]));
+
+    // A role given on the classic wire reaches the roster on this one.
+    let mut admin = classic(&server, "admin", "pw").await;
+    command(&server, &mut admin, "/role add tess editors").await;
+    let tess_uid = tess.uid.unwrap();
+    let told = boss
+        .event_where("user_changed", |d| {
+            d["user"]["uid"] == tess_uid && d["user"]["roles"] == json!(["staff", "editors"])
+        })
+        .await;
+    assert!(told.is_ok(), "{told:?}");
 }

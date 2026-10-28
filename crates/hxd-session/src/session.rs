@@ -5654,6 +5654,7 @@ mod tests {
                 signs: false,
                 server_key: None,
             }),
+            roles: Vec::new(),
         };
         let long = "\u{3042}".repeat(12);
         for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {

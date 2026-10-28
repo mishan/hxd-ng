@@ -196,21 +196,22 @@ impl AccountFile {
             },
         );
         let mut history_named = access.has(bit::CHAT_HISTORY);
+        let (mut grant, mut deny) = (AccessBits::empty(), AccessBits::empty());
         for (key, on) in &self.access.named {
             if let Some(b) = named_bit(key) {
-                access = if *on {
-                    access.with(b)
+                (access, grant, deny) = if *on {
+                    (access.with(b), grant.with(b), deny.without(b))
                 } else {
-                    access.without(b)
+                    (access.without(b), grant.without(b), deny.with(b))
                 };
                 history_named |= b == bit::CHAT_HISTORY;
             }
         }
         for b in &self.access.raw_bits {
-            access = access.with(*b);
+            (access, grant, deny) = (access.with(*b), grant.with(*b), deny.without(*b));
         }
         for b in &self.access.raw_deny {
-            access = access.without(*b);
+            (access, grant, deny) = (access.without(*b), grant.without(*b), deny.with(*b));
             history_named |= *b == bit::CHAT_HISTORY;
         }
         let x = &self.extra;
@@ -231,6 +232,8 @@ impl AccountFile {
             access,
             history_named,
             extra: own.zip_with(granted, |own, role| own.or(role.then_some(true))),
+            grant,
+            deny,
         }
     }
 
@@ -916,7 +919,11 @@ impl AccountAdmin for FileAuth {
             .map(|r| RoleView {
                 name: r.name.clone(),
                 title: r.title.clone(),
+                color: r.color,
                 position: r.position,
+                mentionable: r.mentionable,
+                access: r.access,
+                extra: r.extra_names(),
             })
             .collect();
         all.sort_by(|a, b| b.position.cmp(&a.position).then(a.name.cmp(&b.name)));

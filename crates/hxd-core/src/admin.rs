@@ -102,6 +102,39 @@ impl Core {
             .collect())
     }
 
+    /// One role and the logins holding it, for a session holding
+    /// read-users.
+    pub fn role_get(&self, uid: Uid, name: &str) -> Result<(RoleView, Vec<String>), AdminError> {
+        let admin = self.admin_backend(uid, bit::READ_USERS)?;
+        let role = admin
+            .roles()
+            .into_iter()
+            .find(|r| r.name == name)
+            .ok_or(AdminError::NoSuchRole)?;
+        let holders = admin
+            .list_accounts()?
+            .into_iter()
+            .filter(|a| name == EVERYONE || a.roles.iter().any(|r| r == name))
+            .map(|a| a.login)
+            .collect();
+        Ok((role, holders))
+    }
+
+    /// Every role, highest first, as every session may see them: their
+    /// names, titles and colors are what a user list is drawn with.
+    pub fn roles_shown(&self) -> Vec<RoleView> {
+        self.admin.as_deref().map_or_else(Vec::new, |a| a.roles())
+    }
+
+    /// May session `uid` create, edit and delete roles?
+    pub fn manages_roles(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.users
+            .get(&uid)
+            .and_then(|s| s.account.as_ref().map(|a| a.masked(&s.mask)))
+            .is_some_and(|a| a.manage_roles)
+    }
+
     /// The titles of the roles `listed` names that exist, highest first,
     /// for display. `everyone` is left out: it says nothing about anyone.
     pub fn role_titles(&self, listed: &[String]) -> Vec<String> {
@@ -383,16 +416,22 @@ fn give_account(r: &mut RosterInner, uid: Uid, account: &Account) {
     s.set_subject = effective.set_subject;
     s.is_person = effective.is_person();
     let mut shown = s.info.admin != admin;
+    let roles_changed = s.info.roles != account.roles;
     s.info.admin = admin;
+    s.info.roles.clone_from(&account.roles);
     let renamed = name.as_ref().is_some_and(|n| s.info.nick != *n);
     if let Some(name) = name {
         s.info.nick = name;
     }
     shown |= renamed;
-    let shown = (shown && s.visible).then(|| s.info.clone());
+    // A change to its roles alone, to the wires that can show one.
+    let only_roles = !shown && roles_changed;
+    let shown = ((shown || roles_changed) && s.visible).then(|| s.info.clone());
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
     if let Some(info) = shown {
-        r.broadcast_where(&Event::Changed(info), None, |_| true);
+        r.broadcast_where(&Event::Changed(info), None, |s| {
+            !only_roles || s.info.transport.roles
+        });
         // The admin bit never crosses a link; only the name does.
         if renamed {
             r.export_changed(uid);

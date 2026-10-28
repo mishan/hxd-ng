@@ -213,6 +213,10 @@ pub struct AccountConfig {
     pub history_named: bool,
     /// Each `[extra]` key as named, `None` where it is left to derive.
     pub extra: Extras<Option<bool>>,
+    /// The bits the account's own file grants, whatever its roles do.
+    pub grant: AccessBits,
+    /// The bits the account's own file withholds, whatever its roles do.
+    pub deny: AccessBits,
 }
 
 /// What a session is denied whatever its account says: probation's and
@@ -524,8 +528,15 @@ pub enum RoleChange {
 pub struct RoleView {
     pub name: String,
     pub title: String,
+    /// `0xRRGGBB`.
+    pub color: Option<u32>,
     /// Display order, highest first.
     pub position: i64,
+    pub mentionable: bool,
+    /// The bits it grants.
+    pub access: AccessBits,
+    /// The `[extra]` keys it grants, by name.
+    pub extra: Vec<&'static str>,
 }
 
 /// Why an account was not read, written or deleted.

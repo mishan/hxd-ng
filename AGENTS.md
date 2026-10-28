@@ -300,8 +300,10 @@ Three layers, all `cargo test --workspace`:
   were, `hxd account` applied by a reload, a role's grants reaching
   its holders at login and an `hxd role` edit reaching them on reload,
   a role given with `/role` only by someone holding what it grants and
-  reaching its holder on both wires and in Get User Info, and a classic
-  save leaving a role changed while the editor was open as it is),
+  reaching its holder on both wires and in Get User Info, a classic
+  save leaving a role changed while the editor was open as it is, and
+  an ng client reading the roles, who holds them and an account's own
+  keys, and seeing a role given on the classic wire on its roster),
   `tls.rs`
   (the legacy wire over TLS beside a plaintext client, and HTXF on the
   TLS transfer port), `chat.rs` (chat/PM/moderation over the legacy

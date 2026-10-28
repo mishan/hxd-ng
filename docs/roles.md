@@ -3,7 +3,11 @@
 Status: G1 and G2 are built (§14): the roles file, resolution,
 `everyone`, reload, §6.1's minimal overrides and the command line, §5's
 rule for giving and taking roles, the info line and the commands of
-§6.2 and §6.3. Its `@` login reservation is built on its own.
+§6.2 and §6.3. Its `@` login reservation is built on its own. Of G3,
+§7's reading is built: the capability, the `roles` block, `roles` on
+the user and account objects, `role_list` and `role_get`. §4's
+`bulk_rows` is not, so a change to many holders' roles still sends a
+`user_changed` per holder.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -415,8 +419,10 @@ When 348 List Users is built, roles list after the accounts, as
 
 ### 7.1 The login reply
 
-Capability `"roles"`, present whenever the server has a roles file, and
-requests of the family answer `not_available` without it. A `roles`
+Capability `"roles"`, present whenever the server administers accounts
+(the roles file is always configured, and an absent one is `everyone`
+granting nothing), and requests of the family answer `not_available`
+without it. A `roles`
 block lists the roles:
 
 ```jsonc
@@ -439,7 +445,7 @@ lost in the gap it recovers from.
 
 | `req` | `params` | `ok` | Needs |
 |---|---|---|---|
-| `role_list` | — | `{ "roles": [ role… ] }`, with grants, restrictions included, and holders' count | `read_users` |
+| `role_list` | — | `{ "roles": [ role… ] }`, with grants, restrictions included, and `holder_count` | `read_users` |
 | `role_get` | `name` | `{ "role": {…}, "holders": [ login… ] }` | `read_users` |
 | `role_create` | `name`, `title?`, `color?`, `position?`, `mentionable?`, `access?`, `raw_bits?`, `extra?`; or for a restriction `kind: "restriction"`, `title?`, `deny` | `{ "role": {…} }` | `manage_roles`, §5 |
 | `role_update` | `name`, then any of `role_create`'s fields but `kind`; `color: null` clears it | `{ "role": {…} }` | `manage_roles`, §5 |

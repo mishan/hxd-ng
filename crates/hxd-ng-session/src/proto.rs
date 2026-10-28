@@ -631,6 +631,9 @@ impl serde::Serialize for UserOut<'_> {
         if let Some(color) = u.color {
             m.serialize_entry("color", &color)?;
         }
+        if !u.roles.is_empty() {
+            m.serialize_entry("roles", &u.roles)?;
+        }
         if let Some(r) = &u.remote {
             m.serialize_entry("remote", &remote_json(r))?;
             // As its home server says, over a link trying the user keys
@@ -877,6 +880,9 @@ pub fn event_json(se: &SeqEvent) -> String {
             }
             if account.moderate {
                 data["moderator"] = json!(true);
+            }
+            if account.manage_roles {
+                data["manage_roles"] = json!(true);
             }
             ("account_changed", data)
         }
@@ -1180,6 +1186,11 @@ mod tests {
             }),
             color: full.then_some(0x00ff_8000),
             remote: None,
+            roles: if full {
+                vec!["staff".into()]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1197,6 +1208,7 @@ mod tests {
                 want["system"] = json!(true);
                 want["avatar"] = crate::avatar::avatar_json(u.avatar.as_ref().unwrap());
                 want["color"] = json!(0x00ff_8000);
+                want["roles"] = json!(["staff"]);
                 want["identity"] = json!({
                     "fingerprint": hl_identity::Fingerprint([1; 32]).to_string(),
                     "handle": "ann@example.org",
