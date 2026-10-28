@@ -80,13 +80,15 @@ these live fields without operator duplication:
 
 - software and legacy protocol version;
 - process uptime;
-- inline-media and voice support, only when those services were built and
-  started;
+- inline-media, voice and video support, only when those services were
+  built and started;
 - large-file (64-bit) transfer support, whenever the Files service was built —
   the same condition under which both wires echo the large-file capability;
 - TLS support and the TLS port, whenever `[tls]` is configured and its
   listener bound;
-- current visible-session count in the fixed header.
+- current visible-session count in the fixed header;
+- with `[link]`, server-linking support while a peer is configured, and the
+  other servers' users shown here, which the header's count leaves out.
 
 The optional `[tracker.v3]` table supplies operator facts:
 

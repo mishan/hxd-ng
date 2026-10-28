@@ -2470,7 +2470,7 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) ->
 
 /// Is video both configured and servable? `[voice.video]` present, with
 /// a `[voice]` section that actually produced an SFU.
-fn video_enabled(config: &Config) -> bool {
+pub fn video_enabled(config: &Config) -> bool {
     config.voice.as_ref().is_some_and(|v| v.video.is_some())
 }
 
