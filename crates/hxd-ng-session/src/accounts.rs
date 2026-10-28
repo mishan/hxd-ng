@@ -8,7 +8,7 @@
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::admin::WriteMode;
-use hxd_core::{Account, AccountEdit, AdminError, RoleEdit, RoleView};
+use hxd_core::{Account, AccountEdit, AdminError, RoleChange, RoleEdit, RoleView};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -129,6 +129,31 @@ struct EditParams {
     access: Option<Vec<String>>,
     #[serde(default)]
     raw_bits: Option<Vec<u8>>,
+    #[serde(default)]
+    roles: Option<Vec<String>>,
+    #[serde(default)]
+    grant: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Option<Vec<String>>,
+    #[serde(default)]
+    raw_grant: Option<Vec<u8>>,
+    #[serde(default)]
+    raw_deny: Option<Vec<u8>>,
+}
+
+/// The bits `names` and the numbers in `raw` say.
+fn bits(names: &[String], raw: &[u8]) -> Result<AccessBits, &'static str> {
+    let mut a = AccessBits::empty();
+    for name in names {
+        a = a.with(access::named(name).ok_or("No such access name.")?);
+    }
+    for &b in raw {
+        if b >= 64 {
+            return Err("Raw bits are 0 to 63.");
+        }
+        a = a.with(b);
+    }
+    Ok(a)
 }
 
 impl EditParams {
@@ -150,18 +175,30 @@ impl EditParams {
         let access = match (self.access, self.raw_bits) {
             (None, None) => None,
             (None, Some(_)) => return Err("raw_bits goes with access."),
-            (Some(names), raw) => {
-                let mut a = AccessBits::empty();
-                for name in &names {
-                    a = a.with(access::named(name).ok_or("No such access name.")?);
+            (Some(names), raw) => Some(bits(&names, &raw.unwrap_or_default())?),
+        };
+        let own = self.grant.is_some()
+            || self.deny.is_some()
+            || self.raw_grant.is_some()
+            || self.raw_deny.is_some();
+        // The overrides replace each other as a set, so one left out says
+        // the account sets none of it.
+        let overrides = match (own, access) {
+            (false, _) => None,
+            (true, Some(_)) => return Err("Send access or grant and deny, not both."),
+            (true, None) => {
+                let grant = bits(
+                    &self.grant.unwrap_or_default(),
+                    &self.raw_grant.unwrap_or_default(),
+                )?;
+                let deny = bits(
+                    &self.deny.unwrap_or_default(),
+                    &self.raw_deny.unwrap_or_default(),
+                )?;
+                if grant.raw() & deny.raw() != 0 {
+                    return Err("A bit cannot be both granted and denied.");
                 }
-                for b in raw.unwrap_or_default() {
-                    if b >= 64 {
-                        return Err("raw_bits are 0 to 63.");
-                    }
-                    a = a.with(b);
-                }
-                Some(a)
+                Some((grant, deny))
             }
         };
         Ok(AccountEdit {
@@ -169,6 +206,11 @@ impl EditParams {
             name: self.name.filter(|n| !n.is_empty()),
             password: self.password,
             access,
+            overrides,
+            roles: self
+                .roles
+                .map(|names| vec![RoleChange::Set(names)])
+                .unwrap_or_default(),
             ..Default::default()
         })
     }
@@ -221,19 +263,7 @@ impl RoleParams {
         let access = match (self.access, self.raw_bits) {
             (None, None) => None,
             (None, Some(_)) => return Err("raw_bits goes with access."),
-            (Some(names), raw) => {
-                let mut a = AccessBits::empty();
-                for name in &names {
-                    a = a.with(access::named(name).ok_or("No such access name.")?);
-                }
-                for b in raw.unwrap_or_default() {
-                    if b >= 64 {
-                        return Err("raw_bits are 0 to 63.");
-                    }
-                    a = a.with(b);
-                }
-                Some(a)
-            }
+            (Some(names), raw) => Some(bits(&names, &raw.unwrap_or_default())?),
         };
         Ok(RoleEdit {
             name: self.name,

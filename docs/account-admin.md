@@ -45,9 +45,10 @@ password and log in as it, as mhxd's could.
 
 ## 2. What an edit changes
 
-An edit names some of a login, a name, a password and the access
-bitmap; what it leaves out stays as it was. A new account takes its
-login as its name, no password, and no access.
+An edit names some of a login, a name, a password, the roles and
+either the access bitmap or the account's own keys (roles.md §7.2);
+what it leaves out stays as it was. A new account takes its login as
+its name, no password, and what its roles grant.
 
 The file backend rewrites only the keys an edit's bits change, with
 `toml_edit`, so an operator's comments, `[extra]` and `[identity]`
@@ -57,7 +58,8 @@ to `raw_bits`. Bit 56 (`read_chat_history`) with no key follows
 from it, and an account that never named it goes on following it. A
 bit the account's roles give is written only as `false`, while it is
 unset; set, it has no key and goes on following the roles (roles.md
-§6.1).
+§6.1). Own keys are written as sent instead: every access key, raw
+bit and raw denial the edit leaves out goes.
 
 Passwords are capped at 31 characters on every path, since a classic
 login cuts its password there and a longer one could never be typed on
@@ -147,8 +149,8 @@ data of `account_changed`.
 |---|---|---|---|
 | `account_list` | — | `{ "accounts": [ { "login", "name" } ] }` | `read_users` |
 | `account_get` | `login` | `{ "account": {…} }` | `read_users` |
-| `account_create` | `login`, `name?`, `password?`, `access?`, `raw_bits?` | `{ "account": {…} }` | `create_users` |
-| `account_update` | `login`, `name?`, `password?`, `access?`, `raw_bits?` | `{ "account": {…} }` | `modify_users` |
+| `account_create` | `login`, `name?`, `password?`, `access?`, `raw_bits?`, `roles?`, `grant?`, `deny?`, `raw_grant?`, `raw_deny?` | `{ "account": {…} }` | `create_users` |
+| `account_update` | `login`, `name?`, `password?`, `access?`, `raw_bits?`, `roles?`, `grant?`, `deny?`, `raw_grant?`, `raw_deny?` | `{ "account": {…} }` | `modify_users` |
 | `account_delete` | `login` | `{}` | `delete_users` |
 
 - A login is case-insensitive and answered lowercase.
@@ -156,6 +158,10 @@ data of `account_changed`.
   numbers in `raw_bits`, which is empty when omitted. A client editing
   an account sends back the `raw_bits` it was shown. `raw_bits` without
   `access` is `bad_request`.
+- `roles` replaces the account's roles, beside either form.
+- `grant`, `deny`, `raw_grant` and `raw_deny`, in place of `access`,
+  replace the account's own keys together (roles.md §7.2): one sent
+  alone clears the other three.
 - `password: ""` clears the password. Omitted, it is kept. An empty or
   omitted `name` keeps the account's, which for a new one is its login.
 - `account_update` never makes an account.
@@ -184,8 +190,9 @@ the server.
 | `outranked` | The account may do, or would be left able to do, something the session's own account may not: an access bit or the `[extra]` policy of §1. |
 | `no_such_account` | `account_get`, `account_update`, `account_delete` of a login with no account. |
 | `already_exists` | `account_create` of a login that has one. |
+| `no_such_role` | `roles` naming `everyone`, or a role there is none of that the account does not already list. |
 | `invalid_login` | Not a login: up to 31 letters, digits and `_ - . @`, not starting with `.` or `@`, which is reserved for roles (`roles.md` §6.4). A write to the server's own login, or to an existing account whose login begins with `@`, answers it too. `account_get` and `account_delete` answer `no_such_account` for the server's own login, and act on an existing `@` account as on any other, so it can be cleared away. |
-| `bad_request` | Malformed, an access name that names no bit, a raw bit past 63, or a name or password past 31 characters. |
+| `bad_request` | Malformed, an access name that names no bit, a raw bit past 63, a name or password past 31 characters, `access` sent with the overrides, or a bit both granted and denied. |
 | `not_available` | The server does not administer accounts, whatever the session may do. |
 
 ### 5.4 The event

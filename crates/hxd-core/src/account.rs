@@ -493,7 +493,7 @@ pub const FIELD_MAX_CHARS: usize = 31;
 
 /// An administrator's change to one account. `None` keeps what the
 /// account has; a new account takes its login as its name, no password
-/// and no access.
+/// and what its roles grant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountEdit {
     pub login: String,
@@ -512,6 +512,10 @@ pub struct AccountEdit {
     /// it keeps what the account has now, so a role changed while the
     /// editor was open is not written back as an override.
     pub shown: Option<AccessBits>,
+    /// The account's own keys as `(grant, deny)`, in place of `access`:
+    /// written as given rather than kept minimal over its roles
+    /// (`docs/roles.md` §7.2).
+    pub overrides: Option<(AccessBits, AccessBits)>,
     /// Roles to give or take away, by name (`docs/roles.md` §5).
     pub roles: Vec<RoleChange>,
 }
@@ -521,6 +525,8 @@ pub struct AccountEdit {
 pub enum RoleChange {
     Add(String),
     Remove(String),
+    /// Replaces the list.
+    Set(Vec<String>),
 }
 
 /// An administrator's change to one role. `None` keeps what the role

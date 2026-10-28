@@ -307,7 +307,8 @@ Three layers, all `cargo test --workspace`:
   a role made, changed and deleted on the ng wire only within what its
   editor holds and never while someone it could not edit holds it,
   its holders told on both wires, `roles_changed`, and the file's
-  comments kept),
+  comments kept, and an ng editor giving roles and writing an
+  account's own keys as sent),
   `tls.rs`
   (the legacy wire over TLS beside a plaintext client, and HTXF on the
   TLS transfer port), `chat.rs` (chat/PM/moderation over the legacy
