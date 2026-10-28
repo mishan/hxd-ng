@@ -1196,6 +1196,8 @@ mod tests {
             } else {
                 Vec::new()
             },
+            // The ng wire works it out from `roles`, never sends it.
+            role_color: full.then_some(0x0000_80ff),
         }
     }
 

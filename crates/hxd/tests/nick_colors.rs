@@ -15,11 +15,15 @@ const NO_COLOR: u32 = 0xffff_ffff;
 struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
+    core: std::sync::Arc<hxd_core::Core>,
 }
 
 async fn start(dir: &Path) -> Server {
     let d = dir.display();
-    let text = format!("[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n");
+    let text = format!(
+        "[paths]\naccounts = \"{d}/accounts\"\n[roles]\nfile = \"{d}/roles.toml\"\n\
+         [ng]\nbind = \"127.0.0.1:0\"\n"
+    );
     let path = dir.join("hxd-ng.toml");
     std::fs::write(&path, &text).unwrap();
     let config = hxd::Config::load(&path).unwrap();
@@ -33,6 +37,7 @@ async fn start(dir: &Path) -> Server {
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
+        core: ctx.core.clone(),
     };
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -273,4 +278,86 @@ async fn self_info_and_private_chat_joins_carry_colors_to_a_client_that_sends_th
         .await
         .unwrap();
     assert_eq!(joined.uint(tag::COLOR), Some(NO_COLOR));
+}
+
+/// A role's color is a default: a classic client that shows colors draws
+/// a user who chose none in their highest colored role's, and one who
+/// chose one in theirs. The ng wire is sent only the user's own, and
+/// works the rest out from `roles`.
+#[tokio::test]
+async fn a_user_who_chose_no_color_is_drawn_in_their_roles() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(
+        td.path().join("roles.toml"),
+        "[role.staff]\nposition = 10\ncolor = 0x336699\n\
+         [role.crew]\nposition = 5\ncolor = 0x112233\n\
+         [role.plain]\nposition = 20\n",
+    )
+    .unwrap();
+    let server = start(td.path()).await;
+    std::fs::write(
+        td.path().join("accounts/tess.toml"),
+        "password = \"pw\"\nroles = [\"plain\", \"crew\", \"staff\"]\n[access]\nread_chat = true\n",
+    )
+    .unwrap();
+    let (mut watcher, _) = ng::Client::guest(server.ng, "watcher").await.unwrap();
+    let mut bob = legacy::Client::login_at(server.legacy, &Login::guest("bob"))
+        .await
+        .unwrap();
+    set_color(&mut bob, 0x0000_80ff).await;
+    let mut tess = legacy::Client::login_at(server.legacy, &Login::account("tess", "tess", "pw"))
+        .await
+        .unwrap();
+    let uid = tess.uid.unwrap();
+    assert_eq!(change_color(&mut bob, uid).await, 0x0033_6699, "her join");
+    let list = bob
+        .call(ClientHdr::UserGetList.as_u32(), &[])
+        .await
+        .unwrap();
+    assert_eq!(trailer(&row(&list, uid)), 0x0033_6699u32.to_be_bytes());
+    let joined = watcher
+        .event_where("user_joined", |d| d["user"]["uid"] == uid)
+        .await
+        .unwrap();
+    assert!(
+        joined.data["user"].get("color").is_none(),
+        "{}",
+        joined.data
+    );
+
+    set_color(&mut tess, 0x00ff_0000).await;
+    assert_eq!(change_color(&mut bob, uid).await, 0x00ff_0000);
+    set_color(&mut tess, NO_COLOR).await;
+    assert_eq!(change_color(&mut bob, uid).await, 0x0033_6699);
+
+    // Recolored by hand and reloaded: no row is sent for it, a list
+    // shows it, and the ng client is told how roles look now.
+    std::fs::write(
+        td.path().join("roles.toml"),
+        "[role.staff]\nposition = 10\ncolor = 0x445566\n\
+         [role.crew]\nposition = 5\ncolor = 0x112233\n\
+         [role.plain]\nposition = 20\n",
+    )
+    .unwrap();
+    server.core.reload_accounts();
+    watcher
+        .event_where("roles_changed", |d| {
+            d["list"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|r| r["color"] == 0x0044_5566))
+        })
+        .await
+        .unwrap();
+    let list = bob
+        .call(ClientHdr::UserGetList.as_u32(), &[])
+        .await
+        .unwrap();
+    assert_eq!(trailer(&row(&list, uid)), 0x0044_5566u32.to_be_bytes());
+    let sent = bob.rx.take_backlog();
+    assert!(
+        !sent
+            .iter()
+            .any(|f| f.ty == push::USER_CHANGE && f.uint(tag::UID) == Some(uid.into())),
+        "{sent:?}"
+    );
 }

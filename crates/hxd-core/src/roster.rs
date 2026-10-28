@@ -312,6 +312,10 @@ pub struct UserInfo {
     pub remote: Option<crate::server_link::RemoteRef>,
     /// The roles the session's account lists (`docs/roles.md` §7.1).
     pub roles: Vec<String>,
+    /// Its highest colored role's color: what a wire that shows only a
+    /// nick color draws for a user who chose none (`docs/roles.md` §8).
+    /// An ng client works it out from `roles` itself.
+    pub role_color: Option<u32>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -1992,6 +1996,10 @@ impl Core {
     /// under the roster lock so a revocation's sweep cannot miss a
     /// session that attaches while it runs.
     pub fn attach(&self, info: AttachInfo) -> Option<(Uid, Events)> {
+        let role_color = info
+            .account
+            .as_ref()
+            .and_then(|a| crate::admin::role_color(&self.roles_shown(), &a.roles));
         let mut r = self.roster.lock().unwrap();
         if info
             .transport
@@ -2025,6 +2033,7 @@ impl Core {
                     color: None,
                     remote: None,
                     roles,
+                    role_color,
                 },
                 access: info.access,
                 login: info.login,
