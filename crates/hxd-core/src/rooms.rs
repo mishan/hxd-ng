@@ -373,13 +373,20 @@ pub(crate) type Announced = (String, Option<[u8; 32]>, Option<std::net::IpAddr>)
 /// older than a day are let go, and then the oldest.
 const ANNOUNCED_KEPT: usize = 4096;
 
-/// Does `list` name this session's account, or a role it holds?
+/// Does `list` name this session's account, or a role it holds? A role
+/// admits only an account that is one person: one the guest's file or
+/// another shared login lists would let in whoever logs in as it, which
+/// `@everyone` is refused for (roles.md §10). A gate names a shared
+/// login by its login.
 fn named(list: &[String], sess: &UserSession) -> bool {
     list.iter().any(|e| match e.strip_prefix('@') {
-        Some(role) => sess
-            .account
-            .as_ref()
-            .is_some_and(|a| a.config.roles.iter().any(|r| r == role)),
+        Some(role) => {
+            sess.is_person
+                && sess
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| a.config.roles.iter().any(|r| r == role))
+        }
         None => e.eq_ignore_ascii_case(&sess.login),
     })
 }
@@ -1090,9 +1097,9 @@ impl Core {
         })
     }
 
-    /// `edit.apply`, refusing a gate that names a role there is none of,
-    /// so a gate never names one and the role's delete can see it
-    /// (`docs/roles.md` §5). Under the rooms-write lock.
+    /// `edit.apply`, refusing a gate that names a role there is none of:
+    /// no write from a client or `hxd room` leaves one. Under the
+    /// rooms-write lock.
     fn apply_gated(
         &self,
         edit: RoomEdit,

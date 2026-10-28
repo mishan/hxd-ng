@@ -218,9 +218,8 @@ pub struct AccountConfig {
     /// The bits the account's own file withholds, whatever its roles do.
     pub deny: AccessBits,
     /// The roles it holds that exist, `everyone` aside: what a gate's
-    /// `@role` asks (`docs/roles.md` §10). A name with no role behind it
-    /// admits nobody, so recreating a role does not let its old holders
-    /// back in by a list nobody looked at.
+    /// `@role` asks (`docs/roles.md` §10). A name an account file lists
+    /// with no role behind it grants nothing, and passes no gate either.
     pub roles: Vec<String>,
 }
 

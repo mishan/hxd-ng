@@ -407,9 +407,10 @@ list leaves the decision to the access bit:
   room is seen and paged, and joined by nobody. News gives
   moderators the same reach (roles.md §11.1), so the rule is one rule.
 - **A guest** passes an empty `read` when its bits allow, and a
-  non-empty one only if it names `guest`. A gate naming `@everyone` is
-  refused when written: it would admit the guest while looking
-  restrictive, and an empty list already means everyone.
+  non-empty one only if it names `guest`: a role the guest account, or
+  any login shared by more than one person, holds passes no gate. A
+  gate naming `@everyone` is refused: it would admit the guest while
+  looking restrictive, and an empty list already means everyone.
 - **A room the session may not see does not exist for it.** Every
   listing leaves it out, and every request and transaction naming it,
   on either wire, answers exactly as for a room or chat id that does not

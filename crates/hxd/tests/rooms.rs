@@ -864,7 +864,8 @@ async fn awareness_survives_a_resume() {
 }
 
 /// A gate naming `@staff` admits whoever holds it and nobody else, on
-/// every request, and an account that stops holding it is parted at once.
+/// every request, and an account that stops holding it is parted on the
+/// reload that says so.
 #[tokio::test]
 async fn a_role_in_a_gate_admits_its_holders_until_they_stop_holding_it() {
     let td = tempfile::tempdir().unwrap();
@@ -914,13 +915,24 @@ async fn a_role_in_a_gate_admits_its_holders_until_they_stop_holding_it() {
     );
     let joined = ok(&mut eve, "room_join", json!({ "room": briefing })).await;
     assert_eq!(joined["may_post"], false);
-    sent(&mut frank).await;
-
+    // A login with no password is shared by whoever knows it, and a role
+    // it lists lets none of them in.
     std::fs::write(
-        td.path().join("accounts").join("frank.toml"),
-        format!("name = \"frank\"\npassword = \"pw\"\n[access]\n{MEMBER}"),
+        td.path().join("accounts").join("lobby.toml"),
+        format!("name = \"lobby\"\nroles = [\"staff\"]\n[access]\n{MEMBER}"),
     )
     .unwrap();
+    let (mut shared, hello) = Client::account(addr, "lobby", "", "lobby").await.unwrap();
+    assert!(!listed(&hello).contains(&staff));
+    assert_eq!(
+        refused(&mut shared, "room_join", json!({ "room": staff })).await,
+        "no_such_room"
+    );
+    sent(&mut frank).await;
+
+    // The role gone from the roles file by hand, frank's file still
+    // listing it: a name with no role behind it passes no gate.
+    std::fs::write(td.path().join("roles.toml"), "").unwrap();
     core.reload_accounts();
     let heard: Vec<(String, Value)> = sent(&mut frank)
         .await

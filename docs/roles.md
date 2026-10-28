@@ -637,7 +637,11 @@ access bit already passes.
 
 - A gate may not name `@everyone`, which would admit the guest while
   looking restrictive; an empty list already means everyone. It may not
-  name a restriction.
+  name a restriction, or a role there is none of.
+- A role passes a gate only for an account that is one person: one
+  with a password or a linked identity. The guest, or another login
+  people share, holding one is not let in by it: a gate names such a
+  login by its login.
 - Passing a gate is decided from configuration: the roles the account
   holds and its login. A restriction narrows what a member may *do*
   (a muted member of `#staff` may read it but not post), not which
