@@ -590,6 +590,8 @@ pub enum AdminError {
     NoSuchRole,
     /// A role write this backend will not make, and why.
     BadRole(&'static str),
+    /// A delete of a role a gate still names.
+    RoleInUse,
     /// A create named a login an account already has.
     Exists,
     /// Not a login this backend can store, or one reserved for the
@@ -611,6 +613,7 @@ impl std::fmt::Display for AdminError {
             AdminError::NoSuchAccount => "There is no such account.",
             AdminError::NoSuchRole => "There is no such role.",
             AdminError::BadRole(why) => why,
+            AdminError::RoleInUse => "A gate still names that role. Change the gate first.",
             AdminError::Exists => "That account already exists.",
             AdminError::InvalidLogin => {
                 "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."

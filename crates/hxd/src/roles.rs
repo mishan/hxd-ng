@@ -212,6 +212,21 @@ pub fn remove(config: &Config, name: &str) -> Result<String, String> {
     if load(config)?.get(name).is_none() {
         return Err(format!("there is no role {name:?}"));
     }
+    // Removing a gate's last entry would open what it gated, so the gate
+    // is changed on purpose first (docs/roles.md §5).
+    let gate = format!("@{name}");
+    let rooms = crate::rooms::FileRooms::new(&config.rooms.file);
+    let rooms = hxd_core::RoomStore::load(&rooms).map_err(|e| e.to_string())?;
+    if let Some(room) = rooms
+        .rooms
+        .iter()
+        .find(|r| !r.deleted && r.read.iter().chain(&r.post).any(|g| *g == gate))
+    {
+        return Err(format!(
+            "#{} names {gate}; change its gate with `hxd room edit` first",
+            room.name
+        ));
+    }
     let auth = backend(config)?;
     let mut held = 0;
     for login in auth.logins() {

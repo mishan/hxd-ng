@@ -37,12 +37,17 @@ pub enum WriteMode {
     CreateOrModify,
 }
 
-/// May `target` do anything `actor` may not: hold an access bit, or a
-/// policy its account file grants? Not detaching, mail or an avatar:
-/// those follow from a password, and say an account is one person
-/// rather than what it may do to anyone else.
-fn beyond(actor: &Account, target: &Account) -> bool {
-    target.access.raw() & !actor.access.raw() != 0
+/// May `target` do anything `actor` may not: hold an access bit, a
+/// policy its account file grants, or a role a gate names (`gated`)?
+/// Not detaching, mail or an avatar: those follow from a password, and
+/// say an account is one person rather than what it may do to anyone
+/// else. A gated role is a way in, so whoever could give it could let
+/// themselves into what it gates (`docs/roles.md` §5); `manage_roles`
+/// may, as it may make the role.
+fn beyond(actor: &Account, target: &Account, gated: &[String]) -> bool {
+    let let_in = |r: &String| gated.contains(r) && !actor.config.roles.contains(r);
+    (!actor.manage_roles && target.config.roles.iter().any(let_in))
+        || target.access.raw() & !actor.access.raw() != 0
         || [
             (target.set_subject, actor.set_subject),
             (target.file_list, actor.file_list),
@@ -202,6 +207,12 @@ impl Core {
         }
         let login = self.login_of(uid)?;
         let _writing = self.begin_account_write();
+        // Held through the delete, so no gate comes to name it meanwhile.
+        let _rooms = self.room_state.writes.lock().unwrap();
+        let gated = self.gated_roles();
+        if gated.iter().any(|g| g == name) {
+            return Err(AdminError::RoleInUse);
+        }
         let deleted = admin.delete_role(name, &|before, after, now, then| {
             role_may(admin, &login, before, after, now, then)
         });
@@ -312,6 +323,9 @@ impl Core {
         let admin = self.admin_backend(uid, need)?;
         let login = self.login_of(uid)?;
         let _writing = self.begin_account_write();
+        // So no gate comes to name a role this edit gives meanwhile.
+        let _rooms = self.room_state.writes.lock().unwrap();
+        let gated = self.gated_roles();
         let account = admin.write_account(edit, &|existing, after| {
             let actor = actor(admin, &login, need)?;
             match (mode, existing) {
@@ -322,7 +336,8 @@ impl Core {
                 }
                 _ => {}
             }
-            if existing.is_some_and(|a| beyond(&actor, a)) || beyond(&actor, after) {
+            if existing.is_some_and(|a| beyond(&actor, a, &gated)) || beyond(&actor, after, &gated)
+            {
                 return Err(AdminError::Outranked);
             }
             Ok(())
@@ -337,8 +352,13 @@ impl Core {
         let admin = self.admin_backend(uid, bit::DELETE_USERS)?;
         let actor_login = self.login_of(uid)?;
         let _writing = self.begin_account_write();
+        let gated = self.gated_roles();
         admin.delete_account(login, &|account| {
-            if beyond(&actor(admin, &actor_login, bit::DELETE_USERS)?, account) {
+            if beyond(
+                &actor(admin, &actor_login, bit::DELETE_USERS)?,
+                account,
+                &gated,
+            ) {
                 return Err(AdminError::Outranked);
             }
             Ok(())
@@ -556,7 +576,8 @@ fn role_may(
         .into_iter()
         .chain(after)
         .any(|r| grants_beyond(&actor, r))
-        || now.iter().chain(then).any(|h| beyond(&actor, h))
+        // No gate is beyond one who may manage roles.
+        || now.iter().chain(then).any(|h| beyond(&actor, h, &[]))
     {
         return Err(AdminError::Outranked);
     }

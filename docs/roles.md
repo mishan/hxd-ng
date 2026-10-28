@@ -4,9 +4,9 @@ Status: G1 and G2 are built (§14): the roles file, resolution,
 `everyone`, reload, §6.1's minimal overrides and the command line, §5's
 rule for giving and taking roles, the info line and the commands of
 §6.2 and §6.3. Its `@` login reservation is built on its own. G3, §7,
-is built but for `role_in_use`. Of G4, a room's gates take `@role`
-(§10), but holding a gated role is not yet a privilege (§5), and a role
-a gate names can still be deleted.
+is built. G4 is built: a room's gates take `@role` (§10), a role a
+gate names is a privilege (§5), and it is not deleted while the gate
+names it, `role_in_use` on the ng wire and refused by `hxd role rm`.
 The rest is design. §7, §9.4, §11.3 and §12.5 are the ng spec; the rest
 binds nobody but this server.
 
@@ -953,8 +953,8 @@ the room. Both should exist.
   files directly, so they work with the server down. A running server
   applies them on SIGHUP. `rm` checks §5's delete rule against the
   rooms file and, where the news store can be opened, the news gates,
-  and refuses when it cannot tell; until gates are built (G4, G8) there
-  is nothing to check. It takes the name out of the account files
+  and refuses when it cannot tell; until news gates are built (G8) only
+  the rooms file is checked. It takes the name out of the account files
   first, so a removal cut short can be run again. `hxd account access`
   sets the file's own keys, and writes `false` only where something
   else grants the bit.

@@ -47,13 +47,26 @@ async fn start_with_core(dir: &Path) -> (SocketAddr, Arc<Core>) {
     account("boss", "[extra]\nmanage_rooms = true\nset_subject = true\n");
     // The kick bit makes a moderator.
     account("carol", "disconnect_users = true\n");
+    account("ed", "read_users = true\nmodify_users = true\n");
+    account(
+        "keeper",
+        "read_users = true\nmodify_users = true\n[extra]\nmanage_roles = true\n",
+    );
+    std::fs::write(
+        accounts.join("lead.toml"),
+        format!(
+            "name = \"lead\"\npassword = \"pw\"\nroles = [\"staff\"]\n[access]\n{MEMBER}\
+             read_users = true\nmodify_users = true\n"
+        ),
+    )
+    .unwrap();
     std::fs::write(
         accounts.join("frank.toml"),
         format!("name = \"frank\"\npassword = \"pw\"\nroles = [\"staff\"]\n[access]\n{MEMBER}"),
     )
     .unwrap();
     let roles = dir.join("roles.toml");
-    std::fs::write(&roles, "[role.staff]\ntitle = \"Staff\"\n").unwrap();
+    std::fs::write(&roles, "[role.staff]\ntitle = \"Staff\"\n[role.helpers]\n").unwrap();
 
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
     let auth = Arc::new(
@@ -966,4 +979,84 @@ async fn a_role_in_a_gate_admits_its_holders_until_they_stop_holding_it() {
     for c in [&frank, &eve] {
         no_seq_faults(c);
     }
+}
+
+/// A role a gate names is a way in: it is given, and its holders edited,
+/// only by someone holding it or who may manage roles, and it is not
+/// deleted while the gate names it.
+#[tokio::test]
+async fn a_gated_role_is_given_only_by_its_holders_and_outlives_no_gate() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path()).await;
+    let (mut boss, _) = login(addr, "boss").await;
+    let staff = create(&mut boss, json!({ "name": "staff", "read": ["@staff"] })).await;
+    let (mut ed, _) = login(addr, "ed").await;
+    let (mut keeper, _) = login(addr, "keeper").await;
+    let (mut lead, _) = login(addr, "lead").await;
+
+    // Who asks, what, and the refusal, if it is one. In order.
+    for (who, req, params, refusal) in [
+        (
+            "ed",
+            "account_update",
+            json!({ "login": "eve", "roles": ["staff"] }),
+            Some("outranked"),
+        ),
+        (
+            "ed",
+            "account_update",
+            json!({ "login": "ed", "roles": ["staff"] }),
+            Some("outranked"),
+        ),
+        // Frank holds it, so editing frank could take it away.
+        (
+            "ed",
+            "account_update",
+            json!({ "login": "frank", "name": "Frankie" }),
+            Some("outranked"),
+        ),
+        (
+            "ed",
+            "account_update",
+            json!({ "login": "eve", "roles": ["helpers"] }),
+            None,
+        ),
+        // Holding it, or managing roles, may give it and take it.
+        (
+            "lead",
+            "account_update",
+            json!({ "login": "eve", "roles": ["staff"] }),
+            None,
+        ),
+        (
+            "keeper",
+            "account_update",
+            json!({ "login": "eve", "roles": [] }),
+            None,
+        ),
+        (
+            "keeper",
+            "role_delete",
+            json!({ "name": "staff" }),
+            Some("role_in_use"),
+        ),
+    ] {
+        let c = match who {
+            "ed" => &mut ed,
+            "lead" => &mut lead,
+            _ => &mut keeper,
+        };
+        match refusal {
+            Some(code) => assert_eq!(
+                refused(c, req, params.clone()).await,
+                code,
+                "{req} {params}"
+            ),
+            None => {
+                ok(c, req, params).await;
+            }
+        }
+    }
+    ok(&mut boss, "room_edit", json!({ "room": staff, "read": [] })).await;
+    ok(&mut keeper, "role_delete", json!({ "name": "staff" })).await;
 }

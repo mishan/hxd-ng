@@ -1097,6 +1097,22 @@ impl Core {
         })
     }
 
+    /// Every role a room's gate names (`docs/roles.md` §5), archived rooms'
+    /// too, since an archive can be undone.
+    pub(crate) fn gated_roles(&self) -> Vec<String> {
+        let r = self.roster.lock().unwrap();
+        let mut gated: Vec<String> = r
+            .rooms
+            .values()
+            .filter(|e| !e.room.deleted)
+            .flat_map(|e| e.room.read.iter().chain(&e.room.post))
+            .filter_map(|g| g.strip_prefix('@').map(String::from))
+            .collect();
+        gated.sort();
+        gated.dedup();
+        gated
+    }
+
     /// `edit.apply`, refusing a gate that names a role there is none of:
     /// no write from a client or `hxd room` leaves one. Under the
     /// rooms-write lock.
