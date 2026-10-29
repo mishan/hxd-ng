@@ -617,6 +617,18 @@ fn the_ledger_counts_what_was_sent_and_answers_a_retry(s: &dyn RelationshipStore
     let me_ = Requester::Account(me.clone());
     let addr = Requester::Address("addr-1".into());
     assert_eq!(
+        s.find_request(&me_, &x, &guid(1)).unwrap(),
+        Some(first.clone()),
+        "{case}: found before it is asked again"
+    );
+    for (from, to) in [(&me_, &y), (&addr, &x)] {
+        assert_eq!(
+            s.find_request(from, to, &guid(1)).unwrap(),
+            None,
+            "{case}: another pair's"
+        );
+    }
+    assert_eq!(
         s.requests_to(&me_, &x, RequestKind::Message, at(0))
             .unwrap(),
         2,

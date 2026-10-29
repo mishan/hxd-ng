@@ -484,6 +484,15 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// [`crate::inbox::MessageStore::push`] gives.
     fn record_request(&self, entry: &LedgerEntry) -> Result<Recorded, StoreError>;
 
+    /// What `from` already sent `to` under `guid`, if it did: a retry,
+    /// answered as its original was before any bound is asked.
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError>;
+
     /// How many requests of `kind` `from` has sent `to` since `since`.
     fn requests_to(
         &self,

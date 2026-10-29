@@ -22,7 +22,16 @@ impl Core {
             store.rotate(from, to)?;
         }
         if let Some(store) = self.relationships.as_ref() {
-            store.rotate(from, to)?;
+            let rekeyed = store.rotate(from, to)?;
+            if let Err(e) = self.restamp(&rekeyed.merged) {
+                tracing::warn!("inbox: re-stamping a rotation's merged friendships: {e}");
+            }
+            let successor = crate::inbox::Mailbox::identified(String::new(), *to);
+            self.rekey_friends(
+                &crate::inbox::Mailbox::identified(String::new(), *from),
+                &successor,
+            );
+            self.after_merge(&successor);
         }
         self.news_rotate(from, to)?;
         if let Some(store) = self.devices.as_ref() {

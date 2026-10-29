@@ -124,9 +124,10 @@ pub mod bit {
     /// — the spec has operators grant it explicitly, and the bootstrap
     /// guest does not get it.
     pub const SEND_MEDIA: u8 = 57;
-    // 58 AccessMessaging is allocated by the messaging extension, which
-    // is not implemented here; the number stays reserved so video's
-    // don't drift.
+    /// May take part in instant messaging (`docs/instant-messaging.md`),
+    /// fogWraith's `AccessMessaging`; `admin` and `guest` never do,
+    /// whatever their bits.
+    pub const MESSAGING: u8 = 58;
     /// May publish camera video in a voice room
     /// (`docs/capabilities-video.md` §"Access Privileges").
     pub const VIDEO_CHAT: u8 = 59;
@@ -245,10 +246,10 @@ mod tests {
         // §"Access Privileges"). Bits 59 and 60 are `accessVideoChat`
         // and `accessScreenShare` (`docs/capabilities-video.md`
         // §"Access Privileges"), which follow the inline-media (57)
-        // allocation and the messaging (58) one this server does not
-        // implement.
+        // allocation and the messaging (58) one.
         assert_eq!(bit::VOICE_CHAT, 55);
         assert_eq!(bit::SEND_MEDIA, 57);
+        assert_eq!(bit::MESSAGING, 58);
         assert_eq!(bit::VIDEO_CHAT, 59);
         assert_eq!(bit::SCREEN_SHARE, 60);
 
@@ -264,6 +265,10 @@ mod tests {
         assert_eq!(
             AccessBits::empty().with(bit::SEND_MEDIA).to_wire(),
             [0, 0, 0, 0, 0, 0, 0, 0x40]
+        );
+        assert_eq!(
+            AccessBits::empty().with(bit::MESSAGING).to_wire(),
+            [0, 0, 0, 0, 0, 0, 0, 0x20]
         );
         assert_eq!(
             AccessBits::empty().with(bit::VIDEO_CHAT).to_wire(),
@@ -285,8 +290,8 @@ mod tests {
         assert!(!screen.has(bit::VIDEO_CHAT));
 
         // And from the other direction: an account granted both video
-        // bits sets exactly those two, leaving the reserved 57 and 58
-        // clear so a later extension can still have them.
+        // bits sets exactly those two, leaving 57 and 58, which are
+        // other extensions', clear.
         let both = AccessBits::from_wire([0, 0, 0, 0, 0, 0, 0x00, 0x18]);
         assert!(both.has(bit::VIDEO_CHAT));
         assert!(both.has(bit::SCREEN_SHARE));

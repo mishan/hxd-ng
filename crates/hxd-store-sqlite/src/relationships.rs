@@ -769,6 +769,29 @@ impl RelationshipStore for SqliteStore {
         })
     }
 
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (sender, sender_bind) = sender_sql(from, 3);
+        let text = format!(
+            "SELECT {LEDGER_COLUMNS} FROM request_ledger
+              WHERE guid = ?1 AND {} AND {sender} ORDER BY id LIMIT 1",
+            mailbox_sql(to, "recipient", 2)
+        );
+        sql(conn
+            .query_row(
+                &text,
+                params![guid.as_str(), bind(to), sender_bind],
+                ledger_row,
+            )
+            .optional())?
+        .transpose()
+    }
+
     fn requests_to(
         &self,
         from: &Requester,

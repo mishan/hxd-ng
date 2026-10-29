@@ -10,7 +10,7 @@ use super::{
     AccountUpdate, Ignore, LedgerEntry, MessagingAccount, PendingOut, Recorded, Rekeyed,
     RelationId, Relationship, RelationshipStore, RequestKind, Requester, MAX_LANGUAGES,
 };
-use crate::inbox::{Mailbox, Sent, StoreError};
+use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
 struct Row {
     /// Creation order, which is the order rows are listed in.
@@ -124,6 +124,18 @@ pub struct MemoryRelationships {
 impl MemoryRelationships {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Is this friendship or approval live? What the in-memory inbox's
+    /// gate asks ([`crate::inbox::MemoryStore::gated`]).
+    pub fn is_live(&self, id: RelationId) -> bool {
+        self.inner.lock().unwrap().relations.contains(&id)
+    }
+
+    /// Is this an approval rather than a friendship?
+    pub fn is_approval(&self, id: RelationId) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.rows.iter().any(|r| r.rel.approval == Some(id))
     }
 }
 
@@ -579,6 +591,20 @@ impl RelationshipStore for MemoryRelationships {
             ..entry.clone()
         });
         Ok(Recorded::New)
+    }
+
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .ledger
+            .iter()
+            .find(|e| e.guid.as_ref() == Some(guid) && is(&e.recipient, to) && sent_by(e, from))
+            .cloned())
     }
 
     fn requests_to(

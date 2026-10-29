@@ -26,6 +26,11 @@ impl Clock {
         Instant::now() + self.offset()
     }
 
+    /// The wall time, for what is stored and lapses.
+    pub fn wall(&self) -> SystemTime {
+        SystemTime::now() + self.offset()
+    }
+
     /// Unix seconds.
     pub fn unix(&self) -> u64 {
         (SystemTime::now() + self.offset())

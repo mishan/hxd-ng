@@ -17,11 +17,13 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::relationships::SentOn;
+use std::sync::Arc;
+
+use crate::relationships::{RelationshipStore, SentOn};
 
 use super::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, Sent,
+    Pending, Pushed, Sent,
 };
 
 /// Run every case against a freshly built store. `new_store` is called
@@ -29,38 +31,51 @@ use super::{
 ///
 /// Panics with the failing case's name, which is what a test failure in
 /// an implementation crate has to be able to tell you.
-pub fn run(new_store: &dyn Fn() -> Box<dyn MessageStore>) {
-    pending_is_oldest_first_and_bounded(&*new_store());
-    a_message_round_trips_whole(&*new_store());
-    the_friendship_column_round_trips(&*new_store());
-    delivery_is_idempotent_and_removes_from_pending(&*new_store());
-    reading_stamps_delivery_so_it_is_never_flushed_later(&*new_store());
-    mark_read_never_reaches_another_mailbox(&*new_store());
-    list_is_newest_first_and_pages_backwards(&*new_store());
-    counts_of_a_mailbox_with_no_mail_are_zero(&*new_store());
-    prune_ages_unread_from_sent_and_read_from_read(&*new_store());
-    a_retention_window_older_than_the_clock_prunes_nothing(&*new_store());
+pub fn run(new_store: &dyn Fn() -> Gated) {
+    pending_is_oldest_first_and_bounded(&*new_store().inbox);
+    a_message_round_trips_whole(&*new_store().inbox);
+    the_friendship_column_round_trips(&*new_store().inbox);
+    a_merge_restamps_what_was_sent_on_the_id_it_ended(&*new_store().inbox);
+    delivery_is_idempotent_and_removes_from_pending(&*new_store().inbox);
+    reading_stamps_delivery_so_it_is_never_flushed_later(&*new_store().inbox);
+    mark_read_never_reaches_another_mailbox(&*new_store().inbox);
+    list_is_newest_first_and_pages_backwards(&*new_store().inbox);
+    counts_of_a_mailbox_with_no_mail_are_zero(&*new_store().inbox);
+    prune_ages_unread_from_sent_and_read_from_read(&*new_store().inbox);
+    a_retention_window_older_than_the_clock_prunes_nothing(&*new_store().inbox);
     // The mailbox key — where a disagreement is a wrong-recipient bug.
-    an_identity_and_a_bare_login_are_different_mailboxes(&*new_store());
-    claiming_moves_a_logins_mail_onto_its_new_fingerprint(&*new_store());
-    a_rename_takes_the_mailbox_and_leaves_the_login_free(&*new_store());
-    purging_takes_everything_on_both_sides(&*new_store());
-    rotation_moves_a_mailbox_to_the_successor_key(&*new_store());
-    claiming_merges_a_guid_that_exists_on_both_sides(&*new_store());
-    claiming_merges_a_guid_the_sender_sent_twice(&*new_store());
-    claiming_merges_a_duplicate_the_recipient_was_renamed_out_of(&*new_store());
-    a_collapse_keeps_what_the_duplicate_knew(&*new_store());
-    rotating_merges_a_guid_the_successor_already_holds(&*new_store());
-    rotating_merges_a_guid_the_sender_sent_twice(&*new_store());
+    an_identity_and_a_bare_login_are_different_mailboxes(&*new_store().inbox);
+    claiming_moves_a_logins_mail_onto_its_new_fingerprint(&*new_store().inbox);
+    a_rename_takes_the_mailbox_and_leaves_the_login_free(&*new_store().inbox);
+    purging_takes_everything_on_both_sides(&*new_store().inbox);
+    rotation_moves_a_mailbox_to_the_successor_key(&*new_store().inbox);
+    claiming_merges_a_guid_that_exists_on_both_sides(&*new_store().inbox);
+    claiming_merges_a_guid_the_sender_sent_twice(&*new_store().inbox);
+    claiming_merges_a_duplicate_the_recipient_was_renamed_out_of(&*new_store().inbox);
+    a_collapse_keeps_what_the_duplicate_knew(&*new_store().inbox);
+    rotating_merges_a_guid_the_successor_already_holds(&*new_store().inbox);
+    rotating_merges_a_guid_the_sender_sent_twice(&*new_store().inbox);
     // Retry, and the kinds the inbox holds but does not show.
-    the_same_guid_twice_is_one_message(&*new_store());
-    pushing_the_same_guid_twice_stores_one_row(&*new_store());
-    the_cap_is_enforced_by_the_insert(&*new_store());
-    a_flush_can_stamp_read_in_the_same_step(&*new_store());
-    a_guid_is_scoped_to_one_sender_and_one_recipient(&*new_store());
-    a_receipt_is_stored_but_never_read_as_mail(&*new_store());
+    the_same_guid_twice_is_one_message(&*new_store().inbox);
+    pushing_the_same_guid_twice_stores_one_row(&*new_store().inbox);
+    the_cap_is_enforced_by_the_insert(&*new_store().inbox);
+    a_flush_can_stamp_read_in_the_same_step(&*new_store().inbox);
+    a_guid_is_scoped_to_one_sender_and_one_recipient(&*new_store().inbox);
+    a_receipt_is_stored_but_never_read_as_mail(&*new_store().inbox);
     // The per-sender quota's measure.
-    sent_since_counts_a_senders_stored_mail_in_its_window(&*new_store());
+    sent_since_counts_a_senders_stored_mail_in_its_window(&*new_store().inbox);
+    // The gate (`docs/instant-messaging.md` §5).
+    the_gate_holds_what_was_sent_on_nothing_live(&new_store());
+    a_handed_message_waits_for_its_ack(&new_store());
+    a_receipt_waits_behind_the_gate(&new_store());
+    requests_are_listed_released_and_deleted_by_sender(&new_store());
+}
+
+/// A store under test, and the relationship store its gate reads: for
+/// SQLite one store under both traits.
+pub struct Gated {
+    pub inbox: Arc<dyn MessageStore>,
+    pub relationships: Arc<dyn RelationshipStore>,
 }
 
 fn at(secs: u64) -> SystemTime {
@@ -176,17 +191,305 @@ fn the_friendship_column_round_trips(s: &dyn MessageStore) {
             s,
             &NewMessage {
                 friendship: *on,
+                guid: Some(guid(i as u8)),
                 ..msg(&dave, &alice, "m", at(i as u64))
             },
         );
     }
-    let got: Vec<_> = s
-        .pending(&dave, 10)
-        .unwrap()
-        .iter()
-        .map(|m| m.friendship)
+    let got: Vec<_> = (0..sent.len())
+        .map(|i| {
+            s.find_guid(&dave, Some(&alice), &guid(i as u8))
+                .unwrap()
+                .unwrap()
+                .friendship
+        })
         .collect();
     assert_eq!(got, sent, "{case}");
+}
+
+fn a_merge_restamps_what_was_sent_on_the_id_it_ended(s: &dyn MessageStore) {
+    let case = "a_merge_restamps_what_was_sent_on_the_id_it_ended";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let sent = [
+        Some(SentOn::Relation(3)),
+        Some(SentOn::Relation(5)),
+        Some(SentOn::Relation(4)),
+        Some(SentOn::Request),
+        None,
+    ];
+    for (i, on) in sent.iter().enumerate() {
+        push(
+            s,
+            &NewMessage {
+                friendship: *on,
+                guid: Some(guid(i as u8)),
+                ..msg(&dave, &alice, "m", at(i as u64))
+            },
+        );
+    }
+    s.restamp(&[(3, 5), (5, 9)]).unwrap();
+    let got: Vec<_> = (0..sent.len())
+        .map(|i| {
+            s.find_guid(&dave, Some(&alice), &guid(i as u8))
+                .unwrap()
+                .unwrap()
+                .friendship
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            Some(SentOn::Relation(9)),
+            Some(SentOn::Relation(9)),
+            Some(SentOn::Relation(4)),
+            Some(SentOn::Request),
+            None,
+        ],
+        "{case}: a chain of merges lands on its last id, and nothing else moves"
+    );
+}
+
+fn requests_are_listed_released_and_deleted_by_sender(g: &Gated) {
+    let case = "requests_are_listed_released_and_deleted_by_sender";
+    let (s, rel) = (&*g.inbox, &*g.relationships);
+    let (dave, erin) = (Mailbox::login("dave"), Mailbox::login("erin"));
+    let alice = Mailbox::identified("alice", fp(1));
+    let bob = Mailbox::login("bob");
+    let request = |to: &Mailbox, from: &Mailbox, body: &str, t: u64| {
+        push(
+            s,
+            &NewMessage {
+                friendship: Some(SentOn::Request),
+                ..msg(to, from, body, at(t))
+            },
+        )
+    };
+    request(&dave, &alice, "a1", 1);
+    request(&dave, &bob, "b1", 2);
+    request(&dave, &alice, "a2", 3);
+    request(&erin, &alice, "to erin", 4);
+    push(s, &msg(&dave, &bob, "mail", at(5)));
+    assert_eq!(
+        bodies(&s.requests(&dave, at(0), 10).unwrap()),
+        ["a1", "b1", "a2"],
+        "{case}: oldest first, the recipient's alone"
+    );
+    assert_eq!(
+        bodies(&s.requests(&dave, at(0), 2).unwrap()),
+        ["a1", "b1"],
+        "{case}"
+    );
+    assert_eq!(
+        bodies(&s.requests(&dave, at(2), 10).unwrap()),
+        ["b1", "a2"],
+        "{case}: what was sent before `since` has lapsed"
+    );
+
+    let approval = rel.approve(&dave, &alice, at(6)).unwrap();
+    assert_eq!(
+        s.release_requests(&dave, &alice, approval).unwrap(),
+        2,
+        "{case}"
+    );
+    assert_eq!(
+        bodies(&s.requests(&dave, at(0), 10).unwrap()),
+        ["b1"],
+        "{case}"
+    );
+    assert_eq!(
+        bodies(
+            &s.pending_of(&dave, 10, Pending::Instant { again: false })
+                .unwrap()
+        ),
+        ["a1", "a2"],
+        "{case}: released onto the approval"
+    );
+    assert_eq!(s.delete_requests(&dave, &bob).unwrap(), 1, "{case}");
+    assert!(s.requests(&dave, at(0), 10).unwrap().is_empty(), "{case}");
+    assert_eq!(
+        bodies(&s.requests(&erin, at(0), 10).unwrap()),
+        ["to erin"],
+        "{case}: another recipient's untouched"
+    );
+    assert_eq!(
+        bodies(&s.pending(&dave, 10).unwrap()),
+        ["a1", "a2", "mail"],
+        "{case}"
+    );
+}
+
+/// One row sent on each thing a row can be sent on, and what the gate
+/// lets through of them.
+fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
+    let case = "the_gate_holds_what_was_sent_on_nothing_live";
+    let (s, rel) = (&*g.inbox, &*g.relationships);
+    let (dave, alice, bob, carol) = (
+        Mailbox::login("dave"),
+        Mailbox::login("alice"),
+        Mailbox::login("bob"),
+        Mailbox::login("carol"),
+    );
+    let friend = rel.befriend(&dave, &alice, at(0)).unwrap();
+    let ended = rel.befriend(&dave, &bob, at(0)).unwrap();
+    rel.unfriend(&dave, &bob).unwrap();
+    let approved = rel.approve(&dave, &carol, at(0)).unwrap();
+    let sent = [
+        ("mail", &carol, None),
+        ("friend", &alice, Some(SentOn::Relation(friend))),
+        ("ended", &bob, Some(SentOn::Relation(ended))),
+        ("request", &carol, Some(SentOn::Request)),
+        ("approved", &carol, Some(SentOn::Relation(approved))),
+    ];
+    for (i, (body, from, on)) in sent.iter().enumerate() {
+        push(
+            s,
+            &NewMessage {
+                friendship: *on,
+                ..msg(&dave, from, body, at(i as u64))
+            },
+        );
+    }
+    let read = |which| -> Vec<String> {
+        s.pending_of(&dave, 10, which)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect()
+    };
+    assert_eq!(read(Pending::All), ["mail", "friend", "approved"], "{case}");
+    assert_eq!(read(Pending::Mail), ["mail"], "{case}");
+    assert_eq!(
+        read(Pending::Unapproved),
+        ["mail", "friend"],
+        "{case}: what an approval carries is left out"
+    );
+    assert_eq!(
+        read(Pending::Instant { again: false }),
+        ["friend", "approved"],
+        "{case}"
+    );
+    assert_eq!(
+        s.pending_count(&dave).unwrap(),
+        3,
+        "{case}: held rows take no place"
+    );
+    assert_eq!(
+        bodies(&s.list(&dave, None, 10).unwrap()),
+        ["approved", "friend", "mail"],
+        "{case}: nor are they listed"
+    );
+    assert_eq!(
+        s.counts(&dave).unwrap(),
+        InboxCounts {
+            unread: 3,
+            total: 3
+        },
+        "{case}"
+    );
+    // A cap counts what passes the gate, so a held backlog fills nothing.
+    assert!(
+        matches!(
+            s.push(&msg(&dave, &alice, "one more", at(9)), 4).unwrap(),
+            Pushed::Stored(_)
+        ),
+        "{case}"
+    );
+
+    // Made again, a friendship has a new id, and what was queued on the
+    // old one stays held; ended, what was sent on it is held too.
+    rel.befriend(&dave, &bob, at(10)).unwrap();
+    rel.unfriend(&dave, &alice).unwrap();
+    assert_eq!(
+        read(Pending::Instant { again: false }),
+        ["approved"],
+        "{case}"
+    );
+    assert_eq!(
+        s.mark_read(&dave, MessageId::MAX, at(11)).unwrap(),
+        3,
+        "{case}: a read cursor skips what the gate holds"
+    );
+}
+
+fn a_handed_message_waits_for_its_ack(g: &Gated) {
+    let case = "a_handed_message_waits_for_its_ack";
+    let (s, rel) = (&*g.inbox, &*g.relationships);
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let friend = rel.befriend(&dave, &alice, at(0)).unwrap();
+    let id = push(
+        s,
+        &NewMessage {
+            friendship: Some(SentOn::Relation(friend)),
+            ..msg(&dave, &alice, "im", at(1))
+        },
+    );
+    s.mark_handed(&[id], at(2)).unwrap();
+    assert_eq!(
+        s.pending_count(&dave).unwrap(),
+        0,
+        "{case}: counted as delivered"
+    );
+    assert!(!s.is_pending(&dave, id).unwrap(), "{case}");
+    assert!(
+        s.pending_of(&dave, 10, Pending::Instant { again: false })
+            .unwrap()
+            .is_empty(),
+        "{case}: not handed over twice in one go"
+    );
+    assert_eq!(
+        bodies(
+            &s.pending_of(&dave, 10, Pending::Instant { again: true })
+                .unwrap()
+        ),
+        ["im"],
+        "{case}: but again at the next roster read"
+    );
+    s.mark_delivered(&[id], at(3), Delivery::Delivered).unwrap();
+    assert!(
+        s.pending_of(&dave, 10, Pending::Instant { again: true })
+            .unwrap()
+            .is_empty(),
+        "{case}: until it is acknowledged"
+    );
+}
+
+fn a_receipt_waits_behind_the_gate(g: &Gated) {
+    let case = "a_receipt_waits_behind_the_gate";
+    let (s, rel) = (&*g.inbox, &*g.relationships);
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let friend = rel.befriend(&dave, &alice, at(0)).unwrap();
+    let id = push(
+        s,
+        &NewMessage {
+            kind: MessageKind::ReadReceipt,
+            friendship: Some(SentOn::Relation(friend)),
+            ..msg(&dave, &alice, "a guid", at(1))
+        },
+    );
+    assert!(
+        s.pending(&dave, 10).unwrap().is_empty(),
+        "{case}: never mail"
+    );
+    assert_eq!(
+        bodies(&s.pending_of(&dave, 10, Pending::Receipts).unwrap()),
+        ["a guid"],
+        "{case}"
+    );
+    rel.unfriend(&dave, &alice).unwrap();
+    assert!(
+        s.pending_of(&dave, 10, Pending::Receipts)
+            .unwrap()
+            .is_empty(),
+        "{case}: held with the friendship"
+    );
+    rel.befriend(&dave, &alice, at(2)).unwrap();
+    s.mark_delivered(&[id], at(3), Delivery::Delivered).unwrap();
+    assert!(
+        s.pending_of(&dave, 10, Pending::Receipts)
+            .unwrap()
+            .is_empty(),
+        "{case}"
+    );
 }
 
 fn pending_is_oldest_first_and_bounded(s: &dyn MessageStore) {
@@ -920,6 +1223,13 @@ fn sent_since_counts_a_senders_stored_mail_in_its_window(s: &dyn MessageStore) {
         &NewMessage {
             kind: MessageKind::ReadReceipt,
             ..msg(&bob, &alice, "a receipt", at(300))
+        },
+    );
+    push(
+        s,
+        &NewMessage {
+            friendship: Some(SentOn::Request),
+            ..msg(&bob, &alice, "a request, which the ledger counts", at(300))
         },
     );
     let sent = |who: &Mailbox| s.sent_since(who, at(150)).unwrap();

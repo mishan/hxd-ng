@@ -34,9 +34,9 @@ use hxd_core::history::{
 };
 use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, Sent, StoreError, StoredMessage,
+    Pending, Pushed, Sent, StoreError, StoredMessage,
 };
-use hxd_core::relationships::SentOn;
+use hxd_core::relationships::{RelationId, SentOn};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 /// How hard a commit tries to survive the machine losing power.
@@ -75,7 +75,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -821,6 +821,13 @@ ALTER TABLE message ADD COLUMN friendship INTEGER;
 CREATE INDEX message_friendship ON message (friendship) WHERE friendship IS NOT NULL;
 ";
 
+/// An instant message handed to a session that acknowledges it, and not
+/// yet acknowledged (`docs/instant-messaging.md` §5): counted as
+/// delivered toward the queue cap, and handed over again at Get Roster.
+const SCHEMA_V29: &str = "
+ALTER TABLE message ADD COLUMN handed_at INTEGER;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1550,6 +1557,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 28 {
         steps.push_str(SCHEMA_V28);
     }
+    if version < 29 {
+        steps.push_str(SCHEMA_V29);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1720,6 +1730,16 @@ const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
 /// cannot carry must not be listed, counted, or handed to a flush.
 const MAIL_ONLY: &str = "kind = 0";
 
+/// The gate (`docs/instant-messaging.md` §5): a private message, or one
+/// sent on a friendship or approval that is live, which is one with a
+/// `relation` row. A message request's 0 never has one.
+const LIVE: &str = "(friendship IS NULL OR friendship IN (SELECT id FROM relation))";
+
+/// Mail waiting to be handed over: through the gate, and neither
+/// delivered nor handed to a session that will acknowledge it.
+const WAITING: &str = "kind = 0 AND delivered_at IS NULL AND handed_at IS NULL \
+                       AND (friendship IS NULL OR friendship IN (SELECT id FROM relation))";
+
 fn mailbox(login: String, fingerprint: Option<String>) -> Result<Mailbox, StoreError> {
     Ok(Mailbox {
         login,
@@ -1845,8 +1865,7 @@ impl MessageStore for SqliteStore {
         }
         if m.kind == MessageKind::Message {
             let sql = format!(
-                "SELECT COUNT(*) FROM message
-                  WHERE {} AND {MAIL_ONLY} AND delivered_at IS NULL",
+                "SELECT COUNT(*) FROM message WHERE {} AND {WAITING}",
                 mailbox_sql(&m.recipient, "recipient", 1)
             );
             let waiting: i64 = tx
@@ -1924,11 +1943,29 @@ impl MessageStore for SqliteStore {
             .transpose()
     }
 
-    fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
+    fn pending_of(
+        &self,
+        to: &Mailbox,
+        limit: usize,
+        which: Pending,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
+        let which = match which {
+            Pending::All => WAITING.to_string(),
+            Pending::Unapproved => format!(
+                "{WAITING} AND (friendship IS NULL
+                     OR friendship IN (SELECT id FROM relation WHERE kind = 1))"
+            ),
+            Pending::Mail => format!("{WAITING} AND friendship IS NULL"),
+            Pending::Instant { again } => format!(
+                "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}",
+                if again { "" } else { " AND handed_at IS NULL" }
+            ),
+            Pending::Receipts => format!("kind = 1 AND delivered_at IS NULL AND {LIVE}"),
+        };
         let sql = format!(
             "SELECT {COLUMNS} FROM message
-             WHERE {} AND {MAIL_ONLY} AND delivered_at IS NULL
+             WHERE {} AND {which}
              ORDER BY id LIMIT ?2",
             mailbox_sql(to, "recipient", 1)
         );
@@ -1939,10 +1976,30 @@ impl MessageStore for SqliteStore {
         collect(rows)
     }
 
+    fn mark_handed(&self, ids: &[MessageId], at: SystemTime) -> Result<(), StoreError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "UPDATE message SET handed_at = COALESCE(handed_at, ?1) WHERE id = ?2",
+                )
+                .map_err(StoreError::new)?;
+            for id in ids {
+                stmt.execute(params![unix(at), clamp_id(*id)])
+                    .map_err(StoreError::new)?;
+            }
+        }
+        tx.commit().map_err(StoreError::new)
+    }
+
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT COUNT(*) FROM message WHERE {} AND {MAIL_ONLY} AND delivered_at IS NULL",
+            "SELECT COUNT(*) FROM message WHERE {} AND {WAITING}",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -1954,8 +2011,7 @@ impl MessageStore for SqliteStore {
     fn is_pending(&self, to: &Mailbox, id: MessageId) -> Result<bool, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT 1 FROM message
-              WHERE id = ?2 AND {} AND {MAIL_ONLY} AND delivered_at IS NULL",
+            "SELECT 1 FROM message WHERE id = ?2 AND {} AND {WAITING}",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -2015,7 +2071,7 @@ impl MessageStore for SqliteStore {
         let sql = format!(
             "UPDATE message
                 SET read_at = ?2, delivered_at = COALESCE(delivered_at, ?2)
-              WHERE {} AND {MAIL_ONLY} AND id <= ?3 AND read_at IS NULL",
+              WHERE {} AND {MAIL_ONLY} AND {LIVE} AND id <= ?3 AND read_at IS NULL",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -2032,7 +2088,7 @@ impl MessageStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT {COLUMNS} FROM message
-             WHERE {} AND {MAIL_ONLY} AND (?2 IS NULL OR id < ?2)
+             WHERE {} AND {MAIL_ONLY} AND {LIVE} AND (?2 IS NULL OR id < ?2)
              ORDER BY id DESC LIMIT ?3",
             mailbox_sql(to, "recipient", 1)
         );
@@ -2048,7 +2104,7 @@ impl MessageStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT COUNT(*), COALESCE(SUM(read_at IS NULL), 0)
-               FROM message WHERE {} AND {MAIL_ONLY}",
+               FROM message WHERE {} AND {MAIL_ONLY} AND {LIVE}",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -2198,6 +2254,76 @@ impl MessageStore for SqliteStore {
         .map_err(StoreError::new)
     }
 
+    fn requests(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {COLUMNS} FROM message
+             WHERE {} AND {MAIL_ONLY} AND friendship = 0 AND sent_at >= ?3
+             ORDER BY id LIMIT ?2",
+            mailbox_sql(to, "recipient", 1)
+        );
+        let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map(params![bind(to), limit as i64, unix(since)], row)
+            .map_err(StoreError::new)?;
+        collect(rows)
+    }
+
+    fn release_requests(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        on: RelationId,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "UPDATE message SET friendship = ?3 WHERE {} AND {} AND friendship = 0",
+            mailbox_sql(to, "recipient", 1),
+            mailbox_sql(from, "sender", 2)
+        );
+        conn.execute(
+            &sql,
+            params![bind(to), bind(from), SentOn::Relation(on).as_i64()],
+        )
+        .map_err(StoreError::new)
+    }
+
+    fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "DELETE FROM message WHERE {} AND {} AND friendship = 0",
+            mailbox_sql(to, "recipient", 1),
+            mailbox_sql(from, "sender", 2)
+        );
+        conn.execute(&sql, params![bind(to), bind(from)])
+            .map_err(StoreError::new)
+    }
+
+    fn restamp(&self, merged: &[(RelationId, RelationId)]) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
+        let mut n = 0;
+        for (lost, kept) in merged {
+            let (lost, kept) = (
+                SentOn::Relation(*lost).as_i64(),
+                SentOn::Relation(*kept).as_i64(),
+            );
+            n += tx
+                .execute(
+                    "UPDATE message SET friendship = ?2 WHERE friendship = ?1",
+                    params![lost, kept],
+                )
+                .map_err(StoreError::new)?;
+        }
+        tx.commit().map_err(StoreError::new)?;
+        Ok(n)
+    }
+
     fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
         let conn = self.conn.lock().unwrap();
         // `message_sent_fp` or `message_sent_login`, by which shape of
@@ -2205,7 +2331,7 @@ impl MessageStore for SqliteStore {
         // the window's rows and not the sender's whole retention.
         let sql = format!(
             "SELECT COUNT(*), IFNULL(SUM(length(CAST(body AS BLOB))), 0) FROM message
-              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2",
+              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2 AND IFNULL(friendship, 1) <> 0",
             mailbox_sql(from, "sender", 1)
         );
         let (messages, bytes): (i64, i64) = conn
@@ -3034,7 +3160,13 @@ mod tests {
 
     #[test]
     fn passes_the_conformance_suite() {
-        conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+        conformance::run(&|| {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            conformance::Gated {
+                inbox: store.clone(),
+                relationships: store,
+            }
+        });
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # Instant messaging
 
-Status: design; the store (IM1, §8) is built. hxd-ng's implementation of fogWraith's
+Status: design; the store (IM1, §8) and the domain (IM2) are built, with
+what IM2 leaves open staged as IM2b. hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
 ("the extension"), built on the inbox (`private-messages.md`), with
 message requests (§4) added. Friendships that travel with a person's
@@ -511,8 +512,8 @@ relationship store, through the same calls:
   waiting for it, and its ledger entries, telling its friends `Removed`;
   a portable friendship's withdrawals are kept
   (`proposals/portable-friends.md` §4.4).
-  The running server's delete (`Core::account_delete`) does not call it
-  today; IM2 makes it, so that a freed Login inherits nobody's friends.
+  The running server's delete (`Core::account_delete`) calls it, so
+  that a freed Login inherits nobody's friends.
   `hxd inbox purge`, run while the server is stopped, cannot tell
   anyone, and the friends learn at their next Get Roster.
 - **Revoking `AccessMessaging`** suspends the account's friendships and
@@ -690,6 +691,16 @@ Each stage is a branch with tests, in the house style.
    ids a claim or rotation merged, and a friendship merged beside a
    block ended, both parties told. Unit-tested against the in-memory
    store.
+
+   **IM2b**, what IM2 leaves open: suspension on a revoked
+   `AccessMessaging` (§6); User Search (823); a guest's `/msg <login>`
+   request, by its address; unlinking telling the friends `Removed`;
+   `max_offline` on held rows; `max_sessions_per_login` eviction; the
+   `[messaging]` section and the binary's presence flush task, with a
+   request address keyer of its own, persisted and under its own HMAC
+   label rather than news's; the requests' `request_weight`s; a request
+   answered once its ledger row is written, the rest off its path; and
+   clearing in bulk as one transaction.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol. hx-ng gains a friends list and a requests view. This
    is where the design is first used end to end, by a client we control.

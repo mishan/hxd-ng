@@ -1173,6 +1173,11 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::Equivocation | ChatError::SignedElsewhere | ChatError::NoIdentity => {
             "Signature refused."
         }
+        // A message by login, which this wire sends to the system
+        // account, whose answer is its own.
+        ChatError::NotFriends | ChatError::RequestFull | ChatError::RosterFull => {
+            "That user is not accepting messages from you."
+        }
         ChatError::ServerError => "Server error.",
     }
 }
@@ -3154,6 +3159,15 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport shows roles, which this one does
         // not.
         Event::RolesChanged(_) | Event::RosterStale => {}
+        // Sent only to a session that asked something of the friend
+        // family, which this wire cannot ask until its 800-block lands.
+        Event::FriendEntry(_)
+        | Event::FriendRequest { .. }
+        | Event::Presence { .. }
+        | Event::Im(_)
+        | Event::Receipt { .. }
+        | Event::Typing { .. }
+        | Event::RequestsChanged { .. } => {}
         Event::Kicked => return false,
         Event::AccountChanged(account) => {
             sess.account = *account;

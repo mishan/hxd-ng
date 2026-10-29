@@ -669,6 +669,15 @@ pub enum ChatError {
     SignedElsewhere,
     /// A signed message to a recipient with no identity to sign it to.
     NoIdentity,
+    /// A message by login to someone taking part in instant messaging
+    /// who is no friend, where it cannot be a request
+    /// (`docs/instant-messaging.md` §4.1).
+    NotFriends,
+    /// As many requests to one recipient as a sender may send.
+    RequestFull,
+    /// A reply that would approve a conversation past the replier's
+    /// roster limit.
+    RosterFull,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -698,6 +707,9 @@ pub enum MsgOutcome {
     Delivered,
     /// Stored for a recipient who wasn't there to take it.
     Queued(MessageId),
+    /// A message request (`docs/instant-messaging.md` §4.2), however it
+    /// was stored, held or dropped.
+    Requested,
 }
 
 impl Core {
@@ -2030,6 +2042,10 @@ impl Core {
             }
             return self.run_system_command(from, &text);
         }
+        if let Some(routed) = self.messaging_route(from, to, &text, &guid, media.is_some(), &signed)
+        {
+            return routed;
+        }
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
         // One `None` for "no such account" and "that account takes no
         // offline messages", so this path cannot be used to tell them
@@ -2064,7 +2080,7 @@ impl Core {
     /// Has `from` stored its day's allowance of mail, or would `adds`
     /// more bytes take it past? A rolling day, read from the store, so a
     /// restart forgets nothing.
-    fn send_quota_spent(
+    pub(crate) fn send_quota_spent(
         &self,
         store: &dyn MessageStore,
         from: &Mailbox,
@@ -2078,7 +2094,19 @@ impl Core {
         let since = now
             .checked_sub(Duration::from_secs(24 * 3600))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let sent = store.sent_since(from, since).map_err(store_failed)?;
+        let mut sent = store.sent_since(from, since).map_err(store_failed)?;
+        // Message requests count toward it by what was sent
+        // (`docs/instant-messaging.md` §4.4).
+        if let Some(rel) = self.relationships.as_ref() {
+            let asked = rel
+                .requested_since(
+                    &crate::relationships::Requester::Account(from.clone()),
+                    since,
+                )
+                .map_err(store_failed)?;
+            sent.messages += asked.messages;
+            sent.bytes += asked.bytes;
+        }
         Ok(
             (p.max_sent_per_day > 0 && sent.messages >= p.max_sent_per_day)
                 || (p.max_sent_bytes_per_day > 0
@@ -2503,6 +2531,51 @@ impl Core {
         self.flush_to(Target::Only(uid), &mailbox, None).len()
     }
 
+    /// [`Self::flush_to`] the session `uid`, attached, for a message
+    /// `sender` just sent.
+    pub(crate) fn flush_named(
+        &self,
+        uid: Uid,
+        mailbox: &Mailbox,
+        fresh: Option<MessageId>,
+        sender: Uid,
+    ) -> Vec<MessageId> {
+        self.flush_to(
+            Target::Named {
+                uid: Some(uid),
+                sender,
+            },
+            mailbox,
+            fresh,
+        )
+    }
+
+    /// What a flush to `target` reads: a session that speaks the friend
+    /// family is handed a friend's instant messages at its roster read
+    /// instead, and what an approval carries waits for a session that
+    /// lists requests where the account has one
+    /// (`docs/instant-messaging.md` §5, §4.6).
+    fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
+        let messenger = {
+            let r = self.roster.lock().unwrap();
+            let uid = match *target {
+                Target::Only(uid) => Some(uid),
+                Target::Named { uid, sender } => uid
+                    .filter(|u| r.users.get(u).is_some_and(is_live))
+                    .or_else(|| attached_session_of(&r, mailbox, sender)),
+            };
+            uid.and_then(|u| r.users.get(&u))
+                .is_some_and(crate::messaging::is_messenger)
+        };
+        if messenger {
+            crate::inbox::Pending::Mail
+        } else if self.messaging_enabled() && !self.never_listed(mailbox) {
+            crate::inbox::Pending::Unapproved
+        } else {
+            crate::inbox::Pending::All
+        }
+    }
+
     /// The flush itself.
     ///
     /// `uid` names the session to flush to, or `None` for "whichever
@@ -2581,7 +2654,8 @@ impl Core {
         let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
 
         let limit = self.inbox_policy.deliver_at_flush;
-        let batch = match store.pending(mailbox, limit) {
+        let which = self.flush_reads(&target, mailbox);
+        let batch = match store.pending_of(mailbox, limit, which) {
             Ok(b) => b,
             Err(e) => {
                 warn!("inbox: reading pending mail for {}: {e}", mailbox.login);
@@ -2609,7 +2683,7 @@ impl Core {
             Target::Named { sender, .. } => Some(sender),
             Target::Only(_) => None,
         };
-        let (uid, what) = {
+        let (uid, what, messenger) = {
             let mut r = self.roster.lock().unwrap();
             // Only an attached session receives. A detached one leaves its
             // mail pending rather than filling an outbox buffer that is
@@ -2640,7 +2714,17 @@ impl Core {
             } else {
                 Delivery::Delivered
             };
+            // Read for another session than the one resolved here, the
+            // batch can hold a friend's instant messages that this one
+            // is handed at its roster read instead.
+            let messenger = r
+                .users
+                .get(&uid)
+                .is_some_and(crate::messaging::is_messenger);
             for m in batch {
+                if messenger && m.friendship.is_some() {
+                    continue;
+                }
                 // The message just sent names the session that sent it.
                 // Older ones resolve their sender now and by mailbox: the
                 // sending session is long gone and its uid may belong to
@@ -2675,7 +2759,7 @@ impl Core {
                 );
                 delivered.push(m.id);
             }
-            (uid, what)
+            (uid, what, messenger)
         };
 
         // Stamped after the events are in the outbox: if this fails, the
@@ -2693,7 +2777,16 @@ impl Core {
         // a window. What it leaves behind is still there — say so, in the
         // one place a client of either wire will see it, rather than
         // inventing a digest format.
-        match store.pending_count(mailbox) {
+        let left = match (messenger, which) {
+            (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
+            (true, _) => store
+                .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
+                .map(|m| m.len()),
+            (false, which) => store
+                .pending_of(mailbox, usize::MAX, which)
+                .map(|m| m.len()),
+        };
+        match left {
             Ok(0) => {}
             Ok(n) => {
                 let mut r = self.roster.lock().unwrap();
@@ -2794,7 +2887,9 @@ impl Core {
         }
         store
             .set_blocked(&mailbox, &other, blocked, SystemTime::now())
-            .map_err(store_failed)
+            .map_err(store_failed)?;
+        self.block_changed(&mailbox, &other, blocked);
+        Ok(())
     }
 
     /// Block or unblock whoever holds `uid` on the roster.
@@ -2822,7 +2917,9 @@ impl Core {
         }
         store
             .set_blocked(&mailbox, &other, blocked, SystemTime::now())
-            .map_err(store_failed)
+            .map_err(store_failed)?;
+        self.block_changed(&mailbox, &other, blocked);
+        Ok(())
     }
 
     /// Who this session has blocked.
@@ -2855,7 +2952,9 @@ impl Core {
             .ok_or(ChatError::NoSuchUser)?;
         store
             .set_blocked(&mailbox, &other, false, SystemTime::now())
-            .map_err(store_failed)
+            .map_err(store_failed)?;
+        self.block_changed(&mailbox, &other, false);
+        Ok(())
     }
 
     /// An account has linked an identity: move its mail onto the
@@ -2867,20 +2966,48 @@ impl Core {
     pub fn inbox_claim(&self, login: &str, fingerprint: &[u8; 32]) -> usize {
         self.news_subs_claim(login, fingerprint);
         self.devices_claim(login, fingerprint);
-        if let Some(store) = self.relationships.as_ref() {
-            if let Err(e) = store.claim(login, fingerprint) {
+        let rekeyed = match self
+            .relationships
+            .as_ref()
+            .map(|s| s.claim(login, fingerprint))
+        {
+            Some(Ok(rekeyed)) => rekeyed,
+            Some(Err(e)) => {
                 warn!("relationships: claiming {login}'s: {e}");
+                crate::relationships::Rekeyed::default()
             }
-        }
-        let Some(store) = self.inbox.as_ref() else {
-            return 0;
+            None => crate::relationships::Rekeyed::default(),
         };
-        match store.claim(login, fingerprint) {
-            Ok(n) => n,
-            Err(e) => {
+        let moved = match self.inbox.as_ref().map(|s| s.claim(login, fingerprint)) {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => {
                 warn!("inbox: claiming {login}'s mail: {e}");
                 0
             }
+            None => 0,
+        };
+        if let Err(e) = self.restamp(&rekeyed.merged) {
+            warn!("inbox: re-stamping {login}'s merged friendships: {e}");
+        }
+        let claimed = Mailbox::identified(login, *fingerprint);
+        self.rekey_friends(&Mailbox::login(login), &claimed);
+        // A claim runs at every login of a linked account; only one
+        // that moved rows can have folded a block beside a friendship.
+        if rekeyed.moved > 0 {
+            self.after_merge(&claimed);
+        }
+        moved
+    }
+
+    /// Messages sent on a friendship or approval a merge ended now
+    /// belong to the one that stands in its place.
+    pub(crate) fn restamp(
+        &self,
+        merged: &[(crate::RelationId, crate::RelationId)],
+    ) -> Result<usize, StoreError> {
+        match self.inbox.as_ref() {
+            Some(store) if !merged.is_empty() => store.restamp(merged),
+            _ => Ok(0),
         }
     }
 
@@ -2893,11 +3020,7 @@ impl Core {
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.news_subs_purge(of);
         self.devices_purge(of);
-        if let Some(store) = self.relationships.as_ref() {
-            if let Err(e) = store.purge(of) {
-                warn!("relationships: purging {}: {e}", of.login);
-            }
-        }
+        self.purge_relationships(of);
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -5959,8 +6082,20 @@ mod inbox_tests {
         ) -> Result<Option<StoredMessage>, StoreError> {
             self.inner.find_sent(from, guid)
         }
-        fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
-            self.inner.pending(to, limit)
+        fn pending_of(
+            &self,
+            to: &Mailbox,
+            limit: usize,
+            which: crate::inbox::Pending,
+        ) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.pending_of(to, limit, which)
+        }
+        fn mark_handed(
+            &self,
+            ids: &[MessageId],
+            at: std::time::SystemTime,
+        ) -> Result<(), StoreError> {
+            self.inner.mark_handed(ids, at)
         }
         fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {
             self.inner.pending_count(to)
@@ -6026,6 +6161,32 @@ mod inbox_tests {
             since: SystemTime,
         ) -> Result<crate::inbox::Sent, StoreError> {
             self.inner.sent_since(from, since)
+        }
+
+        fn restamp(
+            &self,
+            merged: &[(crate::RelationId, crate::RelationId)],
+        ) -> Result<usize, StoreError> {
+            self.inner.restamp(merged)
+        }
+        fn requests(
+            &self,
+            to: &Mailbox,
+            since: SystemTime,
+            limit: usize,
+        ) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.requests(to, since, limit)
+        }
+        fn release_requests(
+            &self,
+            to: &Mailbox,
+            from: &Mailbox,
+            on: crate::RelationId,
+        ) -> Result<usize, StoreError> {
+            self.inner.release_requests(to, from, on)
+        }
+        fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
+            self.inner.delete_requests(to, from)
         }
     }
 
