@@ -781,7 +781,7 @@ fn canonical_value(text: &str) -> Value {
     Value::Text(canonicalize(text))
 }
 
-fn bytes16(v: &Value, key: &'static str) -> Result<[u8; 16], Error> {
+pub(crate) fn bytes16(v: &Value, key: &'static str) -> Result<[u8; 16], Error> {
     opt_bytes16(v, key)?.ok_or(Error::MissingField(key))
 }
 

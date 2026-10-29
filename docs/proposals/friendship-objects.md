@@ -1,6 +1,7 @@
 # Proposal: friendship objects
 
-Status: proposal, unimplemented. The signed objects that
+Status: proposal. Built in `hl-identity` (`friendship`) with §6's
+vectors. The signed objects that
 `portable-friends.md` is built on: an offer, an acceptance, the
 friendship the two make, and a withdrawal that ends friendships. Defined
 in the terms of `hotline-ng-identity.md` ("the identity spec"), for
@@ -57,7 +58,7 @@ Domain `hl-identity/friend-offer/v1`. At most 1 KiB.
 | `from` | bstr(32) | yes | The offering identity's public key |
 | `to` | bstr(32) | yes | The offered identity's fingerprint |
 | `time` | uint | yes | |
-| `expires` | uint | yes | `time < expires <= time + 30 days` |
+| `expires` | uint | yes | `time < expires <= time + 30 days` (2,592,000 seconds) |
 | `id` | bstr(16) | yes | Random; makes two offers between the same pair two friendships |
 | `cert` | bstr | yes | |
 | `sig` | bstr(64) | yes | |
@@ -228,9 +229,10 @@ and the client tries again later.
 4. the SHA-256 of `from` is one of the two where the checker has
    applied no rotation of it, or the last key of a chain of rotations
    the checker has applied from one of the two (`portable-friends.md`
-   §4.4). Any key the checker has seen rotated away from, wherever it
-   sits in the chain, is refused as `from`, whatever the withdrawal's
-   `party` and `before`, since the rotation may have retired it. The
+   §4.4); a chain that forks or loops has no last key. Any key the
+   checker has seen rotated away from, wherever it sits in the chain,
+   is refused as `from`, whatever the withdrawal's `party` and
+   `before`, since the rotation may have retired it. The
    effective party is one of the two, and one that the checker has
    seen rotated away from has `before` no later than the `time` of the
    rotation away from it. A successor carries its predecessor's
@@ -276,15 +278,16 @@ not left to lapse, so that the checks that consult revocation
 
 ## 6. Test vectors
 
-`identity-test-vectors.json` gains an offer, its acceptance, the
-friendship's array bytes and its hash, a pair hash with its input in
-hex, and a withdrawal by each party, one with `party` naming the other,
-with a friendship each ends and one each leaves standing, all checked
-at a stated `now` with `S` as above.
+`identity-test-vectors.json` holds, in `friend_objects` and
+`friend_pairs`, checked by `hl-identity`'s `tests/friendship.rs`, an
+offer, its acceptance, the friendship's array bytes and its hash, a
+pair hash with its input in hex, and a withdrawal by each party, one
+with `party` naming the other, with a friendship each ends and one each
+leaves standing, all checked at a stated `now` with `S` as above.
 
-It gains rejections, as `rejects` and `message_rejects` hold for the
-objects already there, each failing at one step with no state beyond
-the object:
+It holds rejections, in `friend_rejects`, as `rejects` and
+`message_rejects` hold for the objects already there, each failing at
+one step with no state beyond the object:
 
 - an offer re-signed under the acceptance's domain, and under
   `hl-identity/message/v1`; a withdrawal re-signed under
@@ -306,12 +309,14 @@ the object:
 - a certificate for another identity, one without bit 1, and one over
   512 bytes, each for an offer, an acceptance and a withdrawal.
 
-And it gains reads, as `message_reads` and `cert_window` hold them:
+And it holds reads, in `friend_reads` and `friend_cert_window`, as
+`message_reads` and `cert_window` hold them:
 each case an object or a friendship with the state it is checked
 against, a `now`, the pair's two fingerprints, the rotations applied
 as a list of records, and the withdrawals held, and an `expect` of
-accepted or the step it fails at. `keys` gains a successor and a
-successor's successor for the chains below.
+accepted or the step it fails at. `keys` holds a successor and a
+successor's successor for the chains below, with `rotate` and
+`rotate_successor` between them.
 
 - a pair hash whose offerer's fingerprint is the greater of the two,
   with its input in hex;
@@ -326,7 +331,8 @@ successor's successor for the chains below.
   naming A with `before` before the first rotation, refused, and one
   from A'' naming A, accepted;
 - a withdrawal applied before a rotation, still ending its friendship
-  once the rotation is applied;
+  once the rotation is applied, since a withdrawal held is not checked
+  again;
 - boundaries: a half dated exactly `before`, which stands, a
   withdrawal with `before` equal to its `time`, accepted, and one
   whose certificate has expired by `now` but was valid at its `time`,

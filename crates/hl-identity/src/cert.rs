@@ -144,14 +144,21 @@ impl DeviceCert {
     /// `hlid` parses back what it signs so an over-long `--name` is an
     /// error there rather than a certificate no server will read.
     pub fn parse(bytes: &[u8]) -> Result<DeviceCert, Error> {
+        let (cert, env) = Self::open(bytes)?;
+        env.verify(&cert.identity, DOMAIN)?;
+        Ok(cert)
+    }
+
+    /// [`DeviceCert::parse`] short of the signature, for a reader whose
+    /// order puts other checks between the two (`friendship.rs`).
+    pub(crate) fn open(bytes: &[u8]) -> Result<(DeviceCert, Envelope), Error> {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLarge);
         }
         let env = Envelope::open(bytes)?;
         let cert = Self::from_envelope(&env)?;
         cert.check_fields()?;
-        env.verify(&cert.identity, DOMAIN)?;
-        Ok(cert)
+        Ok((cert, env))
     }
 
     fn check_fields(&self) -> Result<(), Error> {
