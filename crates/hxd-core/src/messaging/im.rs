@@ -159,14 +159,14 @@ impl Core {
             .collect()
     }
 
-    /// `of` takes no requests, no session of it having opted in or one
-    /// having opted out since: it can be sent an approval's traffic only
-    /// as private messages.
-    pub(crate) fn opted_out(&self, of: &Mailbox) -> bool {
+    /// No session of `of` has ever turned its account's switch on: it
+    /// can be sent an approval's traffic only as private messages. A
+    /// switch turned off since stops new requests and nothing else.
+    pub(crate) fn never_took_requests(&self, of: &Mailbox) -> bool {
         self.relationships
             .as_ref()
             .and_then(|s| s.account(of).ok())
-            .is_none_or(|a| !a.takes_requests)
+            .is_none_or(|a| a.requests_opted_at.is_none())
     }
 
     /// IM Send (810): a message to a friend, onto the inbox. A
@@ -556,9 +556,9 @@ impl Core {
             guid: guid.clone(),
             read,
         };
-        // What an approval shows is a read, and to a party that takes
-        // requests.
-        if approval && (!read || self.opted_out(&sender)) {
+        // What an approval shows is a read, to the party's sessions that
+        // understand requests, whether or not its account takes them.
+        if approval && !read {
             return Ok(());
         }
         // A read is told once, however often it is acknowledged.

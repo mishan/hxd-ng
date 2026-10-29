@@ -331,7 +331,7 @@ pub struct MessagingAccount {
     /// The profile's switch for message requests (§4.1): off until a
     /// session of the account opts in, and off again once one opts out.
     pub takes_requests: bool,
-    /// When a session last opted in, while the switch is on.
+    /// When a session last turned the switch on, kept once it is off.
     pub requests_opted_at: Option<SystemTime>,
     pub profile: Profile,
 }
@@ -345,8 +345,8 @@ pub struct AccountUpdate {
     pub status_text: Option<Option<String>>,
     pub discoverable: Option<bool>,
     /// `Some(Some(at))`: a session opted in to requests at `at`;
-    /// `Some(None)`: one opted out. The switch never turns on without
-    /// the time it lapses from.
+    /// `Some(None)`: one opted out, which keeps when it last opted in.
+    /// The switch never turns on without the time it lapses from.
     pub takes_requests: Option<Option<SystemTime>>,
     pub profile: Option<Profile>,
 }

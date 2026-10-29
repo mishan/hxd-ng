@@ -2204,7 +2204,7 @@ fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
     let (a, _ra) = taker(&s.core, "alice");
     let (b, mut rb) = taker(&s.core, "bob");
     let (_c, _rc) = taker(&s.core, "carol");
-    let (d, _rd) = taker(&s.core, "dave");
+    let (d, mut rd) = taker(&s.core, "dave");
     send(&s.core, d, "bob", "may I?").unwrap();
     s.core
         .request_answer(b, "dave", RequestAction::Approve)
@@ -2237,5 +2237,22 @@ fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
         ims(&drain(&mut rb)),
         [("thanks".into(), false)],
         "and is still handed what comes under an approval it gave"
+    );
+    assert!(matches!(
+        send(&s.core, b, "dave", "welcome"),
+        Ok(MsgOutcome::Queued(_))
+    ));
+    let welcome = drain(&mut rd)
+        .into_iter()
+        .find_map(|e| match e {
+            Event::Im(im) => Some(im.guid),
+            _ => None,
+        })
+        .expect("bob's message");
+    s.core.im_ack(d, "bob", &welcome, true).unwrap();
+    assert_eq!(
+        receipts(&drain(&mut rb)),
+        [("dave".into(), true)],
+        "and told when what it sent under it is read"
     );
 }

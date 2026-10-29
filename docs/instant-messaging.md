@@ -220,9 +220,9 @@ no other guest. The recipient's answer, which approves the conversation
 (§4.3), reaches the sender as an ordinary private message, which a 1.5
 client shows, through the inbox's flush if it has gone
 (`private-messages.md` §6.3), as all of an approval's traffic does for
-a party that takes no requests (§4.6). Refusing it `NotFriends`, for
-want of understanding or of the bit, would cut 1.5 users off from messaging
-accounts they could write to before,
+a party whose account never took requests (§4.6). Refusing it
+`NotFriends`, for want of understanding or of the bit, would cut 1.5
+users off from messaging accounts they could write to before,
 and letting it bypass requests would let any classic session skip the
 holds and bounds. `/block` and `/unblock` are the relationship store's
 block (§3).
@@ -394,9 +394,11 @@ Messages pass both ways, but an approval shows less than a friendship:
 - **Only to sessions that understand requests.** Its 811, 812 and 813
   go to each party's sessions that understand requests, and wait for
   one otherwise, since a client that does not know approvals has no row
-  to show them under. A party that takes no requests, a classic
-  sender's (§4.1), is sent the messages as ordinary private
-  messages through the inbox instead, and no receipts.
+  to show them under. A party whose account never took requests, a
+  classic sender's (§4.1), is sent the messages as ordinary private
+  messages through the inbox instead, and no receipts. Turning requests
+  off stops new ones and nothing else: an approval's traffic, its Read
+  receipts among it, still reaches the sessions that understand them.
 
 On the classic wire an approved conversation over 810 waits for the
 numbers of §7, as requests do; until then it is the ng wire's.
@@ -467,8 +469,8 @@ nor the ng friend family never sends either, so it is handed a friend's
 IMs as private messages: live as `private-messages.md` §6.1 hands a
 stored message to an attached session, and at the login flush for those
 still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
-Approval rows go that way only to a party that takes no requests
-(§4.6). Every drain is capped by
+Approval rows go that way only to a party whose account never took
+requests (§4.6). Every drain is capped by
 `deliver_at_flush`, as the login flush is, the rest pulled or waiting
 for the next. A request's rows are never drained. IM rows count toward
 the sender's daily quota as offline private messages do

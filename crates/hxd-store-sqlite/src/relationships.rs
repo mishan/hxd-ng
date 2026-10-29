@@ -884,7 +884,9 @@ impl RelationshipStore for SqliteStore {
             }
             if let Some(at) = update.takes_requests {
                 a.takes_requests = at.is_some();
-                a.requests_opted_at = at;
+                if at.is_some() {
+                    a.requests_opted_at = at;
+                }
             }
             if let Some(profile) = &update.profile {
                 a.profile = profile.clone();

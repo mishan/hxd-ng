@@ -698,7 +698,9 @@ impl RelationshipStore for MemoryRelationships {
         }
         if let Some(at) = update.takes_requests {
             state.takes_requests = at.is_some();
-            state.requests_opted_at = at.map(floor);
+            if let Some(at) = at {
+                state.requests_opted_at = Some(floor(at));
+            }
         }
         if let Some(profile) = &update.profile {
             state.profile = profile.clone();

@@ -2580,7 +2580,7 @@ impl Core {
     /// What a flush to `target` reads: a session that speaks the friend
     /// family is handed a friend's instant messages at its roster read
     /// instead, and what an approval carries waits for a session that
-    /// understands requests where the account takes them
+    /// understands requests where the account ever took them
     /// (`docs/instant-messaging.md` §5, §4.6).
     fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
         let messenger = {
@@ -2596,7 +2596,7 @@ impl Core {
         };
         if messenger {
             crate::inbox::Pending::Mail
-        } else if self.messaging_enabled() && !self.opted_out(mailbox) {
+        } else if self.messaging_enabled() && !self.never_took_requests(mailbox) {
             crate::inbox::Pending::Unapproved
         } else {
             crate::inbox::Pending::All

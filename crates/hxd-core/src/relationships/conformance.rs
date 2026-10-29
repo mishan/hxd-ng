@@ -775,8 +775,9 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
     assert_eq!(got.status_text, None, "{case}: cleared");
     assert!(got.discoverable && !got.takes_requests, "{case}: kept");
     assert_eq!(
-        got.requests_opted_at, None,
-        "{case}: opting out forgets when"
+        got.requests_opted_at,
+        Some(at(5)),
+        "{case}: opting out keeps when it was on"
     );
     assert_eq!(
         got.profile,
