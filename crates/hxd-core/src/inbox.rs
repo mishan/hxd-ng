@@ -223,6 +223,10 @@ pub struct NewMessage {
     /// A signed message's detached form (`docs/e2e-messages.md` §4.9),
     /// kept with the row so it verifies when it is read days later.
     pub signed: Option<crate::history::Signature>,
+    /// The friendship or approval an instant message was sent on, or
+    /// that it is a message request (`docs/instant-messaging.md` §5);
+    /// `None` for a private message.
+    pub friendship: Option<crate::relationships::SentOn>,
 }
 
 /// A message as the store holds it.
@@ -241,6 +245,7 @@ pub struct StoredMessage {
     /// renders as a placeholder.
     pub media: Option<crate::history::MediaMeta>,
     pub signed: Option<crate::history::Signature>,
+    pub friendship: Option<crate::relationships::SentOn>,
     /// When the server handed this to a live connection — *not* when a
     /// client rendered it. A stronger guarantee needs per-message client
     /// acks, which is what fogWraith's `IM Acknowledge (812)` is for and
@@ -427,16 +432,14 @@ pub trait MessageStore: Send + Sync + 'static {
     /// many rows moved.
     ///
     /// **Key rotation must call this**, or a rotated identity loses its
-    /// mailbox and its blocks quietly stop applying — the second being
-    /// the worse half, because a block that has stopped working looks
-    /// exactly like a block that was never made. `Core::rotate_identity`
-    /// calls it.
+    /// mailbox. `Core::rotate_identity` calls it, and the relationship
+    /// store's beside it.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<usize, StoreError>;
 
     /// An account has linked an identity: stamp everything currently
-    /// keyed by its bare login — mail to it, mail from it, blocks either
-    /// side — with the fingerprint, so the mailbox follows the identity
-    /// from here on. Returns how many rows moved.
+    /// keyed by its bare login — mail to it and mail from it — with the
+    /// fingerprint, so the mailbox follows the identity from here on.
+    /// Returns how many rows moved.
     ///
     /// **The account-linking path must call this**, or an account's
     /// existing mail is stranded the moment it gains an identity ([`Mailbox`]
@@ -444,8 +447,8 @@ pub trait MessageStore: Send + Sync + 'static {
     /// call finds nothing left to stamp.
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
 
-    /// Delete everything belonging to a mailbox — mail to it, mail from
-    /// it, and its blocks. Returns how many rows went.
+    /// Delete everything belonging to a mailbox — mail to it and mail
+    /// from it. Returns how many rows went.
     ///
     /// **Deleting an account must call this.** A login freed by deletion
     /// can be registered by someone else, and [`MessageStore::claim`]
@@ -453,8 +456,7 @@ pub trait MessageStore: Send + Sync + 'static {
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
 
     /// How many rows [`MessageStore::purge`] would delete, without changing
-    /// the store. Messages and blocks are both counted, and a row that names
-    /// the mailbox on both sides counts once.
+    /// the store. A row that names the mailbox on both sides counts once.
     fn purge_count(&self, of: &Mailbox) -> Result<usize, StoreError>;
 
     /// Drop read messages read longer ago than `read`, and unread ones
@@ -463,34 +465,6 @@ pub trait MessageStore: Send + Sync + 'static {
     /// sent, a read one from when the recipient was done with it.
     fn prune(&self, now: SystemTime, unread: Duration, read: Duration)
         -> Result<usize, StoreError>;
-
-    // --- Blocking -------------------------------------------------------
-    //
-    // A minimum viable version of fogWraith's Block User (806), here
-    // rather than in a roster because there is no roster yet and the
-    // mailbox needs it now: account addressing means anyone can put mail
-    // in anyone's queue, and a queue has a cap. Without a block, filling
-    // someone's mailbox locks every other sender out of it. When the
-    // friend graph arrives the block list belongs with it, and this moves.
-
-    /// Block or unblock. Idempotent in both directions.
-    ///
-    /// `at` is when, passed in like every other time here: the domain
-    /// owns the clock, and a store that reads its own is a store whose
-    /// rows a test cannot place in time.
-    fn set_blocked(
-        &self,
-        owner: &Mailbox,
-        other: &Mailbox,
-        blocked: bool,
-        at: SystemTime,
-    ) -> Result<(), StoreError>;
-
-    /// Has `owner` blocked `other`?
-    fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError>;
-
-    /// Who `owner` has blocked, oldest first.
-    fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError>;
 
     /// The mail `from` has stored since `since`, by the mailbox rule on
     /// the sender's columns: every row, delivered and read or still

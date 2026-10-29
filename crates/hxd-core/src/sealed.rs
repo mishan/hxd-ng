@@ -257,7 +257,7 @@ impl Core {
         owner: &crate::inbox::Mailbox,
         other: &crate::inbox::Mailbox,
     ) -> Result<(), SealedError> {
-        let Some(store) = self.inbox.as_ref() else {
+        let Some(store) = self.relationships.as_ref() else {
             return Ok(());
         };
         match store.is_blocked(owner, other) {

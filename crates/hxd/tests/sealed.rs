@@ -93,6 +93,7 @@ async fn start(dir: &Path) -> Server {
             auth.clone(),
             hxd_core::InboxPolicy::default(),
         )
+        .with_relationships(store.clone())
         .with_history(
             store.clone(),
             HistoryPolicy {

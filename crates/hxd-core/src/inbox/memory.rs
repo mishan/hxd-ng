@@ -17,16 +17,10 @@ use super::{
     Pushed, Sent, StoreError, StoredMessage,
 };
 
-struct Block {
-    owner: Mailbox,
-    other: Mailbox,
-}
-
 #[derive(Default)]
 struct Inner {
     next_id: MessageId,
     msgs: Vec<StoredMessage>,
-    blocks: Vec<Block>,
 }
 
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
@@ -157,21 +151,6 @@ fn collapse(
     }
 }
 
-/// One block per pair of mailboxes, keeping the oldest — the SQL store's
-/// `MERGE_BLOCKS`. A merge is the only thing that can make two: block
-/// while linked, unlink, block again, relink.
-fn merge_blocks(blocks: &mut Vec<Block>) {
-    let mut seen: Vec<(String, String)> = Vec::new();
-    blocks.retain(|b| {
-        let key = (index_key(&b.owner), index_key(&b.other));
-        let first = !seen.contains(&key);
-        if first {
-            seen.push(key);
-        }
-        first
-    });
-}
-
 /// Every read path the inbox exposes is mail only.
 fn is_mail(m: &StoredMessage) -> bool {
     m.kind == MessageKind::Message
@@ -229,6 +208,7 @@ impl MessageStore for MemoryStore {
             kind: m.kind,
             media: m.media.clone(),
             signed: m.signed.clone(),
+            friendship: m.friendship,
             delivered_at: None,
             // A receipt is not something anyone reads; stamping it here
             // keeps it out of unread counts and ages it on the read clock
@@ -405,15 +385,6 @@ impl MessageStore for MemoryStore {
                 }
             }
         }
-        for b in inner.blocks.iter_mut() {
-            if claim_one(&mut b.owner, login, fingerprint) {
-                n += 1;
-            }
-            if claim_one(&mut b.other, login, fingerprint) {
-                n += 1;
-            }
-        }
-        merge_blocks(&mut inner.blocks);
         Ok(n)
     }
 
@@ -444,43 +415,25 @@ impl MessageStore for MemoryStore {
                 }
             }
         }
-        for b in inner.blocks.iter_mut() {
-            if rotate_one(&mut b.owner, from, to) {
-                n += 1;
-            }
-            if rotate_one(&mut b.other, from, to) {
-                n += 1;
-            }
-        }
-        merge_blocks(&mut inner.blocks);
         Ok(n)
     }
 
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let before = inner.msgs.len() + inner.blocks.len();
+        let before = inner.msgs.len();
         inner
             .msgs
             .retain(|m| !is(&m.recipient, of) && !m.sender.as_ref().is_some_and(|s| is(s, of)));
-        inner
-            .blocks
-            .retain(|b| !is(&b.owner, of) && !is(&b.other, of));
-        Ok(before - (inner.msgs.len() + inner.blocks.len()))
+        Ok(before - inner.msgs.len())
     }
 
     fn purge_count(&self, of: &Mailbox) -> Result<usize, StoreError> {
         let inner = self.inner.lock().unwrap();
-        let messages = inner
+        Ok(inner
             .msgs
             .iter()
             .filter(|m| is(&m.recipient, of) || m.sender.as_ref().is_some_and(|s| is(s, of)))
-            .count();
-        let blocks = inner
-            .blocks
-            .iter()
-            .filter(|b| is(&b.owner, of) || is(&b.other, of))
-            .count();
-        Ok(messages + blocks)
+            .count())
     }
 
     fn prune(
@@ -498,34 +451,6 @@ impl MessageStore for MemoryStore {
         Ok(before - inner.msgs.len())
     }
 
-    fn set_blocked(
-        &self,
-        owner: &Mailbox,
-        other: &Mailbox,
-        blocked: bool,
-        _at: SystemTime,
-    ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        let held = inner
-            .blocks
-            .iter()
-            .any(|b| is(&b.owner, owner) && is(&b.other, other));
-        match (blocked, held) {
-            (true, false) => inner.blocks.push(Block {
-                owner: owner.clone(),
-                other: other.clone(),
-            }),
-            // *Every* match, as the SQL store's `DELETE` does. Removing
-            // one left the pair still blocked after an unblock said it
-            // wasn't, if anything had ever managed to store two.
-            (false, true) => inner
-                .blocks
-                .retain(|b| !(is(&b.owner, owner) && is(&b.other, other))),
-            _ => {}
-        }
-        Ok(())
-    }
-
     fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -537,24 +462,6 @@ impl MessageStore for MemoryStore {
                 messages: sent.messages + 1,
                 bytes: sent.bytes + x.body.len() as u64,
             }))
-    }
-
-    fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .blocks
-            .iter()
-            .any(|b| is(&b.owner, owner) && is(&b.other, other)))
-    }
-
-    fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .blocks
-            .iter()
-            .filter(|b| is(&b.owner, owner))
-            .map(|b| b.other.clone())
-            .collect())
     }
 }
 
@@ -590,6 +497,7 @@ mod tests {
                     kind: MessageKind::Message,
                     media: None,
                     signed: None,
+                    friendship: None,
                 },
                 usize::MAX,
             )

@@ -489,8 +489,8 @@ impl Core {
         {
             return false;
         }
-        match (self.inbox.as_ref(), poster) {
-            (Some(inbox), Some(poster)) => match inbox.is_blocked(to, poster) {
+        match (self.relationships.as_ref(), poster) {
+            (Some(store), Some(poster)) => match store.is_blocked(to, poster) {
                 Ok(blocked) => !blocked,
                 Err(e) => {
                     warn!("news notify: reading {}'s blocks: {e}", to.login);

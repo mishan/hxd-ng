@@ -36,6 +36,7 @@ use hxd_core::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     Pushed, Sent, StoreError, StoredMessage,
 };
+use hxd_core::relationships::SentOn;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 /// How hard a commit tries to survive the machine losing power.
@@ -67,13 +68,14 @@ mod moderation;
 mod news;
 mod push;
 mod registrar;
+mod relationships;
 
 pub use blobs::FileBlobStore;
 pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -683,6 +685,140 @@ const SCHEMA_V27: &str = "
 ALTER TABLE chat_line ADD COLUMN home_name TEXT;
 ALTER TABLE chat_line ADD COLUMN home_tag TEXT;
 ALTER TABLE chat_line ADD COLUMN home_tagged INTEGER;
+";
+
+/// The relationship store (`docs/instant-messaging.md` §3), which the
+/// inbox's block list moves into, one row per pair as a merge always left
+/// it, with the earliest block's time. Every table is keyed by mailbox as
+/// `message` is, with an index per shape of key; `relationship_pair`
+/// says the one row per pair that `claim` and `rotate` keep.
+///
+/// A friendship or an approval is a `relation` row while it is live, its
+/// id never reused (AUTOINCREMENT), and what an inbox row was sent on is
+/// `message.friendship`: 0 for a message request, else the id. A hold
+/// keeps both keys of each mailbox and matches by either; a purge of a
+/// bare login clears that login from a hold that has a fingerprint too. The ledger is
+/// read by sender and time and by address and time, so a rolling day is
+/// a range.
+const SCHEMA_V28: &str = "
+CREATE TABLE relation (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind    INTEGER NOT NULL,
+  made_at INTEGER NOT NULL
+);
+CREATE TABLE relationship (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner             TEXT    NOT NULL,
+  owner_fp          TEXT,
+  other             TEXT    NOT NULL,
+  other_fp          TEXT,
+  alias             TEXT,
+  blocked_at        INTEGER,
+  friendship        INTEGER,
+  approval          INTEGER,
+  pending_at        INTEGER,
+  pending_lapses    INTEGER,
+  pending_delivered INTEGER,
+  pending_note      TEXT,
+  ignore_mode       INTEGER,
+  ignore_until      INTEGER,
+  CHECK ((pending_at IS NULL) = (pending_lapses IS NULL)
+     AND (pending_at IS NULL) = (pending_delivered IS NULL))
+);
+CREATE UNIQUE INDEX relationship_pair
+  ON relationship (IFNULL(owner_fp, owner), IFNULL(other_fp, other));
+CREATE INDEX relationship_owner_fp ON relationship (owner_fp, id) WHERE owner_fp IS NOT NULL;
+CREATE INDEX relationship_owner_login ON relationship (owner, id) WHERE owner_fp IS NULL;
+CREATE INDEX relationship_other_fp ON relationship (other_fp) WHERE other_fp IS NOT NULL;
+CREATE INDEX relationship_other_login ON relationship (other) WHERE other_fp IS NULL;
+CREATE INDEX relationship_friendship ON relationship (friendship) WHERE friendship IS NOT NULL;
+CREATE INDEX relationship_approval ON relationship (approval) WHERE approval IS NOT NULL;
+CREATE INDEX relationship_pending_lapses ON relationship (pending_lapses)
+  WHERE pending_lapses IS NOT NULL;
+CREATE INDEX relationship_ignore_until ON relationship (ignore_until)
+  WHERE ignore_until IS NOT NULL;
+INSERT INTO relationship (owner, owner_fp, other, other_fp, blocked_at)
+  SELECT owner, owner_fp, other, other_fp,
+         (SELECT MIN(created_at) FROM block AS b
+           WHERE IFNULL(b.owner_fp, b.owner) = IFNULL(block.owner_fp, block.owner)
+             AND IFNULL(b.other_fp, b.other) = IFNULL(block.other_fp, block.other))
+    FROM block
+   WHERE id IN (SELECT MIN(id) FROM block
+                 GROUP BY IFNULL(owner_fp, owner), IFNULL(other_fp, other))
+   ORDER BY id;
+DROP TABLE block;
+
+CREATE TABLE request_hold (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner        TEXT,
+  owner_fp     TEXT,
+  held         TEXT,
+  held_fp      TEXT,
+  held_address TEXT,
+  until        INTEGER NOT NULL,
+  CHECK (owner IS NOT NULL OR owner_fp IS NOT NULL),
+  CHECK ((held IS NULL AND held_fp IS NULL) <> (held_address IS NULL))
+);
+CREATE INDEX request_hold_owner ON request_hold (owner);
+CREATE INDEX request_hold_owner_fp ON request_hold (owner_fp) WHERE owner_fp IS NOT NULL;
+CREATE INDEX request_hold_held ON request_hold (held) WHERE held IS NOT NULL;
+CREATE INDEX request_hold_held_fp ON request_hold (held_fp) WHERE held_fp IS NOT NULL;
+CREATE INDEX request_hold_until ON request_hold (until);
+
+CREATE TABLE request_ledger (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         INTEGER NOT NULL,
+  sender       TEXT,
+  sender_fp    TEXT,
+  address      TEXT,
+  recipient    TEXT    NOT NULL,
+  recipient_fp TEXT,
+  guid         TEXT,
+  bytes        INTEGER NOT NULL,
+  at           INTEGER NOT NULL
+);
+CREATE INDEX request_ledger_sender_fp ON request_ledger (sender_fp, at)
+  WHERE sender_fp IS NOT NULL;
+CREATE INDEX request_ledger_sender_login ON request_ledger (sender, at)
+  WHERE sender_fp IS NULL AND sender IS NOT NULL;
+CREATE INDEX request_ledger_address ON request_ledger (address, at) WHERE address IS NOT NULL;
+CREATE INDEX request_ledger_recipient_fp ON request_ledger (recipient_fp)
+  WHERE recipient_fp IS NOT NULL;
+CREATE INDEX request_ledger_recipient_login ON request_ledger (recipient)
+  WHERE recipient_fp IS NULL;
+CREATE INDEX request_ledger_guid ON request_ledger (guid) WHERE guid IS NOT NULL;
+CREATE INDEX request_ledger_at ON request_ledger (at);
+
+CREATE TABLE messaging_account (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner              TEXT    NOT NULL,
+  owner_fp           TEXT,
+  status_text        TEXT,
+  discoverable       INTEGER NOT NULL DEFAULT 0,
+  takes_requests     INTEGER NOT NULL DEFAULT 1,
+  requests_listed_at INTEGER,
+  requests_dropped   INTEGER NOT NULL DEFAULT 0,
+  nickname           TEXT,
+  first_name         TEXT,
+  last_name          TEXT,
+  email              TEXT,
+  gender             INTEGER NOT NULL DEFAULT 0,
+  birth_year         INTEGER NOT NULL DEFAULT 0,
+  birth_month        INTEGER NOT NULL DEFAULT 0,
+  birth_day          INTEGER NOT NULL DEFAULT 0,
+  country            TEXT,
+  postcode           TEXT,
+  language1          TEXT,
+  language2          TEXT,
+  language3          TEXT
+);
+CREATE UNIQUE INDEX messaging_account_fp ON messaging_account (owner_fp)
+  WHERE owner_fp IS NOT NULL;
+CREATE UNIQUE INDEX messaging_account_login ON messaging_account (owner)
+  WHERE owner_fp IS NULL;
+
+ALTER TABLE message ADD COLUMN friendship INTEGER;
+CREATE INDEX message_friendship ON message (friendship) WHERE friendship IS NOT NULL;
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -1411,6 +1547,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 27 {
         steps.push_str(SCHEMA_V27);
     }
+    if version < 28 {
+        steps.push_str(SCHEMA_V28);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1543,25 +1682,6 @@ impl Collapse {
     }
 }
 
-/// One block per pair of mailboxes. The `block` table has no unique
-/// index to collide with, so a merge leaves duplicates instead: block
-/// while linked, unlink, block again, relink, and the same pair is
-/// listed twice — after which the two stores disagreed about what
-/// `unblock` meant, SQLite deleting every match and the memory store
-/// one. De-duplicating at the merge is what keeps that from being a
-/// question either store has to answer.
-/// Scoped to the fingerprint the merge moved things onto (`?1`): those
-/// are the only rows whose key changed, so they are the only ones that
-/// can have become duplicates. Unscoped this was a whole-table group-by
-/// on an unindexed expression, run inside every `claim` — which is every
-/// login of a linked account.
-const MERGE_BLOCKS: &str = "DELETE FROM block
-  WHERE (owner_fp = ?1 OR other_fp = ?1)
-    AND id NOT IN (
-      SELECT MIN(id) FROM block
-       WHERE owner_fp = ?1 OR other_fp = ?1
-       GROUP BY IFNULL(owner_fp, owner), IFNULL(other_fp, other))";
-
 /// A fingerprint's storage spelling: lowercase hex, chosen here and
 /// nowhere else. The domain's key is the raw 32 bytes (see `Mailbox`), so
 /// this is the only place a fingerprint is text at all — which is what
@@ -1594,7 +1714,7 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
                        sender_nick, body, guid, sent_at, delivered_at, read_at, \
                        media_id, media_type, media_w, media_h, media_bytes, \
-                       signed, signed_content";
+                       signed, signed_content, friendship";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -1651,6 +1771,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let read: Option<i64> = r.get(11)?;
     let media = media_columns(r, 12)?;
     let signed: (Option<Vec<u8>>, Option<Vec<u8>>) = (r.get(17)?, r.get(18)?);
+    let friendship: Option<i64> = r.get(19)?;
     Ok((|| {
         Ok(StoredMessage {
             // `INTEGER PRIMARY KEY` is signed and `MessageId` is not, so
@@ -1689,6 +1810,12 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
                 }),
                 _ => return Err(StoreError::new("a signed message is half stored")),
             },
+            friendship: friendship
+                .map(|n| {
+                    SentOn::from_i64(n)
+                        .ok_or_else(|| StoreError(format!("message friendship {n} is not one")))
+                })
+                .transpose()?,
         })
     })())
 }
@@ -1733,8 +1860,10 @@ impl MessageStore for SqliteStore {
             "INSERT INTO message
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
-                media_id, media_type, media_w, media_h, media_bytes, signed, signed_content)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
+                friendship)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -1759,6 +1888,7 @@ impl MessageStore for SqliteStore {
                 m.media.as_ref().map(|x| x.bytes),
                 m.signed.as_ref().map(|x| &x.form),
                 m.signed.as_ref().map(|x| &x.content[..]),
+                m.friendship.map(SentOn::as_i64),
             ],
         )
         .map_err(StoreError::new)?;
@@ -1975,18 +2105,10 @@ impl MessageStore for SqliteStore {
         for sql in [
             "UPDATE message SET recipient_fp = ?1 WHERE recipient = ?2 AND recipient_fp IS NULL",
             "UPDATE message SET sender_fp = ?1 WHERE sender = ?2 AND sender_fp IS NULL",
-            "UPDATE block SET owner_fp = ?1 WHERE owner = ?2 AND owner_fp IS NULL",
-            "UPDATE block SET other_fp = ?1 WHERE other = ?2 AND other_fp IS NULL",
         ] {
             moved += tx
                 .execute(sql, params![fingerprint, login])
                 .map_err(StoreError::new)?;
-        }
-        let dupes = tx
-            .execute(MERGE_BLOCKS, params![fingerprint])
-            .map_err(StoreError::new)?;
-        if dupes > 0 {
-            tracing::info!(dupes, login, "claim: duplicate blocks merged");
         }
         tx.commit().map_err(StoreError::new)?;
         Ok(moved)
@@ -2020,18 +2142,10 @@ impl MessageStore for SqliteStore {
         for sql in [
             "UPDATE message SET recipient_fp = ?1 WHERE recipient_fp = ?2",
             "UPDATE message SET sender_fp = ?1 WHERE sender_fp = ?2",
-            "UPDATE block SET owner_fp = ?1 WHERE owner_fp = ?2",
-            "UPDATE block SET other_fp = ?1 WHERE other_fp = ?2",
         ] {
             moved += tx
                 .execute(sql, params![to, from])
                 .map_err(StoreError::new)?;
-        }
-        let dupes = tx
-            .execute(MERGE_BLOCKS, params![to])
-            .map_err(StoreError::new)?;
-        if dupes > 0 {
-            tracing::info!(dupes, "rotate: duplicate blocks merged");
         }
         tx.commit().map_err(StoreError::new)?;
         Ok(moved)
@@ -2047,8 +2161,6 @@ impl MessageStore for SqliteStore {
                 mailbox_sql(of, "recipient", 1)
             ),
             format!("DELETE FROM message WHERE {}", mailbox_sql(of, "sender", 1)),
-            format!("DELETE FROM block WHERE {}", mailbox_sql(of, "owner", 1)),
-            format!("DELETE FROM block WHERE {}", mailbox_sql(of, "other", 1)),
         ] {
             gone += tx
                 .execute(&sql, params![bind(of)])
@@ -2061,13 +2173,9 @@ impl MessageStore for SqliteStore {
     fn purge_count(&self, of: &Mailbox) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT
-               (SELECT COUNT(*) FROM message WHERE ({}) OR ({})) +
-               (SELECT COUNT(*) FROM block WHERE ({}) OR ({}))",
+            "SELECT COUNT(*) FROM message WHERE ({}) OR ({})",
             mailbox_sql(of, "recipient", 1),
             mailbox_sql(of, "sender", 1),
-            mailbox_sql(of, "owner", 1),
-            mailbox_sql(of, "other", 1),
         );
         conn.query_row(&sql, params![bind(of)], |r| r.get::<_, i64>(0))
             .map(|n| n as usize)
@@ -2087,57 +2195,6 @@ impl MessageStore for SqliteStore {
                  OR (read_at IS NULL AND sent_at < ?2)",
             params![cutoff(now, read), cutoff(now, unread)],
         )
-        .map_err(StoreError::new)
-    }
-
-    fn set_blocked(
-        &self,
-        owner: &Mailbox,
-        other: &Mailbox,
-        blocked: bool,
-        at: SystemTime,
-    ) -> Result<(), StoreError> {
-        let pair = format!(
-            "{} AND {}",
-            mailbox_sql(owner, "owner", 1),
-            mailbox_sql(other, "other", 2)
-        );
-        let conn = self.conn.lock().unwrap();
-        let (o, t) = (bind(owner), bind(other));
-        if !blocked {
-            conn.execute(&format!("DELETE FROM block WHERE {pair}"), params![o, t])
-                .map(|_| ())
-                .map_err(StoreError::new)?;
-            return Ok(());
-        }
-        // Checked inline rather than by calling `is_blocked`, which would
-        // take this same non-reentrant lock. Checked at all rather than
-        // upserted because the uniqueness we want is over the *matching
-        // rule* — two mailboxes being the same one — which no unique index
-        // over four columns can express.
-        let held: Option<i64> = conn
-            .query_row(
-                &format!("SELECT 1 FROM block WHERE {pair} LIMIT 1"),
-                params![o, t],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(StoreError::new)?;
-        if held.is_some() {
-            return Ok(());
-        }
-        conn.execute(
-            "INSERT INTO block (owner, owner_fp, other, other_fp, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                owner.login,
-                owner.fingerprint.as_ref().map(fp_hex),
-                other.login,
-                other.fingerprint.as_ref().map(fp_hex),
-                unix(at)
-            ],
-        )
-        .map(|_| ())
         .map_err(StoreError::new)
     }
 
@@ -2163,34 +2220,6 @@ impl MessageStore for SqliteStore {
             messages: messages.max(0) as usize,
             bytes: bytes.max(0) as u64,
         })
-    }
-
-    fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT 1 FROM block WHERE {} AND {} LIMIT 1",
-            mailbox_sql(owner, "owner", 1),
-            mailbox_sql(other, "other", 2)
-        );
-        let found: Option<i64> = conn
-            .query_row(&sql, params![bind(owner), bind(other)], |r| r.get(0))
-            .optional()
-            .map_err(StoreError::new)?;
-        Ok(found.is_some())
-    }
-
-    fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT other, other_fp FROM block WHERE {} ORDER BY id",
-            mailbox_sql(owner, "owner", 1)
-        );
-        let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
-        let rows = stmt
-            .query_map(params![bind(owner)], |r| Ok(mailbox(r.get(0)?, r.get(1)?)))
-            .map_err(StoreError::new)?;
-        rows.map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
-            .collect()
     }
 }
 
@@ -2683,6 +2712,7 @@ impl ChatLog for SqliteStore {
 mod tests {
     use super::*;
     use hxd_core::inbox::conformance;
+    use hxd_core::relationships::RelationshipStore;
 
     /// The WAL is folded back into the database by the checkpointer,
     /// never by a commit: what the store writes reaches the main file
@@ -3005,6 +3035,88 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    #[test]
+    fn passes_the_relationship_conformance_suite() {
+        hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
+    }
+
+    /// The inbox's block list moves into the relationship store: a pair
+    /// a merge left blocked twice becomes one row, keeping the older
+    /// block, and every block reads as it did.
+    #[test]
+    fn version_twenty_seven_moves_its_blocks_into_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let fp = [0x2bu8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            for (owner, owner_fp, other, at) in [
+                ("dave", None, "spammer", 30),
+                ("alice", Some(fp_hex(&fp)), "bob", 40),
+                ("dave", None, "pest", 20),
+                // The same pair under a login the identity was renamed
+                // from, as a merge left it before blocks had one row.
+                ("alicia", Some(fp_hex(&fp)), "bob", 10),
+            ] {
+                conn.execute(
+                    "INSERT INTO block (owner, owner_fp, other, other_fp, created_at)
+                     VALUES (?1, ?2, ?3, NULL, ?4)",
+                    params![owner, owner_fp, other, at],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO message (recipient, sender_nick, body, sent_at)
+                 VALUES ('dave', 'alice', 'kept', 1)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 27).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let dave = Mailbox::login("dave");
+        let names = |m: Vec<Mailbox>| m.into_iter().map(|m| m.login).collect::<Vec<_>>();
+        assert_eq!(
+            names(store.blocked(&dave).unwrap()),
+            ["pest", "spammer"],
+            "oldest block first"
+        );
+        let alice = Mailbox::identified("alice", fp);
+        let row = store
+            .relationship(&alice, &Mailbox::login("bob"), SystemTime::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.blocked_at,
+            Some(from_unix(10)),
+            "the earlier of the two"
+        );
+        assert_eq!(store.blocked(&alice).unwrap().len(), 1, "one row per pair");
+        assert!(!store.is_blocked(&Mailbox::login("spammer"), &dave).unwrap());
+        assert_eq!(store.pending(&dave, 10).unwrap()[0].friendship, None);
+        let conn = Connection::open(&path).unwrap();
+        let block: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'block')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!block, "the old table is gone");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -3910,6 +4022,7 @@ mod tests {
                     kind: hxd_core::inbox::MessageKind::Message,
                     media: None,
                     signed: None,
+                    friendship: None,
                 },
                 100,
             )
@@ -4042,6 +4155,7 @@ mod tests {
                     kind: MessageKind::Message,
                     media: None,
                     signed: None,
+                    friendship: None,
                 },
                 100,
             )
@@ -4089,6 +4203,7 @@ mod tests {
                     kind: MessageKind::Message,
                     media: None,
                     signed: None,
+                    friendship: None,
                 },
                 100,
             )
@@ -4114,6 +4229,7 @@ mod tests {
             kind: MessageKind::Message,
             media: None,
             signed: None,
+            friendship: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored(_)));
         m.body = "twice".into();
@@ -4144,6 +4260,7 @@ mod tests {
             kind: MessageKind::Message,
             media: None,
             signed: None,
+            friendship: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -4161,7 +4278,7 @@ mod tests {
         store.push(&plain, 100).unwrap();
 
         // She links again.
-        let moved = store.claim("alice", &fp).unwrap();
+        let moved = MessageStore::claim(&store, "alice", &fp).unwrap();
         assert!(moved > 0, "the bare-login mail moved onto the fingerprint");
         let mine = store
             .pending(&Mailbox::identified("alice", fp), 10)
@@ -4202,6 +4319,7 @@ mod tests {
                     kind: MessageKind::Message,
                     media: None,
                     signed: None,
+                    friendship: None,
                 },
                 100,
             )

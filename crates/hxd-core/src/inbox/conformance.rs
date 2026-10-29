@@ -17,6 +17,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::relationships::SentOn;
+
 use super::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     Pushed, Sent,
@@ -30,6 +32,7 @@ use super::{
 pub fn run(new_store: &dyn Fn() -> Box<dyn MessageStore>) {
     pending_is_oldest_first_and_bounded(&*new_store());
     a_message_round_trips_whole(&*new_store());
+    the_friendship_column_round_trips(&*new_store());
     delivery_is_idempotent_and_removes_from_pending(&*new_store());
     reading_stamps_delivery_so_it_is_never_flushed_later(&*new_store());
     mark_read_never_reaches_another_mailbox(&*new_store());
@@ -42,17 +45,13 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn MessageStore>) {
     claiming_moves_a_logins_mail_onto_its_new_fingerprint(&*new_store());
     a_rename_takes_the_mailbox_and_leaves_the_login_free(&*new_store());
     purging_takes_everything_on_both_sides(&*new_store());
-    rotation_moves_a_mailbox_and_its_blocks_to_the_successor_key(&*new_store());
+    rotation_moves_a_mailbox_to_the_successor_key(&*new_store());
     claiming_merges_a_guid_that_exists_on_both_sides(&*new_store());
     claiming_merges_a_guid_the_sender_sent_twice(&*new_store());
     claiming_merges_a_duplicate_the_recipient_was_renamed_out_of(&*new_store());
     a_collapse_keeps_what_the_duplicate_knew(&*new_store());
     rotating_merges_a_guid_the_successor_already_holds(&*new_store());
     rotating_merges_a_guid_the_sender_sent_twice(&*new_store());
-    a_merge_leaves_one_block_per_pair(&*new_store());
-    // Blocking.
-    blocks_are_directional_and_idempotent(&*new_store());
-    blocks_follow_an_identity_and_are_listed(&*new_store());
     // Retry, and the kinds the inbox holds but does not show.
     the_same_guid_twice_is_one_message(&*new_store());
     pushing_the_same_guid_twice_stores_one_row(&*new_store());
@@ -89,6 +88,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         kind: MessageKind::Message,
         media: None,
         signed: None,
+        friendship: None,
     }
 }
 
@@ -134,6 +134,7 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
                 form: vec![0xa5, 1, 2],
                 content: [4; 32],
             }),
+            friendship: None,
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -164,6 +165,28 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
         (&[0xa5, 1, 2][..], [4; 32]),
         "{case}: its form and content"
     );
+}
+
+fn the_friendship_column_round_trips(s: &dyn MessageStore) {
+    let case = "the_friendship_column_round_trips";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let sent = [None, Some(SentOn::Request), Some(SentOn::Relation(7))];
+    for (i, on) in sent.iter().enumerate() {
+        push(
+            s,
+            &NewMessage {
+                friendship: *on,
+                ..msg(&dave, &alice, "m", at(i as u64))
+            },
+        );
+    }
+    let got: Vec<_> = s
+        .pending(&dave, 10)
+        .unwrap()
+        .iter()
+        .map(|m| m.friendship)
+        .collect();
+    assert_eq!(got, sent, "{case}");
 }
 
 fn pending_is_oldest_first_and_bounded(s: &dyn MessageStore) {
@@ -576,35 +599,6 @@ fn rotating_merges_a_guid_the_sender_sent_twice(s: &dyn MessageStore) {
     );
 }
 
-/// A merge can make two blocks where a client only ever asked for one:
-/// block while linked, unlink, block again, relink. The stores then
-/// disagreed about `unblock` — one deleted every match, the other one —
-/// so a merge leaves one row per pair.
-fn a_merge_leaves_one_block_per_pair(s: &dyn MessageStore) {
-    let case = "a_merge_leaves_one_block_per_pair";
-    let bob = Mailbox::login("bob");
-    let alice_linked = Mailbox::identified("alice", fp(1));
-    let alice_bare = Mailbox::login("alice");
-
-    s.set_blocked(&alice_linked, &bob, true, at(1)).unwrap();
-    s.set_blocked(&alice_bare, &bob, true, at(2)).unwrap();
-    s.claim("alice", &fp(1)).unwrap();
-    assert_eq!(
-        s.blocked(&alice_linked).unwrap().len(),
-        1,
-        "{case}: one block, however many merges made it"
-    );
-    s.set_blocked(&alice_linked, &bob, false, at(3)).unwrap();
-    assert!(
-        !s.is_blocked(&alice_linked, &bob).unwrap(),
-        "{case}: and unblocking means unblocked"
-    );
-    assert!(
-        s.blocked(&alice_linked).unwrap().is_empty(),
-        "{case}: on both of the ways to ask"
-    );
-}
-
 fn a_rename_takes_the_mailbox_and_leaves_the_login_free(s: &dyn MessageStore) {
     let case = "a_rename_takes_the_mailbox_and_leaves_the_login_free";
     let sender = Mailbox::login("sender");
@@ -641,101 +635,29 @@ fn purging_takes_everything_on_both_sides(s: &dyn MessageStore) {
     push(s, &msg(&dave, &alice, "to dave", at(1)));
     push(s, &msg(&alice, &dave, "from dave", at(2)));
     push(s, &msg(&alice, &bob, "unrelated", at(3)));
-    s.set_blocked(&dave, &bob, true, SystemTime::now()).unwrap();
-    s.set_blocked(&bob, &dave, true, SystemTime::now()).unwrap();
 
     assert_eq!(
         s.purge_count(&dave).unwrap(),
-        4,
+        2,
         "{case}: dry run counts exactly what purge will remove"
     );
     let gone = s.purge(&dave).unwrap();
-    assert_eq!(gone, 4, "{case}: two messages and two blocks");
+    assert_eq!(gone, 2, "{case}: one to it and one from it");
     assert_eq!(
         bodies(&s.list(&alice, None, 10).unwrap()),
         ["unrelated"],
         "{case}: and nobody else's mail"
     );
-    assert!(
-        !s.is_blocked(&bob, &dave).unwrap(),
-        "{case}: a block naming the purged account goes too"
-    );
 }
 
-// --- Blocking ------------------------------------------------------------
-
-fn blocks_are_directional_and_idempotent(s: &dyn MessageStore) {
-    let case = "blocks_are_directional_and_idempotent";
-    let (dave, spammer) = (Mailbox::login("dave"), Mailbox::login("spammer"));
-    assert!(
-        !s.is_blocked(&dave, &spammer).unwrap(),
-        "{case}: clean slate"
-    );
-
-    s.set_blocked(&dave, &spammer, true, SystemTime::now())
-        .unwrap();
-    s.set_blocked(&dave, &spammer, true, SystemTime::now())
-        .unwrap();
-    assert!(s.is_blocked(&dave, &spammer).unwrap(), "{case}: blocked");
-    assert!(
-        !s.is_blocked(&spammer, &dave).unwrap(),
-        "{case}: blocking is one-way — it says nothing about the reverse"
-    );
-    assert_eq!(s.blocked(&dave).unwrap().len(), 1, "{case}: listed once");
-
-    s.set_blocked(&dave, &spammer, false, SystemTime::now())
-        .unwrap();
-    s.set_blocked(&dave, &spammer, false, SystemTime::now())
-        .unwrap();
-    assert!(!s.is_blocked(&dave, &spammer).unwrap(), "{case}: unblocked");
-    assert!(s.blocked(&dave).unwrap().is_empty(), "{case}: and delisted");
-}
-
-fn blocks_follow_an_identity_and_are_listed(s: &dyn MessageStore) {
-    let case = "blocks_follow_an_identity_and_are_listed";
-    let dave = Mailbox::login("dave");
-    s.set_blocked(&dave, &Mailbox::login("one"), true, SystemTime::now())
-        .unwrap();
-    s.set_blocked(&dave, &Mailbox::login("two"), true, SystemTime::now())
-        .unwrap();
-
-    s.claim("dave", &fp(1)).unwrap();
-    let identified = Mailbox::identified("dave", fp(1));
-    let listed: Vec<String> = s
-        .blocked(&identified)
-        .unwrap()
-        .into_iter()
-        .map(|m| m.login)
-        .collect();
-    assert_eq!(listed, ["one", "two"], "{case}: the list follows the owner");
-    assert!(
-        s.blocked(&dave).unwrap().is_empty(),
-        "{case}: and the bare login no longer holds it"
-    );
-
-    // A blocked account linking an identity keeps being blocked.
-    s.claim("one", &fp(2)).unwrap();
-    assert!(
-        s.is_blocked(&identified, &Mailbox::identified("one", fp(2)))
-            .unwrap(),
-        "{case}: a block is not shaken off by linking an identity"
-    );
-}
-
-fn rotation_moves_a_mailbox_and_its_blocks_to_the_successor_key(s: &dyn MessageStore) {
-    let case = "rotation_moves_a_mailbox_and_its_blocks_to_the_successor_key";
+fn rotation_moves_a_mailbox_to_the_successor_key(s: &dyn MessageStore) {
+    let case = "rotation_moves_a_mailbox_to_the_successor_key";
     let old = Mailbox::identified("dave", fp(1));
     let new = Mailbox::identified("dave", fp(2));
     let sender = Mailbox::login("sender");
     push(s, &msg(&old, &sender, "before the rotation", at(1)));
-    s.set_blocked(&old, &Mailbox::login("spammer"), true, SystemTime::now())
-        .unwrap();
 
-    assert_eq!(
-        s.rotate(&fp(1), &fp(2)).unwrap(),
-        2,
-        "{case}: mail and block"
-    );
+    assert_eq!(s.rotate(&fp(1), &fp(2)).unwrap(), 1, "{case}: the mail");
     assert_eq!(
         bodies(&s.pending(&new, 10).unwrap()),
         ["before the rotation"],
@@ -744,10 +666,6 @@ fn rotation_moves_a_mailbox_and_its_blocks_to_the_successor_key(s: &dyn MessageS
     assert!(
         s.pending(&old, 10).unwrap().is_empty(),
         "{case}: and the retired key holds nothing"
-    );
-    assert!(
-        s.is_blocked(&new, &Mailbox::login("spammer")).unwrap(),
-        "{case}: a block that quietly stopped applying is the worse half"
     );
     assert_eq!(s.rotate(&fp(1), &fp(2)).unwrap(), 0, "{case}: idempotent");
 }
