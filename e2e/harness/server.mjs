@@ -86,13 +86,17 @@ async function waitForDiscovery(server, timeoutMs) {
  */
 export class Server {
   constructor(proc, dir, ports, config, name) {
-    this.proc = proc;
     this.dir = dir;
     this.ports = ports;
     this.config = config;
     this.name = name;
-    this.exitCode = null;
     this.lines = [];
+    this.attach(proc);
+  }
+
+  attach(proc) {
+    this.proc = proc;
+    this.exitCode = null;
     const take = (d) => {
       for (const line of String(d).split('\n')) if (line) this.lines.push(line);
       // A ring, not an ever-growing string: a file's worth of tests on a
@@ -103,6 +107,18 @@ export class Server {
     proc.stdout.on('data', take);
     proc.stderr.on('data', take);
     proc.on('exit', (code) => (this.exitCode = code));
+  }
+
+  /** Stop the process and start it again on the same directory, config
+   *  and ports, as an operator's restart would: what it kept is what is
+   *  on disk. */
+  async restart() {
+    if (this.exitCode === null) {
+      this.proc.kill();
+      await new Promise((r) => this.proc.once('exit', r));
+    }
+    this.attach(launch(this.dir));
+    await waitForDiscovery(this, 15_000);
   }
 
   get httpBase() {
