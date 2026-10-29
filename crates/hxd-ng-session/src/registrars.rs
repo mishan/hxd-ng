@@ -108,6 +108,10 @@ pub struct Registrars {
 pub struct Lookup {
     /// Every verified record, oldest first.
     pub records: Vec<Record>,
+    /// The rotation records among them, as they were published, by the
+    /// predecessor's fingerprint: what a friend's client fetches to check
+    /// a rotation for itself (`docs/proposals/portable-friends.md` §10).
+    pub rotations: Vec<(Fingerprint, Vec<u8>)>,
     /// Some registrar that attested the identity has no list this
     /// server can call current: `RegistrarsConfig::stale` decides.
     pub stale: bool,
@@ -553,12 +557,16 @@ impl Registrars {
         &self,
         identities: &[Fingerprint],
         frozen_refuses: bool,
-    ) -> (hxd_core::Published, Vec<(Fingerprint, Fingerprint)>) {
+    ) -> (
+        hxd_core::Published,
+        Vec<(Fingerprint, Fingerprint, Vec<u8>)>,
+    ) {
         let mut refused = hxd_core::Published::default();
         let mut rotations = Vec::new();
         for fp in identities {
             let mut frozen: HashMap<String, bool> = HashMap::new();
-            for record in self.lookup_fp(*fp, &[], 0).records {
+            let found = self.lookup_fp(*fp, &[], 0);
+            for record in found.records {
                 match record {
                     Record::RevokeIdentity(_) => {
                         refused.identities.insert(fp.0);
@@ -570,7 +578,13 @@ impl Registrars {
                         frozen.insert(f.registrar, f.frozen);
                     }
                     Record::Rotate(r) if Fingerprint::of(&r.identity) == *fp => {
-                        rotations.push((*fp, Fingerprint::of(&r.successor)));
+                        let record = found
+                            .rotations
+                            .iter()
+                            .find(|(from, _)| from == fp)
+                            .map(|(_, b)| b.clone())
+                            .unwrap_or_default();
+                        rotations.push((*fp, Fingerprint::of(&r.successor), record));
                     }
                     _ => {}
                 }
@@ -621,7 +635,13 @@ impl Registrars {
             };
             for page in pages.iter().filter(|p| p.fingerprint == Some(fp.0)) {
                 for (_, bytes) in &page.entries {
-                    match Record::parse(bytes, Some(keys)) {
+                    let record = Record::parse(bytes, Some(keys));
+                    if let Ok(Record::Rotate(r)) = &record {
+                        lookup
+                            .rotations
+                            .push((Fingerprint::of(&r.identity), bytes.clone()));
+                    }
+                    match record {
                         Ok(r) if Fingerprint::of(r.identity()) == fp => lookup.records.push(r),
                         // A rotation is published under both keys, and the
                         // successor's admission is where it is learned.

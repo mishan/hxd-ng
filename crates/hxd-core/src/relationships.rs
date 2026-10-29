@@ -351,6 +351,70 @@ pub struct AccountUpdate {
     pub profile: Option<Profile>,
 }
 
+/// A friendship one party presented here (`docs/proposals/
+/// portable-friends.md` §4.3), one per presenter and other party:
+/// presenting again replaces it. Both parties are keyed by fingerprint,
+/// the keys their accounts link now, which a rotation re-stamps; `names`
+/// and `pair` are the friendship's own, which it never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Presentation {
+    pub presenter: [u8; 32],
+    pub other: [u8; 32],
+    /// The two fingerprints the friendship names, the presenter's first.
+    pub names: [[u8; 32]; 2],
+    /// The friendship's pair hash, which a withdrawal names it by.
+    pub pair: [u8; 32],
+    /// The friendship hash.
+    pub hash: [u8; 32],
+    /// The friendship's bytes, or `None` where only its hash is kept,
+    /// toward the presenter's bound, for one refused before it could be
+    /// recorded (§4.3, steps 2 and 3).
+    pub friendship: Option<Vec<u8>>,
+    /// The SHA-256 of the device key whose session made it, or for one
+    /// made by Friend Response, that signed the presenter's half: what a
+    /// device's revocation drops (§6).
+    pub device: [u8; 32],
+    /// The id of a friendship this pair had, kept while the edge is
+    /// inactive so that the messages queued on it are released when it
+    /// is active again.
+    pub edge: Option<RelationId>,
+    pub at: SystemTime,
+}
+
+/// A withdrawal this server holds (§4.3): what it ends, and the signed
+/// object where there is one, which is handed to those it ended things
+/// for. A server's own, which ends things here alone, has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldWithdrawal {
+    /// The account it counts toward: its signer's identity, or the
+    /// remover's for a server's own.
+    pub owner: [u8; 32],
+    pub pair: [u8; 32],
+    /// The effective party, whose halves `before` dates.
+    pub party: [u8; 32],
+    /// Unix seconds.
+    pub before: u64,
+    pub withdrawal: Option<Vec<u8>>,
+    /// Checked whole against the pair. One for a pair the server held
+    /// nothing of when it was given is kept unchecked, and ends nothing,
+    /// until a friendship for that pair is presented.
+    pub checked: bool,
+    pub at: SystemTime,
+}
+
+/// An offer waiting for its answer: on a friend request, or on a
+/// friendship already standing, an upgrade offer (§4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOffer {
+    pub offer: Vec<u8>,
+    /// Its `expires`, when it lapses as everything here lapses: read as
+    /// gone from then on.
+    pub lapses_at: SystemTime,
+}
+
+/// The other key of a rotation, and its record as it was published.
+pub type RotationRecord = ([u8; 32], Vec<u8>);
+
 /// The relationship store, behind a trait as the inbox is, so the
 /// in-memory store can carry the domain's tests and SQLite's the server.
 pub trait RelationshipStore: Send + Sync + 'static {
@@ -518,6 +582,101 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// dropped since the listing before.
     fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError>;
 
+    // --- Portable friendships (`docs/proposals/portable-friends.md`) -----
+
+    /// Make `a` and `b` friends again under `id`, a friendship they had,
+    /// as [`RelationshipStore::befriend`] makes one: what a portable edge
+    /// active again after a dropped presentation takes, so that the
+    /// messages queued on it are released. It counts as made at `at`.
+    fn refriend(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        id: RelationId,
+        at: SystemTime,
+    ) -> Result<(), StoreError>;
+
+    /// When the friendship or approval `id` was made, while it is live: a
+    /// withdrawal ends a friendship of this server alone that was made
+    /// before its cutoff (`docs/proposals/portable-friends.md` §2).
+    fn made_at(&self, id: RelationId) -> Result<Option<SystemTime>, StoreError>;
+
+    /// Record a presentation, replacing the presenter's for that other
+    /// party, which is returned.
+    fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError>;
+
+    /// The presentation `presenter` made naming `other`.
+    fn presentation(
+        &self,
+        presenter: &[u8; 32],
+        other: &[u8; 32],
+    ) -> Result<Option<Presentation>, StoreError>;
+
+    /// Every presentation `of` made, and every one naming it, oldest
+    /// first.
+    fn presentations(&self, of: &[u8; 32]) -> Result<Vec<Presentation>, StoreError>;
+
+    /// Drop the presentation `presenter` made naming `other`, returning
+    /// it.
+    fn unpresent(
+        &self,
+        presenter: &[u8; 32],
+        other: &[u8; 32],
+    ) -> Result<Option<Presentation>, StoreError>;
+
+    /// The presentations a device made, oldest first.
+    fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError>;
+
+    /// Keep a withdrawal, in place of one of the same kind, signed or the
+    /// server's own, by the same owner for the same pair and party, whose
+    /// `before` is no later: the two kinds stand side by side. Past `cap` of its
+    /// owner's, the oldest are dropped, a server's own last.
+    fn keep_withdrawal(&self, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError>;
+
+    /// The withdrawals held for a pair hash.
+    fn withdrawals(&self, pair: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
+
+    /// Drop an unchecked withdrawal that failed its check against the
+    /// pair it names.
+    fn drop_withdrawal(
+        &self,
+        owner: &[u8; 32],
+        pair: &[u8; 32],
+        party: &[u8; 32],
+    ) -> Result<(), StoreError>;
+
+    /// Set or clear `owner`'s offer to `other`.
+    fn set_offer(
+        &self,
+        owner: &[u8; 32],
+        other: &[u8; 32],
+        offer: Option<&StoredOffer>,
+    ) -> Result<(), StoreError>;
+
+    /// `owner`'s offer to `other`, as it reads at `now`.
+    fn offer(
+        &self,
+        owner: &[u8; 32],
+        other: &[u8; 32],
+        now: SystemTime,
+    ) -> Result<Option<StoredOffer>, StoreError>;
+
+    /// Keep the record of `from`'s rotation to `to`, verified by the
+    /// caller. The first kept for `from` stands, as the first rotation
+    /// accepted does.
+    fn keep_rotation(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        record: &[u8],
+    ) -> Result<(), StoreError>;
+
+    /// The rotation away from `from`, as its successor and its record.
+    fn rotation_from(&self, from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
+
+    /// The rotation to `to`, as its predecessor and its record.
+    fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
+
     // --- The account -------------------------------------------------------
 
     /// What `of` keeps about itself; the defaults where it has kept
@@ -536,12 +695,16 @@ pub trait RelationshipStore: Send + Sync + 'static {
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
     /// The identity rotated to a successor key: re-stamp everything keyed
-    /// by `from` with `to`, merging as `claim` does.
+    /// by `from` with `to`, merging as `claim` does, presentations,
+    /// offers and the withdrawals it counts toward among it; a successor
+    /// already holding one for the same other party keeps its own.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the
     /// friendships and approvals on them, the holds it placed or is held
-    /// by, its ledger either way and its own record. Returns how many
+    /// by, its ledger either way and its own record; and where it has a
+    /// fingerprint, the presentations it made and the offers either way,
+    /// its withdrawals kept, so that what they end stays ended. Returns how many
     /// rows went. Holds are the purged mailbox's where they carry its
     /// fingerprint, or its login and no fingerprint; its login is taken
     /// off the rest ([`RelationshipStore::hold`]).

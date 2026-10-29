@@ -44,12 +44,14 @@ use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserSession};
 use crate::Core;
 
 mod im;
+mod portable;
 mod requests;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
+pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// What `[messaging]` says, as far as the domain is concerned.
@@ -153,6 +155,14 @@ pub struct FriendEntry {
     /// A waiting request's `DATA_REQUEST_NOTE`, for the 804 a roster
     /// read owes it.
     pub note: Option<String>,
+    /// The hashes of the friendships each party presented, for a portable
+    /// friend (`docs/proposals/portable-friends.md` §4.2).
+    pub friendships: Vec<[u8; 32]>,
+    /// The other's offer waiting for this owner's answer: on its request,
+    /// or an upgrade offer on a friendship (§4.1).
+    pub offer: Option<Vec<u8>>,
+    /// The withdrawal that ended a friendship, on a `Removed` entry.
+    pub withdraw: Option<Vec<u8>>,
 }
 
 impl FriendEntry {
@@ -165,7 +175,19 @@ impl FriendEntry {
             presence: Presence::Offline,
             status_text: None,
             note: None,
+            friendships: Vec::new(),
+            offer: None,
+            withdraw: None,
         }
+    }
+
+    /// What a session that did not ask for portable friendships is told:
+    /// the entry as the extension has it.
+    pub(crate) fn plain(mut self) -> FriendEntry {
+        self.friendships.clear();
+        self.offer = None;
+        self.withdraw = None;
+        self
     }
 
     fn asking(of: &Mailbox, note: Option<String>) -> FriendEntry {
@@ -186,6 +208,11 @@ pub struct FoundUser {
     /// Shown to a friend and to the account itself, never to anyone
     /// else, and never read as presence by its absence.
     pub presence: Option<(Presence, Option<String>)>,
+    /// The fingerprint its account links, for a friendships session
+    /// alone: what an offer is made to (`docs/proposals/
+    /// portable-friends.md` §4.1). hxd-ng shows every link, so there is no
+    /// hidden one to keep out of it.
+    pub fingerprint: Option<[u8; 32]>,
     /// The whole profile, likewise; `None` is the extension's
     /// `NotFriends` beside the name.
     pub profile: Option<Profile>,
@@ -242,6 +269,21 @@ pub enum MessagingError {
     RequestFull,
     /// No request or approval of that sender's to answer.
     NoSuchRequest,
+    /// A friendship act from a session that may not make one: it did not
+    /// prove a device of the account's identity, or that device's
+    /// certificate has expired or been revoked since
+    /// (`docs/proposals/portable-friends.md` §3).
+    NotDeviceProved,
+    /// A friendship object that fails its checks, or is not the
+    /// session's own act (`BadSignature`).
+    BadSignature,
+    /// A withdrawal held here ends it (`Withdrawn`).
+    Withdrawn,
+    /// Its `time` is not within `S` of the server's clock (`Stale`).
+    Stale,
+    /// Past [`MAX_OBJECTS`] in one request, or two withdrawals for one
+    /// pair (§4.3): a failure with no reason code.
+    TooMany,
     ServerError,
 }
 
@@ -373,9 +415,27 @@ impl RosterInner {
             .collect()
     }
 
+    /// Tell `of`'s messenger sessions `ev`, each as it asked to be told:
+    /// what only portable friendships carry reaches a friendships session
+    /// alone, and the rest are told the extension's event.
     pub(crate) fn tell_mailbox(&mut self, of: &Mailbox, ev: Event) {
         for uid in self.messengers(&Key::of(of)) {
-            self.send_to(uid, ev.clone());
+            let ev = if self.users.get(&uid).is_some_and(is_friendships) {
+                ev.clone()
+            } else {
+                plain(ev.clone())
+            };
+            self.send_to(uid, ev);
+        }
+    }
+
+    /// Tell `of`'s friendships sessions alone: an upgrade offer, which any
+    /// other would show as a request from someone already a friend.
+    pub(crate) fn tell_friendships(&mut self, of: &Mailbox, ev: Event) {
+        for uid in self.messengers(&Key::of(of)) {
+            if self.users.get(&uid).is_some_and(is_friendships) {
+                self.send_to(uid, ev.clone());
+            }
         }
     }
 
@@ -478,6 +538,9 @@ impl RosterInner {
             note: asked
                 .filter(|_| state == RosterState::PendingIn)
                 .and_then(|p| p.note.clone()),
+            friendships: Vec::new(),
+            offer: None,
+            withdraw: None,
         })
     }
 }
@@ -485,6 +548,31 @@ impl RosterInner {
 /// Is this a session taking part that is told of the friend family?
 pub(crate) fn is_messenger(s: &UserSession) -> bool {
     s.messaging.as_ref().is_some_and(|m| m.messenger)
+}
+
+/// Is this a session that asked for portable friendships, and was let?
+pub(crate) fn is_friendships(s: &UserSession) -> bool {
+    s.info.transport.friendships
+}
+
+/// An event as a session that did not ask for portable friendships is
+/// told it.
+fn plain(ev: Event) -> Event {
+    match ev {
+        Event::FriendEntry(e) => Event::FriendEntry(Box::new(e.plain())),
+        Event::FriendRequest {
+            login,
+            fingerprint,
+            note,
+            ..
+        } => Event::FriendRequest {
+            login,
+            fingerprint,
+            note,
+            offer: None,
+        },
+        ev => ev,
+    }
 }
 
 /// May an account with these bits and this login take part?
@@ -615,6 +703,12 @@ impl Core {
     /// `of`'s roster row about `other`, sent to `of`'s messenger
     /// sessions: what it is now, or that it is gone.
     fn tell_entry(&self, of: &Mailbox, other: &Mailbox) {
+        self.tell_entry_with(of, other, None);
+    }
+
+    /// [`Self::tell_entry`], with the withdrawal that ended the row where
+    /// one did.
+    fn tell_entry_with(&self, of: &Mailbox, other: &Mailbox, withdraw: Option<&[u8]>) {
         let Ok(store) = self.friends_store() else {
             return;
         };
@@ -627,12 +721,20 @@ impl Core {
             .and_then(|t| t.pending_out)
             .filter(|p| p.delivered);
         let text = self.status_text(row.as_ref());
-        let mut r = self.roster.lock().unwrap();
-        let entry = row
-            .and_then(|row| r.entry_of(&row, asked.as_ref(), text))
-            .or_else(|| asked.map(|p| FriendEntry::asking(other, p.note)))
-            .unwrap_or_else(|| FriendEntry::removed(other));
-        r.tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
+        let mut entry = {
+            let r = self.roster.lock().unwrap();
+            row.and_then(|row| r.entry_of(&row, asked.as_ref(), text))
+                .or_else(|| asked.map(|p| FriendEntry::asking(other, p.note)))
+                .unwrap_or_else(|| FriendEntry::removed(other))
+        };
+        self.portable_fields(store, of, &mut entry, now);
+        if entry.state == RosterState::Removed {
+            entry.withdraw = withdraw.map(<[u8]>::to_vec);
+        }
+        self.roster
+            .lock()
+            .unwrap()
+            .tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
     }
 
     /// A friend's stored status text, for its roster row.
@@ -812,7 +914,14 @@ impl Core {
                 theirs.pending_out.and_then(|p| p.note),
             ));
         }
+        let portable = r.users.get(&uid).is_some_and(is_friendships);
         drop(r);
+        // Read only for a session that is shown them.
+        if portable {
+            for e in out.iter_mut() {
+                self.portable_fields(store, &me.mailbox, e, now);
+            }
+        }
         self.im_drain(uid, &me.mailbox);
         Ok(out)
     }
@@ -828,7 +937,23 @@ impl Core {
         login: &str,
         note: Option<String>,
     ) -> Result<RosterState, MessagingError> {
-        let me = self.messenger(uid)?;
+        self.friend_ask(uid, login, note, None)
+    }
+
+    /// [`Self::friend_add`], carrying an offer where `offer` is one
+    /// (`docs/proposals/portable-friends.md` §4.1): a device act, and on a
+    /// friendship already standing an upgrade offer, answered `Accepted`.
+    pub fn friend_ask(
+        &self,
+        uid: Uid,
+        login: &str,
+        note: Option<String>,
+        offer: Option<Vec<u8>>,
+    ) -> Result<RosterState, MessagingError> {
+        let (me, device) = match offer {
+            Some(_) => self.device_act(uid).map(|(me, d)| (me, Some(d)))?,
+            None => (self.messenger(uid)?, None),
+        };
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
         let p = self.messaging_policy;
@@ -842,6 +967,12 @@ impl Core {
         if store.is_blocked(&them, &me.mailbox).map_err(store_failed)? {
             return Err(MessagingError::AccountNotFound);
         }
+        let offer = match (offer, device.as_ref()) {
+            (Some(bytes), Some(device)) => {
+                Some(self.check_offer(store, &me.mailbox, device, &them, bytes)?)
+            }
+            _ => None,
+        };
         if store.is_blocked(&me.mailbox, &them).map_err(store_failed)? {
             return Err(MessagingError::Blocked);
         }
@@ -849,7 +980,10 @@ impl Core {
             .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?;
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
-            return Err(MessagingError::AlreadyFriends);
+            return match offer {
+                Some(offer) => self.upgrade_offer(store, &me.mailbox, &them, note, offer),
+                None => Err(MessagingError::AlreadyFriends),
+            };
         }
         if mine.as_ref().is_some_and(|m| m.pending_out.is_some()) {
             return Err(MessagingError::RequestPending);
@@ -858,6 +992,12 @@ impl Core {
             .relationship(&them, &me.mailbox, now)
             .map_err(store_failed)?
             .is_some_and(|t| t.pending_out.is_some());
+        // Two offers make no friendship: one that meets a request is
+        // answered as the extension answers a crossing, and the client
+        // answers the earlier request with an 805 instead.
+        if crossing && offer.is_some() {
+            return Err(MessagingError::RequestPending);
+        }
         // Two crossing requests accept each other only from a session
         // that understands requests; any other is answered as the extension
         // answers it. Either way, whether or not the first was
@@ -895,6 +1035,11 @@ impl Core {
             store.request_dropped(&them).map_err(store_failed)?;
         }
         let delivered = !held && !full;
+        let offer = offer.filter(|_| delivered);
+        if let (Some(offer), Some(a), Some(b)) = (&offer, me.mailbox.fingerprint, them.fingerprint)
+        {
+            store.set_offer(&a, &b, Some(offer)).map_err(store_failed)?;
+        }
         store
             .set_pending_out(
                 &me.mailbox,
@@ -916,6 +1061,7 @@ impl Core {
                     login: me.mailbox.login.clone(),
                     fingerprint: me.mailbox.fingerprint,
                     note,
+                    offer: offer.map(|o| o.offer),
                 },
             );
         }
@@ -930,7 +1076,24 @@ impl Core {
         login: &str,
         accept: bool,
     ) -> Result<RosterState, MessagingError> {
-        let me = self.messenger(uid)?;
+        self.friend_answer(uid, login, accept, None)
+    }
+
+    /// [`Self::friend_respond`], accepting with a friendship where
+    /// `friendship` is one: a device act (`docs/proposals/portable-friends.md`
+    /// §4.1). It answers an upgrade offer too, which a decline or a
+    /// plain accept drops alone.
+    pub fn friend_answer(
+        &self,
+        uid: Uid,
+        login: &str,
+        accept: bool,
+        friendship: Option<Vec<u8>>,
+    ) -> Result<RosterState, MessagingError> {
+        let (me, device) = match friendship {
+            Some(_) if accept => self.device_act(uid).map(|(me, d)| (me, Some(d)))?,
+            _ => (self.messenger(uid)?, None),
+        };
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
         let now = self.clock.wall();
@@ -940,8 +1103,22 @@ impl Core {
             .map_err(store_failed)?
             .and_then(|t| t.pending_out)
             .is_some_and(|p| p.delivered);
-        if !asked {
+        let friends = store
+            .relationship(&me.mailbox, &them, now)
+            .map_err(store_failed)?
+            .is_some_and(|r| r.friendship.is_some());
+        let offered = self.offer_between(store, &them, &me.mailbox, now);
+        if !asked && !(friends && offered.is_some()) {
             return Err(MessagingError::NotFriends);
+        }
+        if !asked {
+            if let (Some(bytes), Some(device)) = (friendship.filter(|_| accept), device) {
+                let offered = offered.expect("checked above");
+                self.made_here(store, &me.mailbox, &device, &them, &offered, bytes)?;
+            } else if let (Some(a), Some(b)) = (them.fingerprint, me.mailbox.fingerprint) {
+                store.set_offer(&a, &b, None).map_err(store_failed)?;
+            }
+            return Ok(RosterState::Accepted);
         }
         if !accept {
             self.decline(store, &me.mailbox, &them, now)?;
@@ -954,7 +1131,15 @@ impl Core {
         {
             return Err(MessagingError::RosterFull);
         }
-        self.befriend(store, &me.mailbox, &them, now)?;
+        match (friendship, device) {
+            (Some(bytes), Some(device)) => {
+                let offered = offered.ok_or(MessagingError::BadSignature)?;
+                self.made_here(store, &me.mailbox, &device, &them, &offered, bytes)?;
+            }
+            _ => {
+                self.befriend(store, &me.mailbox, &them, now)?;
+            }
+        }
         Ok(RosterState::Accepted)
     }
 
@@ -962,7 +1147,26 @@ impl Core {
     /// a request the caller sent, or decline one it was sent. Removing a
     /// friend holds them, as declining does (§4.4).
     pub fn friend_remove(&self, uid: Uid, login: &str) -> Result<(), MessagingError> {
+        self.friend_unfriend(uid, login, None)
+    }
+
+    /// [`Self::friend_remove`], withdrawing where `withdraw` is a
+    /// withdrawal: a device act that ends the friendship wherever the
+    /// withdrawal reaches (`docs/proposals/portable-friends.md` §4.3).
+    /// Without one, a portable friendship ends here alone, under a
+    /// withdrawal of the server's own; and so it does where the one it
+    /// carries is refused, the removal standing and the refusal answered,
+    /// for the client to sign afresh for its other servers.
+    pub fn friend_unfriend(
+        &self,
+        uid: Uid,
+        login: &str,
+        withdraw: Option<Vec<u8>>,
+    ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
+        let device = withdraw
+            .as_ref()
+            .map(|_| self.device_act(uid).map(|(_, d)| d));
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
         let now = self.clock.wall();
@@ -972,6 +1176,21 @@ impl Core {
             .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?;
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
+            let taken = match (withdraw, device) {
+                (Some(bytes), Some(Ok(device))) => self
+                    .take_withdrawal(store, &me.mailbox, &device, &them, bytes)
+                    .map(Some),
+                (_, Some(Err(e))) => Err(e),
+                _ => Ok(None),
+            };
+            let still = store
+                .relationship(&me.mailbox, &them, now)
+                .map_err(store_failed)?
+                .is_some_and(|m| m.friendship.is_some());
+            if !still {
+                return taken.map(|_| ());
+            }
+            self.end_here(store, &me.mailbox, &them);
             store.unfriend(&me.mailbox, &them).map_err(store_failed)?;
             store
                 .hold(
@@ -984,11 +1203,13 @@ impl Core {
                 .lock()
                 .unwrap()
                 .friends_changed(&me.mailbox, &them, false);
-            self.tell_entry(&me.mailbox, &them);
-            self.tell_entry(&them, &me.mailbox);
-            return Ok(());
+            let withdraw = taken.as_ref().ok().cloned().flatten();
+            self.tell_entry_with(&me.mailbox, &them, withdraw.as_deref());
+            self.tell_entry_with(&them, &me.mailbox, withdraw.as_deref());
+            return taken.map(|_| ());
         }
         if let Some(sent) = mine.and_then(|m| m.pending_out) {
+            self.drop_offers(store, &me.mailbox, &them);
             store
                 .set_pending_out(&me.mailbox, &them, None)
                 .map_err(store_failed)?;
@@ -1041,6 +1262,21 @@ impl Core {
         b: &Mailbox,
         now: SystemTime,
     ) -> Result<RelationId, MessagingError> {
+        self.befriend_as(store, a, b, now, None)
+    }
+
+    /// [`Self::befriend`], under `id` where the pair had a friendship that
+    /// a dropped presentation left waiting (`docs/proposals/
+    /// portable-friends.md` §4.3). Either way the offers between them go:
+    /// the first acceptance answers them all.
+    fn befriend_as(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &Mailbox,
+        b: &Mailbox,
+        now: SystemTime,
+        id: Option<RelationId>,
+    ) -> Result<RelationId, MessagingError> {
         let mut approvals = Vec::new();
         for (x, y) in [(a, b), (b, a)] {
             if let Some(id) = store
@@ -1051,7 +1287,12 @@ impl Core {
                 approvals.push(id);
             }
         }
-        let id = store.befriend(a, b, now).map_err(store_failed)?;
+        let id = match id {
+            Some(id) => store.refriend(a, b, id, now).map(|()| id),
+            None => store.befriend(a, b, now),
+        }
+        .map_err(store_failed)?;
+        self.drop_offers(store, a, b);
         self.roster.lock().unwrap().friends_changed(a, b, true);
         self.tell_entry(a, b);
         self.tell_entry(b, a);
@@ -1068,6 +1309,7 @@ impl Core {
         them: &Mailbox,
         now: SystemTime,
     ) -> Result<(), MessagingError> {
+        self.drop_offers(store, them, me);
         store
             .set_pending_out(them, me, None)
             .map_err(store_failed)?;
@@ -1159,6 +1401,8 @@ impl Core {
                 .flatten()
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
+            self.end_here(store, blocker, blocked);
+            self.drop_offers(store, blocker, blocked);
             let unfriended = ended(store.unfriend(blocker, blocked));
             if unfriended {
                 self.roster
@@ -1349,7 +1593,15 @@ impl Core {
                 r.friend_view(&them, account.status_text.clone())
             }
         });
+        let portable = self
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&uid)
+            .is_some_and(is_friendships);
         Ok(FoundUser {
+            fingerprint: them.fingerprint.filter(|_| portable),
             login: them.login,
             name,
             presence,

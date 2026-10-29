@@ -27,6 +27,11 @@ sha2 = "0.10"
 # The keyed hash a guest's news share is kept under (`news::GuestKeyer`).
 hmac = { workspace = true }
 metrics = { version = "0.24", optional = true }
+# The friendship objects a portable friendship is made, presented and
+# withdrawn with (`docs/proposals/portable-friends.md`): every check is
+# hl-identity's, run where the store that holds what it is checked
+# against is.
+hl-identity = { workspace = true }
 
 [dev-dependencies]
 # A test waits on a lag signal, which takes a runtime and a clock.

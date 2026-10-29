@@ -75,7 +75,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -833,6 +833,64 @@ ALTER TABLE messaging_account RENAME COLUMN requests_listed_at TO requests_opted
 UPDATE messaging_account SET takes_requests = 0, requests_opted_at = NULL;
 ";
 
+/// Portable friendships (`docs/proposals/portable-friends.md`): what each
+/// party presented here, one per presenter and other party, and the
+/// device that made it, which a revocation drops by; the withdrawals held,
+/// by pair hash, a server's own with no object, beside any signed one
+/// for the same pair and party; the offers waiting, an
+/// upgrade offer among them; and the rotation records this server
+/// applied, the first for each predecessor standing. Every key is a
+/// fingerprint in hex, as the relationship tables keep one.
+const SCHEMA_V30: &str = "
+CREATE TABLE friend_presentation (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  presenter  TEXT    NOT NULL,
+  other      TEXT    NOT NULL,
+  name_mine  BLOB    NOT NULL,
+  name_other BLOB    NOT NULL,
+  pair       BLOB    NOT NULL,
+  hash       BLOB    NOT NULL,
+  friendship BLOB,
+  device     BLOB    NOT NULL,
+  edge       INTEGER,
+  at         INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX friend_presentation_pair ON friend_presentation (presenter, other);
+CREATE INDEX friend_presentation_other ON friend_presentation (other);
+CREATE INDEX friend_presentation_device ON friend_presentation (device);
+
+CREATE TABLE friend_withdrawal (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner      TEXT    NOT NULL,
+  pair       BLOB    NOT NULL,
+  party      BLOB    NOT NULL,
+  before     INTEGER NOT NULL,
+  withdrawal BLOB,
+  own        INTEGER NOT NULL,
+  checked    INTEGER NOT NULL,
+  at         INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX friend_withdrawal_key ON friend_withdrawal (owner, pair, party, own);
+CREATE INDEX friend_withdrawal_pair ON friend_withdrawal (pair);
+
+CREATE TABLE friend_offer (
+  owner  TEXT    NOT NULL,
+  other  TEXT    NOT NULL,
+  offer  BLOB    NOT NULL,
+  lapses INTEGER NOT NULL,
+  PRIMARY KEY (owner, other)
+);
+CREATE INDEX friend_offer_other ON friend_offer (other);
+CREATE INDEX friend_offer_lapses ON friend_offer (lapses);
+
+CREATE TABLE identity_rotation (
+  predecessor TEXT PRIMARY KEY,
+  successor   TEXT NOT NULL,
+  record      BLOB NOT NULL
+);
+CREATE INDEX identity_rotation_successor ON identity_rotation (successor);
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1564,6 +1622,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 29 {
         steps.push_str(SCHEMA_V29);
+    }
+    if version < 30 {
+        steps.push_str(SCHEMA_V30);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"

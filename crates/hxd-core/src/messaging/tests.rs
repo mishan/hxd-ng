@@ -11,7 +11,7 @@ use crate::roster::{drain, AttachInfo, InboxPolicy};
 use crate::{AccessBits, AccountDirectory, Events};
 
 /// Accounts by login, each with its bits.
-struct Directory(Vec<(Mailbox, AccessBits)>);
+pub(super) struct Directory(pub(super) Vec<(Mailbox, AccessBits)>);
 
 impl AccountDirectory for Directory {
     fn inbox_account(&self, login: &str) -> Option<Mailbox> {
@@ -66,7 +66,7 @@ fn server_notifying(
     server_of(dir, policy, InboxPolicy::default(), gateway)
 }
 
-fn server_of(
+pub(super) fn server_of(
     dir: Directory,
     policy: MessagingPolicy,
     inbox_policy: InboxPolicy,

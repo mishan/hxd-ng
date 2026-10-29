@@ -52,7 +52,7 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share), and the signed messages of `docs/e2e-messages.md` §3 (`message.rs`) and their sealing with HPKE (`sealed.rs`), and the server key handover of `docs/server-key-handover.md` with a client's check of a served chain (`handover.rs`), and the friendship objects of `docs/proposals/friendship-objects.md` (`friendship.rs`) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
@@ -101,7 +101,10 @@ Credentials are canonicalized to UTF-8 from the connection's encoding
 before any auth backend sees them, and a HOPE proof is checked against
 the stored password encoded back the way the client typed it
 (`docs/hope.md` §2). Never let a wire type or encoding leak into `hxd-core`'s API; that separation is what makes
-the ng frontend (and any future one) possible.
+the ng frontend (and any future one) possible. Identity objects are
+`hl-identity`'s: `hxd-core` holds them and checks them through that
+crate's API, where the store they are checked against is, and never
+checks an object's signatures or structure by a rule of its own.
 
 **Presence is user-scoped, not connection-scoped.** A `UserSession` owns a
 uid, a serial, and a seq-stamped outbox; transports attach to it. Legacy
@@ -426,6 +429,18 @@ Three layers, all `cargo test --workspace`:
   nothing of it across a resume until it asks, a server
   without messaging answering as before, and a classic client beside
   it all hearing nothing),
+  `portable_friends.rs` (portable friendships signed with real device
+  keys: one made on a server and in place on the next once both
+  present it, a withdrawal on one ending it on the other and refusing
+  it there after, a revoked device's presentations dropped and brought
+  back by the device that stays, an offer refused from a password
+  session, under another device's signature or out of time, an
+  unlinked identity's session making no more acts, a block standing
+  whatever becomes of its withdrawal, a rotation's record fetched and
+  the friendship moved to the successor by an upgrade offer, and a
+  login that never asks, a server without messaging, a password client
+  and a period client answered as before; the domain's tests in
+  `messaging::portable` take the gate through each act),
   `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line

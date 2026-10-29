@@ -83,7 +83,13 @@ async fn reload_on_hangup(
         }
     };
     while hangup.recv().await.is_some() {
-        match hxd::reload_revocations(&core, &path) {
+        // Off the reactor: a revoked device's presentations are dropped
+        // from the store.
+        let (c, p) = (core.clone(), path.clone());
+        let reloaded = tokio::task::spawn_blocking(move || hxd::reload_revocations(&c, &p))
+            .await
+            .unwrap_or_else(|e| Err(format!("the reload task failed: {e}")));
+        match reloaded {
             Ok((listed, ended)) => tracing::info!(
                 "SIGHUP: {listed} revoked keys installed from {}; {} sessions ended",
                 path.display(),

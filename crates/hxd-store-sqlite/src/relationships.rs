@@ -1,5 +1,5 @@
 //! The relationship store on SQLite (`docs/instant-messaging.md` §3),
-//! schema version 28.
+//! schema version 28, and the portable friendships of version 30.
 //!
 //! A row is read into a [`Relationship`], changed and written back, in
 //! one transaction, so the rules about what a row may hold
@@ -10,14 +10,14 @@ use std::time::SystemTime;
 
 use hxd_core::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 use hxd_core::relationships::{
-    AccountUpdate, Birthdate, Ignore, IgnoreMode, LedgerEntry, MessagingAccount, PendingOut,
-    Profile, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, RequestKind,
-    Requester, MAX_LANGUAGES,
+    AccountUpdate, Birthdate, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry, MessagingAccount,
+    PendingOut, Presentation, Profile, Recorded, Rekeyed, RelationId, Relationship,
+    RelationshipStore, RequestKind, Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 
-use super::{bind, fp_hex, from_unix, mailbox, mailbox_sql, unix, SqliteStore};
+use super::{bind, fp_from_hex, fp_hex, from_unix, mailbox, mailbox_sql, unix, SqliteStore};
 
 fn sql<T>(r: rusqlite::Result<T>) -> Result<T, StoreError> {
     r.map_err(StoreError::new)
@@ -353,6 +353,108 @@ fn rotate_moves(r: &str, col: &str) -> String {
     format!("({r}.{col}_fp IS NOT NULL AND {r}.{col}_fp = ?2)")
 }
 
+const PRESENTATION_COLUMNS: &str =
+    "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at";
+
+fn bytes32(v: Vec<u8>) -> Result<[u8; 32], StoreError> {
+    <[u8; 32]>::try_from(v).map_err(|_| StoreError::new("a stored key is not 32 bytes"))
+}
+
+fn presentation_row(r: &Row<'_>) -> rusqlite::Result<Result<Presentation, StoreError>> {
+    let (presenter, other): (String, String) = (r.get(0)?, r.get(1)?);
+    let names: (Vec<u8>, Vec<u8>) = (r.get(2)?, r.get(3)?);
+    let (pair, hash): (Vec<u8>, Vec<u8>) = (r.get(4)?, r.get(5)?);
+    let friendship: Option<Vec<u8>> = r.get(6)?;
+    let device: Vec<u8> = r.get(7)?;
+    let edge: Option<i64> = r.get(8)?;
+    let at: i64 = r.get(9)?;
+    Ok((|| {
+        Ok(Presentation {
+            presenter: fp_from_hex(&presenter)?,
+            other: fp_from_hex(&other)?,
+            names: [bytes32(names.0)?, bytes32(names.1)?],
+            pair: bytes32(pair)?,
+            hash: bytes32(hash)?,
+            friendship,
+            device: bytes32(device)?,
+            edge: edge.map(id_of).transpose()?,
+            at: from_unix(at),
+        })
+    })())
+}
+
+fn presentations_where(
+    conn: &Connection,
+    clause: &str,
+    binds: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Presentation>, StoreError> {
+    let text = format!(
+        "SELECT {PRESENTATION_COLUMNS} FROM friend_presentation WHERE {clause} ORDER BY id"
+    );
+    let mut stmt = sql(conn.prepare_cached(&text))?;
+    let found = sql(stmt.query_map(binds, presentation_row))?;
+    found
+        .map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
+        .collect()
+}
+
+fn withdrawal_row(r: &Row<'_>) -> rusqlite::Result<Result<HeldWithdrawal, StoreError>> {
+    let owner: String = r.get(0)?;
+    let (pair, party): (Vec<u8>, Vec<u8>) = (r.get(1)?, r.get(2)?);
+    let before: i64 = r.get(3)?;
+    let withdrawal: Option<Vec<u8>> = r.get(4)?;
+    let checked: bool = r.get(5)?;
+    let at: i64 = r.get(6)?;
+    Ok((|| {
+        Ok(HeldWithdrawal {
+            owner: fp_from_hex(&owner)?,
+            pair: bytes32(pair)?,
+            party: bytes32(party)?,
+            before: before.max(0) as u64,
+            withdrawal,
+            checked,
+            at: from_unix(at),
+        })
+    })())
+}
+
+/// The portable part of a rotation, as the in-memory store does it: what
+/// moves onto a pair the successor already holds is dropped.
+fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, StoreError> {
+    let mut n = 0;
+    for (table, a, b) in [
+        ("friend_presentation", "presenter", "other"),
+        ("friend_offer", "owner", "other"),
+    ] {
+        n += sql(tx.execute(
+            &format!(
+                "DELETE FROM {table} AS r WHERE ({a} = ?2 OR {b} = ?2) AND EXISTS
+                   (SELECT 1 FROM {table} AS k
+                     WHERE k.{a} = CASE WHEN r.{a} = ?2 THEN ?1 ELSE r.{a} END
+                       AND k.{b} = CASE WHEN r.{b} = ?2 THEN ?1 ELSE r.{b} END
+                       AND k.{a} <> ?2 AND k.{b} <> ?2)"
+            ),
+            params![to, from],
+        ))?;
+        // Two moved onto one pair: the first kept, as in memory.
+        for col in [a, b] {
+            n += sql(tx.execute(
+                &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
+                params![to, from],
+            ))?;
+            sql(tx.execute(
+                &format!("DELETE FROM {table} WHERE {col} = ?1"),
+                params![from],
+            ))?;
+        }
+    }
+    n += sql(tx.execute(
+        "UPDATE OR REPLACE friend_withdrawal SET owner = ?1 WHERE owner = ?2",
+        params![to, from],
+    ))?;
+    Ok(n)
+}
+
 impl SqliteStore {
     fn with_tx<T>(
         &self,
@@ -400,7 +502,15 @@ impl SqliteStore {
 
     /// Fold the rows a re-key makes duplicates of into the rows already
     /// at the destination, then re-key everything else.
-    fn rekey(&self, moves: Moves, to: &str, from: &str) -> Result<Rekeyed, StoreError> {
+    /// With `portable`, a rotation's: presentations, offers and
+    /// withdrawals move in the same transaction.
+    fn rekey(
+        &self,
+        moves: Moves,
+        to: &str,
+        from: &str,
+        portable: bool,
+    ) -> Result<Rekeyed, StoreError> {
         self.with_tx(|tx| {
             let after = |r: &str, col: &str| {
                 format!(
@@ -464,6 +574,9 @@ impl SqliteStore {
                     ),
                     params![to, from],
                 ))?;
+            }
+            if portable {
+                n += rotate_portable(tx, from, to)?;
             }
             merged.sort_unstable();
             merged.dedup();
@@ -895,12 +1008,273 @@ impl RelationshipStore for SqliteStore {
         })
     }
 
+    fn refriend(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        id: RelationId,
+        at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.with_tx(|tx| {
+            sql(tx.execute(
+                "INSERT OR IGNORE INTO relation (id, kind, made_at) VALUES (?1, ?2, ?3)",
+                params![id as i64, FRIENDSHIP, unix(at)],
+            ))?;
+            let mut ended = Vec::new();
+            for (x, y) in [(a, b), (b, a)] {
+                let (rid, mut rel) = match load_pair(tx, x, y)? {
+                    Some((rid, rel)) => (Some(rid), rel),
+                    None => (None, Relationship::new(x, y)),
+                };
+                ended.extend(rel.friendship.replace(id).filter(|old| *old != id));
+                rel.pending_out = None;
+                ended.extend(rel.approval.take());
+                write(tx, rid, &mut rel)?;
+            }
+            forget(tx, ended)
+        })
+    }
+
+    fn made_at(&self, id: RelationId) -> Result<Option<SystemTime>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let made: Option<i64> = sql(conn
+            .query_row(
+                "SELECT made_at FROM relation WHERE id = ?1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(made.map(from_unix))
+    }
+
+    fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
+        let (presenter, other) = (fp_hex(&p.presenter), fp_hex(&p.other));
+        self.with_tx(|tx| {
+            let old =
+                presentations_where(tx, "presenter = ?1 AND other = ?2", &[&presenter, &other])?
+                    .pop();
+            sql(tx.execute(
+                "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
+                params![presenter, other],
+            ))?;
+            sql(tx.execute(
+                "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair,
+                        hash, friendship, device, edge, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    presenter,
+                    other,
+                    p.names[0].as_slice(),
+                    p.names[1].as_slice(),
+                    p.pair.as_slice(),
+                    p.hash.as_slice(),
+                    p.friendship,
+                    p.device.as_slice(),
+                    p.edge.map(|n| n as i64),
+                    unix(p.at),
+                ],
+            ))?;
+            Ok(old)
+        })
+    }
+
+    fn presentation(
+        &self,
+        presenter: &[u8; 32],
+        other: &[u8; 32],
+    ) -> Result<Option<Presentation>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(presentations_where(
+            &conn,
+            "presenter = ?1 AND other = ?2",
+            &[&fp_hex(presenter), &fp_hex(other)],
+        )?
+        .pop())
+    }
+
+    fn presentations(&self, of: &[u8; 32]) -> Result<Vec<Presentation>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        presentations_where(&conn, "presenter = ?1 OR other = ?1", &[&fp_hex(of)])
+    }
+
+    fn unpresent(
+        &self,
+        presenter: &[u8; 32],
+        other: &[u8; 32],
+    ) -> Result<Option<Presentation>, StoreError> {
+        let (presenter, other) = (fp_hex(presenter), fp_hex(other));
+        self.with_tx(|tx| {
+            let old =
+                presentations_where(tx, "presenter = ?1 AND other = ?2", &[&presenter, &other])?
+                    .pop();
+            sql(tx.execute(
+                "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
+                params![presenter, other],
+            ))?;
+            Ok(old)
+        })
+    }
+
+    fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        presentations_where(&conn, "device = ?1", &[&device.as_slice()])
+    }
+
+    fn keep_withdrawal(&self, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError> {
+        let owner = fp_hex(&w.owner);
+        let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+        self.with_tx(|tx| {
+            sql(tx.execute(
+                "INSERT INTO friend_withdrawal
+                        (owner, pair, party, before, withdrawal, own, checked, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (owner, pair, party, own) DO UPDATE SET
+                   before = excluded.before, withdrawal = excluded.withdrawal,
+                   checked = excluded.checked, at = excluded.at
+                 WHERE excluded.before >= friend_withdrawal.before",
+                params![
+                    owner,
+                    w.pair.as_slice(),
+                    w.party.as_slice(),
+                    w.before as i64,
+                    w.withdrawal,
+                    w.withdrawal.is_none(),
+                    w.checked,
+                    unix(w.at),
+                ],
+            ))?;
+            sql(tx.execute(
+                "DELETE FROM friend_withdrawal WHERE id IN
+                   (SELECT id FROM friend_withdrawal WHERE owner = ?1
+                     ORDER BY withdrawal IS NULL, at, id
+                     LIMIT MAX(0, (SELECT COUNT(*) FROM friend_withdrawal WHERE owner = ?1) - ?2))",
+                params![owner, cap],
+            ))?;
+            Ok(())
+        })
+    }
+
+    fn withdrawals(&self, pair: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT owner, pair, party, before, withdrawal, checked, at
+               FROM friend_withdrawal WHERE pair = ?1 ORDER BY id",
+        ))?;
+        let found = sql(stmt.query_map(params![pair.as_slice()], withdrawal_row))?;
+        found
+            .map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
+            .collect()
+    }
+
+    fn drop_withdrawal(
+        &self,
+        owner: &[u8; 32],
+        pair: &[u8; 32],
+        party: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "DELETE FROM friend_withdrawal
+              WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND NOT checked",
+            params![fp_hex(owner), pair.as_slice(), party.as_slice()],
+        ))?;
+        Ok(())
+    }
+
+    fn set_offer(
+        &self,
+        owner: &[u8; 32],
+        other: &[u8; 32],
+        offer: Option<&StoredOffer>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (owner, other) = (fp_hex(owner), fp_hex(other));
+        sql(match offer {
+            Some(o) => conn.execute(
+                "INSERT OR REPLACE INTO friend_offer (owner, other, offer, lapses)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![owner, other, o.offer, unix(o.lapses_at)],
+            ),
+            None => conn.execute(
+                "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
+                params![owner, other],
+            ),
+        })?;
+        Ok(())
+    }
+
+    fn offer(
+        &self,
+        owner: &[u8; 32],
+        other: &[u8; 32],
+        now: SystemTime,
+    ) -> Result<Option<StoredOffer>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn
+            .query_row(
+                "SELECT offer, lapses FROM friend_offer
+                  WHERE owner = ?1 AND other = ?2 AND lapses > ?3",
+                params![fp_hex(owner), fp_hex(other), unix(now)],
+                |r| {
+                    Ok(StoredOffer {
+                        offer: r.get(0)?,
+                        lapses_at: from_unix(r.get(1)?),
+                    })
+                },
+            )
+            .optional())
+    }
+
+    fn keep_rotation(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        record: &[u8],
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT OR IGNORE INTO identity_rotation (predecessor, successor, record)
+             VALUES (?1, ?2, ?3)",
+            params![fp_hex(from), fp_hex(to), record],
+        ))?;
+        Ok(())
+    }
+
+    fn rotation_from(&self, from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<(String, Vec<u8>)> = sql(conn
+            .query_row(
+                "SELECT successor, record FROM identity_rotation WHERE predecessor = ?1",
+                params![fp_hex(from)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        found
+            .map(|(to, record)| Ok((fp_from_hex(&to)?, record)))
+            .transpose()
+    }
+
+    fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<(String, Vec<u8>)> = sql(conn
+            .query_row(
+                "SELECT predecessor, record FROM identity_rotation WHERE successor = ?1
+                  ORDER BY rowid LIMIT 1",
+                params![fp_hex(to)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        found
+            .map(|(from, record)| Ok((fp_from_hex(&from)?, record)))
+            .transpose()
+    }
+
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rekey(claim_moves, &fp_hex(fingerprint), login)
+        self.rekey(claim_moves, &fp_hex(fingerprint), login, false)
     }
 
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rekey(rotate_moves, &fp_hex(to), &fp_hex(from))
+        self.rekey(rotate_moves, &fp_hex(to), &fp_hex(from), true)
     }
 
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError> {
@@ -985,6 +1359,11 @@ impl RelationshipStore for SqliteStore {
                    (SELECT id FROM request_ledger WHERE at < ?1 LIMIT ?2)",
                 params![unix(ledger_before), batch],
             ))?;
+            n += sql(tx.execute(
+                "DELETE FROM friend_offer WHERE rowid IN
+                   (SELECT rowid FROM friend_offer WHERE lapses <= ?1 LIMIT ?2)",
+                params![lapsed, batch],
+            ))?;
             Ok(n)
         })
     }
@@ -1002,7 +1381,7 @@ fn purged(col: &str) -> String {
 fn purges(of: &Mailbox) -> Vec<(String, Vec<Value>)> {
     let key = || vec![Value::Text(bind(of))];
     let loose = loose_binds(of).to_vec();
-    vec![
+    let mut out = vec![
         (
             format!(
                 "DELETE FROM relationship WHERE ({}) OR ({})",
@@ -1034,5 +1413,17 @@ fn purges(of: &Mailbox) -> Vec<(String, Vec<Value>)> {
             ),
             key(),
         ),
-    ]
+    ];
+    if let Some(fp) = of.fingerprint.as_ref() {
+        let fp = || vec![Value::Text(fp_hex(fp))];
+        out.push((
+            "DELETE FROM friend_presentation WHERE presenter = ?1".into(),
+            fp(),
+        ));
+        out.push((
+            "DELETE FROM friend_offer WHERE owner = ?1 OR other = ?1".into(),
+            fp(),
+        ));
+    }
+    out
 }
