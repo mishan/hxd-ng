@@ -938,7 +938,12 @@ Phase 7 item 2 and are listed because item 3 is worthless without them.
    the phone buzz. This is the exit criterion; everything before it is
    plumbing that hasn't met a vendor yet. It is webpush-gateway.md's G5
    run a second time with `gateway = "uniqush"`, and the one test that
-   the two gateways look the same from the phone.
+   the two gateways look the same from the phone. **Passed 2026-10-29**
+   from a phone's browser through uniqush-push 2.11 and Valkey: a DM to a
+   detached user buzzed the phone, the subscriptions the in-process
+   gateway had made carried over without re-registering, and a session
+   still attached elsewhere was correctly sent no push. A UnifiedPush
+   distributor (ntfy) remains to be tried on either gateway.
 
 6. **P6 — sealed payloads.** The `hl-identity/push/v1` sealing to a
    device's `device_enc` (§5.1), specified and vectored in `hl-identity`,
