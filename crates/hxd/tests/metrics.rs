@@ -126,22 +126,20 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
     legacy.user_list().await.unwrap();
     let (ng, _) = ng::Client::guest(server.ng, "modern").await.unwrap();
 
+    // Each wire's login, by how it logged in. A login is counted once its
+    // reply is written, which the client can read before the count lands.
     let text = scrape_until(&server, |t| {
         value(t, "hxd_sessions{state=\"attached\"}") == Some(2.0)
+            && ["legacy", "ng"].iter().all(|w| {
+                has(
+                    t,
+                    "hxd_login_seconds_count",
+                    &[&format!("wire=\"{w}\""), "auth=\"guest\""],
+                )
+            })
     })
     .await;
     assert_eq!(value(&text, "hxd_sessions{state=\"detached\"}"), Some(0.0));
-    // Each wire's login, by how it logged in.
-    assert!(has(
-        &text,
-        "hxd_login_seconds_count",
-        &["wire=\"legacy\"", "auth=\"guest\""]
-    ));
-    assert!(has(
-        &text,
-        "hxd_login_seconds_count",
-        &["wire=\"ng\"", "auth=\"guest\""]
-    ));
     // The roster lock, named for what it guards and by where it was held.
     assert!(has(
         &text,
