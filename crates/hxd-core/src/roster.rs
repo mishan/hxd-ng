@@ -1105,7 +1105,7 @@ pub struct AttachInfo {
     /// [`Account::is_person`]: crate::Account::is_person
     pub is_person: bool,
     /// This session's wire cannot say it has read a message, so handing
-    /// one over *is* the read (`docs/private-messages.md` §11).
+    /// one over *is* the read (`docs/private-messages.md` §8).
     ///
     /// True for the legacy wire, where a private message is a window that
     /// opens and nothing comes back; false for ng, which has `msg_read`.

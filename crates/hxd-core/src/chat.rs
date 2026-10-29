@@ -19,7 +19,7 @@
 //! All text is UTF-8 (`String`) — see the roster module docs for the
 //! conversion rules at the legacy edge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -148,7 +148,14 @@ enum Target {
     /// and a laptop on uid 3, both live, should hear it on the one that
     /// was clicked. §15's multi-device question, answered: prefer the
     /// named session, else the lowest attached but the sender's.
+    ///
+    /// With no uid the message named the account, and every attached
+    /// session but the sender's is handed it: picking one would leave the
+    /// device its reader is holding without it whenever another, say a
+    /// forgotten tab, came first.
     Named { uid: Option<Uid>, sender: Uid },
+    /// Those of these sessions still attached, but the sender's.
+    Each { uids: Vec<Uid>, sender: Uid },
 }
 
 /// Every visible session owning `mailbox`, lowest uid first.
@@ -168,8 +175,8 @@ pub(crate) fn sessions_of(r: &RosterInner, mailbox: &Mailbox) -> Vec<Uid> {
     uids
 }
 
-/// The session to hand `mailbox`'s mail to: an *attached* one, lowest uid
-/// first, or none at all.
+/// The sessions to hand `mailbox`'s mail to: the *attached* ones, lowest
+/// uid first, or none at all.
 ///
 /// Lowest-uid-wins over every session was wrong, and quietly. An account
 /// with a detached phone on uid 5 and an attached laptop on uid 9 had
@@ -184,10 +191,34 @@ pub(crate) fn sessions_of(r: &RosterInner, mailbox: &Mailbox) -> Vec<Uid> {
 /// Never the sender's own session: a message to one's own account is
 /// for its other sessions, and handed back to the one that wrote it, it
 /// reads as a reply from the account and is answered to itself.
-fn attached_session_of(r: &RosterInner, mailbox: &Mailbox, sender: Uid) -> Option<Uid> {
+fn attached_sessions_of(r: &RosterInner, mailbox: &Mailbox, sender: Uid) -> Vec<Uid> {
     sessions_of(r, mailbox)
         .into_iter()
-        .find(|uid| *uid != sender && r.users.get(uid).is_some_and(is_live))
+        .filter(|uid| *uid != sender && r.users.get(uid).is_some_and(is_live))
+        .collect()
+}
+
+/// Is `uid` an attached session holding `mailbox`, as it stands now? A
+/// uid resolved under an earlier hold of the roster lock may have been
+/// reused since.
+fn holds(r: &RosterInner, mailbox: &Mailbox, uid: &Uid) -> bool {
+    r.users
+        .get(uid)
+        .is_some_and(|s| s.mailbox() == *mailbox && is_live(s))
+}
+
+/// Who [`Target::Named`] hands mail to: the named session if it is
+/// attached, else the lowest attached of [`attached_sessions_of`]; and
+/// all of them for a message that named the account.
+fn named_sessions(r: &RosterInner, mailbox: &Mailbox, named: Option<Uid>, sender: Uid) -> Vec<Uid> {
+    match named {
+        Some(uid) if holds(r, mailbox, &uid) => vec![uid],
+        Some(_) => attached_sessions_of(r, mailbox, sender)
+            .into_iter()
+            .take(1)
+            .collect(),
+        None => attached_sessions_of(r, mailbox, sender),
+    }
 }
 
 /// A store that would not answer is a server-side failure, not the
@@ -2051,22 +2082,12 @@ impl Core {
         // offline messages", so this path cannot be used to tell them
         // apart — see AccountDirectory::inbox_account.
         let mailbox = directory.inbox_account(to).ok_or(ChatError::NoSuchUser)?;
-        let (sender, uid) = {
-            let r = self.roster.lock().unwrap();
-            // An attached session, or none: this uid is only used by the
-            // non-durable path, which cannot store what it fails to
-            // deliver, so aiming it at a detached session would lose the
-            // message rather than queue it.
-            (
-                Sender::resolve(&r, from)?,
-                attached_session_of(&r, &mailbox, from),
-            )
-        };
+        let sender = Sender::resolve(&self.roster.lock().unwrap(), from)?;
         self.deliver(
             sender,
             Recipient {
                 principal: crate::media::Principal::Mailbox(mailbox.clone()),
-                uid,
+                uid: None,
                 mailbox,
                 has_inbox: true,
             },
@@ -2224,7 +2245,8 @@ impl Core {
             // if it is attached (§15 — clicking a name in a user list is
             // naming a *device*, and an account with a phone on uid 2 and
             // a laptop on uid 3 should hear it on the one that was
-            // clicked), else whichever session is attached. Preferring
+            // clicked), else whichever session is attached, and every one
+            // for a message that named the account. Preferring
             // the lowest attached uid over a named one that is *also*
             // attached was the durable path's old bug, still living here:
             // this is the path for every plain-guest sender, and for
@@ -2238,28 +2260,26 @@ impl Core {
             // mailbox is `guest`, a login several people share, and
             // resolving *that* would hand the message to whichever guest
             // answered first. There the uid is the address.
-            let attached = |uid: &Uid| {
-                r.users
-                    .get(uid)
-                    .is_some_and(|s| s.mailbox() == to.mailbox && is_live(s))
-            };
             // Every candidate is checked against the mailbox as it
             // stands *now*: `msg` resolved this uid under an earlier
             // hold of the roster lock, and a uid is reused once the
             // counter wraps, so a session that ended in between must not
-            // inherit the message. `attached` covers the first two; the
+            // inherit the message. `holds` covers the attached ones; the
             // last resort is the same check without the attached part,
             // since a detached session is still the right addressee here.
             let owns = |uid: &Uid| r.users.get(uid).is_some_and(|s| s.mailbox() == to.mailbox);
-            let uid = if to.has_inbox {
-                to.uid
-                    .filter(attached)
-                    .or_else(|| attached_session_of(&r, &to.mailbox, from))
-                    .or_else(|| to.uid.filter(owns))
+            let uids = if to.has_inbox {
+                let uids = named_sessions(&r, &to.mailbox, to.uid, from);
+                match to.uid.filter(owns) {
+                    Some(uid) if uids.is_empty() => vec![uid],
+                    _ => uids,
+                }
             } else {
-                to.uid
+                to.uid.into_iter().collect()
+            };
+            if uids.is_empty() {
+                return Err(ChatError::NoSuchUser);
             }
-            .ok_or(ChatError::NoSuchUser)?;
             // There is a recipient and the event is about to go out, so
             // now the image has been shown. Under the roster lock, which
             // is why `media_capture` takes principals rather than
@@ -2267,20 +2287,20 @@ impl Core {
             if let Some(handle) = &image {
                 self.media_capture(handle, audience.clone());
             }
-            r.send_to(
-                uid,
-                Event::Msg {
-                    from: sender.uid,
-                    from_nick: sender.nick,
-                    from_login: sender.reply_login,
-                    text,
-                    id: None,
-                    sent_at: now,
-                    queued: false,
-                    media,
-                    signed: signed.map(|s| s.form),
-                },
-            );
+            let ev = Event::Msg {
+                from: sender.uid,
+                from_nick: sender.nick,
+                from_login: sender.reply_login,
+                text,
+                id: None,
+                sent_at: now,
+                queued: false,
+                media,
+                signed: signed.map(|s| s.form),
+            };
+            for uid in uids {
+                r.send_to(uid, ev.clone());
+            }
             return Ok(MsgOutcome::Delivered);
         };
 
@@ -2339,37 +2359,29 @@ impl Core {
         };
         if self.send_quota_spent(&**store, &from_mailbox, text.len(), now)? && !retry(&guid)? {
             let mut r = self.roster.lock().unwrap();
-            let attached = |uid: &Uid| {
-                r.users
-                    .get(uid)
-                    .is_some_and(|s| s.mailbox() == to.mailbox && is_live(s))
-            };
             // Attached only: a detached session's outbox is not a place
             // to leave what the store was just refused.
-            let Some(uid) = to
-                .uid
-                .filter(attached)
-                .or_else(|| attached_session_of(&r, &to.mailbox, from))
-            else {
+            let uids = named_sessions(&r, &to.mailbox, to.uid, from);
+            if uids.is_empty() {
                 return Err(ChatError::SendQuota);
-            };
+            }
             if let Some(handle) = &image {
                 self.media_capture(handle, audience.clone());
             }
-            r.send_to(
-                uid,
-                Event::Msg {
-                    from: sender.uid,
-                    from_nick: sender.nick,
-                    from_login: sender.reply_login,
-                    text,
-                    id: None,
-                    sent_at: now,
-                    queued: false,
-                    media,
-                    signed: signed.map(|s| s.form),
-                },
-            );
+            let ev = Event::Msg {
+                from: sender.uid,
+                from_nick: sender.nick,
+                from_login: sender.reply_login,
+                text,
+                id: None,
+                sent_at: now,
+                queued: false,
+                media,
+                signed: signed.map(|s| s.form),
+            };
+            for uid in uids {
+                r.send_to(uid, ev.clone());
+            }
             return Ok(MsgOutcome::Delivered);
         }
 
@@ -2558,63 +2570,68 @@ impl Core {
         self.flush_to(Target::Only(uid), &mailbox, None).len()
     }
 
-    /// [`Self::flush_to`] the session `uid`, attached, for a message
+    /// [`Self::flush_to`] those of `uids` still attached, for a message
     /// `sender` just sent.
-    pub(crate) fn flush_named(
+    pub(crate) fn flush_each(
         &self,
-        uid: Uid,
+        uids: Vec<Uid>,
         mailbox: &Mailbox,
         fresh: Option<MessageId>,
         sender: Uid,
     ) -> Vec<MessageId> {
-        self.flush_to(
-            Target::Named {
-                uid: Some(uid),
-                sender,
-            },
-            mailbox,
-            fresh,
-        )
+        self.flush_to(Target::Each { uids, sender }, mailbox, fresh)
     }
 
-    /// What a flush to `target` reads: a session that speaks the friend
-    /// family is handed a friend's instant messages at its roster read
-    /// instead, and what an approval carries waits for a session that
-    /// understands requests where the account ever took them
-    /// (`docs/instant-messaging.md` §5, §4.6).
-    fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
-        let (messenger, understands) = {
+    /// Who a flush to `target` reaches, and what it reads for each: a
+    /// session that speaks the friend family is handed a friend's
+    /// instant messages at its roster read instead, and what an approval
+    /// carries waits for a session that understands requests where the
+    /// account ever took them (`docs/instant-messaging.md` §5, §4.6).
+    fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> Vec<(Uid, crate::inbox::Pending)> {
+        let sessions: Vec<(Uid, bool, bool)> = {
             let r = self.roster.lock().unwrap();
-            let uid = match *target {
-                Target::Only(uid) => Some(uid),
-                Target::Named { uid, sender } => uid
-                    .filter(|u| r.users.get(u).is_some_and(is_live))
-                    .or_else(|| attached_session_of(&r, mailbox, sender)),
+            let uids = match target {
+                Target::Only(uid) => Some(*uid)
+                    .filter(|u| holds(&r, mailbox, u))
+                    .into_iter()
+                    .collect(),
+                Target::Named { uid, sender } => named_sessions(&r, mailbox, *uid, *sender),
+                Target::Each { uids, sender } => attached_sessions_of(&r, mailbox, *sender)
+                    .into_iter()
+                    .filter(|u| uids.contains(u))
+                    .collect(),
             };
-            let s = uid.and_then(|u| r.users.get(&u));
-            (
-                s.is_some_and(crate::messaging::is_messenger),
-                s.is_some_and(crate::messaging::understands_requests),
-            )
+            uids.into_iter()
+                .filter_map(|u| {
+                    let s = r.users.get(&u)?;
+                    Some((
+                        u,
+                        crate::messaging::is_messenger(s),
+                        crate::messaging::understands_requests(s),
+                    ))
+                })
+                .collect()
         };
-        if messenger && !understands && self.never_took_requests(mailbox) {
-            crate::inbox::Pending::MailApproved
-        } else if messenger {
-            crate::inbox::Pending::Mail
-        } else if self.messaging_enabled() && !self.never_took_requests(mailbox) {
-            crate::inbox::Pending::Unapproved
-        } else {
-            crate::inbox::Pending::All
-        }
+        // A store read, so outside the roster lock, and once.
+        let never_took = std::cell::OnceCell::new();
+        let never_took = || *never_took.get_or_init(|| self.never_took_requests(mailbox));
+        sessions
+            .into_iter()
+            .map(|(uid, messenger, understands)| {
+                let which = if messenger && !understands && never_took() {
+                    crate::inbox::Pending::MailApproved
+                } else if messenger {
+                    crate::inbox::Pending::Mail
+                } else if self.messaging_enabled() && !never_took() {
+                    crate::inbox::Pending::Unapproved
+                } else {
+                    crate::inbox::Pending::All
+                };
+                (uid, which)
+            })
+            .collect()
     }
 
-    /// The flush itself.
-    ///
-    /// `uid` names the session to flush to, or `None` for "whichever
-    /// session of this mailbox is in a state to receive" — the send path
-    /// passes `None`, because who should get a message is a question for
-    /// after the write, not before it.
-    ///
     /// The login a reply may name, per distinct sender in a batch.
     ///
     /// Not simply the stored login: an identity guest's mailbox is keyed
@@ -2686,15 +2703,23 @@ impl Core {
         let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
 
         let limit = self.inbox_policy.deliver_at_flush;
-        let which = self.flush_reads(&target, mailbox);
-        let batch = match store.pending_of(mailbox, limit, which) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("inbox: reading pending mail for {}: {e}", mailbox.login);
-                return Vec::new();
+        let targets = self.flush_reads(&target, mailbox);
+        // One read for each kind of session among them: on a server
+        // without messaging, one read.
+        let mut batches: Vec<(crate::inbox::Pending, Vec<StoredMessage>)> = Vec::new();
+        for (_, which) in &targets {
+            if batches.iter().any(|(w, _)| w == which) {
+                continue;
             }
-        };
-        if batch.is_empty() {
+            match store.pending_of(mailbox, limit, *which) {
+                Ok(b) => batches.push((*which, b)),
+                Err(e) => {
+                    warn!("inbox: reading pending mail for {}: {e}", mailbox.login);
+                    return Vec::new();
+                }
+            }
+        }
+        if batches.iter().all(|(_, b)| b.is_empty()) {
             return Vec::new();
         }
 
@@ -2703,103 +2728,104 @@ impl Core {
         // the roster mutex is the one every chat, join, part and voice
         // operation on the server waits behind (roster.rs, §6.2). A
         // 25-message login flush was 25 file reads under it.
-        let from_logins = self.reply_addresses(&batch);
+        //
         // And which of the batch's images are still fetchable, resolved
         // in the same breath and for the same reason: a handle from
         // yesterday may have expired, and the answer belongs to the
         // event this flush is about to build.
-        let handles = self.media_states(&batch);
+        let (mut from_logins, mut handles) = (HashMap::new(), HashMap::new());
+        for (_, batch) in &batches {
+            from_logins.extend(self.reply_addresses(batch));
+            handles.extend(self.media_states(batch));
+        }
 
-        let mut delivered = Vec::with_capacity(batch.len());
+        let mut delivered = Vec::new();
+        // Handed to a session that can say it has read them, so it is
+        // left to say so: a row is read on delivery only when every
+        // session it reached is one whose wire cannot.
+        let mut unread = HashSet::new();
+        let mut reached = Vec::with_capacity(targets.len());
         let sending = match target {
-            Target::Named { sender, .. } => Some(sender),
+            Target::Named { sender, .. } | Target::Each { sender, .. } => Some(sender),
             Target::Only(_) => None,
         };
-        let (uid, what, messenger) = {
+        {
             let mut r = self.roster.lock().unwrap();
-            // Only an attached session receives. A detached one leaves its
-            // mail pending rather than filling an outbox buffer that is
-            // bounded and dies with the grace window — the durable copy is
-            // the copy.
-            let attached = |uid: &Uid| {
-                r.users
-                    .get(uid)
-                    .is_some_and(|s| s.mailbox() == *mailbox && is_live(s))
-            };
-            let uid = match target {
-                Target::Only(uid) => Some(uid).filter(attached),
-                Target::Named { uid, sender } => uid
-                    .filter(attached)
-                    .or_else(|| attached_session_of(&r, mailbox, sender)),
-            };
-            let Some(uid) = uid else {
-                return Vec::new();
-            };
-            // Whose wire this is decides whether handing a message over
-            // counts as reading it. Read here, where the session is
-            // finally known, rather than passed in: `deliver` reaches
-            // this for a live send too, and a legacy user reading a
-            // message the instant it arrives has read it just as much as
-            // one who read it at login.
-            let what = if r.users.get(&uid).is_some_and(|s| s.reads_on_delivery) {
-                Delivery::Read
-            } else {
-                Delivery::Delivered
-            };
-            // Read for another session than the one resolved here, the
-            // batch can hold a friend's instant messages that this one
-            // is handed at its roster read instead.
-            let messenger = r
-                .users
-                .get(&uid)
-                .is_some_and(crate::messaging::is_messenger);
-            // An approval's rows were read for a session that cannot be
-            // handed them as IMs, so it is handed them as mail.
-            let approvals = which == crate::inbox::Pending::MailApproved
-                && !r
-                    .users
-                    .get(&uid)
-                    .is_some_and(crate::messaging::understands_requests);
-            for m in batch {
-                if messenger && m.friendship.is_some() && !approvals {
+            for (uid, which) in targets {
+                // Only an attached session receives, and the lock was let
+                // go for the read. A detached one leaves its mail pending
+                // rather than filling an outbox buffer that is bounded and
+                // dies with the grace window — the durable copy is the
+                // copy.
+                if !holds(&r, mailbox, &uid) {
                     continue;
                 }
-                // The message just sent names the session that sent it.
-                // Older ones resolve their sender now and by mailbox: the
-                // sending session is long gone and its uid may belong to
-                // someone else by now. Same identity, same person; nobody
-                // there, no uid. Never the recipient's own uid, which is
-                // what mail between two sessions of one account would
-                // otherwise name, and a reply to it is to oneself.
-                let from = sending
-                    .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
-                    .or_else(|| {
-                        let s = m.sender.as_ref()?;
-                        sessions_of(&r, s).into_iter().find(|u| *u != uid)
-                    })
-                    .unwrap_or(0);
-                let from_login = m
-                    .sender
-                    .as_ref()
-                    .and_then(|s| from_logins.get(s).cloned().flatten());
-                r.send_to(
-                    uid,
-                    Event::Msg {
-                        from,
-                        from_nick: m.sender_nick,
-                        from_login,
-                        text: m.body,
-                        id: Some(m.id),
-                        sent_at: m.sent_at,
-                        queued: Some(m.id) != fresh,
-                        media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
-                        signed: m.signed.map(|s| s.form),
-                    },
-                );
-                delivered.push(m.id);
+                let s = &r.users[&uid];
+                let Some((_, batch)) = batches.iter().find(|(w, _)| *w == which) else {
+                    continue;
+                };
+                // Whose wire this is decides whether handing a message
+                // over counts as reading it. Read here, where the session
+                // is finally known, rather than passed in: `deliver`
+                // reaches this for a live send too, and a legacy user
+                // reading a message the instant it arrives has read it
+                // just as much as one who read it at login.
+                let reads = s.reads_on_delivery;
+                // Read for another session than this one, the batch can
+                // hold a friend's instant messages that this one is
+                // handed at its roster read instead.
+                let messenger = crate::messaging::is_messenger(s);
+                // An approval's rows were read for a session that cannot
+                // be handed them as IMs, so it is handed them as mail.
+                let approvals = which == crate::inbox::Pending::MailApproved
+                    && !crate::messaging::understands_requests(s);
+                for m in batch {
+                    if messenger && m.friendship.is_some() && !approvals {
+                        continue;
+                    }
+                    // The message just sent names the session that sent
+                    // it. Older ones resolve their sender now and by
+                    // mailbox: the sending session is long gone and its
+                    // uid may belong to someone else by now. Same
+                    // identity, same person; nobody there, no uid. Never
+                    // the recipient's own uid, which is what mail between
+                    // two sessions of one account would otherwise name,
+                    // and a reply to it is to oneself.
+                    let from = sending
+                        .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
+                        .or_else(|| {
+                            let s = m.sender.as_ref()?;
+                            sessions_of(&r, s).into_iter().find(|u| *u != uid)
+                        })
+                        .unwrap_or(0);
+                    let from_login = m
+                        .sender
+                        .as_ref()
+                        .and_then(|s| from_logins.get(s).cloned().flatten());
+                    r.send_to(
+                        uid,
+                        Event::Msg {
+                            from,
+                            from_nick: m.sender_nick.clone(),
+                            from_login,
+                            text: m.body.clone(),
+                            id: Some(m.id),
+                            sent_at: m.sent_at,
+                            queued: Some(m.id) != fresh,
+                            media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
+                            signed: m.signed.as_ref().map(|s| s.form.clone()),
+                        },
+                    );
+                    if !delivered.contains(&m.id) {
+                        delivered.push(m.id);
+                    }
+                    if !reads {
+                        unread.insert(m.id);
+                    }
+                }
+                reached.push((uid, which, messenger));
             }
-            (uid, what, messenger)
-        };
+        }
 
         // Stamped after the events are in the outbox: if this fails, the
         // message is delivered twice on the next flush, which is the right
@@ -2808,27 +2834,41 @@ impl Core {
         // task", and a socket that dies before the bytes go out loses
         // them for good — there is no resume on that wire. See
         // `docs/private-messages.md` §11.)
-        if let Err(e) = store.mark_delivered(&delivered, SystemTime::now(), what) {
-            warn!("inbox: marking {} messages delivered: {e}", delivered.len());
+        let (left_unread, read): (Vec<MessageId>, Vec<MessageId>) =
+            delivered.iter().partition(|id| unread.contains(id));
+        for (ids, what) in [(read, Delivery::Read), (left_unread, Delivery::Delivered)] {
+            if ids.is_empty() {
+                continue;
+            }
+            if let Err(e) = store.mark_delivered(&ids, SystemTime::now(), what) {
+                warn!("inbox: marking {} messages delivered: {e}", ids.len());
+            }
         }
 
         // The cap is for the legacy wire, where each private message opens
         // a window. What it leaves behind is still there — say so, in the
         // one place a client of either wire will see it, rather than
         // inventing a digest format.
-        let left = match (messenger, which) {
-            (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
-            (true, w) if w != crate::inbox::Pending::MailApproved => store
-                .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
-                .map(|m| m.len()),
-            (_, which) => store
-                .pending_of(mailbox, usize::MAX, which)
-                .map(|m| m.len()),
-        };
-        match left {
-            Ok(0) => {}
-            Ok(n) => {
-                let mut r = self.roster.lock().unwrap();
+        let mut notices = Vec::new();
+        for (uid, which, messenger) in reached {
+            let left = match (messenger, which) {
+                (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
+                (true, w) if w != crate::inbox::Pending::MailApproved => store
+                    .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
+                    .map(|m| m.len()),
+                (_, which) => store
+                    .pending_of(mailbox, usize::MAX, which)
+                    .map(|m| m.len()),
+            };
+            match left {
+                Ok(0) => {}
+                Ok(n) => notices.push((uid, n)),
+                Err(e) => warn!("inbox: counting what is left for {}: {e}", mailbox.login),
+            }
+        }
+        if !notices.is_empty() {
+            let mut r = self.roster.lock().unwrap();
+            for (uid, n) in notices {
                 r.send_to(
                     uid,
                     Event::Notice {
@@ -2839,7 +2879,6 @@ impl Core {
                     },
                 );
             }
-            Err(e) => warn!("inbox: counting what is left for {}: {e}", mailbox.login),
         }
 
         delivered
@@ -5067,6 +5106,11 @@ mod inbox_tests {
     }
 
     pub(super) fn attach(core: &Core, login: &str, has_inbox: bool) -> (Uid, Events) {
+        attach_wire(core, login, has_inbox, false)
+    }
+
+    /// [`attach`], on the classic wire when `classic`.
+    fn attach_wire(core: &Core, login: &str, has_inbox: bool, classic: bool) -> (Uid, Events) {
         let (uid, rx) = core
             .attach(AttachInfo {
                 account: None,
@@ -5088,7 +5132,7 @@ mod inbox_tests {
                 manage_rooms: false,
                 set_subject: false,
                 is_person: has_inbox,
-                reads_on_delivery: false,
+                reads_on_delivery: classic,
                 identity: None,
                 system: false,
             })
@@ -5411,6 +5455,117 @@ mod inbox_tests {
             matches!(&msgs(drain(&mut rl))[..], [Event::Msg { text, .. }] if text == "dinner?"),
             "and it is the laptop that got it"
         );
+    }
+
+    #[test]
+    fn a_message_by_login_reaches_every_attached_session_of_the_account() {
+        // Each case is the wires of dave's sessions, classic or not.
+        for wires in [
+            &[false][..],
+            &[true],
+            &[false, false],
+            &[true, false],
+            &[true, true],
+        ] {
+            let (core, store) = server(&["alice", "dave"]);
+            let (a, _ra) = attach(&core, "alice", true);
+            let (_a2, mut ra2) = attach(&core, "alice", true);
+            let mut daves: Vec<(Uid, Events)> = wires
+                .iter()
+                .map(|classic| attach_wire(&core, "dave", true, *classic))
+                .collect();
+            for (_, rx) in &mut daves {
+                drain(rx);
+            }
+
+            assert_eq!(
+                core.msg_login(a, "dave", "dinner?".into(), None, None),
+                Ok(MsgOutcome::Delivered),
+                "{wires:?}"
+            );
+            let stored = store.all();
+            assert_eq!(stored.len(), 1, "{wires:?}: stored once");
+            for (_, rx) in &mut daves {
+                assert!(
+                    matches!(
+                        &msgs(drain(rx))[..],
+                        [Event::Msg { text, id: Some(id), queued: false, .. }]
+                            if text == "dinner?" && *id == stored[0].id
+                    ),
+                    "{wires:?}: every session hears it, once"
+                );
+            }
+            assert!(
+                msgs(drain(&mut ra2)).is_empty(),
+                "{wires:?}: not the sender's"
+            );
+            assert!(stored[0].delivered_at.is_some(), "{wires:?}");
+            // Read only where no session that got it can say so itself.
+            assert_eq!(
+                stored[0].read_at.is_some(),
+                wires.iter().all(|classic| *classic),
+                "{wires:?}"
+            );
+
+            // A uid still names one session.
+            let first = daves[0].0;
+            core.msg(a, first, "you".into(), None, None).unwrap();
+            assert_eq!(msgs(drain(&mut daves[0].1)).len(), 1, "{wires:?}");
+            for (_, rx) in &mut daves[1..] {
+                assert!(msgs(drain(rx)).is_empty(), "{wires:?}: only the named one");
+            }
+
+            // To one's own account, for its other sessions, and waiting
+            // where there are none.
+            let outcome = core.msg_login(first, "dave", "note".into(), None, None);
+            assert!(msgs(drain(&mut daves[0].1)).is_empty(), "{wires:?}");
+            for (_, rx) in &mut daves[1..] {
+                assert_eq!(msgs(drain(rx)).len(), 1, "{wires:?}");
+            }
+            assert_eq!(
+                matches!(outcome, Ok(MsgOutcome::Queued(_))),
+                daves.len() == 1,
+                "{wires:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_by_login_that_stores_nothing_reaches_every_attached_session() {
+        let quota = InboxPolicy {
+            max_sent_per_day: 1,
+            ..InboxPolicy::default()
+        };
+        for (what, guest) in [("past the sender's quota", false), ("from a guest", true)] {
+            let (core, store) = server_with(quota, &["alice", "dave"]);
+            let (from, _rf) = if guest {
+                attach(&core, "guest", false)
+            } else {
+                attach(&core, "alice", true)
+            };
+            if !guest {
+                core.msg_login(from, "dave", "spent".into(), None, None)
+                    .unwrap();
+            }
+            let rows = store.all().len();
+            let (_d1, mut r1) = attach(&core, "dave", true);
+            let (_d2, mut r2) = attach_wire(&core, "dave", true, true);
+            assert_eq!(
+                core.msg_login(from, "dave", "live".into(), None, None),
+                Ok(MsgOutcome::Delivered),
+                "{what}"
+            );
+            for rx in [&mut r1, &mut r2] {
+                assert!(
+                    matches!(
+                        &msgs(drain(rx))[..],
+                        [Event::Msg { id: None, text, .. }] if text == "live"
+                    ),
+                    "{what}: each session hears it, with no row"
+                );
+            }
+            assert_eq!(store.all().len(), rows, "{what}");
+        }
     }
 
     #[test]

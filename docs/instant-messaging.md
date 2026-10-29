@@ -469,16 +469,18 @@ request, rather than with the rest of the inbox at login
 (`private-messages.md` §6.3). A session that negotiated neither bit 6
 nor the ng friend family never sends either, so it is handed a friend's
 IMs as private messages: live as `private-messages.md` §6.1 hands a
-stored message to an attached session, and at the login flush for those
-still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
+stored message to every attached session, and at the login flush for
+those still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
+A plain session attached beside a messenger that has not read its
+roster can be handed the account's waiting IMs as mail this way.
 Approval rows go that way only to a party whose account never took
 requests (§4.6). Every drain is capped by
 `deliver_at_flush`, as the login flush is, the rest pulled or waiting
 for the next. A request's rows are never drained. IM rows count toward
 the sender's daily quota as offline private messages do
-(`private-messages.md` §9): past it, a friend's IM reaches an attached
-session live with no row, as mail does, and is refused only with none
-there.
+(`private-messages.md` §9): past it, a friend's IM reaches every
+attached session live with no row, as mail does, and is refused only
+with none there.
 
 **`delivered_at`** is stamped at the 812 ack from a session that can
 send one, and at the handover for a session that cannot. A row handed

@@ -273,7 +273,7 @@ impl Core {
                     media: None,
                     signed: form,
                 };
-                (plain.into_iter().take(1).collect(), ev)
+                (plain, ev)
             } else {
                 let ev = Event::Im(Box::new(Im {
                     from_login: me.mailbox.login.clone(),
@@ -354,7 +354,7 @@ impl Core {
 
     /// Hand `to`'s waiting instant messages over live: to every attached
     /// messenger session, what an approval carries to those that
-    /// understand requests alone, or, where it has none, to an attached
+    /// understand requests alone, or, where it has none, to every attached
     /// session as private messages. `under_approval` says an approval's
     /// rows may be among them. Returns the ids handed over.
     pub(crate) fn im_deliver(
@@ -380,14 +380,11 @@ impl Core {
             let understood = m
                 .iter()
                 .any(|u| r.users.get(u).is_some_and(understands_requests));
-            (m, p.first().copied(), understood)
+            (m, p, understood)
         };
         if messengers.is_empty() {
             drop(flushing);
-            return match plain {
-                Some(uid) => self.flush_named(uid, to, fresh, sender),
-                None => Vec::new(),
-            };
+            return self.flush_each(plain, to, fresh, sender);
         }
         let batch = match store.pending_of(
             to,
@@ -440,7 +437,7 @@ impl Core {
         // go as private messages to a party that never took requests.
         if under_approval && !understood && self.never_took_requests(to) {
             drop(flushing);
-            handed.extend(self.flush_named(messengers[0], to, fresh, sender));
+            handed.extend(self.flush_each(messengers, to, fresh, sender));
         }
         handed
     }

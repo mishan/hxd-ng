@@ -263,7 +263,7 @@ CREATE TABLE message (
   guid         TEXT,                  -- the client's own id, when it gave one
   sent_at      INTEGER NOT NULL,      -- unix seconds
   delivered_at INTEGER,               -- handed to a live connection, on either wire
-  read_at      INTEGER                -- an ng client said so (`msg_read`); never the legacy wire (§8)
+  read_at      INTEGER                -- an ng client said so, or delivery reached only legacy sessions (§8)
 );
 -- Retry safety: one message per (sender, recipient, guid), keyed on the
 -- *mailbox* rather than on its two columns — see below.
@@ -372,7 +372,7 @@ server, exactly. Two entry points:
 | | |
 |---|---|
 | `msg(from: Uid, to: Uid, text)` | What both wires call. Resolves `to`'s mailbox and status, then §6.1. |
-| `msg_login(from: Uid, to: &str, text)` | Address an account. Delivers live to the session that account holds if any, stores otherwise. |
+| `msg_login(from: Uid, to: &str, text)` | Address an account. Delivers live to every session that account holds attached but the sender's, stores otherwise. |
 
 ### 6.1 The rule
 
@@ -571,11 +571,7 @@ user would make the count useless. The consequence it did not state is
 the one a person with a phone and a period client meets: the phone's
 badge drops to zero because the Mac received the message. So the two
 are split.
-**Delivery to a legacy session sets `delivered_at` only.** `read_at` is
-set by the ng `msg_read` request, and by nothing on the legacy wire.
-`inbox.unread`, and the login reply's count, are messages with no
-`read_at` — which is what a badge means anyway, and the same split XMPP
-made between delivery and display receipts.
+**Delivery to a legacy session is its read** — unless an ng session of the account was handed the same row in that flush, in which case it is stamped delivered only and left to that client's `msg_read`.
 
 Said plainly, because a client author and an operator will both meet
 it: **mail delivered to a period client stays unread on the ng side
@@ -896,10 +892,12 @@ Each stage is a branch with tests, in the house style.
   real client has two devices. *Half-answered:* a message that **names a
   uid** goes to that session when it is attached, and to the lowest
   attached one otherwise — naming a uid names a device, and a legacy
-  user clicking a name in the user list means that one. Never to the
-  sender's own session, though: mail to one's own account is for its
-  other sessions, and stays pending if there are none. Read state is
-  still shared, which is the half that remains.
+  user clicking a name in the user list means that one. A message that
+  **names the account** goes to every attached session, and is read on
+  delivery only when each of them is on a wire that cannot say it read
+  it. Never to the sender's own session, though: mail to one's own
+  account is for its other sessions, and stays pending if there are
+  none. Read state is still shared, which is the half that remains.
 - **Retention defaults.** 30 days unread and 7 read are guesses; the spec
   says 30 for its queue. The number that matters is whichever one an
   operator notices.
