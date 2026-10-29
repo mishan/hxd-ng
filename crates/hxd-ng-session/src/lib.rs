@@ -11,6 +11,7 @@ mod conn;
 pub mod enroll;
 mod files;
 mod files_upload;
+mod friends;
 mod http;
 pub mod identity;
 pub mod media;

@@ -15,7 +15,7 @@
 //! read_users = true
 //! send_media = false      # false withholds what a role grants
 //! # any named bit below; plus raw_bits = [55] as an escape hatch, and
-//! # raw_deny = [58] to withhold a bit with no name
+//! # raw_deny = [61] to withhold a bit with no name
 //!
 //! [identity]              # portable identity (docs/hotline-ng-identity.md §8)
 //! fingerprint = "318s87c…" # 52-char fingerprint of the linked identity; set by
@@ -2306,10 +2306,10 @@ mod tests {
     fn a_created_account_keeps_bits_this_build_has_no_name_for() {
         // The guest account is the usual template, and `raw_bits` is
         // where an operator puts an allocation this build predates —
-        // the messaging extension's access bit 58, for one. Emitting
+        // a bit above the current extensions, for one. Emitting
         // only `NAMES` dropped them on the floor.
         let (td, auth) = backend();
-        let access = AccessBits::empty().with(bit::SEND_CHAT).with(58).with(61);
+        let access = AccessBits::empty().with(bit::SEND_CHAT).with(61).with(62);
         let (a, created) = auth
             .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access)
             .unwrap();
@@ -2671,7 +2671,7 @@ mod tests {
         const READ: &str = "[role.r]\naccess = { read_chat = true }\n";
         const KICK: &str = "[role.r]\naccess = { disconnect_users = true }\n";
         const MODERATE: &str = "[role.r]\nextra = { moderate = true }\n";
-        const RAW: &str = "[role.r]\naccess = { raw_bits = [58] }\n";
+        const RAW: &str = "[role.r]\naccess = { raw_bits = [61] }\n";
         const LISTED: &str = "roles = [\"r\"]\n";
         // The roles file, the account file, the key, what it resolves to.
         let rows: &[(&str, &str, &str, bool)] = &[
@@ -2749,14 +2749,14 @@ mod tests {
                 "manage_rooms",
                 true,
             ),
-            (RAW, LISTED, "raw:58", true),
+            (RAW, LISTED, "raw:61", true),
             (
                 RAW,
-                "roles = [\"r\"]\n[access]\nraw_deny = [58]\n",
-                "raw:58",
+                "roles = [\"r\"]\n[access]\nraw_deny = [61]\n",
+                "raw:61",
                 false,
             ),
-            ("", "[access]\nraw_bits = [58]\n", "raw:58", true),
+            ("", "[access]\nraw_bits = [61]\n", "raw:61", true),
             // `everyone` reaches an account that lists nothing, the guest's.
             (
                 "[role.everyone]\naccess = { read_news = true }\n",
@@ -2797,7 +2797,7 @@ mod tests {
                 "not supported",
             ),
             ("[role.r]\naccess = { send_msg = true }\n", "no access key"),
-            ("[role.r]\naccess = { raw_deny = [58] }\n", "raw_deny"),
+            ("[role.r]\naccess = { raw_deny = [61] }\n", "raw_deny"),
             (
                 &*format!("[role.r]\ntitle = \"{}\"\n", "t".repeat(32)),
                 "31",
@@ -2940,7 +2940,7 @@ mod tests {
     #[test]
     fn a_save_writes_only_where_the_editor_parts_from_the_roles() {
         const ROLES: &str = "[role.r]\naccess = { send_media = true, \
-            read_chat_history = true, raw_bits = [58] }\n";
+            read_chat_history = true, raw_bits = [61] }\n";
         const HELD: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = true\n";
         const PLAIN: &str = "password = \"pw\"\n# kept\n[access]\nread_chat = true # mine\n\
             send_chat = true\nraw_bits = [41]\nraw_deny = [42]\n";
@@ -2967,13 +2967,13 @@ mod tests {
             ),
             (
                 HELD,
-                &[(58, false)],
+                &[(61, false)],
                 None,
-                format!("{HELD}raw_deny = [58]\n"),
+                format!("{HELD}raw_deny = [61]\n"),
             ),
             (
-                &format!("{HELD}raw_deny = [58]\n"),
-                &[(58, true)],
+                &format!("{HELD}raw_deny = [61]\n"),
+                &[(61, true)],
                 None,
                 HELD.into(),
             ),
@@ -3043,15 +3043,15 @@ mod tests {
         write(td.path(), "roles.toml", "");
         auth.reload().unwrap();
         let access = auth.read_account("al").unwrap().access;
-        assert!(!access.has(bit::SEND_MEDIA) && !access.has(58));
+        assert!(!access.has(bit::SEND_MEDIA) && !access.has(61));
     }
 
     #[test]
     fn a_save_keeps_the_bits_above_its_editor_as_the_file_has_them() {
-        const ROLES: &str = "[role.r]\naccess = { send_media = true, raw_bits = [58] }\n";
+        const ROLES: &str = "[role.r]\naccess = { send_media = true, raw_bits = [62] }\n";
         const FILE: &str = "password = \"pw\"\nroles = [\"r\"]\n[access]\nread_chat = true\n\
             can_broadcast = true\nsend_msgs = true\nvoice_chat = true\nvideo_chat = false\n\
-            raw_bits = [41, 61]\nraw_deny = [58]\n";
+            raw_bits = [41, 61]\nraw_deny = [62]\n";
         let unsent = FILE.replace("send_msgs = true", "send_msgs = false");
         let unraw = FILE.replace("raw_bits = [41, 61]", "raw_bits = [61]");
         // The highest bit the editor shows, a bit it clears, and the file

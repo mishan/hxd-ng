@@ -57,7 +57,7 @@ send_chat = true
 send_msgs = true
 # Bits with no name — reserved, or an extension this server has not
 # implemented — go in by number.
-raw_bits = [58]
+raw_bits = [61]
 ```
 
 Rules worth knowing:
@@ -76,7 +76,7 @@ Rules worth knowing:
 - **Roles come first, and the file's own keys win either way.** What
   `everyone` and the roles an account lists grant (roles.md §3) is
   where its file starts: a key set `true` grants what no role does, one
-  set `false` withholds what a role grants, and `raw_deny = [58]` does
+  set `false` withholds what a role grants, and `raw_deny = [61]` does
   that for a bit with no name. Without roles, `false` and absent are
   the same.
 - **A classic editor changes only the bits it can show.** The tiers of
@@ -204,6 +204,7 @@ traffic they gate — but the bit is what decides whether a client that
 | 55 | `voice_chat` | Join a voice room | **Enforced**, both wires |
 | 56 | `read_chat_history` | Request scrollback. Falls back to bit 9 when unmentioned — see section 1 | **Enforced**, both wires |
 | 57 | `send_media` | Upload an image and reference it from a chat line or a private message. **Off unless an account file says so**: an image is the one thing a user can put on everyone else's screen without their asking, so an operator grants it rather than an account inheriting it | **Enforced** in the domain, so both wires |
+| 58 | `messaging` | Take part in instant messaging: friends, presence, instant messages and message requests ([instant-messaging.md](instant-messaging.md)). `admin` and `guest` never do, whatever their bits | **Enforced** in the domain, so both wires |
 | 59 | `video_chat` | Publish camera video in a voice room | **Enforced**, both wires |
 | 60 | `screen_share` | Publish a screen share. **Its own bit, deliberately** — showing your face and showing your desktop are different trust decisions, and a screen share can leak documents, credentials and other people's messages in a way a camera generally cannot. Neither bit implies the other | **Enforced**, both wires |
 
@@ -220,7 +221,6 @@ them would corrupt an account it was only reading.
 |---|---|
 | 12, 13, 18, 19 | Reserved in the reference headers. mhxd's "everything enabled" constant leaves them clear, which is the cross-check `access.rs` tests against |
 | 41–54 | Unallocated between the last classic bit and the first extension |
-| 58 | `AccessMessaging`, allocated by fogWraith's messaging extension. Not implemented here; the number stays reserved so the video bits do not drift onto it |
 | 61–63 | Unallocated above the current extensions |
 
 Nothing in this tree should claim one of these. New server-local policy

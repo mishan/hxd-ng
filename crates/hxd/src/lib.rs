@@ -70,6 +70,10 @@ pub struct Config {
     /// The durable private-message inbox. Absent = disabled, and then
     /// private messaging behaves exactly as it did before there was one.
     pub inbox: Option<InboxSection>,
+    /// Instant messaging: friends, presence and message requests
+    /// (`docs/instant-messaging.md` §8). Absent, or `enabled` left off,
+    /// = none on either wire. Needs `[inbox]`.
+    pub messaging: Option<MessagingSection>,
     /// Server-held public-chat scrollback. Absent = disabled.
     pub history: Option<HistorySection>,
     /// Inline media (`docs/inline-media.md` §11). Absent = disabled: no
@@ -1453,6 +1457,97 @@ fn default_max_sent_bytes_per_day() -> u64 {
     hxd_core::InboxPolicy::default().max_sent_bytes_per_day
 }
 
+/// Instant messaging (`docs/instant-messaging.md` §8), the extension's
+/// settings and the requests' beside them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagingSection {
+    /// Off unless turned on, as the extension has it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `MaxRosterSize`: friends, blocks, approvals and requests sent.
+    #[serde(default = "default_max_roster")]
+    pub max_roster: usize,
+    /// An instant message's text, in UTF-8 bytes.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Message requests one sender may send one recipient until it
+    /// answers.
+    #[serde(default = "default_request_messages")]
+    pub request_messages: usize,
+    /// Distinct recipients one sender may send requests in a rolling day.
+    #[serde(default = "default_requests_per_day")]
+    pub requests_per_day: usize,
+    /// Senders whose message requests one recipient may have waiting.
+    #[serde(default = "default_max_requests")]
+    pub max_requests: usize,
+    /// Friend requests one recipient may have waiting.
+    #[serde(default = "default_max_friend_requests")]
+    pub max_friend_requests: usize,
+    /// Days a request waits, and a declined or deleted sender is held.
+    #[serde(default = "default_request_retention_days")]
+    pub request_retention_days: u64,
+}
+
+impl MessagingSection {
+    pub fn policy(&self, limits: &LimitsSection) -> Result<hxd_core::MessagingPolicy, String> {
+        let counts = [
+            self.max_roster,
+            self.max_message_bytes,
+            self.request_messages,
+            self.requests_per_day,
+            self.max_requests,
+            self.max_friend_requests,
+        ];
+        if counts.contains(&0) || self.request_retention_days == 0 {
+            return Err("[messaging] counts and request_retention_days must be above 0".into());
+        }
+        Ok(hxd_core::MessagingPolicy {
+            enabled: self.enabled,
+            max_roster: self.max_roster,
+            request_retention: Duration::from_secs(self.request_retention_days * 24 * 3600),
+            max_friend_requests: self.max_friend_requests,
+            requests_per_day: self.requests_per_day,
+            requests_per_address: match limits.requests_per_address {
+                0 => usize::MAX,
+                n => n,
+            },
+            max_message_bytes: self.max_message_bytes,
+            request_messages: self.request_messages,
+            max_requests: self.max_requests,
+            ..hxd_core::MessagingPolicy::default()
+        })
+    }
+}
+
+fn default_max_roster() -> usize {
+    hxd_core::MessagingPolicy::default().max_roster
+}
+fn default_max_message_bytes() -> usize {
+    hxd_core::MessagingPolicy::default().max_message_bytes
+}
+fn default_request_messages() -> usize {
+    hxd_core::MessagingPolicy::default().request_messages
+}
+fn default_requests_per_day() -> usize {
+    hxd_core::MessagingPolicy::default().requests_per_day
+}
+fn default_max_requests() -> usize {
+    hxd_core::MessagingPolicy::default().max_requests
+}
+fn default_max_friend_requests() -> usize {
+    hxd_core::MessagingPolicy::default().max_friend_requests
+}
+fn default_request_retention_days() -> u64 {
+    hxd_core::MessagingPolicy::default()
+        .request_retention
+        .as_secs()
+        / (24 * 3600)
+}
+fn default_requests_per_address() -> usize {
+    hxd_core::MessagingPolicy::default().requests_per_address
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InboxSync {
@@ -2116,6 +2211,12 @@ pub struct LimitsSection {
     /// and hold everywhere.
     #[serde(default = "default_limits_exempt")]
     pub exempt: Vec<String>,
+    /// Distinct recipients sent message and friend requests from one
+    /// address in a rolling day, whoever sent them, so that new accounts
+    /// are not new budgets (`docs/instant-messaging.md` §4.4). Loose,
+    /// since many people can share an address; 0 for no limit.
+    #[serde(default = "default_requests_per_address")]
+    pub requests_per_address: usize,
     /// Chat lines one session may send in each `chat_seconds` window,
     /// public and private rooms together and every line of a multi-line
     /// send counted, before it is kicked; 0 for no limit. mhxd's
@@ -2282,6 +2383,7 @@ impl Default for LimitsSection {
             reconnect_seconds: default_reconnect_seconds(),
             connections_per_account: default_connections_per_account(),
             exempt: default_limits_exempt(),
+            requests_per_address: default_requests_per_address(),
             chat_lines: default_chat_lines(),
             chat_seconds: default_chat_seconds(),
             spam_points: default_spam_points(),
@@ -3253,6 +3355,12 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(inbox) = &config.inbox {
         inbox.policy().check()?;
     }
+    if let Some(messaging) = &config.messaging {
+        messaging.policy(&config.limits)?;
+        if messaging.enabled && config.inbox.is_none() {
+            return Err("[messaging] needs [inbox]: instant messages are kept there".into());
+        }
+    }
     if let Some(history) = &config.history {
         if history.db.is_none() && config.inbox.is_none() {
             return Err("[history] needs db unless [inbox] names the shared database".into());
@@ -4088,6 +4196,23 @@ pub async fn avatar_pruner(core: Arc<Core>) {
     }
 }
 
+/// Tells each login's friends of its presence once a burst of changes
+/// has settled (`hxd_core::Core::presence_flush`).
+pub async fn presence_flusher(core: Arc<Core>) {
+    let wake = core.presence_wake();
+    loop {
+        match core.presence_flush(std::time::Instant::now()) {
+            Some(due) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(due.into()) => {}
+                    _ = wake.notified() => {}
+                }
+            }
+            None => wake.notified().await,
+        }
+    }
+}
+
 /// Delete the device rows whose certificates have expired. Skipping it
 /// costs rows and never a wrong push: the gateway compares expiry
 /// itself, so a lapsed device stops being sent to the moment it lapses
@@ -4299,6 +4424,10 @@ pub fn build_ctx(
     };
     let core = match stores.relationships {
         Some(store) => core.with_relationships(store),
+        None => core,
+    };
+    let core = match &config.messaging {
+        Some(messaging) => core.with_messaging(messaging.policy(&config.limits)?),
         None => core,
     };
     let core = match (stores.history, config.history.as_ref()) {
@@ -4834,6 +4963,42 @@ sync = "full"
         assert!(check_config(&zero_page).unwrap_err().contains("max_page"));
         let huge_page = parse("[history]\ndb = \"h.sqlite\"\nmax_page = 201\n").unwrap();
         assert!(check_config(&huge_page).unwrap_err().contains("max_page"));
+    }
+
+    #[test]
+    fn messaging_needs_an_inbox_and_counts_above_zero() {
+        const INBOX: &str = "[inbox]\ndb = \"server.sqlite\"\n";
+        for (toml, refused) in [
+            (format!("{INBOX}[messaging]\nenabled = true\n"), None),
+            ("[messaging]\n".to_string(), None),
+            ("[messaging]\nenabled = true\n".to_string(), Some("[inbox]")),
+            (
+                format!("{INBOX}[messaging]\nenabled = true\nmax_roster = 0\n"),
+                Some("above 0"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nrequest_retention_days = 0\n"),
+                Some("above 0"),
+            ),
+        ] {
+            let checked = check_config(&parse(&toml).unwrap());
+            match refused {
+                None => checked.unwrap_or_else(|e| panic!("{toml:?}: {e}")),
+                Some(why) => assert!(checked.unwrap_err().contains(why), "{toml:?}"),
+            }
+        }
+        for (limits, want) in [
+            ("", 100),
+            ("requests_per_address = 7\n", 7),
+            ("requests_per_address = 0\n", usize::MAX),
+        ] {
+            let cfg = parse(&format!(
+                "{INBOX}[limits]\n{limits}[messaging]\nenabled = true\n"
+            ))
+            .unwrap();
+            let policy = cfg.messaging.as_ref().unwrap().policy(&cfg.limits).unwrap();
+            assert_eq!(policy.requests_per_address, want, "{limits:?}");
+        }
     }
 
     #[cfg(feature = "inbox")]

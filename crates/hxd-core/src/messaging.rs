@@ -191,6 +191,15 @@ pub struct FoundUser {
     pub profile: Option<Profile>,
 }
 
+/// What an account shows of itself, to itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnPresence {
+    pub state: Presence,
+    pub status_text: Option<String>,
+    pub discoverable: bool,
+    pub takes_requests: bool,
+}
+
 /// A Set Presence (808): each `None` leaves its part as it was.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PresenceUpdate {
@@ -322,14 +331,6 @@ impl RosterInner {
             .map_or((Presence::Offline, None), |p| (p, e.status_text.clone()))
     }
 
-    /// What `of`'s own sessions show of it now.
-    fn presence_of(&self, of: &Mailbox) -> Shown {
-        self.presences
-            .by
-            .get(&Key::of(of))
-            .map_or((Presence::Offline, None), |e| self.shown(e))
-    }
-
     /// What a friend reading `of` is shown: what friends were last told,
     /// so that a read never runs ahead of an announcement still owed; a
     /// change undone within the debounce is never announced, so a read
@@ -340,6 +341,15 @@ impl RosterInner {
         match self.presences.by.get(&Key::of(of)) {
             Some(e) => (e.told.0, e.told_text.clone()),
             None => (Presence::Offline, stored),
+        }
+    }
+
+    /// What `of` shows itself: invisible as it is, rather than offline.
+    fn own_state(&self, of: &Mailbox) -> Presence {
+        match self.presences.by.get(&Key::of(of)) {
+            Some(e) if e.invisible => Presence::Invisible,
+            Some(e) => self.shown(e).0,
+            None => Presence::Offline,
         }
     }
 
@@ -506,6 +516,46 @@ impl Core {
 
     pub fn messaging_enabled(&self) -> bool {
         self.messaging_policy.enabled && self.relationships.is_some() && self.directory.is_some()
+    }
+
+    pub fn messaging_policy(&self) -> MessagingPolicy {
+        self.messaging_policy
+    }
+
+    /// Does this session take part, on a server where messaging is on?
+    /// Decided as it was announced, and kept for its life.
+    pub fn takes_part(&self, uid: Uid) -> bool {
+        self.messaging_enabled()
+            && self
+                .roster
+                .lock()
+                .unwrap()
+                .users
+                .get(&uid)
+                .is_some_and(|s| s.messaging.is_some())
+    }
+
+    /// What the caller's account shows of itself, as it set it: its
+    /// state, [`Presence::Invisible`] included, its text, and its two
+    /// switches. Asking makes the session no messenger.
+    pub fn own_presence(&self, uid: Uid) -> Result<OwnPresence, MessagingError> {
+        let store = self.friends_store()?;
+        let mailbox = {
+            let r = self.roster.lock().unwrap();
+            let sess = r
+                .users
+                .get(&uid)
+                .filter(|s| s.messaging.is_some())
+                .ok_or(MessagingError::NotEnabled)?;
+            sess.mailbox()
+        };
+        let account = store.account(&mailbox).map_err(store_failed)?;
+        Ok(OwnPresence {
+            state: self.roster.lock().unwrap().own_state(&mailbox),
+            status_text: account.status_text,
+            discoverable: account.discoverable,
+            takes_requests: account.takes_requests,
+        })
     }
 
     fn friends_store(&self) -> Result<&Arc<dyn RelationshipStore>, MessagingError> {
@@ -1290,10 +1340,11 @@ impl Core {
             .nickname
             .clone()
             .unwrap_or_else(|| them.login.clone());
+        let mine = Key::of(&them) == Key::of(&me.mailbox);
         let presence = shown.then(|| {
             let r = self.roster.lock().unwrap();
-            if Key::of(&them) == Key::of(&me.mailbox) {
-                r.presence_of(&them)
+            if mine {
+                (r.own_state(&them), account.status_text.clone())
             } else {
                 r.friend_view(&them, account.status_text.clone())
             }

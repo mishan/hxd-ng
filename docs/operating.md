@@ -792,6 +792,7 @@ a window needs its seconds.
 | `ng_requests`, `ng_request_seconds` | 40, 2 | Request weight one ng session spends at once, earned back over the seconds |
 | `news_posts`, `news_post_seconds` | 10, 300 | News posts one account makes at once, earned back over the seconds |
 | `folders`, `folder_seconds` | 500, 5000 | Folders one account makes at once, by New Folder or a folder upload, earned back over the seconds |
+| `requests_per_address` | 100 | Distinct people sent message or friend requests from one address in a rolling day, whoever sent them ([instant-messaging.md](instant-messaging.md) §4.4) |
 | `login_failures` | 10 | Wrong passwords one address gives for one login, on any wire |
 | `login_failures_per_addr` | 50 | Wrong passwords one address gives for every login together, earned back at the per-login rate |
 | `login_failure_seconds` | 30 | How often one of either is earned back |
@@ -1170,6 +1171,32 @@ talker who waits for each line before sending the next is held to a
 couple of hundred a second. `normal` loses at most the last moments
 before a power cut, never a line that reached the disk, and never the
 database.
+
+### `[messaging]`
+
+Instant messaging: friends, presence, instant messages and message
+requests, on the ng wire (hotline-ng.md §7.5) and, for a message by
+login, the classic one's `/msg <login>`. Off unless `enabled`, and it
+needs `[inbox]`, which keeps the messages. Only accounts holding
+`messaging` (bit 58) take part, never `admin` or `guest`. See
+[instant-messaging.md](instant-messaging.md).
+
+```toml
+[messaging]
+enabled = true
+max_roster = 500             # friends, blocks, approvals and requests sent, per account
+max_message_bytes = 4096     # an instant message's text
+request_messages = 5         # message requests one sender sends one recipient
+requests_per_day = 20        # distinct people one account sends requests in a day
+max_requests = 50            # senders waiting with requests, per recipient
+max_friend_requests = 50     # friend requests waiting, per recipient
+request_retention_days = 30  # how long a request waits, and a refused sender is held
+```
+
+Once it is on, an ng `msg` by `to_login`, and a classic `/msg <login>`,
+to an account that takes part and is no friend of the sender's becomes
+a message request, or is refused, rather than mail
+(instant-messaging.md §4.1).
 
 ### `[sealed]`
 

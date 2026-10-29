@@ -296,6 +296,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_INBOX_RETAIN_READ` | 604800 | Seconds a read one is kept. |
 | `HXD_INBOX_MAX_SENT_PER_DAY` | 1000 | Messages one account may store in a day, delivered or waiting; 0 for no quota. Past it, a message to someone connected still arrives, unstored. |
 | `HXD_INBOX_MAX_SENT_BYTES_PER_DAY` | 8388608 | The same in bytes. |
+| `HXD_MESSAGING` | `off` | Friends, presence, instant messages and message requests ([instant-messaging.md](instant-messaging.md)), for accounts holding `messaging`. Needs `HXD_INBOX`. |
 | `HXD_HISTORY` | `on` | Chat scrollback ([chat-history.md](chat-history.md)). |
 | `HXD_HISTORY_MAX_LINES` | 10000 | Lines kept; 0 is unlimited. |
 | `HXD_HISTORY_MAX_DAYS` | 0 | Days kept; 0 is unlimited. |

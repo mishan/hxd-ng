@@ -1,7 +1,8 @@
 # Instant messaging
 
-Status: design; the store (IM1, §8) and the domain (IM2) are built, with
-what IM2 leaves open staged as IM2b. hxd-ng's implementation of fogWraith's
+Status: design; the store (IM1, §8), the domain (IM2) and the ng wire's
+server half (IM3) are built, with what IM2 leaves open staged as IM2b.
+hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
 ("the extension"), built on the inbox (`private-messages.md`), with
 message requests (§4) added. Friendships that travel with a person's
@@ -652,35 +653,34 @@ under which a held request reads to its sender as one never answered.
 The hxd-ng policy below (§8) is not asked of anyone.
 
 **The ng wire**: the friend family in the JSON protocol, the same
-operations and states under the ng spellings, and for requests:
+operations and states under the ng spellings, specified as the
+`messaging` capability in `hotline-ng.md` §7.5, which is normative for
+it. In brief:
 
-- `requests` `{ cursor? }`, answered `{ requests: [{ login,
-  fingerprint?, messages: [{ id, text, at, guid, signed? }] }],
-  approvals: [{ login, fingerprint? }], dropped, cursor? }`;
-- `request_answer` `{ login, action: "approve" | "delete" | "end" }`,
-  answered `{}`, or refused `no_such_request`, and `approve` past the
-  approver's `MaxRosterSize` `roster_full`;
-- `requests_clear` `{ since?, before? }` (§4.3), Unix seconds as `at`
-  is, answered `{ declined, deleted }`;
-- the event `requests_changed` `{ count }`, the senders waiting, to
-  sessions that understand requests;
-- `takes_requests` in the profile, beside `discoverable`; a profile
-  update that leaves it out leaves it as it was, since the classic
-  wire sets it in 808 rather than in the whole-profile 826;
-- `msg`'s reply for a request, `{ "queued": true, "requested": true }`
-  (§4.2), and its new refusals, `not_friends`, `request_full` and
-  `roster_full` (§4.1), with `quota_exceeded` and `no_such_user` as they
-  are.
+- a session declares the family with `messaging` at login, and only
+  then, or once it sends one of the family's requests, is it sent the
+  family's events, so an ng client that never asks sees the wire as it
+  was;
+- `friends`, `friend_add`, `friend_respond`, `friend_remove` and
+  `friend_alias` are 800, 802, 805, 803 and the alias; `presence` is
+  808, `takes_requests` and `discoverable` beside the state and text
+  as 808 carries them; `find_user` and `user_profile` are 822 and 825;
+  `receipt` and `typing` are 812 and 813; and the events `friend`,
+  `friend_request`, `presence`, `im`, `receipt` and `typing` are 801,
+  804, 809, 811, 812 and 813;
+- an instant message is sent as a `msg` by `to_login`, which §4.1
+  routes, answered for a request `{ "queued": true, "requested": true }`
+  (§4.2), with its new refusals `not_friends`, `request_full` and
+  `roster_full`, and `quota_exceeded` and `no_such_user` as they are;
+- `requests` `{ cursor? }`, `request_answer` `{ login, action }` and
+  `requests_clear` `{ since?, before? }` (§4.3), with the event
+  `requests_changed` `{ count }` to sessions that understand requests.
 
-This document is the family's, a `messaging` capability in
-`hotline-ng.md` §4's table, with its error codes owed to §10 there:
-the friend family's requests and events under ng spellings, `requests`,
-`request_answer`, `requests_clear` and `requests_changed`, and §10's
-`ignore`, `unignore`, `ignores`, `ignores_changed` and the `user`
-object's `ignored`. Each request is owed a weight in `request_weight`
-in `conn.rs`. `system-account.md` §3 is owed `/requests clear`,
-`/ignore`, `/unignore` and `/ignores`, and `/block` and `/unblock`
-moving onto the relationship store.
+Still owed on the ng wire: §10's `ignore`, `unignore`, `ignores`,
+`ignores_changed` and the `user` object's `ignored`, built after IM3.
+`system-account.md` §3 is owed `/requests clear`, `/ignore`,
+`/unignore` and `/ignores`, and `/block` and `/unblock` moving onto the
+relationship store.
 
 ---
 
@@ -709,10 +709,9 @@ Each stage is a branch with tests, in the house style.
    **IM2b**, what IM2 leaves open: suspension on a revoked
    `AccessMessaging` (§6); User Search (823); a guest's `/msg <login>`
    request, by its address; unlinking telling the friends `Removed`;
-   `max_offline` on held rows; `max_sessions_per_login` eviction; the
-   `[messaging]` section and the binary's presence flush task, with a
+   `max_offline` on held rows; `max_sessions_per_login` eviction; a
    request address keyer of its own, persisted and under its own HMAC
-   label rather than news's; the requests' `request_weight`s; a request
+   label rather than news's; a request
    answered once its ledger row is written, the rest off its path;
    clearing in bulk as one transaction; a merge's re-stamp of
    `message.friendship` in the transaction that merged, so a failed
@@ -725,8 +724,12 @@ Each stage is a branch with tests, in the house style.
    the last session leaves, kept from them by persisting the last text
    shown or deferring the write until the account is visible.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
-   JSON protocol. hx-ng gains a friends list and a requests view. This
-   is where the design is first used end to end, by a client we control.
+   JSON protocol (`hotline-ng.md` §7.5) and their `request_weight`s,
+   with two of IM2b's: the `[messaging]` section, its `max_offline`,
+   `offline_retention_days` and `max_sessions_per_login` aside, and the
+   binary's presence flush task. hx-ng gains a friends list and a
+   requests view. This is where the design is first used end to end, by
+   a client we control.
 4. **IM4, the classic wire.** §7's classic half, requests once IM5 has
    their numbers. The 800-block in `hxproto` in hx-libs first, then
    GtkHx's buddy list. Checked against Janus where it can be run, and

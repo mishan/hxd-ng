@@ -71,8 +71,8 @@ pub use media::{
     MediaRef, MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
 };
 pub use messaging::{
-    FoundUser, FriendEntry, Im, ImSent, MessagingError, MessagingPolicy, Presence, PresenceUpdate,
-    RosterState,
+    FoundUser, FriendEntry, Im, ImSent, MessagingError, MessagingPolicy, OwnPresence, Presence,
+    PresenceUpdate, RosterState,
 };
 pub use moderation::{
     Act, ActKind, Actor, Filed, MemoryModeration, ModError, ModerationPolicy, ModerationStore,
