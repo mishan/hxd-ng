@@ -50,6 +50,8 @@ pub enum Error {
     OpenFailed,
     /// A sealed message already accepted.
     Replayed,
+    /// A friendship or an offer that a withdrawal held ends.
+    Withdrawn,
 }
 
 impl fmt::Display for Error {
@@ -75,6 +77,7 @@ impl fmt::Display for Error {
             Error::CertMismatch => write!(f, "certificate does not match"),
             Error::OpenFailed => write!(f, "sealed message does not open"),
             Error::Replayed => write!(f, "sealed message already accepted"),
+            Error::Withdrawn => write!(f, "ended by a withdrawal"),
         }
     }
 }

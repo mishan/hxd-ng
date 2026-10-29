@@ -21,9 +21,9 @@
 //! cache. [`verify_login`] is that sequence for the common case.
 //!
 //! Test vectors live in `docs/identity-test-vectors.json` and
-//! `docs/server-handover-vectors.json`, checked by `tests/vectors.rs` and
-//! `tests/server_handover.rs`; other implementations should check against
-//! the same files.
+//! `docs/server-handover-vectors.json`, checked by `tests/vectors.rs`,
+//! `tests/friendship.rs` and `tests/server_handover.rs`; other
+//! implementations should check against the same files.
 
 pub mod attestation;
 pub mod bundle;
@@ -32,6 +32,7 @@ pub mod cbor;
 pub mod cert;
 pub mod enroll;
 mod error;
+pub mod friendship;
 pub mod handover;
 pub mod keys;
 pub mod message;
@@ -47,6 +48,7 @@ pub use card::Card;
 pub use cert::{caps, DeviceCert};
 pub use enroll::{EnrollRequest, SessionClaim};
 pub use error::Error;
+pub use friendship::{Acceptance, Friendship, Offer, Pair, Withdrawal};
 pub use handover::Handover;
 pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use message::{Article, ChatLine, PrivateMessage, Signed};
