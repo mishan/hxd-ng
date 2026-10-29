@@ -323,29 +323,17 @@ pub struct Profile {
 pub const MAX_LANGUAGES: usize = 3;
 
 /// What an account keeps about itself for messaging.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessagingAccount {
     pub status_text: Option<String>,
     /// Found by User Search (823). Off until the account turns it on.
     pub discoverable: bool,
-    /// The profile's switch for message requests (§4.1). On by default:
-    /// an account takes requests only once a client of it has listed them
-    /// as well, which `requests_listed_at` says.
+    /// The profile's switch for message requests (§4.1): off until a
+    /// session of the account opts in, and off again once one opts out.
     pub takes_requests: bool,
-    pub requests_listed_at: Option<SystemTime>,
+    /// When a session last opted in, while the switch is on.
+    pub requests_opted_at: Option<SystemTime>,
     pub profile: Profile,
-}
-
-impl Default for MessagingAccount {
-    fn default() -> Self {
-        MessagingAccount {
-            status_text: None,
-            discoverable: false,
-            takes_requests: true,
-            requests_listed_at: None,
-            profile: Profile::default(),
-        }
-    }
 }
 
 /// A change to a [`MessagingAccount`]: each `None` leaves its part as it
@@ -357,6 +345,8 @@ pub struct AccountUpdate {
     pub status_text: Option<Option<String>>,
     pub discoverable: Option<bool>,
     pub takes_requests: Option<bool>,
+    /// With `takes_requests: Some(true)`, when the session opted in.
+    pub opted_at: Option<SystemTime>,
     pub profile: Option<Profile>,
 }
 
@@ -485,11 +475,13 @@ pub trait RelationshipStore: Send + Sync + 'static {
     fn record_request(&self, entry: &LedgerEntry) -> Result<Recorded, StoreError>;
 
     /// What `from` already sent `to` under `guid`, if it did: a retry,
-    /// answered as its original was before any bound is asked.
+    /// answered as its original was before any bound is asked. With `to`
+    /// `None`, toward anyone, as a signed id is its signer's across
+    /// recipients.
     fn find_request(
         &self,
         from: &Requester,
-        to: &Mailbox,
+        to: Option<&Mailbox>,
         guid: &MessageGuid,
     ) -> Result<Option<LedgerEntry>, StoreError>;
 
@@ -521,9 +513,9 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// A request to `owner` was dropped (§4.4).
     fn request_dropped(&self, owner: &Mailbox) -> Result<(), StoreError>;
 
-    /// A client of `owner` has listed its requests: stamp when, and
-    /// return how many were dropped since the listing before.
-    fn requests_listed(&self, owner: &Mailbox, at: SystemTime) -> Result<u64, StoreError>;
+    /// A client of `owner` has listed its requests: how many were
+    /// dropped since the listing before.
+    fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError>;
 
     // --- The account -------------------------------------------------------
 

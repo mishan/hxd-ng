@@ -597,14 +597,18 @@ impl RelationshipStore for MemoryRelationships {
     fn find_request(
         &self,
         from: &Requester,
-        to: &Mailbox,
+        to: Option<&Mailbox>,
         guid: &MessageGuid,
     ) -> Result<Option<LedgerEntry>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .ledger
             .iter()
-            .find(|e| e.guid.as_ref() == Some(guid) && is(&e.recipient, to) && sent_by(e, from))
+            .find(|e| {
+                e.guid.as_ref() == Some(guid)
+                    && to.is_none_or(|to| is(&e.recipient, to))
+                    && sent_by(e, from)
+            })
             .cloned())
     }
 
@@ -668,11 +672,9 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
-    fn requests_listed(&self, owner: &Mailbox, at: SystemTime) -> Result<u64, StoreError> {
+    fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let account = inner.account_mut(owner);
-        account.state.requests_listed_at = Some(floor(at));
-        Ok(std::mem::take(&mut account.dropped))
+        Ok(std::mem::take(&mut inner.account_mut(owner).dropped))
     }
 
     fn account(&self, of: &Mailbox) -> Result<MessagingAccount, StoreError> {
@@ -696,6 +698,12 @@ impl RelationshipStore for MemoryRelationships {
         }
         if let Some(on) = update.takes_requests {
             state.takes_requests = on;
+            if !on {
+                state.requests_opted_at = None;
+            }
+        }
+        if let Some(at) = update.opted_at {
+            state.requests_opted_at = Some(floor(at));
         }
         if let Some(profile) = &update.profile {
             state.profile = profile.clone();

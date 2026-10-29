@@ -9,9 +9,9 @@
 //! private message instead, which counts as its delivery.
 //!
 //! What was sent under an approval (§4.6) goes only to the sessions that
-//! have listed requests, since a client that does not know approvals has
-//! nowhere to show it, or as private messages to a party none of whose
-//! clients ever has; it never says when it arrived, and nor does a
+//! have opted in to requests, since a client that does not know approvals
+//! has nowhere to show it, or as private messages to a party that takes
+//! no requests; it never says when it arrived, and nor does a
 //! delivery receipt for it.
 
 use std::collections::HashSet;
@@ -38,8 +38,9 @@ pub struct Im {
     pub from_fingerprint: Option<[u8; 32]>,
     pub from_nick: String,
     pub text: String,
-    /// The inbox row, which a client marks read by.
-    pub id: MessageId,
+    /// The inbox row, which a client marks read by; `None` for one
+    /// handed over live past the sender's quota, with no row.
+    pub id: Option<MessageId>,
     pub guid: MessageGuid,
     pub sent_at: SystemTime,
     /// It waited rather than arriving in the moment.
@@ -55,7 +56,8 @@ pub struct Im {
 /// otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImSent {
-    pub id: MessageId,
+    /// `None` where nothing was stored.
+    pub id: Option<MessageId>,
     pub guid: MessageGuid,
     pub delivered: bool,
 }
@@ -78,7 +80,7 @@ fn im_of(m: StoredMessage, queued: bool, approval: bool) -> Option<Event> {
         from_fingerprint: sender.fingerprint,
         from_nick: m.sender_nick,
         text: m.body,
-        id: m.id,
+        id: Some(m.id),
         guid: m.guid?,
         sent_at: m.sent_at,
         queued,
@@ -94,12 +96,12 @@ fn relation_of(m: &StoredMessage) -> Option<RelationId> {
     }
 }
 
-/// A messenger session that has listed requests, so it is shown what an
-/// approval carries.
-pub(crate) fn lists_requests(s: &UserSession) -> bool {
+/// A messenger session that has opted in to requests, so it is shown
+/// what an approval carries.
+pub(crate) fn opted_in(s: &UserSession) -> bool {
     s.messaging
         .as_ref()
-        .is_some_and(|m| m.messenger && m.lists_requests)
+        .is_some_and(|m| m.messenger && m.opted_in)
 }
 
 impl Core {
@@ -157,13 +159,14 @@ impl Core {
             .collect()
     }
 
-    /// No client of `of` has ever listed requests: it can be sent an
-    /// approval's traffic only as private messages.
-    pub(crate) fn never_listed(&self, of: &Mailbox) -> bool {
+    /// `of` takes no requests, no session of it having opted in or one
+    /// having opted out since: it can be sent an approval's traffic only
+    /// as private messages.
+    pub(crate) fn opted_out(&self, of: &Mailbox) -> bool {
         self.relationships
             .as_ref()
             .and_then(|s| s.account(of).ok())
-            .is_none_or(|a| a.requests_listed_at.is_none())
+            .is_none_or(|a| !a.takes_requests)
     }
 
     /// IM Send (810): a message to a friend, onto the inbox. A
@@ -210,33 +213,25 @@ impl Core {
         let content = signed.as_ref().map(|s| s.content);
         let store = self.inbox_store()?;
         let now = self.clock.wall();
-        // A signed id is its signer's across recipients
-        // (`docs/e2e-messages.md` §3.6); toward this one, `push` finds it.
         if let (Some(_), Some(g)) = (&signed, &guid) {
-            if let Some(m) = store.find_sent(&me.mailbox, g).map_err(store_failed)? {
-                if !them.matches(&m.recipient.login, m.recipient.fingerprint.as_ref()) {
-                    return Err(MessagingError::Equivocation);
-                }
+            if self
+                .signed_elsewhere(&me.mailbox, them, g)
+                .map_err(store_failed)?
+            {
+                return Err(MessagingError::Equivocation);
             }
         }
-        // Every instant message is stored, so the sender's daily quota
-        // (`docs/private-messages.md` §9) refuses one past it; a retry
-        // stores nothing and is not the quota's to refuse.
-        if self
+        // A retry stores nothing and is not the quota's to refuse.
+        let spent = self
             .send_quota_spent(&**store, &me.mailbox, text.len(), now)
             .map_err(|_| MessagingError::ServerError)?
-        {
-            let retry = match &guid {
+            && match &guid {
                 Some(g) => store
                     .find_guid(them, Some(&me.mailbox), g)
                     .map_err(store_failed)?
-                    .is_some(),
-                None => false,
+                    .is_none(),
+                None => true,
             };
-            if !retry {
-                return Err(MessagingError::RateLimited);
-            }
-        }
         let guid = match guid {
             Some(g) => g,
             None => new_guid()?,
@@ -248,6 +243,62 @@ impl Core {
                 .map(|s| s.info.nick.clone())
                 .unwrap_or_default()
         };
+        if spent {
+            // The sender's daily quota (`docs/private-messages.md` §9)
+            // bounds storage and never conversation: past it, a friend's
+            // message reaches an attached session live with no row, as
+            // mail does, and is refused only with none there. An
+            // approval's is answered as queued whoever takes it, which
+            // only a row can be.
+            if approval {
+                return Err(MessagingError::RateLimited);
+            }
+            let mut r = self.roster.lock().unwrap();
+            let (messengers, plain): (Vec<Uid>, Vec<Uid>) = sessions_of(&r, them)
+                .into_iter()
+                .filter(|u| r.users.get(u).is_some_and(is_live))
+                .partition(|u| r.users.get(u).is_some_and(is_messenger));
+            let form = signed.map(|s| s.form);
+            let (to, ev) = if messengers.is_empty() {
+                let ev = Event::Msg {
+                    from: uid,
+                    from_nick: nick,
+                    from_login: Some(me.mailbox.login.clone()),
+                    text,
+                    id: None,
+                    sent_at: now,
+                    queued: false,
+                    media: None,
+                    signed: form,
+                };
+                (plain.into_iter().take(1).collect(), ev)
+            } else {
+                let ev = Event::Im(Box::new(Im {
+                    from_login: me.mailbox.login.clone(),
+                    from_fingerprint: me.mailbox.fingerprint,
+                    from_nick: nick,
+                    text,
+                    id: None,
+                    guid: guid.clone(),
+                    sent_at: now,
+                    queued: false,
+                    signed: form,
+                    approval: false,
+                }));
+                (messengers, ev)
+            };
+            if to.is_empty() {
+                return Err(MessagingError::RateLimited);
+            }
+            for u in to {
+                r.send_to(u, ev.clone());
+            }
+            return Ok(ImSent {
+                id: None,
+                guid,
+                delivered: true,
+            });
+        }
         let pushed = store
             .push(
                 &NewMessage {
@@ -267,7 +318,7 @@ impl Core {
             .map_err(store_failed)?;
         let (id, fresh) = match pushed {
             Pushed::Stored(id) => (id, true),
-            // An unsigned message under the id says something else.
+            // A signed message whose id was used for other words.
             Pushed::Existing(m)
                 if content.is_some() && m.signed.as_ref().map(|was| was.content) != content =>
             {
@@ -277,7 +328,7 @@ impl Core {
             // approval's as queued whatever became of it.
             Pushed::Existing(m) if m.delivered_at.is_some() => {
                 return Ok(ImSent {
-                    id: m.id,
+                    id: Some(m.id),
                     guid,
                     delivered: !approval,
                 })
@@ -293,15 +344,15 @@ impl Core {
             self.im_notify(them, &me.mailbox, &nick, &text, id);
         }
         Ok(ImSent {
-            id,
+            id: Some(id),
             guid,
             delivered,
         })
     }
 
     /// Hand `to`'s waiting instant messages over live: to every attached
-    /// messenger session, what an approval carries to those that list
-    /// requests alone, or, where it has none, to an attached session as
+    /// messenger session, what an approval carries to those that have
+    /// opted in to requests alone, or, where it has none, to an attached session as
     /// private messages. Returns the ids handed over.
     pub(crate) fn im_deliver(
         &self,
@@ -313,7 +364,7 @@ impl Core {
             return Vec::new();
         };
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        let (messengers, plain, listing) = {
+        let (messengers, plain, opted) = {
             let r = self.roster.lock().unwrap();
             let attached: Vec<Uid> = sessions_of(&r, to)
                 .into_iter()
@@ -322,8 +373,8 @@ impl Core {
             let (m, p): (Vec<Uid>, Vec<Uid>) = attached
                 .into_iter()
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
-            let listing = m.iter().any(|u| r.users.get(u).is_some_and(lists_requests));
-            (m, p.first().copied(), listing)
+            let opted = m.iter().any(|u| r.users.get(u).is_some_and(opted_in));
+            (m, p.first().copied(), opted)
         };
         if messengers.is_empty() {
             drop(flushing);
@@ -337,7 +388,7 @@ impl Core {
             self.inbox_policy.deliver_at_flush,
             Pending::Instant {
                 again: false,
-                approvals: listing,
+                approvals: opted,
             },
         ) {
             Ok(b) => b,
@@ -361,7 +412,7 @@ impl Core {
                     .filter(|u| {
                         r.users
                             .get(u)
-                            .is_some_and(|s| is_live(s) && (!approval || lists_requests(s)))
+                            .is_some_and(|s| is_live(s) && (!approval || opted_in(s)))
                     })
                     .collect();
                 if to.is_empty() {
@@ -390,11 +441,11 @@ impl Core {
             return;
         };
         let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        let lists = |r: &RosterInner| r.users.get(&uid).filter(|s| is_live(s)).map(lists_requests);
+        let opted_of = |r: &RosterInner| r.users.get(&uid).filter(|s| is_live(s)).map(opted_in);
         // The read itself leaves out what an approval carries for a
-        // session that does not list requests, so that never takes the
+        // session that has not opted in to requests, so that never takes the
         // places of what it can be shown.
-        let Some(listing) = lists(&self.roster.lock().unwrap()) else {
+        let Some(opted) = opted_of(&self.roster.lock().unwrap()) else {
             return;
         };
         let limit = self.inbox_policy.deliver_at_flush;
@@ -406,13 +457,13 @@ impl Core {
         };
         let ims = read(Pending::Instant {
             again: true,
-            approvals: listing,
+            approvals: opted,
         });
-        let receipts = read(Pending::Receipts { approvals: listing });
+        let receipts = read(Pending::Receipts { approvals: opted });
         let approvals = self.approval_ids(me, &ims);
         {
             let mut r = self.roster.lock().unwrap();
-            if lists(&r).is_none() {
+            if opted_of(&r).is_none() {
                 return;
             }
             for m in &ims {
@@ -477,9 +528,7 @@ impl Core {
                 None => return Ok(()),
             },
         };
-        // A read is told once: a repeat would queue the sender another
-        // receipt for each.
-        if m.friendship != Some(SentOn::Relation(id)) || (read && m.read_at.is_some()) {
+        if m.friendship != Some(SentOn::Relation(id)) {
             return Ok(());
         }
         let what = if read {
@@ -496,24 +545,36 @@ impl Core {
             guid: guid.clone(),
             read,
         };
-        // What an approval shows is a read, and to a party that can list
+        // What an approval shows is a read, and to a party that takes
         // requests.
-        if approval && (!read || self.never_listed(&sender)) {
+        if approval && (!read || self.opted_out(&sender)) {
             return Ok(());
         }
+        // A read is told once, however often it is acknowledged.
+        if read
+            && !store
+                .receipt_told(m.id, self.clock.wall())
+                .map_err(store_failed)?
+        {
+            return Ok(());
+        }
+        // To attached sessions alone: a detached one is handed what is
+        // kept for it at its next roster read, and only once.
         let told = {
             let mut r = self.roster.lock().unwrap();
             let to: Vec<Uid> = r
                 .messengers(&Key::of(&sender))
                 .into_iter()
-                .filter(|u| !approval || r.users.get(u).is_some_and(lists_requests))
+                .filter(|u| {
+                    r.users
+                        .get(u)
+                        .is_some_and(|s| is_live(s) && (!approval || opted_in(s)))
+                })
                 .collect();
             for uid in &to {
                 r.send_to(*uid, receipt.clone());
             }
-            // A detached session's buffer is no place to leave what is
-            // kept otherwise.
-            to.iter().any(|u| r.users.get(u).is_some_and(is_live))
+            !to.is_empty()
         };
         // A delivery receipt may be dropped; a read one is a person's
         // act, and waits for the sender's next roster read.

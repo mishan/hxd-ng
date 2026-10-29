@@ -762,21 +762,19 @@ which is part of why adoption asks rather than waiting for one.
 ## 7. Numbers
 
 The classic wire needs fields, transactions, reason codes and a
-capability bit, all fogWraith's to number, and asked for with message
-requests' in one list (`instant-messaging.md` §7). The extension's last
-free block of messaging field IDs is too small even for message
-requests' fields, so he places these; the transactions would
-come from 829–839, beside message requests', and the reason codes after
-`Requested`. The codes below assume `Requested` is 17, and follow
-whatever it is given, or take 17 and 18 if it is given none.
+capability bit, all fogWraith's to number, asked for with message
+requests' in one list (`instant-messaging.md` §7). He has reserved
+them, which is not adopting this draft: `CAPABILITY_FRIENDSHIPS` is bit
+15 (`0x8000`), Present Friendships 833 and Get Friendships 834, and the
+fields and codes are as below.
 
-| Field | Type | In |
-|---|---|---|
-| `DATA_FRIEND_OFFER` | Binary (at most 1024) | 802, 804; 803 canceling an upgrade offer (§4.1) |
-| `DATA_FRIENDSHIP` | Binary (at most 2080: two objects and the array around them) | 805; Present Friendships; the Get Friendships reply |
-| `DATA_FRIEND_WITHDRAW` | Binary (at most 1024) | 803, 806, a `Removed` 801, and Present Friendships and its reply |
-| `DATA_FRIENDSHIP_HASH` | Binary (32) | 800 and 801, up to two in an entry; the Present Friendships reply, a friendship hash or a pair hash; Get Friendships and its reply |
-| `DATA_IDENTITY_ROTATION` | Binary (at most 512), repeated in chain order | The Get Friendships reply, for a friend's fingerprint (§10) |
+| Field | Number | Type | In |
+|---|---|---|---|
+| `DATA_FRIEND_OFFER` | `0x0658` | Binary (at most 1024) | 802, 804; 803 canceling an upgrade offer (§4.1) |
+| `DATA_FRIENDSHIP` | `0x0659` | Binary (at most 2080: two objects and the array around them) | 805; Present Friendships; the Get Friendships reply |
+| `DATA_FRIEND_WITHDRAW` | `0x065A` | Binary (at most 1024) | 803, 806, a `Removed` 801, and Present Friendships and its reply |
+| `DATA_FRIENDSHIP_HASH` | `0x065B` | Binary (32) | 800 and 801, up to two in an entry; the Present Friendships reply, a friendship hash or a pair hash; Get Friendships and its reply |
+| `DATA_IDENTITY_ROTATION` | `0x065C` | Binary (at most 512), repeated in chain order | The Get Friendships reply, for a friend's fingerprint (§10) |
 
 | Code | Name | Meaning |
 |---|---|---|
@@ -817,18 +815,19 @@ fields, the upgrade offer's 804 and the hashes in entries only to
 sessions that negotiated both bits, and opens Present Friendships and
 Get Friendships to those alone.
 
-**Device proof's own numbers**, asked for apart from messaging's (§3):
-`CAPABILITY_DEVICE_PROOF`; Get Device Challenge and Prove Device; and
-the fields below. A server opens the two transactions to a session that
-negotiated the bit, whatever else it negotiated.
+**Device proof's own numbers**, reserved apart from messaging's (§3):
+`CAPABILITY_DEVICE_PROOF`, bit 14 (`0x4000`); Get Device Challenge,
+1020, and Prove Device, 1021; and the fields below. A server opens the
+two transactions to a session that negotiated the bit, whatever else it
+negotiated.
 
-| Field | Type | In |
-|---|---|---|
-| `DATA_PROOF_HOST` | String (at most 260) | Get Device Challenge (§3) |
-| `DATA_SERVER_CHALLENGE` | Binary (at most 576) | Get Device Challenge's reply |
-| `DATA_DEVICE_PROOF` | Binary (at most 576) | Prove Device |
-| `DATA_DEVICE_CERT` | Binary (at most 512) | Prove Device |
-| `DATA_USER_CARD` | Binary (at most 16384) | Prove Device, to link (§3) |
+| Field | Number | Type | In |
+|---|---|---|---|
+| `DATA_PROOF_HOST` | `0x0420` | String (at most 260) | Get Device Challenge (§3) |
+| `DATA_SERVER_CHALLENGE` | `0x0421` | Binary (at most 576) | Get Device Challenge's reply |
+| `DATA_DEVICE_PROOF` | `0x0422` | Binary (at most 576) | Prove Device |
+| `DATA_DEVICE_CERT` | `0x0423` | Binary (at most 512) | Prove Device |
+| `DATA_USER_CARD` | `0x0424` | Binary (at most 16384) | Prove Device, to link (§3) |
 
 **The ng wire** carries the same objects as base64url, as it carries
 every identity object: an `offer` on the friend family's add request

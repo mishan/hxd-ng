@@ -253,32 +253,51 @@ fn a_request_accepted_makes_friends_and_tells_both() {
 }
 
 #[test]
-fn crossing_requests_accept_each_other_even_one_never_delivered() {
-    let s = server(&["alice", "bob"]);
-    let (a, _ra) = messenger(&s.core, "alice");
-    let (b, mut rb) = messenger(&s.core, "bob");
-    s.rel
-        .hold(
-            &Mailbox::login("alice"),
-            &Requester::Account(Mailbox::login("bob")),
-            s.core.clock.wall() + Duration::from_secs(3600),
-        )
-        .unwrap();
-    assert_eq!(
-        s.core.friend_add(b, "alice", None),
-        Ok(RosterState::PendingOut)
-    );
-    assert_eq!(state_of(&s.core, a, "bob"), None, "held, so not pending in");
-    drain(&mut rb);
-    assert_eq!(
-        s.core.friend_add(a, "bob", None),
-        Ok(RosterState::Accepted),
-        "the same friendship asked for twice"
-    );
-    assert_eq!(
-        entries(&drain(&mut rb)),
-        [("alice".into(), RosterState::Accepted)]
-    );
+fn crossing_requests_accept_each_other_only_from_a_session_that_opted_in() {
+    for (held, opted) in [(false, true), (true, true), (false, false), (true, false)] {
+        let case = format!("held: {held}, opted in: {opted}");
+        let s = server(&["alice", "bob"]);
+        let (a, _ra) = if opted {
+            taker(&s.core, "alice")
+        } else {
+            messenger(&s.core, "alice")
+        };
+        let (b, mut rb) = messenger(&s.core, "bob");
+        if held {
+            s.rel
+                .hold(
+                    &Mailbox::login("alice"),
+                    &Requester::Account(Mailbox::login("bob")),
+                    s.core.clock.wall() + Duration::from_secs(3600),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            s.core.friend_add(b, "alice", None),
+            Ok(RosterState::PendingOut),
+            "{case}"
+        );
+        drain(&mut rb);
+        if opted {
+            assert_eq!(
+                s.core.friend_add(a, "bob", None),
+                Ok(RosterState::Accepted),
+                "{case}: the same friendship asked for twice"
+            );
+            assert_eq!(
+                entries(&drain(&mut rb)),
+                [("alice".into(), RosterState::Accepted)],
+                "{case}"
+            );
+        } else {
+            assert_eq!(
+                s.core.friend_add(a, "bob", None),
+                Err(MessagingError::RequestPending),
+                "{case}: as the extension answers it, shown or not"
+            );
+            assert!(drain(&mut rb).is_empty(), "{case}");
+        }
+    }
 }
 
 #[test]
@@ -996,44 +1015,76 @@ fn what_was_queued_on_a_friendship_is_held_once_it_ends() {
 
 #[test]
 fn a_read_waits_for_a_sender_that_was_not_there() {
-    for detached in [false, true] {
+    for gone in ["ended", "detached", "resumed"] {
         let s = server(&["alice", "bob"]);
         let (a, mut ra) = messenger(&s.core, "alice");
         let (b, mut rb) = messenger(&s.core, "bob");
         friends(&s, a, &mut ra, b, &mut rb);
         let sent = s.core.im_send(a, "bob", "hi".into(), None, None).unwrap();
-        if detached {
-            s.core.connection_lost(a, 4);
-        } else {
+        s.core.im_typing(b, "alice", true).unwrap();
+        let last_seq = std::iter::from_fn(|| ra.try_recv().ok())
+            .last()
+            .map_or(0, |se| se.seq);
+        if gone == "ended" {
             s.core.end_session(a);
+        } else {
+            s.core.connection_lost(a, 4);
         }
         s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
         s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
         assert!(s.inbox.all()[0].read_at.is_some());
 
-        let (a, mut ra) = family(&s.core, "alice");
+        let (a, mut ra, replayed) = if gone == "resumed" {
+            let crate::Resume::Replayed(rx, replay) = s.core.resume(a, last_seq) else {
+                panic!("{gone}: resume should replay");
+            };
+            (a, rx, replay.into_iter().map(|se| se.event).collect())
+        } else {
+            let (a, ra) = family(&s.core, "alice");
+            (a, ra, Vec::new())
+        };
         s.core.friends_roster(a).unwrap();
+        let mut heard = receipts(&replayed);
+        heard.extend(receipts(&drain(&mut ra)));
         assert_eq!(
-            receipts(&drain(&mut ra)),
+            heard,
             [("bob".into(), true)],
-            "detached: {detached}: kept once, however often it was read"
+            "{gone}: kept once, however often it was read"
         );
         s.core.friends_roster(a).unwrap();
-        assert!(receipts(&drain(&mut ra)).is_empty(), "once");
+        assert!(receipts(&drain(&mut ra)).is_empty(), "{gone}: once");
     }
+}
+
+#[test]
+fn a_read_after_a_period_clients_delivery_is_still_told() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core.end_session(b);
+    let (_p, _rp) = classic(&s.core, "bob", messaging_bits());
+    let sent = s.core.im_send(a, "bob", "hi".into(), None, None).unwrap();
+    assert!(
+        s.inbox.all()[0].read_at.is_some(),
+        "a period client's delivery is its read"
+    );
+    let (b, _rb) = messenger(&s.core, "bob");
+    s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
+    assert_eq!(receipts(&drain(&mut ra)), [("bob".into(), true)]);
 }
 
 #[test]
 fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
     let key = |n: u8| [n; 32];
     let dir = Directory(
-        [("alice", 1), ("bob", 2), ("carol", 3)]
+        [("alice", 1), ("bob", 2), ("carol", 3), ("dave", 4)]
             .iter()
             .map(|(l, n)| (Mailbox::identified(*l, key(*n)), messaging_bits()))
             .collect(),
     );
     let quota = InboxPolicy {
-        max_sent_per_day: 2,
+        max_sent_per_day: 3,
         ..InboxPolicy::default()
     };
     let s = server_of(dir, policy(), quota, None);
@@ -1051,16 +1102,51 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
             to: key(to),
         })
     };
-    let (g1, g2) = (
+    let (g1, g2, g4) = (
         MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000011").unwrap(),
         MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000012").unwrap(),
+        MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000014").unwrap(),
     );
+    // A signed request to a stranger, who deletes it.
+    let (d, _rd) = attach_identified(&s.core, "dave", key(4));
+    for uid in [a, d] {
+        s.core
+            .set_presence(
+                uid,
+                PresenceUpdate {
+                    takes_requests: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        s.core.msg_login_signed(
+            a,
+            "dave",
+            "hello?".into(),
+            Some(g4.clone()),
+            None,
+            signed(4, 4)
+        ),
+        Ok(crate::MsgOutcome::Requested)
+    );
+    s.core
+        .request_answer(d, "alice", RequestAction::Delete)
+        .unwrap();
     let im = |to: &str, text: &str, guid: &MessageGuid, signed| {
         s.core
             .im_send(a, to, text.into(), Some(guid.clone()), signed)
             .map(|_| ())
     };
     for (case, to, guid, signed, want) in [
+        (
+            "a request's id, whatever became of it",
+            "bob",
+            &g4,
+            signed(2, 4),
+            Err(MessagingError::Equivocation),
+        ),
         ("signed", "bob", &g1, signed(2, 1), Ok(())),
         (
             "other words",
@@ -1079,16 +1165,36 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
         ("the day's last", "bob", &g2, None, Ok(())),
         ("a retry past it", "bob", &g2, None, Ok(())),
         (
-            "past the quota",
+            "past the quota, to a friend there",
             "bob",
             &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000013").unwrap(),
             None,
-            Err(MessagingError::RateLimited),
+            Ok(()),
         ),
     ] {
         assert_eq!(im(to, case, guid, signed), want, "{case}");
     }
-    assert_eq!(s.inbox.all().len(), 2, "nothing refused was stored");
+    assert_eq!(
+        s.inbox.all().len(),
+        2,
+        "nothing refused, or past the quota, was stored"
+    );
+    assert!(
+        drain(&mut rb)
+            .iter()
+            .any(|e| matches!(e, Event::Im(im) if im.id.is_none() && !im.queued)),
+        "handed over live, with no row"
+    );
+    s.core.end_session(b);
+    assert_eq!(
+        im(
+            "bob",
+            "with nobody there",
+            &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000015").unwrap(),
+            None
+        ),
+        Err(MessagingError::RateLimited)
+    );
 }
 
 #[test]
@@ -1197,11 +1303,18 @@ fn an_im_pushes_unless_its_recipient_is_there_or_busy() {
 
 // --- Message requests and approvals ------------------------------------
 
-/// A messenger session that has listed requests, so its account takes
-/// them and it is shown them.
-fn lister(core: &Core, login: &str) -> (Uid, Events) {
+/// A messenger session that has opted in to requests, so its account
+/// takes them and it is shown them.
+fn taker(core: &Core, login: &str) -> (Uid, Events) {
     let (uid, mut rx) = messenger(core, login);
-    core.requests_list(uid).unwrap();
+    core.set_presence(
+        uid,
+        PresenceUpdate {
+            takes_requests: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     drain(&mut rx);
     (uid, rx)
 }
@@ -1263,9 +1376,9 @@ fn a_message_to_a_stranger_is_a_request_answered_alike_however_it_ends() {
         .map(|l| (*l, messaging_bits()))
         .collect();
     let s = server_with(p, &accounts);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
-    let (c, _rc) = lister(&s.core, "carol");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (c, _rc) = taker(&s.core, "carol");
 
     assert_eq!(
         send(&s.core, a, "bob", "hello?"),
@@ -1311,13 +1424,17 @@ fn who_may_ask_and_who_is_answered_otherwise() {
     type Setup = fn(&Server) -> Uid;
     let cases: [(&str, Setup, Result<MsgOutcome, ChatError>); 7] = [
         (
-            "both list",
-            |s| lister(&s.core, "alice").0,
+            "both opted in",
+            |s| taker(&s.core, "alice").0,
             Ok(MsgOutcome::Requested),
         ),
         (
-            "a sender that never listed",
-            |s| messenger(&s.core, "alice").0,
+            "a sender that only listed",
+            |s| {
+                let (alice, _) = messenger(&s.core, "alice");
+                s.core.requests_list(alice).unwrap();
+                alice
+            },
             Err(ChatError::NotFriends),
         ),
         (
@@ -1341,7 +1458,7 @@ fn who_may_ask_and_who_is_answered_otherwise() {
         (
             "a recipient that turned requests off",
             |s| {
-                let (bob, _) = lister(&s.core, "bob");
+                let (bob, _) = taker(&s.core, "bob");
                 s.core
                     .set_presence(
                         bob,
@@ -1351,23 +1468,23 @@ fn who_may_ask_and_who_is_answered_otherwise() {
                         },
                     )
                     .unwrap();
-                lister(&s.core, "alice").0
+                taker(&s.core, "alice").0
             },
             Err(ChatError::NotFriends),
         ),
         (
             "a recipient that blocked the sender",
             |s| {
-                let (bob, _) = lister(&s.core, "bob");
+                let (bob, _) = taker(&s.core, "bob");
                 s.core.inbox_block(bob, "alice", true).unwrap();
-                lister(&s.core, "alice").0
+                taker(&s.core, "alice").0
             },
             Err(ChatError::NoSuchUser),
         ),
         (
             "a sender that blocked the recipient",
             |s| {
-                let (alice, _) = lister(&s.core, "alice");
+                let (alice, _) = taker(&s.core, "alice");
                 s.core.inbox_block(alice, "bob", true).unwrap();
                 alice
             },
@@ -1384,18 +1501,19 @@ fn who_may_ask_and_who_is_answered_otherwise() {
             ],
         );
         // Bob takes requests unless a case says otherwise.
-        let (bob, _rb) = lister(&s.core, "bob");
+        let (bob, _rb) = taker(&s.core, "bob");
         let from = setup(&s);
         assert_eq!(send(&s.core, from, "bob", "hi"), want, "{case}");
         let stored = !waiting(&s.core, bob).is_empty();
         assert_eq!(stored, want.is_ok(), "{case}");
     }
 
-    // A recipient none of whose clients has listed requests takes none,
-    // and an image is no stranger's first contact.
+    // A recipient none of whose sessions has opted in takes none, though
+    // it lists them.
     let s = server(&["alice", "bob"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    attach_as(&s.core, "bob", messaging_bits(), "10.0.0.2");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = messenger(&s.core, "bob");
+    s.core.requests_list(b).unwrap();
     assert_eq!(send(&s.core, a, "bob", "hi"), Err(ChatError::NotFriends));
 }
 
@@ -1412,9 +1530,9 @@ fn requests_are_bounded_by_what_was_sent_and_a_retry_is_not_counted() {
         .map(|l| (*l, messaging_bits()))
         .collect();
     let s = server_with(p, &accounts);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, _rb) = lister(&s.core, "bob");
-    lister(&s.core, "carol");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
+    taker(&s.core, "carol");
     let g = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
     for text in ["one", "two"] {
         let guid = (text == "two").then(|| g.clone());
@@ -1447,8 +1565,8 @@ fn requests_are_bounded_by_what_was_sent_and_a_retry_is_not_counted() {
 fn an_approved_conversation_shows_less_than_a_friendship() {
     use crate::MsgOutcome;
     let s = server(&["alice", "bob"]);
-    let (a, mut ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
+    let (a, mut ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
     // Bob's other session shows no requests, so it is shown none of this.
     let (_b2, mut rb2) = messenger(&s.core, "bob");
     send(&s.core, a, "bob", "may I?").unwrap();
@@ -1505,9 +1623,9 @@ fn an_approved_conversation_shows_less_than_a_friendship() {
 fn writing_back_approves_and_a_friendship_takes_what_waited() {
     use crate::MsgOutcome;
     let s = server(&["alice", "bob", "carol"]);
-    let (a, mut ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
-    let (c, _rc) = lister(&s.core, "carol");
+    let (a, mut ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (c, _rc) = taker(&s.core, "carol");
     send(&s.core, a, "bob", "hi bob").unwrap();
     drain(&mut rb);
     assert!(matches!(
@@ -1534,10 +1652,10 @@ fn writing_back_approves_and_a_friendship_takes_what_waited() {
 #[test]
 fn clearing_takes_what_came_in_the_span_and_keeps_what_came_before() {
     let s = server(&["alice", "bob", "carol", "dave"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
-    let (c, _rc) = lister(&s.core, "carol");
-    let (d, mut rd) = lister(&s.core, "dave");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (c, _rc) = taker(&s.core, "carol");
+    let (d, mut rd) = taker(&s.core, "dave");
     send(&s.core, a, "bob", "before the flood").unwrap();
     s.core.clock.advance(Duration::from_secs(60));
     // A second back, since what is stored is kept to the second.
@@ -1573,8 +1691,8 @@ fn clearing_takes_what_came_in_the_span_and_keeps_what_came_before() {
 #[test]
 fn a_block_deletes_the_requests_it_meets() {
     let s = server(&["alice", "bob"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, _rb) = lister(&s.core, "bob");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
     send(&s.core, a, "bob", "hi").unwrap();
     s.core.inbox_block(b, "alice", true).unwrap();
     s.core.inbox_block(b, "alice", false).unwrap();
@@ -1591,7 +1709,7 @@ fn a_classic_party_is_sent_an_approval_as_private_messages() {
         ],
     );
     let (p, mut rp) = classic(&s.core, "plain", AccessBits::empty().with(bit::SEND_MSGS));
-    let (b, _rb) = lister(&s.core, "bob");
+    let (b, _rb) = taker(&s.core, "bob");
     send(&s.core, p, "bob", "from a period client").unwrap();
     assert!(matches!(
         send(&s.core, b, "plain", "welcome"),
@@ -1634,8 +1752,8 @@ fn attach_identified(core: &Core, login: &str, fp: [u8; 32]) -> (Uid, Events) {
 #[test]
 fn a_blocker_reads_as_no_account_whatever_is_sent_by_login() {
     let s = server(&["alice", "bob"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, _rb) = lister(&s.core, "bob");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
     s.core.inbox_block(b, "alice", true).unwrap();
     let long = "x".repeat(policy().max_message_bytes + 1);
     for (case, text, media) in [
@@ -1654,8 +1772,8 @@ fn a_blocker_reads_as_no_account_whatever_is_sent_by_login() {
 #[test]
 fn a_retry_under_an_approval_is_answered_queued() {
     let s = server(&["alice", "bob"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
     send(&s.core, a, "bob", "may I?").unwrap();
     s.core
         .request_answer(b, "alice", RequestAction::Approve)
@@ -1685,9 +1803,9 @@ fn a_backlog_the_flush_must_skip_never_starves_private_mail() {
         let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
         let now = s.core.clock.wall();
         let on = if on_approval {
-            // Bob's account shows requests, so an approval's traffic
-            // waits for a session that lists them.
-            let (b, _rb) = lister(&s.core, "bob");
+            // Bob's account takes requests, so an approval's traffic
+            // waits for a session that has opted in.
+            let (b, _rb) = taker(&s.core, "bob");
             s.core.end_session(b);
             s.rel.approve(&bob, &alice, now).unwrap()
         } else {
@@ -1876,16 +1994,21 @@ fn a_request_left_alone_lapses_and_frees_its_place() {
         .map(|l| (*l, messaging_bits()))
         .collect();
     let s = server_with(p, &accounts);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (_b, _rb) = lister(&s.core, "bob");
-    let (c, _rc) = lister(&s.core, "carol");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (_b, _rb) = taker(&s.core, "bob");
+    let (c, _rc) = taker(&s.core, "carol");
     send(&s.core, a, "bob", "hello?").unwrap();
     s.core
         .clock
         .advance(p.request_retention + Duration::from_secs(1));
-    // Bob looks again, so he is not a recipient whose listing lapsed.
-    let (b, _rb) = lister(&s.core, "bob");
-    assert!(waiting(&s.core, b).is_empty(), "lapsed");
+    // Bob's opt-in has lapsed: carol is answered as ever, and dropped.
+    assert_eq!(
+        send(&s.core, c, "bob", "anyone?"),
+        Ok(crate::MsgOutcome::Requested)
+    );
+    // Bob opts in again, so he is not a recipient whose opt-in lapsed.
+    let (b, _rb) = taker(&s.core, "bob");
+    assert!(waiting(&s.core, b).is_empty(), "lapsed, and dropped");
     send(&s.core, c, "bob", "me?").unwrap();
     assert_eq!(waiting(&s.core, b), [("carol".into(), vec!["me?".into()])]);
 }
@@ -1893,8 +2016,8 @@ fn a_request_left_alone_lapses_and_frees_its_place() {
 #[test]
 fn a_request_to_a_full_mailbox_is_dropped_and_counted() {
     let s = server(&["alice", "bob"]);
-    let (a, _ra) = lister(&s.core, "alice");
-    let (b, _rb) = lister(&s.core, "bob");
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
     s.core.end_session(b);
     for i in 0..InboxPolicy::default().max_queued {
         s.inbox
@@ -1989,9 +2112,9 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
     let s = server(&["alice", "bob", "carol"]);
     let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
     let now = s.core.clock.wall();
-    // Bob's account shows requests, so an approval's traffic waits for a
-    // session that lists them.
-    let (b, _rb) = lister(&s.core, "bob");
+    // Bob's account takes requests, so an approval's traffic waits for a
+    // session that has opted in.
+    let (b, _rb) = taker(&s.core, "bob");
     s.core.end_session(b);
     let on = s.rel.approve(&bob, &alice, now).unwrap();
     for i in 0..InboxPolicy::default().deliver_at_flush + 5 {
@@ -2030,8 +2153,8 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
 #[test]
 fn a_retry_of_a_request_is_answered_as_one_whatever_came_after() {
     let s = server(&["alice", "bob"]);
-    let (a, mut ra) = lister(&s.core, "alice");
-    let (b, mut rb) = lister(&s.core, "bob");
+    let (a, mut ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
     let g = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000003").unwrap();
     let send_g = || {
         s.core

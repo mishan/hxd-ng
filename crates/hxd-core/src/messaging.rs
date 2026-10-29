@@ -265,9 +265,10 @@ pub(crate) struct SessionState {
     /// Its wire speaks the friend family, or it has asked something of
     /// it, so it is told.
     pub(crate) messenger: bool,
-    /// It has listed message requests (§4.5), so it is shown what an
-    /// approval carries and sends requests of its own.
-    pub(crate) lists_requests: bool,
+    /// It has opted in to message requests this login (§4.1), so it
+    /// sends requests of its own, is told what becomes of them, and is
+    /// shown what an approval carries and that requests changed.
+    pub(crate) opted_in: bool,
 }
 
 /// What friends are told of a login: its state and its text.
@@ -460,6 +461,8 @@ pub(crate) fn session_takes_part(s: &UserSession) -> bool {
 /// The caller, as a friend operation sees it.
 struct Me {
     mailbox: Mailbox,
+    /// Its session has opted in to requests.
+    opted: bool,
 }
 
 impl Core {
@@ -493,6 +496,7 @@ impl Core {
         let state = sess.messaging.as_mut().ok_or(MessagingError::NotEnabled)?;
         state.messenger = true;
         Ok(Me {
+            opted: state.opted_in,
             mailbox: sess.mailbox(),
         })
     }
@@ -618,10 +622,13 @@ impl Core {
         // So two updates land in the store and in the entry in one order,
         // and an entry being loaded reads the text either before or after.
         let _writing = self.friend_writes();
+        // Taking requests is an opt-in, by a session, that lapses
+        // (`docs/instant-messaging.md` §4.1).
         let account = AccountUpdate {
             status_text: update.status_text.clone(),
             discoverable: update.discoverable,
             takes_requests: update.takes_requests,
+            opted_at: (update.takes_requests == Some(true)).then(|| self.clock.wall()),
             profile: None,
         };
         if account != AccountUpdate::default() {
@@ -630,6 +637,12 @@ impl Core {
                 .map_err(store_failed)?;
         }
         let mut r = self.roster.lock().unwrap();
+        if let (Some(on), Some(m)) = (
+            update.takes_requests,
+            r.users.get_mut(&uid).and_then(|s| s.messaging.as_mut()),
+        ) {
+            m.opted_in = on;
+        }
         let key = Key::of(&me.mailbox);
         match update.state {
             Some(Presence::Invisible) => {
@@ -763,12 +776,16 @@ impl Core {
             .relationship(&them, &me.mailbox, now)
             .map_err(store_failed)?
             .is_some_and(|t| t.pending_out.is_some());
+        // Two crossing requests accept each other only from a session
+        // that has opted in; any other is answered as the extension
+        // answers it. Either way, whether or not the first was
+        // delivered, so the answer says nothing of whether it was held.
+        if crossing && !me.opted {
+            return Err(MessagingError::RequestPending);
+        }
         if store.roster_size(&me.mailbox, now).map_err(store_failed)? >= p.max_roster {
             return Err(MessagingError::RosterFull);
         }
-        // Two crossing requests ask for the same friendship, whether or
-        // not the first was delivered, so the answer says nothing of
-        // whether it was held.
         if crossing {
             self.befriend(store, &me.mailbox, &them, now)?;
             return Ok(RosterState::Accepted);
@@ -1104,8 +1121,9 @@ impl Core {
         for mine in rows {
             let other = mine.other.clone();
             let theirs = store.relationship(&other, me, now).ok().flatten();
-            // A rotation names the successor by its key alone; the
-            // friend's row has the login it is known by.
+            // A rotation the directory has no account for names the
+            // successor by its key alone; the friend's row has the login
+            // it is known by.
             let me = &Mailbox {
                 login: theirs
                     .as_ref()

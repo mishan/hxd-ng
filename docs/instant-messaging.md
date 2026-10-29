@@ -78,9 +78,11 @@ while the other still blocks, needs nothing special: two rows, each
 blocked or not. The extension's `PendingIn` is the other row's pending
 out, read from the owner's side, where it was delivered: a held or
 dropped request is a pending out its target never sees. An 802 that
-meets the other side's pending out accepts both, whether or not that
-pending out was delivered, since the caller has asked for the same
-friendship, so the answer says nothing of whether the earlier request
+meets the other side's pending out, from a session that has opted in to
+requests (§4.1), accepts both, whether or not that pending out was
+delivered, since the caller has asked for the same friendship; from any
+other session it is answered `RequestPending`, as the extension answers
+it. Either way the answer says nothing of whether the earlier request
 was held; an 802 carrying an offer aside
 (`proposals/portable-friends.md` §4.1), which waits for an acceptance.
 
@@ -138,16 +140,18 @@ reclaiming space, never deciding, and nothing waits on it.
 Requests exist only where `[messaging] enabled` is on, between two
 accounts that both hold `AccessMessaging` (`admin` and `guest` are
 treated as lacking it whatever their bits, as the extension requires),
-a classic sender aside (below), and both **take requests**. A recipient
-account takes requests unless it has turned them off in its profile, as
-it turns off `discoverable`, or no client of it has ever listed them
-(§4.5). A sender takes them per session: only a session that has listed
-requests sends one, so a session that never has, though another of its
-account's has, is answered as the extension answers it today, is never
-sent `Requested`, and never approves a request by replying (§4.3). So a
-user whose clients have never shown requests is never sent one, and a
-client that has never shown them is told nothing it could not read, a
-classic sender aside (below).
+a classic sender aside (below), and both **take requests**. Taking
+them is an explicit **opt-in**: a session opts in by sending
+`DATA_TAKES_REQUESTS` = 1 in Set Presence (808), and its account takes
+requests from then until a session of it sends 0; an account none of
+whose sessions ever has takes none. Listing them (§4.5) is only
+listing. A sender takes them per session: only a session that has opted
+in this login sends one, so a session that has not, though another of
+its account's has, is answered as the extension answers it today, is
+never sent `Requested`, and never approves a request by replying
+(§4.3). So a user whose clients have never opted in is never sent one,
+and a client that has not is told nothing it could not read, a classic
+sender aside (below).
 
 A message to a non-friend is then answered, in this order:
 
@@ -167,21 +171,21 @@ A message to a non-friend is then answered, in this order:
    own requests to the blocked account and its pending out, so that the
    blocked account never answers one and meets the block.
 2. **The sender has blocked the recipient**, or either side has turned
-   requests off or never listed them: `NotFriends`, as the extension has
+   requests off or never opted in: `NotFriends`, as the extension has
    it. It tells the sender only about its own block or about a setting.
 3. **Otherwise**: a **request**, answered `Requested` (§4.2), and
    stored, held or dropped by the bounds (§4.4).
 
-An account that once listed requests but has not within
-`request_retention_days` is **lapsed**: it is still answered as taking
-requests, and the request is dropped, answered and counted as one that
-was stored (§4.4). Answering it `NotFriends` instead would tell a
-stranger when its user last used a client that shows requests.
+An account that takes requests but none of whose sessions has opted in
+within `request_retention_days` is **lapsed**: it is still answered as
+taking requests, and the request is dropped, answered and counted as
+one that was stored (§4.4). Answering it `NotFriends` instead would
+tell a stranger when its user last used a client that shows requests.
 
 A request is not delivered as an IM Deliver (811), raises no badge and
 no push (§5), and does not count toward the recipient's queue. The
-recipient's sessions that have listed requests are told only that the
-number of requests changed.
+recipient's sessions that have opted in are told only that the number
+of requests changed.
 
 **Which messages.** On the ng wire, a `msg` by `to_login` to an account
 holding `AccessMessaging`: to a friend, or under an approval, it is an
@@ -201,8 +205,8 @@ that would approve (§4.3) past the replier's `MaxRosterSize` is refused
 
 The classic `/msg <login>` (`system-account.md` §3) is the same call,
 `Core::msg_login`, and follows the same rule, under the same holds and
-bounds. Its sender is a classic session, which can never list requests,
-and is exempt from having to, and from holding `AccessMessaging`, so a
+bounds. Its sender is a classic session, which is exempt from opting
+in, and from holding `AccessMessaging`, so a
 guest or an account without the bit makes a request as anyone does.
 Guests share one account, so a guest sender is bounded and held by its
 address rather than its account, at the per-sender values, so that
@@ -212,8 +216,8 @@ no other guest. The recipient's answer, which approves the conversation
 (§4.3), reaches the sender as an ordinary private message, which a 1.5
 client shows, through the inbox's flush if it has gone
 (`private-messages.md` §6.3), as all of an approval's traffic does for
-a party that cannot list requests (§4.6). Refusing it `NotFriends`, for
-want of listing or of the bit, would cut 1.5 users off from messaging
+a party that takes no requests (§4.6). Refusing it `NotFriends`, for
+want of an opt-in or of the bit, would cut 1.5 users off from messaging
 accounts they could write to before,
 and letting it bypass requests would let any classic session skip the
 holds and bounds. `/block` and `/unblock` are the relationship store's
@@ -290,7 +294,7 @@ is written, and the message row, `requests_changed` and any lazy delete
 
 - **Per sender and recipient**: at most `request_messages` requests sent
   to one recipient within `request_retention_days`. Past it the sender
-  is refused `QueueFull` (ng `request_full`).
+  is refused `RequestFull` (ng `request_full`).
 - **Per sender**: at most `requests_per_day` distinct recipients in a
   rolling day, refused `RateLimited` (ng `quota_exceeded`). Requests
   count toward the inbox's daily quota (`private-messages.md` §9) from
@@ -359,10 +363,9 @@ and each message with its inbox id, so that a request can be reported as
 any message is (`moderation.md` §4.2); the report path reads a request
 row for its recipient alone, past the gate of §5. The listing also gives
 the approvals, and how many requests were dropped since the last
-listing. Listing is what marks a client as able to show requests
-(§4.1), and a session as one to send approvals and `requests_changed`
-to (§4.6), so a client that shows requests lists them once after each
-login.
+listing. Listing marks nothing: it is the opt-in (§4.1) that makes a
+session one to send approvals and `requests_changed` to (§4.6), so a
+client that shows requests opts in after each login.
 
 ### 4.6 Approvals
 
@@ -384,11 +387,11 @@ Messages pass both ways, but an approval shows less than a friendship:
   extension's discovery rules).
 - **Signed, not sealed.** A sealed send to a non-friend is refused
   (§4.1), so an approved conversation can be signed but not sealed.
-- **Only to sessions that list requests.** Its 811, 812 and 813 go to
-  each party's sessions that have listed requests, and wait for one
-  otherwise, since a client that does not know approvals has no row to
-  show them under. A party none of whose sessions can list them, a
-  classic sender's (§4.1), is sent the messages as ordinary private
+- **Only to sessions that have opted in.** Its 811, 812 and 813 go to
+  each party's sessions that have opted in to requests, and wait for
+  one otherwise, since a client that does not know approvals has no row
+  to show them under. A party that takes no requests, a classic
+  sender's (§4.1), is sent the messages as ordinary private
   messages through the inbox instead, and no receipts.
 
 On the classic wire an approved conversation over 810 waits for the
@@ -443,7 +446,7 @@ a session past its live queue's bound and drop it as a slow consumer.
 The rows become pending, oldest first, as far as the recipient's queue
 cap has room, the rest staying held until it has, and go as any pending
 row of their kind does: IM rows at the next drain below, approval rows
-the same to sessions that have listed requests, and private messages by
+the same to sessions that have opted in, and private messages by
 the inbox's flush (`private-messages.md` §6.3). A release to an
 attached recipient drains it then, rather than at its next 800, so that
 what was held arrives ahead of what is sent after. Each is capped at
@@ -460,10 +463,14 @@ nor the ng friend family never sends either, so it is handed a friend's
 IMs as private messages: live as `private-messages.md` §6.1 hands a
 stored message to an attached session, and at the login flush for those
 still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
-Approval rows go that way only to a party none of whose sessions can
-list requests (§4.6). Every drain is capped by
+Approval rows go that way only to a party that takes no requests
+(§4.6). Every drain is capped by
 `deliver_at_flush`, as the login flush is, the rest pulled or waiting
-for the next. A request's rows are never drained.
+for the next. A request's rows are never drained. IM rows count toward
+the sender's daily quota as offline private messages do
+(`private-messages.md` §9): past it, a friend's IM reaches an attached
+session live with no row, as mail does, and is refused only with none
+there.
 
 **`delivered_at`** is stamped at the 812 ack from a session that can
 send one, and at the handover for a session that cannot. A row handed
@@ -534,8 +541,8 @@ relationship store, through the same calls:
 **The classic wire**: capability bits 6 and 8 (bit 6 only for accounts
 with bit 58), transactions 800–813 and 822–826, the limits fields, bit
 8's hiding from 300/301/302 and from the ng roster, and the identity
-draft's fields. Message requests add transactions from the extension's
-unallocated 829–839:
+draft's fields. Message requests add transactions 829–832, reserved
+(below):
 
 - **Get Message Requests**, `DATA_REQUEST_CURSOR` optional, answered
   first with `DATA_REQUEST_COUNT`, the requests dropped since the last
@@ -556,13 +563,13 @@ unallocated 829–839:
   the message requests deleted, and `DATA_FRIEND_REQUEST_COUNT`, the
   friend requests declined;
 - **Message Requests Changed**, a push carrying `DATA_REQUEST_COUNT`,
-  the senders waiting, sent only to sessions that have listed requests.
+  the senders waiting, sent only to sessions that have opted in.
 
 A period client clears its requests as `/requests clear
 [newer|older <duration>]` to the system account (`system-account.md`),
 everything if no span is given.
 
-Until the numbers are given, a classic 810 to a non-friend is refused
+Until the numbers are adopted, a classic 810 to a non-friend is refused
 `NotFriends` and requests exist on the ng wire alone (§4.1), apart from
 `/msg <login>`, which needs no number.
 
@@ -573,45 +580,44 @@ limits (its Server Limits Advertisement), and one that sends no
 `DATA_MAX_REQUEST_MESSAGES` takes none, so a client offers no requests
 view and expects `NotFriends`.
 
-**The numbers asked of fogWraith**, for this document and
-`proposals/portable-friends.md` together, sent as one request (§8), so
-that the two ask for adjacent ranges once. The fields overflow the
-extension's free messaging block, `0x062C`–`0x062F`, so he places them;
-portable friends' fields are specified in its §7. The identity draft's
-own field line names `0x0628`–`0x062F`, though the extension reserves
-it only `0x0628`–`0x062B`; the request points that out, so that the
-block stays free for him to place these in.
+**The numbers fogWraith has reserved**, for this document and
+`proposals/portable-friends.md` together, asked for as one request (§8).
+They are reserved, not adopted: the drafts that use them are his to
+take or leave, and until he does, nothing here is the extension's.
 
-| Kind | Name | Type, or proposed | In |
+| Kind | Name | Reserved, and type | In |
 |---|---|---|---|
 | Reason code | `Requested` | 17 | 810 (§4.2) |
-| Reason code | `Withdrawn` | 18, or 17 if `Requested` is given none | portable friends §7 |
-| Reason code | `Stale` | 19, or 18 if `Requested` is given none | portable friends §7 |
-| Capability bit | `CAPABILITY_FRIENDSHIPS` | his to choose | portable friends §7 |
-| Transaction | Get Message Requests | 829–839 | above |
-| Transaction | Answer Message Request | 829–839 | above |
-| Transaction | Clear Message Requests | 829–839 | above |
-| Transaction | Message Requests Changed | 829–839 | above |
-| Transaction | Present Friendships | 829–839 | portable friends §4.3 |
-| Transaction | Get Friendships | 829–839 | portable friends §4.2 |
-| Field | `DATA_TAKES_REQUESTS` | UInt16 | 808, beside `DATA_DISCOVERABLE` |
-| Field | `DATA_REQUEST_CURSOR` | Binary | Get Message Requests and its reply |
-| Field | `DATA_REQUEST_ACTION` | UInt16: 1 approve, 2 delete, 3 end | Answer Message Request |
-| Field | `DATA_REQUEST_COUNT` | UInt32 | Get Message Requests, Clear Message Requests and Message Requests Changed replies, as each says |
-| Field | `DATA_FRIEND_REQUEST_COUNT` | UInt32 | Clear Message Requests' reply |
-| Field | `DATA_SPAN_SINCE`, `DATA_SPAN_BEFORE` | UInt64, Unix seconds | Clear Message Requests |
-| Field | `DATA_MAX_REQUEST_MESSAGES` | UInt32 | Login reply, from the limits sub-block `0x0625`–`0x0627`: `request_messages`; absent when the server takes no requests |
-| Field | `DATA_FRIEND_OFFER`, `DATA_FRIENDSHIP`, `DATA_FRIEND_WITHDRAW`, `DATA_FRIENDSHIP_HASH`, `DATA_IDENTITY_ROTATION` | Binary | portable friends §7 |
+| Reason code | `Withdrawn` | 18 | portable friends §7 |
+| Reason code | `Stale` | 19 | portable friends §7 |
+| Capability bit | `CAPABILITY_FRIENDSHIPS` | bit 15 (`0x8000`) | portable friends §7 |
+| Transaction | Get Message Requests | 829 | above |
+| Transaction | Answer Message Request | 830 | above |
+| Transaction | Clear Message Requests | 831 | above |
+| Transaction | Message Requests Changed | 832 | above |
+| Transaction | Present Friendships | 833 | portable friends §4.3 |
+| Transaction | Get Friendships | 834 | portable friends §4.2 |
+| Field | `DATA_TAKES_REQUESTS` | `0x0650`, UInt16 | 808, beside `DATA_DISCOVERABLE` |
+| Field | `DATA_REQUEST_CURSOR` | `0x0651`, Binary | Get Message Requests and its reply |
+| Field | `DATA_REQUEST_ACTION` | `0x0652`, UInt16: 1 approve, 2 delete, 3 end | Answer Message Request |
+| Field | `DATA_REQUEST_COUNT` | `0x0653`, UInt32 | Get Message Requests, Clear Message Requests and Message Requests Changed replies, as each says |
+| Field | `DATA_FRIEND_REQUEST_COUNT` | `0x0654`, UInt32 | Clear Message Requests' reply |
+| Field | `DATA_SPAN_SINCE`, `DATA_SPAN_BEFORE` | `0x0655`, `0x0656`, UInt64, Unix seconds | Clear Message Requests |
+| Field | `DATA_MAX_REQUEST_MESSAGES` | `0x0625`, UInt32 | Login reply, in the limits sub-block: `request_messages`; absent when the server takes no requests |
+| Field | `DATA_FRIEND_OFFER`, `DATA_FRIENDSHIP`, `DATA_FRIEND_WITHDRAW`, `DATA_FRIENDSHIP_HASH`, `DATA_IDENTITY_ROTATION` | `0x0658`–`0x065C`, Binary | portable friends §7 |
 
-Device proof (portable friends §3) is not messaging's and is asked for
-on its own, as a standalone extension with a capability bit,
-transactions and fields outside these ranges, since sealed messages,
-portable friendships and the server link's user keys draft all need a
-classic session that proved a device.
+Device proof (portable friends §3) is not messaging's and is reserved
+on its own, as a standalone extension, since sealed messages, portable
+friendships and the server link's user keys draft all need a classic
+session that proved a device: capability bit 14 (`0x4000`),
+transactions 1020 Get Device Challenge and 1021 Prove Device, and
+fields `0x0420` `DATA_PROOF_HOST`, `0x0421` `DATA_SERVER_CHALLENGE`,
+`0x0422` `DATA_DEVICE_PROOF`, `0x0423` `DATA_DEVICE_CERT` and `0x0424`
+`DATA_USER_CARD`.
 
 **Asked of fogWraith**, beside the numbers:
 
-1. to reserve the numbers above;
+1. to adopt the numbers above, which he has reserved;
 2. to comment on message requests, as an optional section of the
    extension or a companion draft;
 3. to accept the deviations a client other than ours depends on:
@@ -624,10 +630,10 @@ classic session that proved a device.
    own, which the identity draft and the user keys draft cite.
 
 **What an existing client sees.** Everything asked is opt-in: a client
-that sets no new capability bit, sends no new field and never lists
-requests is answered as the extension answers it today, and is sent
+that sets no new capability bit, sends no new field and never opts in
+to requests is answered as the extension answers it today, and is sent
 nothing it has not seen before. Requests pass only between accounts
-whose clients have both listed them (§4.1); portable friendships go
+whose clients have both opted in (§4.1), with `DATA_TAKES_REQUESTS`; portable friendships go
 only to sessions that negotiated `CAPABILITY_FRIENDSHIPS`; Prove Device
 changes only the session that sends it. Two things an existing client
 can notice are asked as what a server MAY or SHOULD do, with replies
@@ -649,7 +655,7 @@ operations and states under the ng spellings, and for requests:
 - `requests_clear` `{ since?, before? }` (§4.3), Unix seconds as `at`
   is, answered `{ declined, deleted }`;
 - the event `requests_changed` `{ count }`, the senders waiting, to
-  sessions that have listed requests;
+  sessions that have opted in;
 - `takes_requests` in the profile, beside `discoverable`; a profile
   update that leaves it out leaves it as it was, since the classic
   wire sets it in 808 rather than in the whole-profile 826;
@@ -679,8 +685,8 @@ Each stage is a branch with tests, in the house style.
    block list into it, under one conformance suite with the rename,
    linking and rotation cases in it; friendships and approvals with
    their ids; requests, the ledger and holds (§4.4); per-account status
-   text, `discoverable`, taking requests and when requests were last
-   listed, and profile; the inbox's friendship column.
+   text, `discoverable`, taking requests and when a session last opted
+   in, and profile; the inbox's friendship column.
 2. **IM2, the domain.** `Core`'s friend operations, telling both
    parties' sessions; presence summed across a login's sessions; the
    Invisible rule; discovery that shows non-friends no presence; IM Send
@@ -704,7 +710,7 @@ Each stage is a branch with tests, in the house style.
    `message.friendship` in the transaction that merged, so a failed
    one is not lost; `account_delete`'s purge safe against a send in
    flight, the deleting session and a store that fails; a signed
-   request's id held to one content and one recipient by the ledger;
+   request's id held to one content by the ledger;
    a released request counted once toward the daily quota; and a link
    made while the account has sessions re-keying them, or ending them.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
@@ -772,7 +778,7 @@ hxd-ng's own policy and is not.
 *Proposed upstream:*
 
 - **Message requests** (§4): between accounts that both take requests,
-  an 810 to a non-friend succeeds with `Requested` instead of failing
+  which a session opts in to with `DATA_TAKES_REQUESTS` in 808, an 810 to a non-friend succeeds with `Requested` instead of failing
   `NotFriends`; and an 810 to an account that has blocked the sender
   fails `AccountNotFound`, as Find User does, instead of `Blocked`,
   carrying to 810 the extension's SHOULD at 802.
@@ -788,7 +794,8 @@ hxd-ng's own policy and is not.
   `PendingIn` does not count toward the recipient's `MaxRosterSize`, so
   an 805 that accepts at the cap is refused `RosterFull`; an unanswered
   request lapses, where the extension's never do; and two crossing
-  requests accept each other (§3).
+  requests accept each other from a session that has opted in to
+  requests (§3).
 - **Sealed messages** (§4.1): refused to anyone but a friend, where the
   identity draft would carry one to anyone holding the certificate.
 

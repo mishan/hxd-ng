@@ -78,7 +78,7 @@ pub struct Gated {
     pub relationships: Arc<dyn RelationshipStore>,
 }
 
-/// What a session that lists requests reads.
+/// What a session that has opted in to requests reads.
 const INSTANT: Pending = Pending::Instant {
     again: false,
     approvals: true,
@@ -456,6 +456,14 @@ fn a_handed_message_waits_for_its_ack(g: &Gated) {
     assert!(
         s.pending_of(&dave, 10, AGAIN).unwrap().is_empty(),
         "{case}: until it is acknowledged"
+    );
+    assert!(
+        s.receipt_told(id, at(4)).unwrap(),
+        "{case}: a read told once"
+    );
+    assert!(
+        !s.receipt_told(id, at(5)).unwrap(),
+        "{case}: and never again"
     );
 }
 

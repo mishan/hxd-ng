@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use super::im::lists_requests;
+use super::im::opted_in;
 use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
 use crate::inbox::{Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
@@ -62,11 +62,10 @@ struct Sending {
     mailbox: Mailbox,
     /// Its session takes part in messaging.
     takes_part: bool,
-    /// It has listed requests.
-    lists: bool,
-    /// It is on the classic wire, which can never list requests, and is
-    /// exempt from having to, and from holding `AccessMessaging`
-    /// (§4.1).
+    /// It has opted in to requests.
+    opted: bool,
+    /// It is on the classic wire, which is exempt from opting in, and
+    /// from holding `AccessMessaging`, to send a request (§4.1).
     classic: bool,
 }
 
@@ -110,14 +109,14 @@ impl Core {
         out
     }
 
-    /// Tell `of`'s sessions that list requests how many senders wait.
+    /// Tell `of`'s sessions that have opted in to requests how many senders wait.
     fn requests_changed(&self, of: &Mailbox) {
         let count = self.requesters(of).len();
         let mut r = self.roster.lock().unwrap();
         let to: Vec<Uid> = r
             .messengers(&Key::of(of))
             .into_iter()
-            .filter(|u| r.users.get(u).is_some_and(lists_requests))
+            .filter(|u| r.users.get(u).is_some_and(opted_in))
             .collect();
         for uid in to {
             r.send_to(uid, Event::RequestsChanged { count });
@@ -157,7 +156,7 @@ impl Core {
             Sending {
                 mailbox: s.mailbox(),
                 takes_part: s.messaging.is_some(),
-                lists: s.messaging.as_ref().is_some_and(|m| m.lists_requests),
+                opted: s.messaging.as_ref().is_some_and(|m| m.opted_in),
                 classic: s.reads_on_delivery,
             }
         };
@@ -166,7 +165,7 @@ impl Core {
         }
         if !takes_part {
             let me = &sending.mailbox;
-            let asked = sending.lists
+            let asked = sending.opted
                 && self
                     .requesters(me)
                     .iter()
@@ -219,6 +218,7 @@ impl Core {
         let rel = self.friends_store().map_err(chat_error)?;
         let me = Me {
             mailbox: sending.mailbox.clone(),
+            opted: sending.opted,
         };
         // A block reads as no account at all, before any bound.
         if rel
@@ -238,7 +238,7 @@ impl Core {
         if let Some(g) = guid {
             let sender = Requester::Account(me.mailbox.clone());
             if rel
-                .find_request(&sender, &them, g)
+                .find_request(&sender, Some(&them), g)
                 .map_err(|e| chat_error(store_failed(e)))?
                 .is_some()
             {
@@ -255,12 +255,9 @@ impl Core {
                 guid.clone(),
                 signed.clone(),
             )
-            .map(|sent| {
-                if sent.delivered {
-                    MsgOutcome::Delivered
-                } else {
-                    MsgOutcome::Queued(sent.id)
-                }
+            .map(|sent| match (sent.delivered, sent.id) {
+                (false, Some(id)) => MsgOutcome::Queued(id),
+                _ => MsgOutcome::Delivered,
             })
             .map_err(chat_error)
         };
@@ -277,8 +274,8 @@ impl Core {
             return store((id, true));
         }
         // Writing back is consent to the conversation (§4.3), from a
-        // session that has shown requests.
-        if sending.lists
+        // session that has opted in.
+        if sending.opted
             && self
                 .requesters(&me.mailbox)
                 .iter()
@@ -289,13 +286,13 @@ impl Core {
                 .map_err(chat_error)?;
             return store((id, true));
         }
-        // Both sides take requests, a classic sender aside, which never
-        // can list them and is exempt from having to (§4.1).
+        // Both sides take requests, a classic sender aside, which is
+        // exempt from opting in (§4.1).
         let read = |of: &Mailbox| rel.account(of).map_err(|e| chat_error(store_failed(e)));
         let may_ask = sending.classic
-            || (sending.takes_part && sending.lists && read(&me.mailbox)?.takes_requests);
+            || (sending.takes_part && sending.opted && read(&me.mailbox)?.takes_requests);
         let account = read(&them)?;
-        if !may_ask || !account.takes_requests || account.requests_listed_at.is_none() {
+        if !may_ask || !account.takes_requests {
             return Err(ChatError::NotFriends);
         }
         self.request(
@@ -305,7 +302,7 @@ impl Core {
             text,
             guid,
             signed,
-            account.requests_listed_at,
+            account.requests_opted_at,
         )
         .map_err(chat_error)?;
         Ok(MsgOutcome::Requested)
@@ -322,7 +319,7 @@ impl Core {
         text: &str,
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
-        listed_at: Option<SystemTime>,
+        opted_at: Option<SystemTime>,
     ) -> Result<(), MessagingError> {
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
@@ -340,6 +337,11 @@ impl Core {
         let _writing = self.friend_writes();
         if rel.is_blocked(them, me).map_err(store_failed)? {
             return Err(MessagingError::AccountNotFound);
+        }
+        if let (Some(_), Some(g)) = (signed, guid) {
+            if self.signed_elsewhere(me, them, g).map_err(store_failed)? {
+                return Err(MessagingError::Equivocation);
+            }
         }
         let retained = now
             .checked_sub(p.request_retention)
@@ -377,9 +379,10 @@ impl Core {
         if rel.is_held(them, &sender, now).map_err(store_failed)? {
             return Ok(());
         }
-        // A recipient that has not looked in a while is answered as one
-        // taking requests, so a stranger cannot tell when it last did.
-        let lapsed = listed_at.is_some_and(|at| at < retained);
+        // A recipient none of whose sessions has opted in for a while is
+        // answered as one taking requests, so a stranger cannot tell when
+        // one last did.
+        let lapsed = opted_at.is_some_and(|at| at < retained);
         let waiting = self.requesters(them);
         let new = !waiting.iter().any(|s| Key::of(s) == Key::of(me));
         if lapsed || (new && waiting.len() >= p.max_requests) {
@@ -428,6 +431,13 @@ impl Core {
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
         let now = self.clock.wall();
+        // Under the lock a block's cleanup takes, as a request is stored.
+        let _writing = self.friend_writes();
+        if rel.is_blocked(them, me).map_err(store_failed)?
+            || rel.is_blocked(me, them).map_err(store_failed)?
+        {
+            return Err(MessagingError::NoSuchRequest);
+        }
         if rel.roster_size(me, now).map_err(store_failed)? >= self.messaging_policy.max_roster {
             return Err(MessagingError::RosterFull);
         }
@@ -471,27 +481,14 @@ impl Core {
         self.im_deliver(b, None, 0);
     }
 
-    /// The caller's message requests and approvals (§4.5). Listing is what
-    /// marks its account as taking requests and the session as one shown
-    /// them.
+    /// The caller's message requests and approvals (§4.5). Listing is
+    /// only listing: taking requests is an opt-in of its own (§4.1).
     pub fn requests_list(&self, uid: Uid) -> Result<RequestsListing, MessagingError> {
         let me = self.messenger(uid)?;
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
-        if let Some(m) = self
-            .roster
-            .lock()
-            .unwrap()
-            .users
-            .get_mut(&uid)
-            .and_then(|s| s.messaging.as_mut())
-        {
-            m.lists_requests = true;
-        }
         let now = self.clock.wall();
-        let dropped = rel
-            .requests_listed(&me.mailbox, now)
-            .map_err(store_failed)?;
+        let dropped = rel.requests_listed(&me.mailbox).map_err(store_failed)?;
         let mut requests: Vec<RequestGroup> = Vec::new();
         for m in inbox
             .requests(&me.mailbox, self.requests_since(), self.requests_bound())
@@ -653,11 +650,14 @@ fn chat_error(e: MessagingError) -> ChatError {
         MessagingError::QueueFull => ChatError::MailboxFull,
         MessagingError::SignedElsewhere => ChatError::SignedElsewhere,
         MessagingError::Equivocation => ChatError::Equivocation,
-        MessagingError::AccountNotFound | MessagingError::Blocked => ChatError::NoSuchUser,
+        // A request a block has just deleted reads as no account, as the
+        // block does.
+        MessagingError::AccountNotFound
+        | MessagingError::Blocked
+        | MessagingError::NoSuchRequest => ChatError::NoSuchUser,
         MessagingError::MessageTooLong
         | MessagingError::AlreadyFriends
         | MessagingError::RequestPending
-        | MessagingError::NoSuchRequest
         | MessagingError::ServerError => ChatError::ServerError,
     }
 }

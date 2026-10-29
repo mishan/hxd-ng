@@ -26,6 +26,8 @@ struct Inner {
     msgs: Vec<StoredMessage>,
     /// Instant messages handed over and not yet acknowledged.
     handed: HashSet<MessageId>,
+    /// Messages whose read receipt was told.
+    receipted: HashSet<MessageId>,
 }
 
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
@@ -333,6 +335,10 @@ impl MessageStore for MemoryStore {
         let mut inner = self.inner.lock().unwrap();
         inner.handed.extend(ids.iter().copied());
         Ok(())
+    }
+
+    fn receipt_told(&self, id: MessageId, _at: SystemTime) -> Result<bool, StoreError> {
+        Ok(self.inner.lock().unwrap().receipted.insert(id))
     }
 
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {

@@ -2077,6 +2077,35 @@ impl Core {
         )
     }
 
+    /// Has `from` used the signed id `guid` toward someone other than
+    /// `to` (`docs/e2e-messages.md` §3.6)? The request ledger is asked
+    /// too, which keeps what a recipient held or deleted, so the answer
+    /// never tells the sender what became of a request
+    /// (`docs/instant-messaging.md` §4.2).
+    pub(crate) fn signed_elsewhere(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+        guid: &MessageGuid,
+    ) -> Result<bool, StoreError> {
+        let other = |m: &Mailbox| !to.matches(&m.login, m.fingerprint.as_ref());
+        if let Some(store) = self.inbox.as_ref() {
+            if store
+                .find_sent(from, guid)?
+                .is_some_and(|m| other(&m.recipient))
+            {
+                return Ok(true);
+            }
+        }
+        let sender = crate::relationships::Requester::Account(from.clone());
+        Ok(match self.relationships.as_ref() {
+            Some(rel) => rel
+                .find_request(&sender, None, guid)?
+                .is_some_and(|e| other(&e.recipient)),
+            None => false,
+        })
+    }
+
     /// Has `from` stored its day's allowance of mail, or would `adds`
     /// more bytes take it past? A rolling day, read from the store, so a
     /// restart forgets nothing.
@@ -2271,13 +2300,11 @@ impl Core {
         // sender used toward someone else is another message. Toward this
         // recipient, `push` finds it.
         if let (Some(_), Some(g)) = (&signed, &guid) {
-            if let Some(m) = store.find_sent(&from_mailbox, g).map_err(store_failed)? {
-                if !to
-                    .mailbox
-                    .matches(&m.recipient.login, m.recipient.fingerprint.as_ref())
-                {
-                    return Err(ChatError::Equivocation);
-                }
+            if self
+                .signed_elsewhere(&from_mailbox, &to.mailbox, g)
+                .map_err(store_failed)?
+            {
+                return Err(ChatError::Equivocation);
             }
         }
 
@@ -2553,7 +2580,7 @@ impl Core {
     /// What a flush to `target` reads: a session that speaks the friend
     /// family is handed a friend's instant messages at its roster read
     /// instead, and what an approval carries waits for a session that
-    /// lists requests where the account has one
+    /// has opted in to requests where the account takes them
     /// (`docs/instant-messaging.md` §5, §4.6).
     fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
         let messenger = {
@@ -2569,7 +2596,7 @@ impl Core {
         };
         if messenger {
             crate::inbox::Pending::Mail
-        } else if self.messaging_enabled() && !self.never_listed(mailbox) {
+        } else if self.messaging_enabled() && !self.opted_out(mailbox) {
             crate::inbox::Pending::Unapproved
         } else {
             crate::inbox::Pending::All
@@ -6096,6 +6123,13 @@ mod inbox_tests {
             at: std::time::SystemTime,
         ) -> Result<(), StoreError> {
             self.inner.mark_handed(ids, at)
+        }
+        fn receipt_told(
+            &self,
+            id: MessageId,
+            at: std::time::SystemTime,
+        ) -> Result<bool, StoreError> {
+            self.inner.receipt_told(id, at)
         }
         fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {
             self.inner.pending_count(to)

@@ -824,8 +824,13 @@ CREATE INDEX message_friendship ON message (friendship) WHERE friendship IS NOT 
 /// An instant message handed to a session that acknowledges it, and not
 /// yet acknowledged (`docs/instant-messaging.md` §5): counted as
 /// delivered toward the queue cap, and handed over again at Get Roster.
+/// When a read receipt for a message was told, so it is told once. And
+/// taking requests made an opt-in (§4.1), which no session has made yet.
 const SCHEMA_V29: &str = "
 ALTER TABLE message ADD COLUMN handed_at INTEGER;
+ALTER TABLE message ADD COLUMN receipt_at INTEGER;
+ALTER TABLE messaging_account RENAME COLUMN requests_listed_at TO requests_opted_at;
+UPDATE messaging_account SET takes_requests = 0, requests_opted_at = NULL;
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -2007,6 +2012,17 @@ impl MessageStore for SqliteStore {
             }
         }
         tx.commit().map_err(StoreError::new)
+    }
+
+    fn receipt_told(&self, id: MessageId, at: SystemTime) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE message SET receipt_at = ?1 WHERE id = ?2 AND receipt_at IS NULL",
+                params![unix(at), clamp_id(id)],
+            )
+            .map_err(StoreError::new)?;
+        Ok(changed == 1)
     }
 
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {

@@ -314,8 +314,8 @@ pub enum Pending {
     /// a session that does not speak the friend family is given.
     All,
     /// [`Pending::All`] but what was sent under an approval, which waits
-    /// for a session that lists requests (`docs/instant-messaging.md`
-    /// §4.6).
+    /// for a session that has opted in to requests
+    /// (`docs/instant-messaging.md` §4.6).
     Unapproved,
     /// Private messages alone.
     Mail,
@@ -410,6 +410,11 @@ pub trait MessageStore: Send + Sync + 'static {
     /// queue cap, and handed over again at Get Roster until one is
     /// acknowledged ([`Pending::Instant`]).
     fn mark_handed(&self, ids: &[MessageId], at: SystemTime) -> Result<(), StoreError>;
+
+    /// Note that `id`'s read receipt is told: true the first time alone,
+    /// so a read is told once however often it is acknowledged, and
+    /// whatever else stamped the row read.
+    fn receipt_told(&self, id: MessageId, at: SystemTime) -> Result<bool, StoreError>;
 
     /// How many messages are waiting to be flushed. Messages only: a
     /// chatty reader's receipts must not fill the mailbox they are
