@@ -29,8 +29,9 @@ docker run -d --name hxd-ng --restart unless-stopped \
   ghcr.io/mishan/hxd-ng:latest
 ```
 
-Tags are `latest` and `sha-<commit>`; pin the second in anything that
-should not change under you. `docker build -t hxd-ng .` builds the same
+Tags are `latest` and `sha-<commit>` from main, and `X.Y.Z` and `X.Y`
+for each release; pin a version or a `sha-` in anything that should not
+change under you. `docker build -t hxd-ng .` builds the same
 image from a checkout (see [Building](#building)).
 
 Then put [`docker/nginx.conf`](../docker/nginx.conf) in `/etc/nginx/conf.d/`

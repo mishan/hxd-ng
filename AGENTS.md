@@ -612,6 +612,16 @@ a client trace and a server trace of the same session line up.
 - Prefer a scripted reproduction (an e2e test against a live in-process
   server) over interactive debugging sessions.
 
+### Releasing
+
+The version is the `hxd` binary's, semver in 0.x: a minor release for
+anything an operator must act on — a schema migration, a config key
+added or renamed, a protocol change — and a patch release for fixes.
+The release PR bumps `crates/hxd/Cargo.toml` and adds the
+`CHANGELOG.md` entry, written for operators from the merge commits
+since the last tag. Once it merges, tag `vX.Y.Z` on main; the tag
+publishes the image as `X.Y.Z` and `X.Y`.
+
 ## Where things stand, and what's next
 
 ROADMAP.md carries live status. In brief: the legacy server covers login,
