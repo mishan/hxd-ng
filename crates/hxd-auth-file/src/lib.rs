@@ -275,11 +275,8 @@ pub struct FileAuth {
     /// of files this is what provides it. Never held across anything but
     /// this backend's own I/O.
     assoc: Mutex<()>,
-    /// login → (file identity, fingerprint text) for every account file
-    /// seen. Lets `find_by_fingerprint` stat the directory instead of
-    /// reading and parsing every account on every identity auth; a file
-    /// whose size or mtime moved is re-read, so a hand edit still counts.
-    index: Mutex<HashMap<String, (FileStamp, Option<String>)>>,
+    /// What `find_by_fingerprint` knows without reading the directory.
+    index: Mutex<Index>,
     /// A login nobody may authenticate as, lowercase: the reserved
     /// server account (`docs/system-account.md` §2). It is on the roster
     /// and it is a mailbox, and it is reachable by nobody — which for
@@ -294,6 +291,21 @@ pub struct FileAuth {
     roles: RwLock<Arc<Roles>>,
 }
 
+#[derive(Default)]
+struct Index {
+    /// login to (file identity, fingerprint text) for every account file
+    /// seen. Lets a scan stat the directory instead of reading and
+    /// parsing every account; a file whose size or mtime moved is
+    /// re-read, so a hand edit still counts.
+    files: HashMap<String, (FileStamp, Option<String>)>,
+    /// Lowercased fingerprint text to the login found carrying it, so a
+    /// fingerprint looked up before costs one file's `stat` rather than
+    /// the directory's (`docs/instant-messaging.md` §8). Kept in step by
+    /// linking and unlinking, and checked against the file on every hit,
+    /// so a hand edit that moved the link falls back to the scan.
+    by_fp: HashMap<String, String>,
+}
+
 /// Enough of a file's metadata to notice an edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
@@ -306,7 +318,7 @@ impl FileAuth {
         FileAuth {
             dir: dir.into(),
             assoc: Mutex::new(()),
-            index: Mutex::new(HashMap::new()),
+            index: Mutex::new(Index::default()),
             reserved: None,
             roles_file: None,
             roles: RwLock::new(Arc::new(Roles::default())),
@@ -1324,9 +1336,21 @@ impl FileAuth {
     /// account instead. Comparison is on the stored text, case-folded,
     /// so an unreadable value in one file can't affect another account.
     fn login_for(&self, fingerprint: &[u8; 32]) -> Result<Option<String>, AuthError> {
-        let want = hl_identity::Fingerprint(*fingerprint).to_string();
+        let want = hl_identity::Fingerprint(*fingerprint)
+            .to_string()
+            .to_ascii_lowercase();
+        let mut guard = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(login) = guard.by_fp.get(&want).cloned() {
+            if self.carries(&mut guard.files, &login, &want) {
+                return Ok(Some(login));
+            }
+            guard.by_fp.remove(&want);
+        }
         let entries = self.entries()?;
-        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        let Index {
+            files: index,
+            by_fp,
+        } = &mut *guard;
         // `entries` is sorted by login, so this is a binary search per
         // index key rather than a scan: the prune runs on every identity
         // auth, under the index mutex, and a directory of any size made
@@ -1376,7 +1400,41 @@ impl FileAuth {
                 found = Some(login);
             }
         }
+        if let Some(login) = &found {
+            by_fp.insert(want, login.clone());
+        }
         Ok(found)
+    }
+
+    /// Does `login`'s file still carry the fingerprint `want`? One
+    /// `stat`, and a read only where the file moved or has not settled.
+    fn carries(
+        &self,
+        files: &mut HashMap<String, (FileStamp, Option<String>)>,
+        login: &str,
+        want: &str,
+    ) -> bool {
+        let Ok(meta) = std::fs::metadata(self.dir.join(format!("{login}.toml"))) else {
+            return false;
+        };
+        let stamp = FileStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        };
+        let settled = settled(&stamp, SystemTime::now());
+        let fp = match files.get(login) {
+            Some((s, fp)) if settled && *s == stamp => fp.clone(),
+            _ => {
+                let Ok(file) = self.load(login) else {
+                    return false;
+                };
+                if settled {
+                    files.insert(login.to_owned(), (stamp, file.identity.fingerprint.clone()));
+                }
+                file.identity.fingerprint
+            }
+        };
+        fp.is_some_and(|fp| fp.eq_ignore_ascii_case(want))
     }
 
     /// Set or clear one account's `identity.fingerprint`, preserving the
@@ -1414,7 +1472,16 @@ impl FileAuth {
             }
         }
         write_atomic(&path, &doc.to_string())
-            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))?;
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        index.by_fp.retain(|_, l| *l != login);
+        if let Some(fp) = fingerprint {
+            let text = hl_identity::Fingerprint(fp)
+                .to_string()
+                .to_ascii_lowercase();
+            index.by_fp.insert(text, login);
+        }
+        Ok(())
     }
 }
 
@@ -2021,6 +2088,34 @@ mod tests {
         // And a deleted account leaves the index.
         std::fs::remove_file(td.path().join("alice.toml")).unwrap();
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+    }
+
+    /// A fingerprint found once is looked for in that file first; a hand
+    /// edit that moved it to another account is found there all the same.
+    #[test]
+    fn a_link_moved_by_hand_is_found_where_it_went() {
+        let (td, auth) = backend();
+        let fp = [8u8; 32];
+        let linked = format!(
+            "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &linked);
+        write(td.path(), "bob.toml", "password = \"pw\"\n");
+        assert_eq!(
+            auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
+            "alice"
+        );
+        write(td.path(), "alice.toml", "password = \"pw\"\n");
+        write(td.path(), "bob.toml", &linked);
+        assert_eq!(auth.find_by_fingerprint(&fp).unwrap().unwrap().login, "bob");
+        auth.unlink_identity(&fp).unwrap();
+        assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
+        auth.link_identity("alice", &fp).unwrap();
+        assert_eq!(
+            auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
+            "alice"
+        );
     }
 
     #[test]

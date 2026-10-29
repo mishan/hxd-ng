@@ -31,6 +31,7 @@ use crate::inbox::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
     StoreError, StoredMessage,
 };
+use crate::relationships::RelationshipStore;
 use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
 use crate::Core;
 
@@ -2231,7 +2232,8 @@ impl Core {
         // recipient can sidestep by clicking a name in the user list is
         // not a block.
         let from_mailbox = sender.mailbox.clone().expect("checked by `durable`");
-        if store
+        if self
+            .relationships()?
             .is_blocked(&to.mailbox, &from_mailbox)
             .map_err(store_failed)?
         {
@@ -2339,6 +2341,7 @@ impl Core {
                     kind: MessageKind::Message,
                     media: media.as_ref().map(|m| m.to_meta()),
                     signed: signed.clone(),
+                    friendship: None,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -2778,7 +2781,7 @@ impl Core {
     /// against. Naming anything else answers `NoSuchUser`, the same one
     /// answer `msg_login` gives.
     pub fn inbox_block(&self, uid: Uid, other: &str, blocked: bool) -> Result<(), ChatError> {
-        let (store, mailbox) = self.inbox_of(uid)?;
+        let (store, mailbox) = self.relationships_of(uid)?;
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
         let other = directory
             .inbox_account(other)
@@ -2804,7 +2807,7 @@ impl Core {
         if let Some(done) = self.block_ghost(uid, other, blocked) {
             return done;
         }
-        let (store, mailbox) = self.inbox_of(uid)?;
+        let (store, mailbox) = self.relationships_of(uid)?;
         let other = {
             let r = self.roster.lock().unwrap();
             let sess = r
@@ -2830,7 +2833,7 @@ impl Core {
     /// answer for once they left. The fingerprint is what identifies
     /// that block, so it is what the list carries.
     pub fn inbox_blocked(&self, uid: Uid) -> Result<Vec<Mailbox>, ChatError> {
-        let (store, mailbox) = self.inbox_of(uid)?;
+        let (store, mailbox) = self.relationships_of(uid)?;
         store.blocked(&mailbox).map_err(store_failed)
     }
 
@@ -2843,7 +2846,7 @@ impl Core {
         uid: Uid,
         fingerprint: &[u8; 32],
     ) -> Result<(), ChatError> {
-        let (store, mailbox) = self.inbox_of(uid)?;
+        let (store, mailbox) = self.relationships_of(uid)?;
         let other = store
             .blocked(&mailbox)
             .map_err(store_failed)?
@@ -2857,13 +2860,18 @@ impl Core {
 
     /// An account has linked an identity: move its mail onto the
     /// fingerprint. The account-linking path owes this call — see
-    /// [`crate::inbox::MessageStore::claim`]. News subscriptions and push
-    /// devices are keyed the same way and move in the same call, so every
-    /// link site that pays one obligation pays all three. Returns how
-    /// much mail moved.
+    /// [`crate::inbox::MessageStore::claim`]. Relationships, news
+    /// subscriptions and push devices are keyed the same way and move in
+    /// the same call, so every link site that pays one obligation pays
+    /// them all. Returns how much mail moved.
     pub fn inbox_claim(&self, login: &str, fingerprint: &[u8; 32]) -> usize {
         self.news_subs_claim(login, fingerprint);
         self.devices_claim(login, fingerprint);
+        if let Some(store) = self.relationships.as_ref() {
+            if let Err(e) = store.claim(login, fingerprint) {
+                warn!("relationships: claiming {login}'s: {e}");
+            }
+        }
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -2876,8 +2884,8 @@ impl Core {
         }
     }
 
-    /// An account has been deleted: take its mail, its news
-    /// subscriptions and its push devices with it, so a later holder of
+    /// An account has been deleted: take its mail, its relationships, its
+    /// news subscriptions and its push devices with it, so a later holder of
     /// the freed login inherits none of them. Its news push budget goes too, but that is
     /// memory, and only a purge in the server's own process reaches it —
     /// `hxd inbox purge` purges the stores from a process of its own (see
@@ -2885,6 +2893,11 @@ impl Core {
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.news_subs_purge(of);
         self.devices_purge(of);
+        if let Some(store) = self.relationships.as_ref() {
+            if let Err(e) = store.purge(of) {
+                warn!("relationships: purging {}: {e}", of.login);
+            }
+        }
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
@@ -2910,6 +2923,21 @@ impl Core {
                 0
             }
         }
+    }
+
+    /// The relationship store and `uid`'s mailbox in it, on the terms
+    /// [`Self::inbox_of`] gives the inbox: blocks are between accounts
+    /// that have inboxes.
+    fn relationships_of(
+        &self,
+        uid: Uid,
+    ) -> Result<(&Arc<dyn RelationshipStore>, Mailbox), ChatError> {
+        let (_, mailbox) = self.inbox_of(uid)?;
+        Ok((self.relationships()?, mailbox))
+    }
+
+    fn relationships(&self) -> Result<&Arc<dyn RelationshipStore>, ChatError> {
+        self.relationships.as_ref().ok_or(ChatError::NoInbox)
     }
 
     /// The store and the mailbox behind a session, when both exist.
@@ -5606,6 +5634,7 @@ mod inbox_tests {
     fn a_rotation_takes_the_mailbox_the_blocks_and_the_subscriptions() {
         use crate::news::{MemoryNews, NewNode, NewsPolicy, NewsStore, NodeKind, SubScope};
         let store = Arc::new(MemoryStore::new());
+        let relationships = Arc::new(crate::relationships::MemoryRelationships::new());
         let news = Arc::new(MemoryNews::new());
         let dir = Arc::new(Directory(vec![
             Mailbox::identified("alice", fp(10)),
@@ -5614,6 +5643,7 @@ mod inbox_tests {
         let core = Arc::new(
             Core::new()
                 .with_inbox(store.clone(), dir, InboxPolicy::default())
+                .with_relationships(relationships.clone())
                 .with_news(news.clone(), NewsPolicy::default()),
         );
         let (s, _rs) = attach(&core, "sender", true);
@@ -5624,7 +5654,7 @@ mod inbox_tests {
             Mailbox::identified("alice", fp(12)),
         );
         let now = SystemTime::now();
-        store
+        relationships
             .set_blocked(&old, &Mailbox::login("sender"), true, now)
             .unwrap();
         let node = NewNode {
@@ -5650,7 +5680,10 @@ mod inbox_tests {
             &msgs(drain(&mut ra))[..],
             [Event::Msg { text, .. }] if text == "private"
         ));
-        assert_eq!(store.blocked(&new).unwrap(), [Mailbox::login("sender")]);
+        assert_eq!(
+            relationships.blocked(&new).unwrap(),
+            [Mailbox::login("sender")]
+        );
         assert_eq!(news.subscriptions(&new).unwrap().len(), 1);
     }
 
@@ -5986,21 +6019,6 @@ mod inbox_tests {
             read: Duration,
         ) -> Result<usize, StoreError> {
             self.inner.prune(now, unread, read)
-        }
-        fn set_blocked(
-            &self,
-            owner: &Mailbox,
-            other: &Mailbox,
-            blocked: bool,
-            at: SystemTime,
-        ) -> Result<(), StoreError> {
-            self.inner.set_blocked(owner, other, blocked, at)
-        }
-        fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
-            self.inner.is_blocked(owner, other)
-        }
-        fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError> {
-            self.inner.blocked(owner)
         }
         fn sent_since(
             &self,

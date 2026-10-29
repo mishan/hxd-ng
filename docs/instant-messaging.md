@@ -1,6 +1,6 @@
 # Instant messaging
 
-Status: design, unimplemented. hxd-ng's implementation of fogWraith's
+Status: design; the store (IM1, §8) is built. hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
 ("the extension"), built on the inbox (`private-messages.md`), with
 message requests (§4) added. Friendships that travel with a person's
@@ -97,7 +97,7 @@ document and `proposals/portable-friends.md` say so, is a friendship.
 `private-messages.md` §9's behavior unchanged: a block is checked
 before anything is written, applies to every way of addressing an
 account, and is what the inbox's `set_blocked`, `is_blocked` and
-`blocked` (`MessageStore`) answer today. The ng `block`, `unblock` and
+`blocked` (`MessageStore`) answered before it moved. The ng `block`, `unblock` and
 `blocks` are Block User (806), Unblock User (807) and the `Blocked` rows
 of Get Roster under the ng spelling, with the same effects, so a block
 ends a friendship or an approval on either wire, on this server; it
@@ -114,8 +114,8 @@ bounds) holds as written. The Login stays the address on the wire.
 **Expiry is lazy.** Whatever lapses (an ignore, a hold, a friend
 request, a request, a queued message past retention) is stored with
 when it lapses, and is found lapsed when it is next read: the read
-compares that time with the core's clock, answers as if the row were
-gone, and deletes it then. A lapse is announced to nobody. A client
+compares that time with the core's clock and answers as if the lapsed
+part were gone, and the cleanup below deletes it. A lapse is announced to nobody. A client
 sees a lapsed friend request gone at its next roster read, and an act
 on one, 805 or 803, is answered `NotFriends` (ng `not_friends`), as on
 a request its sender withdrew. Counts against a
@@ -503,7 +503,8 @@ relationship store, through the same calls:
   next holder inherits nobody's relationships. A fingerprint-keyed
   account keeps them through a rename, and its friends are told as the
   identity draft has it: under bit 13 its entry in place, otherwise
-  `Removed` and a new entry.
+  `Removed` and a new entry. The purge of the old Login is owed for it
+  too, since a hold also matches by Login (§4.4).
 - **Deletion** (`Core::inbox_purge`) deletes the account's
   relationships in both directions: its rows, the rows naming it,
   friendships and approvals either way, the requests it sent and those
@@ -685,7 +686,10 @@ Each stage is a branch with tests, in the house style.
    onto the inbox, `delivered_at` at the ack, drained at Get Roster and
    gated in the store (§5); requests, approvals and their bounds (§4),
    `/msg <login>` among them; push (§5); the lifecycle calls of §6, with
-   `account_delete` purging. Unit-tested against the in-memory store.
+   `account_delete` purging; `message.friendship` re-stamped from the
+   ids a claim or rotation merged, and a friendship merged beside a
+   block ended, both parties told. Unit-tested against the in-memory
+   store.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol. hx-ng gains a friends list and a requests view. This
    is where the design is first used end to end, by a client we control.

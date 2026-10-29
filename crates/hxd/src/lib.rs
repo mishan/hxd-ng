@@ -3396,6 +3396,8 @@ fn open_sqlite_with(
 #[cfg(feature = "inbox")]
 struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
+    /// In the inbox's file, where its block list was.
+    relationships: Option<Arc<dyn hxd_core::RelationshipStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
@@ -3467,10 +3469,14 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     };
     // The inbox first, so a shared file gets the inbox's `sync`: it is
     // the section that asked for durability.
-    let inbox = match &inbox_path {
-        Some(p) => Some(open(p, inbox_sync)? as Arc<dyn hxd_core::MessageStore>),
+    let inbox_store = match &inbox_path {
+        Some(p) => Some(open(p, inbox_sync)?),
         None => None,
     };
+    let inbox = inbox_store
+        .clone()
+        .map(|s| s as Arc<dyn hxd_core::MessageStore>);
+    let relationships = inbox_store.map(|s| s as Arc<dyn hxd_core::RelationshipStore>);
     let news = match &news_path {
         Some(p) => Some(open(p, Synchronous::Normal)? as Arc<dyn hxd_core::NewsStore>),
         None => None,
@@ -3535,6 +3541,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     };
     Ok(RuntimeStores {
         inbox,
+        relationships,
         #[cfg(test)]
         history_sqlite: history.clone(),
         history: history.map(|h| h as Arc<dyn hxd_core::ChatLog>),
@@ -3574,6 +3581,7 @@ fn database_path(path: &Path) -> Result<PathBuf, String> {
 #[cfg(not(feature = "inbox"))]
 struct RuntimeStores {
     inbox: Option<Arc<dyn hxd_core::MessageStore>>,
+    relationships: Option<Arc<dyn hxd_core::RelationshipStore>>,
     history: Option<Arc<dyn hxd_core::ChatLog>>,
     news: Option<Arc<dyn hxd_core::NewsStore>>,
     devices: Option<Arc<dyn hxd_core::PushStore>>,
@@ -3604,6 +3612,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
     }
     Ok(RuntimeStores {
         inbox: None,
+        relationships: None,
         history: None,
         news: None,
         devices: None,
@@ -3622,7 +3631,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
 /// feature refuses a config that asks for a store in
 /// `open_runtime_stores`, so there is no second shape of this to keep.
 #[cfg(feature = "inbox")]
-fn open_inbox(config: &Config) -> Result<Option<Arc<dyn hxd_core::MessageStore>>, String> {
+fn open_inbox(config: &Config) -> Result<Option<Arc<hxd_store_sqlite::SqliteStore>>, String> {
     use hxd_store_sqlite::{SqliteStore, Synchronous};
     let Some(section) = &config.inbox else {
         return Ok(None);
@@ -3694,14 +3703,15 @@ fn open_inbox_kind(config: &Config) -> Result<InboxKind, String> {
 
 /// A handle that reads and does not write, for `--dry-run`.
 #[cfg(feature = "inbox")]
-fn open_read_only(path: &Path) -> Result<Arc<dyn hxd_core::MessageStore>, String> {
+fn open_read_only(path: &Path) -> Result<Arc<hxd_store_sqlite::SqliteStore>, String> {
     let store = hxd_store_sqlite::SqliteStore::open_read_only(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Arc::new(store))
 }
 
 /// `hxd inbox purge <login> [--fingerprint HEX]`: take an account's mail
-/// with it (`docs/private-messages.md` §4), and its news subscriptions,
+/// and relationships with it (`docs/private-messages.md` §4,
+/// `docs/instant-messaging.md` §6), and its news subscriptions,
 /// which are keyed the same way (`docs/news.md` §10.2).
 ///
 /// Deleting an account is `rm accounts/alice.toml`, which leaves the
@@ -3766,11 +3776,18 @@ pub fn inbox_purge(
         // not. Deleting mail is not undoable and the operator has just
         // deleted the account file, so it is worth being able to look
         // first.
-        (true, InboxKind::At(path)) => open_read_only(&path)?
-            .purge_count(&mailbox)
-            .map_err(|e| e.to_string())?,
+        (true, InboxKind::At(path)) => {
+            let store = open_read_only(&path)?;
+            hxd_core::MessageStore::purge_count(&*store, &mailbox).map_err(|e| e.to_string())?
+                + hxd_core::RelationshipStore::purge_count(&*store, &mailbox)
+                    .map_err(|e| e.to_string())?
+        }
         (false, InboxKind::At(_)) => match open_inbox(config)? {
-            Some(store) => store.purge(&mailbox).map_err(|e| e.to_string())?,
+            Some(store) => {
+                hxd_core::MessageStore::purge(&*store, &mailbox).map_err(|e| e.to_string())?
+                    + hxd_core::RelationshipStore::purge(&*store, &mailbox)
+                        .map_err(|e| e.to_string())?
+            }
             None => return Err("[inbox] is not configured; there is nothing to purge".into()),
         },
     };
@@ -4278,6 +4295,10 @@ pub fn build_ctx(
                 .as_ref()
                 .map_or_else(hxd_core::InboxPolicy::default, InboxSection::policy),
         ),
+        None => core,
+    };
+    let core = match stores.relationships {
+        Some(store) => core.with_relationships(store),
         None => core,
     };
     let core = match (stores.history, config.history.as_ref()) {
@@ -5559,6 +5580,7 @@ sync = "full"
     #[test]
     fn a_dry_run_counts_every_row_the_real_purge_removes() {
         use hxd_core::inbox::{Mailbox, MessageKind, MessageStore, NewMessage};
+        use hxd_core::RelationshipStore;
         use std::time::SystemTime;
 
         let dir = tempfile::tempdir().unwrap();
@@ -5583,6 +5605,7 @@ sync = "full"
                         kind,
                         media: None,
                         signed: None,
+                        friendship: None,
                     },
                     usize::MAX,
                 )

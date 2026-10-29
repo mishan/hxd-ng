@@ -21,6 +21,9 @@ impl Core {
         if let Some(store) = self.inbox.as_ref() {
             store.rotate(from, to)?;
         }
+        if let Some(store) = self.relationships.as_ref() {
+            store.rotate(from, to)?;
+        }
         self.news_rotate(from, to)?;
         if let Some(store) = self.devices.as_ref() {
             let taken = store.devices_rotate(from, to)?;

@@ -1462,6 +1462,9 @@ pub struct Core {
     /// calls are disk I/O and must not happen under the roster lock; a
     /// field the locked state cannot reach is a structural reminder.
     pub(crate) inbox: Option<Arc<dyn crate::inbox::MessageStore>>,
+    /// Blocks, and the rest of `docs/instant-messaging.md` §3. Off the
+    /// roster lock for the reason `inbox` is.
+    pub(crate) relationships: Option<Arc<dyn crate::relationships::RelationshipStore>>,
     /// Durable public-chat scrollback, or `None` when history is off.
     /// Store calls never happen under `roster`.
     pub(crate) history: Option<Arc<dyn crate::history::ChatLog>>,
@@ -1721,6 +1724,10 @@ impl Core {
     /// Give the domain a durable inbox. Without one, a private message to
     /// a detached session buffers in its outbox as before and a message to
     /// an account with no session is refused.
+    ///
+    /// The blocks an inbox checks are kept in memory unless
+    /// [`Self::with_relationships`] gives them a store of their own, so a
+    /// durable inbox wants a durable relationship store beside it.
     pub fn with_inbox(
         mut self,
         store: Arc<dyn crate::inbox::MessageStore>,
@@ -1728,8 +1735,19 @@ impl Core {
         policy: InboxPolicy,
     ) -> Self {
         self.inbox = Some(store);
+        self.relationships
+            .get_or_insert_with(|| Arc::new(crate::relationships::MemoryRelationships::new()));
         self.directory = Some(directory);
         self.inbox_policy = policy;
+        self
+    }
+
+    /// Keep blocks, and every other relationship, in `store`.
+    pub fn with_relationships(
+        mut self,
+        store: Arc<dyn crate::relationships::RelationshipStore>,
+    ) -> Self {
+        self.relationships = Some(store);
         self
     }
 

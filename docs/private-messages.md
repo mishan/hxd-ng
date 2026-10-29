@@ -230,12 +230,7 @@ pub trait MessageStore: Send + Sync + 'static {
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError>;
     fn prune(&self, now: SystemTime, unread: Duration, read: Duration)
         -> Result<usize, StoreError>;
-    // `at` because the store never reads a clock of its own: one clock,
-    // the caller's, so a test can move it.
-    fn set_blocked(&self, owner: &Mailbox, other: &Mailbox, blocked: bool, at: SystemTime)
-        -> Result<(), StoreError>;
-    fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError>;
-    fn blocked(&self, owner: &Mailbox) -> Result<Vec<Mailbox>, StoreError>;
+    // Blocks are the relationship store's (`instant-messaging.md` §3).
 }
 ```
 
@@ -278,16 +273,8 @@ CREATE UNIQUE INDEX message_guid ON message (
   IFNULL(sender_fp, IFNULL(sender, ''))
 ) WHERE guid IS NOT NULL;
 
-CREATE TABLE block (
-  id         INTEGER PRIMARY KEY,
-  owner      TEXT NOT NULL, owner_fp TEXT,
-  other      TEXT NOT NULL, other_fp TEXT,
-  created_at INTEGER NOT NULL         -- when, so a UI can say "blocked since"
-  -- One row per pair. Nothing enforces it in SQL, because the key is
-  -- again the mailbox rather than the columns; `claim` and `rotate`
-  -- de-duplicate after a merge, and the conformance suite holds both
-  -- stores to it.
-);
+-- The block list was a `block` table here until schema 28 moved it
+-- into the relationship store's `relationship` (`instant-messaging.md` §3).
 ```
 
 **`guid` is the client's own id, and it is parsed rather than stored as

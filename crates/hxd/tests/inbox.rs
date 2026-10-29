@@ -70,7 +70,9 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
     let core = Arc::new(if inbox {
         let store =
             Arc::new(SqliteStore::open(dir.join("messages.db"), Synchronous::Full).unwrap());
-        Core::new().with_inbox(store, auth.clone(), policy)
+        Core::new()
+            .with_inbox(store.clone(), auth.clone(), policy)
+            .with_relationships(store)
     } else {
         Core::new()
     });
