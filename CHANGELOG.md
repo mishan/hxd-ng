@@ -32,7 +32,7 @@ Designed but not built yet:
 - The delivered/read split for private messages: delivery to a classic client still marks a message read.
 - Instant messaging on the classic wire (the extension's 800-block for period clients), and portable friendships (docs/proposals/portable-friends.md).
 - Legacy text encodings other than Mac Roman, such as Shift-JIS or Latin-1.
-- The real-client exit tests for rooms (period 1.2, 1.5 and 1.9 clients) and for voice (a mixed room) have not been run.
+- The real-client exit test for rooms (period 1.2, 1.5 and 1.9 clients) has not been run.
 
 ### Legacy Hotline wire
 
