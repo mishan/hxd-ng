@@ -564,25 +564,19 @@ Three timestamps, each meaning one thing: `sent_at`, `delivered_at` (the
 server handed it to a live connection), `read_at` (a client said so, via
 `msg_read`).
 
-A legacy session has no way to say it read something, and an earlier
-draft of this section made delivery the read on that wire — the flush
-set both — on the argument that a permanently unread inbox for every 1.x
-user would make the count useless. The consequence it did not state is
-the one a person with a phone and a period client meets: the phone's
-badge drops to zero because the Mac received the message. So the two
-are split.
+A legacy session has no way to say it read something, so delivery is
+the read on that wire: a permanently unread inbox for every 1.x user
+would make the count useless. But a person with a phone and a period
+client should not see the phone's badge drop to zero because the Mac
+received the message, so the rule turns on who was handed the row.
 **Delivery to a legacy session is its read** — unless an ng session of the account was handed the same row in that flush, in which case it is stamped delivered only and left to that client's `msg_read`.
 
 Said plainly, because a client author and an operator will both meet
-it: **mail delivered to a period client stays unread on the ng side
-until an ng client marks it.** An account used only from 1.x has a
-count that only grows, and nothing on that wire can lower it; that is
-the truth about what the wire can express, and the badge it would have
-zeroed is on a client that wire's user does not have. Retention follows
-the same fact: `retain_read` never applies to mail only a legacy client
-has seen, and `retain_unread` does — thirty days from `sent_at` rather
-than seven from a read that never happened. The flush no longer needs
-to know which wire it is writing to.
+it: **mail handed to period clients alone is read; mail an ng session
+of the account was also handed stays unread until an ng client marks
+it.** An account used only from 1.x keeps a count that delivery lowers.
+Retention follows the stamps: `retain_read` applies to mail delivery
+marked read, and `retain_unread` to mail still waiting on an ng client.
 
 And one more thing that wire cannot do, said here rather than discovered:
 **`delivered_at` on the legacy wire means "handed to the writer task"**,

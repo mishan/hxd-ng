@@ -253,8 +253,8 @@ pub struct StoredMessage {
     /// what this becomes when that lands.
     pub delivered_at: Option<SystemTime>,
     /// When a client said it had been read. A legacy session has no way to
-    /// say so, so on that wire delivery *is* the read (the flush sets
-    /// both) — the truth about what that wire can express.
+    /// say so, so delivery that reaches only legacy sessions is the read
+    /// (the flush sets both); one an ng session also got waits for it.
     pub read_at: Option<SystemTime>,
 }
 
@@ -293,9 +293,9 @@ pub struct Sent {
 /// The ng wire has `msg_read`, so a client says for itself when it has
 /// read something. The legacy wire has no way to say it — a private
 /// message is a window that opens, and nothing comes back — so on that
-/// wire the flush *is* the read, which is what
-/// `docs/private-messages.md` §11 says and what the unread count and the
-/// retention clock both depend on.
+/// wire the flush is the read, unless an ng session of the account was
+/// handed the same rows, as `docs/private-messages.md` §8 says; the
+/// unread count and the retention clock both depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     /// Delivered; the client will say when it has read them.
