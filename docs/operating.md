@@ -1190,7 +1190,7 @@ request_messages = 5         # message requests one sender sends one recipient
 requests_per_day = 20        # distinct people one account sends requests in a day
 max_requests = 50            # senders waiting with requests, per recipient
 max_friend_requests = 50     # friend requests waiting, per recipient
-request_retention_days = 30  # how long a request waits, and a refused sender is held
+request_retention_days = 30  # how long a request waits, and a refused sender is held; at most 3650
 ```
 
 Once it is on, an ng `msg` by `to_login`, and a classic `/msg <login>`,

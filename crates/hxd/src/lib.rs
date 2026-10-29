@@ -1492,15 +1492,22 @@ pub struct MessagingSection {
 impl MessagingSection {
     pub fn policy(&self, limits: &LimitsSection) -> Result<hxd_core::MessagingPolicy, String> {
         let counts = [
-            self.max_roster,
-            self.max_message_bytes,
-            self.request_messages,
-            self.requests_per_day,
-            self.max_requests,
-            self.max_friend_requests,
+            ("max_roster", self.max_roster),
+            ("max_message_bytes", self.max_message_bytes),
+            ("request_messages", self.request_messages),
+            ("requests_per_day", self.requests_per_day),
+            ("max_requests", self.max_requests),
+            ("max_friend_requests", self.max_friend_requests),
         ];
-        if counts.contains(&0) || self.request_retention_days == 0 {
-            return Err("[messaging] counts and request_retention_days must be above 0".into());
+        if let Some((key, _)) = counts.iter().find(|(_, n)| *n == 0) {
+            return Err(format!("[messaging] {key} must be above 0"));
+        }
+        // Added to the clock as a deadline, so it is bounded well short of
+        // where the arithmetic would overflow.
+        if !(1..=MAX_REQUEST_RETENTION_DAYS).contains(&self.request_retention_days) {
+            return Err(format!(
+                "[messaging] request_retention_days must be 1 to {MAX_REQUEST_RETENTION_DAYS}"
+            ));
         }
         Ok(hxd_core::MessagingPolicy {
             enabled: self.enabled,
@@ -1519,6 +1526,8 @@ impl MessagingSection {
         })
     }
 }
+
+const MAX_REQUEST_RETENTION_DAYS: u64 = 3650;
 
 fn default_max_roster() -> usize {
     hxd_core::MessagingPolicy::default().max_roster
@@ -4974,11 +4983,27 @@ sync = "full"
             ("[messaging]\nenabled = true\n".to_string(), Some("[inbox]")),
             (
                 format!("{INBOX}[messaging]\nenabled = true\nmax_roster = 0\n"),
-                Some("above 0"),
+                Some("max_roster must be above 0"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_friend_requests = 0\n"),
+                Some("max_friend_requests must be above 0"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nrequest_retention_days = 3650\n"),
+                None,
             ),
             (
                 format!("{INBOX}[messaging]\nrequest_retention_days = 0\n"),
-                Some("above 0"),
+                Some("request_retention_days must be 1 to 3650"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nrequest_retention_days = 3651\n"),
+                Some("request_retention_days must be 1 to 3650"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nrequest_retention_days = 9223372036854775807\n"),
+                Some("request_retention_days must be 1 to 3650"),
             ),
         ] {
             let checked = check_config(&parse(&toml).unwrap());
