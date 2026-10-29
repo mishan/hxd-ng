@@ -10,8 +10,8 @@
 //!
 //! What was sent under an approval (§4.6) goes only to the sessions that
 //! understand requests, since a client that does not know approvals
-//! has nowhere to show it, or as private messages to a party that takes
-//! no requests; it never says when it arrived, and nor does a
+//! has nowhere to show it, or as private messages to a party whose account
+//! never took requests; it never says when it arrived, and nor does a
 //! delivery receipt for it.
 
 use std::collections::HashSet;

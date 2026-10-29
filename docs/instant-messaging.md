@@ -172,16 +172,15 @@ A message to a non-friend is then answered, in this order:
    apart from a missing account. A block also deletes the blocker's
    own requests to the blocked account and its pending out, so that the
    blocked account never answers one and meets the block.
-2. **The sender has blocked the recipient**, or either side has turned
-   requests off, never turned them on or does not understand them:
-   `NotFriends`, as the extension has
-   it. It tells the sender only about its own block or about a setting.
+2. **The sender has blocked the recipient**, or the recipient has
+   turned requests off or never turned them on, or the sender does not
+   understand them: `NotFriends`, as the extension has it. It tells the sender only about its own block or about a setting.
 3. **Otherwise**: a **request**, answered `Requested` (§4.2), and
    stored, held or dropped by the bounds (§4.4).
 
 An account that takes requests, whose last 1 is older than
 `request_retention_days` and none of whose sessions that understand
-requests is connected, is **lapsed**: it is still answered as
+requests is on the roster, detached ones included, is **lapsed**: it is still answered as
 taking requests, and the request is dropped, answered and counted as
 one that was stored (§4.4). Answering it `NotFriends` instead would
 tell a stranger when its user last used a client that shows requests.
@@ -396,7 +395,7 @@ Messages pass both ways, but an approval shows less than a friendship:
   one otherwise, since a client that does not know approvals has no row
   to show them under. A party whose account never took requests, a
   classic sender's (§4.1), is sent the messages as ordinary private
-  messages through the inbox instead, and no receipts. Turning requests
+  messages through the inbox instead, and shown no receipts. Turning requests
   off stops new ones and nothing else: an approval's traffic, its Read
   receipts among it, still reaches the sessions that understand them.
 
