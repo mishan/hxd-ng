@@ -454,7 +454,7 @@ impl Core {
             .release_requests(me, them, id, self.requests_since())
             .map_err(store_failed)?;
         self.requests_changed(me);
-        self.im_deliver(me, None, 0);
+        self.im_deliver(me, None, 0, true);
         Ok(id)
     }
 
@@ -485,8 +485,8 @@ impl Core {
             }
             Err(e) => tracing::warn!("inbox: releasing onto a friendship: {e}"),
         }
-        self.im_deliver(a, None, 0);
-        self.im_deliver(b, None, 0);
+        self.im_deliver(a, None, 0, false);
+        self.im_deliver(b, None, 0, false);
     }
 
     /// The caller's message requests and approvals (§4.5). Listing makes

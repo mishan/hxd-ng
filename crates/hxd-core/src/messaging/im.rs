@@ -339,7 +339,7 @@ impl Core {
             Pushed::Full => return Err(MessagingError::QueueFull),
         };
         let delivered = self
-            .im_deliver(them, fresh.then_some(id), uid)
+            .im_deliver(them, fresh.then_some(id), uid, approval)
             .contains(&id)
             && !approval;
         if fresh {
@@ -355,12 +355,14 @@ impl Core {
     /// Hand `to`'s waiting instant messages over live: to every attached
     /// messenger session, what an approval carries to those that
     /// understand requests alone, or, where it has none, to an attached
-    /// session as private messages. Returns the ids handed over.
+    /// session as private messages. `under_approval` says an approval's
+    /// rows may be among them. Returns the ids handed over.
     pub(crate) fn im_deliver(
         &self,
         to: &Mailbox,
         fresh: Option<MessageId>,
         sender: Uid,
+        under_approval: bool,
     ) -> Vec<MessageId> {
         let Some(store) = self.inbox.as_ref() else {
             return Vec::new();
@@ -436,11 +438,9 @@ impl Core {
         }
         // An approval's rows, which no session here can be handed as IMs,
         // go as private messages to a party that never took requests.
-        if !understood && self.never_took_requests(to) {
+        if under_approval && !understood && self.never_took_requests(to) {
             drop(flushing);
-            if let Some(uid) = messengers.first().copied().or(plain) {
-                handed.extend(self.flush_named(uid, to, fresh, sender));
-            }
+            handed.extend(self.flush_named(messengers[0], to, fresh, sender));
         }
         handed
     }

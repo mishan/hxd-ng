@@ -719,8 +719,11 @@ Each stage is a branch with tests, in the house style.
    one is not lost; `account_delete`'s purge safe against a send in
    flight, the deleting session and a store that fails; a signed
    request's id held to one content by the ledger;
-   a released request counted once toward the daily quota; and a link
-   made while the account has sessions re-keying them, or ending them.
+   a released request counted once toward the daily quota; a link
+   made while the account has sessions re-keying them, or ending them;
+   and a status text changed while invisible, which friends read once
+   the last session leaves, kept from them by persisting the last text
+   shown or deferring the write until the account is visible.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol. hx-ng gains a friends list and a requests view. This
    is where the design is first used end to end, by a client we control.
