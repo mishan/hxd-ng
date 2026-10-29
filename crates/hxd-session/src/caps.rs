@@ -54,14 +54,15 @@ impl Caps {
         Caps(bits)
     }
 
-    /// Encode for the wire in the narrowest width that holds the mask:
-    /// two bytes for everything defined today, eight if a bit above 15
-    /// is ever allocated. Clients decode the field by width, so a
+    /// Encode for the wire in the narrowest of two, four or eight bytes
+    /// that holds the mask. Clients decode the field by width, so a
     /// two-byte answer to a two-byte offer is what every deployed
     /// implementation expects.
     pub fn to_wire(self) -> Vec<u8> {
         if self.0 <= u16::MAX as u64 {
             (self.0 as u16).to_be_bytes().to_vec()
+        } else if self.0 <= u32::MAX as u64 {
+            (self.0 as u32).to_be_bytes().to_vec()
         } else {
             self.0.to_be_bytes().to_vec()
         }
@@ -166,8 +167,16 @@ mod tests {
             Caps::from_wire(&[0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0x04]),
             Caps::empty().with(cap::VOICE)
         );
-        // A bit above 15 forces the eight-byte form.
-        assert_eq!(Caps::from_bits(1 << 40).to_wire().len(), 8);
+    }
+
+    #[test]
+    fn answers_in_the_narrowest_width() {
+        for (bit, width) in [(15, 2), (16, 4), (31, 4), (32, 8), (63, 8)] {
+            let caps = Caps::empty().with(bit);
+            let wire = caps.to_wire();
+            assert_eq!(wire.len(), width, "bit {bit}");
+            assert_eq!(Caps::from_wire(&wire), caps, "bit {bit}");
+        }
     }
 
     #[test]
