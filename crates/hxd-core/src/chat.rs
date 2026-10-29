@@ -2583,7 +2583,7 @@ impl Core {
     /// understands requests where the account ever took them
     /// (`docs/instant-messaging.md` §5, §4.6).
     fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
-        let messenger = {
+        let (messenger, understands) = {
             let r = self.roster.lock().unwrap();
             let uid = match *target {
                 Target::Only(uid) => Some(uid),
@@ -2591,10 +2591,15 @@ impl Core {
                     .filter(|u| r.users.get(u).is_some_and(is_live))
                     .or_else(|| attached_session_of(&r, mailbox, sender)),
             };
-            uid.and_then(|u| r.users.get(&u))
-                .is_some_and(crate::messaging::is_messenger)
+            let s = uid.and_then(|u| r.users.get(&u));
+            (
+                s.is_some_and(crate::messaging::is_messenger),
+                s.is_some_and(crate::messaging::understands_requests),
+            )
         };
-        if messenger {
+        if messenger && !understands && self.never_took_requests(mailbox) {
+            crate::inbox::Pending::MailApproved
+        } else if messenger {
             crate::inbox::Pending::Mail
         } else if self.messaging_enabled() && !self.never_took_requests(mailbox) {
             crate::inbox::Pending::Unapproved
@@ -2748,8 +2753,15 @@ impl Core {
                 .users
                 .get(&uid)
                 .is_some_and(crate::messaging::is_messenger);
+            // An approval's rows were read for a session that cannot be
+            // handed them as IMs, so it is handed them as mail.
+            let approvals = which == crate::inbox::Pending::MailApproved
+                && !r
+                    .users
+                    .get(&uid)
+                    .is_some_and(crate::messaging::understands_requests);
             for m in batch {
-                if messenger && m.friendship.is_some() {
+                if messenger && m.friendship.is_some() && !approvals {
                     continue;
                 }
                 // The message just sent names the session that sent it.
@@ -2806,6 +2818,9 @@ impl Core {
         // inventing a digest format.
         let left = match (messenger, which) {
             (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
+            (true, crate::inbox::Pending::MailApproved) => store
+                .pending_of(mailbox, usize::MAX, which)
+                .map(|m| m.len()),
             (true, _) => store
                 .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
                 .map(|m| m.len()),

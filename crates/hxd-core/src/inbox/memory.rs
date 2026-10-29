@@ -313,6 +313,9 @@ impl MessageStore for MemoryStore {
                 Pending::All => self.waiting(&inner, m),
                 Pending::Unapproved => self.waiting(&inner, m) && !self.on_approval(m),
                 Pending::Mail => self.waiting(&inner, m) && m.friendship.is_none(),
+                Pending::MailApproved => {
+                    self.waiting(&inner, m) && (m.friendship.is_none() || self.on_approval(m))
+                }
                 Pending::Instant { again, approvals } => {
                     is_mail(m)
                         && instant(m)

@@ -48,6 +48,7 @@ mod requests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 

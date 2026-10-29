@@ -1971,6 +1971,10 @@ impl MessageStore for SqliteStore {
                      OR friendship IN (SELECT id FROM relation WHERE kind = 1))"
             ),
             Pending::Mail => format!("{WAITING} AND friendship IS NULL"),
+            Pending::MailApproved => format!(
+                "{WAITING} AND (friendship IS NULL
+                     OR friendship IN (SELECT id FROM relation WHERE kind = 2))"
+            ),
             Pending::Instant { again, approvals } => format!(
                 "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}{}",
                 if again { "" } else { " AND handed_at IS NULL" },

@@ -1706,21 +1706,35 @@ fn a_block_deletes_the_requests_it_meets() {
 
 #[test]
 fn a_classic_party_is_sent_an_approval_as_private_messages() {
-    let s = server_with(
-        policy(),
-        &[
-            ("plain", AccessBits::empty().with(bit::SEND_MSGS)),
-            ("bob", messaging_bits()),
-        ],
-    );
-    let (p, mut rp) = classic(&s.core, "plain", AccessBits::empty().with(bit::SEND_MSGS));
-    let (b, _rb) = taker(&s.core, "bob");
-    send(&s.core, p, "bob", "from a period client").unwrap();
-    assert!(matches!(
-        send(&s.core, b, "plain", "welcome"),
-        Ok(crate::MsgOutcome::Queued(_))
-    ));
-    assert_eq!(msgs(&drain(&mut rp)), ["welcome"]);
+    // Live to the period client, or at the flush of a session that
+    // speaks the friend family but does not understand requests.
+    for later_family in [false, true] {
+        let s = server_with(
+            policy(),
+            &[
+                ("plain", AccessBits::empty().with(bit::SEND_MSGS)),
+                ("bob", messaging_bits()),
+            ],
+        );
+        let (p, mut rp) = classic(&s.core, "plain", AccessBits::empty().with(bit::SEND_MSGS));
+        let (b, _rb) = taker(&s.core, "bob");
+        send(&s.core, p, "bob", "from a period client").unwrap();
+        if later_family {
+            s.core.end_session(p);
+        }
+        assert!(matches!(
+            send(&s.core, b, "plain", "welcome"),
+            Ok(crate::MsgOutcome::Queued(_))
+        ));
+        let heard = if later_family {
+            let (f, mut rf) = family(&s.core, "plain");
+            s.core.flush_inbox(f);
+            drain(&mut rf)
+        } else {
+            drain(&mut rp)
+        };
+        assert_eq!(msgs(&heard), ["welcome"], "later family: {later_family}");
+    }
 }
 
 // --- Blocks, flushes and presence races ----------------------------------

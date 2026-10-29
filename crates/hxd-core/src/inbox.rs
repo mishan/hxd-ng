@@ -319,6 +319,11 @@ pub enum Pending {
     Unapproved,
     /// Private messages alone.
     Mail,
+    /// Private messages and what was sent under an approval: what a
+    /// session that speaks the friend family is given when it does not
+    /// understand requests and its account never took them
+    /// (`docs/instant-messaging.md` §4.6).
+    MailApproved,
     /// Instant messages not yet handed over, and with `again` those
     /// handed over and never acknowledged too, which Get Roster hands
     /// over again. Without `approvals`, what was sent under an approval

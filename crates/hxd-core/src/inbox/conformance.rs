@@ -372,6 +372,11 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
     assert_eq!(read(Pending::All), ["mail", "friend", "approved"], "{case}");
     assert_eq!(read(Pending::Mail), ["mail"], "{case}");
     assert_eq!(
+        read(Pending::MailApproved),
+        ["mail", "approved"],
+        "{case}: mail, and what an approval carries"
+    );
+    assert_eq!(
         read(Pending::Unapproved),
         ["mail", "friend"],
         "{case}: what an approval carries is left out"
