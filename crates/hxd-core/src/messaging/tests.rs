@@ -1706,9 +1706,15 @@ fn a_block_deletes_the_requests_it_meets() {
 
 #[test]
 fn a_classic_party_is_sent_an_approval_as_private_messages() {
-    // Live to the period client, or at the flush of a session that
-    // speaks the friend family but does not understand requests.
-    for later_family in [false, true] {
+    // Live to whatever of the party is attached, or at the flush of a
+    // session that speaks the friend family but does not understand
+    // requests.
+    for case in [
+        "classic",
+        "classic beside family",
+        "attached family",
+        "later family",
+    ] {
         let s = server_with(
             policy(),
             &[
@@ -1719,21 +1725,25 @@ fn a_classic_party_is_sent_an_approval_as_private_messages() {
         let (p, mut rp) = classic(&s.core, "plain", AccessBits::empty().with(bit::SEND_MSGS));
         let (b, _rb) = taker(&s.core, "bob");
         send(&s.core, p, "bob", "from a period client").unwrap();
-        if later_family {
+        if case != "classic" && case != "classic beside family" {
             s.core.end_session(p);
         }
+        let mut family_rx = (case.ends_with("family") && case != "later family")
+            .then(|| family(&s.core, "plain").1);
         assert!(matches!(
             send(&s.core, b, "plain", "welcome"),
             Ok(crate::MsgOutcome::Queued(_))
         ));
-        let heard = if later_family {
+        let mut heard = drain(&mut rp);
+        if let Some(rx) = family_rx.as_mut() {
+            heard.extend(drain(rx));
+        }
+        if case == "later family" {
             let (f, mut rf) = family(&s.core, "plain");
             s.core.flush_inbox(f);
-            drain(&mut rf)
-        } else {
-            drain(&mut rp)
-        };
-        assert_eq!(msgs(&heard), ["welcome"], "later family: {later_family}");
+            heard.extend(drain(&mut rf));
+        }
+        assert_eq!(msgs(&heard), ["welcome"], "{case}");
     }
 }
 
@@ -2323,5 +2333,67 @@ fn a_roster_read_within_the_debounce_never_runs_ahead_of_what_is_told() {
     assert_eq!(
         state_of(&s.core, b, "alice"),
         Some((RosterState::Accepted, Presence::Online))
+    );
+}
+
+#[test]
+fn a_friends_status_text_is_read_as_it_was_told() {
+    let s = server_with(
+        MessagingPolicy {
+            presence_debounce: Duration::from_secs(5),
+            ..policy()
+        },
+        &[("alice", messaging_bits()), ("bob", messaging_bits())],
+    );
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    let mut later = Instant::now() + Duration::from_secs(60);
+    let mut flush = || {
+        s.core.presence_flush(later);
+        later += Duration::from_secs(60);
+    };
+    let say = |state, text: &str| {
+        s.core
+            .set_presence(
+                a,
+                PresenceUpdate {
+                    state,
+                    status_text: Some(Some(text.into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    let read = || {
+        s.core
+            .friends_roster(b)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.login == "alice")
+            .map(|e| (e.presence, e.status_text))
+            .unwrap()
+    };
+    say(None, "here");
+    flush();
+    assert_eq!(read(), (Presence::Online, Some("here".into())));
+
+    say(None, "lunch");
+    assert_eq!(
+        read(),
+        (Presence::Online, Some("here".into())),
+        "not before it is told"
+    );
+    flush();
+    assert_eq!(read(), (Presence::Online, Some("lunch".into())));
+
+    say(Some(Presence::Invisible), "hiding");
+    flush();
+    say(None, "still hiding");
+    flush();
+    assert_eq!(
+        read(),
+        (Presence::Offline, Some("lunch".into())),
+        "invisible reads as offline, with what it last showed"
     );
 }

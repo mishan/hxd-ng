@@ -285,6 +285,9 @@ pub(crate) struct Entry {
     status_text: Option<String>,
     /// What its friends were last told.
     told: Shown,
+    /// The status text they were last shown it with, kept through
+    /// Invisible as an offline account keeps its stored text.
+    told_text: Option<String>,
 }
 
 /// Every entry, and the announcements owed.
@@ -327,15 +330,17 @@ impl RosterInner {
             .map_or((Presence::Offline, None), |e| self.shown(e))
     }
 
-    /// What `of`'s friends were last told of it, which is what a friend
-    /// reading it is shown too, so that a read never runs ahead of an
-    /// announcement still owed: one that a change back within the
-    /// debounce makes no change would leave the read uncorrected.
-    fn told_of(&self, of: &Mailbox) -> Shown {
-        self.presences
-            .by
-            .get(&Key::of(of))
-            .map_or((Presence::Offline, None), |e| e.told.clone())
+    /// What a friend reading `of` is shown: what friends were last told,
+    /// so that a read never runs ahead of an announcement still owed; a
+    /// change undone within the debounce is never announced, so a read
+    /// that showed it would stay wrong. An invisible account reads as
+    /// one with no session: offline, with the text it last had to them;
+    /// `stored` is that text for an account with no session at all.
+    fn friend_view(&self, of: &Mailbox, stored: Option<String>) -> Shown {
+        match self.presences.by.get(&Key::of(of)) {
+            Some(e) => (e.told.0, e.told_text.clone()),
+            None => (Presence::Offline, stored),
+        }
     }
 
     /// The sessions of a mailbox taking part.
@@ -398,6 +403,9 @@ impl RosterInner {
         }
         let e = self.presences.by.get_mut(of).expect("read above");
         e.told = now;
+        if !e.invisible {
+            e.told_text = e.status_text.clone();
+        }
         if e.uids.is_empty() {
             self.presences.by.remove(of);
         }
@@ -445,18 +453,18 @@ impl RosterInner {
         } else {
             return None;
         };
-        let accepted = state == RosterState::Accepted;
+        let (presence, status_text) = if state == RosterState::Accepted {
+            self.friend_view(&row.other, text)
+        } else {
+            (Presence::Offline, None)
+        };
         Some(FriendEntry {
             login: row.other.login.clone(),
             fingerprint: row.other.fingerprint,
             state,
             alias: row.alias.clone(),
-            presence: if accepted {
-                self.told_of(&row.other).0
-            } else {
-                Presence::Offline
-            },
-            status_text: text.filter(|_| accepted),
+            presence,
+            status_text,
             note: asked
                 .filter(|_| state == RosterState::PendingIn)
                 .and_then(|p| p.note.clone()),
@@ -1287,7 +1295,7 @@ impl Core {
             if Key::of(&them) == Key::of(&me.mailbox) {
                 r.presence_of(&them)
             } else {
-                r.told_of(&them)
+                r.friend_view(&them, account.status_text.clone())
             }
         });
         Ok(FoundUser {
@@ -1327,6 +1335,7 @@ impl RosterInner {
                 uids: Vec::new(),
                 friends,
                 invisible: false,
+                told_text: status_text.clone(),
                 status_text,
                 told: (Presence::Offline, None),
             }),

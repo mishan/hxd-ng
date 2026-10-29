@@ -434,6 +434,14 @@ impl Core {
         if let Err(e) = store.mark_handed(&handed, self.clock.wall()) {
             warn!("inbox: marking {} messages handed over: {e}", handed.len());
         }
+        // An approval's rows, which no session here can be handed as IMs,
+        // go as private messages to a party that never took requests.
+        if !understood && self.never_took_requests(to) {
+            drop(flushing);
+            if let Some(uid) = messengers.first().copied().or(plain) {
+                handed.extend(self.flush_named(uid, to, fresh, sender));
+            }
+        }
         handed
     }
 

@@ -2818,13 +2818,10 @@ impl Core {
         // inventing a digest format.
         let left = match (messenger, which) {
             (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
-            (true, crate::inbox::Pending::MailApproved) => store
-                .pending_of(mailbox, usize::MAX, which)
-                .map(|m| m.len()),
-            (true, _) => store
+            (true, w) if w != crate::inbox::Pending::MailApproved => store
                 .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
                 .map(|m| m.len()),
-            (false, which) => store
+            (_, which) => store
                 .pending_of(mailbox, usize::MAX, which)
                 .map(|m| m.len()),
         };
