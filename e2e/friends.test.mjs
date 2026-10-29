@@ -142,6 +142,7 @@ describe('instant messaging', () => {
     await alice.conn.setPresence({ state: 'away', status_text: 'at lunch' });
     const told = await bob.waitFor('presence', { login: 'alice' }, { since: mark });
     assert.deepEqual(told.data, { login: 'alice', state: 'away', status_text: 'at lunch' });
+    await bob.expectNo('presence', { login: 'alice' }, { since: told.n + 1 });
   });
 
   test('an instant message is received and read, and typing is shown', async () => {
