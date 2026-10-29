@@ -47,6 +47,8 @@ jobs:
         id: meta
         with:
           images: ${{ steps.name.outputs.image }}
+          # A release tag would otherwise add `latest` too; it is main's.
+          flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
