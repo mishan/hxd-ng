@@ -78,6 +78,17 @@ pub struct Gated {
     pub relationships: Arc<dyn RelationshipStore>,
 }
 
+/// What a session that lists requests reads.
+const INSTANT: Pending = Pending::Instant {
+    again: false,
+    approvals: true,
+};
+const AGAIN: Pending = Pending::Instant {
+    again: true,
+    approvals: true,
+};
+const RECEIPTS: Pending = Pending::Receipts { approvals: true };
+
 fn at(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
@@ -287,7 +298,12 @@ fn requests_are_listed_released_and_deleted_by_sender(g: &Gated) {
 
     let approval = rel.approve(&dave, &alice, at(6)).unwrap();
     assert_eq!(
-        s.release_requests(&dave, &alice, approval).unwrap(),
+        s.release_requests(&dave, &alice, approval, at(4)).unwrap(),
+        0,
+        "{case}: a lapsed request is never released"
+    );
+    assert_eq!(
+        s.release_requests(&dave, &alice, approval, at(0)).unwrap(),
         2,
         "{case}"
     );
@@ -297,10 +313,7 @@ fn requests_are_listed_released_and_deleted_by_sender(g: &Gated) {
         "{case}"
     );
     assert_eq!(
-        bodies(
-            &s.pending_of(&dave, 10, Pending::Instant { again: false })
-                .unwrap()
-        ),
+        bodies(&s.pending_of(&dave, 10, INSTANT).unwrap()),
         ["a1", "a2"],
         "{case}: released onto the approval"
     );
@@ -363,10 +376,14 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
         ["mail", "friend"],
         "{case}: what an approval carries is left out"
     );
+    assert_eq!(read(INSTANT), ["friend", "approved"], "{case}");
     assert_eq!(
-        read(Pending::Instant { again: false }),
-        ["friend", "approved"],
-        "{case}"
+        read(Pending::Instant {
+            again: false,
+            approvals: false
+        }),
+        ["friend"],
+        "{case}: or without what an approval carries"
     );
     assert_eq!(
         s.pending_count(&dave).unwrap(),
@@ -399,11 +416,7 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
     // old one stays held; ended, what was sent on it is held too.
     rel.befriend(&dave, &bob, at(10)).unwrap();
     rel.unfriend(&dave, &alice).unwrap();
-    assert_eq!(
-        read(Pending::Instant { again: false }),
-        ["approved"],
-        "{case}"
-    );
+    assert_eq!(read(INSTANT), ["approved"], "{case}");
     assert_eq!(
         s.mark_read(&dave, MessageId::MAX, at(11)).unwrap(),
         3,
@@ -431,24 +444,17 @@ fn a_handed_message_waits_for_its_ack(g: &Gated) {
     );
     assert!(!s.is_pending(&dave, id).unwrap(), "{case}");
     assert!(
-        s.pending_of(&dave, 10, Pending::Instant { again: false })
-            .unwrap()
-            .is_empty(),
+        s.pending_of(&dave, 10, INSTANT).unwrap().is_empty(),
         "{case}: not handed over twice in one go"
     );
     assert_eq!(
-        bodies(
-            &s.pending_of(&dave, 10, Pending::Instant { again: true })
-                .unwrap()
-        ),
+        bodies(&s.pending_of(&dave, 10, AGAIN).unwrap()),
         ["im"],
         "{case}: but again at the next roster read"
     );
     s.mark_delivered(&[id], at(3), Delivery::Delivered).unwrap();
     assert!(
-        s.pending_of(&dave, 10, Pending::Instant { again: true })
-            .unwrap()
-            .is_empty(),
+        s.pending_of(&dave, 10, AGAIN).unwrap().is_empty(),
         "{case}: until it is acknowledged"
     );
 }
@@ -471,23 +477,19 @@ fn a_receipt_waits_behind_the_gate(g: &Gated) {
         "{case}: never mail"
     );
     assert_eq!(
-        bodies(&s.pending_of(&dave, 10, Pending::Receipts).unwrap()),
+        bodies(&s.pending_of(&dave, 10, RECEIPTS).unwrap()),
         ["a guid"],
         "{case}"
     );
     rel.unfriend(&dave, &alice).unwrap();
     assert!(
-        s.pending_of(&dave, 10, Pending::Receipts)
-            .unwrap()
-            .is_empty(),
+        s.pending_of(&dave, 10, RECEIPTS).unwrap().is_empty(),
         "{case}: held with the friendship"
     );
     rel.befriend(&dave, &alice, at(2)).unwrap();
     s.mark_delivered(&[id], at(3), Delivery::Delivered).unwrap();
     assert!(
-        s.pending_of(&dave, 10, Pending::Receipts)
-            .unwrap()
-            .is_empty(),
+        s.pending_of(&dave, 10, RECEIPTS).unwrap().is_empty(),
         "{case}"
     );
 }

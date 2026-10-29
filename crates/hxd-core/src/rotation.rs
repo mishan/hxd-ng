@@ -26,7 +26,16 @@ impl Core {
             if let Err(e) = self.restamp(&rekeyed.merged) {
                 tracing::warn!("inbox: re-stamping a rotation's merged friendships: {e}");
             }
-            let successor = crate::inbox::Mailbox::identified(String::new(), *to);
+            // By the login the account link now gives it, so a friend
+            // with no row of its own naming the successor is told too.
+            let successor = self
+                .directory
+                .as_ref()
+                .and_then(|d| d.account_by_key(to))
+                .map_or_else(
+                    || crate::inbox::Mailbox::identified(String::new(), *to),
+                    |(m, _)| m,
+                );
             self.rekey_friends(
                 &crate::inbox::Mailbox::identified(String::new(), *from),
                 &successor,

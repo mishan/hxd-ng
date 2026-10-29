@@ -1735,6 +1735,15 @@ const MAIL_ONLY: &str = "kind = 0";
 /// `relation` row. A message request's 0 never has one.
 const LIVE: &str = "(friendship IS NULL OR friendship IN (SELECT id FROM relation))";
 
+/// What leaves out a row sent under an approval, unless `approvals`.
+fn friendships_unless(approvals: bool) -> &'static str {
+    if approvals {
+        ""
+    } else {
+        " AND friendship IN (SELECT id FROM relation WHERE kind = 1)"
+    }
+}
+
 /// Mail waiting to be handed over: through the gate, and neither
 /// delivered nor handed to a session that will acknowledge it.
 const WAITING: &str = "kind = 0 AND delivered_at IS NULL AND handed_at IS NULL \
@@ -1957,11 +1966,15 @@ impl MessageStore for SqliteStore {
                      OR friendship IN (SELECT id FROM relation WHERE kind = 1))"
             ),
             Pending::Mail => format!("{WAITING} AND friendship IS NULL"),
-            Pending::Instant { again } => format!(
-                "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}",
-                if again { "" } else { " AND handed_at IS NULL" }
+            Pending::Instant { again, approvals } => format!(
+                "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}{}",
+                if again { "" } else { " AND handed_at IS NULL" },
+                friendships_unless(approvals)
             ),
-            Pending::Receipts => format!("kind = 1 AND delivered_at IS NULL AND {LIVE}"),
+            Pending::Receipts { approvals } => format!(
+                "kind = 1 AND delivered_at IS NULL AND {LIVE}{}",
+                friendships_unless(approvals)
+            ),
         };
         let sql = format!(
             "SELECT {COLUMNS} FROM message
@@ -2279,16 +2292,23 @@ impl MessageStore for SqliteStore {
         to: &Mailbox,
         from: &Mailbox,
         on: RelationId,
+        since: SystemTime,
     ) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "UPDATE message SET friendship = ?3 WHERE {} AND {} AND friendship = 0",
+            "UPDATE message SET friendship = ?3
+              WHERE {} AND {} AND friendship = 0 AND sent_at >= ?4",
             mailbox_sql(to, "recipient", 1),
             mailbox_sql(from, "sender", 2)
         );
         conn.execute(
             &sql,
-            params![bind(to), bind(from), SentOn::Relation(on).as_i64()],
+            params![
+                bind(to),
+                bind(from),
+                SentOn::Relation(on).as_i64(),
+                unix(since)
+            ],
         )
         .map_err(StoreError::new)
     }

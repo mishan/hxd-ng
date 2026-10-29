@@ -699,8 +699,14 @@ Each stage is a branch with tests, in the house style.
    `[messaging]` section and the binary's presence flush task, with a
    request address keyer of its own, persisted and under its own HMAC
    label rather than news's; the requests' `request_weight`s; a request
-   answered once its ledger row is written, the rest off its path; and
-   clearing in bulk as one transaction.
+   answered once its ledger row is written, the rest off its path;
+   clearing in bulk as one transaction; a merge's re-stamp of
+   `message.friendship` in the transaction that merged, so a failed
+   one is not lost; `account_delete`'s purge safe against a send in
+   flight, the deleting session and a store that fails; a signed
+   request's id held to one content and one recipient by the ledger;
+   a released request counted once toward the daily quota; and a link
+   made while the account has sessions re-keying them, or ending them.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol. hx-ng gains a friends list and a requests view. This
    is where the design is first used end to end, by a client we control.

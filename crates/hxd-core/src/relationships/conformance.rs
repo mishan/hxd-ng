@@ -190,10 +190,15 @@ fn a_claim_folds_two_rows_for_one_pair_into_the_older_claim(s: &dyn Relationship
     s.set_blocked(&bare, &bob, true, at(2)).unwrap();
     let approval = s.approve(&bare, &bob, at(2)).unwrap();
 
+    let claimed = s.claim("alice", &fp(1)).unwrap();
     assert_eq!(
-        s.claim("alice", &fp(1)).unwrap().merged,
+        claimed.merged,
         [(second, first)],
         "{case}: the lost friendship, beside the one that stands for it"
+    );
+    assert!(
+        claimed.moved >= 2,
+        "{case}: each row folded counts, though none is left to re-key"
     );
     let mine = s.relationship(&linked, &bob, at(3)).unwrap().unwrap();
     assert_eq!(mine.friendship, Some(first), "{case}: the older claim's");

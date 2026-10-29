@@ -6182,8 +6182,9 @@ mod inbox_tests {
             to: &Mailbox,
             from: &Mailbox,
             on: crate::RelationId,
+            since: SystemTime,
         ) -> Result<usize, StoreError> {
-            self.inner.release_requests(to, from, on)
+            self.inner.release_requests(to, from, on, since)
         }
         fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
             self.inner.delete_requests(to, from)

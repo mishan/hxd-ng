@@ -2063,6 +2063,18 @@ async fn dispatch(
                         "bad_request",
                         "That user proved no identity to sign a message to.",
                     ),
+                    // `docs/instant-messaging.md` §4.1, §7.
+                    Err(ChatError::NotFriends) => {
+                        reply_err(req.id, "not_friends", "That user is not your friend.")
+                    }
+                    Err(ChatError::RequestFull) => reply_err(
+                        req.id,
+                        "request_full",
+                        "You have sent that user as many requests as you may.",
+                    ),
+                    Err(ChatError::RosterFull) => {
+                        reply_err(req.id, "roster_full", "Your roster is full.")
+                    }
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
                     // them can be told apart from outside.

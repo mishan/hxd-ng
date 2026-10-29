@@ -196,8 +196,9 @@ impl Core {
                 Err(e) => return Some(Err(chat_error(store_failed(e)))),
             }
         }
-        // An image goes to a friend as it always has, and is no stranger's
-        // first contact.
+        // An image, or text too long for an instant message, goes to a
+        // friend as a private message, as it always has, and is no
+        // stranger's first contact.
         if media || text.len() > self.messaging_policy.max_message_bytes {
             return friend.is_none().then_some(Err(ChatError::NotFriends));
         }
@@ -225,6 +226,24 @@ impl Core {
             .map_err(|e| chat_error(store_failed(e)))?
         {
             return Err(ChatError::NoSuchUser);
+        }
+        if signed
+            .as_ref()
+            .is_some_and(|s| them.fingerprint != Some(s.to))
+        {
+            return Err(ChatError::SignedElsewhere);
+        }
+        // A retry of a request is answered as the request was, whatever
+        // the two have become since (§4.4).
+        if let Some(g) = guid {
+            let sender = Requester::Account(me.mailbox.clone());
+            if rel
+                .find_request(&sender, &them, g)
+                .map_err(|e| chat_error(store_failed(e)))?
+                .is_some()
+            {
+                return Ok(MsgOutcome::Requested);
+            }
         }
         let store = |on| {
             self.im_store(
@@ -315,14 +334,12 @@ impl Core {
             Some(g) => g.clone(),
             None => super::im::new_guid()?,
         };
-        if let Some(g) = guid {
-            if rel
-                .find_request(&sender, them, g)
-                .map_err(store_failed)?
-                .is_some()
-            {
-                return Ok(());
-            }
+        // Under the lock a block's cleanup takes, so a block made since
+        // `route` looked is seen here or deletes what this stores, and
+        // the bounds are read and the ledger written as one.
+        let _writing = self.friend_writes();
+        if rel.is_blocked(them, me).map_err(store_failed)? {
+            return Err(MessagingError::AccountNotFound);
         }
         let retained = now
             .checked_sub(p.request_retention)
@@ -342,11 +359,7 @@ impl Core {
         {
             return Err(MessagingError::RateLimited);
         }
-        let signed = match signed {
-            None => None,
-            Some(s) if them.fingerprint == Some(s.to) => Some(s.signature.clone()),
-            Some(_) => return Err(MessagingError::SignedElsewhere),
-        };
+        let signed = signed.as_ref().map(|s| s.signature.clone());
         if let Recorded::Retry(_) = rel
             .record_request(&LedgerEntry {
                 kind: RequestKind::Message,
@@ -419,7 +432,9 @@ impl Core {
             return Err(MessagingError::RosterFull);
         }
         let id = rel.approve(me, them, now).map_err(store_failed)?;
-        inbox.release_requests(me, them, id).map_err(store_failed)?;
+        inbox
+            .release_requests(me, them, id, self.requests_since())
+            .map_err(store_failed)?;
         self.requests_changed(me);
         self.im_deliver(me, None, 0);
         Ok(id)
@@ -439,9 +454,10 @@ impl Core {
             return;
         };
         let merged: Vec<_> = approvals.iter().map(|id| (*id, friendship)).collect();
+        let since = self.requests_since();
         let released = inbox.restamp(&merged).and_then(|_| {
-            Ok(inbox.release_requests(a, b, friendship)?
-                + inbox.release_requests(b, a, friendship)?)
+            Ok(inbox.release_requests(a, b, friendship, since)?
+                + inbox.release_requests(b, a, friendship, since)?)
         });
         match released {
             Ok(0) => {}
@@ -636,6 +652,7 @@ fn chat_error(e: MessagingError) -> ChatError {
         MessagingError::RateLimited => ChatError::SendQuota,
         MessagingError::QueueFull => ChatError::MailboxFull,
         MessagingError::SignedElsewhere => ChatError::SignedElsewhere,
+        MessagingError::Equivocation => ChatError::Equivocation,
         MessagingError::AccountNotFound | MessagingError::Blocked => ChatError::NoSuchUser,
         MessagingError::MessageTooLong
         | MessagingError::AlreadyFriends

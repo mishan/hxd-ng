@@ -27,6 +27,13 @@ impl AccountDirectory for Directory {
             .find(|(m, _)| who.matches(&m.login, m.fingerprint.as_ref()))
             .map(|(_, a)| *a)
     }
+
+    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+        self.0
+            .iter()
+            .find(|(m, _)| m.fingerprint == Some(*fp))
+            .cloned()
+    }
 }
 
 pub(super) fn messaging_bits() -> AccessBits {
@@ -56,10 +63,19 @@ fn server_notifying(
             .map(|(l, a)| (Mailbox::login(*l), *a))
             .collect(),
     );
+    server_of(dir, policy, InboxPolicy::default(), gateway)
+}
+
+fn server_of(
+    dir: Directory,
+    policy: MessagingPolicy,
+    inbox_policy: InboxPolicy,
+    gateway: Option<Arc<dyn crate::NotificationGateway>>,
+) -> Server {
     let rel = Arc::new(MemoryRelationships::new());
     let inbox = Arc::new(MemoryStore::gated(rel.clone()));
     let mut core = Core::new()
-        .with_inbox(inbox.clone(), Arc::new(dir), InboxPolicy::default())
+        .with_inbox(inbox.clone(), Arc::new(dir), inbox_policy)
         .with_relationships(rel.clone())
         .with_messaging(policy);
     if let Some(gateway) = gateway {
@@ -980,20 +996,99 @@ fn what_was_queued_on_a_friendship_is_held_once_it_ends() {
 
 #[test]
 fn a_read_waits_for_a_sender_that_was_not_there() {
-    let s = server(&["alice", "bob"]);
-    let (a, mut ra) = messenger(&s.core, "alice");
-    let (b, mut rb) = messenger(&s.core, "bob");
-    friends(&s, a, &mut ra, b, &mut rb);
-    let sent = s.core.im_send(a, "bob", "hi".into(), None, None).unwrap();
-    s.core.end_session(a);
-    s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
-    assert!(s.inbox.all()[0].read_at.is_some());
+    for detached in [false, true] {
+        let s = server(&["alice", "bob"]);
+        let (a, mut ra) = messenger(&s.core, "alice");
+        let (b, mut rb) = messenger(&s.core, "bob");
+        friends(&s, a, &mut ra, b, &mut rb);
+        let sent = s.core.im_send(a, "bob", "hi".into(), None, None).unwrap();
+        if detached {
+            s.core.connection_lost(a, 4);
+        } else {
+            s.core.end_session(a);
+        }
+        s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
+        s.core.im_ack(b, "alice", &sent.guid, true).unwrap();
+        assert!(s.inbox.all()[0].read_at.is_some());
 
-    let (a, mut ra) = family(&s.core, "alice");
-    s.core.friends_roster(a).unwrap();
-    assert_eq!(receipts(&drain(&mut ra)), [("bob".into(), true)]);
-    s.core.friends_roster(a).unwrap();
-    assert!(receipts(&drain(&mut ra)).is_empty(), "once");
+        let (a, mut ra) = family(&s.core, "alice");
+        s.core.friends_roster(a).unwrap();
+        assert_eq!(
+            receipts(&drain(&mut ra)),
+            [("bob".into(), true)],
+            "detached: {detached}: kept once, however often it was read"
+        );
+        s.core.friends_roster(a).unwrap();
+        assert!(receipts(&drain(&mut ra)).is_empty(), "once");
+    }
+}
+
+#[test]
+fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
+    let key = |n: u8| [n; 32];
+    let dir = Directory(
+        [("alice", 1), ("bob", 2), ("carol", 3)]
+            .iter()
+            .map(|(l, n)| (Mailbox::identified(*l, key(*n)), messaging_bits()))
+            .collect(),
+    );
+    let quota = InboxPolicy {
+        max_sent_per_day: 2,
+        ..InboxPolicy::default()
+    };
+    let s = server_of(dir, policy(), quota, None);
+    let (a, mut ra) = attach_identified(&s.core, "alice", key(1));
+    let (b, mut rb) = attach_identified(&s.core, "bob", key(2));
+    let (c, mut rc) = attach_identified(&s.core, "carol", key(3));
+    friends(&s, a, &mut ra, b, &mut rb);
+    friends(&s, a, &mut ra, c, &mut rc);
+    let signed = |to: u8, says: u8| {
+        Some(crate::chat::SignedMsg {
+            signature: crate::history::Signature {
+                form: vec![says],
+                content: [says; 32],
+            },
+            to: key(to),
+        })
+    };
+    let (g1, g2) = (
+        MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000011").unwrap(),
+        MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000012").unwrap(),
+    );
+    let im = |to: &str, text: &str, guid: &MessageGuid, signed| {
+        s.core
+            .im_send(a, to, text.into(), Some(guid.clone()), signed)
+            .map(|_| ())
+    };
+    for (case, to, guid, signed, want) in [
+        ("signed", "bob", &g1, signed(2, 1), Ok(())),
+        (
+            "other words",
+            "bob",
+            &g1,
+            signed(2, 9),
+            Err(MessagingError::Equivocation),
+        ),
+        (
+            "another recipient",
+            "carol",
+            &g1,
+            signed(3, 1),
+            Err(MessagingError::Equivocation),
+        ),
+        ("the day's last", "bob", &g2, None, Ok(())),
+        ("a retry past it", "bob", &g2, None, Ok(())),
+        (
+            "past the quota",
+            "bob",
+            &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000013").unwrap(),
+            None,
+            Err(MessagingError::RateLimited),
+        ),
+    ] {
+        assert_eq!(im(to, case, guid, signed), want, "{case}");
+    }
+    assert_eq!(s.inbox.all().len(), 2, "nothing refused was stored");
 }
 
 #[test]
@@ -1852,4 +1947,104 @@ fn a_claim_rekeys_its_friends_presence() {
         )
         .unwrap();
     assert_eq!(presences(&drain(&mut ra)), [("bob".into(), Presence::Busy)]);
+}
+
+#[test]
+fn a_rotation_tells_a_friend_with_no_row_naming_the_successor() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", new), messaging_bits()),
+        (Mailbox::login("bob"), messaging_bits()),
+    ]);
+    let s = server_of(dir, policy(), InboxPolicy::default(), None);
+    let bob = Mailbox::login("bob");
+    let now = s.core.clock.wall();
+    // Bob was shown a request from alice's old key, and her new one had
+    // blocked him: the rotation folds the two, and the block ends it.
+    s.rel
+        .set_pending_out(
+            &Mailbox::identified("alice", old),
+            &bob,
+            Some(&PendingOut {
+                sent_at: now,
+                lapses_at: now + Duration::from_secs(3600),
+                delivered: true,
+                note: None,
+            }),
+        )
+        .unwrap();
+    s.rel
+        .set_blocked(&Mailbox::identified("alice", new), &bob, true, now)
+        .unwrap();
+    let (_b, mut rb) = messenger(&s.core, "bob");
+    s.core.rotate_identity(&old, &new).unwrap();
+    assert_eq!(
+        entries(&drain(&mut rb)),
+        [("alice".into(), RosterState::Removed)]
+    );
+}
+
+#[test]
+fn an_approvals_backlog_never_starves_a_friends_im() {
+    let s = server(&["alice", "bob", "carol"]);
+    let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+    let now = s.core.clock.wall();
+    // Bob's account shows requests, so an approval's traffic waits for a
+    // session that lists them.
+    let (b, _rb) = lister(&s.core, "bob");
+    s.core.end_session(b);
+    let on = s.rel.approve(&bob, &alice, now).unwrap();
+    for i in 0..InboxPolicy::default().deliver_at_flush + 5 {
+        s.inbox
+            .push(
+                &NewMessage {
+                    recipient: bob.clone(),
+                    sender: Some(alice.clone()),
+                    sender_nick: "alice".into(),
+                    body: format!("approved {i}"),
+                    sent_at: now,
+                    guid: MessageGuid::parse(&format!("{i:032x}")),
+                    kind: MessageKind::Message,
+                    media: None,
+                    signed: None,
+                    friendship: Some(SentOn::Relation(on)),
+                },
+                1000,
+            )
+            .unwrap();
+    }
+    let (c, mut rc) = messenger(&s.core, "carol");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, c, &mut rc, b, &mut rb);
+
+    s.core.im_send(c, "bob", "live".into(), None, None).unwrap();
+    assert_eq!(ims(&drain(&mut rb)), [("live".into(), false)]);
+    s.core.friends_roster(b).unwrap();
+    assert_eq!(
+        ims(&drain(&mut rb)),
+        [("live".into(), true)],
+        "and again at the roster read"
+    );
+}
+
+#[test]
+fn a_retry_of_a_request_is_answered_as_one_whatever_came_after() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = lister(&s.core, "alice");
+    let (b, mut rb) = lister(&s.core, "bob");
+    let g = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000003").unwrap();
+    let send_g = || {
+        s.core
+            .msg_login(a, "bob", "hi".into(), Some(g.clone()), None)
+    };
+    assert_eq!(send_g(), Ok(crate::MsgOutcome::Requested));
+    s.core
+        .request_answer(b, "alice", RequestAction::Delete)
+        .unwrap();
+    friends(&s, b, &mut rb, a, &mut ra);
+    assert_eq!(send_g(), Ok(crate::MsgOutcome::Requested));
+    assert!(
+        ims(&drain(&mut rb)).is_empty(),
+        "what was deleted is not sent again"
+    );
 }

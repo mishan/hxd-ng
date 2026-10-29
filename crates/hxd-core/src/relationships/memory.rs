@@ -272,6 +272,7 @@ impl Inner {
         // into that row, which is kept, as the SQLite store's unique
         // index would have it.
         let mut merged = Vec::new();
+        let mut n = 0;
         let mut i = 0;
         while i < self.rows.len() {
             let r = &self.rows[i].rel;
@@ -289,12 +290,12 @@ impl Inner {
                     let dup = self.rows.remove(i).rel;
                     let k = if k > i { k - 1 } else { k };
                     merged.extend(self.rows[k].rel.absorb(dup));
+                    n += 1;
                 }
                 None => i += 1,
             }
         }
         self.forget(merged.iter().map(|(lost, _)| *lost));
-        let mut n = 0;
         for r in self.rows.iter_mut() {
             n += stamp(&mut r.rel.owner) + stamp(&mut r.rel.other);
         }

@@ -225,7 +225,7 @@ impl Relationship {
 /// did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rekeyed {
-    /// Rows whose key changed.
+    /// Rows whose key changed, and rows folded into another's.
     pub moved: usize,
     /// `(lost, kept)`: a friendship or approval id that a merge ended,
     /// and the one of the same pair that stands in its place, once each,

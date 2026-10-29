@@ -61,6 +61,12 @@ impl MemoryStore {
         }
     }
 
+    /// Was `m` sent under an approval?
+    fn on_approval(&self, m: &StoredMessage) -> bool {
+        matches!(m.friendship, Some(SentOn::Relation(id))
+            if self.gate.as_ref().is_some_and(|g| g.is_approval(id)))
+    }
+
     /// Mail waiting to be handed over, through the gate.
     fn waiting(&self, inner: &Inner, m: &StoredMessage) -> bool {
         is_mail(m) && m.delivered_at.is_none() && !inner.handed.contains(&m.id) && self.live(m)
@@ -303,19 +309,20 @@ impl MessageStore for MemoryStore {
             .filter(|m| is(&m.recipient, to) && m.delivered_at.is_none())
             .filter(|m| match which {
                 Pending::All => self.waiting(&inner, m),
-                Pending::Unapproved => {
-                    self.waiting(&inner, m)
-                        && !matches!(m.friendship, Some(SentOn::Relation(id))
-                            if self.gate.as_ref().is_some_and(|g| g.is_approval(id)))
-                }
+                Pending::Unapproved => self.waiting(&inner, m) && !self.on_approval(m),
                 Pending::Mail => self.waiting(&inner, m) && m.friendship.is_none(),
-                Pending::Instant { again } => {
+                Pending::Instant { again, approvals } => {
                     is_mail(m)
                         && instant(m)
                         && self.live(m)
                         && (again || !inner.handed.contains(&m.id))
+                        && (approvals || !self.on_approval(m))
                 }
-                Pending::Receipts => m.kind == MessageKind::ReadReceipt && self.live(m),
+                Pending::Receipts { approvals } => {
+                    m.kind == MessageKind::ReadReceipt
+                        && self.live(m)
+                        && (approvals || !self.on_approval(m))
+                }
             })
             .take(limit)
             .cloned()
@@ -558,12 +565,14 @@ impl MessageStore for MemoryStore {
         to: &Mailbox,
         from: &Mailbox,
         on: RelationId,
+        since: SystemTime,
     ) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if is_request(m)
                 && is(&m.recipient, to)
+                && m.sent_at >= since
                 && m.sender.as_ref().is_some_and(|s| is(s, from))
             {
                 m.friendship = Some(SentOn::Relation(on));

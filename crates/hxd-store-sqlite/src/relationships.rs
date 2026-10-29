@@ -428,6 +428,7 @@ impl SqliteStore {
                 sql(found.collect())?
             };
             let mut merged = Vec::new();
+            let mut n = 0;
             for (dup, kept) in pairs {
                 let (Some(d), Some(mut k)) = (load_id(tx, dup)?, load_id(tx, kept)?) else {
                     continue;
@@ -437,6 +438,7 @@ impl SqliteStore {
                 write(tx, Some(kept), &mut k)?;
                 forget(tx, lost.iter().map(|(l, _)| *l))?;
                 merged.extend(lost);
+                n += 1;
             }
             sql(tx.execute(
                 &format!(
@@ -446,7 +448,6 @@ impl SqliteStore {
                 ),
                 params![to, from],
             ))?;
-            let mut n = 0;
             for (table, col) in [
                 ("relationship", "owner"),
                 ("relationship", "other"),

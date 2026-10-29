@@ -321,10 +321,13 @@ pub enum Pending {
     Mail,
     /// Instant messages not yet handed over, and with `again` those
     /// handed over and never acknowledged too, which Get Roster hands
-    /// over again.
-    Instant { again: bool },
-    /// Read receipts waiting for the sender they are addressed to.
-    Receipts,
+    /// over again. Without `approvals`, what was sent under an approval
+    /// is left out before the limit, so a backlog the reader cannot be
+    /// shown never crowds out a friend's.
+    Instant { again: bool, approvals: bool },
+    /// Read receipts waiting for the sender they are addressed to, an
+    /// approval's only with `approvals`.
+    Receipts { approvals: bool },
 }
 
 /// A store operation failed. The string is for the log, not for a client —
@@ -533,13 +536,15 @@ pub trait MessageStore: Send + Sync + 'static {
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError>;
 
-    /// `from`'s requests to `to` now belong to `on`, the approval or
-    /// friendship that released them. Returns how many.
+    /// `from`'s requests to `to` sent since `since` now belong to `on`,
+    /// the approval or friendship that released them; an older one has
+    /// lapsed. Returns how many.
     fn release_requests(
         &self,
         to: &Mailbox,
         from: &Mailbox,
         on: RelationId,
+        since: SystemTime,
     ) -> Result<usize, StoreError>;
 
     /// Delete `from`'s requests to `to`. Returns how many went.

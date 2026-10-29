@@ -225,6 +225,8 @@ pub enum MessagingError {
     QueueFull,
     /// A signature that does not name the recipient's identity.
     SignedElsewhere,
+    /// A signed id already used for other words or another recipient.
+    Equivocation,
     /// As many requests to one recipient as a sender may send
     /// (`request_full`).
     RequestFull,
@@ -613,6 +615,9 @@ impl Core {
     pub fn set_presence(&self, uid: Uid, update: PresenceUpdate) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
         let store = self.friends_store()?;
+        // So two updates land in the store and in the entry in one order,
+        // and an entry being loaded reads the text either before or after.
+        let _writing = self.friend_writes();
         let account = AccountUpdate {
             status_text: update.status_text.clone(),
             discoverable: update.discoverable,
@@ -737,6 +742,11 @@ impl Core {
         }
         let now = self.clock.wall();
         let _writing = self.friend_writes();
+        // Again under the lock a block's cleanup takes, so a block made
+        // since `other` looked is seen here or ends what this writes.
+        if store.is_blocked(&them, &me.mailbox).map_err(store_failed)? {
+            return Err(MessagingError::AccountNotFound);
+        }
         if store.is_blocked(&me.mailbox, &them).map_err(store_failed)? {
             return Err(MessagingError::Blocked);
         }

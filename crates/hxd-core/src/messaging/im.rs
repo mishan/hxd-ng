@@ -27,7 +27,7 @@ use crate::inbox::{
     Pushed, StoredMessage,
 };
 use crate::relationships::{RelationId, SentOn};
-use crate::roster::{is_live, Event, Uid, UserSession};
+use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
 /// An instant message as it reaches a messenger session (IM Deliver,
@@ -207,7 +207,36 @@ impl Core {
             Some(s) if them.fingerprint == Some(s.to) => Some(s.signature),
             Some(_) => return Err(MessagingError::SignedElsewhere),
         };
+        let content = signed.as_ref().map(|s| s.content);
         let store = self.inbox_store()?;
+        let now = self.clock.wall();
+        // A signed id is its signer's across recipients
+        // (`docs/e2e-messages.md` §3.6); toward this one, `push` finds it.
+        if let (Some(_), Some(g)) = (&signed, &guid) {
+            if let Some(m) = store.find_sent(&me.mailbox, g).map_err(store_failed)? {
+                if !them.matches(&m.recipient.login, m.recipient.fingerprint.as_ref()) {
+                    return Err(MessagingError::Equivocation);
+                }
+            }
+        }
+        // Every instant message is stored, so the sender's daily quota
+        // (`docs/private-messages.md` §9) refuses one past it; a retry
+        // stores nothing and is not the quota's to refuse.
+        if self
+            .send_quota_spent(&**store, &me.mailbox, text.len(), now)
+            .map_err(|_| MessagingError::ServerError)?
+        {
+            let retry = match &guid {
+                Some(g) => store
+                    .find_guid(them, Some(&me.mailbox), g)
+                    .map_err(store_failed)?
+                    .is_some(),
+                None => false,
+            };
+            if !retry {
+                return Err(MessagingError::RateLimited);
+            }
+        }
         let guid = match guid {
             Some(g) => g,
             None => new_guid()?,
@@ -219,7 +248,6 @@ impl Core {
                 .map(|s| s.info.nick.clone())
                 .unwrap_or_default()
         };
-        let now = self.clock.wall();
         let pushed = store
             .push(
                 &NewMessage {
@@ -239,6 +267,12 @@ impl Core {
             .map_err(store_failed)?;
         let (id, fresh) = match pushed {
             Pushed::Stored(id) => (id, true),
+            // An unsigned message under the id says something else.
+            Pushed::Existing(m)
+                if content.is_some() && m.signed.as_ref().map(|was| was.content) != content =>
+            {
+                return Err(MessagingError::Equivocation)
+            }
             // A retry is that message, answered as of now, and an
             // approval's as queued whatever became of it.
             Pushed::Existing(m) if m.delivered_at.is_some() => {
@@ -279,7 +313,7 @@ impl Core {
             return Vec::new();
         };
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        let (messengers, plain) = {
+        let (messengers, plain, listing) = {
             let r = self.roster.lock().unwrap();
             let attached: Vec<Uid> = sessions_of(&r, to)
                 .into_iter()
@@ -288,7 +322,8 @@ impl Core {
             let (m, p): (Vec<Uid>, Vec<Uid>) = attached
                 .into_iter()
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
-            (m, p.first().copied())
+            let listing = m.iter().any(|u| r.users.get(u).is_some_and(lists_requests));
+            (m, p.first().copied(), listing)
         };
         if messengers.is_empty() {
             drop(flushing);
@@ -300,7 +335,10 @@ impl Core {
         let batch = match store.pending_of(
             to,
             self.inbox_policy.deliver_at_flush,
-            Pending::Instant { again: false },
+            Pending::Instant {
+                again: false,
+                approvals: listing,
+            },
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -315,10 +353,16 @@ impl Core {
             for m in batch {
                 let (id, queued) = (m.id, Some(m.id) != fresh);
                 let approval = relation_of(&m).is_some_and(|id| approvals.contains(&id));
+                // Still attached, since the roster lock was let go for
+                // the read.
                 let to: Vec<Uid> = messengers
                     .iter()
                     .copied()
-                    .filter(|u| !approval || r.users.get(u).is_some_and(lists_requests))
+                    .filter(|u| {
+                        r.users
+                            .get(u)
+                            .is_some_and(|s| is_live(s) && (!approval || lists_requests(s)))
+                    })
                     .collect();
                 if to.is_empty() {
                     continue;
@@ -346,6 +390,13 @@ impl Core {
             return;
         };
         let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        let lists = |r: &RosterInner| r.users.get(&uid).filter(|s| is_live(s)).map(lists_requests);
+        // The read itself leaves out what an approval carries for a
+        // session that does not list requests, so that never takes the
+        // places of what it can be shown.
+        let Some(listing) = lists(&self.roster.lock().unwrap()) else {
+            return;
+        };
         let limit = self.inbox_policy.deliver_at_flush;
         let read = |which| {
             store.pending_of(me, limit, which).unwrap_or_else(|e| {
@@ -353,24 +404,17 @@ impl Core {
                 Vec::new()
             })
         };
-        let ims = read(Pending::Instant { again: true });
-        let receipts = read(Pending::Receipts);
+        let ims = read(Pending::Instant {
+            again: true,
+            approvals: listing,
+        });
+        let receipts = read(Pending::Receipts { approvals: listing });
         let approvals = self.approval_ids(me, &ims);
-        let receipt_approvals = self.approval_ids(me, &receipts);
-        let (ims, receipts): (Vec<StoredMessage>, Vec<StoredMessage>) = {
+        {
             let mut r = self.roster.lock().unwrap();
-            let Some(lists) = r.users.get(&uid).filter(|s| is_live(s)).map(lists_requests) else {
+            if lists(&r).is_none() {
                 return;
-            };
-            let shown = |m: &StoredMessage, approvals: &HashSet<RelationId>| {
-                lists || !relation_of(m).is_some_and(|id| approvals.contains(&id))
-            };
-            let ims: Vec<StoredMessage> =
-                ims.into_iter().filter(|m| shown(m, &approvals)).collect();
-            let receipts: Vec<StoredMessage> = receipts
-                .into_iter()
-                .filter(|m| shown(m, &receipt_approvals))
-                .collect();
+            }
             for m in &ims {
                 let approval = relation_of(m).is_some_and(|id| approvals.contains(&id));
                 if let Some(ev) = im_of(m.clone(), true, approval) {
@@ -391,8 +435,7 @@ impl Core {
                     },
                 );
             }
-            (ims, receipts)
-        };
+        }
         let now = self.clock.wall();
         let ids = |v: &[StoredMessage]| v.iter().map(|m| m.id).collect::<Vec<_>>();
         if let Err(e) = store.mark_handed(&ids(&ims), now) {
@@ -434,7 +477,9 @@ impl Core {
                 None => return Ok(()),
             },
         };
-        if m.friendship != Some(SentOn::Relation(id)) {
+        // A read is told once: a repeat would queue the sender another
+        // receipt for each.
+        if m.friendship != Some(SentOn::Relation(id)) || (read && m.read_at.is_some()) {
             return Ok(());
         }
         let what = if read {
@@ -466,7 +511,9 @@ impl Core {
             for uid in &to {
                 r.send_to(*uid, receipt.clone());
             }
-            !to.is_empty()
+            // A detached session's buffer is no place to leave what is
+            // kept otherwise.
+            to.iter().any(|u| r.users.get(u).is_some_and(is_live))
         };
         // A delivery receipt may be dropped; a read one is a person's
         // act, and waits for the sender's next roster read.
