@@ -89,7 +89,7 @@ function redact(raw) {
 export class TestClient {
   /**
    * @param {import('./server.mjs').Server} server
-   * @param {object} creds `login`/`password`/`nick`/`icon`/`identity`
+   * @param {object} creds `login`/`password`/`nick`/`icon`/`identity`/`messaging`
    */
   constructor(server, creds = {}) {
     this.server = server;
@@ -106,6 +106,7 @@ export class TestClient {
         nick: creds.nick ?? 'guest',
         icon: creds.icon ?? 0,
         ...(creds.identity ? { identity: creds.identity } : {}),
+        ...(creds.messaging ? { messaging: true } : {}),
       },
       {
         onTrace: (t) => this.onTrace(t),
@@ -114,11 +115,13 @@ export class TestClient {
         onResumed: (replay) => this.push('hook', 'onResumed', { replay }),
         onLogin: (ok) => this.push('hook', 'onLogin', ok),
         onSnapshot: (ok) => this.push('hook', 'onSnapshot', ok),
-        // These two change what the client *sends*: with no hook the
-        // library skips the `inbox` and `history` catch-up entirely. A
-        // suite that wants to observe recovery has to ask for it.
+        // These change what the client *sends*: with no hook the
+        // library skips the `inbox` and `history` catch-up, and the
+        // `friends` read that hands over what waited, entirely. A suite
+        // that wants to observe recovery has to ask for it.
         onMissedMail: (ok) => this.push('hook', 'onMissedMail', ok),
         onMissedHistory: (ok) => this.push('hook', 'onMissedHistory', ok),
+        onFriends: (ok) => this.push('hook', 'onFriends', ok),
       },
     );
   }
