@@ -88,6 +88,9 @@ fn req_label(req: &str) -> &'static str {
     if crate::moderation::handles(req) {
         return "moderation";
     }
+    if crate::friends::handles(req) {
+        return "messaging";
+    }
     "other"
 }
 
@@ -103,7 +106,9 @@ fn req_label(req: &str) -> &'static str {
 /// it gathers, one for each address a multi-homed device has and each
 /// kind of candidate, all as the call is joined, and a candidate refused
 /// is one the call silently goes without. Nothing else bounds how many a
-/// peer may send, so it is not free.
+/// peer may send, so it is not free. `receipt` is a read's price too: a
+/// client acknowledges every `im` a `friends` read hands over, a batch
+/// of them at once.
 fn request_weight(req: &str) -> u32 {
     match req {
         "logout" => 0,
@@ -114,12 +119,15 @@ fn request_weight(req: &str) -> u32 {
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
         | "report_close" | "redact" | "revoke" | "kick" | "account_get" | "account_create"
         | "account_update" | "account_delete" | "role_create" | "role_update" | "role_delete"
-        | "room_topic" | "room_join" | "room_part" => 2,
+        | "room_topic" | "room_join" | "room_part" | "friends" | "friend_respond"
+        | "friend_remove" | "friend_alias" | "presence" | "typing" | "requests"
+        | "request_answer" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
         | "account_list" | "role_list" | "role_get" | "files_preview" | "room_create"
-        | "room_edit" | "room_archive" | "room_unarchive" | "device_cert" => 4,
+        | "room_edit" | "room_archive" | "room_unarchive" | "device_cert" | "friend_add"
+        | "requests_clear" | "find_user" | "user_profile" => 4,
         _ => 1,
     }
 }
@@ -779,8 +787,9 @@ async fn handle_login(
             // client that renders nothing for it is a client that
             // renders the text, which is what a classic one does too.
             inline_media: ctx.core.media_enabled(),
-            // Until this wire carries the friend family.
-            messaging: false,
+            // Only for a client that said it speaks the friend family,
+            // so one that did not is sent nothing new (§7.5).
+            messaging: p.messaging && ctx.core.messaging_enabled(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -982,6 +991,9 @@ async fn handle_login(
     if crate::signed::offered(ctx) && !caps.iter().any(|c| c == "signed") {
         caps.push("signed".into());
     }
+    if ctx.core.messaging_enabled() && !caps.iter().any(|c| c == "messaging") {
+        caps.push("messaging".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -1091,6 +1103,12 @@ async fn handle_login(
     }
     if let Some(rooms) = crate::rooms::login_json(&ctx.core, uid) {
         ok["rooms"] = rooms;
+    }
+    let messaging = off_reactor(&ctx.core, move |c| crate::friends::login_json(c, uid))
+        .await
+        .flatten();
+    if let Some(messaging) = messaging {
+        ok["messaging"] = messaging;
     }
     let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
@@ -1552,13 +1570,20 @@ async fn handle_sync(
     if let Some(rooms) = crate::rooms::sync_json(&ctx.core, state.uid) {
         ok["rooms"] = rooms;
     }
+    // And the account's own presence and switches, as the login's.
+    let uid = state.uid;
+    let messaging = off_reactor(&ctx.core, move |c| crate::friends::login_json(c, uid))
+        .await
+        .flatten();
+    if let Some(messaging) = messaging {
+        ok["messaging"] = messaging;
+    }
     let out = reply_ok_with_users(req.id, ok, &ctx.core.roster_rows());
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
     }
     // After the seq this reply reports, so the mail arrives as events
     // the client has not already been told it is past.
-    let uid = state.uid;
     off_reactor(&ctx.core, move |c| c.flush_inbox(uid)).await;
     Flow::Continue
 }
@@ -1630,7 +1655,10 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// Open and Set User, 20 each but Open's 10, and the role writes Set
 /// User's. Whatever else this wire asks
 /// for, it has no classic counterpart to be priced by, and is held to the
-/// request limit instead. As `(type, points)`.
+/// request limit instead. So is the friend family but `msg`: mhxd's
+/// table predates the extension and would price it only by its
+/// catch-all, at which a receipt for every message read is a ban. As
+/// `(type, points)`.
 fn spam_charge(req: &str) -> Option<(u32, u32)> {
     match req {
         "chat" => Some((0x69, 2)),
@@ -2426,6 +2454,11 @@ async fn dispatch(
         r if crate::moderation::handles(r) => crate::moderation::handle(ctx, state, req).await,
         r if crate::accounts::handles(r) => crate::accounts::handle(ctx, state, req).await,
         r if crate::rooms::handles(r) => crate::rooms::handle(ctx, state, req).await,
+        // Without messaging the family is unknown, as it was before it
+        // existed.
+        r if crate::friends::handles(r) && ctx.core.messaging_enabled() => {
+            crate::friends::handle(ctx, state, req).await
+        }
 
         // --- Files (docs/files-plan.md) -------------------------------
         r if r.starts_with("files_") => crate::files::handle(ctx, state, req).await,
@@ -2503,10 +2536,10 @@ pub(crate) fn retry_secs(wait: std::time::Duration) -> u64 {
 /// Counting UTF-8 bytes here instead cut a 28-character accented nick
 /// that a 1.x client would have carried whole, and cut it for every
 /// viewer including the ng ones.
-const NICK_MAX_CHARS: usize = 31;
+pub(crate) const NICK_MAX_CHARS: usize = 31;
 
 /// `String::truncate` panics off char boundaries; caps shouldn't.
-trait TruncateToCharBoundary {
+pub(crate) trait TruncateToCharBoundary {
     /// Truncate to at most `max` *bytes*, at a character boundary.
     fn truncate_to_char_boundary(&mut self, max: usize);
     /// Truncate to at most `max` *characters*.

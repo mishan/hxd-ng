@@ -754,6 +754,7 @@ impl Event {
                 e.login.len()
                     + e.alias.as_ref().map_or(0, String::len)
                     + e.status_text.as_ref().map_or(0, String::len)
+                    + e.note.as_ref().map_or(0, String::len)
             }
             Event::FriendRequest { login, note, .. } => {
                 login.len() + note.as_ref().map_or(0, String::len)

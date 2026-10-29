@@ -147,6 +147,7 @@ mod tests {
             voice,
             identity: None,
             inbox: None,
+            messaging: None,
             history: None,
             media: None,
             news: None,

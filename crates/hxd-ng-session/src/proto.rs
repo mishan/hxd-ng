@@ -35,6 +35,9 @@ pub struct LoginParams {
     /// Whether it can open sealed messages (§4.1).
     #[serde(default)]
     pub sealed: bool,
+    /// Whether it speaks the friend family (`docs/hotline-ng.md` §7.5).
+    #[serde(default)]
+    pub messaging: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -976,6 +979,58 @@ pub fn event_json(se: &SeqEvent) -> String {
             json!({ "room": crate::rooms::room_json(v) }),
         ),
         Event::RoomRemoved { room } => ("room_removed", json!({ "room": room })),
+        // Only ever to a session that speaks the friend family (§7.5).
+        Event::FriendEntry(e) => (
+            "friend",
+            json!({ "friend": crate::friends::friend_json(e) }),
+        ),
+        Event::FriendRequest {
+            login,
+            fingerprint,
+            note,
+        } => {
+            let mut data = crate::friends::named(login, fingerprint.as_ref());
+            if let Some(note) = note {
+                data["note"] = json!(note);
+            }
+            ("friend_request", data)
+        }
+        Event::Presence {
+            login,
+            fingerprint,
+            state,
+            status_text,
+        } => (
+            "presence",
+            crate::friends::presence_json(
+                login,
+                fingerprint.as_ref(),
+                *state,
+                status_text.as_deref(),
+            ),
+        ),
+        Event::Im(m) => ("im", crate::friends::im_json(m)),
+        Event::Receipt {
+            login,
+            fingerprint,
+            guid,
+            read,
+        } => {
+            let mut data = crate::friends::named(login, fingerprint.as_ref());
+            data["guid"] = json!(guid.as_str());
+            data["read"] = json!(read);
+            ("receipt", data)
+        }
+        Event::Typing {
+            login,
+            fingerprint,
+            typing,
+        } => {
+            let mut data = crate::friends::named(login, fingerprint.as_ref());
+            data["typing"] = json!(typing);
+            ("typing", data)
+        }
+        Event::RequestsChanged { count } => ("requests_changed", json!({ "count": count })),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.

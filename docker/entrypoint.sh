@@ -288,6 +288,12 @@ generate() {
         num HXD_INBOX_MAX_SENT_BYTES_PER_DAY max_sent_bytes_per_day
         db=
     fi
+    if on HXD_MESSAGING off; then
+        on HXD_INBOX on || die "HXD_MESSAGING needs HXD_INBOX"
+        echo
+        echo "[messaging]"
+        echo "enabled = true"
+    fi
     if on HXD_HISTORY on; then
         echo
         echo "[history]"

@@ -416,6 +416,16 @@ Three layers, all `cargo test --workspace`:
   shared by a classic and an ng client, joins past a session's
   allowance refused on each wire while leaves never are, and a burst of
   mute flips announced once with its final state),
+  `friends.rs` (the friend family on the ng wire: two clients made
+  friends, presence through the binary's flusher, instant messages
+  with receipts and typing, one sent while away handed over at the
+  roster read, a block reading as a missing account on every request
+  naming one, a request listed, approved and answered, crossing
+  requests, Invisible hiding presence alone, an account without the bit
+  taking no part, a client that never declared the family hearing
+  nothing of it across a resume until it asks, a server
+  without messaging answering as before, and a classic client beside
+  it all hearing nothing),
   `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line

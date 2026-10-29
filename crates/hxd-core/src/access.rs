@@ -188,6 +188,7 @@ pub const NAMES: &[(&str, u8)] = &[
     // everyone else's screen without their asking, so an operator grants
     // it rather than inheriting it. Bootstrap's guest does not get it.
     ("send_media", bit::SEND_MEDIA),
+    ("messaging", bit::MESSAGING),
     ("video_chat", bit::VIDEO_CHAT),
     // Off for guests by default, per the video spec: a screen share can
     // leak documents, credentials and other people's messages in a way a

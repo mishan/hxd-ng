@@ -4,11 +4,10 @@ Status: built — the core below, plus history (chat-history.md), the
 inbox (private-messages.md), news (news.md), media (inline-media.md),
 voice and video (voice.md, capabilities-video.md), files (§7.2),
 identity (hotline-ng-identity.md), and signed lines, articles and
-private messages that are not sealed, and rooms that require signing
-(e2e-messages.md §4.6 to §4.12). The vouch
-requests, `retry_after`, the `*@host` ban entry and the general rate
-limits of §9 are design not yet built in hxd-ng, and say so where they
-appear.
+private messages that are not sealed, rooms that require signing
+(e2e-messages.md §4.6 to §4.12), and instant messaging (§7.5). The vouch
+requests and the `*@host` ban entry are design not yet built in hxd-ng,
+and say so where they appear.
 
 > **Conformance language:** The key words "MUST", "MUST NOT", "REQUIRED",
 > "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and
@@ -181,6 +180,7 @@ over them.
 | `roles` | Roles: `roles` on the `user` and account objects, `role_list`, `role_get`, `role_create`, `role_update`, `role_delete`, `roles_changed` and `roster_stale` | roles.md §7 | `roles`, and in `sync`'s reply |
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
+| `messaging` | Friends, presence, instant messages and message requests: `friends`, `friend_*`, `presence`, `find_user`, `user_profile`, `receipt`, `typing`, `requests`, `request_answer`, `requests_clear`, their events, and `msg` by `to_login` as an instant message or a request | §7.5 here; instant-messaging.md | `messaging` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -277,7 +277,8 @@ Starts a new session.
     "nick": "Alice",         // honored only with the use-any-name privilege
     "icon": 128,             // classic icon id; optional
     "signs": "default",      // optional: "default" | "able" (e2e-messages.md §4.6)
-    "sealed": true           // optional: it can open sealed messages (e2e-messages.md §4.1)
+    "sealed": true,          // optional: it can open sealed messages (e2e-messages.md §4.1)
+    "messaging": true        // optional: it speaks the friend family (§7.5)
 } }
 ```
 
@@ -312,6 +313,7 @@ hotline-ng-identity.md §8.1 says.
 | `caps` | §4. |
 | `seq` | The seq the client is at: 0 for a new session. |
 | `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
+| `messaging` | Not echoed: the `messaging` block (§7.5) is present whenever the capability is. With the capability, `true` makes this a session that speaks the friend family from its login on (§7.5); without it, it is ignored. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -647,7 +649,7 @@ family document. Each family of §4 adds its own.
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "id"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "id"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
@@ -813,6 +815,216 @@ counts in §3's sequence.
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
+### 7.5 Instant messaging
+
+The `messaging` capability is instant-messaging.md's friend family:
+friends made by request and response, their presence, instant messages
+with receipts and typing, and message requests. That document gives
+the semantics (who may take part, what a block, a request and an
+approval do, the bounds); this section is the family's wire. Accounts
+are named by `login` throughout, and every `fingerprint` here is the
+52-character form of §7.4's `identity`, present where the account links
+an identity.
+
+**Declaring it.** A client that speaks the family says so at login
+with `"messaging": true` (§6.1); a resume keeps what the login said.
+Such a session is sent the family's events from its login on. A
+session that never declared it is sent none of them, and is answered
+as it was before the family existed, until it sends one of the
+family's requests, which makes it a session that speaks the family
+from then on. `msg` is not one of them.
+
+**Taking part.** Only an account that holds `AccessMessaging` (bit 58,
+`messaging` in access-bits.md) takes part, and never `admin` or
+`guest`, whatever their bits. Any other session's requests of the
+family are answered `access_denied`. The login reply's `messaging`
+block says which this session is, and what its account shows of
+itself, as it set it:
+
+```jsonc
+"messaging": {
+  "takes_part": true,         // false: every request below is access_denied
+  "max_roster": 500,          // MaxRosterSize: friends, blocks, approvals and requests sent
+  "max_message_bytes": 4096,  // an instant message's text, in UTF-8 bytes
+  "request_messages": 5,      // message requests one sender may send one recipient
+  // The rest only where takes_part is true: the account's own.
+  "state": "online",          // online | away | busy | invisible
+  "status_text": "at lunch",  // absent unless set
+  "discoverable": false,
+  "takes_requests": false
+}
+```
+
+`sync`'s reply carries the block too, as it stands then. `takes_part`
+is decided as the session logs in and kept for its life: an
+`account_changed` that gives or takes `messaging` changes it at the
+account's next login, not before (*hxd-ng:* instant-messaging.md §6's
+suspension is staged). A session's `state` starts `online`, whatever
+another of its account's said, and a new login ends the account's
+`invisible`: the account is shown to its friends again, and they are
+told so, as the extension has it.
+
+**Sending.** An instant message is a `msg` by `to_login` (§7.1) to a
+friend, or under an approval; to anyone else taking part it becomes a
+message request or is refused, as instant-messaging.md §4.1 orders it.
+Beside §7.1's answers, its reply may be `{ "queued": true,
+"requested": true }`, the one answer a request has, whether it was
+stored, held or dropped; and it may be refused `not_friends`,
+`request_full` or `roster_full` (below), with `quota_exceeded` for a
+bound of instant-messaging.md §4.4 and `no_such_user` for an account
+that has blocked the sender. A request carries text alone: one with
+`media` is `not_friends`. A message to a friend whose text is longer
+than `max_message_bytes`, or that carries `media`, is a private
+message, as before. A sender SHOULD send a `guid`: receipts name the
+message by it. A `msg` to an attached friend is answered `queued:
+false` whatever the friend's state, `invisible` included, as the
+extension has it.
+
+**Receiving.** A friend's instant message reaches every attached
+session of the recipient's that speaks the family as an `im` event,
+and one sent while none was attached waits for the next `friends`
+request, which hands over what waited (*hxd-ng:* `[inbox]
+deliver_at_flush` at a time, the rest at the next). A client
+acknowledges each `im` with `receipt`; one not acknowledged is handed
+over again at the next `friends`. So a client SHOULD send `friends`
+after `login`, after a `resume`, after `sync`, and after the first of
+the family's requests from a session that did not declare it, and
+MUST treat an `im` whose `guid` and sender it has already shown as a
+repeat, not a second message: a resume's replay and a `friends` read
+can both hand the same one over again. A session that does not speak
+the family is handed a friend's instant messages as `msg` events, as
+before.
+
+| `req` | `params` | `ok` | Errors besides §10's universal set |
+|---|---|---|---|
+| `friends` | — | `{ "friends": [ friend… ] }` | — |
+| `friend_add` | `login`, `note?` | `{ "state" }`: `pending_out`, or `accepted` where it met a request of theirs | `no_such_user`, `blocked`, `already_friends`, `request_pending`, `roster_full`, `quota_exceeded`, `bad_request` |
+| `friend_respond` | `login`, `accept` (bool) | `{ "state" }`: `accepted`, or `removed` for a decline | `no_such_user`, `not_friends`, `roster_full` |
+| `friend_remove` | `login` | `{}` | `no_such_user`, `not_friends` |
+| `friend_alias` | `login`, `alias` (string, or `null` to clear) | `{}` | `no_such_user`, `not_friends` |
+| `presence` | `state?` (`online` \| `away` \| `busy` \| `invisible`), `status_text?` (string, or `null` to clear), `discoverable?`, `takes_requests?` | `{}` | — |
+| `find_user` | `login` | `{ "user" }` | `no_such_user` |
+| `user_profile` | `login` | `{ "user" }`, with `profile` | `no_such_user` |
+| `receipt` | `login`, `guid`, `read?` (default `false`) | `{}` | — |
+| `typing` | `login`, `typing` (bool) | `{}` | — |
+| `requests` | `cursor?` | `{ "requests": […], "approvals": […], "dropped", "takes_requests", "cursor"? }` | — |
+| `request_answer` | `login`, `action` (`approve` \| `delete` \| `end`) | `{}` | `no_such_request`, `roster_full` |
+| `requests_clear` | `since?`, `before?` (Unix seconds) | `{ "declined", "deleted" }` | — |
+
+- **`friends`** is Get Roster (800): every row of this account's, a
+  request sent to it among them. An approval is not a row; `requests`
+  lists them.
+- **`friend_add`** asks `login` for friendship, with `note` the
+  request's note, cut to §8's private-message limit; a note longer
+  than `max_message_bytes`, where a server sets that lower, is
+  `bad_request`. A request already
+  waiting from `login` is accepted instead, `accepted`; a session that
+  has not said `takes_requests` and has not sent `requests` is
+  answered `request_pending` for it, as the extension answers it.
+  `blocked` here is the caller's own block of `login`, to be lifted
+  first. A request is answered `pending_out` whether it was delivered,
+  held or dropped (instant-messaging.md §4.4).
+- **`friend_respond`** accepts or declines a request `login` sent;
+  **`friend_remove`** ends a friendship, which ends it for both,
+  withdraws a request the caller sent, or declines one it was sent. An
+  act on a request that has lapsed or been withdrawn is `not_friends`.
+- **`friend_alias`** sets the name this account shows a friend by, for
+  itself alone. *hxd-ng* cuts it to a nick's 31 characters.
+- **`presence`** is Set Presence (808), each absent field left as it
+  was. `invisible` hides the account from its friends' presence,
+  every session of it, which they are told is `offline`; any other
+  state is this session's, and friends see the most
+  available of an account's sessions. `discoverable` is the extension's,
+  for a user search this wire does not carry yet. `takes_requests` turns message requests to this account on or off;
+  sending it either way makes this a session that understands requests
+  (instant-messaging.md §4.1), as `requests` does. *hxd-ng* cuts
+  `status_text` to §8's subject limit.
+- **`find_user`** and **`user_profile`** are Find User (822) and Get
+  User Info (825). The `user` object is `{ login, name, presence?,
+  status_text?, profile? }`: `name` is the profile's nickname or the
+  login, `presence` and `status_text` are shown for a friend and for
+  the caller's own account alone, and `profile` likewise, on
+  `user_profile`'s reply: `{ nickname?, first_name?, last_name?,
+  email?, gender?, birthdate?, country?, postcode?, languages }`, with
+  `birthdate` `{ year?, month?, day? }` and `gender` the extension's
+  code: 1 female, 2 male, 3 other, absent for unspecified, and any
+  other number read as unspecified. On the caller's own login,
+  `presence` is its own `state`, `invisible` included. An account that
+  has blocked the caller is `no_such_user`, as one that does not exist
+  is.
+- **`receipt`** is IM Acknowledge (812): the caller received, or with
+  `read` read, the `im` `login` sent under `guid`. **`typing`** is IM
+  Typing (813). Both are answered `{}` whatever becomes of them: between
+  two accounts with no friendship or approval they are dropped, so a
+  stranger learns nothing from one, and a typing flag goes only to a
+  friend. A typing flag lapses: a client that receives `typing: true`
+  shows it for 10 seconds unless it is said again, and a client sends
+  `typing: true` again every 5 seconds while its user is typing, and
+  `typing: false` when they stop, send or leave the conversation.
+- **`requests`** lists the message requests waiting for this account,
+  by sender, oldest first, and its approvals: `requests` is `[{ login,
+  fingerprint?, messages: [{ id, text, at, guid, signed? }] }]`, with
+  `id` the inbox id a `report` names it by (moderation.md §4.2) and
+  `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
+  `dropped` is how many requests were dropped since the last listing,
+  and `takes_requests` whether this account takes them now.
+  `cursor`, an opaque string where present, is passed back to read
+  the rest; a client
+  MUST read on while it is present. *hxd-ng* bounds what can wait
+  (`[messaging] max_requests` senders, each `request_messages`
+  messages) and answers it all at once, so sends no `cursor`.
+- **`request_answer`** approves the conversation with `login`, whose
+  waiting messages then arrive as `im` events with `approval`;
+  deletes its request, telling the sender nothing; or ends an
+  approval. Deleting and ending hold the sender (instant-messaging.md
+  §4.4).
+- **`requests_clear`** declines every friend request and deletes every
+  message request received from `since` up to `before`, each bound
+  optional, and answers how many of each (instant-messaging.md §4.3).
+
+**The `friend` object** is one row as its owner sees it:
+
+```jsonc
+{
+  "login": "bob", "fingerprint": "6htgz65…",   // fingerprint absent unless linked
+  "state": "accepted",          // pending_out | pending_in | accepted | blocked | removed
+  "alias": "Bobby",             // absent unless set
+  "presence": "online",         // offline | online | away | busy; only for accepted
+  "status_text": "at lunch",    // only for accepted, when set
+  "note": "hi, it's Bob"        // only for pending_in, when sent
+}
+```
+
+`removed` appears only in a `friend` event: the row is gone.
+
+**Events.** Only to a session that speaks the family:
+
+| `ev` | `data` | Sent when |
+|---|---|---|
+| `friend` | `{ "friend": {…} }` | A row changed, whole, as it now stands, or went (`removed`): to every session of the account that speaks the family, the one whose request changed it included, so all of them agree. A client replaces its copy. |
+| `friend_request` | `{ "login", "fingerprint"?, "note"? }` | Someone asked this account for friendship (804). |
+| `presence` | `{ "login", "fingerprint"?, "state", "status_text"? }` | A friend's presence changed (809): `state` as on the `friend` object. *hxd-ng* tells a burst of changes once, with its final state. |
+| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "signed"?, "approval"? }` | An instant message (811). `id` is the inbox row, absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
+| `receipt` | `{ "login", "fingerprint"?, "guid", "read" }` | A friend received (`read` false) or read a message this account sent it under `guid`. Under an approval only reads are told. |
+| `typing` | `{ "login", "fingerprint"?, "typing" }` | A friend started or stopped typing to this account. |
+| `requests_changed` | `{ "count" }` | The number of senders whose requests wait changed: to sessions that understand requests alone. |
+
+A server that does not serve the family answers its requests
+`unknown_method`, as §4 allows. The family's codes:
+
+| Code | From | Meaning |
+|---|---|---|
+| `access_denied` | the family | This account does not take part. |
+| `no_such_user` | the family, `msg` | No such account, one that does not take part, or one that has blocked you: one answer for all three. |
+| `blocked` | `friend_add` | You have blocked them. |
+| `already_friends` | `friend_add` | They are your friend already. |
+| `request_pending` | `friend_add` | A friend request between you waits already. |
+| `not_friends` | `friend_respond`, `friend_remove`, `friend_alias`, `msg` | There is no friendship or request to act on, or a `msg` that cannot be a request: they take no requests, you have blocked them, it carries `media`, or this session does not understand requests. |
+| `roster_full` | `friend_add`, `friend_respond`, `request_answer`, `msg` | The act would take your rows past `max_roster`. |
+| `quota_exceeded` | `friend_add`, `msg` | You have asked as many new people today as the server allows. |
+| `request_full` | `msg` | You have sent that account as many requests as you may until it answers. |
+| `no_such_request` | `request_answer` | No request or approval of theirs to answer. |
+
 ## 8. Text and limits
 
 All text on this wire is UTF-8; JSON makes it so. A server that shares its
@@ -874,14 +1086,19 @@ news body is different: it declares its own type (news.md §5).
   `msg_read`, `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
   `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
   `push_unregister`, `files_download`, `files_mkdir`, `files_delete`,
-  `files_move`, `files_comment`, `report_close`, `redact`, `revoke` and
-  `kick`. What fans out, searches, or joins, leaves or
+  `files_move`, `files_comment`, `report_close`, `redact`, `revoke`,
+  `kick`, `friend_respond`, `friend_remove`, `friend_alias`,
+  `presence`, `typing` and `request_answer`, and `friends` and
+  `requests`, which read a row of the store for each one listed. What fans out,
+  searches, asks a stranger, or joins, leaves or
   renegotiates media costs 4: `news_post`, `news_delete`,
   `news_node_create`, `news_node_rename`, `news_node_delete`,
   `news_search`, `voice_join`, `voice_leave`, `video_start`,
   `video_stop`, `video_subscribe`, `push_register`, `report`,
-  `purge` and `device_cert`. Every other request, the reads and a
-  trickled `voice_ice` candidate among them, costs 1, and only `logout`
+  `purge`, `device_cert`, `friend_add`, `requests_clear`, `find_user`
+  and `user_profile`. Every other request, the reads, a
+  trickled `voice_ice` candidate and a `receipt`, which a client sends
+  for each `im` a `friends` read hands over, among them, costs 1, and only `logout`
   is free. A request the bucket cannot pay for costs nothing, and is
   answered `rate_limited` with `retry_after`, the whole seconds until it
   could be. The bucket is the session's rather than the connection's: it is
@@ -942,7 +1159,11 @@ news body is different: it declares its own type (news.md §5).
   User Change, and `signs` too, being told as one, the news writes
   their 1.5 transactions, `news_post` a threaded post, and the
   file-area changes their Delete File, New
-  Folder, Set File Info and Move File. Past the first the session is kicked and its room told;
+  Folder, Set File Info and Move File. The friend family's requests
+  but `msg` spend none: mhxd's table predates the extension and prices
+  its transactions only by its catch-all, at which a receipt for every
+  message read would be a ban, so they are held to the request limit
+  and instant-messaging.md §4.4's bounds instead. Past the first the session is kicked and its room told;
   past the second it is kicked and banned for `[server] ban_time` —
   its account's login or its identity, and its address unless
   `[limits] exempt` holds that to nothing, so a plain guest on an
@@ -992,7 +1213,7 @@ news body is different: it declares its own type (news.md §5).
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
 | `mailbox_full` | `msg` | The recipient's inbox is at its cap, or for a sealed message, the detached recipient holds as many as it may (e2e-messages.md §4.3; *hxd-ng:* `[sealed]`). |
 | `quota_exceeded` | `msg` | The recipient is not connected, and you have stored as much mail today as the server allows. To someone connected, the same message is delivered. *hxd-ng:* `[inbox] max_sent_per_day` and `max_sent_bytes_per_day`. |
-| `blocked` | `msg`, `device_cert` | The recipient blocks you. |
+| `blocked` | `msg`, `device_cert` | The recipient blocks you. For a `msg` by `to_login`, only outside instant messaging: between two accounts that take part, a block reads as `no_such_user` (§7.5). |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
 | `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3), or a user of a linked server behind a link that does not carry them, or whose server is not shown this session's key. |
@@ -1041,6 +1262,9 @@ normative, this list is not.
   may send again, and reuse it on retry (§7.1, §7.3); retries a chat
   line only where the server offers `chat_guid` (§4);
 - reads an absent `system` as `false` (§7.4);
+- with `messaging`, acknowledges each `im` with `receipt`, shows an
+  `im` it has shown before once, sends `friends` after each handshake
+  and `sync` for what waited, and lets a typing flag lapse (§7.5);
 - treats `rate_limited` as a delay, not a failure (§9);
 - renders no markup in chat that a classic client would not also see as
   text (§8);
