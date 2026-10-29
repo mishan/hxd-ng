@@ -22,6 +22,7 @@ pub mod inbox;
 pub mod instrument;
 pub mod limits;
 pub mod media;
+pub mod messaging;
 pub mod moderation;
 pub mod news;
 pub mod notify;
@@ -68,6 +69,10 @@ pub use limits::{
 pub use media::{
     Canonical, CodecLimits, Fetched, Handle, HistoryAccess, MediaCodec, MediaConfig, MediaRecord,
     MediaRef, MediaReject, MediaType, Principal, UploadOutcome, UploadPart,
+};
+pub use messaging::{
+    FoundUser, FriendEntry, Im, ImSent, MessagingError, MessagingPolicy, Presence, PresenceUpdate,
+    RosterState,
 };
 pub use moderation::{
     Act, ActKind, Actor, Filed, MemoryModeration, ModError, ModerationPolicy, ModerationStore,

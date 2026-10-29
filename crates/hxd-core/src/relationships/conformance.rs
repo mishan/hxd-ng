@@ -190,10 +190,15 @@ fn a_claim_folds_two_rows_for_one_pair_into_the_older_claim(s: &dyn Relationship
     s.set_blocked(&bare, &bob, true, at(2)).unwrap();
     let approval = s.approve(&bare, &bob, at(2)).unwrap();
 
+    let claimed = s.claim("alice", &fp(1)).unwrap();
     assert_eq!(
-        s.claim("alice", &fp(1)).unwrap().merged,
+        claimed.merged,
         [(second, first)],
         "{case}: the lost friendship, beside the one that stands for it"
+    );
+    assert!(
+        claimed.moved >= 2,
+        "{case}: each row folded counts, though none is left to re-key"
     );
     let mine = s.relationship(&linked, &bob, at(3)).unwrap().unwrap();
     assert_eq!(mine.friendship, Some(first), "{case}: the older claim's");
@@ -617,6 +622,23 @@ fn the_ledger_counts_what_was_sent_and_answers_a_retry(s: &dyn RelationshipStore
     let me_ = Requester::Account(me.clone());
     let addr = Requester::Address("addr-1".into());
     assert_eq!(
+        s.find_request(&me_, Some(&x), &guid(1)).unwrap(),
+        Some(first.clone()),
+        "{case}: found before it is asked again"
+    );
+    assert_eq!(
+        s.find_request(&me_, None, &guid(1)).unwrap(),
+        Some(first.clone()),
+        "{case}: and toward anyone"
+    );
+    for (from, to) in [(&me_, &y), (&addr, &x)] {
+        assert_eq!(
+            s.find_request(from, Some(to), &guid(1)).unwrap(),
+            None,
+            "{case}: another pair's"
+        );
+    }
+    assert_eq!(
         s.requests_to(&me_, &x, RequestKind::Message, at(0))
             .unwrap(),
         2,
@@ -682,15 +704,13 @@ fn the_ledger_counts_what_was_sent_and_answers_a_retry(s: &dyn RelationshipStore
 fn a_listing_takes_the_dropped_count(s: &dyn RelationshipStore) {
     let case = "a_listing_takes_the_dropped_count";
     let me = Mailbox::login("me");
-    assert_eq!(s.account(&me).unwrap().requests_listed_at, None, "{case}");
     s.request_dropped(&me).unwrap();
     s.request_dropped(&me).unwrap();
-    assert_eq!(s.requests_listed(&me, at(5)).unwrap(), 2, "{case}");
-    assert_eq!(s.requests_listed(&me, at(6)).unwrap(), 0, "{case}: since");
-    assert_eq!(
-        s.account(&me).unwrap().requests_listed_at,
-        Some(at(6)),
-        "{case}: and when"
+    assert_eq!(s.requests_listed(&me).unwrap(), 2, "{case}");
+    assert_eq!(s.requests_listed(&me).unwrap(), 0, "{case}: since");
+    assert!(
+        !s.account(&me).unwrap().takes_requests,
+        "{case}: listing is no opt-in"
     );
 }
 
@@ -699,7 +719,24 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
     let me = Mailbox::identified("me", fp(1));
     let fresh = s.account(&me).unwrap();
     assert!(!fresh.discoverable, "{case}: unlisted until asked");
-    assert!(fresh.takes_requests, "{case}: the switch starts on");
+    assert!(
+        !fresh.takes_requests && fresh.requests_opted_at.is_none(),
+        "{case}: off until a session opts in"
+    );
+    s.update_account(
+        &me,
+        &AccountUpdate {
+            takes_requests: Some(Some(at(5))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let opted = s.account(&me).unwrap();
+    assert_eq!(
+        (opted.takes_requests, opted.requests_opted_at),
+        (true, Some(at(5))),
+        "{case}: and when"
+    );
     let profile = Profile {
         nickname: Some("Misha".into()),
         first_name: Some("A".into()),
@@ -720,7 +757,7 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
         &AccountUpdate {
             status_text: Some(Some("out".into())),
             discoverable: Some(true),
-            takes_requests: Some(false),
+            takes_requests: Some(None),
             profile: Some(profile.clone()),
         },
     )
@@ -737,6 +774,11 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
     let got = s.account(&me).unwrap();
     assert_eq!(got.status_text, None, "{case}: cleared");
     assert!(got.discoverable && !got.takes_requests, "{case}: kept");
+    assert_eq!(
+        got.requests_opted_at,
+        Some(at(5)),
+        "{case}: opting out keeps when it was on"
+    );
     assert_eq!(
         got.profile,
         Profile {

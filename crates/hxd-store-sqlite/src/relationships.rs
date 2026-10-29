@@ -238,7 +238,7 @@ fn ledger_row(r: &Row<'_>) -> rusqlite::Result<Result<LedgerEntry, StoreError>> 
 }
 
 const ACCOUNT_COLUMNS: &str = "id, status_text, discoverable, takes_requests, \
-                               requests_listed_at, requests_dropped, nickname, first_name, \
+                               requests_opted_at, requests_dropped, nickname, first_name, \
                                last_name, email, gender, birth_year, birth_month, birth_day, \
                                country, postcode, language1, language2, language3";
 
@@ -259,7 +259,7 @@ fn load_account(
                     status_text: r.get(1)?,
                     discoverable: r.get(2)?,
                     takes_requests: r.get(3)?,
-                    requests_listed_at: r.get::<_, Option<i64>>(4)?.map(from_unix),
+                    requests_opted_at: r.get::<_, Option<i64>>(4)?.map(from_unix),
                     profile: Profile {
                         nickname: r.get(6)?,
                         first_name: r.get(7)?,
@@ -297,7 +297,7 @@ fn write_account(
         a.status_text,
         a.discoverable,
         a.takes_requests,
-        a.requests_listed_at.map(unix),
+        a.requests_opted_at.map(unix),
         dropped as i64,
         p.nickname,
         p.first_name,
@@ -317,7 +317,7 @@ fn write_account(
     sql(match id {
         Some(_) => conn.execute(
             "UPDATE messaging_account SET owner = ?1, owner_fp = ?2, status_text = ?3,
-                    discoverable = ?4, takes_requests = ?5, requests_listed_at = ?6,
+                    discoverable = ?4, takes_requests = ?5, requests_opted_at = ?6,
                     requests_dropped = ?7, nickname = ?8, first_name = ?9, last_name = ?10,
                     email = ?11, gender = ?12, birth_year = ?13, birth_month = ?14,
                     birth_day = ?15, country = ?16, postcode = ?17, language1 = ?18,
@@ -327,7 +327,7 @@ fn write_account(
         ),
         None => conn.execute(
             "INSERT INTO messaging_account (owner, owner_fp, status_text, discoverable,
-                    takes_requests, requests_listed_at, requests_dropped, nickname, first_name,
+                    takes_requests, requests_opted_at, requests_dropped, nickname, first_name,
                     last_name, email, gender, birth_year, birth_month, birth_day, country,
                     postcode, language1, language2, language3)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
@@ -428,6 +428,7 @@ impl SqliteStore {
                 sql(found.collect())?
             };
             let mut merged = Vec::new();
+            let mut n = 0;
             for (dup, kept) in pairs {
                 let (Some(d), Some(mut k)) = (load_id(tx, dup)?, load_id(tx, kept)?) else {
                     continue;
@@ -437,6 +438,7 @@ impl SqliteStore {
                 write(tx, Some(kept), &mut k)?;
                 forget(tx, lost.iter().map(|(l, _)| *l))?;
                 merged.extend(lost);
+                n += 1;
             }
             sql(tx.execute(
                 &format!(
@@ -446,7 +448,6 @@ impl SqliteStore {
                 ),
                 params![to, from],
             ))?;
-            let mut n = 0;
             for (table, col) in [
                 ("relationship", "owner"),
                 ("relationship", "other"),
@@ -769,6 +770,29 @@ impl RelationshipStore for SqliteStore {
         })
     }
 
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: Option<&Mailbox>,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let (sender, sender_bind) = sender_sql(from, 3);
+        let text = format!(
+            "SELECT {LEDGER_COLUMNS} FROM request_ledger
+              WHERE guid = ?1 AND {} AND {sender} ORDER BY id LIMIT 1",
+            to.map_or_else(|| "?2 IS NULL".into(), |to| mailbox_sql(to, "recipient", 2))
+        );
+        sql(conn
+            .query_row(
+                &text,
+                params![guid.as_str(), to.map(bind), sender_bind],
+                ledger_row,
+            )
+            .optional())?
+        .transpose()
+    }
+
     fn requests_to(
         &self,
         from: &Requester,
@@ -839,11 +863,8 @@ impl RelationshipStore for SqliteStore {
         self.account_edit(owner, |_, dropped| *dropped += 1)
     }
 
-    fn requests_listed(&self, owner: &Mailbox, at: SystemTime) -> Result<u64, StoreError> {
-        self.account_edit(owner, |a, dropped| {
-            a.requests_listed_at = Some(at);
-            std::mem::take(dropped)
-        })
+    fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError> {
+        self.account_edit(owner, |_, dropped| std::mem::take(dropped))
     }
 
     fn account(&self, of: &Mailbox) -> Result<MessagingAccount, StoreError> {
@@ -861,8 +882,11 @@ impl RelationshipStore for SqliteStore {
             if let Some(on) = update.discoverable {
                 a.discoverable = on;
             }
-            if let Some(on) = update.takes_requests {
-                a.takes_requests = on;
+            if let Some(at) = update.takes_requests {
+                a.takes_requests = at.is_some();
+                if at.is_some() {
+                    a.requests_opted_at = at;
+                }
             }
             if let Some(profile) = &update.profile {
                 a.profile = profile.clone();

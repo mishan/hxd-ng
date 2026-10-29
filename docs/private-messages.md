@@ -184,12 +184,12 @@ locking discipline.
   (`identity-records.md` §4).
 - **Deleting an account must call `purge`** (`Core::inbox_purge`). A
   freed login can be registered by someone else, and a later `claim`
-  would otherwise hand them the previous holder's mail. There is no
-  account-deletion path in the server yet — deleting an account is
-  `rm accounts/alice.toml` — so this one has a command of its own until
-  there is: `hxd inbox purge <login> [--fingerprint HEX]`, which reads
-  the account file for the mailbox key while it is still there and takes
-  the fingerprint by hand when it is not.
+  would otherwise hand them the previous holder's mail. **Wired** for
+  the running server's delete (`Core::account_delete`); an account
+  deleted by removing its file has a command of its own: `hxd inbox
+  purge <login> [--fingerprint HEX]`, which reads the account file for
+  the mailbox key while it is still there and takes the fingerprint by
+  hand when it is not.
 - **Unlinking owes nothing**, and that is a decision rather than an
   oversight. Mail is addressed to a person; under the strict rule the
   fingerprint *is* the person, so an account that gives up its link gives

@@ -369,6 +369,7 @@ impl Core {
         let actor_login = self.login_of(uid)?;
         let _writing = self.begin_account_write();
         let gated = self.gated_roles();
+        let deleted = std::cell::Cell::new(None);
         admin.delete_account(login, &|account| {
             if beyond(
                 &actor(admin, &actor_login, bit::DELETE_USERS)?,
@@ -377,10 +378,19 @@ impl Core {
             ) {
                 return Err(AdminError::Outranked);
             }
+            deleted.set(Some(crate::inbox::Mailbox {
+                login: account.login.clone(),
+                fingerprint: account.identity.fingerprint,
+            }));
             Ok(())
         })?;
         let login = login.to_ascii_lowercase();
         self.end_account(|l| l == login, Some(uid));
+        // So that whoever is given the login next inherits none of it
+        // (`docs/private-messages.md` §4).
+        if let Some(mailbox) = deleted.take() {
+            self.inbox_purge(&mailbox);
+        }
         Ok(())
     }
 

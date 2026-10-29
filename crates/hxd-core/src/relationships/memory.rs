@@ -10,7 +10,7 @@ use super::{
     AccountUpdate, Ignore, LedgerEntry, MessagingAccount, PendingOut, Recorded, Rekeyed,
     RelationId, Relationship, RelationshipStore, RequestKind, Requester, MAX_LANGUAGES,
 };
-use crate::inbox::{Mailbox, Sent, StoreError};
+use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
 struct Row {
     /// Creation order, which is the order rows are listed in.
@@ -124,6 +124,18 @@ pub struct MemoryRelationships {
 impl MemoryRelationships {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Is this friendship or approval live? What the in-memory inbox's
+    /// gate asks ([`crate::inbox::MemoryStore::gated`]).
+    pub fn is_live(&self, id: RelationId) -> bool {
+        self.inner.lock().unwrap().relations.contains(&id)
+    }
+
+    /// Is this an approval rather than a friendship?
+    pub fn is_approval(&self, id: RelationId) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.rows.iter().any(|r| r.rel.approval == Some(id))
     }
 }
 
@@ -260,6 +272,7 @@ impl Inner {
         // into that row, which is kept, as the SQLite store's unique
         // index would have it.
         let mut merged = Vec::new();
+        let mut n = 0;
         let mut i = 0;
         while i < self.rows.len() {
             let r = &self.rows[i].rel;
@@ -277,12 +290,12 @@ impl Inner {
                     let dup = self.rows.remove(i).rel;
                     let k = if k > i { k - 1 } else { k };
                     merged.extend(self.rows[k].rel.absorb(dup));
+                    n += 1;
                 }
                 None => i += 1,
             }
         }
         self.forget(merged.iter().map(|(lost, _)| *lost));
-        let mut n = 0;
         for r in self.rows.iter_mut() {
             n += stamp(&mut r.rel.owner) + stamp(&mut r.rel.other);
         }
@@ -581,6 +594,24 @@ impl RelationshipStore for MemoryRelationships {
         Ok(Recorded::New)
     }
 
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: Option<&Mailbox>,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .ledger
+            .iter()
+            .find(|e| {
+                e.guid.as_ref() == Some(guid)
+                    && to.is_none_or(|to| is(&e.recipient, to))
+                    && sent_by(e, from)
+            })
+            .cloned())
+    }
+
     fn requests_to(
         &self,
         from: &Requester,
@@ -641,11 +672,9 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
-    fn requests_listed(&self, owner: &Mailbox, at: SystemTime) -> Result<u64, StoreError> {
+    fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let account = inner.account_mut(owner);
-        account.state.requests_listed_at = Some(floor(at));
-        Ok(std::mem::take(&mut account.dropped))
+        Ok(std::mem::take(&mut inner.account_mut(owner).dropped))
     }
 
     fn account(&self, of: &Mailbox) -> Result<MessagingAccount, StoreError> {
@@ -667,8 +696,11 @@ impl RelationshipStore for MemoryRelationships {
         if let Some(on) = update.discoverable {
             state.discoverable = on;
         }
-        if let Some(on) = update.takes_requests {
-            state.takes_requests = on;
+        if let Some(at) = update.takes_requests {
+            state.takes_requests = at.is_some();
+            if let Some(at) = at {
+                state.requests_opted_at = Some(floor(at));
+            }
         }
         if let Some(profile) = &update.profile {
             state.profile = profile.clone();

@@ -22,7 +22,25 @@ impl Core {
             store.rotate(from, to)?;
         }
         if let Some(store) = self.relationships.as_ref() {
-            store.rotate(from, to)?;
+            let rekeyed = store.rotate(from, to)?;
+            if let Err(e) = self.restamp(&rekeyed.merged) {
+                tracing::warn!("inbox: re-stamping a rotation's merged friendships: {e}");
+            }
+            // By the login the account link now gives it, so a friend
+            // with no row of its own naming the successor is told too.
+            let successor = self
+                .directory
+                .as_ref()
+                .and_then(|d| d.account_by_key(to))
+                .map_or_else(
+                    || crate::inbox::Mailbox::identified(String::new(), *to),
+                    |(m, _)| m,
+                );
+            self.rekey_friends(
+                &crate::inbox::Mailbox::identified(String::new(), *from),
+                &successor,
+            );
+            self.after_merge(&successor);
         }
         self.news_rotate(from, to)?;
         if let Some(store) = self.devices.as_ref() {

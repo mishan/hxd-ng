@@ -9,29 +9,69 @@
 //! Where the SQLite store expresses a rule in SQL, this expresses it in
 //! Rust, and [`super::conformance`] holds them to the same answer.
 
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+use crate::relationships::{MemoryRelationships, RelationId, SentOn};
 
 use super::{
     Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pushed, Sent, StoreError, StoredMessage,
+    Pending, Pushed, Sent, StoreError, StoredMessage,
 };
 
 #[derive(Default)]
 struct Inner {
     next_id: MessageId,
     msgs: Vec<StoredMessage>,
+    /// Instant messages handed over and not yet acknowledged.
+    handed: HashSet<MessageId>,
+    /// Messages whose read receipt was told.
+    receipted: HashSet<MessageId>,
 }
 
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
 #[derive(Default)]
 pub struct MemoryStore {
     inner: Mutex<Inner>,
+    /// Whose friendships and approvals are live, for the gate; with none,
+    /// nothing sent on one is.
+    gate: Option<Arc<MemoryRelationships>>,
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store whose gate asks `relationships` what is live, as SQLite's
+    /// asks the relationship tables in its own file.
+    pub fn gated(relationships: Arc<MemoryRelationships>) -> Self {
+        MemoryStore {
+            gate: Some(relationships),
+            ..Self::default()
+        }
+    }
+
+    /// Does the gate let `m` through? Its own lock is taken under this
+    /// store's, and never the other way round.
+    fn live(&self, m: &StoredMessage) -> bool {
+        match m.friendship {
+            None => true,
+            Some(SentOn::Request) => false,
+            Some(SentOn::Relation(id)) => self.gate.as_ref().is_some_and(|g| g.is_live(id)),
+        }
+    }
+
+    /// Was `m` sent under an approval?
+    fn on_approval(&self, m: &StoredMessage) -> bool {
+        matches!(m.friendship, Some(SentOn::Relation(id))
+            if self.gate.as_ref().is_some_and(|g| g.is_approval(id)))
+    }
+
+    /// Mail waiting to be handed over, through the gate.
+    fn waiting(&self, inner: &Inner, m: &StoredMessage) -> bool {
+        is_mail(m) && m.delivered_at.is_none() && !inner.handed.contains(&m.id) && self.live(m)
     }
 
     /// Every message held, oldest first — for tests that want to look at
@@ -151,6 +191,10 @@ fn collapse(
     }
 }
 
+fn is_request(m: &StoredMessage) -> bool {
+    m.friendship == Some(SentOn::Request)
+}
+
 /// Every read path the inbox exposes is mail only.
 fn is_mail(m: &StoredMessage) -> bool {
     m.kind == MessageKind::Message
@@ -187,9 +231,7 @@ impl MessageStore for MemoryStore {
             let waiting = inner
                 .msgs
                 .iter()
-                .filter(|x| {
-                    is_mail(x) && is(&x.recipient, &m.recipient) && x.delivered_at.is_none()
-                })
+                .filter(|x| is(&x.recipient, &m.recipient) && self.waiting(&inner, x))
                 .count();
             if waiting >= cap {
                 return Ok(Pushed::Full);
@@ -255,15 +297,51 @@ impl MessageStore for MemoryStore {
             .cloned())
     }
 
-    fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
+    fn pending_of(
+        &self,
+        to: &Mailbox,
+        limit: usize,
+        which: Pending,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
         let inner = self.inner.lock().unwrap();
+        let instant = |m: &StoredMessage| matches!(m.friendship, Some(SentOn::Relation(_)));
         Ok(inner
             .msgs
             .iter()
-            .filter(|m| is_mail(m) && is(&m.recipient, to) && m.delivered_at.is_none())
+            .filter(|m| is(&m.recipient, to) && m.delivered_at.is_none())
+            .filter(|m| match which {
+                Pending::All => self.waiting(&inner, m),
+                Pending::Unapproved => self.waiting(&inner, m) && !self.on_approval(m),
+                Pending::Mail => self.waiting(&inner, m) && m.friendship.is_none(),
+                Pending::MailApproved => {
+                    self.waiting(&inner, m) && (m.friendship.is_none() || self.on_approval(m))
+                }
+                Pending::Instant { again, approvals } => {
+                    is_mail(m)
+                        && instant(m)
+                        && self.live(m)
+                        && (again || !inner.handed.contains(&m.id))
+                        && (approvals || !self.on_approval(m))
+                }
+                Pending::Receipts { approvals } => {
+                    m.kind == MessageKind::ReadReceipt
+                        && self.live(m)
+                        && (approvals || !self.on_approval(m))
+                }
+            })
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    fn mark_handed(&self, ids: &[MessageId], _at: SystemTime) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.handed.extend(ids.iter().copied());
+        Ok(())
+    }
+
+    fn receipt_told(&self, id: MessageId, _at: SystemTime) -> Result<bool, StoreError> {
+        Ok(self.inner.lock().unwrap().receipted.insert(id))
     }
 
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError> {
@@ -271,7 +349,7 @@ impl MessageStore for MemoryStore {
         Ok(inner
             .msgs
             .iter()
-            .filter(|m| is_mail(m) && is(&m.recipient, to) && m.delivered_at.is_none())
+            .filter(|m| is(&m.recipient, to) && self.waiting(&inner, m))
             .count())
     }
 
@@ -301,7 +379,7 @@ impl MessageStore for MemoryStore {
         Ok(inner
             .msgs
             .iter()
-            .any(|m| m.id == id && is_mail(m) && is(&m.recipient, to) && m.delivered_at.is_none()))
+            .any(|m| m.id == id && is(&m.recipient, to) && self.waiting(&inner, m)))
     }
 
     fn mark_read(
@@ -313,7 +391,12 @@ impl MessageStore for MemoryStore {
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
-            if is_mail(m) && is(&m.recipient, to) && m.id <= up_to && m.read_at.is_none() {
+            if is_mail(m)
+                && is(&m.recipient, to)
+                && m.id <= up_to
+                && m.read_at.is_none()
+                && self.live(m)
+            {
                 m.read_at = Some(at);
                 // A message read straight out of `list` was never flushed;
                 // stamping it delivered here is what keeps `pending` from
@@ -336,7 +419,12 @@ impl MessageStore for MemoryStore {
             .msgs
             .iter()
             .rev()
-            .filter(|m| is_mail(m) && is(&m.recipient, to) && before.is_none_or(|b| m.id < b))
+            .filter(|m| {
+                is_mail(m)
+                    && is(&m.recipient, to)
+                    && before.is_none_or(|b| m.id < b)
+                    && self.live(m)
+            })
             .take(limit)
             .cloned()
             .collect())
@@ -348,7 +436,7 @@ impl MessageStore for MemoryStore {
         for m in inner
             .msgs
             .iter()
-            .filter(|m| is_mail(m) && is(&m.recipient, to))
+            .filter(|m| is_mail(m) && is(&m.recipient, to) && self.live(m))
         {
             counts.total += 1;
             if m.read_at.is_none() {
@@ -451,12 +539,75 @@ impl MessageStore for MemoryStore {
         Ok(before - inner.msgs.len())
     }
 
+    fn restamp(&self, merged: &[(RelationId, RelationId)]) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut n = 0;
+        for (lost, kept) in merged {
+            for m in inner.msgs.iter_mut() {
+                if m.friendship == Some(SentOn::Relation(*lost)) {
+                    m.friendship = Some(SentOn::Relation(*kept));
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    fn requests(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .msgs
+            .iter()
+            .filter(|m| is_mail(m) && is_request(m) && is(&m.recipient, to) && m.sent_at >= since)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn release_requests(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        on: RelationId,
+        since: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut n = 0;
+        for m in inner.msgs.iter_mut() {
+            if is_request(m)
+                && is(&m.recipient, to)
+                && m.sent_at >= since
+                && m.sender.as_ref().is_some_and(|s| is(s, from))
+            {
+                m.friendship = Some(SentOn::Relation(on));
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.msgs.len();
+        inner.msgs.retain(|m| {
+            !(is_request(m)
+                && is(&m.recipient, to)
+                && m.sender.as_ref().is_some_and(|s| is(s, from)))
+        });
+        Ok(before - inner.msgs.len())
+    }
+
     fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .msgs
             .iter()
-            .filter(|x| x.kind == MessageKind::Message && x.sent_at >= since)
+            .filter(|x| x.kind == MessageKind::Message && x.sent_at >= since && !is_request(x))
             .filter(|x| x.sender.as_ref().is_some_and(|s| is(s, from)))
             .fold(Sent::default(), |sent, x| Sent {
                 messages: sent.messages + 1,
@@ -479,7 +630,13 @@ mod tests {
 
     #[test]
     fn passes_the_conformance_suite() {
-        conformance::run(&|| Box::new(MemoryStore::new()));
+        conformance::run(&|| {
+            let relationships = Arc::new(MemoryRelationships::new());
+            conformance::Gated {
+                inbox: Arc::new(MemoryStore::gated(relationships.clone())),
+                relationships,
+            }
+        });
     }
 
     #[test]

@@ -239,6 +239,12 @@ pub struct Transport {
     /// roster again when told it is stale. A classic client's row has
     /// nowhere to put them, and the frontend sets it only for ng.
     pub roles: bool,
+    /// This link speaks the friend family (`docs/instant-messaging.md`
+    /// §7): the ng wire's, or capability bit 6 on the classic one. A
+    /// friend's instant messages wait for its roster read rather than
+    /// arriving as private messages, and friend events reach it from
+    /// login on.
+    pub messaging: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -636,6 +642,47 @@ pub enum Event {
     RoomRemoved {
         room: u32,
     },
+
+    // --- Instant messaging (see [`crate::messaging`]) -----------------
+    //
+    // Only ever to a messenger session: one whose wire speaks the friend
+    // family, or that has asked something of it.
+    /// A roster row, whole, as it now stands, or that it is gone
+    /// (Roster Entry, 801).
+    FriendEntry(Box<crate::messaging::FriendEntry>),
+    /// A friend request for the recipient (804).
+    FriendRequest {
+        login: String,
+        fingerprint: Option<[u8; 32]>,
+        note: Option<String>,
+    },
+    /// A friend's presence changed (809).
+    Presence {
+        login: String,
+        fingerprint: Option<[u8; 32]>,
+        state: crate::messaging::Presence,
+        status_text: Option<String>,
+    },
+    /// An instant message from a friend (811).
+    Im(Box<crate::messaging::Im>),
+    /// A friend received or read a message the recipient sent it (812).
+    Receipt {
+        login: String,
+        fingerprint: Option<[u8; 32]>,
+        guid: crate::inbox::MessageGuid,
+        read: bool,
+    },
+    /// A friend is typing to the recipient, or has stopped (813).
+    Typing {
+        login: String,
+        fingerprint: Option<[u8; 32]>,
+        typing: bool,
+    },
+    /// How many senders' message requests wait for the recipient, to
+    /// its sessions that understand requests.
+    RequestsChanged {
+        count: usize,
+    },
 }
 
 impl Event {
@@ -703,6 +750,24 @@ impl Event {
             Event::RoomAdded(v) | Event::RoomChanged(v) => {
                 v.room.name.len() + v.room.topic.text.len()
             }
+            Event::FriendEntry(e) => {
+                e.login.len()
+                    + e.alias.as_ref().map_or(0, String::len)
+                    + e.status_text.as_ref().map_or(0, String::len)
+            }
+            Event::FriendRequest { login, note, .. } => {
+                login.len() + note.as_ref().map_or(0, String::len)
+            }
+            Event::Presence {
+                login, status_text, ..
+            } => login.len() + status_text.as_ref().map_or(0, String::len),
+            Event::Im(im) => {
+                im.from_login.len()
+                    + im.from_nick.len()
+                    + im.text.len()
+                    + im.signed.as_ref().map_or(0, Vec::len)
+            }
+            Event::Receipt { login, .. } | Event::Typing { login, .. } => login.len(),
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -751,6 +816,13 @@ impl Event {
             Event::RoomAdded(..) => "room_added",
             Event::RoomChanged(..) => "room_changed",
             Event::RoomRemoved { .. } => "room_removed",
+            Event::FriendEntry(..) => "friend_entry",
+            Event::FriendRequest { .. } => "friend_request",
+            Event::Presence { .. } => "presence",
+            Event::Im(..) => "im",
+            Event::Receipt { .. } => "receipt",
+            Event::Typing { .. } => "typing",
+            Event::RequestsChanged { .. } => "requests_changed",
         }
     }
 }
@@ -988,6 +1060,9 @@ pub(crate) struct UserSession {
     /// What this session is denied whatever its account says
     /// ([`Core::set_session_mask`]).
     pub(crate) mask: crate::DenyMask,
+    /// Its part in instant messaging, from its announce, where it takes
+    /// part (`crate::messaging`).
+    pub(crate) messaging: Option<crate::messaging::SessionState>,
 }
 
 /// What a transport hands the roster at login.
@@ -1145,6 +1220,9 @@ pub(crate) struct RosterInner {
     /// The newest line in each channel, 0 the lobby's.
     pub(crate) last_ids: HashMap<u32, crate::history::LineId>,
     pub(crate) voice: crate::voice::VoiceState,
+    /// Who takes part in instant messaging, and what their friends were
+    /// last told of them (`crate::messaging`).
+    pub(crate) presences: crate::messaging::Presences,
 }
 
 impl RosterInner {
@@ -1330,6 +1408,9 @@ impl RosterInner {
         let Some(sess) = self.users.remove(&uid) else {
             return;
         };
+        if sess.messaging.is_some() {
+            self.presence_leave(uid, &sess.mailbox());
+        }
         self.export_gone(&sess);
         self.freed_uids.hold(uid, Instant::now());
         if sess.visible {
@@ -1346,10 +1427,14 @@ impl RosterInner {
             return;
         }
         sess.info.status = status;
+        let messaging = sess.messaging.is_some().then(|| sess.mailbox());
         if sess.visible {
             let ev = Event::Changed(sess.info.clone());
             self.broadcast(&ev, None);
             self.export_changed(uid);
+        }
+        if let Some(m) = messaging {
+            self.presence_soon(&crate::messaging::Key::of(&m));
         }
     }
 }
@@ -1497,6 +1582,12 @@ pub struct Core {
     /// [`crate::admin::BULK_ROWS`].
     pub(crate) bulk_rows: Option<usize>,
     pub(crate) inbox_policy: InboxPolicy,
+    /// What `[messaging]` says (`crate::messaging`).
+    pub(crate) messaging_policy: crate::messaging::MessagingPolicy,
+    /// Held across a relationship store write and the roster's copy of
+    /// what it changed, and across loading a mailbox's friends, so the
+    /// two agree. Taken before `roster`, never while it is held.
+    pub(crate) friend_writes: Mutex<()>,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
@@ -2095,6 +2186,7 @@ impl Core {
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
                 mask: Default::default(),
+                messaging: None,
             },
         );
         Some((uid, rx))
@@ -2103,6 +2195,7 @@ impl Core {
     /// Make an attached session visible and broadcast its join to everyone
     /// else. Idempotent.
     pub fn announce(&self, uid: Uid) {
+        let load = self.presence_load(uid);
         let mut r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get_mut(&uid) else {
             return;
@@ -2114,6 +2207,9 @@ impl Core {
         let ev = Event::Joined(sess.info.clone());
         r.broadcast(&ev, Some(uid));
         r.export_shown(uid);
+        if let Some(load) = load {
+            r.presence_join(uid, load);
+        }
     }
 
     /// Update a session's nick and/or icon. Broadcasts a change event (to

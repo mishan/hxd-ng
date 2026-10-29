@@ -29,6 +29,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::relationships::RelationId;
+
 pub mod conformance;
 pub mod memory;
 
@@ -167,11 +169,10 @@ impl std::fmt::Display for MessageGuid {
 /// applies to it unchanged, which is why this is a column rather than a
 /// second table. Only a wire that can express a receipt branches on it.
 ///
-/// **Nothing writes a receipt yet.** The wire that will is fogWraith's
-/// `IM Acknowledge (812)`; until then the column exists so that adding
-/// receipts is not a migration, and every read path the inbox exposes
-/// filters to [`MessageKind::Message`] so a row of another kind can
-/// never be rendered as mail.
+/// Instant messaging's `IM Acknowledge (812)` writes them, for a sender
+/// that was not there to hear a read. Every read path the inbox exposes
+/// but [`Pending::Receipts`] filters to [`MessageKind::Message`], so a
+/// row of another kind can never be rendered as mail.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageKind {
     #[default]
@@ -303,6 +304,37 @@ pub enum Delivery {
     Read,
 }
 
+/// Which of a mailbox's waiting rows a read is for. Every one of them
+/// passes the gate (`docs/instant-messaging.md` §5): a row sent on a
+/// friendship or approval waits while that is not live, and a message
+/// request's is never handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// Private messages, and instant messages not yet handed over: what
+    /// a session that does not speak the friend family is given.
+    All,
+    /// [`Pending::All`] but what was sent under an approval, which waits
+    /// for a session that understands requests
+    /// (`docs/instant-messaging.md` §4.6).
+    Unapproved,
+    /// Private messages alone.
+    Mail,
+    /// Private messages and what was sent under an approval: what a
+    /// session that speaks the friend family is given when it does not
+    /// understand requests and its account never took them
+    /// (`docs/instant-messaging.md` §4.6).
+    MailApproved,
+    /// Instant messages not yet handed over, and with `again` those
+    /// handed over and never acknowledged too, which Get Roster hands
+    /// over again. Without `approvals`, what was sent under an approval
+    /// is left out before the limit, so a backlog the reader cannot be
+    /// shown never crowds out a friend's.
+    Instant { again: bool, approvals: bool },
+    /// Read receipts waiting for the sender they are addressed to, an
+    /// approval's only with `approvals`.
+    Receipts { approvals: bool },
+}
+
 /// A store operation failed. The string is for the log, not for a client —
 /// same convention as [`crate::AuthError::Backend`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,11 +398,35 @@ pub trait MessageStore: Send + Sync + 'static {
     /// Messages only, like every read path here: a kind the wire cannot
     /// carry must not occupy a flush slot and come back forever unsent.
     /// This gains a kind filter when there is a wire for the other kinds.
-    fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError>;
+    fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError> {
+        self.pending_of(to, limit, Pending::All)
+    }
+
+    /// [`MessageStore::pending`], for the rows `which` names.
+    fn pending_of(
+        &self,
+        to: &Mailbox,
+        limit: usize,
+        which: Pending,
+    ) -> Result<Vec<StoredMessage>, StoreError>;
+
+    /// Instant messages handed to a session that acknowledges them
+    /// (`docs/instant-messaging.md` §5): counted as delivered toward the
+    /// queue cap, and handed over again at Get Roster until one is
+    /// acknowledged ([`Pending::Instant`]).
+    fn mark_handed(&self, ids: &[MessageId], at: SystemTime) -> Result<(), StoreError>;
+
+    /// Note that `id`'s read receipt is told: true the first time alone,
+    /// so a read is told once however often it is acknowledged, and
+    /// whatever else stamped the row read.
+    fn receipt_told(&self, id: MessageId, at: SystemTime) -> Result<bool, StoreError>;
 
     /// How many messages are waiting to be flushed. Messages only: a
     /// chatty reader's receipts must not fill the mailbox they are
     /// acking into.
+    ///
+    /// What the gate holds, and what was handed over and not yet
+    /// acknowledged, is not waiting.
     ///
     /// This is the number the mailbox cap is measured against, and it is
     /// deliberately not the unread count: a message the recipient received
@@ -470,8 +526,39 @@ pub trait MessageStore: Send + Sync + 'static {
     /// the sender's columns: every row, delivered and read or still
     /// waiting, because a delivered row is kept for retention all the
     /// same and it is storage this measures (§9). Receipts are not mail
-    /// and are not counted.
+    /// and are not counted, nor are message requests, which the
+    /// relationship store's ledger counts by what was sent.
     fn sent_since(&self, from: &Mailbox, since: SystemTime) -> Result<Sent, StoreError>;
+
+    /// Each message sent on the first id of a pair now carries the
+    /// second: what a merge of two rows for one pair owes the inbox
+    /// ([`crate::relationships::Rekeyed::merged`]), in order, so a chain
+    /// lands on its last id. Returns how many rows changed.
+    fn restamp(&self, merged: &[(RelationId, RelationId)]) -> Result<usize, StoreError>;
+
+    /// The message requests waiting for `to` sent since `since`, oldest
+    /// first: past the gate, as the recipient lists, reports and clears
+    /// them (`docs/instant-messaging.md` §4.5). An older one has lapsed.
+    fn requests(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError>;
+
+    /// `from`'s requests to `to` sent since `since` now belong to `on`,
+    /// the approval or friendship that released them; an older one has
+    /// lapsed. Returns how many.
+    fn release_requests(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        on: RelationId,
+        since: SystemTime,
+    ) -> Result<usize, StoreError>;
+
+    /// Delete `from`'s requests to `to`. Returns how many went.
+    fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError>;
 }
 
 #[cfg(test)]

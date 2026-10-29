@@ -543,10 +543,20 @@ impl Core {
         }
         match self.msg_login(from, who, body, None, None) {
             Ok(crate::MsgOutcome::Delivered) => "ok: sent".into(),
-            Ok(crate::MsgOutcome::Queued { .. }) => "ok: queued".into(),
+            // A request is answered as a queued message is, so nothing
+            // here tells it apart (`docs/instant-messaging.md` §4.2).
+            Ok(crate::MsgOutcome::Queued { .. } | crate::MsgOutcome::Requested) => {
+                "ok: queued".into()
+            }
             Err(crate::ChatError::NoSuchUser) => "error: no such account".into(),
             Err(crate::ChatError::Blocked) => "ok: sent".into(),
             Err(crate::ChatError::MailboxFull) => "error: that mailbox is full".into(),
+            Err(crate::ChatError::NotFriends) => {
+                "error: that account takes no messages from you".into()
+            }
+            Err(crate::ChatError::RequestFull) => {
+                "error: you have sent that account as much as it takes before it answers".into()
+            }
             Err(crate::ChatError::SendQuota) => {
                 "error: you have sent as much offline mail today as this server allows".into()
             }

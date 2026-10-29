@@ -779,6 +779,8 @@ async fn handle_login(
             // client that renders nothing for it is a client that
             // renders the text, which is what a classic one does too.
             inline_media: ctx.core.media_enabled(),
+            // Until this wire carries the friend family.
+            messaging: false,
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -2016,6 +2018,11 @@ async fn dispatch(
                         reply_ok(req.id, json!({ "queued": true, "id": id }))
                     }
                     Ok(MsgOutcome::Queued(_)) => reply_ok(req.id, json!({ "queued": true })),
+                    // The one answer a request has (`docs/instant-messaging.md`
+                    // §4.2).
+                    Ok(MsgOutcome::Requested) => {
+                        reply_ok(req.id, json!({ "queued": true, "requested": true }))
+                    }
                     Err(ChatError::MailboxFull) => {
                         reply_err(req.id, "mailbox_full", "That user's mailbox is full.")
                     }
@@ -2056,6 +2063,18 @@ async fn dispatch(
                         "bad_request",
                         "That user proved no identity to sign a message to.",
                     ),
+                    // `docs/instant-messaging.md` §4.1, §7.
+                    Err(ChatError::NotFriends) => {
+                        reply_err(req.id, "not_friends", "That user is not your friend.")
+                    }
+                    Err(ChatError::RequestFull) => reply_err(
+                        req.id,
+                        "request_full",
+                        "You have sent that user as many requests as you may.",
+                    ),
+                    Err(ChatError::RosterFull) => {
+                        reply_err(req.id, "roster_full", "Your roster is full.")
+                    }
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
                     // them can be told apart from outside.

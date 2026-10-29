@@ -225,7 +225,7 @@ impl Relationship {
 /// did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rekeyed {
-    /// Rows whose key changed.
+    /// Rows whose key changed, and rows folded into another's.
     pub moved: usize,
     /// `(lost, kept)`: a friendship or approval id that a merge ended,
     /// and the one of the same pair that stands in its place, once each,
@@ -323,29 +323,17 @@ pub struct Profile {
 pub const MAX_LANGUAGES: usize = 3;
 
 /// What an account keeps about itself for messaging.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessagingAccount {
     pub status_text: Option<String>,
     /// Found by User Search (823). Off until the account turns it on.
     pub discoverable: bool,
-    /// The profile's switch for message requests (§4.1). On by default:
-    /// an account takes requests only once a client of it has listed them
-    /// as well, which `requests_listed_at` says.
+    /// The profile's switch for message requests (§4.1): off until a
+    /// session of the account opts in, and off again once one opts out.
     pub takes_requests: bool,
-    pub requests_listed_at: Option<SystemTime>,
+    /// When a session last turned the switch on, kept once it is off.
+    pub requests_opted_at: Option<SystemTime>,
     pub profile: Profile,
-}
-
-impl Default for MessagingAccount {
-    fn default() -> Self {
-        MessagingAccount {
-            status_text: None,
-            discoverable: false,
-            takes_requests: true,
-            requests_listed_at: None,
-            profile: Profile::default(),
-        }
-    }
 }
 
 /// A change to a [`MessagingAccount`]: each `None` leaves its part as it
@@ -356,7 +344,10 @@ pub struct AccountUpdate {
     /// `Some(None)` clears the text.
     pub status_text: Option<Option<String>>,
     pub discoverable: Option<bool>,
-    pub takes_requests: Option<bool>,
+    /// `Some(Some(at))`: a session opted in to requests at `at`;
+    /// `Some(None)`: one opted out, which keeps when it last opted in.
+    /// The switch never turns on without the time it lapses from.
+    pub takes_requests: Option<Option<SystemTime>>,
     pub profile: Option<Profile>,
 }
 
@@ -484,6 +475,17 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// [`crate::inbox::MessageStore::push`] gives.
     fn record_request(&self, entry: &LedgerEntry) -> Result<Recorded, StoreError>;
 
+    /// What `from` already sent `to` under `guid`, if it did: a retry,
+    /// answered as its original was before any bound is asked. With `to`
+    /// `None`, toward anyone, as a signed id is its signer's across
+    /// recipients.
+    fn find_request(
+        &self,
+        from: &Requester,
+        to: Option<&Mailbox>,
+        guid: &MessageGuid,
+    ) -> Result<Option<LedgerEntry>, StoreError>;
+
     /// How many requests of `kind` `from` has sent `to` since `since`.
     fn requests_to(
         &self,
@@ -512,9 +514,9 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// A request to `owner` was dropped (§4.4).
     fn request_dropped(&self, owner: &Mailbox) -> Result<(), StoreError>;
 
-    /// A client of `owner` has listed its requests: stamp when, and
-    /// return how many were dropped since the listing before.
-    fn requests_listed(&self, owner: &Mailbox, at: SystemTime) -> Result<u64, StoreError>;
+    /// A client of `owner` has listed its requests: how many were
+    /// dropped since the listing before.
+    fn requests_listed(&self, owner: &Mailbox) -> Result<u64, StoreError>;
 
     // --- The account -------------------------------------------------------
 
