@@ -2668,7 +2668,13 @@ impl ChatLog for SqliteStore {
 
     fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(StoreError::new)?;
+        // Immediate, since with no age to prune by the first statement is
+        // a read, and SQLite will not upgrade a read to a write once the
+        // connection beside has committed since: it answers busy at once,
+        // however long the busy timeout.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
         let mut gone = 0;
         // By age: a channel with a rule of its own by that rule, and every
         // other in one statement, since `at` is indexed.
@@ -3182,6 +3188,52 @@ mod tests {
             page.lines.last().map(|l| l.id),
             ids.last().map(|done| done.id)
         );
+    }
+
+    /// A prune by count alone on the connection beside waits out a write
+    /// the other connection has open, rather than failing once it lands.
+    #[test]
+    fn a_prune_beside_another_waits_for_its_write() {
+        use hxd_core::history::{ChatLog, HistoryQuery, Retention};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let first = std::sync::Arc::new(SqliteStore::open(&path, Synchronous::Normal).unwrap());
+        let beside = SqliteStore::open_beside(&path, Synchronous::Normal, &first).unwrap();
+        let insert = "INSERT INTO chat_line (channel, nick, icon, flags, body, at)
+                      VALUES (0, 'n', 0, 0, 'old', 0)";
+        for _ in 0..3 {
+            first.conn.lock().unwrap().execute(insert, []).unwrap();
+        }
+        let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let holder = {
+            let (first, held) = (first.clone(), held.clone());
+            std::thread::spawn(move || {
+                let conn = first.conn.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                conn.execute(insert, []).unwrap();
+                held.wait();
+                std::thread::sleep(Duration::from_millis(300));
+                conn.execute_batch("COMMIT").unwrap();
+            })
+        };
+        held.wait();
+        let keep = Retention {
+            max_lines: 1,
+            max_age: None,
+            channels: Vec::new(),
+        };
+        let gone = ChatLog::prune(&beside, &keep, SystemTime::now()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(gone, 3);
+        let page = first
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(page.lines.len(), 1);
     }
 
     /// A closed store leaves no WAL behind: the checkpointer's connection
