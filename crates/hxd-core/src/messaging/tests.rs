@@ -2270,3 +2270,58 @@ fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
         "and told when what it sent under it is read"
     );
 }
+
+#[test]
+fn a_roster_read_within_the_debounce_never_runs_ahead_of_what_is_told() {
+    let s = server_with(
+        MessagingPolicy {
+            presence_debounce: Duration::from_secs(5),
+            ..policy()
+        },
+        &[("alice", messaging_bits()), ("bob", messaging_bits())],
+    );
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    let later = Instant::now() + Duration::from_secs(60);
+    s.core.end_session(a);
+    s.core.presence_flush(later);
+    drain(&mut rb);
+
+    // Alice signs on and goes invisible within the debounce.
+    let (a, _ra) = messenger(&s.core, "alice");
+    assert_eq!(
+        state_of(&s.core, b, "alice"),
+        Some((RosterState::Accepted, Presence::Offline)),
+        "not shown before it is told"
+    );
+    let set = |state| {
+        s.core
+            .set_presence(
+                a,
+                PresenceUpdate {
+                    state: Some(state),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    set(Presence::Invisible);
+    s.core.presence_flush(later);
+    assert!(presences(&drain(&mut rb)).is_empty(), "nothing to correct");
+    assert_eq!(
+        state_of(&s.core, b, "alice"),
+        Some((RosterState::Accepted, Presence::Offline))
+    );
+
+    set(Presence::Online);
+    s.core.presence_flush(later + Duration::from_secs(60));
+    assert_eq!(
+        presences(&drain(&mut rb)),
+        [("alice".into(), Presence::Online)]
+    );
+    assert_eq!(
+        state_of(&s.core, b, "alice"),
+        Some((RosterState::Accepted, Presence::Online))
+    );
+}

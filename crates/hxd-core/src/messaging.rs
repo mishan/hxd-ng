@@ -319,12 +319,23 @@ impl RosterInner {
             .map_or((Presence::Offline, None), |p| (p, e.status_text.clone()))
     }
 
-    /// What `of`'s friends see of it now.
+    /// What `of`'s own sessions show of it now.
     fn presence_of(&self, of: &Mailbox) -> Shown {
         self.presences
             .by
             .get(&Key::of(of))
             .map_or((Presence::Offline, None), |e| self.shown(e))
+    }
+
+    /// What `of`'s friends were last told of it, which is what a friend
+    /// reading it is shown too, so that a read never runs ahead of an
+    /// announcement still owed: one that a change back within the
+    /// debounce makes no change would leave the read uncorrected.
+    fn told_of(&self, of: &Mailbox) -> Shown {
+        self.presences
+            .by
+            .get(&Key::of(of))
+            .map_or((Presence::Offline, None), |e| e.told.clone())
     }
 
     /// The sessions of a mailbox taking part.
@@ -441,7 +452,7 @@ impl RosterInner {
             state,
             alias: row.alias.clone(),
             presence: if accepted {
-                self.presence_of(&row.other).0
+                self.told_of(&row.other).0
             } else {
                 Presence::Offline
             },
@@ -1271,7 +1282,14 @@ impl Core {
             .nickname
             .clone()
             .unwrap_or_else(|| them.login.clone());
-        let presence = shown.then(|| self.roster.lock().unwrap().presence_of(&them));
+        let presence = shown.then(|| {
+            let r = self.roster.lock().unwrap();
+            if Key::of(&them) == Key::of(&me.mailbox) {
+                r.presence_of(&them)
+            } else {
+                r.told_of(&them)
+            }
+        });
         Ok(FoundUser {
             login: them.login,
             name,
