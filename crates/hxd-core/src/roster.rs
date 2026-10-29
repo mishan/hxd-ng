@@ -679,7 +679,7 @@ pub enum Event {
         typing: bool,
     },
     /// How many senders' message requests wait for the recipient, to
-    /// its sessions that have opted in to them.
+    /// its sessions that understand requests.
     RequestsChanged {
         count: usize,
     },

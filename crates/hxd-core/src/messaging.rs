@@ -265,10 +265,11 @@ pub(crate) struct SessionState {
     /// Its wire speaks the friend family, or it has asked something of
     /// it, so it is told.
     pub(crate) messenger: bool,
-    /// It has opted in to message requests this login (§4.1), so it
-    /// sends requests of its own, is told what becomes of them, and is
-    /// shown what an approval carries and that requests changed.
-    pub(crate) opted_in: bool,
+    /// It understands message requests (§4.1), having said whether its
+    /// account takes them or listed them this login, so it sends
+    /// requests of its own, is told what becomes of them, and is shown
+    /// what an approval carries and that requests changed.
+    pub(crate) understands_requests: bool,
 }
 
 /// What friends are told of a login: its state and its text.
@@ -469,8 +470,8 @@ pub(crate) fn session_takes_part(s: &UserSession) -> bool {
 /// The caller, as a friend operation sees it.
 struct Me {
     mailbox: Mailbox,
-    /// Its session has opted in to requests.
-    opted: bool,
+    /// Its session understands requests.
+    understands: bool,
 }
 
 impl Core {
@@ -504,7 +505,7 @@ impl Core {
         let state = sess.messaging.as_mut().ok_or(MessagingError::NotEnabled)?;
         state.messenger = true;
         Ok(Me {
-            opted: state.opted_in,
+            understands: state.understands_requests,
             mailbox: sess.mailbox(),
         })
     }
@@ -646,17 +647,13 @@ impl Core {
                 .map_err(store_failed)?;
         }
         let mut r = self.roster.lock().unwrap();
-        // An opt-in is the session's; an opt-out is the account's, and
-        // ends every session's.
-        let opting = match update.takes_requests {
-            Some(true) => vec![uid],
-            Some(false) => r.taking_part(&me.mailbox),
-            None => Vec::new(),
-        };
-        for u in opting {
-            if let Some(m) = r.users.get_mut(&u).and_then(|s| s.messaging.as_mut()) {
-                m.opted_in = update.takes_requests == Some(true);
-            }
+        // Either answer says the session understands requests; only the
+        // account's switch is turned off by a 0.
+        if let (Some(_), Some(m)) = (
+            update.takes_requests,
+            r.users.get_mut(&uid).and_then(|s| s.messaging.as_mut()),
+        ) {
+            m.understands_requests = true;
         }
         let key = Key::of(&me.mailbox);
         match update.state {
@@ -792,10 +789,10 @@ impl Core {
             .map_err(store_failed)?
             .is_some_and(|t| t.pending_out.is_some());
         // Two crossing requests accept each other only from a session
-        // that has opted in; any other is answered as the extension
+        // that understands requests; any other is answered as the extension
         // answers it. Either way, whether or not the first was
         // delivered, so the answer says nothing of whether it was held.
-        if crossing && !me.opted {
+        if crossing && !me.understands {
             return Err(MessagingError::RequestPending);
         }
         if store.roster_size(&me.mailbox, now).map_err(store_failed)? >= p.max_roster {

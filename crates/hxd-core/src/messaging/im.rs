@@ -9,7 +9,7 @@
 //! private message instead, which counts as its delivery.
 //!
 //! What was sent under an approval (§4.6) goes only to the sessions that
-//! have opted in to requests, since a client that does not know approvals
+//! understand requests, since a client that does not know approvals
 //! has nowhere to show it, or as private messages to a party that takes
 //! no requests; it never says when it arrived, and nor does a
 //! delivery receipt for it.
@@ -96,12 +96,12 @@ fn relation_of(m: &StoredMessage) -> Option<RelationId> {
     }
 }
 
-/// A messenger session that has opted in to requests, so it is shown
-/// what an approval carries.
-pub(crate) fn opted_in(s: &UserSession) -> bool {
+/// A messenger session that understands requests, so it is shown what
+/// an approval carries.
+pub(crate) fn understands_requests(s: &UserSession) -> bool {
     s.messaging
         .as_ref()
-        .is_some_and(|m| m.messenger && m.opted_in)
+        .is_some_and(|m| m.messenger && m.understands_requests)
 }
 
 impl Core {
@@ -353,9 +353,9 @@ impl Core {
     }
 
     /// Hand `to`'s waiting instant messages over live: to every attached
-    /// messenger session, what an approval carries to those that have
-    /// opted in to requests alone, or, where it has none, to an attached session as
-    /// private messages. Returns the ids handed over.
+    /// messenger session, what an approval carries to those that
+    /// understand requests alone, or, where it has none, to an attached
+    /// session as private messages. Returns the ids handed over.
     pub(crate) fn im_deliver(
         &self,
         to: &Mailbox,
@@ -366,7 +366,7 @@ impl Core {
             return Vec::new();
         };
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        let (messengers, plain, opted) = {
+        let (messengers, plain, understood) = {
             let r = self.roster.lock().unwrap();
             let attached: Vec<Uid> = sessions_of(&r, to)
                 .into_iter()
@@ -375,8 +375,10 @@ impl Core {
             let (m, p): (Vec<Uid>, Vec<Uid>) = attached
                 .into_iter()
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
-            let opted = m.iter().any(|u| r.users.get(u).is_some_and(opted_in));
-            (m, p.first().copied(), opted)
+            let understood = m
+                .iter()
+                .any(|u| r.users.get(u).is_some_and(understands_requests));
+            (m, p.first().copied(), understood)
         };
         if messengers.is_empty() {
             drop(flushing);
@@ -390,7 +392,7 @@ impl Core {
             self.inbox_policy.deliver_at_flush,
             Pending::Instant {
                 again: false,
-                approvals: opted,
+                approvals: understood,
             },
         ) {
             Ok(b) => b,
@@ -414,7 +416,7 @@ impl Core {
                     .filter(|u| {
                         r.users
                             .get(u)
-                            .is_some_and(|s| is_live(s) && (!approval || opted_in(s)))
+                            .is_some_and(|s| is_live(s) && (!approval || understands_requests(s)))
                     })
                     .collect();
                 if to.is_empty() {
@@ -443,11 +445,16 @@ impl Core {
             return;
         };
         let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
-        let opted_of = |r: &RosterInner| r.users.get(&uid).filter(|s| is_live(s)).map(opted_in);
+        let understands_of = |r: &RosterInner| {
+            r.users
+                .get(&uid)
+                .filter(|s| is_live(s))
+                .map(understands_requests)
+        };
         // The read itself leaves out what an approval carries for a
-        // session that has not opted in to requests, so that never takes the
-        // places of what it can be shown.
-        let Some(opted) = opted_of(&self.roster.lock().unwrap()) else {
+        // session that does not understand requests, so that never takes
+        // the places of what it can be shown.
+        let Some(understood) = understands_of(&self.roster.lock().unwrap()) else {
             return;
         };
         let limit = self.inbox_policy.deliver_at_flush;
@@ -459,13 +466,15 @@ impl Core {
         };
         let ims = read(Pending::Instant {
             again: true,
-            approvals: opted,
+            approvals: understood,
         });
-        let receipts = read(Pending::Receipts { approvals: opted });
+        let receipts = read(Pending::Receipts {
+            approvals: understood,
+        });
         let approvals = self.approval_ids(me, &ims);
         {
             let mut r = self.roster.lock().unwrap();
-            if opted_of(&r).is_none() {
+            if understands_of(&r).is_none() {
                 return;
             }
             for m in &ims {
@@ -570,7 +579,7 @@ impl Core {
                 .filter(|u| {
                     r.users
                         .get(u)
-                        .is_some_and(|s| is_live(s) && (!approval || opted_in(s)))
+                        .is_some_and(|s| is_live(s) && (!approval || understands_requests(s)))
                 })
                 .collect();
             for uid in &to {

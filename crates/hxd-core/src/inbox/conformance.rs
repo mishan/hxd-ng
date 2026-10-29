@@ -78,7 +78,7 @@ pub struct Gated {
     pub relationships: Arc<dyn RelationshipStore>,
 }
 
-/// What a session that has opted in to requests reads.
+/// What a session that understands requests reads.
 const INSTANT: Pending = Pending::Instant {
     again: false,
     approvals: true,

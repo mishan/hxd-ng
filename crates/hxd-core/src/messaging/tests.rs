@@ -253,11 +253,11 @@ fn a_request_accepted_makes_friends_and_tells_both() {
 }
 
 #[test]
-fn crossing_requests_accept_each_other_only_from_a_session_that_opted_in() {
-    for (held, opted) in [(false, true), (true, true), (false, false), (true, false)] {
-        let case = format!("held: {held}, opted in: {opted}");
+fn crossing_requests_accept_each_other_only_from_a_session_that_understands() {
+    for (held, understands) in [(false, true), (true, true), (false, false), (true, false)] {
+        let case = format!("held: {held}, understands: {understands}");
         let s = server(&["alice", "bob"]);
-        let (a, _ra) = if opted {
+        let (a, _ra) = if understands {
             taker(&s.core, "alice")
         } else {
             messenger(&s.core, "alice")
@@ -278,7 +278,7 @@ fn crossing_requests_accept_each_other_only_from_a_session_that_opted_in() {
             "{case}"
         );
         drain(&mut rb);
-        if opted {
+        if understands {
             assert_eq!(
                 s.core.friend_add(a, "bob", None),
                 Ok(RosterState::Accepted),
@@ -1422,19 +1422,24 @@ fn who_may_ask_and_who_is_answered_otherwise() {
     use crate::{ChatError, MsgOutcome};
     let without = AccessBits::empty().with(bit::SEND_MSGS);
     type Setup = fn(&Server) -> Uid;
-    let cases: [(&str, Setup, Result<MsgOutcome, ChatError>); 7] = [
+    let cases: [(&str, Setup, Result<MsgOutcome, ChatError>); 8] = [
         (
             "both opted in",
             |s| taker(&s.core, "alice").0,
             Ok(MsgOutcome::Requested),
         ),
         (
-            "a sender that only listed",
+            "a sender that only listed, which is understanding",
             |s| {
                 let (alice, _) = messenger(&s.core, "alice");
                 s.core.requests_list(alice).unwrap();
                 alice
             },
+            Ok(MsgOutcome::Requested),
+        ),
+        (
+            "a sender that never understood",
+            |s| messenger(&s.core, "alice").0,
             Err(ChatError::NotFriends),
         ),
         (
@@ -1804,7 +1809,7 @@ fn a_backlog_the_flush_must_skip_never_starves_private_mail() {
         let now = s.core.clock.wall();
         let on = if on_approval {
             // Bob's account takes requests, so an approval's traffic
-            // waits for a session that has opted in.
+            // waits for a session that understands them.
             let (b, _rb) = taker(&s.core, "bob");
             s.core.end_session(b);
             s.rel.approve(&bob, &alice, now).unwrap()
@@ -2115,7 +2120,7 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
     let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
     let now = s.core.clock.wall();
     // Bob's account takes requests, so an approval's traffic waits for a
-    // session that has opted in.
+    // session that understands them.
     let (b, _rb) = taker(&s.core, "bob");
     s.core.end_session(b);
     let on = s.rel.approve(&bob, &alice, now).unwrap();
@@ -2193,24 +2198,44 @@ fn an_opt_in_held_by_a_session_still_there_never_lapses() {
 }
 
 #[test]
-fn an_opt_out_from_one_session_ends_every_sessions_opt_in() {
-    let s = server(&["bob", "carol"]);
-    let (b1, _rb1) = taker(&s.core, "bob");
-    let (b2, _rb2) = taker(&s.core, "bob");
-    let (c, _rc) = messenger(&s.core, "carol");
-    s.core.friend_add(c, "bob", None).unwrap();
+fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
+    use crate::MsgOutcome;
+    let s = server(&["alice", "bob", "carol", "dave"]);
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (_c, _rc) = taker(&s.core, "carol");
+    let (d, _rd) = taker(&s.core, "dave");
+    send(&s.core, d, "bob", "may I?").unwrap();
+    s.core
+        .request_answer(b, "dave", RequestAction::Approve)
+        .unwrap();
     s.core
         .set_presence(
-            b1,
+            b,
             PresenceUpdate {
                 takes_requests: Some(false),
                 ..Default::default()
             },
         )
         .unwrap();
+    drain(&mut rb);
     assert_eq!(
-        s.core.friend_add(b2, "carol", None),
-        Err(MessagingError::RequestPending),
-        "no longer opted in, so a crossing request is not accepted"
+        send(&s.core, a, "bob", "hi"),
+        Err(crate::ChatError::NotFriends),
+        "the account takes no new requests"
+    );
+    assert_eq!(
+        send(&s.core, b, "carol", "hello"),
+        Ok(MsgOutcome::Requested),
+        "but its session still writes to a stranger"
+    );
+    assert!(matches!(
+        send(&s.core, d, "bob", "thanks"),
+        Ok(MsgOutcome::Queued(_))
+    ));
+    assert_eq!(
+        ims(&drain(&mut rb)),
+        [("thanks".into(), false)],
+        "and is still handed what comes under an approval it gave"
     );
 }

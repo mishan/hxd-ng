@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use super::im::opted_in;
+use super::im::understands_requests;
 use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
 use crate::inbox::{Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
@@ -62,10 +62,10 @@ struct Sending {
     mailbox: Mailbox,
     /// Its session takes part in messaging.
     takes_part: bool,
-    /// It has opted in to requests.
-    opted: bool,
-    /// It is on the classic wire, which is exempt from opting in, and
-    /// from holding `AccessMessaging`, to send a request (§4.1).
+    /// It understands requests.
+    understands: bool,
+    /// It is on the classic wire, which need not understand requests,
+    /// nor hold `AccessMessaging`, to send one (§4.1).
     classic: bool,
 }
 
@@ -109,14 +109,15 @@ impl Core {
         out
     }
 
-    /// Tell `of`'s sessions that have opted in to requests how many senders wait.
+    /// Tell `of`'s sessions that understand requests how many senders
+    /// wait.
     fn requests_changed(&self, of: &Mailbox) {
         let count = self.requesters(of).len();
         let mut r = self.roster.lock().unwrap();
         let to: Vec<Uid> = r
             .messengers(&Key::of(of))
             .into_iter()
-            .filter(|u| r.users.get(u).is_some_and(opted_in))
+            .filter(|u| r.users.get(u).is_some_and(understands_requests))
             .collect();
         for uid in to {
             r.send_to(uid, Event::RequestsChanged { count });
@@ -156,7 +157,7 @@ impl Core {
             Sending {
                 mailbox: s.mailbox(),
                 takes_part: s.messaging.is_some(),
-                opted: s.messaging.as_ref().is_some_and(|m| m.opted_in),
+                understands: s.messaging.as_ref().is_some_and(|m| m.understands_requests),
                 classic: s.reads_on_delivery,
             }
         };
@@ -165,7 +166,7 @@ impl Core {
         }
         if !takes_part {
             let me = &sending.mailbox;
-            let asked = sending.opted
+            let asked = sending.understands
                 && self
                     .requesters(me)
                     .iter()
@@ -218,7 +219,7 @@ impl Core {
         let rel = self.friends_store().map_err(chat_error)?;
         let me = Me {
             mailbox: sending.mailbox.clone(),
-            opted: sending.opted,
+            understands: sending.understands,
         };
         // A block reads as no account at all, before any bound.
         if rel
@@ -274,8 +275,8 @@ impl Core {
             return store((id, true));
         }
         // Writing back is consent to the conversation (§4.3), from a
-        // session that has opted in.
-        if sending.opted
+        // session that understands requests.
+        if sending.understands
             && self
                 .requesters(&me.mailbox)
                 .iter()
@@ -286,12 +287,13 @@ impl Core {
                 .map_err(chat_error)?;
             return store((id, true));
         }
-        // Both sides take requests, a classic sender aside, which is
-        // exempt from opting in (§4.1).
-        let read = |of: &Mailbox| rel.account(of).map_err(|e| chat_error(store_failed(e)));
-        let may_ask = sending.classic
-            || (sending.takes_part && sending.opted && read(&me.mailbox)?.takes_requests);
-        let account = read(&them)?;
+        // The sender understands requests, a classic sender aside, which
+        // is exempt (§4.1), whether or not its own account takes them;
+        // the recipient's account takes them.
+        let may_ask = sending.classic || (sending.takes_part && sending.understands);
+        let account = rel
+            .account(&them)
+            .map_err(|e| chat_error(store_failed(e)))?;
         if !may_ask || !account.takes_requests {
             return Err(ChatError::NotFriends);
         }
@@ -380,13 +382,14 @@ impl Core {
             return Ok(());
         }
         // A recipient none of whose sessions has opted in for a while,
-        // and none of whose sessions is opted in now, is answered as one
-        // taking requests, so a stranger cannot tell when one last did.
+        // and none of whose sessions that understand requests is there
+        // now, is answered as one taking requests, so a stranger cannot
+        // tell when one last did.
         let lapsed = opted_at.is_some_and(|at| at < retained) && {
             let r = self.roster.lock().unwrap();
             !r.taking_part(them)
                 .iter()
-                .any(|u| r.users.get(u).is_some_and(opted_in))
+                .any(|u| r.users.get(u).is_some_and(understands_requests))
         };
         let waiting = self.requesters(them);
         let new = !waiting.iter().any(|s| Key::of(s) == Key::of(me));
@@ -486,12 +489,23 @@ impl Core {
         self.im_deliver(b, None, 0);
     }
 
-    /// The caller's message requests and approvals (§4.5). Listing is
-    /// only listing: taking requests is an opt-in of its own (§4.1).
+    /// The caller's message requests and approvals (§4.5). Listing makes
+    /// the session one that understands requests, and leaves whether its
+    /// account takes them as it was (§4.1).
     pub fn requests_list(&self, uid: Uid) -> Result<RequestsListing, MessagingError> {
         let me = self.messenger(uid)?;
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
+        if let Some(m) = self
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&uid)
+            .and_then(|s| s.messaging.as_mut())
+        {
+            m.understands_requests = true;
+        }
         let now = self.clock.wall();
         let dropped = rel.requests_listed(&me.mailbox).map_err(store_failed)?;
         let mut requests: Vec<RequestGroup> = Vec::new();

@@ -2580,7 +2580,7 @@ impl Core {
     /// What a flush to `target` reads: a session that speaks the friend
     /// family is handed a friend's instant messages at its roster read
     /// instead, and what an approval carries waits for a session that
-    /// has opted in to requests where the account takes them
+    /// understands requests where the account takes them
     /// (`docs/instant-messaging.md` §5, §4.6).
     fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> crate::inbox::Pending {
         let messenger = {

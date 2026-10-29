@@ -314,7 +314,7 @@ pub enum Pending {
     /// a session that does not speak the friend family is given.
     All,
     /// [`Pending::All`] but what was sent under an approval, which waits
-    /// for a session that has opted in to requests
+    /// for a session that understands requests
     /// (`docs/instant-messaging.md` §4.6).
     Unapproved,
     /// Private messages alone.
