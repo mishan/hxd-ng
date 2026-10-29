@@ -726,8 +726,7 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
     s.update_account(
         &me,
         &AccountUpdate {
-            takes_requests: Some(true),
-            opted_at: Some(at(5)),
+            takes_requests: Some(Some(at(5))),
             ..Default::default()
         },
     )
@@ -758,8 +757,7 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
         &AccountUpdate {
             status_text: Some(Some("out".into())),
             discoverable: Some(true),
-            takes_requests: Some(false),
-            opted_at: None,
+            takes_requests: Some(None),
             profile: Some(profile.clone()),
         },
     )

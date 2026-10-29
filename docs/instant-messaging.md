@@ -633,15 +633,15 @@ fields `0x0420` `DATA_PROOF_HOST`, `0x0421` `DATA_SERVER_CHALLENGE`,
 that sets no new capability bit, sends no new field and never opts in
 to requests is answered as the extension answers it today, and is sent
 nothing it has not seen before. Requests pass only between accounts
-whose clients have both opted in (§4.1), with `DATA_TAKES_REQUESTS`; portable friendships go
-only to sessions that negotiated `CAPABILITY_FRIENDSHIPS`; Prove Device
-changes only the session that sends it. Two things an existing client
-can notice are asked as what a server MAY or SHOULD do, with replies
-the extension already has: a block read as `AccountNotFound` at 810,
-which is the extension's own SHOULD at 802 carried to 810, and the
-friend-request bounds of §4.4, under which a held request reads to its
-sender as one never answered. The hxd-ng policy below (§8) is not
-asked of anyone.
+whose clients have both opted in (§4.1), with `DATA_TAKES_REQUESTS`;
+portable friendships go only to sessions that negotiated
+`CAPABILITY_FRIENDSHIPS`; Prove Device changes only the session that
+sends it. Two things an existing client can notice are asked as what a
+server MAY or SHOULD do, with replies the extension already has: a
+block read as `AccountNotFound` at 810, which is the extension's own
+SHOULD at 802 carried to 810, and the friend-request bounds of §4.4,
+under which a held request reads to its sender as one never answered.
+The hxd-ng policy below (§8) is not asked of anyone.
 
 **The ng wire**: the friend family in the JSON protocol, the same
 operations and states under the ng spellings, and for requests:
@@ -778,7 +778,8 @@ hxd-ng's own policy and is not.
 *Proposed upstream:*
 
 - **Message requests** (§4): between accounts that both take requests,
-  which a session opts in to with `DATA_TAKES_REQUESTS` in 808, an 810 to a non-friend succeeds with `Requested` instead of failing
+  which a session opts in to with `DATA_TAKES_REQUESTS` in 808, an 810
+  to a non-friend succeeds with `Requested` instead of failing
   `NotFriends`; and an 810 to an account that has blocked the sender
   fails `AccountNotFound`, as Find User does, instead of `Blocked`,
   carrying to 810 the extension's SHOULD at 802.

@@ -253,6 +253,8 @@ impl Core {
             if approval {
                 return Err(MessagingError::RateLimited);
             }
+            // Behind any hand-over under way, so it overtakes nothing older.
+            let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
             let mut r = self.roster.lock().unwrap();
             let (messengers, plain): (Vec<Uid>, Vec<Uid>) = sessions_of(&r, them)
                 .into_iter()

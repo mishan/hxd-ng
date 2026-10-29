@@ -882,14 +882,9 @@ impl RelationshipStore for SqliteStore {
             if let Some(on) = update.discoverable {
                 a.discoverable = on;
             }
-            if let Some(on) = update.takes_requests {
-                a.takes_requests = on;
-                if !on {
-                    a.requests_opted_at = None;
-                }
-            }
-            if let Some(at) = update.opted_at {
-                a.requests_opted_at = Some(at);
+            if let Some(at) = update.takes_requests {
+                a.takes_requests = at.is_some();
+                a.requests_opted_at = at;
             }
             if let Some(profile) = &update.profile {
                 a.profile = profile.clone();

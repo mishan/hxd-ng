@@ -379,10 +379,15 @@ impl Core {
         if rel.is_held(them, &sender, now).map_err(store_failed)? {
             return Ok(());
         }
-        // A recipient none of whose sessions has opted in for a while is
-        // answered as one taking requests, so a stranger cannot tell when
-        // one last did.
-        let lapsed = opted_at.is_some_and(|at| at < retained);
+        // A recipient none of whose sessions has opted in for a while,
+        // and none of whose sessions is opted in now, is answered as one
+        // taking requests, so a stranger cannot tell when one last did.
+        let lapsed = opted_at.is_some_and(|at| at < retained) && {
+            let r = self.roster.lock().unwrap();
+            !r.taking_part(them)
+                .iter()
+                .any(|u| r.users.get(u).is_some_and(opted_in))
+        };
         let waiting = self.requesters(them);
         let new = !waiting.iter().any(|s| Key::of(s) == Key::of(me));
         if lapsed || (new && waiting.len() >= p.max_requests) {

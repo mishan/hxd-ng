@@ -325,6 +325,14 @@ impl RosterInner {
             .map_or((Presence::Offline, None), |e| self.shown(e))
     }
 
+    /// The sessions of a mailbox taking part.
+    pub(crate) fn taking_part(&self, of: &Mailbox) -> Vec<Uid> {
+        self.presences
+            .by
+            .get(&Key::of(of))
+            .map_or_else(Vec::new, |e| e.uids.clone())
+    }
+
     /// The messenger sessions of a mailbox.
     fn messengers(&self, of: &Key) -> Vec<Uid> {
         let Some(e) = self.presences.by.get(of) else {
@@ -627,8 +635,9 @@ impl Core {
         let account = AccountUpdate {
             status_text: update.status_text.clone(),
             discoverable: update.discoverable,
-            takes_requests: update.takes_requests,
-            opted_at: (update.takes_requests == Some(true)).then(|| self.clock.wall()),
+            takes_requests: update
+                .takes_requests
+                .map(|on| on.then(|| self.clock.wall())),
             profile: None,
         };
         if account != AccountUpdate::default() {
@@ -637,11 +646,17 @@ impl Core {
                 .map_err(store_failed)?;
         }
         let mut r = self.roster.lock().unwrap();
-        if let (Some(on), Some(m)) = (
-            update.takes_requests,
-            r.users.get_mut(&uid).and_then(|s| s.messaging.as_mut()),
-        ) {
-            m.opted_in = on;
+        // An opt-in is the session's; an opt-out is the account's, and
+        // ends every session's.
+        let opting = match update.takes_requests {
+            Some(true) => vec![uid],
+            Some(false) => r.taking_part(&me.mailbox),
+            None => Vec::new(),
+        };
+        for u in opting {
+            if let Some(m) = r.users.get_mut(&u).and_then(|s| s.messaging.as_mut()) {
+                m.opted_in = update.takes_requests == Some(true);
+            }
         }
         let key = Key::of(&me.mailbox);
         match update.state {

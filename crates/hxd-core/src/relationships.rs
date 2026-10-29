@@ -344,9 +344,10 @@ pub struct AccountUpdate {
     /// `Some(None)` clears the text.
     pub status_text: Option<Option<String>>,
     pub discoverable: Option<bool>,
-    pub takes_requests: Option<bool>,
-    /// With `takes_requests: Some(true)`, when the session opted in.
-    pub opted_at: Option<SystemTime>,
+    /// `Some(Some(at))`: a session opted in to requests at `at`;
+    /// `Some(None)`: one opted out. The switch never turns on without
+    /// the time it lapses from.
+    pub takes_requests: Option<Option<SystemTime>>,
     pub profile: Option<Profile>,
 }
 

@@ -1995,13 +1995,15 @@ fn a_request_left_alone_lapses_and_frees_its_place() {
         .collect();
     let s = server_with(p, &accounts);
     let (a, _ra) = taker(&s.core, "alice");
-    let (_b, _rb) = taker(&s.core, "bob");
+    let (b, _rb) = taker(&s.core, "bob");
     let (c, _rc) = taker(&s.core, "carol");
     send(&s.core, a, "bob", "hello?").unwrap();
+    s.core.end_session(b);
     s.core
         .clock
         .advance(p.request_retention + Duration::from_secs(1));
-    // Bob's opt-in has lapsed: carol is answered as ever, and dropped.
+    // Bob's opt-in has lapsed, with no session of his opted in: carol is
+    // answered as ever, and dropped.
     assert_eq!(
         send(&s.core, c, "bob", "anyone?"),
         Ok(crate::MsgOutcome::Requested)
@@ -2169,5 +2171,46 @@ fn a_retry_of_a_request_is_answered_as_one_whatever_came_after() {
     assert!(
         ims(&drain(&mut rb)).is_empty(),
         "what was deleted is not sent again"
+    );
+}
+
+#[test]
+fn an_opt_in_held_by_a_session_still_there_never_lapses() {
+    let s = server(&["alice", "bob"]);
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
+    s.core
+        .clock
+        .advance(policy().request_retention + Duration::from_secs(1));
+    assert_eq!(
+        send(&s.core, a, "bob", "still there?"),
+        Ok(crate::MsgOutcome::Requested)
+    );
+    assert_eq!(
+        waiting(&s.core, b),
+        [("alice".into(), vec!["still there?".into()])]
+    );
+}
+
+#[test]
+fn an_opt_out_from_one_session_ends_every_sessions_opt_in() {
+    let s = server(&["bob", "carol"]);
+    let (b1, _rb1) = taker(&s.core, "bob");
+    let (b2, _rb2) = taker(&s.core, "bob");
+    let (c, _rc) = messenger(&s.core, "carol");
+    s.core.friend_add(c, "bob", None).unwrap();
+    s.core
+        .set_presence(
+            b1,
+            PresenceUpdate {
+                takes_requests: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        s.core.friend_add(b2, "carol", None),
+        Err(MessagingError::RequestPending),
+        "no longer opted in, so a crossing request is not accepted"
     );
 }
