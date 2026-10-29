@@ -2,8 +2,8 @@
 
 Status: built — the registry, the sender, the two ng requests and
 `[push]` on the server, and hx-ng as the client that asks for
-permission and renders what arrives. What is left is §9's G5, a real
-end-to-end against a phone. Staged in §9; each stage marks itself there
+permission and renders what arrives, verified from a browser on a
+phone. What is left is §9's G5 from a UnifiedPush distributor. Staged in §9; each stage marks itself there
 as it lands.
 
 [push-notifications.md](push-notifications.md) §0 decided that the first
@@ -451,7 +451,9 @@ the same shape news uses for a server with no `[news.notify]`.
 5. **G5 — a real end-to-end.** A browser and a UnifiedPush distributor on
    a real device against a real server: DM a detached user, watch it
    buzz. The exit criterion, as push-notifications.md §9 P5 says; the
-   only difference is that there is no sidecar in the picture.
+   only difference is that there is no sidecar in the picture. The
+   browser half passed 2026-10-29, a phone's browser buzzing for a DM to
+   a detached user; the UnifiedPush half remains.
 
 G1 and G2 are independent and can land in either order. G3 needs both.
 

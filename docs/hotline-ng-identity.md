@@ -7,9 +7,11 @@ association including `trtp_login` (§8), the `hlid` tool, the
 server-local revocation list of `identity-registrar.md` §7.3 (§12's
 `revoked_identities` and `revoked_devices`), and the registrar itself —
 handles, attestations and the records it publishes (`identity-registrar.md`
-§3–§6). Design only: a server fetching and applying those records
-(`identity-registrar.md` §7, which §5.2 step 4, §8.5 and §12 now cite), vouching (`identity-vouch.md`), the
-system account (`system-account.md`), reserved-name enforcement, and
+§3–§6), a server fetching and applying those records
+(`identity-registrar.md` §7, which §5.2 step 4, §8.5 and §12 cite;
+staged in `identity-records.md`), and the system account
+(`system-account.md`, in part). Design only: vouching
+(`identity-vouch.md`), reserved-name enforcement, and
 everything in the federation spec, which does not exist yet. The
 identity object set is frozen at `v = 1` until the registrar's
 revocation path is built end to end; no new identity features before

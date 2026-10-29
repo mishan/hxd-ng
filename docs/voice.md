@@ -1,8 +1,7 @@
 # Voice chat: one SFU, two signalling wires
 
-Status: built, 2026-09. V0–V4 of §9 have landed on both wires; V5 (real
-clients, one mixed room) is the exit criterion, and §11 holds what is
-open.
+Status: built, 2026-09. V0–V4 of §9 have landed on both wires, and V5's
+mixed room has been heard with real clients; §11 holds what is open.
 
 hxd-ng implements the fogWraith voice-chat capability — a server-side SFU
 that clients reach over WebRTC, signalled over the client's existing
@@ -446,7 +445,7 @@ Each stage is a branch with tests, in the house style.
 sketch below, and what it cost is in the commit messages; the deviations
 worth knowing about are recorded in §7 (the participants builder), §5
 (the forwarding SSRC and the ICE-lite demux workaround) and §12 below.
-V5 is what remains: real clients, real microphones, one room.
+V5 is what remained: real clients, real microphones, one room.
 
 0. **V0 — capabilities.** `DATA_CAPABILITIES` parse/echo in
    `hxd-session`; `caps` list in the ng login reply; e2e that a client
@@ -487,8 +486,8 @@ V5 is what remains: real clients, real microphones, one room.
    the server), and the cross-frontend e2e: **a scripted legacy client
    and a scripted ng client in one voice room, RTP forwarded both ways**.
 5. **V5 — real clients, mixed room.** GtkHx on :5500 and the browser page
-   on :5700 in one room, hearing each other. This is the exit criterion.
-   Run the two Janus-bug reproductions from gtkhx's `tools/` against
+   on :5700 in one room, hearing each other. This is the exit criterion,
+   met 2026-10-29. Run the two Janus-bug reproductions from gtkhx's `tools/` against
    hxd-ng and confirm they don't reproduce.
 
 ## 10. Risks, honestly

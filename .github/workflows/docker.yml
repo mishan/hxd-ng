@@ -3,7 +3,8 @@
 # legacy port answers the handshake and the ng port answers discovery,
 # and that the image in relay mode carries /trtp to the server.
 # A push to main does the same and then publishes the image to GHCR as
-# `latest` and `sha-<commit>`.
+# `latest` and `sha-<commit>`; a pushed `v*` tag publishes it as the
+# version, `X.Y.Z` and `X.Y`, and `sha-<commit>`.
 #
 # Every pull request, not only those touching docker/: the image builds
 # the whole workspace, so a change anywhere can break it.
@@ -16,6 +17,7 @@ name: Docker
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 # As in ci.yml: a re-pushed branch cancels its stale run, and main's
@@ -47,6 +49,8 @@ jobs:
           images: ${{ steps.name.outputs.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
 
       # Built into the local image store first, so the smoke test runs the
