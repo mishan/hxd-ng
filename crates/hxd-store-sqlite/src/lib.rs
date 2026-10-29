@@ -3222,7 +3222,10 @@ mod tests {
             max_age: None,
             channels: Vec::new(),
         };
+        let began = std::time::Instant::now();
         let gone = ChatLog::prune(&beside, &keep, SystemTime::now()).unwrap();
+        // It waited for the held write, so it overlapped it.
+        assert!(began.elapsed() >= Duration::from_millis(200));
         holder.join().unwrap();
         assert_eq!(gone, 3);
         let page = first
