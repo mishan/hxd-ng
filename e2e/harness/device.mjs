@@ -5,31 +5,41 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { bytesToHex, fetchChallenge, fetchDiscovery, postAuth, signLoginProof } from '@hotline-ng/client';
+import { bytesToHex, decodeDeviceCert, fetchChallenge, fetchDiscovery, fingerprintOf, postAuth, signLoginProof } from '@hotline-ng/client';
 
 import { hlid } from './server.mjs';
 
-/** A device certified by `hlid` for messages as well as login, under an
- *  identity of its own named `name` in `server`'s directory, both its
- *  private keys, and the token-minting an identity login runs. */
-export async function enrolledDevice(server, name) {
+/** A device certified by `hlid` for messages as well as login, both its
+ *  private keys, and the token-minting an identity login runs.
+ *
+ *  Options: `identity`, the key file of an identity that already exists,
+ *  where one identity has a device on each of two servers (otherwise a
+ *  new one named `name` in `server`'s directory); `card`, a card file to
+ *  log in with, such as the one `hlid register` rewrote (otherwise a new
+ *  one); `caps` and `issued`, as `hlid cert` takes them.
+ *
+ *  Of what it returns, `identity` and `device` are the raw public keys,
+ *  the device's being what a revocation names. */
+export async function enrolledDevice(server, name, { identity, card: cardFile, caps = 'web', issued } = {}) {
   const sign = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
   const enc = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
   const signPub = new Uint8Array(await crypto.subtle.exportKey('raw', sign.publicKey));
   const encPub = new Uint8Array(await crypto.subtle.exportKey('raw', enc.publicKey));
-  const keygen = hlid(server.dir, ['keygen', 'identity', `${name}.key`]);
-  const fingerprint = /fingerprint: (\S+)/.exec(keygen)?.[1];
+  const key = identity ?? join(server.dir, `${name}.key`);
+  if (!identity) hlid(server.dir, ['keygen', 'identity', key]);
   hlid(server.dir, [
     'cert',
-    '--identity', `${name}.key`,
+    '--identity', key,
     '--device-pub', bytesToHex(signPub),
     '--device-enc-pub', bytesToHex(encPub),
-    '--caps', 'web',
+    '--caps', caps,
+    ...(issued ? ['--issued', String(issued)] : []),
     '-o', `${name}.cert`,
   ]);
-  hlid(server.dir, ['card', '--identity', `${name}.key`, '--name', name, '-o', `${name}.card`]);
+  if (!cardFile) hlid(server.dir, ['card', '--identity', key, '--name', name, '-o', `${name}.card`]);
   const cert = new Uint8Array(readFileSync(join(server.dir, `${name}.cert`)));
-  const card = new Uint8Array(readFileSync(join(server.dir, `${name}.card`)));
+  const card = new Uint8Array(readFileSync(cardFile ?? join(server.dir, `${name}.card`)));
+  const identityPub = decodeDeviceCert(cert).identity;
   const doc = await fetchDiscovery(server.httpBase);
   const endpoint = (path) => new URL(path, server.httpBase).toString();
   const getToken = async () => {
@@ -44,7 +54,17 @@ export async function enrolledDevice(server, name) {
     const auth = await postAuth(endpoint(doc.identity.endpoints.auth), { host: challenge.host, card, deviceCert: cert, proof });
     return auth.token;
   };
-  return { key: sign.privateKey, enc: enc.privateKey, cert, fingerprint, getToken, challengeAt: endpoint(doc.identity.endpoints.challenge) };
+  return {
+    key: sign.privateKey,
+    enc: enc.privateKey,
+    cert,
+    identity: identityPub,
+    identityFile: key,
+    device: signPub,
+    fingerprint: await fingerprintOf(identityPub),
+    getToken,
+    challengeAt: endpoint(doc.identity.endpoints.challenge),
+  };
 }
 
 /** The `[identity]` a file's server signs with: its hosts, which make it

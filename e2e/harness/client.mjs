@@ -89,7 +89,7 @@ function redact(raw) {
 export class TestClient {
   /**
    * @param {import('./server.mjs').Server} server
-   * @param {object} creds `login`/`password`/`nick`/`icon`/`identity`/`messaging`
+   * @param {object} creds `login`/`password`/`nick`/`icon`/`identity`/`messaging`/`friendships`
    */
   constructor(server, creds = {}) {
     this.server = server;
@@ -107,6 +107,7 @@ export class TestClient {
         icon: creds.icon ?? 0,
         ...(creds.identity ? { identity: creds.identity } : {}),
         ...(creds.messaging ? { messaging: true } : {}),
+        ...(creds.friendships ? { friendships: true } : {}),
       },
       {
         onTrace: (t) => this.onTrace(t),
