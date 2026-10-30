@@ -10,12 +10,17 @@ import { bytesToHex, decodeDeviceCert, fetchChallenge, fetchDiscovery, fingerpri
 import { hlid } from './server.mjs';
 
 /** A device certified by `hlid` for messages as well as login, both its
- *  private keys, and the token-minting an identity login runs. The
- *  identity is a new one named `name` in `server`'s directory, or the key
- *  file `identity`, where one identity has a device on each of two
- *  servers. `identity` and `device` are the raw public keys, the device's
- *  being what a revocation names. */
-export async function enrolledDevice(server, name, identity) {
+ *  private keys, and the token-minting an identity login runs.
+ *
+ *  Options: `identity`, the key file of an identity that already exists,
+ *  where one identity has a device on each of two servers (otherwise a
+ *  new one named `name` in `server`'s directory); `card`, a card file to
+ *  log in with, such as the one `hlid register` rewrote (otherwise a new
+ *  one); `caps` and `issued`, as `hlid cert` takes them.
+ *
+ *  Of what it returns, `identity` and `device` are the raw public keys,
+ *  the device's being what a revocation names. */
+export async function enrolledDevice(server, name, { identity, card: cardFile, caps = 'web', issued } = {}) {
   const sign = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
   const enc = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
   const signPub = new Uint8Array(await crypto.subtle.exportKey('raw', sign.publicKey));
@@ -27,12 +32,13 @@ export async function enrolledDevice(server, name, identity) {
     '--identity', key,
     '--device-pub', bytesToHex(signPub),
     '--device-enc-pub', bytesToHex(encPub),
-    '--caps', 'web',
+    '--caps', caps,
+    ...(issued ? ['--issued', String(issued)] : []),
     '-o', `${name}.cert`,
   ]);
-  hlid(server.dir, ['card', '--identity', key, '--name', name, '-o', `${name}.card`]);
+  if (!cardFile) hlid(server.dir, ['card', '--identity', key, '--name', name, '-o', `${name}.card`]);
   const cert = new Uint8Array(readFileSync(join(server.dir, `${name}.cert`)));
-  const card = new Uint8Array(readFileSync(join(server.dir, `${name}.card`)));
+  const card = new Uint8Array(readFileSync(cardFile ?? join(server.dir, `${name}.card`)));
   const identityPub = decodeDeviceCert(cert).identity;
   const doc = await fetchDiscovery(server.httpBase);
   const endpoint = (path) => new URL(path, server.httpBase).toString();
