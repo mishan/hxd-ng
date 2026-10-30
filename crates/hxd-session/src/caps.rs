@@ -120,8 +120,16 @@ pub mod cap {
     /// §7.1). Never offered in `legacy_caps()`: a link login is taken by
     /// the link path before capabilities are intersected.
     pub const SERVER_LINK: u8 = 11;
+    /// The identity draft's first version: signed and sealed messages,
+    /// which this wire does not carry yet. Never confirmed; read only as
+    /// what a client offers beside [`FRIENDSHIPS`].
+    pub const IDENTITY: u8 = 13;
     /// The session may prove a device (`crate::device`).
     pub const DEVICE_PROOF: u8 = 14;
+    /// Portable friendships (`docs/proposals/portable-friends.md` §7).
+    /// **Depends on [`MESSAGING`]**, and only for a client that offered
+    /// [`IDENTITY`] with it.
+    pub const FRIENDSHIPS: u8 = 15;
 }
 
 #[cfg(test)]
@@ -145,6 +153,10 @@ mod tests {
         assert_eq!(
             Caps::empty().with(cap::DEVICE_PROOF).bits(),
             hxproto::messaging::CAP_DEVICE_PROOF
+        );
+        assert_eq!(
+            Caps::empty().with(cap::FRIENDSHIPS).bits(),
+            hxproto::messaging::CAP_FRIENDSHIPS
         );
         // "When all three extensions are active (large files, text
         // encoding, voice), the capability bitmask is 0x0007."

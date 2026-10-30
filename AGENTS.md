@@ -475,7 +475,27 @@ Three layers, all `cargo test --workspace`:
   unlinked account on an encrypted session, and linking nothing
   everywhere else; a client that never sets bit 14, and a server with
   no classic host, answered as before; and an account's proofs rated
-  across its reconnects),
+  across its reconnects), `friendships_classic.rs` (portable
+  friendships on the classic wire, from a real config, with devices
+  proved by Prove Device and every object signed with real device
+  keys: one made with an ng client and in place on the next server
+  once two classic clients present it, its hashes in their entries and
+  fetched by 834; one made between two classic clients, a withdrawal
+  on one server ending it on the other, its `Removed` 801 carrying the
+  withdrawal, and its presentation refused `Withdrawn` there after; 802,
+  805, 803 and 806 answering `Stale` and `Withdrawn`, the removal and
+  the block standing; 834 answering a rotation's record in chain order;
+  bit 15 confirmed only beside bits 6 and 13 where a device can be
+  proved, and never bit 13; a session without bit 15 sent plain
+  requests and entries, answered 833 as unimplemented and its offer
+  ignored, and a period client of a friend's account hearing nothing
+  new; an upgrade offer answered `Accepted`, told to bit-15 sessions
+  alone, waiting after Get Roster's reply and canceled alone by 803;
+  803 naming its party by fingerprint; 806's withdrawal answered alike
+  whoever it names; an unproved session's friendship acts refused and
+  spending nothing; and presenting paced per account across reconnects,
+  an empty request too, one past the bound refused before it spends,
+  and none kicked for),
   `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line

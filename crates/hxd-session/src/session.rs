@@ -2513,10 +2513,28 @@ async fn login_phase(
     if req.caps.has(cap::DEVICE_PROOF) && ctx.device_proof.is_some() {
         caps = caps.with(cap::DEVICE_PROOF);
     }
+    // Bit 15 beside bit 6, to a client that offered bit 13 with it, so
+    // that one of the identity draft's first version is never sent an
+    // upgrade offer (`docs/proposals/portable-friends.md` §7), and only
+    // where the session proved a device of its account's identity in the
+    // tunnel or may prove one with bit 14: its friendship acts wait for
+    // that proof. Bit 13 itself, signed and sealed messages, is not this
+    // wire's yet, and is never confirmed.
+    let proved = transport.identity.as_ref().is_some_and(|t| {
+        account.identity.fingerprint == Some(t.fingerprint) && t.device_cert.is_some()
+    });
+    if req.caps.has(cap::FRIENDSHIPS)
+        && req.caps.has(cap::IDENTITY)
+        && caps.has(cap::MESSAGING)
+        && (proved || caps.has(cap::DEVICE_PROOF))
+    {
+        caps = caps.with(cap::FRIENDSHIPS);
+    }
     let transport = Transport {
         inline_media: caps.has(cap::INLINE_MEDIA),
         messaging: caps.has(cap::MESSAGING),
         messenger_session: caps.has(cap::MESSENGER_SESSION),
+        friendships: caps.has(cap::FRIENDSHIPS),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -3255,7 +3273,8 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         | Event::Typing { .. }
         | Event::RequestsChanged { .. }) => {
             if let Some((ty, chunks)) =
-                friends::event(&ev, sess.enc).filter(|_| sess.has_cap(cap::MESSAGING))
+                friends::event(&ev, sess.enc, sess.has_cap(cap::FRIENDSHIPS))
+                    .filter(|_| sess.has_cap(cap::MESSAGING))
             {
                 notify(tx, ty, chunks);
             }
@@ -3442,7 +3461,7 @@ fn public_chat_frame(f: &Frame, ctx: &ServerCtx) -> Option<u32> {
 /// reconnect.
 async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
     let points = friends::price(f.ty)
-        .filter(|_| sess.has_cap(cap::MESSAGING))
+        .filter(|_| speaks_friends(sess, f.ty))
         .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
@@ -3454,6 +3473,14 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
             false
         }
     }
+}
+
+/// Is `ty` one of the friend family's that this session negotiated: bit
+/// 6, and for Present Friendships and Get Friendships bit 15?
+fn speaks_friends(sess: &Session, ty: u32) -> bool {
+    friends::handles(ty)
+        && sess.has_cap(cap::MESSAGING)
+        && (!friends::friendships_only(ty) || sess.has_cap(cap::FRIENDSHIPS))
 }
 
 /// A chat send (105) as the session will act on it: the chat it is for,
@@ -5707,12 +5734,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 
         // The friend family, for a session that negotiated bit 6; any
         // other is answered below, as before the family existed.
-        t if friends::handles(t) && sess.has_cap(cap::MESSAGING) => {
+        t if speaks_friends(sess, t) => {
             if t == ClientHdr::ImSend.as_u32() && !sess.can(bit::SEND_MSGS) {
                 reply_error(tx, f.trans, "You are not allowed to send private messages.");
                 return;
             }
-            let op = match friends::parse(f, sess.enc) {
+            // As negotiated, though an unlink clears the domain's flag
+            // after: what such a session sends then is refused by the
+            // domain's gate, and the fingerprints it is shown are ones
+            // this server shows anyone (hxd-ng has no hidden links).
+            let friendships = sess.has_cap(cap::FRIENDSHIPS);
+            let op = match friends::parse(f, sess.enc, friendships) {
                 Ok(op) => op,
                 Err(text) => {
                     if friends::answers(t) {
@@ -5722,7 +5754,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 }
             };
             let (uid, enc) = (sess.uid, sess.enc);
-            match off_reactor(&ctx.core, move |c| friends::act(c, uid, enc, op)).await {
+            match off_reactor(&ctx.core, move |c| {
+                friends::act(c, uid, enc, friendships, op)
+            })
+            .await
+            {
                 Some(friends::Answer::Reply { chunks, then }) => {
                     reply(tx, f.trans, chunks);
                     for (ty, chunks) in then {

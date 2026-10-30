@@ -567,8 +567,13 @@ account. Not yet:
 file transfer and calls (814–821), User Search (823), Set User Info
 (826), which the domain has no write for and which is answered as any
 transaction the server does not implement, buddy icons (827, 828) and
-the identity draft's fields. Message requests add transactions 829–832,
-under the numbers fogWraith reserved (below):
+the identity draft's signed and sealed messages (bit 13). Portable
+friendships (`proposals/portable-friends.md` §7) are built: bit 15, the
+offers, friendships, withdrawals and hashes of 802 to 806, 801 and 800,
+`DATA_FRIEND_IDENTITY` naming a party in 803 and 822 and beside an entry,
+and Present Friendships (833) and Get Friendships (834). Message
+requests add transactions 829–832, under the numbers fogWraith reserved
+(below):
 
 - **Get Message Requests**, `DATA_REQUEST_CURSOR` optional, answered
   first, on the first page, with `DATA_TAKES_REQUESTS`, the caller's own
@@ -625,6 +630,33 @@ What the classic wire says differently from the documents, on purpose:
   identity draft's, unnegotiated here; and, as on the ng wire, Get
   Message Requests delivers nothing, where the draft has it hand over
   what waits under the caller's approvals.
+- **Bit 15 without bit 13.** Bit 15 is confirmed beside bit 6 to a
+  client that offered bits 13 and 15, as portable friends §7 asks so
+  that a client of the identity draft's first version is never sent an
+  upgrade offer, and only where the session proved a device in the
+  tunnel or may prove one with bit 14; bit 13 itself is never confirmed,
+  since this wire carries no signed or sealed message yet. A session
+  confirmed bit 15 is sent the fields, the upgrade offer's 804 and
+  `DATA_FRIEND_IDENTITY` on its entries and requests from login on; its
+  friendship acts, 833 and 834 among them, wait for its proof, and are
+  refused with no reason code until then.
+- **An upgrade offer waiting** goes after Get Roster's reply as an 804
+  carrying it, since an entry has no field for it.
+- **Friendship objects are paced as the ng wire weighs them**: Present
+  Friendships and Get Friendships, which spend no spam points, and the
+  offers, friendships and withdrawals 802, 803, 805 and 806 carry beside
+  the spam points those spend, draw on a rate of their own, per account
+  and per address, as Prove Device does, at the weights `hotline-ng.md`
+  §7.5 gives them. A session that proved no device spends none of it on
+  what the gate refuses, beyond 833's and 834's own weights. A request
+  past it is refused whole, `RateLimited` with no delay, which this wire
+  cannot carry, except a removal or a block, which pacing never holds
+  up: its withdrawal is charged and taken whatever is left.
+- **Replies of groups.** Present Friendships answers its withdrawals'
+  groups before its friendships'. Get Friendships answers as many
+  questions as fit a frame, in order, and leaves the rest unanswered, for
+  the client to ask again; only a long run of rotation records comes
+  near it.
 - **A cursor** is the place of the next group in the listing, read
   whole again for each page, so a request that arrives or goes between
   pages can move what the next page starts with. Only the first page

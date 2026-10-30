@@ -15,7 +15,7 @@ pub type Chunks = Vec<(u16, Vec<u8>)>;
 /// What a builder filled, owned. Panics where it refused the request,
 /// which is a test asking for something the wire cannot say.
 pub fn built(fill: impl FnOnce(&mut [HxChunk], &mut [u8]) -> usize) -> Chunks {
-    let mut chunks = [HxChunk::EMPTY; 16];
+    let mut chunks = [HxChunk::EMPTY; m::MAX_FRIENDSHIP_OBJECTS];
     let mut scratch = [0u8; SCRATCH_LEN];
     let n = fill(&mut chunks, &mut scratch);
     assert!(n > 0, "the builder refused the request");
@@ -50,6 +50,39 @@ pub fn block(login: &[u8]) -> Chunks {
     built(|c, s| m::build_block_user_chunks(login, None, c, s))
 }
 
+/// Add Friend (802) carrying an offer.
+pub fn add_friend_offering(login: &[u8], offer: &[u8]) -> Chunks {
+    built(|c, s| m::build_add_friend_chunks(login, None, Some(offer), c, s))
+}
+
+/// Remove Friend (803) naming `who`, carrying an upgrade offer to cancel
+/// or a withdrawal.
+pub fn remove_friend_with(
+    who: m::Who<'_>,
+    offer: Option<&[u8]>,
+    withdrawal: Option<&[u8]>,
+) -> Chunks {
+    built(|c, s| m::build_remove_friend_chunks(who, offer, withdrawal, c, s))
+}
+
+/// Friend Response (805) accepting with a friendship.
+pub fn friend_response_with(login: &[u8], friendship: &[u8]) -> Chunks {
+    built(|c, s| m::build_friend_response_chunks(login, true, Some(friendship), c, s))
+}
+
+/// Block User (806) carrying a withdrawal.
+pub fn block_withdrawing(login: &[u8], withdrawal: &[u8]) -> Chunks {
+    built(|c, s| m::build_block_user_chunks(login, Some(withdrawal), c, s))
+}
+
+pub fn present_friendships(objects: &[m::Presentation<'_>]) -> Chunks {
+    built(|c, s| m::build_present_friendships_chunks(objects, c, s))
+}
+
+pub fn get_friendships(asked: &[m::FriendshipQuery<'_>]) -> Chunks {
+    built(|c, s| m::build_get_friendships_chunks(asked, c, s))
+}
+
 /// Unblock User (807) and Get User Info (825).
 pub fn login_only(login: &[u8]) -> Chunks {
     built(|c, s| m::build_login_only_chunks(login, c, s))
@@ -77,7 +110,11 @@ pub fn im_typing(login: &[u8], state: m::TypingState) -> Chunks {
 }
 
 pub fn find_user(login: &[u8]) -> Chunks {
-    built(|c, s| m::build_find_user_chunks(m::Who::Login(login), c, s))
+    find_user_by(m::Who::Login(login))
+}
+
+pub fn find_user_by(who: m::Who<'_>) -> Chunks {
+    built(|c, s| m::build_find_user_chunks(who, c, s))
 }
 
 pub fn set_friend_nickname(login: &[u8], nickname: &[u8]) -> Chunks {

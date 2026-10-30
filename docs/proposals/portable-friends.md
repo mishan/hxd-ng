@@ -2,8 +2,10 @@
 
 Status: proposal. PF1 and PF2 (§8) are built: the objects in
 `hl-identity`, and the server and the ng wire (`hotline-ng.md` §7.5).
-Of PF3, device proof on the classic wire (§3) is built, on a server
-with an ng port; Present Friendships and Get Friendships are not.
+PF3's server is built, on a server with an ng port: device proof on the
+classic wire (§3), and there §7's fields, Present Friendships and Get
+Friendships, under bit 15 confirmed without bit 13
+(`instant-messaging.md` §7).
 Builds on `instant-messaging.md`,
 hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
@@ -808,7 +810,10 @@ frame bound a server sets in practice, and each field is well inside the
 32 `DATA_FRIENDSHIP_HASH` and `DATA_FRIEND_IDENTITY` fields, and its
 reply's groups are delimited by the one they answer, each followed by
 its `DATA_FRIENDSHIP`, or for a fingerprint its `DATA_IDENTITY_ROTATION`
-records in chain order, where there are any. Remove Friend (803) may
+records in chain order, where there are any. A reply may stop short of
+the frame bound, leaving the questions after it unanswered: one with no
+group is unanswered, for the client to ask again, where one with a group
+and no object was answered that there is nothing. Remove Friend (803) may
 name its party by `DATA_FRIEND_IDENTITY` (§4.3).
 
 **`CAPABILITY_FRIENDSHIPS`**, a capability bit, says a client
@@ -877,7 +882,9 @@ they are reserved before PF3 needs them.
    once their numbers are reserved, each rated as §4.3 has it, in
    `hxproto` in hx-libs first, then GtkHx with its own device key, on
    any port; `[identity] classic_hosts` and `classic_proof`, owed to
-   `hotline-ng-identity.md` §12.
+   `hotline-ng-identity.md` §12. The server's half is built, driven by
+   `hxproto`'s builders and parsers in `crates/hxd/tests/device_proof.rs`
+   and `friendships_classic.rs`; GtkHx's is still to come.
 4. **PF4, upstream.** §4's rules and §7's numbers as the identity
    draft's second version, citing the objects, written server-neutral
    once PF2 has shown they work: without hxd-ng's settings (`[identity]

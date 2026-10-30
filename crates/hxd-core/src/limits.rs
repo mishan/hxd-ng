@@ -849,6 +849,12 @@ pub struct LoginAttempt {
 /// behind one carrier's address.
 pub(crate) const DEVICE_PROOFS: u32 = 10;
 pub(crate) const DEVICE_PROOFS_PER: Duration = Duration::from_secs(60);
+/// The classic wire's friendship acts ([`Core::friendships_spend`]), in
+/// the weights the ng wire's request limit gives them: two full Present
+/// Friendships' worth for one account at once, earned back over
+/// [`DEVICE_PROOFS_PER`], so that a few hundred friends brought to a new
+/// server are paced over minutes. An address, four times as many.
+pub(crate) const FRIENDSHIP_WEIGHT: u32 = 2 * (1 + 4 * 32);
 
 impl Core {
     /// Spend one of the device proofs `uid`'s account and its address may
@@ -859,27 +865,65 @@ impl Core {
     /// nothing. An account that `can_spam` is held to neither, and an
     /// address `[limits]` exempts to its account's alone.
     pub fn device_proof_spend(&self, uid: crate::Uid) -> Result<(), Duration> {
+        let rates = (&self.device_proofs, &self.device_proof_addrs);
+        self.paced(uid, 1, rates, (DEVICE_PROOFS, DEVICE_PROOFS_PER))
+    }
+
+    /// Spend `weight` of what `uid`'s account and its address may spend
+    /// on friendship acts from the classic wire
+    /// (`docs/proposals/portable-friends.md` §4.3), or say how long until
+    /// there is room: each object a signature check or a store read.
+    /// Held, and exempted, as [`Self::device_proof_spend`] is.
+    pub fn friendships_spend(&self, uid: crate::Uid, weight: u32) -> Result<(), Duration> {
+        let rates = (&self.friendship_objects, &self.friendship_object_addrs);
+        self.paced(uid, weight, rates, (FRIENDSHIP_WEIGHT, DEVICE_PROOFS_PER))
+    }
+
+    /// [`Self::friendships_spend`], counted whether or not there is room:
+    /// for a removal or a block, which pacing never holds up
+    /// (`docs/proposals/portable-friends.md` §4.3), so that what its
+    /// withdrawal costs still slows what follows it.
+    pub fn friendships_charge(&self, uid: crate::Uid, weight: u32) {
+        let Some(key) = self.post_key(uid) else {
+            return;
+        };
+        let (rate, now) = ((FRIENDSHIP_WEIGHT, DEVICE_PROOFS_PER), Instant::now());
+        self.friendship_objects.charge(key, weight, rate, now);
+        if let Some(addr) = self.paced_addr(uid) {
+            let rate = (4 * FRIENDSHIP_WEIGHT, DEVICE_PROOFS_PER);
+            self.friendship_object_addrs.charge(addr, weight, rate, now);
+        }
+    }
+
+    fn paced(
+        &self,
+        uid: crate::Uid,
+        cost: u32,
+        (by_account, by_addr): (&PostRates, &PostRates),
+        (count, per): (u32, Duration),
+    ) -> Result<(), Duration> {
         let Some(key) = self.post_key(uid) else {
             return Ok(());
         };
+        let now = Instant::now();
+        by_account.take(key.clone(), cost, (count, per), now)?;
+        match self.paced_addr(uid) {
+            Some(addr) => by_addr
+                .take(addr, cost, (4 * count, per), now)
+                .inspect_err(|_| by_account.give_back(&key, cost, now)),
+            None => Ok(()),
+        }
+    }
+
+    /// The bucket `uid`'s address is paced under, unless `[limits]`
+    /// exempts it.
+    fn paced_addr(&self, uid: crate::Uid) -> Option<PostKey> {
         let addr = {
             let r = self.roster.lock().unwrap();
             r.users.get(&uid).and_then(|s| s.addr)
         };
-        let now = Instant::now();
-        self.device_proofs
-            .reserve(key.clone(), (DEVICE_PROOFS, DEVICE_PROOFS_PER), now)?;
-        match addr.filter(|a| !self.conn_gate.exempt(*a)) {
-            Some(addr) => self
-                .device_proof_addrs
-                .reserve(
-                    PostKey::Guest(limit_key(addr)),
-                    (4 * DEVICE_PROOFS, DEVICE_PROOFS_PER),
-                    now,
-                )
-                .inspect_err(|_| self.device_proofs.refund(&key, now)),
-            None => Ok(()),
-        }
+        addr.filter(|a| !self.conn_gate.exempt(*a))
+            .map(|a| PostKey::Guest(limit_key(a)))
     }
 
     /// Take one folder from what `uid`'s account may make
@@ -1318,26 +1362,53 @@ impl PostRates {
         (count, per): (u32, Duration),
         now: Instant,
     ) -> Result<(), Duration> {
+        self.take(key, 1, (count, per), now)
+    }
+
+    /// [`Self::reserve`], of `cost` at once.
+    pub(crate) fn take(
+        &self,
+        key: PostKey,
+        cost: u32,
+        (count, per): (u32, Duration),
+        now: Instant,
+    ) -> Result<(), Duration> {
         let Some(fresh) = RateBucket::new(count, per, now) else {
             return Ok(());
         };
-        self.with(key, fresh, now, |b| b.spend(1, now))
+        self.with(key, fresh, now, |b| b.spend(cost, now))
     }
 
     /// Give back a post [`Self::reserve`] took for one that did not land.
     pub(crate) fn refund(&self, key: &PostKey, now: Instant) {
+        self.give_back(key, 1, now);
+    }
+
+    /// [`Self::refund`], of `cost` at once.
+    pub(crate) fn give_back(&self, key: &PostKey, cost: u32, now: Instant) {
         if let Some(b) = self.0.lock().unwrap().get_mut(key) {
-            b.refund(1, now);
+            b.refund(cost, now);
         }
     }
 
     /// Count one post of `key`'s, whether or not there was one left: a
     /// post that has landed has been made.
-    pub(crate) fn count(&self, key: PostKey, (count, per): (u32, Duration), now: Instant) {
+    pub(crate) fn count(&self, key: PostKey, rate: (u32, Duration), now: Instant) {
+        self.charge(key, 1, rate, now);
+    }
+
+    /// [`Self::count`], of `cost` at once.
+    pub(crate) fn charge(
+        &self,
+        key: PostKey,
+        cost: u32,
+        (count, per): (u32, Duration),
+        now: Instant,
+    ) {
         let Some(fresh) = RateBucket::new(count, per, now) else {
             return;
         };
-        self.with(key, fresh, now, |b| b.charge(1, now));
+        self.with(key, fresh, now, |b| b.charge(cost, now));
     }
 
     fn with<T>(

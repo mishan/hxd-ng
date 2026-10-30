@@ -7,12 +7,15 @@
 //! message becomes and which sessions are told are
 //! `hxd_core::messaging`'s. Only a session that negotiated capability
 //! bit 6 is answered here, or sent anything; every other is answered as
-//! before the family existed.
+//! before the family existed. Portable friendships
+//! (`docs/proposals/portable-friends.md`) are read from and told to a
+//! session that negotiated bit 15 alone, whose friendship acts the
+//! domain gates on the device it proved.
 
 use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::MessageGuid;
-use hxd_core::messaging::{RequestAction, RequestsListing};
+use hxd_core::messaging::{Fetched, PresentResult, Presented, RequestAction, RequestsListing};
 use hxd_core::relationships::Profile;
 use hxd_core::{
     ChatError, Core, Event, FoundUser, FriendEntry, MessagingError, MsgOutcome, Presence,
@@ -21,7 +24,7 @@ use hxd_core::{
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::messaging::{
     AckType, PresenceState, ReasonCode, RequestAction as WireAction, RosterState as WireState,
-    TypingState,
+    TypingState, HASH_LEN, MAX_FRIENDSHIP_LEN, MAX_FRIENDSHIP_OBJECTS, MAX_OFFER_LEN,
 };
 
 use crate::encoding::TextEncoding;
@@ -54,6 +57,8 @@ const HANDLED: &[ClientHdr] = &[
     ClientHdr::GetMessageRequests,
     ClientHdr::AnswerMessageRequest,
     ClientHdr::ClearMessageRequests,
+    ClientHdr::PresentFriendships,
+    ClientHdr::GetFriendships,
 ];
 
 fn handled(ty: u32) -> Option<ClientHdr> {
@@ -63,6 +68,11 @@ fn handled(ty: u32) -> Option<ClientHdr> {
 /// Is `ty` a transaction of the family this wire answers?
 pub(crate) fn handles(ty: u32) -> bool {
     handled(ty).is_some()
+}
+
+/// Is `ty` one answered only for a session that negotiated bit 15?
+pub(crate) fn friendships_only(ty: u32) -> bool {
+    ty == ClientHdr::PresentFriendships.as_u32() || ty == ClientHdr::GetFriendships.as_u32()
 }
 
 /// Whether `ty` has a reply: IM Typing (813) is a notification both ways.
@@ -85,9 +95,12 @@ pub(crate) fn answers(ty: u32) -> bool {
 /// names a Login as Find User does, and so does a block or an unblock,
 /// answered alike whether or not the Login exists but looked up all the
 /// same, so they cost as much, as the requests draft counts a send
-/// toward Find User's rate.
+/// toward Find User's rate. Present Friendships and Get Friendships cost
+/// none: they are paced by their own rate (`Core::friendships_spend`),
+/// never kicked for (`docs/proposals/portable-friends.md` §4.3).
 pub(crate) fn price(ty: u32) -> Option<u32> {
     let points = match handled(ty)? {
+        ClientHdr::PresentFriendships | ClientHdr::GetFriendships => 0,
         ClientHdr::GetRoster => 20,
         ClientHdr::GetMessageRequests => 10,
         ClientHdr::AddFriend => 8,
@@ -131,22 +144,38 @@ pub(crate) fn limits(core: &Core, enc: TextEncoding) -> Chunks {
     .collect()
 }
 
+/// Who a request names: an account by Login, or, on a session that
+/// negotiated bit 15, by the fingerprint it links.
+pub(crate) enum Named {
+    Login(String),
+    Key([u8; 32]),
+}
+
+/// What Remove Friend (803) carries beside whom it names.
+pub(crate) enum Removal {
+    Plain,
+    Withdraw(Vec<u8>),
+    CancelOffer(Vec<u8>),
+}
+
 /// A request of the family, parsed.
 pub(crate) enum Op {
     Roster,
-    Add(String, Option<String>),
-    Remove(String),
-    Respond(String, bool),
-    Block(String, bool),
+    Add(String, Option<String>, Option<Vec<u8>>),
+    Remove(Named, Removal),
+    Respond(String, bool, Option<Vec<u8>>),
+    Block(String, bool, Option<Vec<u8>>),
     Presence(PresenceUpdate),
     Send(String, MessageGuid, String),
     Ack(String, MessageGuid, bool),
     Typing(String, bool),
-    Find(String, bool),
+    Find(Named, bool),
     Alias(String, Option<String>),
     Requests(usize),
     Answer(String, RequestAction),
     Clear(Option<SystemTime>, Option<SystemTime>),
+    Present(Vec<Vec<u8>>, Vec<Vec<u8>>),
+    Fetch(Vec<[u8; 32]>, Vec<[u8; 32]>),
 }
 
 /// What a request is answered.
@@ -181,9 +210,28 @@ impl Answer {
 
 const MALFORMED: &str = "Malformed request.";
 
-/// Read `f`, a transaction [`handles`] says is the family's.
-pub(crate) fn parse(f: &Frame, enc: TextEncoding) -> Result<Op, &'static str> {
+/// Read `f`, a transaction [`handles`] says is the family's, with what
+/// only bit 15 adds read where `friendships` says the session negotiated
+/// it, and ignored, as any field unknown to the extension is, where not.
+pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<Op, &'static str> {
     let field = |t: u16| f.chunks().find(|c| c.tag == t).map(|c| c.data.to_vec());
+    // A friendship object, within its field's bound.
+    let object = |t: u16, max: usize| {
+        field(t)
+            .filter(|_| friendships)
+            .map(|o| {
+                (!o.is_empty() && o.len() <= max)
+                    .then_some(o)
+                    .ok_or(MALFORMED)
+            })
+            .transpose()
+    };
+    let key = || -> Result<Option<[u8; 32]>, &'static str> {
+        field(tag::FRIEND_IDENTITY)
+            .filter(|_| friendships)
+            .map(|k| <[u8; 32]>::try_from(k.as_slice()).map_err(|_| MALFORMED))
+            .transpose()
+    };
     let uint = |t: u16| f.chunks().find(|c| c.tag == t).map(|c| c.as_uint());
     let login = || {
         field(tag::FRIEND_LOGIN)
@@ -219,15 +267,37 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding) -> Result<Op, &'static str> {
                 cut(&mut n, NOTE_MAX_BYTES);
                 n
             });
-            Op::Add(login()?, note)
+            Op::Add(login()?, note, object(tag::FRIEND_OFFER, MAX_OFFER_LEN)?)
         }
-        ClientHdr::RemoveFriend => Op::Remove(login()?),
-        ClientHdr::FriendResponse => Op::Respond(
-            login()?,
-            uint(tag::ROSTER_STATE) == Some(WireState::Accepted.wire().into()),
-        ),
-        ClientHdr::BlockUser => Op::Block(login()?, true),
-        ClientHdr::UnblockUser => Op::Block(login()?, false),
+        ClientHdr::RemoveFriend => {
+            let removal = match (
+                object(tag::FRIEND_WITHDRAW, MAX_OFFER_LEN)?,
+                object(tag::FRIEND_OFFER, MAX_OFFER_LEN)?,
+            ) {
+                (None, None) => Removal::Plain,
+                (Some(w), None) => Removal::Withdraw(w),
+                (None, Some(o)) => Removal::CancelOffer(o),
+                (Some(_), Some(_)) => return Err(MALFORMED),
+            };
+            let named = match (field(tag::FRIEND_LOGIN), key()?) {
+                (Some(_), Some(_)) => return Err(MALFORMED),
+                (None, Some(k)) if !matches!(removal, Removal::CancelOffer(_)) => Named::Key(k),
+                _ => Named::Login(login()?),
+            };
+            Op::Remove(named, removal)
+        }
+        ClientHdr::FriendResponse => {
+            let accept = uint(tag::ROSTER_STATE) == Some(WireState::Accepted.wire().into());
+            let friendship = object(tag::FRIENDSHIP, MAX_FRIENDSHIP_LEN)?;
+            if friendship.is_some() && !accept {
+                return Err(MALFORMED);
+            }
+            Op::Respond(login()?, accept, friendship)
+        }
+        ClientHdr::BlockUser => {
+            Op::Block(login()?, true, object(tag::FRIEND_WITHDRAW, MAX_OFFER_LEN)?)
+        }
+        ClientHdr::UnblockUser => Op::Block(login()?, false, None),
         ClientHdr::SetPresence => {
             let state = match uint(tag::PRESENCE_STATE)
                 .and_then(|v| PresenceState::from_wire(u16::try_from(v).ok()?))
@@ -273,8 +343,12 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding) -> Result<Op, &'static str> {
             login()?,
             uint(tag::TYPING_STATE) == Some(TypingState::Started.wire().into()),
         ),
-        ClientHdr::FindUser => Op::Find(login()?, false),
-        ClientHdr::GetProfile => Op::Find(login()?, true),
+        ClientHdr::FindUser => match (field(tag::FRIEND_LOGIN), key()?) {
+            (None, Some(k)) => Op::Find(Named::Key(k), false),
+            (Some(_), Some(_)) => return Err(MALFORMED),
+            _ => Op::Find(Named::Login(login()?), false),
+        },
+        ClientHdr::GetProfile => Op::Find(Named::Login(login()?), true),
         ClientHdr::SetFriendNickname => {
             let alias = field(tag::FRIEND_NICKNAME).ok_or(MALFORMED)?;
             let alias = enc.decode_chars(&alias, ALIAS_MAX_CHARS);
@@ -301,33 +375,110 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding) -> Result<Op, &'static str> {
             Op::Answer(login()?, action)
         }
         ClientHdr::ClearMessageRequests => Op::Clear(at(tag::SPAN_SINCE)?, at(tag::SPAN_BEFORE)?),
+        ClientHdr::PresentFriendships => {
+            let (mut withdrawals, mut presented) = (Vec::new(), Vec::new());
+            for c in f.chunks() {
+                let (to, max) = match c.tag {
+                    tag::FRIEND_WITHDRAW => (&mut withdrawals, MAX_OFFER_LEN),
+                    tag::FRIENDSHIP => (&mut presented, MAX_FRIENDSHIP_LEN),
+                    _ => continue,
+                };
+                if c.data.is_empty() || c.data.len() > max {
+                    return Err(MALFORMED);
+                }
+                to.push(c.data.to_vec());
+            }
+            Op::Present(withdrawals, presented)
+        }
+        ClientHdr::GetFriendships => {
+            let (mut hashes, mut keys) = (Vec::new(), Vec::new());
+            for c in f.chunks() {
+                let to = match c.tag {
+                    tag::FRIENDSHIP_HASH => &mut hashes,
+                    tag::FRIEND_IDENTITY => &mut keys,
+                    _ => continue,
+                };
+                to.push(<[u8; HASH_LEN]>::try_from(c.data).map_err(|_| MALFORMED)?);
+            }
+            Op::Fetch(hashes, keys)
+        }
         _ => return Err(MALFORMED),
     })
 }
 
 /// Answer one request, off the reactor: each is a store read or write.
-pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, op: Op) -> Answer {
+/// `friendships` is whether the session negotiated bit 15.
+pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, op: Op) -> Answer {
     let done = |r: Result<(), MessagingError>| match r {
         Ok(()) => Answer::ok(vec![reason_chunk(ReasonCode::Ok)]),
         Err(e) => refusal(e),
     };
+    let state = |r: Result<RosterState, MessagingError>| match r {
+        Ok(state) => Answer::ok(vec![
+            reason_chunk(ReasonCode::Ok),
+            (tag::ROSTER_STATE, u16_bytes(roster_state(state).wire())),
+        ]),
+        Err(e) => refusal(e),
+    };
+    if let Some((base, per_object)) = weight(&op) {
+        let objects = match &op {
+            Op::Present(w, f) => w.len() + f.len(),
+            Op::Fetch(h, k) => h.len() + k.len(),
+            _ => 1,
+        };
+        if objects > MAX_FRIENDSHIP_OBJECTS {
+            return refusal(MessagingError::TooMany);
+        }
+        // The objects are charged only to a session the domain's gate
+        // would let act, so that one that proved no device spends none of
+        // its account's or its address's rate on what is refused; the
+        // request's own weight, always.
+        let may_act = core
+            .user(uid)
+            .is_some_and(|u| u.transport.friendships && u.transport.identity.is_some());
+        let weight = base + if may_act { per_object } else { 0 };
+        // A removal or a block is never held up by pacing (§4.3): its
+        // withdrawal is charged, and taken, whatever is left.
+        let removes = matches!(op, Op::Remove(..) | Op::Block(..));
+        if removes {
+            core.friendships_charge(uid, weight);
+        } else if weight > 0 && core.friendships_spend(uid, weight).is_err() {
+            return refusal(MessagingError::RateLimited);
+        }
+    }
     match op {
         Op::Roster => match core.friends_roster(uid) {
             Ok(rows) => {
                 // As many entries as fit a frame, and the rest as Roster
                 // Entries after it, which the extension allows.
-                let mut entries: Vec<Chunks> = rows.iter().map(|e| entry_chunks(e, enc)).collect();
+                let mut entries: Vec<Chunks> = rows
+                    .iter()
+                    .map(|e| entry_chunks(e, enc, friendships))
+                    .collect();
                 let (listed, _) = page(&entries, 0, PAGE_BUDGET);
                 let rest = entries.split_off(listed);
                 let mut then: Vec<(u32, Chunks)> = rest
                     .into_iter()
                     .map(|c| (ServerHdr::RosterEntry.as_u32(), c))
                     .collect();
-                // A request waiting is told as its Friend Request too.
+                // A request waiting is told as its Friend Request too, and
+                // so is an upgrade offer waiting on a friend, which an entry
+                // has no field for.
                 then.extend(
                     rows.iter()
-                        .filter(|e| e.state == RosterState::PendingIn)
-                        .map(|e| request_frame(&e.login, e.note.as_deref(), enc)),
+                        .filter(|e| {
+                            e.state == RosterState::PendingIn
+                                || (e.state == RosterState::Accepted && e.offer.is_some())
+                        })
+                        .map(|e| {
+                            let request = Request {
+                                login: &e.login,
+                                fingerprint: e.fingerprint.as_ref(),
+                                note: e.note.as_deref(),
+                                offer: e.offer.as_deref(),
+                            };
+                            request.frame(enc, friendships)
+                        }),
                 );
                 Answer::Reply {
                     chunks: entries.into_iter().flatten().collect(),
@@ -336,25 +487,41 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, op: Op) -> Answer {
             }
             Err(e) => refusal(e),
         },
-        Op::Add(login, note) => match core.friend_add(uid, &login, note) {
-            Ok(state) => Answer::ok(vec![
-                reason_chunk(ReasonCode::Ok),
-                (tag::ROSTER_STATE, u16_bytes(roster_state(state).wire())),
-            ]),
-            Err(e) => refusal(e),
-        },
-        Op::Remove(login) => done(core.friend_remove(uid, &login)),
-        Op::Respond(login, accept) => done(core.friend_respond(uid, &login, accept).map(|_| ())),
-        Op::Block(login, on) => match core.inbox_block(uid, &login, on) {
-            // A Login nobody holds is answered as any other, so that a
-            // block never confirms that a Login exists.
-            Ok(()) | Err(ChatError::NoSuchUser) => Answer::ok(vec![reason_chunk(ReasonCode::Ok)]),
-            Err(ChatError::NoInbox) => Answer::Refused {
-                text: "This account has no inbox.",
-                reason: None,
-            },
-            Err(_) => refusal(MessagingError::ServerError),
-        },
+        Op::Add(login, note, offer) => state(core.friend_ask(uid, &login, note, offer)),
+        Op::Remove(Named::Key(fp), removal) => {
+            let withdraw = match removal {
+                Removal::Withdraw(w) => Some(w),
+                _ => None,
+            };
+            done(core.friend_remove_by_key(uid, &fp, withdraw))
+        }
+        Op::Remove(Named::Login(login), Removal::Plain) => done(core.friend_remove(uid, &login)),
+        Op::Remove(Named::Login(login), Removal::Withdraw(w)) => {
+            done(core.friend_unfriend(uid, &login, Some(w)))
+        }
+        Op::Remove(Named::Login(login), Removal::CancelOffer(o)) => {
+            done(core.friend_cancel_offer(uid, &login, &o))
+        }
+        Op::Respond(login, accept, friendship) => done(
+            core.friend_answer(uid, &login, accept, friendship)
+                .map(|_| ()),
+        ),
+        // The block stands whatever becomes of the withdrawal before it,
+        // whose refusal is the answer, for the client to sign afresh for
+        // its other servers (§4.3).
+        Op::Block(login, on, withdraw) => {
+            let taken = withdraw.map_or(Ok(()), |w| core.block_withdrawing(uid, &login, w));
+            match core.inbox_block(uid, &login, on) {
+                // A Login nobody holds is answered as any other, so that a
+                // block never confirms that a Login exists.
+                Ok(()) | Err(ChatError::NoSuchUser) => done(taken),
+                Err(ChatError::NoInbox) => Answer::Refused {
+                    text: "This account has no inbox.",
+                    reason: None,
+                },
+                Err(_) => refusal(MessagingError::ServerError),
+            }
+        }
         Op::Presence(update) => done(core.set_presence(uid, update)),
         Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid)) {
             Ok(outcome) => {
@@ -373,11 +540,11 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, op: Op) -> Answer {
             let _ = core.im_typing(uid, &login, typing);
             Answer::Silent
         }
-        Op::Find(login, profile) => {
-            let found = if profile {
-                core.messaging_user_info(uid, &login)
-            } else {
-                core.find_user(uid, &login)
+        Op::Find(named, profile) => {
+            let found = match named {
+                Named::Login(login) if profile => core.messaging_user_info(uid, &login),
+                Named::Login(login) => core.find_user(uid, &login),
+                Named::Key(fp) => core.find_user_by_key(uid, &fp, profile),
             };
             match found {
                 Ok(u) => Answer::ok(found_chunks(&u, profile, enc)),
@@ -404,7 +571,86 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, op: Op) -> Answer {
             ]),
             Err(e) => refusal(e),
         },
+        Op::Present(withdrawals, presented) => {
+            match core.friendships_present(uid, withdrawals, presented) {
+                Ok((taken, presented)) => Answer::ok(
+                    taken
+                        .iter()
+                        .chain(&presented)
+                        .flat_map(outcome_chunks)
+                        .collect(),
+                ),
+                Err(e) => refusal(e),
+            }
+        }
+        Op::Fetch(hashes, keys) => match core.friendships_fetch(uid, &hashes, &keys) {
+            Ok(f) => Answer::ok(fetched_chunks(&f)),
+            Err(e) => refusal(e),
+        },
     }
+}
+
+/// What a request carrying friendship objects weighs against
+/// `Core::friendships_spend`, as the ng wire's request limit weighs it
+/// (`docs/hotline-ng.md` §7.5): each object the signatures it is checked
+/// with, and Present Friendships and Get Friendships their own requests'
+/// weights besides, which the classic wire's spam points do not price:
+/// the request's own weight, and its objects'.
+fn weight(op: &Op) -> Option<(u32, u32)> {
+    let n = |len: usize| u32::try_from(len).unwrap_or(u32::MAX);
+    match op {
+        Op::Add(_, _, Some(_))
+        | Op::Remove(_, Removal::Withdraw(_) | Removal::CancelOffer(_))
+        | Op::Block(_, true, Some(_)) => Some((0, 2)),
+        Op::Respond(_, _, Some(_)) => Some((0, 4)),
+        Op::Present(w, f) => Some((1, 4 * n(w.len() + f.len()))),
+        Op::Fetch(h, k) => Some((4, n(h.len() + k.len()))),
+        _ => None,
+    }
+}
+
+/// One group of a Present Friendships (833) reply: the object's hash, its
+/// reason code, and for `Withdrawn` the withdrawal where there is one.
+fn outcome_chunks(r: &PresentResult) -> Chunks {
+    let (reason, withdraw) = match &r.outcome {
+        Presented::Ok => (ReasonCode::Ok, None),
+        Presented::AccountNotFound => (ReasonCode::AccountNotFound, None),
+        Presented::RosterFull => (ReasonCode::RosterFull, None),
+        Presented::BadSignature => (ReasonCode::BadSignature, None),
+        Presented::Withdrawn(w) => (ReasonCode::Withdrawn, w.as_ref()),
+        Presented::Stale => (ReasonCode::Stale, None),
+    };
+    let mut c = vec![
+        (tag::FRIENDSHIP_HASH, r.hash.to_vec()),
+        reason_chunk(reason),
+    ];
+    if let Some(w) = withdraw {
+        c.push((tag::FRIEND_WITHDRAW, w.clone()));
+    }
+    c
+}
+
+/// A Get Friendships (834) reply: a group for each hash, with its
+/// friendship where the caller may have it, and for each fingerprint,
+/// with its rotation records in chain order; as many groups as fit a
+/// frame, the questions after them left unanswered for the client to
+/// ask again.
+fn fetched_chunks(f: &Fetched) -> Chunks {
+    let mut groups: Vec<Chunks> = Vec::new();
+    for (hash, friendship) in &f.friendships {
+        let mut c = vec![(tag::FRIENDSHIP_HASH, hash.to_vec())];
+        if let Some(b) = friendship {
+            c.push((tag::FRIENDSHIP, b.clone()));
+        }
+        groups.push(c);
+    }
+    for (fp, records) in &f.rotations {
+        let mut c = vec![(tag::FRIEND_IDENTITY, fp.to_vec())];
+        c.extend(records.iter().map(|r| (tag::IDENTITY_ROTATION, r.clone())));
+        groups.push(c);
+    }
+    let (end, _) = page(&groups, 0, PAGE_BUDGET);
+    groups.into_iter().take(end).flatten().collect()
 }
 
 /// A refusal by the extension's reason codes, and the requests draft's
@@ -444,15 +690,29 @@ fn refusal(e: MessagingError) -> Answer {
             Some(ReasonCode::QueueFull),
         ),
         MessagingError::NoSuchRequest => ("No such request.", Some(ReasonCode::AccountNotFound)),
-        // Signed messages and portable friendships are not negotiated on
-        // this wire, so none of these can be asked for here.
+        // A friendship act from a session that proved no device of the
+        // account's identity: the extension has no code for it.
+        MessagingError::NotDeviceProved => (
+            "This session has not proved a device that may make friendships.",
+            None,
+        ),
+        MessagingError::BadSignature => (
+            "That friendship object does not verify, or is not this session's own.",
+            Some(ReasonCode::BadSignature),
+        ),
+        MessagingError::Withdrawn => (
+            "A withdrawal held here ends it. Sign again in ten minutes.",
+            Some(ReasonCode::Withdrawn),
+        ),
+        MessagingError::Stale => (
+            "Its time is not within ten minutes of the server's clock.",
+            Some(ReasonCode::Stale),
+        ),
+        MessagingError::TooMany => ("At most 32 objects, and one withdrawal for a pair.", None),
+        // Signed messages are not negotiated on this wire, so neither of
+        // these can be asked for here.
         MessagingError::SignedElsewhere
         | MessagingError::Equivocation
-        | MessagingError::NotDeviceProved
-        | MessagingError::BadSignature
-        | MessagingError::Withdrawn
-        | MessagingError::Stale
-        | MessagingError::TooMany
         | MessagingError::ServerError => ("Server error.", None),
     };
     Answer::Refused { text, reason }
@@ -460,10 +720,24 @@ fn refusal(e: MessagingError) -> Answer {
 
 /// The notification a domain event is on this wire, for one of the
 /// family's.
-pub(crate) fn event(ev: &Event, enc: TextEncoding) -> Option<(u32, Chunks)> {
+pub(crate) fn event(ev: &Event, enc: TextEncoding, friendships: bool) -> Option<(u32, Chunks)> {
     Some(match ev {
-        Event::FriendEntry(e) => (ServerHdr::RosterEntry.as_u32(), entry_chunks(e, enc)),
-        Event::FriendRequest { login, note, .. } => request_frame(login, note.as_deref(), enc),
+        Event::FriendEntry(e) => (
+            ServerHdr::RosterEntry.as_u32(),
+            entry_chunks(e, enc, friendships),
+        ),
+        Event::FriendRequest {
+            login,
+            fingerprint,
+            note,
+            offer,
+        } => Request {
+            login,
+            fingerprint: fingerprint.as_ref(),
+            note: note.as_deref(),
+            offer: offer.as_deref(),
+        }
+        .frame(enc, friendships),
         Event::Presence {
             login,
             state,
@@ -536,13 +810,28 @@ pub(crate) fn event(ev: &Event, enc: TextEncoding) -> Option<(u32, Chunks)> {
 /// One roster entry, whole, as Get Roster (800) lists it and a Roster
 /// Entry (801) carries it: one routine for both, so the two are the same
 /// bytes, as the extension asks. A friend's presence only while it is
-/// shown, and its status text whenever it keeps one.
-fn entry_chunks(e: &FriendEntry, enc: TextEncoding) -> Chunks {
+/// shown, and its status text whenever it keeps one. What the domain
+/// fills in for a session that negotiated bit 15 alone, a friend's hashes
+/// and the withdrawal that removed one, wherever it is there, and to
+/// such a session the fingerprint the account links.
+fn entry_chunks(e: &FriendEntry, enc: TextEncoding, friendships: bool) -> Chunks {
     let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(&e.login))];
     if e.state == RosterState::Removed {
         c.push((tag::ROSTER_STATE, u16_bytes(WireState::Removed.wire())));
+        if let Some(w) = &e.withdraw {
+            c.push((tag::FRIEND_WITHDRAW, w.clone()));
+        }
         return c;
     }
+    if let Some(fp) = e.fingerprint.filter(|_| friendships) {
+        c.push((tag::FRIEND_IDENTITY, fp.to_vec()));
+    }
+    c.extend(
+        e.friendships
+            .iter()
+            .take(2)
+            .map(|h| (tag::FRIENDSHIP_HASH, h.to_vec())),
+    );
     if let Some(alias) = &e.alias {
         c.push((tag::FRIEND_NICKNAME, enc.encode(alias)));
     }
@@ -561,16 +850,36 @@ fn entry_chunks(e: &FriendEntry, enc: TextEncoding) -> Chunks {
     c
 }
 
-fn request_frame(login: &str, note: Option<&str>, enc: TextEncoding) -> (u32, Chunks) {
-    let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(login))];
-    if let Some(n) = note {
-        c.push((tag::REQUEST_NOTE, enc.body(n)));
+/// A Friend Request (804): a request waiting, or an upgrade offer.
+struct Request<'a> {
+    login: &'a str,
+    fingerprint: Option<&'a [u8; 32]>,
+    note: Option<&'a str>,
+    offer: Option<&'a [u8]>,
+}
+
+impl Request<'_> {
+    /// With the sender's fingerprint to a session that negotiated bit
+    /// 15, and its offer, which the domain sends no other.
+    fn frame(&self, enc: TextEncoding, friendships: bool) -> (u32, Chunks) {
+        let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(self.login))];
+        if let Some(n) = self.note {
+            c.push((tag::REQUEST_NOTE, enc.body(n)));
+        }
+        if let Some(fp) = self.fingerprint.filter(|_| friendships) {
+            c.push((tag::FRIEND_IDENTITY, fp.to_vec()));
+        }
+        if let Some(o) = self.offer {
+            c.push((tag::FRIEND_OFFER, o.to_vec()));
+        }
+        (ServerHdr::FriendRequest.as_u32(), c)
     }
-    (ServerHdr::FriendRequest.as_u32(), c)
 }
 
 /// Find User (822) and Get User Info (825): the public card, and for 825
-/// the profile where the caller may read it or `NotFriends` where not.
+/// the profile where the caller may read it or `NotFriends` where not;
+/// and the fingerprint the account links, which the domain fills in for
+/// a session that negotiated bit 15 alone.
 fn found_chunks(u: &FoundUser, profile: bool, enc: TextEncoding) -> Chunks {
     let shown = u.profile.as_ref().filter(|_| profile);
     let reason = if profile && shown.is_none() {
@@ -583,6 +892,9 @@ fn found_chunks(u: &FoundUser, profile: bool, enc: TextEncoding) -> Chunks {
         (tag::FRIEND_LOGIN, enc.encode(&u.login)),
         (tag::NAME, enc.encode(&u.name)),
     ];
+    if let Some(fp) = &u.fingerprint {
+        c.push((tag::FRIEND_IDENTITY, fp.to_vec()));
+    }
     if let Some(p) = shown {
         c.extend(profile_chunks(p, enc));
     }
@@ -840,7 +1152,7 @@ mod tests {
             ),
         ];
         for (e, want) in cases {
-            let m = message(&entry_chunks(&e, TextEncoding::MacRoman));
+            let m = message(&entry_chunks(&e, TextEncoding::MacRoman, false));
             let got = parse_entry(&m, m.len()).unwrap();
             assert_eq!(got.login, b"bob");
             assert_eq!(
@@ -850,6 +1162,22 @@ mod tests {
                 e.state
             );
         }
+    }
+
+    #[test]
+    fn get_friendships_answers_what_fits_a_frame() {
+        let records = vec![vec![7u8; 512]; 16];
+        let fetched = Fetched {
+            friendships: vec![([1; 32], Some(vec![2; 2080]))],
+            rotations: (0..32u8).map(|n| ([n; 32], records.clone())).collect(),
+        };
+        let m = message(&fetched_chunks(&fetched));
+        assert!(m.len() <= MAX_FRAME_DATA as usize + hxproto::HL_HDR_LEN);
+        let answered = hxproto::messaging::parse_friendships(&m, m.len())
+            .unwrap()
+            .answers()
+            .count();
+        assert!((2..33).contains(&answered), "{answered} of 33, in order");
     }
 
     #[test]

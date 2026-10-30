@@ -772,13 +772,35 @@ impl Core {
         // runs, and dropped by it, or refused after.
         let _writing = self.friend_writes();
         let (me, device) = self.device_act(uid)?;
-        // One the caller may not name has no friendship here to withdraw,
-        // and the block that follows answers for it as a plain one does,
-        // so that the withdrawal tells nothing of a blocker.
+        // What can be said of the withdrawal alone is said before anyone
+        // is looked up, so that its answer is the same whoever it names.
+        let now = self.clock.unix();
+        let kept = Withdrawal::parse(&withdraw, now).map_err(|r| match r.error {
+            IdError::ClockSkew => MessagingError::Stale,
+            _ => MessagingError::BadSignature,
+        })?;
+        let w = kept.withdrawal();
+        own(&device, &me.mailbox, &w.from, &w.cert)?;
+        fresh(w.time, now)?;
+        // One the caller may not name, one linking no identity, and one
+        // whose pair it does not name have no friendship here to withdraw,
+        // and the block that follows answers for them as a plain one does,
+        // so that the withdrawal tells nothing of a blocker or of a Login.
         let Ok(them) = self.other(&me, login) else {
             return Ok(());
         };
         let store = self.friends_store()?;
+        let (Some(mine), Some(theirs)) = (me.mailbox.fingerprint, them.fingerprint) else {
+            return Ok(());
+        };
+        let named = w.pair;
+        if !self
+            .pairs_between(store, &mine, &theirs)?
+            .iter()
+            .any(|p| p.hash() == named)
+        {
+            return Ok(());
+        }
         self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw)
             .map(|_| ())
     }
