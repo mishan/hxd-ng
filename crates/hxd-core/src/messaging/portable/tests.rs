@@ -829,3 +829,40 @@ fn a_blocks_withdrawal_tells_nothing_of_a_blocker() {
     assert_eq!(s.core.block_withdrawing(a, "bob", w.clone()), Ok(()));
     assert_eq!(s.core.block_withdrawing(a, "nobody", w), Ok(()));
 }
+
+#[test]
+fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let device = Fingerprint::of(&alice.devices[0].0.public()).0;
+    let core = s.core.clone();
+    let present = {
+        // Held as a cleanup or another act would hold it, so the act
+        // waits with its authorization not yet asked for.
+        let writing = s.core.friend_writes();
+        let presenting =
+            std::thread::spawn(move || core.friendships_present(a, vec![], vec![f]).map(|_| ()));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let core = s.core.clone();
+        let revoking = std::thread::spawn(move || {
+            core.set_revocations(Revocations {
+                devices: [device].into(),
+                ..Default::default()
+            })
+        });
+        while !s.core.is_revoked(&fp(&alice), &device) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(writing);
+        revoking.join().unwrap();
+        presenting.join().unwrap()
+    };
+    assert_eq!(present, Err(MessagingError::NotDeviceProved));
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none());
+}

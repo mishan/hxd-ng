@@ -950,6 +950,10 @@ impl Core {
         note: Option<String>,
         offer: Option<Vec<u8>>,
     ) -> Result<RosterState, MessagingError> {
+        // The gate is asked under the lock a revocation's or an unlink's
+        // cleanup takes, so what it admits is recorded before that cleanup
+        // runs, and dropped by it, or refused after.
+        let _writing = self.friend_writes();
         let (me, device) = match offer {
             Some(_) => self.device_act(uid).map(|(me, d)| (me, Some(d)))?,
             None => (self.messenger(uid)?, None),
@@ -961,7 +965,6 @@ impl Core {
             return Err(MessagingError::MessageTooLong);
         }
         let now = self.clock.wall();
-        let _writing = self.friend_writes();
         // Again under the lock a block's cleanup takes, so a block made
         // since `other` looked is seen here or ends what this writes.
         if store.is_blocked(&them, &me.mailbox).map_err(store_failed)? {
@@ -1090,6 +1093,10 @@ impl Core {
         accept: bool,
         friendship: Option<Vec<u8>>,
     ) -> Result<RosterState, MessagingError> {
+        // The gate is asked under the lock a revocation's or an unlink's
+        // cleanup takes, so what it admits is recorded before that cleanup
+        // runs, and dropped by it, or refused after.
+        let _writing = self.friend_writes();
         let (me, device) = match friendship {
             Some(_) if accept => self.device_act(uid).map(|(me, d)| (me, Some(d)))?,
             _ => (self.messenger(uid)?, None),
@@ -1097,7 +1104,6 @@ impl Core {
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
         let now = self.clock.wall();
-        let _writing = self.friend_writes();
         let asked = store
             .relationship(&them, &me.mailbox, now)
             .map_err(store_failed)?
@@ -1163,6 +1169,10 @@ impl Core {
         login: &str,
         withdraw: Option<Vec<u8>>,
     ) -> Result<(), MessagingError> {
+        // The gate is asked under the lock a revocation's or an unlink's
+        // cleanup takes, so what it admits is recorded before that cleanup
+        // runs, and dropped by it, or refused after.
+        let _writing = self.friend_writes();
         let me = self.messenger(uid)?;
         let device = withdraw
             .as_ref()
@@ -1171,7 +1181,6 @@ impl Core {
         let store = self.friends_store()?;
         let now = self.clock.wall();
         let p = self.messaging_policy;
-        let _writing = self.friend_writes();
         let mine = store
             .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?;

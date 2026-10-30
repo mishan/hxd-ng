@@ -767,6 +767,10 @@ impl Core {
         login: &str,
         withdraw: Vec<u8>,
     ) -> Result<(), MessagingError> {
+        // The gate is asked under the lock a revocation's or an unlink's
+        // cleanup takes, so what it admits is recorded before that cleanup
+        // runs, and dropped by it, or refused after.
+        let _writing = self.friend_writes();
         let (me, device) = self.device_act(uid)?;
         // One the caller may not name has no friendship here to withdraw,
         // and the block that follows answers for it as a plain one does,
@@ -775,7 +779,6 @@ impl Core {
             return Ok(());
         };
         let store = self.friends_store()?;
-        let _writing = self.friend_writes();
         self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw)
             .map(|_| ())
     }
@@ -788,12 +791,7 @@ impl Core {
         withdrawals: Vec<Vec<u8>>,
         friendships: Vec<Vec<u8>>,
     ) -> Result<(Vec<PresentResult>, Vec<PresentResult>), MessagingError> {
-        let (me, device) = self.device_act(uid)?;
         let store = self.friends_store()?;
-        let mine = me
-            .mailbox
-            .fingerprint
-            .ok_or(MessagingError::NotDeviceProved)?;
         if withdrawals.len() + friendships.len() > MAX_OBJECTS {
             return Err(MessagingError::TooMany);
         }
@@ -810,7 +808,15 @@ impl Core {
         if pairs.len() != named {
             return Err(MessagingError::TooMany);
         }
+        // The gate is asked under the lock a revocation's or an unlink's
+        // cleanup takes, so what it admits is recorded before that cleanup
+        // runs, and dropped by it, or refused after.
         let _writing = self.friend_writes();
+        let (me, device) = self.device_act(uid)?;
+        let mine = me
+            .mailbox
+            .fingerprint
+            .ok_or(MessagingError::NotDeviceProved)?;
         let taken = withdrawals
             .into_iter()
             .map(|b| self.present_withdrawal(store, &me.mailbox, &device, b))
