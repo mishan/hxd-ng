@@ -567,8 +567,11 @@ pub(crate) fn enqueue(tx: &Tx, out: Outbound) {
     }
     if tx.out.send(out).is_err() {
         b.share.give(len);
-        // The writer is gone, and with it the next publish.
+        // The writer is gone, and with it the next publish. Gone with the
+        // socket still open, a panic, say, it would leave the session
+        // listed and deaf: lagging ends it, as a writer that stalls does.
         b.publish(1, len as i64);
+        b.lag();
     }
 }
 

@@ -65,6 +65,11 @@ enum Stop {
 
 pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
     let (generation, mut closed) = hub.register(&entry.name);
+    let _registered = Registered {
+        hub: hub.clone(),
+        peer: entry.name.clone(),
+        generation,
+    };
     let mut link = Link {
         hub: &hub,
         entry: &entry,
@@ -102,6 +107,30 @@ pub(crate) async fn run(hub: Hub, entry: PeerEntry, mut io: LinkIo) -> End {
     instrument::link_end(end.label);
     info!(peer = %entry.name, reason = end.label, "link ended");
     end
+}
+
+/// Unregisters a link whose task unwinds before it reaches
+/// `Hub::unregister`, which would leave the hub holding the link and
+/// every local roster its ghosts. As interrupted, so a reconnection
+/// within the grace keeps what it learned.
+struct Registered {
+    hub: Hub,
+    peer: String,
+    generation: u64,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // On a thread of its own: a panic during an unwind aborts the
+        // process, and the lock that panicked may be the hub's.
+        let (hub, peer, generation) = (self.hub.clone(), self.peer.clone(), self.generation);
+        let _ = std::thread::Builder::new()
+            .name("link-let-go".into())
+            .spawn(move || hub.unregister(&peer, generation, true));
+    }
 }
 
 struct Link<'a> {

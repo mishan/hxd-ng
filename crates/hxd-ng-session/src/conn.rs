@@ -848,9 +848,9 @@ async fn handle_login(
         let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
         return None;
     };
-    let held = ctx
-        .core
-        .hold(uid, &events, Some(ctx.cfg.max_detached_per_addr));
+    // Ended, not detached, until the client has its token: a session
+    // nobody can resume would only hold a detached place.
+    let held = ctx.core.hold(uid, &events, None);
     // Asked again now the session is on the roster: a ban placed since
     // the check above found no session to end. Ended here, before it is
     // announced or given a token.
@@ -1151,7 +1151,11 @@ async fn handle_login(
     Some((
         SessState {
             uid,
-            _held: held,
+            _held: {
+                drop(held);
+                ctx.core
+                    .hold(uid, &events, Some(ctx.cfg.max_detached_per_addr))
+            },
             session_id,
             access: account.access,
             device,

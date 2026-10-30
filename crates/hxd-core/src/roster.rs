@@ -3284,45 +3284,50 @@ mod tests {
         assert!(core.is_detached(uid));
     }
 
-    /// Whether `uid` is on the roster, once the guard's thread has had
-    /// its chance to let it go.
-    fn on_roster_after_unwind(core: &Core, uid: Uid) -> bool {
+    /// Until `cond` holds, or five seconds: the guard lets go on a
+    /// thread of its own.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let here = core.roster.lock().unwrap().users.contains_key(&uid);
-            if !here || Instant::now() >= deadline {
-                return here;
+        while !cond() {
+            if Instant::now() >= deadline {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        true
     }
 
-    /// Hold `uid`'s session through `events` on a thread that panics.
-    fn panic_holding(core: &Arc<Core>, uid: Uid, events: &Events, detach: Option<usize>) {
+    fn on_roster(core: &Core, uid: Uid) -> bool {
+        core.roster.lock().unwrap().users.contains_key(&uid)
+    }
+
+    /// Hold `uid`'s session through `events` in a tokio task that
+    /// panics across an await, as a frontend's connection task would.
+    async fn panic_holding(core: &Arc<Core>, uid: Uid, events: &Events, detach: Option<usize>) {
         let held = core.hold(uid, events, detach);
-        let unwound = std::thread::spawn(move || {
+        let unwound = tokio::spawn(async move {
             let _held = held;
+            tokio::task::yield_now().await;
             panic!("a frontend bug, mid-request");
         })
-        .join();
-        assert!(unwound.is_err());
+        .await;
+        assert!(unwound.unwrap_err().is_panic());
     }
 
     #[test]
     fn a_task_that_unwinds_holding_a_session_lets_it_go() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let core = Arc::new(Core::new());
         let (classic, classic_rx) = test_attach(&core, "classic", AccessBits::empty());
-        panic_holding(&core, classic, &classic_rx, None);
-        assert!(!on_roster_after_unwind(&core, classic), "ended");
+        rt.block_on(panic_holding(&core, classic, &classic_rx, None));
+        assert!(eventually(|| !on_roster(&core, classic)), "ended");
 
         let (ng, ng_rx) = ng_attach(&core, "ng", "10.0.0.1");
-        panic_holding(&core, ng, &ng_rx, Some(2));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !core.is_detached(ng) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        rt.block_on(panic_holding(&core, ng, &ng_rx, Some(2)));
         assert!(
-            core.is_detached(ng),
+            eventually(|| core.is_detached(ng)),
             "detached, as a dropped socket would be"
         );
     }
@@ -3331,21 +3336,18 @@ mod tests {
     fn a_held_session_is_let_go_only_by_an_unwind_and_only_by_its_connection() {
         let core = Arc::new(Core::new());
         let (uid, rx) = test_attach(&core, "fine", AccessBits::empty());
+        // Dropped outside an unwind, nothing is spawned to let it go.
         drop(core.hold(uid, &rx, None));
-        assert!(
-            core.roster.lock().unwrap().users.contains_key(&uid),
-            "an ordinary drop"
-        );
+        assert!(on_roster(&core, uid), "an ordinary drop");
 
         let (uid, old) = ng_attach(&core, "two-devices", "10.0.0.2");
         let _new = match core.resume(uid, 0) {
             Resume::Replayed(rx, _) | Resume::ResyncRequired(rx) => rx,
             Resume::Gone => panic!("the session is there"),
         };
-        panic_holding(&core, uid, &old, None);
-        std::thread::sleep(Duration::from_millis(100));
+        core.let_go(uid, &old.conn, None);
         assert!(
-            core.roster.lock().unwrap().users.contains_key(&uid) && !core.is_detached(uid),
+            on_roster(&core, uid) && !core.is_detached(uid),
             "the connection that took it over keeps it"
         );
     }
