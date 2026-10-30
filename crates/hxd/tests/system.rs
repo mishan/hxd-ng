@@ -74,6 +74,7 @@ async fn start_server(dir: &Path) -> (SocketAddr, SocketAddr, Arc<Core>) {
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

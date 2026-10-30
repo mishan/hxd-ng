@@ -1308,7 +1308,7 @@ async fn main() {
             ),
             None => None,
         };
-        let ctx = build_ctx(
+        let mut ctx = build_ctx(
             &config,
             voice.as_ref(),
             files.as_ref(),
@@ -1391,6 +1391,7 @@ async fn main() {
         let ng_ctx = tokio::task::block_in_place(|| {
             hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref(), push.as_ref())
         })?;
+        ctx.device_proof = hxd::device::prover(ng_ctx.as_ref());
 
         if let Some(files) = files.as_ref() {
             let section = config.files.as_ref().expect("Files service has config");

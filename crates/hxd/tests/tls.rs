@@ -110,6 +110,7 @@ async fn start(login_timeout: Duration) -> Running {
         }),
         files: Some(service.clone()),
         banner: None,
+        device_proof: None,
     };
 
     let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();

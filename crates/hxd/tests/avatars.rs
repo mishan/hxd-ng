@@ -72,6 +72,7 @@ async fn start(dir: &Path, avatars: Option<AvatarPolicy>) -> Server {
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

@@ -82,6 +82,7 @@ async fn start(shown: Shown<'_>) -> Running {
         }),
         files: None,
         banner: banner.clone(),
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

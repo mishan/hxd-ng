@@ -531,6 +531,7 @@ async fn run_service_with(service: Arc<FileService>, access: &str, core: Arc<Cor
         }),
         files: Some(service.clone()),
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

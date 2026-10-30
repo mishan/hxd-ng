@@ -252,6 +252,7 @@ async fn start_server_inner(
         }),
         files: None,
         banner,
+        device_proof: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

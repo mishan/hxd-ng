@@ -2,6 +2,8 @@
 
 Status: proposal. PF1 and PF2 (§8) are built: the objects in
 `hl-identity`, and the server and the ng wire (`hotline-ng.md` §7.5).
+Of PF3, device proof on the classic wire (§3) is built, on a server
+with an ng port; Present Friendships and Get Friendships are not.
 Builds on `instant-messaging.md`,
 hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)

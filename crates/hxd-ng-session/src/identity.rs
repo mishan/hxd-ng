@@ -107,6 +107,23 @@ pub struct IdentityConfig {
     /// Accept a `v = 1` login proof, which names no host and so can be
     /// relayed (`hotline-ng-auth.md` §6.2).
     pub login_proof_v1: bool,
+    /// The hosts the classic ports answer as, in `canonical_host` form,
+    /// each with the port it names, which that form leaves off for 80 and
+    /// 443: what Get Device Challenge signs for
+    /// (`docs/proposals/portable-friends.md` §3). Apart from `hosts`,
+    /// since these carry the classic ports.
+    pub classic_hosts: Vec<(String, u16)>,
+    /// Which classic sessions may prove a device.
+    pub classic_proof: ClassicProof,
+}
+
+/// `[identity] classic_proof`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassicProof {
+    Any,
+    /// Only a session `hotline-ng-auth.md` §8 counts encrypted: TLS, or
+    /// HOPE with a cipher.
+    Encrypted,
 }
 
 impl Default for IdentityConfig {
@@ -127,6 +144,8 @@ impl Default for IdentityConfig {
             newcomer_delay: 0,
             hosts: Vec::new(),
             login_proof_v1: false,
+            classic_hosts: Vec::new(),
+            classic_proof: ClassicProof::Any,
         }
     }
 }
@@ -289,6 +308,9 @@ pub enum AuthRefused {
     },
     /// The auth backend failed; logged, not shown.
     Backend,
+    /// A device proof's `time` is outside `clock_skew`, which the classic
+    /// wire tells apart so that the user can fix the clock.
+    ClockSkew,
 }
 
 impl AuthRefused {
@@ -296,7 +318,7 @@ impl AuthRefused {
         match self {
             AuthRefused::BadCard => "bad_card",
             AuthRefused::BadCert => "bad_cert",
-            AuthRefused::BadProof => "bad_proof",
+            AuthRefused::BadProof | AuthRefused::ClockSkew => "bad_proof",
             AuthRefused::Revoked => "revoked",
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
@@ -392,6 +414,17 @@ struct Tables {
     created: Vec<Instant>,
     /// When a `v = 1` login was last warned about.
     v1_warned: Option<Instant>,
+}
+
+/// What [`IdentityState::standing`] found of an identity.
+struct Standing {
+    fingerprint: Fingerprint,
+    /// The accepted attestation's handle, and its age.
+    handle: Option<String>,
+    age: u64,
+    /// Attested, and long enough ago.
+    attested: bool,
+    now: u64,
 }
 
 /// What association work `admit` is allowed to do.
@@ -566,6 +599,12 @@ fn hash(token: &[u8]) -> [u8; 32] {
     Sha256::digest(token).into()
 }
 
+/// The port `host[:port]` names, before `canonical_host` drops 80 and
+/// 443, or `None` where it names none.
+pub fn host_port(host: &str) -> Option<u16> {
+    host.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
 pub fn b64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -712,6 +751,150 @@ impl IdentityState {
         let expires = self.clock.unix() + TTL.as_secs();
         let next = self.handovers().next;
         hl_identity::ServerChallenge::sign(&self.key, challenge, host, expires, next.as_ref()).ok()
+    }
+
+    /// Get Device Challenge (`docs/proposals/portable-friends.md` §3):
+    /// `challenge` signed for `host`, under the TRTP domain, when it is one
+    /// of `classic_hosts` on `port`, the listener the request arrived on,
+    /// so that a challenge for the TLS port is never signed on the plain
+    /// one. The port is read from `host` as the client sent it
+    /// ([`host_port`]), since `canonical_host` leaves off 80 and 443.
+    pub fn sign_trtp_challenge(
+        &self,
+        challenge: &[u8; 32],
+        host: &str,
+        port: u16,
+    ) -> Option<Vec<u8>> {
+        let sent = host_port(host).filter(|p| *p == port)?;
+        let host = hl_identity::proof::canonical_host(host)
+            .filter(|h| self.cfg.classic_hosts.contains(&(h.clone(), sent)))?;
+        let expires = self.clock.unix() + TTL.as_secs();
+        let next = self.handovers().next;
+        hl_identity::ServerChallenge::sign_trtp(&self.key, challenge, &host, expires, next.as_ref())
+            .ok()
+    }
+
+    /// Prove Device's checks (`docs/proposals/portable-friends.md` §3):
+    /// §6.2's on the proof, against the `challenge` the session holds and
+    /// the `host` it was given for, on the connection whose exporter is
+    /// `exporter`, and then the certificate's and the card's as the ng
+    /// port checks them — `card`, or the one held here for the
+    /// certificate's identity.
+    pub fn verify_device_proof(
+        &self,
+        card: Option<&[u8]>,
+        cert: &[u8],
+        proof: &[u8],
+        challenge: &[u8; 32],
+        host: &str,
+        exporter: Option<&[u8; 32]>,
+    ) -> Result<Verified, AuthRefused> {
+        if cert.len() > hl_identity::cert::MAX_BYTES {
+            return Err(AuthRefused::BadCert);
+        }
+        let now = self.clock.unix();
+        let skew = self.cfg.clock_skew;
+        let p = hl_identity::DeviceProof::parse(proof).map_err(|_| AuthRefused::BadProof)?;
+        p.check(challenge, &self.key.public(), host, exporter, now, skew)
+            .map_err(|e| match e {
+                hl_identity::Error::ClockSkew => AuthRefused::ClockSkew,
+                e => classify(&e, 0),
+            })?;
+        let card = match card {
+            Some(card) => card.to_vec(),
+            None => {
+                let cert =
+                    hl_identity::DeviceCert::parse(cert).map_err(|_| AuthRefused::BadCert)?;
+                self.card(&Fingerprint::of(&cert.identity))
+                    .ok_or(AuthRefused::BadCard)?
+                    .1
+            }
+        };
+        let (c, dc) = hl_identity::verify_presented(&card, cert, &p.device, now, skew)
+            .map_err(|e| classify(&e, card.len()))?;
+        Ok(Verified {
+            card: c,
+            cert: dc,
+            card_bytes: card,
+            cert_bytes: cert.to_vec(),
+        })
+    }
+
+    /// Admit a device [`Self::verify_device_proof`] verified to the
+    /// classic session of the account `login`: steps 4 to 6 as for an ng
+    /// login, and then the identity must be the one the account links
+    /// now, on an account that allows identity login. One that links
+    /// none is linked by a proof that showed its card (`card_shown`), as
+    /// §8.2 "at auth" links one: from a certificate that may `manage`, on
+    /// an `encrypted` session, to an identity linked to no other account.
+    pub fn admit_device(
+        &self,
+        v: Verified,
+        login: &str,
+        card_shown: bool,
+        encrypted: bool,
+    ) -> Result<TransportIdentity, AuthRefused> {
+        let Standing {
+            fingerprint,
+            handle,
+            age,
+            ..
+        } = self.standing(&v.card, &v.cert, None, Assoc::Write)?;
+        let account = self.auth.lookup(login).map_err(|e| {
+            tracing::warn!("account lookup failed: {e}");
+            AuthRefused::Backend
+        })?;
+        let account = match account.identity.fingerprint {
+            Some(f) if f == fingerprint.0 => account,
+            Some(_) => return Err(AuthRefused::NotLinked),
+            None if !card_shown => return Err(AuthRefused::NotLinked),
+            // Logging in as guest names no account to link.
+            None if account.login == "guest" => return Err(AuthRefused::GuestLink),
+            None if !v.cert.allows(caps::MANAGE) => return Err(AuthRefused::NoManage),
+            // Someone riding a plain session could link the account to an
+            // identity of their own.
+            None if !encrypted => return Err(AuthRefused::Denied),
+            // Refused below once linked, so the link is never written.
+            None if !account.identity.identity_login => return Err(AuthRefused::Denied),
+            None => {
+                if self
+                    .core
+                    .person_banned(Some(&account.login), None, None)
+                    .is_some()
+                {
+                    return Err(AuthRefused::Banned);
+                }
+                match self.link_exclusive(&account.login, &fingerprint)? {
+                    LinkOutcome::Linked(a) => {
+                        info!(login = %a.login, fingerprint = %fingerprint.short(), "identity linked by device proof");
+                        a
+                    }
+                    LinkOutcome::Already(a) => a,
+                    LinkOutcome::Taken(_) => return Err(AuthRefused::AlreadyLinked),
+                    LinkOutcome::Refused(_) => return Err(AuthRefused::Denied),
+                }
+            }
+        };
+        if !account.identity.identity_login {
+            return Err(AuthRefused::Denied);
+        }
+        let ident = TransportIdentity {
+            identity: v.card.identity,
+            device: v.cert.device,
+            fingerprint,
+            handle,
+            age,
+            outcome: Outcome::Linked,
+            device_caps: v.cert.caps,
+            device_expires: v.cert.expires,
+            device_cert: v.cert_bytes,
+            device_enc: v.cert.device_enc,
+            account: Some(account.login),
+            downstream_cleartext: false,
+            quiet_until: None,
+        };
+        self.keep(&ident, None, &v.card, v.card_bytes, Downstream::Local);
+        Ok(ident)
     }
 
     /// `POST /identity/auth`, challenge binding: the spec's step list
@@ -877,134 +1060,13 @@ impl IdentityState {
         assoc: Assoc,
     ) -> Result<(String, TransportIdentity), AuthRefused> {
         let classic_offered = req.classic.is_some();
-        let fingerprint = Fingerprint::of(&card.identity);
-
-        // Step 4, revocation: the operator's own list, consulted first and
-        // needing no registrar (`identity-registrar.md`). A revoked
-        // device's cached certificate goes with it, so the mTLS
-        // path cannot re-admit it from the cache. The registrar's
-        // published records, when there is a registrar to fetch them
-        // from, are consulted here too.
-        // A key rotated away from is told where it went, which
-        // `is_revoked` would not say.
-        if let Some(successor) = self.rotated_to(&fingerprint) {
-            debug!(fingerprint = %fingerprint.short(), successor = %successor.short(), "identity auth refused: rotated");
-            return Err(AuthRefused::Rotated { successor });
-        }
-        if let Some(bytes) = req.rotation {
-            self.rotation_shown(bytes, &fingerprint);
-        }
-        self.finish_rotations(Some(&fingerprint));
-        let device = Fingerprint::of(&cert.device);
-        if self.core.is_revoked(&fingerprint.0, &device.0) {
-            debug!(
-                fingerprint = %fingerprint.short(),
-                device = %device.short(),
-                "identity auth refused: revoked here"
-            );
-            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.devices.remove(&cert.device);
-            return Err(AuthRefused::Revoked);
-        }
-
-        // A banned registrar refuses every identity that carries its
-        // attestation, verified or not, and whatever else the card
-        // carries: a card is its holder's own signature, so what is on it
-        // its holder chose, and nobody can put it on another's.
-        if card
-            .attestations
-            .iter()
-            .any(|a| self.cfg.banned_registrars.contains(&a.registrar))
-        {
-            info!(fingerprint = %fingerprint.short(), "identity auth refused: a banned registrar's attestation");
-            return Err(AuthRefused::Denied);
-        }
-
-        // Step 4, continued: what the registrars that attested it publish.
-        let now = self.clock.unix();
-        let attestations = self.apply_records(&card, &cert, now)?;
-        // A rotation to this key whose moves have not all landed would
-        // leave it to be admitted without the predecessor's account, and
-        // `new_accounts = create` to make it another one; it is admitted
-        // once the moves land, which this admission has just retried.
-        if self
-            .anchors
-            .as_ref()
-            .is_some_and(|a| !a.unmoved(Some(&fingerprint)).is_empty())
-        {
-            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its rotation's moves have not all landed");
-            return Err(AuthRefused::Backend);
-        }
-
-        // Step 5: attestations against the trusted registrars' keys.
-        let (handle, age) = match &attestations {
-            Some(atts) => self.accept_attestations(atts, now),
-            None => (None, 0),
-        };
-
-        // A card that moves a committed successor is refused outright —
-        // *first*, before any account is linked or created. Checking it
-        // after the writes meant a refused auth could still leave a link
-        // behind, which is the opposite of what the anchor is for.
-        if successor_changed(self.committed_successor(&fingerprint), &card) {
-            debug!(fingerprint = %fingerprint.short(), "card changes a committed successor");
-            return Err(AuthRefused::BadCard);
-        }
-        if let Some(reg) = &self.registrar {
-            match reg.check_card(&card) {
-                Ok(()) => {}
-                Err(hxd_registrar::Refusal::SuccessorMismatch) => {
-                    debug!(
-                        fingerprint = %fingerprint.short(),
-                        "card changes the successor this server's registrar holds"
-                    );
-                    return Err(AuthRefused::BadCard);
-                }
-                Err(e) => {
-                    tracing::warn!("registrar could not check a card: {e}");
-                    return Err(AuthRefused::Backend);
-                }
-            }
-        }
-
-        // A banned person is refused before anything below writes: an
-        // account created for a banned identity, or a link to one, is a
-        // way back in that the ban was meant to close. Re-admitting a
-        // device on file writes nothing, and the login on the socket it
-        // opens is refused with the ban's reason, so that is left to it.
-        if assoc == Assoc::Write {
-            // A ban's `*@host` is the registrar's, so it reads every
-            // handle the card names, as `banned_registrars` does.
-            let named = card.attestations.iter().map(|a| Some(a.full_handle()));
-            let hit = std::iter::once(handle.clone()).chain(named).find_map(|h| {
-                self.core
-                    .person_banned(None, Some(&fingerprint.0), h.as_deref())
-            });
-            if let Some(hit) = hit {
-                info!(fingerprint = %fingerprint.short(), ban = hit.id, "identity auth refused: banned");
-                return Err(AuthRefused::Banned);
-            }
-        }
-
-        // Step 6: policy.
-        if !self.cfg.allow_list.is_empty() {
-            let fp = fingerprint.to_string();
-            let listed = self
-                .cfg
-                .allow_list
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&fp) || handle.as_deref() == Some(e.as_str()));
-            if !listed {
-                return Err(AuthRefused::Denied);
-            }
-        }
-        let attested = handle.is_some() && age >= self.cfg.min_attestation_age;
-        if !attested {
-            match self.cfg.unattested {
-                Unattested::Deny => return Err(AuthRefused::Denied),
-                Unattested::Guest | Unattested::Allow => {}
-            }
-        }
+        let Standing {
+            fingerprint,
+            handle,
+            age,
+            attested,
+            now,
+        } = self.standing(&card, &cert, req.rotation, assoc)?;
 
         // §8.2 "at auth": classic credentials, verified as for a normal
         // login, then linked if the account allows it.
@@ -1045,6 +1107,19 @@ impl IdentityState {
                 debug!("link at auth refused: the device certificate lacks manage");
                 return Err(AuthRefused::NoManage);
             } else {
+                // A link its account refuses identity login by is refused
+                // below once written, so where one would be written it is
+                // refused first.
+                let writes = account.identity.fingerprint.is_none()
+                    && account.has_password
+                    && account.identity.allow_self_link;
+                if writes
+                    && !account.identity.identity_login
+                    && self.find_linked(&fingerprint)?.is_none()
+                {
+                    debug!(login = %account.login, "link at auth refused: identity_login is off");
+                    return Err(AuthRefused::Denied);
+                }
                 // One call: the backend reads, decides and writes under
                 // its own lock, so two concurrent auths by this identity
                 // can't both conclude "not linked yet".
@@ -1183,7 +1258,7 @@ impl IdentityState {
             outcome,
             device_caps: cert.caps,
             device_expires: cert.expires,
-            device_cert: cert_bytes.clone(),
+            device_cert: cert_bytes,
             device_enc: cert.device_enc,
             account,
             downstream_cleartext: req.downstream == Downstream::Cleartext,
@@ -1195,28 +1270,42 @@ impl IdentityState {
         // and a token minted there would sit unread in the table for a
         // minute per upgrade.
         let token = (assoc == Assoc::Write).then(random32);
+        self.keep(&ident, token.as_ref(), &card, card_bytes, req.downstream);
+        Ok((token.as_ref().map(|t| b64(t)).unwrap_or_default(), ident))
+    }
+
+    /// What an admission leaves behind: the token, when there is one, the
+    /// device and the card, and the card's commitment.
+    fn keep(
+        &self,
+        ident: &TransportIdentity,
+        token: Option<&[u8; 32]>,
+        card: &hl_identity::Card,
+        card_bytes: Vec<u8>,
+        downstream: Downstream,
+    ) {
         let inst = self.clock.now();
         {
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(token) = &token {
+            if let Some(token) = token {
                 remember_token(&mut t.tokens, hash(token), ident.clone(), inst, MAX_TOKENS);
             }
             remember_device(
                 &mut t.devices,
-                cert.device,
+                ident.device,
                 DeviceRecord {
-                    cert: cert_bytes,
-                    identity: cert.identity,
-                    expires: cert.expires,
-                    downstream: req.downstream,
+                    cert: ident.device_cert.clone(),
+                    identity: ident.identity,
+                    expires: ident.device_expires,
+                    downstream,
                     seen: inst,
                 },
-                now,
+                self.clock.unix(),
             );
-            remember_card(&mut t.cards, fingerprint, &card, card_bytes, inst);
+            remember_card(&mut t.cards, ident.fingerprint, card, card_bytes, inst);
         }
         // Anchor a first commitment outside the table lock — it writes a
-        // file. A changed one was refused at the top of this function.
+        // file. A changed one was refused by `standing`.
         //
         // Only for an identity with standing here: an account (linked or
         // just created) or an attestation this server accepted. §13 says
@@ -1226,9 +1315,157 @@ impl IdentityState {
         // this server have a relationship with; a key nobody knows has
         // nothing to protect yet, and anchors on its first login here.
         if let Some(s) = card.successor {
-            self.anchor(&ident, s);
+            self.anchor(ident, s);
         }
-        Ok((token.as_ref().map(|t| b64(t)).unwrap_or_default(), ident))
+    }
+
+    /// Steps 4 to 6 (§5.2), as far as they are about the identity rather
+    /// than an account: revocation, the registrars' records, attestations,
+    /// the card's commitments, bans and the admission policy. `assoc`
+    /// says whether what follows writes, and so whether bans are read
+    /// here.
+    fn standing(
+        &self,
+        card: &hl_identity::Card,
+        cert: &hl_identity::DeviceCert,
+        rotation: Option<&[u8]>,
+        assoc: Assoc,
+    ) -> Result<Standing, AuthRefused> {
+        let fingerprint = Fingerprint::of(&card.identity);
+
+        // Step 4, revocation: the operator's own list, consulted first and
+        // needing no registrar (`identity-registrar.md`). A revoked
+        // device's cached certificate goes with it, so the mTLS
+        // path cannot re-admit it from the cache. The registrar's
+        // published records, when there is a registrar to fetch them
+        // from, are consulted here too.
+        // A key rotated away from is told where it went, which
+        // `is_revoked` would not say.
+        if let Some(successor) = self.rotated_to(&fingerprint) {
+            debug!(fingerprint = %fingerprint.short(), successor = %successor.short(), "identity auth refused: rotated");
+            return Err(AuthRefused::Rotated { successor });
+        }
+        if let Some(bytes) = rotation {
+            self.rotation_shown(bytes, &fingerprint);
+        }
+        self.finish_rotations(Some(&fingerprint));
+        let device = Fingerprint::of(&cert.device);
+        if self.core.is_revoked(&fingerprint.0, &device.0) {
+            debug!(
+                fingerprint = %fingerprint.short(),
+                device = %device.short(),
+                "identity auth refused: revoked here"
+            );
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.devices.remove(&cert.device);
+            return Err(AuthRefused::Revoked);
+        }
+
+        // A banned registrar refuses every identity that carries its
+        // attestation, verified or not, and whatever else the card
+        // carries: a card is its holder's own signature, so what is on it
+        // its holder chose, and nobody can put it on another's.
+        if card
+            .attestations
+            .iter()
+            .any(|a| self.cfg.banned_registrars.contains(&a.registrar))
+        {
+            info!(fingerprint = %fingerprint.short(), "identity auth refused: a banned registrar's attestation");
+            return Err(AuthRefused::Denied);
+        }
+
+        // Step 4, continued: what the registrars that attested it publish.
+        let now = self.clock.unix();
+        let attestations = self.apply_records(card, cert, now)?;
+        // A rotation to this key whose moves have not all landed would
+        // leave it to be admitted without the predecessor's account, and
+        // `new_accounts = create` to make it another one; it is admitted
+        // once the moves land, which this admission has just retried.
+        if self
+            .anchors
+            .as_ref()
+            .is_some_and(|a| !a.unmoved(Some(&fingerprint)).is_empty())
+        {
+            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its rotation's moves have not all landed");
+            return Err(AuthRefused::Backend);
+        }
+
+        // Step 5: attestations against the trusted registrars' keys.
+        let (handle, age) = match &attestations {
+            Some(atts) => self.accept_attestations(atts, now),
+            None => (None, 0),
+        };
+
+        // A card that moves a committed successor is refused outright —
+        // *first*, before any account is linked or created. Checking it
+        // after the writes meant a refused auth could still leave a link
+        // behind, which is the opposite of what the anchor is for.
+        if successor_changed(self.committed_successor(&fingerprint), card) {
+            debug!(fingerprint = %fingerprint.short(), "card changes a committed successor");
+            return Err(AuthRefused::BadCard);
+        }
+        if let Some(reg) = &self.registrar {
+            match reg.check_card(card) {
+                Ok(()) => {}
+                Err(hxd_registrar::Refusal::SuccessorMismatch) => {
+                    debug!(
+                        fingerprint = %fingerprint.short(),
+                        "card changes the successor this server's registrar holds"
+                    );
+                    return Err(AuthRefused::BadCard);
+                }
+                Err(e) => {
+                    tracing::warn!("registrar could not check a card: {e}");
+                    return Err(AuthRefused::Backend);
+                }
+            }
+        }
+
+        // A banned person is refused before anything below writes: an
+        // account created for a banned identity, or a link to one, is a
+        // way back in that the ban was meant to close. Re-admitting a
+        // device on file writes nothing, and the login on the socket it
+        // opens is refused with the ban's reason, so that is left to it.
+        if assoc == Assoc::Write {
+            // A ban's `*@host` is the registrar's, so it reads every
+            // handle the card names, as `banned_registrars` does.
+            let named = card.attestations.iter().map(|a| Some(a.full_handle()));
+            let hit = std::iter::once(handle.clone()).chain(named).find_map(|h| {
+                self.core
+                    .person_banned(None, Some(&fingerprint.0), h.as_deref())
+            });
+            if let Some(hit) = hit {
+                info!(fingerprint = %fingerprint.short(), ban = hit.id, "identity auth refused: banned");
+                return Err(AuthRefused::Banned);
+            }
+        }
+
+        // Step 6: policy.
+        if !self.cfg.allow_list.is_empty() {
+            let fp = fingerprint.to_string();
+            let listed = self
+                .cfg
+                .allow_list
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&fp) || handle.as_deref() == Some(e.as_str()));
+            if !listed {
+                return Err(AuthRefused::Denied);
+            }
+        }
+        let attested = handle.is_some() && age >= self.cfg.min_attestation_age;
+        if !attested {
+            match self.cfg.unattested {
+                Unattested::Deny => return Err(AuthRefused::Denied),
+                Unattested::Guest | Unattested::Allow => {}
+            }
+        }
+        Ok(Standing {
+            fingerprint,
+            handle,
+            age,
+            attested,
+            now,
+        })
     }
 
     fn find_linked(&self, fp: &Fingerprint) -> Result<Option<Account>, AuthRefused> {
@@ -2995,6 +3232,90 @@ mod tests {
             .auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), classic())
             .unwrap();
         assert_eq!(ident.outcome, Outcome::ClassicPendingLink);
+    }
+
+    #[test]
+    fn a_trtp_challenge_is_signed_only_on_the_port_the_client_names() {
+        let st = state(IdentityConfig {
+            classic_hosts: vec![("hl.example".into(), 443), ("hl.example:5500".into(), 5500)],
+            ..Default::default()
+        });
+        let ch = [9u8; 32];
+        for (host, port, signed) in [
+            ("hl.example:5500", 5500, true),
+            ("hl.example:443", 443, true),
+            ("HL.example:443", 443, true),
+            ("hl.example:443", 80, false),
+            ("hl.example:80", 80, false),
+            ("hl.example:80", 443, false),
+            ("hl.example", 443, false),
+            ("hl.example:5500", 5600, false),
+            ("other.example:5500", 5500, false),
+        ] {
+            let c = st.sign_trtp_challenge(&ch, host, port);
+            assert_eq!(c.is_some(), signed, "{host} on {port}");
+        }
+    }
+
+    #[test]
+    fn credentials_of_an_account_that_refuses_the_link_leave_the_linked_one() {
+        let auth = MemAuth::new();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let mut kiosk = account("kiosk", true);
+        kiosk.identity.identity_login = false;
+        kiosk.identity.allow_self_link = false;
+        {
+            let mut a = auth.accounts.lock().unwrap();
+            a.insert("kiosk".into(), kiosk);
+            a.get_mut("alice").unwrap().identity.fingerprint = Some(id.fingerprint().0);
+        }
+        let st = state_with(IdentityConfig::default(), auth.clone());
+        let (card, cert) = objects(&id, &dev);
+        let proof = proof_for(&st, &dev);
+        let classic = ClassicLogin {
+            login: "kiosk",
+            password: b"pw",
+        };
+        let req = AuthRequest {
+            classic: Some(classic),
+            ..Default::default()
+        };
+        let (_, ident) = st
+            .auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), req)
+            .unwrap();
+        assert_eq!(ident.outcome, Outcome::Linked);
+        assert_eq!(ident.account.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_link_its_account_would_refuse_is_never_written() {
+        let auth = MemAuth::new();
+        let mut kiosk = account("kiosk", true);
+        kiosk.identity.identity_login = false;
+        auth.accounts.lock().unwrap().insert("kiosk".into(), kiosk);
+        let st = state_with(IdentityConfig::default(), auth.clone());
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let (card, cert) = objects(&id, &dev);
+        let proof = proof_for(&st, &dev);
+        let classic = ClassicLogin {
+            login: "kiosk",
+            password: b"pw",
+        };
+        let req = AuthRequest {
+            classic: Some(classic),
+            ..Default::default()
+        };
+        assert_eq!(
+            st.auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), req)
+                .unwrap_err(),
+            AuthRefused::Denied
+        );
+        assert!(auth
+            .find_by_fingerprint(&id.fingerprint().0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

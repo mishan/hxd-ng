@@ -43,6 +43,7 @@ use tracing::{debug, info, warn, Instrument};
 use crate::accounts;
 use crate::banner::Banner;
 use crate::caps::{cap, Caps};
+use crate::device::{self, Arrival};
 use crate::encoding::TextEncoding;
 use crate::file_manage;
 use crate::files;
@@ -251,6 +252,9 @@ pub struct ServerCtx {
     /// The banner every 1.5+ client is shown after its agreement. Absent =
     /// none, and no `HTLS_HDR_BANNER` is ever sent.
     pub banner: Option<Arc<Banner>>,
+    /// What checks a device proof (`crate::device`). Absent = none, and
+    /// capability bit 14 is never confirmed.
+    pub device_proof: Option<Arc<dyn device::DeviceProver>>,
 }
 
 /// The next connection, however long that takes. An accept error —
@@ -281,6 +285,10 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
         let (stream, peer) = accept(&listener, &mut backoff).await;
         let _ = stream.set_nodelay(true);
         let ctx = ctx.clone();
+        let arrival = Arrival {
+            port: stream.local_addr().ok().map(|a| a.port()),
+            ..Arrival::default()
+        };
         tokio::spawn(async move {
             let span = tracing::info_span!("session", %peer);
             run_connection(
@@ -291,6 +299,7 @@ pub async fn serve(listener: TcpListener, ctx: ServerCtx) {
                 LinkAuthority::default(),
                 Direct::Admit,
                 None,
+                arrival,
             )
             .instrument(span)
             .await;
@@ -352,6 +361,7 @@ pub async fn serve_tls_with_peers(
             None => continue,
         };
         let _ = stream.set_nodelay(true);
+        let port = stream.local_addr().ok().map(|a| a.port());
         let ctx = ctx.clone();
         let acceptor = tls.acceptor();
         let peers = peers.clone();
@@ -374,10 +384,16 @@ pub async fn serve_tls_with_peers(
                 encrypted: true,
                 ..Transport::default()
             };
+            let conn = stream.get_ref().1;
             let link_port = peers.map(|acceptor| crate::peer::LinkPort {
                 acceptor,
-                exporter: link_exporter(stream.get_ref().1),
+                exporter: exporter(conn, crate::peer::EXPORTER_LABEL),
             });
+            let arrival = Arrival {
+                port,
+                exporter: exporter(conn, device::EXPORTER_LABEL),
+                tls: true,
+            };
             run_connection(
                 stream,
                 peer,
@@ -386,6 +402,7 @@ pub async fn serve_tls_with_peers(
                 LinkAuthority::default(),
                 Direct::Admitted(place),
                 link_port,
+                arrival,
             )
             .instrument(span)
             .await;
@@ -393,21 +410,19 @@ pub async fn serve_tls_with_peers(
     }
 }
 
-/// The session's exporter value for a key-mode link, on TLS 1.3 only:
-/// TLS 1.2 without extended master secret is open to triple-handshake
-/// attacks, which would let a proof made for one session serve another.
-fn link_exporter(
+/// The session's exporter value under `label`, for a key-mode link or a
+/// device proof, on TLS 1.3 only: TLS 1.2 without extended master secret
+/// is open to triple-handshake attacks, which would let a proof made for
+/// one session serve another.
+fn exporter(
     conn: &tokio_rustls::rustls::ServerConnection,
+    label: &[u8],
 ) -> Option<[u8; crate::peer::EXPORTER_LEN]> {
     if conn.protocol_version() != Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3) {
         return None;
     }
-    conn.export_keying_material(
-        [0u8; crate::peer::EXPORTER_LEN],
-        crate::peer::EXPORTER_LABEL,
-        Some(&[]),
-    )
-    .ok()
+    conn.export_keying_material([0u8; crate::peer::EXPORTER_LEN], label, Some(&[]))
+        .ok()
 }
 
 /// One outbound frame, typed by who stamps the transaction id.
@@ -634,11 +649,13 @@ const HANDLED: &[ClientHdr] = &[
     ClientHdr::FilePut,
     ClientHdr::FilePutFolder,
     ClientHdr::GetChatHistory,
+    ClientHdr::GetDeviceChallenge,
     ClientHdr::KillDownload,
     ClientHdr::Login,
     ClientHdr::Msg,
     ClientHdr::MsgBroadcast,
     ClientHdr::Ping,
+    ClientHdr::ProveDevice,
     ClientHdr::UserChange,
     ClientHdr::UserGetInfo,
     ClientHdr::UserGetList,
@@ -1562,6 +1579,10 @@ struct Session {
     editor_tier: u8,
     /// The accounts the user editor has open, and the bits it showed.
     opened: accounts::Opened,
+    /// What only the connection knows, for a device proof.
+    arrival: Arrival,
+    /// The device challenge it holds, one at a time.
+    device_challenge: Option<device::Held>,
 }
 
 impl Session {
@@ -1673,6 +1694,10 @@ pub async fn run_session<S>(
         link,
         Direct::Tunnelled(place),
         None,
+        Arrival {
+            tls: true,
+            ..Arrival::default()
+        },
     )
     .await
 }
@@ -1710,7 +1735,9 @@ fn admit(ctx: &ServerCtx, peer: SocketAddr) -> Option<ConnPermit> {
 }
 
 /// [`run_session`], told whether `peer` is the client's own TCP address
-/// and whether its place is already taken ([`Direct`]).
+/// and whether its place is already taken ([`Direct`]), and what only
+/// the connection knows ([`Arrival`]).
+#[allow(clippy::too_many_arguments)]
 async fn run_connection<S>(
     stream: S,
     peer: SocketAddr,
@@ -1719,6 +1746,7 @@ async fn run_connection<S>(
     link: LinkAuthority,
     direct: Direct,
     link_port: Option<crate::peer::LinkPort>,
+    arrival: Arrival,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1792,6 +1820,7 @@ async fn run_connection<S>(
         &mut place,
         link_port.as_ref(),
         &slots,
+        arrival,
     )
     .await;
     let ended = if let Some(LoginOutcome::Link(grant, acceptor)) = outcome {
@@ -2174,6 +2203,7 @@ async fn login_phase(
     place: &mut ConnPermit,
     link_port: Option<&crate::peer::LinkPort>,
     slots: &crate::hope::Slots,
+    arrival: Arrival,
 ) -> Option<LoginOutcome> {
     let f = match timeout(ctx.cfg.login_timeout, frames.recv()).await {
         Ok(Some(f)) => f,
@@ -2478,6 +2508,11 @@ async fn login_phase(
             caps = caps.with(cap::MESSENGER_SESSION);
         }
     }
+    // Bit 14 wherever a proof can be checked, whatever else the session
+    // negotiated.
+    if req.caps.has(cap::DEVICE_PROOF) && ctx.device_proof.is_some() {
+        caps = caps.with(cap::DEVICE_PROOF);
+    }
     let transport = Transport {
         inline_media: caps.has(cap::INLINE_MEDIA),
         messaging: caps.has(cap::MESSAGING),
@@ -2660,6 +2695,8 @@ async fn login_phase(
         told_read_only: Vec::new(),
         editor_tier: accounts::editor_tier(req.clientversion),
         opened: Default::default(),
+        arrival,
+        device_challenge: None,
     };
 
     // A 1.5+ client that sent no name finishes its login via
@@ -3351,10 +3388,11 @@ async fn session_loop(
     }
 }
 
-/// What a messenger session (bit 8) may ask: the friend family, and what
-/// any session needs to finish its login and stay up.
+/// What a messenger session (bit 8) may ask: the friend family, device
+/// proof, and what any session needs to finish its login and stay up.
 fn messenger_may(ty: u32) -> bool {
     friends::handles(ty)
+        || device::handles(ty)
         || [
             ClientHdr::Ping,
             ClientHdr::AgreementAgree,
@@ -3405,6 +3443,7 @@ fn public_chat_frame(f: &Frame, ctx: &ServerCtx) -> Option<u32> {
 async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
     let points = friends::price(f.ty)
         .filter(|_| sess.has_cap(cap::MESSAGING))
+        .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
@@ -5696,6 +5735,60 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Some(friends::Answer::Silent) => {}
                 None if friends::answers(t) => reply_error(tx, f.trans, "Server error."),
                 None => {}
+            }
+        }
+
+        t if t == ClientHdr::GetDeviceChallenge.as_u32() && sess.has_cap(cap::DEVICE_PROOF) => {
+            sess.device_challenge = None;
+            let prover = ctx
+                .device_proof
+                .as_ref()
+                .expect("bit 14 is confirmed with one");
+            let mut challenge = [0u8; 32];
+            getrandom::getrandom(&mut challenge).expect("the OS CSPRNG");
+            let asked = device::host(f).zip(sess.arrival.port);
+            if asked.is_some() && ctx.core.device_proof_spend(sess.uid).is_err() {
+                reply_error(tx, f.trans, device::TOO_MANY);
+                return;
+            }
+            let signed = asked.and_then(|(host, port)| {
+                let signed = prover.challenge(&challenge, &host, port)?;
+                Some((signed, host))
+            });
+            match signed {
+                Some((signed, host)) => {
+                    sess.device_challenge = Some(device::held(challenge, host));
+                    reply(tx, f.trans, vec![(tag::SERVER_CHALLENGE, signed)]);
+                }
+                None => reply_error(tx, f.trans, device::NO_CHALLENGE),
+            }
+        }
+
+        // The challenge is spent whatever follows, and a session proves
+        // one device, once.
+        t if t == ClientHdr::ProveDevice.as_u32() && sess.has_cap(cap::DEVICE_PROOF) => {
+            let held = sess.device_challenge.take();
+            let prover = ctx
+                .device_proof
+                .as_ref()
+                .expect("bit 14 is confirmed with one");
+            let me = ctx.core.user(sess.uid);
+            let unproved = me.as_ref().is_some_and(|u| u.transport.identity.is_none());
+            let encrypted = me.is_some_and(|u| u.transport.encrypted);
+            let req = device::request(f, held, sess.arrival, &sess.account.login, encrypted)
+                .filter(|_| unproved && ctx.core.device_proof_spend(sess.uid).is_ok());
+            let proved = match req {
+                Some(req) => (prover.prove(req).await)
+                    .map(|identity| ctx.core.device_proved(sess.uid, identity)),
+                None => Err(device::ProveRefused::Refused),
+            };
+            match proved {
+                Ok(true) => {
+                    info!(uid = sess.uid, "device proved");
+                    reply(tx, f.trans, vec![]);
+                }
+                Err(device::ProveRefused::ClockSkew) => reply_error(tx, f.trans, device::SKEWED),
+                _ => reply_error(tx, f.trans, device::NOT_PROVED),
             }
         }
 

@@ -34,7 +34,8 @@ pub enum Error {
     /// A proof's `time` is outside the skew allowance, or a sealed
     /// message's `sent` outside the window its reader accepts.
     ClockSkew,
-    /// A proof echoes a different challenge or server key than expected.
+    /// A proof echoes a different challenge or server key than expected,
+    /// or is bound to another connection than the one it arrived on.
     ChallengeMismatch,
     /// A proof or a server's challenge names a different host than the
     /// one the request was addressed to.

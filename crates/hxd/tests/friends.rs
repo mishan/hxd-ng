@@ -82,6 +82,7 @@ async fn start(dir: &Path, messaging: bool) -> Server {
         cfg: Arc::new(ServerConfig::default()),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

@@ -119,6 +119,7 @@ async fn start(dir: &Path, system: Option<SystemPolicy>, config: &str) -> Server
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

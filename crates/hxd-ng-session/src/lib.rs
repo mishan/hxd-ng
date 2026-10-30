@@ -40,7 +40,8 @@ use tokio::net::TcpListener;
 use tracing::{info, warn, Instrument};
 
 pub use identity::{
-    AuthRequest, ClassicLogin, Downstream, IdentityConfig, IdentityState, NewAccounts, Unattested,
+    AuthRequest, ClassicLogin, ClassicProof, Downstream, IdentityConfig, IdentityState,
+    NewAccounts, Unattested,
 };
 pub use registry::Registry;
 

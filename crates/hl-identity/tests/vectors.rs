@@ -15,9 +15,9 @@ use hl_identity::registrar::{
 use hl_identity::sealed::{self, Opened, Opening, Replay};
 use hl_identity::{
     attestation, card, cert, enroll, message, proof, Attestation, AttestationRevocation, Bundle,
-    Card, DeviceCert, DeviceKey, DeviceRevocation, EnrollRequest, Fingerprint, Freeze, IdentityKey,
-    IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest, RegistrarKeys,
-    Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
+    Card, DeviceCert, DeviceKey, DeviceProof, DeviceRevocation, EnrollRequest, Fingerprint, Freeze,
+    IdentityKey, IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest,
+    RegistrarKeys, Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
 };
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
@@ -363,6 +363,66 @@ fn server_challenge_vector() {
         .check(&challenge, &k.srv.public(), host, expires, 0)
         .is_ok());
     check_signed(e, proof::SERVER_DOMAIN, &k.srv.public(), &signed);
+}
+
+#[test]
+fn server_challenge_trtp_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["server_challenge_trtp"]["object"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), proof::TRTP_SERVER_DOMAIN);
+    let challenge = unhex32(str_of(f, "challenge"));
+    let host = str_of(f, "host");
+    let expires = u64_of(f, "expires");
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        ServerChallenge::sign_trtp(&k.srv, &challenge, host, expires, None).unwrap(),
+        signed
+    );
+    let c = ServerChallenge::parse_trtp(&signed).unwrap();
+    assert_eq!(
+        (c.challenge, c.server_key, c.host.as_str(), c.expires),
+        (challenge, k.srv.public(), host, expires)
+    );
+    assert_eq!(
+        ServerChallenge::parse(&signed),
+        Err(hl_identity::Error::BadSignature)
+    );
+    check_signed(e, proof::TRTP_SERVER_DOMAIN, &k.srv.public(), &signed);
+}
+
+#[test]
+fn device_proof_vector_binds_the_connection() {
+    let v = vectors();
+    let k = keys(&v);
+    let dp = &v["device_proof"];
+    let e = &dp["object"];
+    assert_eq!(str_of(e, "domain"), proof::DEVICE_DOMAIN);
+    let challenge = unhex32(str_of(dp, "challenge_hex"));
+    let server_key = unhex32(str_of(dp, "server_key_hex"));
+    let exporter = unhex32(str_of(dp, "exporter_hex"));
+    let host = str_of(dp, "host");
+    let time = u64_of(&e["fields"], "time");
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        DeviceProof::sign(&k.dev, &challenge, &server_key, host, time, Some(&exporter)).unwrap(),
+        signed
+    );
+    let p = DeviceProof::parse(&signed).unwrap();
+    assert_eq!(
+        p.check(&challenge, &server_key, host, Some(&exporter), time, 0),
+        Ok(())
+    );
+    assert_eq!(
+        p.check(&challenge, &server_key, host, None, time, 0),
+        Err(hl_identity::Error::ChallengeMismatch)
+    );
+    assert_eq!(
+        LoginProof::parse(&signed),
+        Err(hl_identity::Error::BadSignature)
+    );
+    check_signed(e, proof::DEVICE_DOMAIN, &k.dev.public(), &signed);
 }
 
 #[test]

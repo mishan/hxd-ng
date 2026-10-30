@@ -243,6 +243,7 @@ async fn start_with(dir: &Path, cfg: MediaConfig, inbox: bool, history: bool) ->
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

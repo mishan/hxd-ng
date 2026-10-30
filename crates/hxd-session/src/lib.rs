@@ -6,6 +6,7 @@
 mod accounts;
 pub mod banner;
 pub mod caps;
+pub mod device;
 pub mod encoding;
 mod file_manage;
 mod files;
@@ -22,6 +23,7 @@ pub mod voice;
 
 pub use banner::Banner;
 pub use caps::{cap, Caps};
+pub use device::{DeviceProver, ProveRefused, ProveRequest};
 pub use encoding::TextEncoding;
 pub use friends::request_group_fits;
 pub use news::{FlatNews, FlatPushes, FlatReply, LegacyNews};

@@ -15,10 +15,27 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::rustls::{ClientConfig, ProtocolVersion};
 use tokio_rustls::TlsConnector;
 
 use crate::{Error, Result, DEFAULT_TIMEOUT};
+
+async fn tls(
+    addr: SocketAddr,
+    server_name: &str,
+    config: Arc<ClientConfig>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let name = ServerName::try_from(server_name.to_owned())
+        .map_err(|e| Error::Protocol(format!("server name: {e}")))?;
+    timeout(DEFAULT_TIMEOUT, async {
+        let tcp = TcpStream::connect(addr).await?;
+        tcp.set_nodelay(true)?;
+        TlsConnector::from(config).connect(name, tcp).await
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
+    .map_err(Into::into)
+}
 
 /// A task reply's type. Replies echo the request's `trans`.
 pub const TASK: u32 = 0x0001_0000;
@@ -212,7 +229,7 @@ impl Login {
         }
     }
 
-    fn chunks(&self) -> Vec<(u16, Vec<u8>)> {
+    pub(crate) fn chunks(&self) -> Vec<(u16, Vec<u8>)> {
         let mut c = vec![
             (tag::NAME, self.nick.as_bytes().to_vec()),
             (tag::ICON, self.icon.to_be_bytes().to_vec()),
@@ -433,16 +450,26 @@ impl Client {
         server_name: &str,
         config: Arc<ClientConfig>,
     ) -> Result<Client> {
-        let name = ServerName::try_from(server_name.to_owned())
-            .map_err(|e| Error::Protocol(format!("server name: {e}")))?;
-        let tls = timeout(DEFAULT_TIMEOUT, async {
-            let tcp = TcpStream::connect(addr).await?;
-            tcp.set_nodelay(true)?;
-            TlsConnector::from(config).connect(name, tcp).await
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
-        Client::over(Box::new(tls)).await
+        Client::over(Box::new(tls(addr, server_name, config).await?)).await
+    }
+
+    /// [`Client::connect_tls`], with the connection's exporter value under
+    /// `label` (RFC 8446 section 7.5, an empty context) where it is TLS 1.3.
+    pub async fn connect_tls_exporting(
+        addr: SocketAddr,
+        server_name: &str,
+        config: Arc<ClientConfig>,
+        label: &[u8],
+    ) -> Result<(Client, Option<[u8; 32]>)> {
+        let tls = tls(addr, server_name, config).await?;
+        let conn = tls.get_ref().1;
+        let exporter = (conn.protocol_version() == Some(ProtocolVersion::TLSv1_3))
+            .then(|| {
+                conn.export_keying_material([0u8; 32], label, Some(&[]))
+                    .ok()
+            })
+            .flatten();
+        Ok((Client::over(Box::new(tls)).await?, exporter))
     }
 
     /// Exchange the magic over a stream the caller opened.

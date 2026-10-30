@@ -13,6 +13,7 @@
 //! Everything returns a [`Result`]. A test that wants to fail loudly
 //! unwraps; the harness counts the error and carries on.
 
+pub mod device;
 pub mod legacy;
 pub mod messaging;
 pub mod ng;

@@ -75,6 +75,7 @@ async fn start() -> Running {
         }),
         files: Some(service.clone()),
         banner: None,
+        device_proof: None,
     };
     let legacy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let transfer = TcpListener::bind("127.0.0.1:0").await.unwrap();
