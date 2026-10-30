@@ -1136,8 +1136,11 @@ What the family's existing requests take beside what they took:
 - **`block` with a `withdraw`**, by `login` alone, withdraws, then
   blocks, as `friend_remove` with one does; the friend's other servers
   are told of a removal, never of a block. The block stands whatever
-  becomes of the withdrawal, whose refusal is the answer. A `withdraw`
-  beside `uid`, or on `unblock`, is `bad_request`.
+  becomes of the withdrawal, whose refusal is the answer. A withdrawal
+  naming another pair than the two's is answered `ok`, where
+  `friend_remove` refuses it: a block names whom it blocks, and its
+  answer says nothing of anyone else. A `withdraw` beside `uid`, or on
+  `unblock`, is `bad_request`.
 
 Two requests are added, answered to friendships sessions alone:
 

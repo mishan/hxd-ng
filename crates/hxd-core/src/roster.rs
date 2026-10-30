@@ -250,10 +250,11 @@ pub struct Transport {
     /// reached through the friend family alone
     /// (`docs/instant-messaging.md` §7).
     pub messenger_session: bool,
-    /// It asked for portable friendships and proved a device that may
-    /// make them (`docs/proposals/portable-friends.md` §7): the only kind
-    /// of session sent an offer, a friendship hash or a withdrawal, and
-    /// the only one that may make a friendship act.
+    /// It asked for portable friendships, and proved a device that may
+    /// make them or, with classic capability bit 15, may prove one
+    /// (`docs/proposals/portable-friends.md` §7): the only kind of session
+    /// sent an offer, a friendship hash or a withdrawal, and the only one
+    /// that may make a friendship act, once it has proved its device.
     pub friendships: bool,
 }
 
@@ -1562,6 +1563,10 @@ pub struct Core {
     /// they may ask, likewise ([`Core::device_proof_spend`]).
     pub(crate) device_proofs: crate::limits::PostRates,
     pub(crate) device_proof_addrs: crate::limits::PostRates,
+    /// And of the friendship acts they may make on the classic wire
+    /// ([`Core::friendships_spend`]).
+    pub(crate) friendship_objects: crate::limits::PostRates,
+    pub(crate) friendship_object_addrs: crate::limits::PostRates,
     /// Every standing ban, for matching without the store
     /// (`crate::ban`).
     pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,
