@@ -892,6 +892,27 @@ fn family(core: &Core, login: &str) -> (Uid, Events) {
 }
 
 #[test]
+fn a_send_by_login_from_a_session_without_an_inbox_is_refused() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&a)
+        .unwrap()
+        .has_inbox = false;
+    assert_eq!(
+        s.core.im_send_login(a, "bob", "hi".into(), None),
+        Err(MessagingError::NotEnabled)
+    );
+    assert!(s.inbox.all().is_empty());
+}
+
+#[test]
 fn an_im_is_handed_to_a_friend_and_again_until_it_is_acknowledged() {
     let s = server(&["alice", "bob"]);
     let (a, mut ra) = messenger(&s.core, "alice");

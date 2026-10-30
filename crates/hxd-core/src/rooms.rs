@@ -596,7 +596,8 @@ impl RosterInner {
         target: Uid,
     ) -> Result<(), crate::ChatError> {
         use crate::ChatError;
-        let (Some(inviter), Some(invitee)) = (self.users.get(&by), self.users.get(&target)) else {
+        let invitee = self.users.get(&target).filter(|s| s.visible);
+        let (Some(inviter), Some(invitee)) = (self.users.get(&by), invitee) else {
             return Err(ChatError::NoSuchUser);
         };
         let entry = self.rooms.get(&room).ok_or(ChatError::NoSuchChat)?;

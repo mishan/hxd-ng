@@ -10,6 +10,7 @@ pub mod encoding;
 mod file_manage;
 mod files;
 pub mod frame;
+mod friends;
 mod hope;
 pub mod media;
 pub mod news;
@@ -22,10 +23,11 @@ pub mod voice;
 pub use banner::Banner;
 pub use caps::{cap, Caps};
 pub use encoding::TextEncoding;
+pub use friends::request_group_fits;
 pub use news::{FlatNews, FlatPushes, FlatReply, LegacyNews};
 pub use peer::{LinkGrant, LinkIo, LinkLogin, LinkOut, PeerAcceptor};
 pub use session::{
     run_session, serve, serve_tls, serve_tls_with_peers, ServerConfig, ServerCtx, TrtpLogin,
-    NAMES_A_USER,
+    MAX_IM_BYTES, NAMES_A_USER,
 };
 pub use tls::LegacyTls;

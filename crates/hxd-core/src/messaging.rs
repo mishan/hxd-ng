@@ -610,6 +610,18 @@ impl Core {
         self.messaging_policy
     }
 
+    /// Would a session of this account take part, on this server? What a
+    /// frontend asks before the attach, where the classic wire confirms
+    /// capability bit 6.
+    pub fn account_takes_part(
+        &self,
+        login: &str,
+        access: crate::AccessBits,
+        is_person: bool,
+    ) -> bool {
+        self.messaging_enabled() && is_person && takes_part(login, access)
+    }
+
     /// Does this session take part, on a server where messaging is on?
     /// Decided as it was announced, and kept for its life.
     pub fn takes_part(&self, uid: Uid) -> bool {

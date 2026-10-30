@@ -567,7 +567,15 @@ fn named_one(login: Option<String>, fp: Option<String>) -> Result<Named, &'stati
 fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
     let p = &req.params;
     let bad = "Malformed request.";
-    let at = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+    // A time past what `SystemTime` holds is malformed, never a panic.
+    let at = |s: Option<u64>| {
+        s.map(|s| {
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(s))
+                .ok_or(bad)
+        })
+        .transpose()
+    };
     Ok(match req.req.as_str() {
         "friends" => Op::Friends,
         "requests" => Op::Requests,
@@ -673,7 +681,7 @@ fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
         }
         _ => {
             let p: ClearParams = crate::conn::params_or_default(p).map_err(|_| bad)?;
-            Op::Clear(p.since.map(at), p.before.map(at))
+            Op::Clear(at(p.since)?, at(p.before)?)
         }
     })
 }

@@ -1502,6 +1502,21 @@ impl MessagingSection {
         if let Some((key, _)) = counts.iter().find(|(_, n)| *n == 0) {
             return Err(format!("[messaging] {key} must be above 0"));
         }
+        if self.max_message_bytes > hxd_session::MAX_IM_BYTES {
+            return Err(format!(
+                "[messaging] max_message_bytes must be at most {}",
+                hxd_session::MAX_IM_BYTES
+            ));
+        }
+        // A page of the classic wire's Get Message Requests holds one
+        // sender's group whole.
+        if !hxd_session::request_group_fits(self.request_messages, self.max_message_bytes) {
+            return Err(
+                "[messaging] request_messages times max_message_bytes is more than one \
+                 page of message requests holds: lower either"
+                    .into(),
+            );
+        }
         // Added to the clock as a deadline, so it is bounded well short of
         // where the arithmetic would overflow.
         if !(1..=MAX_REQUEST_RETENTION_DAYS).contains(&self.request_retention_days) {
@@ -4993,6 +5008,18 @@ sync = "full"
             (
                 format!("{INBOX}[messaging]\nrequest_retention_days = 3650\n"),
                 None,
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65505\nrequest_messages = 3\n"),
+                None,
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65505\nrequest_messages = 4\n"),
+                Some("request_messages times max_message_bytes"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65506\n"),
+                Some("max_message_bytes must be at most 65505"),
             ),
             (
                 format!("{INBOX}[messaging]\nrequest_retention_days = 0\n"),

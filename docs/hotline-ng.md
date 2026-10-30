@@ -838,6 +838,11 @@ as it was before the family existed, until it sends one of the
 family's requests, which makes it a session that speaks the family
 from then on. `msg` is not one of them.
 
+**Classic messengers.** A classic session that negotiated capability
+bit 8, a pure messenger (instant-messaging.md §7), is on no roster: no
+`users`, `user_joined`, `user_changed` or `user_parted` names it, and it
+is reached through this family alone.
+
 **Taking part.** Only an account that holds `AccessMessaging` (bit 58,
 `messaging` in access-bits.md) takes part, and never `admin` or
 `guest`, whatever their bits. Any other session's requests of the

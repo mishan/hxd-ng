@@ -202,7 +202,42 @@ impl Core {
         if media || text.len() > self.messaging_policy.max_message_bytes {
             return friend.is_none().then_some(Err(ChatError::NotFriends));
         }
-        Some(self.route(uid, sending, them, friend, text, guid, signed))
+        Some(
+            self.route(uid, sending, them, friend, text, guid, signed)
+                .map_err(chat_error),
+        )
+    }
+
+    /// IM Send (810), by login: routed as an ng `msg` by `to_login` is
+    /// (§4.1), but never as mail, so an account outside messaging is no
+    /// account and a text too long is refused as one, and a request is
+    /// made only from a session that understands them, as the requests
+    /// draft has it, where `/msg <login>` makes one from any classic
+    /// session.
+    pub fn im_send_login(
+        &self,
+        uid: Uid,
+        to: &str,
+        text: String,
+        guid: Option<MessageGuid>,
+    ) -> Result<MsgOutcome, MessagingError> {
+        let me = self.messenger(uid)?;
+        // As an ng `msg` from it would never be routed as one.
+        if !self.has_inbox(uid) {
+            return Err(MessagingError::NotEnabled);
+        }
+        let them = self.other(&me, to)?;
+        if text.len() > self.messaging_policy.max_message_bytes {
+            return Err(MessagingError::MessageTooLong);
+        }
+        let friend = self.friendship(&me.mailbox, &them)?;
+        let sending = Sending {
+            mailbox: me.mailbox,
+            takes_part: true,
+            understands: me.understands,
+            classic: false,
+        };
+        self.route(uid, sending, them, friend, &text, &guid, &None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -215,24 +250,21 @@ impl Core {
         text: &str,
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
-    ) -> Result<MsgOutcome, ChatError> {
-        let rel = self.friends_store().map_err(chat_error)?;
+    ) -> Result<MsgOutcome, MessagingError> {
+        let rel = self.friends_store()?;
         let me = Me {
             mailbox: sending.mailbox.clone(),
             understands: sending.understands,
         };
         // A block reads as no account at all, before any bound.
-        if rel
-            .is_blocked(&them, &me.mailbox)
-            .map_err(|e| chat_error(store_failed(e)))?
-        {
-            return Err(ChatError::NoSuchUser);
+        if rel.is_blocked(&them, &me.mailbox).map_err(store_failed)? {
+            return Err(MessagingError::AccountNotFound);
         }
         if signed
             .as_ref()
             .is_some_and(|s| them.fingerprint != Some(s.to))
         {
-            return Err(ChatError::SignedElsewhere);
+            return Err(MessagingError::SignedElsewhere);
         }
         // A retry of a request is answered as the request was, whatever
         // the two have become since (§4.4).
@@ -240,7 +272,7 @@ impl Core {
             let sender = Requester::Account(me.mailbox.clone());
             if rel
                 .find_request(&sender, Some(&them), g)
-                .map_err(|e| chat_error(store_failed(e)))?
+                .map_err(store_failed)?
                 .is_some()
             {
                 return Ok(MsgOutcome::Requested);
@@ -260,18 +292,14 @@ impl Core {
                 (false, Some(id)) => MsgOutcome::Queued(id),
                 _ => MsgOutcome::Delivered,
             })
-            .map_err(chat_error)
         };
         if let Some(id) = friend {
             return store((id, false));
         }
-        if rel
-            .is_blocked(&me.mailbox, &them)
-            .map_err(|e| chat_error(store_failed(e)))?
-        {
-            return Err(ChatError::NotFriends);
+        if rel.is_blocked(&me.mailbox, &them).map_err(store_failed)? {
+            return Err(MessagingError::NotFriends);
         }
-        if let Some(id) = self.approval(&me.mailbox, &them).map_err(chat_error)? {
+        if let Some(id) = self.approval(&me.mailbox, &them)? {
             return store((id, true));
         }
         // Writing back is consent to the conversation (§4.3), from a
@@ -282,20 +310,16 @@ impl Core {
                 .iter()
                 .any(|s| Key::of(s) == Key::of(&them))
         {
-            let id = self
-                .approve_requests(&me.mailbox, &them)
-                .map_err(chat_error)?;
+            let id = self.approve_requests(&me.mailbox, &them)?;
             return store((id, true));
         }
         // The sender understands requests, a classic sender aside, which
         // is exempt (§4.1), whether or not its own account takes them;
         // the recipient's account takes them.
         let may_ask = sending.classic || (sending.takes_part && sending.understands);
-        let account = rel
-            .account(&them)
-            .map_err(|e| chat_error(store_failed(e)))?;
+        let account = rel.account(&them).map_err(store_failed)?;
         if !may_ask || !account.takes_requests {
-            return Err(ChatError::NotFriends);
+            return Err(MessagingError::NotFriends);
         }
         self.request(
             uid,
@@ -305,8 +329,7 @@ impl Core {
             guid,
             signed,
             account.requests_opted_at,
-        )
-        .map_err(chat_error)?;
+        )?;
         Ok(MsgOutcome::Requested)
     }
 
@@ -493,6 +516,17 @@ impl Core {
     /// the session one that understands requests, and leaves whether its
     /// account takes them as it was (§4.1).
     pub fn requests_list(&self, uid: Uid) -> Result<RequestsListing, MessagingError> {
+        self.requests_list_page(uid, true)
+    }
+
+    /// [`Self::requests_list`] for a wire that pages it: only the first
+    /// page says how many were dropped, and only reading it resets the
+    /// count, so a later page reads `dropped` as 0.
+    pub fn requests_list_page(
+        &self,
+        uid: Uid,
+        first: bool,
+    ) -> Result<RequestsListing, MessagingError> {
         let me = self.messenger(uid)?;
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
@@ -507,7 +541,11 @@ impl Core {
             m.understands_requests = true;
         }
         let now = self.clock.wall();
-        let dropped = rel.requests_listed(&me.mailbox).map_err(store_failed)?;
+        let dropped = if first {
+            rel.requests_listed(&me.mailbox).map_err(store_failed)?
+        } else {
+            0
+        };
         let mut requests: Vec<RequestGroup> = Vec::new();
         for m in inbox
             .requests(&me.mailbox, self.requests_since(), self.requests_bound())

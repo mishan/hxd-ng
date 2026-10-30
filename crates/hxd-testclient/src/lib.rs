@@ -14,6 +14,7 @@
 //! unwraps; the harness counts the error and carries on.
 
 pub mod legacy;
+pub mod messaging;
 pub mod ng;
 pub mod tls;
 

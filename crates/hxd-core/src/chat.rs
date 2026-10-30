@@ -1588,7 +1588,7 @@ impl Core {
     /// chosen now, while the session is on the roster to be read.
     pub fn spend_spam(&self, uid: Uid, points: u32, trans: u32) -> Result<(), Flooded> {
         let limits = self.flood_limits;
-        let (nick, total, targets) = {
+        let (nick, total, targets, shown) = {
             let mut r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get_mut(&uid) else {
                 return Ok(());
@@ -1608,10 +1608,11 @@ impl Core {
             } else {
                 self.kick_ban_targets(sess)
             };
+            let shown = sess.visible;
             // Kicked under the lock that found it over, so a burst in
             // flight kicks it once; banned once the lock is let go.
             match kick_in(&mut r, uid) {
-                Ok(nick) => (nick, total, targets),
+                Ok(nick) => (nick, total, targets, shown),
                 Err(_) => return Err(Flooded { ban: None }),
             }
         };
@@ -1623,16 +1624,19 @@ impl Core {
         warn!(uid, nick = %nick, total, trans, "{verb} for spam_max");
         crate::instrument::flood_kick("spam");
         // mhxd's `user_kick` with the spammer as its own kicker, and the
-        // reason its `hxd_rcv` gives.
-        self.chat_notice(
-            0,
-            uid,
-            format!(
-                "{nick} has been {verb} by {nick}: spam_max exceeded: {total} >= {}, \
-                 last transaction: 0x{trans:x}",
-                limits.spam_points
-            ),
-        );
+        // reason its `hxd_rcv` gives; never of a session no list shows,
+        // whose leaving the lobby would learn of from nothing else.
+        if shown {
+            self.chat_notice(
+                0,
+                uid,
+                format!(
+                    "{nick} has been {verb} by {nick}: spam_max exceeded: {total} >= {}, \
+                     last transaction: 0x{trans:x}",
+                    limits.spam_points
+                ),
+            );
+        }
         Err(Flooded {
             ban: (!targets.is_empty()).then_some(SpamBan {
                 uid,
@@ -1729,7 +1733,8 @@ impl Core {
     /// creator's row (the reply carries it).
     pub fn chat_create(&self, creator: Uid, invitee: Uid) -> Result<(u32, UserInfo), ChatError> {
         let mut r = self.roster.lock().unwrap();
-        if !r.users.contains_key(&invitee) {
+        // A session no list shows is nobody to invite.
+        if !r.users.get(&invitee).is_some_and(|s| s.visible) {
             return Err(ChatError::NoSuchUser);
         }
         let me = r
@@ -1783,7 +1788,7 @@ impl Core {
             .get(&by)
             .map(|s| s.info.nick.clone())
             .ok_or(ChatError::NoSuchUser)?;
-        if !r.users.contains_key(&target) {
+        if !r.users.get(&target).is_some_and(|s| s.visible) {
             return Err(ChatError::NoSuchUser);
         }
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
@@ -3225,7 +3230,14 @@ impl Core {
     pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<Kicked, ChatError> {
         let (nick, targets, serial) = {
             let mut r = self.roster.lock().unwrap();
-            let sess = r.users.get_mut(&target).ok_or(ChatError::NoSuchUser)?;
+            // A session no list shows is nobody to kick by uid, as it is
+            // nobody to message or ask about: a messenger session
+            // (`Transport::messenger_session`) is ended by a ban.
+            let sess = r
+                .users
+                .get_mut(&target)
+                .filter(|s| s.visible)
+                .ok_or(ChatError::NoSuchUser)?;
             // The server cannot be kicked off its own roster
             // (`docs/system-account.md` §2). Refused the same way a kick
             // of somebody who is not there is refused, because from the
@@ -4592,6 +4604,8 @@ mod tests {
             .unwrap()
         };
         let kick_ban = |uid, by| {
+            // A kick names a session on the roster, as only a shown one is.
+            core.announce(uid);
             core.kick_by(
                 uid,
                 Some(KickBan {
@@ -4675,6 +4689,8 @@ mod tests {
             .unwrap()
         };
         let kick_ban = |uid| {
+            // A kick names a session on the roster, as only a shown one is.
+            core.announce(uid);
             core.kick_by(
                 uid,
                 Some(KickBan {
@@ -4770,6 +4786,8 @@ mod tests {
         // Placed, the person and the address are one act, which one lift
         // undoes whole.
         let ban = |uid| {
+            // A kick names a session on the roster, as only a shown one is.
+            core.announce(uid);
             core.kick_by(
                 uid,
                 Some(KickBan {

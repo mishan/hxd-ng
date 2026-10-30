@@ -1,7 +1,8 @@
 # Instant messaging
 
-Status: design; the store (IM1, §8), the domain (IM2) and the ng wire's
-server half (IM3) are built, with what IM2 leaves open staged as IM2b.
+Status: design; the store (IM1, §8), the domain (IM2), the ng wire's
+server half (IM3) and the classic wire (IM4) are built, with what IM2
+leaves open staged as IM2b.
 hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
 ("the extension"), built on the inbox (`private-messages.md`), with
@@ -235,8 +236,10 @@ messaging, as before, keep `private-messages.md` §11's named `blocked`,
 and a uid `msg` to a detached session still goes to its inbox. A bit-8
 messenger session (§7) is on neither user list, so neither 108 nor a uid
 `msg` can name it. On the classic wire, an IM Send (810) to a non-friend
-is refused `NotFriends` whatever the recipient takes until fogWraith
-gives `Requested` a number (§7), and only then makes requests.
+follows the order above under the number fogWraith reserved for
+`Requested` (§7), from a session that understands requests; unlike
+`/msg <login>`, one from any other session is refused `NotFriends`, as
+the requests draft has it.
 
 ### 4.2 What the sender sees
 
@@ -402,9 +405,6 @@ Messages pass both ways, but an approval shows less than a friendship:
   off stops new ones and nothing else: an approval's traffic, its Read
   receipts among it, still reaches the sessions that understand them.
 
-On the classic wire an approved conversation over 810 waits for the
-numbers of §7, as requests do; until then it is the ng wire's.
-
 The approver ends one through the requests operations (§7), which holds
 the sender as a delete does (§4.4). Either party's Block User (806) ends
 it, and so does a friendship between the pair, which then takes the
@@ -548,17 +548,35 @@ relationship store, through the same calls:
 
 ## 7. The wires
 
-**The classic wire**: capability bits 6 and 8 (bit 6 only for accounts
-with bit 58), transactions 800–813 and 822–826, the limits fields, bit
-8's hiding from 300/301/302 and from the ng roster, and the identity
-draft's fields. Message requests add transactions 829–832, reserved
-(below):
+**The classic wire** (`hxd-session`'s `friends.rs`): capability bits 6
+and 8, bit 6 only for an account that takes part (bit 58, not `admin`
+or `guest`) on a server with `[messaging]` on, and bit 8 only beside
+it; transactions 800–813 and 822, 824 and 825; the limits fields; and
+bit 8's hiding from 300/301/302 and from the ng roster. A bit-8 session
+is never announced, so no user list, join, change or part names it;
+neither 108, a uid `msg`, a private chat's or a room's invite nor a
+kick by uid reaches it; it is flushed no private messages, which wait
+for a visible session of its account; and the friend family alone
+reaches it. It may itself send only the family's transactions and what
+finishing its login and staying up need (the agreement, User Change
+for a 1.5 client's name, and the keep-alive); anything else is refused
+and a chat line dropped, since a session nobody can see that could chat,
+message, invite or fetch files would make bit 8 a stealth mode for any
+messaging account. A moderator ends one by banning or disabling its
+account. Not yet:
+file transfer and calls (814–821), User Search (823), Set User Info
+(826), which the domain has no write for and which is answered as any
+transaction the server does not implement, buddy icons (827, 828) and
+the identity draft's fields. Message requests add transactions 829–832,
+under the numbers fogWraith reserved (below):
 
 - **Get Message Requests**, `DATA_REQUEST_CURSOR` optional, answered
-  first with `DATA_REQUEST_COUNT`, the requests dropped since the last
-  listing, and `DATA_REQUEST_CURSOR` where there is more, before any
-  group, as a reason code precedes entries, since everything after a
-  `DATA_FRIEND_LOGIN` belongs to its group; then groups delimited by
+  first, on the first page, with `DATA_TAKES_REQUESTS`, the caller's own
+  setting, and `DATA_REQUEST_COUNT`, the requests and friend requests
+  dropped since the last listing, and with `DATA_REQUEST_CURSOR` where
+  there is more, before any group, as a reason code precedes entries,
+  since everything after a `DATA_FRIEND_LOGIN` belongs to its group;
+  then groups delimited by
   `DATA_FRIEND_LOGIN`, each the sender's `DATA_FRIEND_IDENTITY` where
   §4.5 shows it and its messages, each message delimited by its
   `DATA_MESSAGE_GUID`, which with the sender names it for a report, and
@@ -579,9 +597,38 @@ A period client clears its requests as `/requests clear
 [newer|older <duration>]` to the system account (`system-account.md`),
 everything if no span is given.
 
-Until the numbers are adopted, a classic 810 to a non-friend is refused
-`NotFriends` and requests exist on the ng wire alone (§4.1), apart from
-`/msg <login>`, which needs no number.
+What the classic wire says differently from the documents, on purpose:
+
+- **Prices.** Every request of the family spends spam points as its
+  nearest classic counterpart in mhxd's table, not at its catch-all, at
+  which a roster read's receipts would be a ban (the table in
+  `friends.rs`); a message, a block and an unblock, which name a Login,
+  cost as much as Find User.
+- **A block or an unblock of a Login nobody holds** is answered OK, so
+  that neither confirms that a Login exists.
+- **The message bound** advertised to a Mac Roman session is a third of
+  `max_message_bytes`: the domain bounds UTF-8, which a Mac Roman byte
+  can take three of, and an advertisement may be tighter than the bound
+  but never looser.
+- **Get Roster** sends as many entries as fit a frame in its reply and
+  the rest as Roster Entries after it, as the extension allows.
+- **Reasons.** A request past `request_messages` is refused `QueueFull`
+  and an answer with no such request `AccountNotFound`, as the requests
+  draft has them, where the ng wire says `request_full` and
+  `no_such_request`. An 802 to an account the caller has blocked is
+  refused with no reason code: the extension's `Blocked` is the other
+  side's block.
+- **What an entry carries.** Roster entries and presence changes carry
+  no `FieldUserName` or `DATA_FRIEND_CAPABILITIES` yet, which the
+  extension makes optional; a page of Get Message Requests carries
+  no `DATA_FRIEND_IDENTITY` or `DATA_MESSAGE_SIGNED`, which are the
+  identity draft's, unnegotiated here; and, as on the ng wire, Get
+  Message Requests delivers nothing, where the draft has it hand over
+  what waits under the caller's approvals.
+- **A cursor** is the place of the next group in the listing, read
+  whole again for each page, so a request that arrives or goes between
+  pages can move what the next page starts with. Only the first page
+  says, and resets, the dropped count.
 
 **A client learns that a server takes requests** from the login reply,
 as it learns buddy icons: a server that confirms `CAPABILITY_MESSAGING`
@@ -607,13 +654,14 @@ take or leave, and until he does, nothing here is the extension's.
 | Transaction | Message Requests Changed | 832 | above |
 | Transaction | Present Friendships | 833 | portable friends §4.3 |
 | Transaction | Get Friendships | 834 | portable friends §4.2 |
-| Field | `DATA_TAKES_REQUESTS` | `0x0650`, UInt16 | 808, beside `DATA_DISCOVERABLE` |
+| Field | `DATA_TAKES_REQUESTS` | `0x0650`, UInt16 | 808, beside `DATA_DISCOVERABLE`, and Get Message Requests' first page |
 | Field | `DATA_REQUEST_CURSOR` | `0x0651`, Binary | Get Message Requests and its reply |
 | Field | `DATA_REQUEST_ACTION` | `0x0652`, UInt16: 1 approve, 2 delete, 3 end | Answer Message Request |
 | Field | `DATA_REQUEST_COUNT` | `0x0653`, UInt32 | Get Message Requests, Clear Message Requests and Message Requests Changed replies, as each says |
 | Field | `DATA_FRIEND_REQUEST_COUNT` | `0x0654`, UInt32 | Clear Message Requests' reply |
 | Field | `DATA_SPAN_SINCE`, `DATA_SPAN_BEFORE` | `0x0655`, `0x0656`, UInt64, Unix seconds | Clear Message Requests |
 | Field | `DATA_MAX_REQUEST_MESSAGES` | `0x0625`, UInt32 | Login reply, in the limits sub-block: `request_messages`; absent when the server takes no requests |
+| Field | | `0x0657` | kept spare |
 | Field | `DATA_FRIEND_OFFER`, `DATA_FRIENDSHIP`, `DATA_FRIEND_WITHDRAW`, `DATA_FRIENDSHIP_HASH`, `DATA_IDENTITY_ROTATION` | `0x0658`–`0x065C`, Binary | portable friends §7 |
 
 Device proof (portable friends §3) is not messaging's and is reserved
@@ -738,10 +786,13 @@ Each stage is a branch with tests, in the house style.
    binary's presence flush task. hx-ng gains a friends list and a
    requests view. This is where the design is first used end to end, by
    a client we control.
-4. **IM4, the classic wire.** §7's classic half, requests once IM5 has
-   their numbers. The 800-block in `hxproto` in hx-libs first, then
-   GtkHx's buddy list. Checked against Janus where it can be run, and
-   against Tagban's Hotline Instant Messenger where a Mac is to hand.
+4. **IM4, the classic wire.** §7's classic half, requests under the
+   numbers IM5 had reserved. The 800-block in `hxproto` in hx-libs
+   first, then GtkHx's buddy list. Checked against Janus where it can
+   be run, and against Tagban's Hotline Instant Messenger where a Mac is
+   to hand. The server's half is built, driven by `hxproto`'s builders
+   and parsers in `crates/hxd/tests/friends_classic.rs`; the buddy list
+   and those checks are still to come.
 5. **IM5, upstream**, before IM4 rather than after it. Message requests
    sent to fogWraith early, as a draft for his input, with §7's numbers
    and asks in one request together with
@@ -786,7 +837,9 @@ per account rather than two to keep in step. They follow IM4.
   (§10), so the relay's path is the same for every ng session.
 
 **Settings**: a `[messaging]` section with the extension's settings
-(`enabled`, off by default; `max_roster`; `max_message_bytes`;
+(`enabled`, off by default; `max_roster`; `max_message_bytes`, at most
+what one classic field carries beside the queued stamp, and with `request_messages`
+no more than one page of Get Message Requests holds for one sender;
 `offline_retention_days`; `max_offline`, aligned with `[inbox]`;
 `max_sessions_per_login`, default 0, unlimited) and the requests'
 (`request_messages`, `requests_per_day`, `max_requests`,
