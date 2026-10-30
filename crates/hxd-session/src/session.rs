@@ -567,11 +567,8 @@ pub(crate) fn enqueue(tx: &Tx, out: Outbound) {
     }
     if tx.out.send(out).is_err() {
         b.share.give(len);
-        // The writer is gone, and with it the next publish. Gone with the
-        // socket still open, a panic, say, it would leave the session
-        // listed and deaf: lagging ends it, as a writer that stalls does.
+        // The writer is gone, and with it the next publish.
         b.publish(1, len as i64);
-        b.lag();
     }
 }
 
@@ -672,11 +669,25 @@ fn type_label(ty: u32) -> Kind<'static> {
     }
 }
 
+/// Ends the session of a writer that panics, which would otherwise leave
+/// it listed and deaf behind a reader still open: as a writer that stalls
+/// does, by lagging.
+struct LagOnUnwind(Arc<Backlog>);
+
+impl Drop for LagOnUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.lag();
+        }
+    }
+}
+
 pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: UnboundedReceiver<Outbound>,
     backlog: Arc<Backlog>,
 ) {
+    let _unwind = LagOnUnwind(backlog.clone());
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;

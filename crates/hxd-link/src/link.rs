@@ -125,11 +125,16 @@ impl Drop for Registered {
             return;
         }
         // On a thread of its own: a panic during an unwind aborts the
-        // process, and the lock that panicked may be the hub's.
+        // process, and the lock that panicked may be the hub's. In the
+        // runtime, because holding the link spawns its expiry.
         let (hub, peer, generation) = (self.hub.clone(), self.peer.clone(), self.generation);
+        let rt = tokio::runtime::Handle::try_current();
         let _ = std::thread::Builder::new()
             .name("link-let-go".into())
-            .spawn(move || hub.unregister(&peer, generation, true));
+            .spawn(move || {
+                let _rt = rt.as_ref().map(|rt| rt.enter());
+                hub.unregister(&peer, generation, true)
+            });
     }
 }
 
@@ -1208,6 +1213,53 @@ mod tests {
             reply,
         };
         assert!(admit(&mut pending, request).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_link_task_that_unwinds_is_held_as_interrupted() {
+        let hub = Hub::new(
+            &[1; 32],
+            crate::hub::HubConfig {
+                tag: "hx".into(),
+                name: "here".into(),
+                color: None,
+                show_tags: false,
+                max_ghosts: 100,
+                grace: Duration::from_secs(60),
+                peers: vec![],
+                discovery_key: None,
+                export_keys: true,
+            },
+            Arc::new(hxd_core::Core::new()),
+        );
+        let (generation, _closed) = hub.register("a");
+        let peer = ServerGroup {
+            id: ServerId([2; 8]),
+            tag: "two".into(),
+            name: "two".into(),
+            hops: 0,
+            color: None,
+            extra: vec![],
+        };
+        hub.accept_server("a", generation, peer, true).unwrap();
+        hub.resume("a", generation, ServerId([2; 8]), [1; 8], 0);
+        let registered = Registered {
+            hub: hub.clone(),
+            peer: "a".into(),
+            generation,
+        };
+        let unwound = tokio::spawn(async move {
+            let _registered = registered;
+            panic!("unwinding");
+        });
+        assert!(unwound.await.unwrap_err().is_panic());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.holding("a").is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("held for the grace period");
     }
 
     #[test]
