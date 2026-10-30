@@ -722,9 +722,15 @@ Each stage is a branch with tests, in the house style.
    request's id held to one content by the ledger;
    a released request counted once toward the daily quota; a link
    made while the account has sessions re-keying them, or ending them;
-   and a status text changed while invisible, which friends read once
+   a status text changed while invisible, which friends read once
    the last session leaves, kept from them by persisting the last text
-   shown or deferring the write until the account is visible.
+   shown or deferring the write until the account is visible; and a
+   message by login reaching every eligible session of the account
+   when their reads differ and the backlog passes `deliver_at_flush`,
+   where today a row in one session's batch is stamped delivered for
+   the mailbox and the other session never reads it, closed by
+   delivery tracked per session or a stamp deferred until each has
+   been handed the row.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol (`hotline-ng.md` §7.5) and their `request_weight`s,
    with two of IM2b's: the `[messaging]` section, its `max_offline`,
