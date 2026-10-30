@@ -223,6 +223,15 @@ fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn Relati
     s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
     s.keep_withdrawal(&withdrawal(1, 9, 5, true, 1), 10)
         .unwrap();
+    // The successor's own for two more pairs: a later cutoff than the
+    // predecessor's for one, and an earlier one for the other.
+    let held = |owner, pair, before| HeldWithdrawal {
+        party: fp(9),
+        ..withdrawal(owner, pair, before, true, 1)
+    };
+    for (owner, pair, before) in [(1, 7, 10), (5, 7, 20), (1, 6, 30), (5, 6, 15)] {
+        s.keep_withdrawal(&held(owner, pair, before), 10).unwrap();
+    }
     s.keep_rotation(&fp(1), &fp(5), b"record").unwrap();
     s.keep_rotation(&fp(1), &fp(6), b"other").unwrap();
     s.rotate(&fp(1), &fp(5)).unwrap();
@@ -264,6 +273,19 @@ fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn Relati
         fp(5),
         "{case}: counted toward the successor"
     );
+    for (pair, before) in [(7, 20), (6, 30)] {
+        let kept: Vec<_> = s
+            .withdrawals(&[pair; 32])
+            .unwrap()
+            .iter()
+            .map(|w| (w.owner, w.before, w.withdrawal.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [(fp(5), before, Some(vec![pair, before as u8]))],
+            "{case}: the later cutoff stands, with its object"
+        );
+    }
 
     s.purge(&Mailbox::identified("x", fp(5))).unwrap();
     assert!(

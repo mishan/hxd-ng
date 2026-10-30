@@ -390,17 +390,26 @@ impl Inner {
             kept.push((a, b, o));
         }
         self.offers = kept;
-        // A moved withdrawal takes the place of the successor's own for
-        // the same pair and party, as SQLite's replace does.
+        // Of a successor's withdrawal and a moved one for the same pair,
+        // party and kind, the later cutoff stands, the moved one on a tie.
         let key = |w: &HeldWithdrawal| (w.pair, w.party, w.withdrawal.is_none());
-        let moved: Vec<_> = self
-            .withdrawals
-            .iter()
-            .filter(|w| w.owner == *from)
-            .map(key)
-            .collect();
-        self.withdrawals
-            .retain(|w| !(w.owner == *to && moved.contains(&key(w))));
+        let of = |owner: &[u8; 32]| -> Vec<_> {
+            self.withdrawals
+                .iter()
+                .filter(|w| w.owner == *owner)
+                .map(|w| (key(w), w.before))
+                .collect()
+        };
+        let (moved, theirs) = (of(from), of(to));
+        self.withdrawals.retain(|w| {
+            if w.owner == *to {
+                !moved.iter().any(|(k, b)| *k == key(w) && *b >= w.before)
+            } else if w.owner == *from {
+                !theirs.iter().any(|(k, b)| *k == key(w) && *b > w.before)
+            } else {
+                true
+            }
+        });
         for w in self.withdrawals.iter_mut() {
             if w.owner == *from {
                 w.owner = *to;

@@ -448,8 +448,21 @@ fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, Store
             ))?;
         }
     }
+    // Of a successor's withdrawal and a moved one for the same pair,
+    // party and kind, the later cutoff stands, with its object.
+    for (kept, gone, wins) in [("?2", "?1", ">="), ("?1", "?2", ">")] {
+        sql(tx.execute(
+            &format!(
+                "DELETE FROM friend_withdrawal AS g WHERE g.owner = {gone} AND EXISTS
+                   (SELECT 1 FROM friend_withdrawal AS k
+                     WHERE k.owner = {kept} AND k.pair = g.pair AND k.party = g.party
+                       AND k.own = g.own AND k.before {wins} g.before)"
+            ),
+            params![to, from],
+        ))?;
+    }
     n += sql(tx.execute(
-        "UPDATE OR REPLACE friend_withdrawal SET owner = ?1 WHERE owner = ?2",
+        "UPDATE friend_withdrawal SET owner = ?1 WHERE owner = ?2",
         params![to, from],
     ))?;
     Ok(n)

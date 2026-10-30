@@ -111,7 +111,9 @@ pub struct Lookup {
     /// The rotation records among them, as they were published, by the
     /// predecessor's fingerprint: what a friend's client fetches to check
     /// a rotation for itself (`docs/proposals/portable-friends.md` §10).
-    pub rotations: Vec<(Fingerprint, Vec<u8>)>,
+    /// Each with its successor's too, since a predecessor can be named by
+    /// two rotations to two keys, of which only one stands here.
+    pub rotations: Vec<(Fingerprint, Fingerprint, Vec<u8>)>,
     /// Some registrar that attested the identity has no list this
     /// server can call current: `RegistrarsConfig::stale` decides.
     pub stale: bool,
@@ -578,13 +580,14 @@ impl Registrars {
                         frozen.insert(f.registrar, f.frozen);
                     }
                     Record::Rotate(r) if Fingerprint::of(&r.identity) == *fp => {
+                        let to = Fingerprint::of(&r.successor);
                         let record = found
                             .rotations
                             .iter()
-                            .find(|(from, _)| from == fp)
-                            .map(|(_, b)| b.clone())
+                            .find(|(from, succ, _)| from == fp && *succ == to)
+                            .map(|(_, _, b)| b.clone())
                             .unwrap_or_default();
-                        rotations.push((*fp, Fingerprint::of(&r.successor), record));
+                        rotations.push((*fp, to, record));
                     }
                     _ => {}
                 }
@@ -637,9 +640,11 @@ impl Registrars {
                 for (_, bytes) in &page.entries {
                     let record = Record::parse(bytes, Some(keys));
                     if let Ok(Record::Rotate(r)) = &record {
-                        lookup
-                            .rotations
-                            .push((Fingerprint::of(&r.identity), bytes.clone()));
+                        lookup.rotations.push((
+                            Fingerprint::of(&r.identity),
+                            Fingerprint::of(&r.successor),
+                            bytes.clone(),
+                        ));
                     }
                     match record {
                         Ok(r) if Fingerprint::of(r.identity()) == fp => lookup.records.push(r),
@@ -764,6 +769,61 @@ mod tests {
         let registrars = registrars(cache);
         assert_eq!(registrars.keys("hl.example", &identity, 99), [old, new]);
         assert_eq!(registrars.keys("hl.example", &identity, 100), [new]);
+    }
+
+    #[test]
+    fn each_rotation_found_carries_its_own_record() {
+        use hl_identity::{IdentityKey, Rotation};
+        let key = ServerKey::from_seed(&[3; 32]);
+        let from = IdentityKey::from_seed(&[4; 32]);
+        let to = [5u8, 6].map(|n| IdentityKey::from_seed(&[n; 32]));
+        let records = to.each_ref().map(|t| {
+            Rotation {
+                identity: from.public(),
+                successor: t.public(),
+                time: 10,
+            }
+            .sign(&from, t)
+            .unwrap()
+        });
+        let pred = Fingerprint::of(&from.public());
+        let page = SignedList {
+            registrar: "hl.example".into(),
+            issued: 1,
+            expires: u64::MAX,
+            fingerprint: Some(pred.0),
+            since: None,
+            more: false,
+            entries: records
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, r)| (i as u64 + 1, r))
+                .collect(),
+        }
+        .sign(ListKind::Records, &key);
+        let cache = Arc::new(hxd_core::identity_records::MemoryRecordCache::default());
+        cache
+            .put(
+                &pred.0,
+                &CachedList {
+                    registrar: "hl.example".into(),
+                    pages: vec![page],
+                    keys: vec![(key.public(), None)],
+                    fetched: 1,
+                },
+            )
+            .unwrap();
+        let (_, rotations) = registrars(cache).refused(&[pred], false);
+        assert_eq!(rotations.len(), 2);
+        for (f, t, record) in rotations {
+            let r = Rotation::parse(&record).unwrap();
+            assert_eq!(
+                (f, t),
+                (Fingerprint::of(&r.identity), Fingerprint::of(&r.successor)),
+                "a record for the rotation it is passed with"
+            );
+        }
     }
 
     #[test]

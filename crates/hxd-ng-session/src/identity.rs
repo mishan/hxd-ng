@@ -1460,12 +1460,15 @@ impl IdentityState {
                 Record::RevokeAttestation(r) => attestations.retain(|a| !r.voids(a)),
                 Record::Rotate(r) => {
                     let (from, to) = (Fingerprint::of(&r.identity), Fingerprint::of(&r.successor));
-                    let record = found.rotations.iter().find(|(f, _)| *f == from);
+                    let record = found
+                        .rotations
+                        .iter()
+                        .find(|(f, t, _)| *f == from && *t == to);
                     self.accept_rotation(
                         from,
                         to,
                         "a registrar's records",
-                        record.map(|(_, b)| b.as_slice()),
+                        record.map(|(_, _, b)| b.as_slice()),
                     );
                     // Refused only to a rotation accepted here, so one
                     // the anchor overrules names nobody; with no file to

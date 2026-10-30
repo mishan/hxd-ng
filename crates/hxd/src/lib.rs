@@ -4288,7 +4288,8 @@ pub fn build_ng_ctx(
     let identity = match config.identity.as_ref() {
         Some(section) => {
             // Installed before anything can connect, so there is no
-            // session yet for it to end.
+            // session yet for it to end; a store read, so the binary calls
+            // this off the reactor.
             legacy.core.set_revocations(section.revocations()?);
             Some(Arc::new(
                 build_identity(section, legacy.auth.clone(), legacy.core.clone())?
