@@ -245,6 +245,11 @@ pub struct Transport {
     /// arriving as private messages, and friend events reach it from
     /// login on.
     pub messaging: bool,
+    /// It asked for portable friendships and proved a device that may
+    /// make them (`docs/proposals/portable-friends.md` §7): the only kind
+    /// of session sent an offer, a friendship hash or a withdrawal, and
+    /// the only one that may make a friendship act.
+    pub friendships: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -276,6 +281,10 @@ pub struct IdentityTag {
     /// (`docs/e2e-messages.md` §4.1): shown as `sealed`, and what a box
     /// to it must be sealed to.
     pub sealed: Option<Arc<crate::sealed::SealedDevice>>,
+    /// The certificate the session proved, where it allows messages and
+    /// is at most 512 bytes: what every friendship act it makes is signed
+    /// with (`docs/proposals/portable-friends.md` §3).
+    pub device_cert: Option<Arc<Vec<u8>>>,
 }
 
 impl IdentityTag {
@@ -655,6 +664,9 @@ pub enum Event {
         login: String,
         fingerprint: Option<[u8; 32]>,
         note: Option<String>,
+        /// The offer it carries, for a friendships session alone
+        /// (`docs/proposals/portable-friends.md` §4.1).
+        offer: Option<Vec<u8>>,
     },
     /// A friend's presence changed (809).
     Presence {
@@ -755,9 +767,16 @@ impl Event {
                     + e.alias.as_ref().map_or(0, String::len)
                     + e.status_text.as_ref().map_or(0, String::len)
                     + e.note.as_ref().map_or(0, String::len)
+                    + e.friendships.len() * 32
+                    + e.offer.as_ref().map_or(0, Vec::len)
+                    + e.withdraw.as_ref().map_or(0, Vec::len)
             }
-            Event::FriendRequest { login, note, .. } => {
-                login.len() + note.as_ref().map_or(0, String::len)
+            Event::FriendRequest {
+                login, note, offer, ..
+            } => {
+                login.len()
+                    + note.as_ref().map_or(0, String::len)
+                    + offer.as_ref().map_or(0, Vec::len)
             }
             Event::Presence {
                 login, status_text, ..

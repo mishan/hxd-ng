@@ -1,6 +1,8 @@
 # Proposal: portable friends for the Instant Messaging extension
 
-Status: proposal, unimplemented. Builds on `instant-messaging.md`,
+Status: proposal. PF1 and PF2 (§8) are built: the objects in
+`hl-identity`, and the server and the ng wire (`hotline-ng.md` §7.5).
+Builds on `instant-messaging.md`,
 hxd-ng's implementation of fogWraith's
 [Capabilities-Messaging.md](https://github.com/fogWraith/Hotline/blob/main/Docs/Protocol/Capabilities-Messaging.md)
 ("the extension"), on the extension's
@@ -321,15 +323,14 @@ makes a local edge, as the extension describes.
   keep a canceled offer from becoming a friendship anywhere. An 803
   carrying an upgrade offer (`DATA_FRIEND_OFFER`) cancels that offer
   and keeps the edge.
-- **Crossing requests.** An 802 that meets the target's pending request
-  to the sender, where either carries an offer, is not accepted by
-  `instant-messaging.md` §3's crossing rule, since two offers make no
-  friendship: the server stores it as any offer, and sends the earlier
-  request's 804, with its offer, to the caller's sessions that
-  negotiated `CAPABILITY_FRIENDSHIPS`, whose client answers with an
-  805. Where neither carries one, the crossing rule stands. Once both
-  accounts of a local edge are linked, whichever client learns it first
-  sends an upgrade offer; two that cross are harmless, since the first
+- **Crossing requests.** An 802 carrying an offer that meets the
+  target's pending request to the sender is answered `RequestPending`,
+  as the extension has it; one without an offer is answered as the
+  extension, or message requests where a server implements them
+  (`instant-messaging.md` §3), answers it; a client that implements this
+  answers the pending request with an 805 instead. Once both accounts
+  of a local edge are linked, whichever client learns it first sends an
+  upgrade offer; two that cross are harmless, since the first
   acceptance makes the edge portable and drops the other offer.
 
 A message request (`instant-messaging.md` §4) answered with Add Friend
@@ -440,8 +441,9 @@ hidden party. Inactive presentations are bounded on their own, at
 refused `RosterFull` at step 1, rather than an older one dropped while
 the client still records it as presented. The bound counts every
 friendship the account has presented here that is not active, whether
-step 4 recorded it or steps 2 and 3 kept nothing of it but its hash,
-so that reaching it says nothing of which other parties were hidden. A
+step 4 recorded it or step 2 kept nothing of it but its hash, as the
+identity draft has it, so that reaching it says nothing of which other
+parties were hidden. A
 party's presentations are dropped when it unlinks or its account is
 deleted; its withdrawals are kept.
 

@@ -123,12 +123,27 @@ impl Core {
     /// and `resume` refuses one outright. Either way the resume token
     /// dies with the session, which is the point: an attacker holding
     /// one should not be able to come back through it.
+    ///
+    /// The presentations a newly revoked device made are dropped too
+    /// (`docs/proposals/portable-friends.md` §6): store work, so this is
+    /// called off the reactor.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
-        self.revoked.write().unwrap().local = list.clone();
+        let devices: Vec<_> = {
+            let mut refused = self.revoked.write().unwrap();
+            let new = list
+                .devices
+                .difference(&refused.local.devices)
+                .map(|d| (None, *d))
+                .collect();
+            refused.local = list.clone();
+            new
+        };
         if list.is_empty() {
             return Vec::new();
         }
-        self.end_revoked(|tag| list.refuses(tag))
+        let ended = self.end_revoked(|tag| list.refuses(tag));
+        self.drop_revoked_presentations(&devices);
+        ended
     }
 
     /// The identity keys of every session on the roster, live or
@@ -148,12 +163,24 @@ impl Core {
     /// Install what the registrars this server trusts publish against
     /// keys, replacing the last, and end every session it now refuses, as
     /// [`Self::set_revocations`] does for the operator's own list.
+    /// Called off the reactor, as [`Self::set_revocations`] is.
     pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
-        self.revoked.write().unwrap().published = list.clone();
+        let devices: Vec<_> = {
+            let mut refused = self.revoked.write().unwrap();
+            let new = list
+                .devices
+                .difference(&refused.published.devices)
+                .map(|(i, d)| (Some(*i), *d))
+                .collect();
+            refused.published = list.clone();
+            new
+        };
         if list.is_empty() {
             return Vec::new();
         }
-        self.end_revoked(|tag| list.refuses(tag))
+        let ended = self.end_revoked(|tag| list.refuses(tag));
+        self.drop_revoked_presentations(&devices);
+        ended
     }
 
     /// Refuse `identity` from now on, as a key its holder rotated away
@@ -240,6 +267,7 @@ mod tests {
             can_sign: false,
             device_expires: u64::MAX,
             sealed: None,
+            device_cert: None,
         }
     }
 

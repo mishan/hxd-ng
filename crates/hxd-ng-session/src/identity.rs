@@ -223,6 +223,8 @@ impl TransportIdentity {
             can_sign: false,
             device_expires: self.device_expires,
             sealed: None,
+            device_cert: (self.may_message() && self.device_cert.len() <= 512)
+                .then(|| std::sync::Arc::new(self.device_cert.clone())),
         }
     }
 }
@@ -1363,6 +1365,7 @@ impl IdentityState {
             })?;
         match outcome {
             UnlinkOutcome::Unlinked(a) => {
+                self.core.friendships_unlinked(&ident.fingerprint.0);
                 let stays = self
                     .core
                     .inbox_counts_of(&hxd_core::inbox::Mailbox::identified(
@@ -1457,7 +1460,16 @@ impl IdentityState {
                 Record::RevokeAttestation(r) => attestations.retain(|a| !r.voids(a)),
                 Record::Rotate(r) => {
                     let (from, to) = (Fingerprint::of(&r.identity), Fingerprint::of(&r.successor));
-                    self.accept_rotation(from, to, "a registrar's records");
+                    let record = found
+                        .rotations
+                        .iter()
+                        .find(|(f, t, _)| *f == from && *t == to);
+                    self.accept_rotation(
+                        from,
+                        to,
+                        "a registrar's records",
+                        record.map(|(_, _, b)| b.as_slice()),
+                    );
                     // Refused only to a rotation accepted here, so one
                     // the anchor overrules names nobody; with no file to
                     // keep rotations in, the record is all there is.
@@ -1578,22 +1590,20 @@ impl IdentityState {
         // A rotation found is accepted as at an admission, which refuses
         // its predecessor unless an anchor here overrules it; with no
         // file to keep rotations in, the record refuses it here.
-        let refused = match crate::spawn_blocking("identity", move || {
+        crate::spawn_blocking("identity", move || {
             let (mut refused, rotations) = registrars.refused(&live, frozen_refuses);
-            for (from, to) in rotations {
-                this.accept_rotation(from, to, "a registrar's records");
+            for (from, to, record) in rotations {
+                this.accept_rotation(from, to, "a registrar's records", Some(&record));
                 if this.anchors.is_none() {
                     refused.identities.insert(from.0);
                 }
             }
-            refused
+            // Here too: installing it drops what newly revoked devices
+            // presented, from the store.
+            this.core.set_published_revocations(refused)
         })
         .await
-        {
-            Ok(refused) => refused,
-            Err(_) => return Vec::new(),
-        };
-        self.core.set_published_revocations(refused)
+        .unwrap_or_default()
     }
 
     /// The card a device on file is admitted under, as `identity_for_device`
@@ -1741,7 +1751,7 @@ impl IdentityState {
         // `committed_successor`: a card a thief showed after the cache
         // forgot the owner's would otherwise be the consent.
         if self.anchors.as_ref().and_then(|a| a.get(&from)) == Some(successor.0) {
-            self.accept_rotation(from, *successor, "the successor's auth");
+            self.accept_rotation(from, *successor, "the successor's auth", Some(bytes));
         } else {
             debug!(predecessor = %from.short(), "rotation shown for a key not anchored to it; ignored");
         }
@@ -1753,11 +1763,29 @@ impl IdentityState {
     /// one that stands, and one to a key other than the successor this
     /// server anchored for it is ignored: the commitment exists to beat a
     /// thief who signs a rotation with a stolen key, whoever publishes it.
-    fn accept_rotation(&self, from: Fingerprint, to: Fingerprint, source: &str) {
+    ///
+    /// The rotation's `record`, where the caller has it, is kept with the
+    /// core once the rotation stands here, for the friends of the identity
+    /// to fetch and check it by (`docs/proposals/portable-friends.md` §10).
+    fn accept_rotation(
+        &self,
+        from: Fingerprint,
+        to: Fingerprint,
+        source: &str,
+        record: Option<&[u8]>,
+    ) {
         let Some(anchors) = &self.anchors else {
             return;
         };
-        if anchors.rotated(&from).is_some() {
+        let keep = |r: Option<&[u8]>| {
+            if let Some(r) = r.filter(|r| !r.is_empty()) {
+                self.core.keep_rotation_record(r);
+            }
+        };
+        if let Some(stands) = anchors.rotated(&from) {
+            if stands == to {
+                keep(record);
+            }
             return;
         }
         if self.committed_successor(&from).is_some_and(|c| c != to.0) {
@@ -1767,6 +1795,7 @@ impl IdentityState {
         if !anchors.rotate(&from, &to) {
             return;
         }
+        keep(record);
         info!(predecessor = %from, successor = %to, source, "identity rotated");
         for (uid, nick) in self.core.refuse_rotated(from.0) {
             info!(uid, nick = %nick, "session ended: its key rotated away");

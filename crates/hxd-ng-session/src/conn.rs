@@ -127,7 +127,7 @@ fn request_weight(req: &str) -> u32 {
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
         | "account_list" | "role_list" | "role_get" | "files_preview" | "room_create"
         | "room_edit" | "room_archive" | "room_unarchive" | "device_cert" | "friend_add"
-        | "requests_clear" | "find_user" | "user_profile" => 4,
+        | "requests_clear" | "find_user" | "user_profile" | "friendships_fetch" => 4,
         _ => 1,
     }
 }
@@ -383,10 +383,11 @@ pub(crate) async fn run(
                     // box (§4.3), here as its base64url's length says.
                     let sealed = req.params.get("sealed").and_then(Value::as_str);
                     let sealed = sealed.map_or(0, |b| (b.len() * 3 / 4 / 2048) as u32);
-                    let over = ctx
-                        .core
-                        .spend_request(state.uid, request_weight(&req.req) + signed + sealed)
-                        .err();
+                    let objects = crate::friends::object_weight(&req);
+                    let cost = request_weight(&req.req)
+                        .saturating_add(signed + sealed)
+                        .saturating_add(objects);
+                    let over = ctx.core.spend_request(state.uid, cost).err();
                     let newcomer = matches!(req.req.as_str(), "chat" | "msg" | "news_post")
                         .then(|| ctx.core.newcomer_wait(state.uid))
                         .flatten();
@@ -790,6 +791,16 @@ async fn handle_login(
             // Only for a client that said it speaks the friend family,
             // so one that did not is sent nothing new (§7.5).
             messaging: p.messaging && ctx.core.messaging_enabled(),
+            // A device of the identity the account links, which may sign
+            // messages, asked for by a client that speaks the family
+            // (§7.5); whether the account takes part is the domain's.
+            friendships: p.friendships
+                && p.messaging
+                && ctx.core.messaging_enabled()
+                && identity.is_some_and(|i| {
+                    account.identity.fingerprint == Some(i.fingerprint.0)
+                        && i.tag().device_cert.is_some()
+                }),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -819,6 +830,7 @@ async fn handle_login(
         .identity
         .as_ref()
         .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
+    let attach_friendships = attach.transport.friendships;
     let attached = if revoked {
         None
     } else {
@@ -993,6 +1005,11 @@ async fn handle_login(
     }
     if ctx.core.messaging_enabled() && !caps.iter().any(|c| c == "messaging") {
         caps.push("messaging".into());
+    }
+    // Listed only where asked for, so a login that never asks is
+    // answered as it always was (§7.5).
+    if attach_friendships && ctx.core.takes_part(uid) {
+        caps.push("friendships".into());
     }
     let mut ok = json!({
         "session": session_id,
@@ -2192,8 +2209,27 @@ async fn dispatch(
                         )
                         .await
                     }
+                    _ if p.withdraw.is_some() && (!on || p.login.is_none()) => {
+                        return finish(
+                            ws_tx,
+                            reply_err(
+                                req.id,
+                                "bad_request",
+                                "A withdrawal goes with `block` by `login`.",
+                            ),
+                        )
+                        .await
+                    }
                     (Some(uid), _, _) => {
                         off_reactor(&ctx.core, move |c| c.inbox_block_uid(me, uid, on)).await
+                    }
+                    (_, Some(login), _) if p.withdraw.is_some() => {
+                        let w = p.withdraw.unwrap_or_default();
+                        return finish(
+                            ws_tx,
+                            crate::friends::block(ctx, me, req.id, login, &w).await,
+                        )
+                        .await;
                     }
                     (_, Some(login), _) => {
                         off_reactor(&ctx.core, move |c| c.inbox_block(me, &login, on)).await

@@ -72,6 +72,11 @@ impl Pair {
         }
     }
 
+    /// The lesser fingerprint and the greater.
+    pub fn fingerprints(&self) -> (Fingerprint, Fingerprint) {
+        (self.lo, self.hi)
+    }
+
     pub fn contains(&self, fp: &Fingerprint) -> bool {
         self.lo == *fp || self.hi == *fp
     }
@@ -175,7 +180,13 @@ impl Offer {
     /// offeree does not, since an acceptance signed after it postdates
     /// its cutoff.
     pub fn ended_by(&self, w: &Held) -> bool {
-        w.ends(&self.pair(), &self.offerer(), self.time)
+        self.cut_by(&w.cutoff())
+    }
+
+    /// Whether `c` ends this offer, as [`Offer::ended_by`] asks of a
+    /// withdrawal.
+    pub fn cut_by(&self, c: &Cutoff) -> bool {
+        c.ends(&self.pair(), &self.offerer(), self.time)
     }
 }
 
@@ -289,9 +300,15 @@ impl Friendship {
     /// Whether `w` ends this friendship: its half by `w`'s effective
     /// party is dated before `w`'s `before` (§4).
     pub fn ended_by(&self, w: &Held) -> bool {
+        self.cut_by(&w.cutoff())
+    }
+
+    /// Whether `c` ends this friendship, as [`Friendship::ended_by`] asks
+    /// of a withdrawal.
+    pub fn cut_by(&self, c: &Cutoff) -> bool {
         let pair = self.pair();
-        w.ends(&pair, &self.offer.offerer(), self.offer.time)
-            || w.ends(&pair, &self.offer.to, self.acceptance.time)
+        c.ends(&pair, &self.offer.offerer(), self.offer.time)
+            || c.ends(&pair, &self.offer.to, self.acceptance.time)
     }
 }
 
@@ -467,14 +484,42 @@ impl Held {
     /// Whether this ends a half by `party`, dated `time`, of a
     /// friendship between `pair`. A half dated exactly `before` stands.
     pub fn ends(&self, pair: &Pair, party: &Fingerprint, time: u64) -> bool {
+        self.cutoff().ends(pair, party, time)
+    }
+
+    pub fn cutoff(&self) -> Cutoff {
         let w = &self.0;
-        w.pair == pair.hash() && w.effective_party() == *party && time < w.before
+        Cutoff {
+            pair: w.pair,
+            party: w.effective_party(),
+            before: w.before,
+        }
+    }
+}
+
+/// What a withdrawal ends, apart from who signed it: what a checker
+/// keeps of one it has checked whole, and the form a server's own
+/// withdrawal takes, which no device signs (`portable-friends.md` §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cutoff {
+    pub pair: [u8; 32],
+    pub party: Fingerprint,
+    pub before: u64,
+}
+
+impl Cutoff {
+    /// Whether this ends a half by `party`, dated `time`, of a
+    /// friendship between `pair`. A half dated exactly `before` stands.
+    pub fn ends(&self, pair: &Pair, party: &Fingerprint, time: u64) -> bool {
+        self.pair == pair.hash() && self.party == *party && time < self.before
     }
 }
 
 /// The last key of the chain of rotations from `start`, or `None` where
-/// the rotations applied fork or loop, so that no one key ends it.
-fn chain_end(start: Fingerprint, rotations: &[Rotation]) -> Option<Fingerprint> {
+/// the rotations applied fork or loop, so that no one key ends it: the
+/// key that takes `start`'s place in every check a checker makes after
+/// applying them (`portable-friends.md` §4.4).
+pub fn chain_end(start: Fingerprint, rotations: &[Rotation]) -> Option<Fingerprint> {
     let mut key = start;
     for _ in 0..=rotations.len() {
         let mut next = rotations

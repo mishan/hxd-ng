@@ -7,7 +7,9 @@
 use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::{Mailbox, MessageGuid};
-use hxd_core::messaging::{Cleared, RequestAction, RequestsListing};
+use hxd_core::messaging::{
+    Cleared, Fetched, PresentResult, Presented, RequestAction, RequestsListing,
+};
 use hxd_core::relationships::Profile;
 use hxd_core::{
     Core, FoundUser, FriendEntry, Im, MessagingError, OwnPresence, Presence, PresenceUpdate,
@@ -44,7 +46,31 @@ pub(crate) fn handles(req: &str) -> bool {
             | "requests"
             | "request_answer"
             | "requests_clear"
+            | "friendships_present"
+            | "friendships_fetch"
     )
+}
+
+/// What the friendship objects a request carries add to its price
+/// (`docs/hotline-ng.md` §7.5): each costs the signatures it is checked
+/// with, and a presentation or a fetch is paced an object at a time.
+pub(crate) fn object_weight(req: &ReqEnvelope) -> u32 {
+    let p = &req.params;
+    let n = |key: &str| {
+        p.get(key)
+            .and_then(Value::as_array)
+            .map_or(0, |a| u32::try_from(a.len()).unwrap_or(u32::MAX))
+    };
+    let has = |key: &str| u32::from(p.get(key).is_some());
+    match req.req.as_str() {
+        "friendships_present" => {
+            4u32.saturating_mul(n("friendships").saturating_add(n("withdrawals")))
+        }
+        "friendships_fetch" => n("hashes").saturating_add(n("fingerprints")),
+        "friend_add" | "friend_remove" | "block" => 2 * (has("offer") + has("withdraw")),
+        "friend_respond" => 4 * has("friendship"),
+        _ => 0,
+    }
 }
 
 /// The login and sync replies' `messaging` (§7.5), where the server has
@@ -142,6 +168,16 @@ pub(crate) fn friend_json(e: &FriendEntry) -> Value {
     {
         v["note"] = json!(note);
     }
+    // The domain fills these in for a friendships session alone.
+    if !e.friendships.is_empty() {
+        v["friendships"] = json!(e.friendships.iter().map(|h| b64url(h)).collect::<Vec<_>>());
+    }
+    if let Some(offer) = &e.offer {
+        v["offer"] = json!(b64url(offer));
+    }
+    if let Some(withdraw) = &e.withdraw {
+        v["withdraw"] = json!(b64url(withdraw));
+    }
     v
 }
 
@@ -217,6 +253,10 @@ fn profile_json(p: &Profile) -> Value {
 
 fn user_json(u: &FoundUser) -> Value {
     let mut v = json!({ "login": u.login, "name": u.name });
+    // Only ever filled in for a friendships session.
+    if let Some(fp) = &u.fingerprint {
+        v["fingerprint"] = json!(fingerprint(fp));
+    }
     if let Some((state, text)) = &u.presence {
         v["presence"] = json!(presence_name(*state));
         if let Some(text) = text {
@@ -259,6 +299,52 @@ fn listing_json(l: &RequestsListing) -> Value {
     json!({ "requests": requests, "approvals": approvals, "dropped": l.dropped })
 }
 
+fn results_json(results: &[PresentResult]) -> Vec<Value> {
+    results
+        .iter()
+        .map(|r| {
+            let (result, withdraw) = match &r.outcome {
+                Presented::Ok => ("ok", None),
+                Presented::AccountNotFound => ("no_such_user", None),
+                Presented::RosterFull => ("roster_full", None),
+                Presented::BadSignature => ("bad_signature", None),
+                Presented::Withdrawn(w) => ("withdrawn", w.as_ref()),
+                Presented::Stale => ("stale", None),
+            };
+            let mut v = json!({ "hash": b64url(&r.hash), "result": result });
+            if let Some(w) = withdraw {
+                v["withdraw"] = json!(b64url(w));
+            }
+            v
+        })
+        .collect()
+}
+
+fn fetched_json(f: &Fetched) -> Value {
+    let friendships: Vec<Value> = f
+        .friendships
+        .iter()
+        .map(|(h, bytes)| {
+            let mut v = json!({ "hash": b64url(h) });
+            if let Some(b) = bytes {
+                v["friendship"] = json!(b64url(b));
+            }
+            v
+        })
+        .collect();
+    let rotations: Vec<Value> = f
+        .rotations
+        .iter()
+        .map(|(fp, records)| {
+            json!({
+                "fingerprint": fingerprint(fp),
+                "records": records.iter().map(|r| b64url(r)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({ "friendships": friendships, "rotations": rotations })
+}
+
 fn messaging_err(id: u64, e: MessagingError) -> String {
     let (code, text) = match e {
         MessagingError::NotEnabled => (
@@ -288,6 +374,26 @@ fn messaging_err(id: u64, e: MessagingError) -> String {
             "You have sent that user as many requests as you may.",
         ),
         MessagingError::NoSuchRequest => ("no_such_request", "No such request."),
+        MessagingError::NotDeviceProved => (
+            "access_denied",
+            "This session has not proved a device that may make friendships.",
+        ),
+        MessagingError::BadSignature => (
+            "bad_signature",
+            "That friendship object does not verify, or is not this session's own.",
+        ),
+        MessagingError::Withdrawn => (
+            "withdrawn",
+            "A withdrawal held here ends it; sign again in ten minutes.",
+        ),
+        MessagingError::TooMany => (
+            "bad_request",
+            "At most 32 objects, and one withdrawal for a pair.",
+        ),
+        MessagingError::Stale => (
+            "stale",
+            "Its time is not within ten minutes of the server's clock.",
+        ),
         MessagingError::ServerError => ("server_error", "Server error."),
     };
     reply_err(id, code, text)
@@ -299,20 +405,47 @@ fn set_or_clear<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>
 }
 
 #[derive(Deserialize)]
-struct LoginParams {
-    login: String,
-}
-
-#[derive(Deserialize)]
 struct AddParams {
     login: String,
     note: Option<String>,
+    offer: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct RespondParams {
     login: String,
     accept: bool,
+    friendship: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoveParams {
+    login: Option<String>,
+    fingerprint: Option<String>,
+    withdraw: Option<String>,
+    offer: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FindParams {
+    login: Option<String>,
+    fingerprint: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct PresentParams {
+    #[serde(default)]
+    withdrawals: Vec<String>,
+    #[serde(default)]
+    friendships: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct FetchParams {
+    #[serde(default)]
+    hashes: Vec<String>,
+    #[serde(default)]
+    fingerprints: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -373,15 +506,31 @@ struct ClearParams {
     before: Option<u64>,
 }
 
+/// Who a request names: an account by login, or by the fingerprint it
+/// links.
+enum Named {
+    Login(String),
+    Key([u8; 32]),
+}
+
+/// What Remove Friend carries beside whom it names.
+enum Removal {
+    Plain,
+    Withdraw(Vec<u8>),
+    CancelOffer(Vec<u8>),
+}
+
 /// A request of the family, parsed.
 enum Op {
     Friends,
-    Add(String, Option<String>),
-    Respond(String, bool),
-    Remove(String),
+    Add(String, Option<String>, Option<Vec<u8>>),
+    Respond(String, bool, Option<Vec<u8>>),
+    Remove(Named, Removal),
     Alias(String, Option<String>),
     Presence(PresenceUpdate),
-    Find(String, bool),
+    Find(Named, bool),
+    Present(Vec<Vec<u8>>, Vec<Vec<u8>>),
+    Fetch(Vec<[u8; 32]>, Vec<[u8; 32]>),
     Receipt(String, MessageGuid, bool),
     Typing(String, bool),
     Requests,
@@ -389,9 +538,34 @@ enum Op {
     Clear(Option<SystemTime>, Option<SystemTime>),
 }
 
+/// A friendship object, as base64url.
+fn object(s: &str) -> Result<Vec<u8>, &'static str> {
+    crate::identity::unb64(s).ok_or("A friendship object is not base64url.")
+}
+
+fn hash(s: &str) -> Result<[u8; 32], &'static str> {
+    object(s)?.try_into().map_err(|_| "A hash is not 32 bytes.")
+}
+
+fn key(s: &str) -> Result<[u8; 32], &'static str> {
+    hl_identity::Fingerprint::parse(s)
+        .map(|f| f.0)
+        .ok_or("Malformed fingerprint.")
+}
+
+/// Exactly one of `login` and `fingerprint`; neither is the malformed
+/// request it always was.
+fn named_one(login: Option<String>, fp: Option<String>) -> Result<Named, &'static str> {
+    match (login, fp) {
+        (Some(l), None) => Ok(Named::Login(l)),
+        (None, Some(f)) => key(&f).map(Named::Key),
+        (None, None) => Err("Malformed request."),
+        (Some(_), Some(_)) => Err("Name exactly one of `login` and `fingerprint`."),
+    }
+}
+
 fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
     let p = &req.params;
-    let of = |v: &Value| serde_json::from_value::<LoginParams>(v.clone()).map(|p| p.login);
     let bad = "Malformed request.";
     let at = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
     Ok(match req.req.as_str() {
@@ -403,13 +577,48 @@ fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
                 n.truncate_to_char_boundary(NOTE_MAX_BYTES);
                 n
             });
-            Op::Add(p.login, note)
+            let offer = p.offer.as_deref().map(object).transpose()?;
+            Op::Add(p.login, note, offer)
         }
         "friend_respond" => {
             let p: RespondParams = serde_json::from_value(p.clone()).map_err(|_| bad)?;
-            Op::Respond(p.login, p.accept)
+            let friendship = p.friendship.as_deref().map(object).transpose()?;
+            Op::Respond(p.login, p.accept, friendship)
         }
-        "friend_remove" => Op::Remove(of(p).map_err(|_| bad)?),
+        "friend_remove" => {
+            let p: RemoveParams = serde_json::from_value(p.clone()).map_err(|_| bad)?;
+            let removal = match (p.withdraw, p.offer) {
+                (None, None) => Removal::Plain,
+                (Some(w), None) => Removal::Withdraw(object(&w)?),
+                (None, Some(o)) if p.login.is_some() => Removal::CancelOffer(object(&o)?),
+                _ => return Err(bad),
+            };
+            Op::Remove(named_one(p.login, p.fingerprint)?, removal)
+        }
+        "friendships_present" => {
+            let p: PresentParams = crate::conn::params_or_default(p).map_err(|_| bad)?;
+            let ws = p
+                .withdrawals
+                .iter()
+                .map(|w| object(w))
+                .collect::<Result<_, _>>()?;
+            let fs = p
+                .friendships
+                .iter()
+                .map(|f| object(f))
+                .collect::<Result<_, _>>()?;
+            Op::Present(ws, fs)
+        }
+        "friendships_fetch" => {
+            let p: FetchParams = crate::conn::params_or_default(p).map_err(|_| bad)?;
+            let hashes = p.hashes.iter().map(|h| hash(h)).collect::<Result<_, _>>()?;
+            let fps = p
+                .fingerprints
+                .iter()
+                .map(|f| key(f))
+                .collect::<Result<_, _>>()?;
+            Op::Fetch(hashes, fps)
+        }
         "friend_alias" => {
             let p: AliasParams = serde_json::from_value(p.clone()).map_err(|_| bad)?;
             let alias = p.alias.filter(|a| !a.is_empty()).map(|mut a| {
@@ -438,7 +647,11 @@ fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
             })
         }
         "find_user" | "user_profile" => {
-            Op::Find(of(p).map_err(|_| bad)?, req.req == "user_profile")
+            let p: FindParams = serde_json::from_value(p.clone()).map_err(|_| bad)?;
+            Op::Find(
+                named_one(p.login, p.fingerprint)?,
+                req.req == "user_profile",
+            )
         }
         "receipt" => {
             let p: ReceiptParams = serde_json::from_value(p.clone()).map_err(|_| bad)?;
@@ -474,12 +687,28 @@ fn act(core: &Core, uid: Uid, op: Op) -> Result<Value, MessagingError> {
         Op::Friends => core
             .friends_roster(uid)
             .map(|rows| json!({ "friends": rows.iter().map(friend_json).collect::<Vec<_>>() })),
-        Op::Add(login, note) => core.friend_add(uid, &login, note).map(state),
-        Op::Respond(login, accept) => core.friend_respond(uid, &login, accept).map(state),
-        Op::Remove(login) => done(core.friend_remove(uid, &login)),
+        Op::Add(login, note, offer) => core.friend_ask(uid, &login, note, offer).map(state),
+        Op::Respond(login, accept, friendship) => core
+            .friend_answer(uid, &login, accept, friendship)
+            .map(state),
+        Op::Remove(Named::Key(fp), Removal::Withdraw(w)) => {
+            done(core.friend_remove_by_key(uid, &fp, Some(w)))
+        }
+        Op::Remove(Named::Key(fp), _) => done(core.friend_remove_by_key(uid, &fp, None)),
+        Op::Remove(Named::Login(login), Removal::Plain) => done(core.friend_remove(uid, &login)),
+        Op::Remove(Named::Login(login), Removal::Withdraw(w)) => {
+            done(core.friend_unfriend(uid, &login, Some(w)))
+        }
+        Op::Remove(Named::Login(login), Removal::CancelOffer(o)) => {
+            done(core.friend_cancel_offer(uid, &login, &o))
+        }
+        Op::Present(withdrawals, friendships) => core
+            .friendships_present(uid, withdrawals, friendships)
+            .map(|(w, f)| json!({ "withdrawals": results_json(&w), "friendships": results_json(&f) })),
+        Op::Fetch(hashes, fps) => core.friendships_fetch(uid, &hashes, &fps).map(|f| fetched_json(&f)),
         Op::Alias(login, alias) => done(core.friend_alias(uid, &login, alias.as_deref())),
         Op::Presence(update) => done(core.set_presence(uid, update)),
-        Op::Find(login, profile) => {
+        Op::Find(Named::Login(login), profile) => {
             let found = if profile {
                 core.messaging_user_info(uid, &login)
             } else {
@@ -487,6 +716,9 @@ fn act(core: &Core, uid: Uid, op: Op) -> Result<Value, MessagingError> {
             };
             found.map(|u| json!({ "user": user_json(&u) }))
         }
+        Op::Find(Named::Key(fp), profile) => core
+            .find_user_by_key(uid, &fp, profile)
+            .map(|u| json!({ "user": user_json(&u) })),
         Op::Receipt(login, guid, read) => done(core.im_ack(uid, &login, &guid, read)),
         Op::Typing(login, typing) => done(core.im_typing(uid, &login, typing)),
         Op::Requests => {
@@ -513,5 +745,33 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
         Some(Ok(ok)) => reply_ok(id, ok),
         Some(Err(e)) => messaging_err(id, e),
         None => reply_err(id, "server_error", "Server error."),
+    }
+}
+
+/// `block` with a `withdraw` (§7.5): the withdrawal taken, then the block
+/// made, as Block User (806) carrying one does. The block stands whatever
+/// becomes of the withdrawal, whose refusal is the answer, for the client
+/// to sign afresh for its other servers.
+pub(crate) async fn block(ctx: &NgCtx, uid: Uid, id: u64, login: String, withdraw: &str) -> String {
+    let w = match object(withdraw) {
+        Ok(w) => w,
+        Err(text) => return reply_err(id, "bad_request", text),
+    };
+    let done = off_reactor(&ctx.core, move |c| {
+        let taken = c.block_withdrawing(uid, &login, w);
+        c.inbox_block(uid, &login, true)?;
+        Ok(taken)
+    })
+    .await;
+    match done {
+        Some(Ok(Ok(()))) => reply_ok(id, json!({})),
+        Some(Ok(Err(e))) => messaging_err(id, e),
+        Some(Err(hxd_core::ChatError::NoInbox)) => {
+            reply_err(id, "no_inbox", "This account has no inbox.")
+        }
+        Some(Err(hxd_core::ChatError::ServerError)) | None => {
+            reply_err(id, "server_error", "Server error.")
+        }
+        Some(Err(_)) => reply_err(id, "no_such_user", "No such user."),
     }
 }

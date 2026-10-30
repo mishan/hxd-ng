@@ -677,6 +677,11 @@ fn chat_error(e: MessagingError) -> ChatError {
         MessagingError::MessageTooLong
         | MessagingError::AlreadyFriends
         | MessagingError::RequestPending
+        | MessagingError::NotDeviceProved
+        | MessagingError::BadSignature
+        | MessagingError::Withdrawn
+        | MessagingError::Stale
+        | MessagingError::TooMany
         | MessagingError::ServerError => ChatError::ServerError,
     }
 }

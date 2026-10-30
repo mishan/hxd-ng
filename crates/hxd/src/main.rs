@@ -83,7 +83,13 @@ async fn reload_on_hangup(
         }
     };
     while hangup.recv().await.is_some() {
-        match hxd::reload_revocations(&core, &path) {
+        // Off the reactor: a revoked device's presentations are dropped
+        // from the store.
+        let (c, p) = (core.clone(), path.clone());
+        let reloaded = tokio::task::spawn_blocking(move || hxd::reload_revocations(&c, &p))
+            .await
+            .unwrap_or_else(|e| Err(format!("the reload task failed: {e}")));
+        match reloaded {
             Ok((listed, ended)) => tracing::info!(
                 "SIGHUP: {listed} revoked keys installed from {}; {} sessions ended",
                 path.display(),
@@ -1380,8 +1386,11 @@ async fn main() {
 
         // The ng context is built before voice is consumed below, so its
         // capability list can see it.
-        let ng_ctx =
-            hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref(), push.as_ref())?;
+        // Blocking: installing the revocation list drops, from the store,
+        // what its devices presented.
+        let ng_ctx = tokio::task::block_in_place(|| {
+            hxd::build_ng_ctx(&config, &ctx, voice.as_ref(), files.as_ref(), push.as_ref())
+        })?;
 
         if let Some(files) = files.as_ref() {
             let section = config.files.as_ref().expect("Files service has config");

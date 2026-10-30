@@ -8,8 +8,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Birthdate, Ignore, IgnoreMode, LedgerEntry, MessagingAccount, PendingOut,
-    Profile, Recorded, RelationshipStore, RequestKind, Requester,
+    AccountUpdate, Birthdate, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry, MessagingAccount,
+    PendingOut, Presentation, Profile, Recorded, RelationshipStore, RequestKind, Requester,
+    StoredOffer,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent};
 
@@ -34,6 +35,273 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     an_account_keeps_what_it_was_told_and_nothing_else(&*new_store());
     the_cleanup_changes_no_answer(&*new_store());
     times_are_kept_to_the_second(&*new_store());
+    a_presentation_is_one_per_party_and_is_dropped_by_its_device(&*new_store());
+    a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(&*new_store());
+    an_offer_lapses_and_a_refriend_keeps_the_id(&*new_store());
+    rotation_moves_the_portable_part_and_purging_keeps_withdrawals(&*new_store());
+}
+
+fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
+    Presentation {
+        presenter: fp(presenter),
+        other: fp(other),
+        names: [fp(presenter), fp(other)],
+        pair: [presenter ^ other; 32],
+        hash: [hash; 32],
+        friendship: Some(vec![hash; 3]),
+        device: [device; 32],
+        edge: None,
+        at: at(100 + u64::from(hash)),
+    }
+}
+
+fn withdrawal(owner: u8, pair: u8, before: u64, signed: bool, secs: u64) -> HeldWithdrawal {
+    HeldWithdrawal {
+        owner: fp(owner),
+        pair: [pair; 32],
+        party: fp(owner),
+        before,
+        withdrawal: signed.then(|| vec![pair, before as u8]),
+        checked: true,
+        at: at(secs),
+    }
+}
+
+fn a_presentation_is_one_per_party_and_is_dropped_by_its_device(s: &dyn RelationshipStore) {
+    let case = "a_presentation_is_one_per_party_and_is_dropped_by_its_device";
+    let first = presentation(1, 2, 10, 7);
+    assert_eq!(s.present(&first).unwrap(), None, "{case}: new");
+    let again = Presentation {
+        edge: Some(4),
+        ..presentation(1, 2, 11, 8)
+    };
+    assert_eq!(s.present(&again).unwrap(), Some(first), "{case}: replaced");
+    let theirs = Presentation {
+        friendship: None,
+        ..presentation(2, 1, 12, 7)
+    };
+    s.present(&theirs).unwrap();
+    s.present(&presentation(1, 3, 13, 7)).unwrap();
+    assert_eq!(
+        s.presentation(&fp(1), &fp(2)).unwrap(),
+        Some(again.clone()),
+        "{case}: read back whole"
+    );
+    let hashes = |v: Vec<Presentation>| v.iter().map(|p| p.hash[0]).collect::<Vec<_>>();
+    assert_eq!(
+        hashes(s.presentations(&fp(2)).unwrap()),
+        [11, 12],
+        "{case}: made and naming"
+    );
+    assert_eq!(
+        hashes(s.presented_by(&[7; 32]).unwrap()),
+        [12, 13],
+        "{case}: by device"
+    );
+    assert_eq!(
+        s.unpresent(&fp(1), &fp(2)).unwrap(),
+        Some(again),
+        "{case}: dropped"
+    );
+    assert_eq!(s.unpresent(&fp(1), &fp(2)).unwrap(), None, "{case}: gone");
+}
+
+fn a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(s: &dyn RelationshipStore) {
+    let case = "a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest";
+    s.keep_withdrawal(&withdrawal(1, 9, 50, true, 1), 3)
+        .unwrap();
+    s.keep_withdrawal(&withdrawal(1, 9, 40, true, 2), 3)
+        .unwrap();
+    let befores = |pair: u8| -> Vec<u64> {
+        s.withdrawals(&[pair; 32])
+            .unwrap()
+            .iter()
+            .map(|w| w.before)
+            .collect()
+    };
+    assert_eq!(befores(9), [50], "{case}: an earlier cutoff ends less");
+    s.keep_withdrawal(&withdrawal(1, 9, 60, true, 3), 3)
+        .unwrap();
+    assert_eq!(befores(9), [60], "{case}: a later one ends more");
+    // The server's own is the last to go, past the owner's cap.
+    s.keep_withdrawal(&withdrawal(1, 8, 5, false, 0), 3)
+        .unwrap();
+    s.keep_withdrawal(&withdrawal(1, 7, 5, true, 4), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(1, 6, 5, true, 5), 3).unwrap();
+    assert!(
+        befores(9).is_empty(),
+        "{case}: the oldest signed went first"
+    );
+    assert_eq!(befores(8), [5], "{case}: the server's own kept");
+    s.keep_withdrawal(&withdrawal(2, 5, 5, true, 0), 3).unwrap();
+    assert_eq!(befores(7), [5], "{case}: another owner's counts apart");
+    s.keep_withdrawal(&withdrawal(4, 3, 10, true, 1), 3)
+        .unwrap();
+    s.keep_withdrawal(&withdrawal(4, 3, 20, false, 2), 3)
+        .unwrap();
+    assert_eq!(
+        befores(3),
+        [10, 20],
+        "{case}: a server's own beside a signed one for the pair"
+    );
+
+    let unchecked = HeldWithdrawal {
+        checked: false,
+        party: fp(4),
+        ..withdrawal(3, 4, 5, true, 6)
+    };
+    s.keep_withdrawal(&unchecked, 3).unwrap();
+    s.drop_withdrawal(&fp(1), &[8; 32], &fp(1)).unwrap();
+    assert_eq!(befores(8), [5], "{case}: only an unchecked one is dropped");
+    s.drop_withdrawal(&fp(3), &[4; 32], &fp(4)).unwrap();
+    assert!(befores(4).is_empty(), "{case}: unchecked, dropped");
+}
+
+fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
+    let case = "an_offer_lapses_and_a_refriend_keeps_the_id";
+    let offer = StoredOffer {
+        offer: vec![1, 2, 3],
+        lapses_at: at(100),
+    };
+    s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(99)).unwrap(),
+        Some(offer),
+        "{case}"
+    );
+    assert_eq!(
+        s.offer(&fp(2), &fp(1), at(99)).unwrap(),
+        None,
+        "{case}: directed"
+    );
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(100)).unwrap(),
+        None,
+        "{case}: lapsed"
+    );
+    s.cleanup(at(200), at(0), 10).unwrap();
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(0)).unwrap(),
+        None,
+        "{case}: reclaimed"
+    );
+
+    let (a, b) = (
+        Mailbox::identified("a", fp(1)),
+        Mailbox::identified("b", fp(2)),
+    );
+    let id = s.befriend(&a, &b, at(1)).unwrap();
+    assert_eq!(s.made_at(id).unwrap(), Some(at(1)), "{case}: made");
+    s.unfriend(&a, &b).unwrap();
+    assert_eq!(s.made_at(id).unwrap(), None, "{case}: ended");
+    s.set_pending_out(&a, &b, Some(&pending(2, 1000, true)))
+        .unwrap();
+    s.refriend(&a, &b, id, at(3)).unwrap();
+    assert_eq!(s.made_at(id).unwrap(), Some(at(3)), "{case}: made again");
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        let row = s.relationship(x, y, at(3)).unwrap().unwrap();
+        assert_eq!(row.friendship, Some(id), "{case}: the id it had");
+        assert_eq!(row.pending_out, None, "{case}: a request answered");
+    }
+    assert!(
+        s.befriend(&a, &b, at(4)).unwrap() == id,
+        "{case}: the same friendship"
+    );
+}
+
+fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn RelationshipStore) {
+    let case = "rotation_moves_the_portable_part_and_purging_keeps_withdrawals";
+    s.present(&presentation(1, 2, 10, 7)).unwrap();
+    s.present(&presentation(2, 1, 11, 7)).unwrap();
+    // The successor's own for party 3 wins over the predecessor's.
+    s.present(&presentation(1, 3, 12, 7)).unwrap();
+    s.present(&presentation(5, 3, 13, 7)).unwrap();
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+    };
+    s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
+    s.keep_withdrawal(&withdrawal(1, 9, 5, true, 1), 10)
+        .unwrap();
+    // The successor's own for two more pairs: a later cutoff than the
+    // predecessor's for one, and an earlier one for the other.
+    let held = |owner, pair, before| HeldWithdrawal {
+        party: fp(9),
+        ..withdrawal(owner, pair, before, true, 1)
+    };
+    for (owner, pair, before) in [(1, 7, 10), (5, 7, 20), (1, 6, 30), (5, 6, 15)] {
+        s.keep_withdrawal(&held(owner, pair, before), 10).unwrap();
+    }
+    s.keep_rotation(&fp(1), &fp(5), b"record").unwrap();
+    s.keep_rotation(&fp(1), &fp(6), b"other").unwrap();
+    s.rotate(&fp(1), &fp(5)).unwrap();
+
+    assert_eq!(
+        s.rotation_from(&fp(1)).unwrap(),
+        Some((fp(5), b"record".to_vec())),
+        "{case}: the first record stands"
+    );
+    assert_eq!(
+        s.rotation_to(&fp(5)).unwrap(),
+        Some((fp(1), b"record".to_vec())),
+        "{case}"
+    );
+    assert!(s.presentations(&fp(1)).unwrap().is_empty(), "{case}: moved");
+    let mine = s.presentation(&fp(5), &fp(2)).unwrap().unwrap();
+    assert_eq!(
+        mine.names,
+        [fp(1), fp(2)],
+        "{case}: the names its friendship gave"
+    );
+    assert_eq!(
+        s.presentation(&fp(2), &fp(5)).unwrap().map(|p| p.hash),
+        Some([11; 32]),
+        "{case}: naming it, moved"
+    );
+    assert_eq!(
+        s.presentation(&fp(5), &fp(3)).unwrap().map(|p| p.hash),
+        Some([13; 32]),
+        "{case}: the successor's own kept"
+    );
+    assert_eq!(
+        s.offer(&fp(5), &fp(2), at(1)).unwrap(),
+        Some(offer),
+        "{case}"
+    );
+    assert_eq!(
+        s.withdrawals(&[9; 32]).unwrap()[0].owner,
+        fp(5),
+        "{case}: counted toward the successor"
+    );
+    for (pair, before) in [(7, 20), (6, 30)] {
+        let kept: Vec<_> = s
+            .withdrawals(&[pair; 32])
+            .unwrap()
+            .iter()
+            .map(|w| (w.owner, w.before, w.withdrawal.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [(fp(5), before, Some(vec![pair, before as u8]))],
+            "{case}: the later cutoff stands, with its object"
+        );
+    }
+
+    s.purge(&Mailbox::identified("x", fp(5))).unwrap();
+    assert!(
+        s.presentation(&fp(5), &fp(2)).unwrap().is_none(),
+        "{case}: its own presentations go"
+    );
+    assert!(
+        s.presentation(&fp(2), &fp(5)).unwrap().is_some(),
+        "{case}: its friend's stay its friend's"
+    );
+    assert_eq!(s.offer(&fp(5), &fp(2), at(1)).unwrap(), None, "{case}");
+    assert_eq!(
+        s.withdrawals(&[9; 32]).unwrap().len(),
+        1,
+        "{case}: withdrawals stay"
+    );
 }
 
 fn at(secs: u64) -> SystemTime {

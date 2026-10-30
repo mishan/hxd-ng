@@ -38,6 +38,9 @@ pub struct LoginParams {
     /// Whether it speaks the friend family (`docs/hotline-ng.md` §7.5).
     #[serde(default)]
     pub messaging: bool,
+    /// Whether it speaks the family's portable part (§7.5).
+    #[serde(default)]
+    pub friendships: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +239,9 @@ pub struct BlockParams {
     pub uid: Option<u16>,
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// A withdrawal, taken before the block (§7.5).
+    #[serde(default)]
+    pub withdraw: Option<String>,
 }
 
 /// One entry of the `blocks` list.
@@ -988,10 +994,15 @@ pub fn event_json(se: &SeqEvent) -> String {
             login,
             fingerprint,
             note,
+            offer,
         } => {
             let mut data = crate::friends::named(login, fingerprint.as_ref());
             if let Some(note) = note {
                 data["note"] = json!(note);
+            }
+            // Only ever in the event a friendships session is sent.
+            if let Some(offer) = offer {
+                data["offer"] = json!(b64url(offer));
             }
             ("friend_request", data)
         }
@@ -1230,6 +1241,7 @@ mod tests {
                     can_sign: false,
                     device_expires: u64::MAX,
                     sealed: None,
+                    device_cert: None,
                 }),
                 ..Default::default()
             },

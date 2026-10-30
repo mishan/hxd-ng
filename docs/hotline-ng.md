@@ -181,9 +181,11 @@ over them.
 | `rooms` | Curated rooms: `rooms`, `room_*`, `room` on `chat` and `history`, and the `room_*` events | chat-rooms.md §7 | `rooms`, and in `sync`'s reply |
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
 | `messaging` | Friends, presence, instant messages and message requests: `friends`, `friend_*`, `presence`, `find_user`, `user_profile`, `receipt`, `typing`, `requests`, `request_answer`, `requests_clear`, their events, and `msg` by `to_login` as an instant message or a request | §7.5 here; instant-messaging.md | `messaging` |
+| `friendships` | Portable friendships: offers, friendships and withdrawals on the `messaging` family's requests and events, `friendships_present` and `friendships_fetch`. Listed only to a login that asked for it (§7.5) | §7.5 here; proposals/portable-friends.md | — |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
+- `friendships` MUST NOT appear without `messaging`.
 - A login reply block is present exactly when its capability is, except
   where the family's own document says otherwise.
 - Each family's document is normative for its requests, events, error
@@ -278,7 +280,8 @@ Starts a new session.
     "icon": 128,             // classic icon id; optional
     "signs": "default",      // optional: "default" | "able" (e2e-messages.md §4.6)
     "sealed": true,          // optional: it can open sealed messages (e2e-messages.md §4.1)
-    "messaging": true        // optional: it speaks the friend family (§7.5)
+    "messaging": true,       // optional: it speaks the friend family (§7.5)
+    "friendships": true      // optional: with messaging, its portable part (§7.5)
 } }
 ```
 
@@ -314,6 +317,7 @@ hotline-ng-identity.md §8.1 says.
 | `seq` | The seq the client is at: 0 for a new session. |
 | `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
 | `messaging` | Not echoed: the `messaging` block (§7.5) is present whenever the capability is. With the capability, `true` makes this a session that speaks the friend family from its login on (§7.5); without it, it is ignored. |
+| `friendships` | Not echoed: `caps` lists `friendships` when it is granted (§7.5). Without `messaging`, it is ignored. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -655,7 +659,7 @@ family document. Each family of §4 adds its own.
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
-| `block` | exactly one of `uid` / `login` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
+| `block` | exactly one of `uid` / `login`; `withdraw?` with `login` (§7.5) | `{}` | `no_such_user`, `no_inbox`, `server_error` |
 | `unblock` | exactly one of `uid` / `login` / `fingerprint` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
 | `blocks` | — | `{ "blocked": [ { "login", "fingerprint"? } ] }` | `no_inbox`, `server_error` |
 | `vouch` / `unvouch` / `vouches` | identity-vouch.md §3.2 | there | there. *Design, not built.* |
@@ -1025,6 +1029,203 @@ A server that does not serve the family answers its requests
 | `request_full` | `msg` | You have sent that account as many requests as you may until it answers. |
 | `no_such_request` | `request_answer` | No request or approval of theirs to answer. |
 
+#### Portable friendships
+
+The family's portable part is proposals/portable-friends.md's: a
+friendship made by an offer signed by one party's device and an
+acceptance signed by the other's, kept by the two clients and presented
+by each on the servers its user chooses, and ended everywhere by a
+signed withdrawal. That document gives the semantics, the order of each
+check and why; proposals/friendship-objects.md defines the objects,
+which travel here as base64url strings, as every identity object does:
+an `offer`, a `friendship` (the offer and its acceptance) and a
+`withdraw`. A friendship is named by its hash, and a withdrawal by its
+pair hash, each the base64url of 32 bytes. Everything below reaches a
+session only once it has asked for it, so a client that never does is
+sent and answered what the rest of §7.5 says, byte for byte.
+
+**Declaring it.** A client asks with `"friendships": true` at login,
+beside `"messaging": true`. It is granted to a session that takes part,
+whose socket authenticated with an identity its account links
+(hotline-ng-identity.md §8.1), on a device whose certificate allows
+messages and is at most 512 bytes; the login reply's `caps` then lists
+`friendships`. Unlike every other name in `caps`, `friendships` is
+listed only in reply to a login that asked for it, so that a client
+that never asks is sent the reply it always was. Asked for and not
+granted, it is not listed, and the session is answered as if it had not
+asked. A resume keeps what the login was granted. Such a session is a
+**friendships session**.
+
+**The device-act gate** (portable-friends §3). Offering, accepting with
+a friendship, presenting and withdrawing are open to a friendships
+session alone, and only while its certificate is unexpired and not
+revoked here, at the time of the act; any other session is answered
+`access_denied`. An offer, an acceptance or a withdrawal that the
+session gives as its own act is signed with the certificate it proved,
+and one signed with any other is `bad_signature`. Its `time` is within
+ten minutes of the server's clock either way, or it is `stale`: a
+client signs by its own clock and never by one a server offers, and a
+client told `stale` tells its user its clock is off. A password session
+can still remove a friend, which ends the friendship on this server
+alone.
+
+What the family's existing requests take beside what they took:
+
+| `req` | Added `params` | Added errors |
+|---|---|---|
+| `friend_add` | `offer` | `withdrawn`, `stale`, `bad_signature` |
+| `friend_respond` | `friendship`, with `accept: true` | `withdrawn`, `stale`, `bad_signature` |
+| `friend_remove` | `withdraw`; or `offer`, the caller's own upgrade offer, to cancel it alone; `fingerprint` in place of `login` | `stale`, `bad_signature` |
+| `find_user` | `fingerprint` in place of `login` | — |
+| `block` (§7.1) | `withdraw`, beside `login` | `stale`, `bad_signature` |
+
+- **`friend_add` with an `offer`** asks for a portable friendship. Its
+  `from` is the caller's identity and its `to` the fingerprint `login`'s
+  account links, or the answer is `no_such_user`, one answer whether
+  `login` links no identity or another, so that an offer cannot test a
+  guess at a fingerprint. A withdrawal held here that ends it is
+  `withdrawn`: sign a new one after ten minutes. Otherwise it is a
+  friend request as ever, held to the same bounds, and answered the
+  same. One that meets a request `login` sent is `request_pending`, as
+  the extension answers it, and the client answers that request with
+  `friend_respond` instead; a `friend_add` without an offer that meets
+  one is answered as the rest of §7.5 answers a crossing. On a
+  friendship already standing between two linked accounts it is an
+  **upgrade offer**: answered `{ "state": "accepted" }`, outside the
+  friend-request bounds, the friendship standing whatever becomes of
+  it, and told to the friend's friendships sessions alone. An offer
+  lapses at its `expires`: the request stays, plain, and an upgrade
+  offer goes.
+- **`friend_respond` with a `friendship`** accepts the offer `login`
+  sent, built into a friendship by this client with its own acceptance:
+  the offer must be the one stored, and the acceptance the caller's own.
+  The friendship is then presented by both parties here, and both are
+  told the `friend` entry with its hash. Without one, an `accept`
+  makes a friendship of this server alone, and drops the offer. A
+  decline drops the offer; for an upgrade offer it drops nothing else,
+  and is answered `{ "state": "accepted" }`.
+- **`friend_remove` with a `withdraw`** ends every friendship between
+  the two whose half by the withdrawal's party predates its `before`,
+  on this server and, as the withdrawal travels, everywhere else; the
+  friend is told `removed` with it. Without one, it ends the friendship
+  here alone, and the server keeps a withdrawal of its own for the
+  caller, so that the caller's other devices do not present it straight
+  back. So does one whose `withdraw` is refused, `stale`,
+  `bad_signature`, or `access_denied` from a session that is not a
+  friendships session: the friend is removed here all the same, and the
+  refusal is the answer, for the client to sign afresh for the other
+  servers. With `offer`, it cancels the caller's
+  upgrade offer to `login` and nothing else. With `fingerprint` in place
+  of `login`, it drops a friendship this account presented and the other
+  party has not, and is answered `{}` whether or not there was one;
+  with a friend's fingerprint it ends that friendship as `login` would.
+- **`find_user` by `fingerprint`** finds the account that links it, as
+  by `login`, with the same one answer `no_such_user` for an account
+  that does not exist, does not take part or has blocked the caller.
+  To a friendships session, the `user` object of `find_user` and
+  `user_profile`, by either name, carries `fingerprint` where the
+  account links an identity whose link the server would show it: what
+  an `offer`'s `to` is. A link it would not show is answered as no link
+  at all, never as `no_such_user`, so that the answer tells a hidden
+  link from none and no further. *hxd-ng* shows every link.
+- **`block` with a `withdraw`**, by `login` alone, withdraws, then
+  blocks, as `friend_remove` with one does; the friend's other servers
+  are told of a removal, never of a block. The block stands whatever
+  becomes of the withdrawal, whose refusal is the answer. A `withdraw`
+  beside `uid`, or on `unblock`, is `bad_request`.
+
+Two requests are added, answered to friendships sessions alone:
+
+| `req` | `params` | `ok` | Errors besides §10's universal set |
+|---|---|---|---|
+| `friendships_present` | `withdrawals?`, `friendships?`: arrays of objects, at most 32 together and at most one withdrawal for a pair | `{ "withdrawals": [ result… ], "friendships": [ result… ] }`, each in the order sent | `bad_request` past either bound |
+| `friendships_fetch` | `hashes?`, `fingerprints?`: at most 32 together | `{ "friendships": [ { "hash", "friendship"? } ], "rotations": [ { "fingerprint", "records": [ … ] } ] }` | `bad_request` past the bound |
+
+- **`friendships_present`** presents friendships on this server and
+  gives it withdrawals, the withdrawals first. A result is `{ "hash",
+  "result", "withdraw"? }`, `hash` the friendship hash, or a
+  withdrawal's pair hash, and `result` one of:
+
+  | `result` | For | The client |
+  |---|---|---|
+  | `ok` | presented, or a withdrawal taken | records it as presented here |
+  | `no_such_user` | the other party has no account here, does not take part, or one of the two has blocked the other; counted toward the bound below as a presentation is | tries again at a later login |
+  | `roster_full` | this account's own bound on friendships it presented whose friendship here is not active, or its roster as the friendship becomes active | tries again when it has room |
+  | `bad_signature` | a friendship that fails its checks or names neither of this account's identity and a successor's, or a withdrawal that fails its checks or is not this session's own | drops the object |
+  | `withdrawn` | a withdrawal held here ends the friendship | with `withdraw`, checks it and treats the friendship as withdrawn; with none, stops presenting it here |
+  | `stale` | a withdrawal whose `time` is not within ten minutes of the server's clock | signs it afresh |
+
+  When each party has presented a friendship for the pair, the two are
+  friends here and each is told the `friend` entry as for a new friend;
+  they need not have presented the same one. A client sends its
+  withdrawals before `friends` at login, so that they are applied
+  before its roster is read, and its friendships after. It presents only
+  where its user chose to, per server and per friend, and finds a
+  friend first by `find_user` by `fingerprint`, though presenting still
+  answers for a friend who is not here.
+- **`friendships_fetch`** fetches the friendships whose hashes a `friend`
+  entry carried that the client does not hold: each hash is answered
+  with its `friendship` only where it is in an entry this account was
+  sent for a friend it now has, and without one otherwise, so that a
+  hash tells a stranger nothing. A fingerprint is answered with
+  `records`, the rotation records (identity-registrar.md §4.6) that end
+  at it, oldest first, each the base64url of the signed record as it
+  was published, where it is a friend's and this server has applied
+  them, and with none otherwise: what a client checks before it moves a
+  friendship to a friend's new key (portable-friends §10).
+- **Checking a rotation.** A client checks both of each record's
+  signatures itself. The other check, that the successor is the one the
+  predecessor's card committed to or that its registrar published, is
+  one this wire does not hand the client the means to make: a server
+  applies a rotation only to the successor it anchored from the
+  predecessor's own card, or from the records of a registrar it trusts
+  (identity-records.md §4), and answers records for no rotation it has
+  not applied, so a record served is one that check passed here. That
+  is this server's word, which an honest server's is, and a dishonest
+  one can serve only a rotation the predecessor's key signed, which is
+  the theft the commitment guards against. So a client that has not
+  made the check itself, from a card or a registrar it reaches another
+  way, accepts a successor's upgrade offer only once its user confirms
+  it, rather than unasked as portable-friends §10 lets a client that
+  has.
+
+What friendships sessions are sent beside the rest, and nobody else is:
+
+- the **`friend` object** carries `friendships`, the hashes of the
+  friendships each party presented, on an `accepted` entry that is
+  portable: this account's own presentation first and the friend's
+  second, or one alone where both presented the same friendship; `offer` on a `pending_in` entry whose request
+  carries one, and on an `accepted` entry whose friend sent an upgrade
+  offer this account has not answered; and `withdraw` on a `removed`
+  entry that a withdrawal ended. A `removed` entry with no `withdraw`
+  ended the friendship on this server alone: an account went, a
+  presentation was dropped as its device was revoked, or a client
+  removed without one. A client that recorded the friendship as
+  presented here presents it again;
+- **`friend_request`** carries `offer`, and an upgrade offer's is sent
+  to these sessions alone.
+
+| Code | From | Meaning |
+|---|---|---|
+| `withdrawn` | `friend_add`, `friend_respond` | A withdrawal this server holds ends the offer or the friendship. Sign again after ten minutes. |
+| `stale` | `friend_add`, `friend_respond`, `friend_remove`, `block` | An offer, acceptance or withdrawal whose `time` is not within ten minutes of the server's clock. |
+| `bad_signature` | `friend_add`, `friend_respond`, `friend_remove`, `block` | An offer, friendship or withdrawal that fails its checks, or is not this session's own act. |
+
+*hxd-ng* prices `friendships_present` at 1 and 4 for each object it
+carries and `friendships_fetch` at 4 and 1 for each hash or fingerprint,
+against the session's request limit (§9), which is the session's and
+not the account's, so a new login starts it afresh, and an `offer` or a
+`withdraw` on
+another request at 2 beside that request's price and a `friendship` at
+4, for their signatures; none of them costs spam points, so a user who
+brings hundreds of friends to a new server is paced, never kicked. It
+shows every account's link to anyone, so it has no hidden links
+(portable-friends §3), and its own bound on presentations not yet
+presented by the other party is `[messaging] max_roster`. Unlinking an
+identity drops what the account presented under it, and its sessions
+that proved it make friendship acts no more, but its friends are told
+nothing until instant-messaging.md's IM2b tells them of an unlink.
+
 ## 8. Text and limits
 
 All text on this wire is UTF-8; JSON makes it so. A server that shares its
@@ -1219,6 +1420,7 @@ news body is different: it declares its own type (news.md §5).
 | `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3), or a user of a linked server behind a link that does not carry them, or whose server is not shown this session's key. |
 | `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). |
 | `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
+| `withdrawn`, `stale` | the `messaging` family | §7.5: a friendship object a withdrawal held here ends, or one out of the server's time. `bad_signature` is §7.5's too, for a friendship object that fails its checks. |
 
 The files codes are §7.2's. Each family's document lists its own. A
 client MUST treat a code it does not recognize as a failure of that one
@@ -1265,6 +1467,9 @@ normative, this list is not.
 - with `messaging`, acknowledges each `im` with `receipt`, shows an
   `im` it has shown before once, sends `friends` after each handshake
   and `sync` for what waited, and lets a typing flag lapse (§7.5);
+- with `friendships`, sends its withdrawals before `friends`, signs
+  friendship objects by its own clock, and presents only where its user
+  chose to (§7.5);
 - treats `rate_limited` as a delay, not a failure (§9);
 - renders no markup in chat that a classic client would not also see as
   text (§8);
