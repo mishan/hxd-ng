@@ -37,6 +37,8 @@ struct State {
 }
 
 pub struct Proxy {
+    /// Where it listens: the port it was given, or the one bound for 0.
+    pub addr: SocketAddr,
     state: watch::Sender<State>,
     task: JoinHandle<()>,
 }
@@ -51,13 +53,16 @@ impl Proxy {
         let listener = TcpListener::bind(listen)
             .await
             .map_err(|e| format!("proxy {listen}: {e}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| format!("proxy {listen}: {e}"))?;
         let (state, rx) = watch::channel(State {
             open: true,
             latency,
             ..State::default()
         });
         let task = tokio::spawn(serve(listener, upstream, rx));
-        Ok(Proxy { state, task })
+        Ok(Proxy { addr, state, task })
     }
 
     pub fn cut(&self) {
@@ -208,6 +213,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    /// A port the proxy binds itself: one found free and released first
+    /// can be taken by a test running beside it before the proxy binds.
+    const ANY: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
     async fn echo() -> SocketAddr {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -232,14 +241,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_ends_what_it_carries_and_refuses_more_until_restored() {
-        let listen = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let proxy = Proxy::start(listen, echo().await, Duration::ZERO)
+        let proxy = Proxy::start(ANY, echo().await, Duration::ZERO)
             .await
             .unwrap();
+        let listen = proxy.addr;
         let mut carried = TcpStream::connect(listen).await.unwrap();
         carried.write_all(b"ping").await.unwrap();
         let mut got = [0; 4];
@@ -262,14 +267,8 @@ mod tests {
             // Accept, then give up on the dialer at once.
             let _ = peer.accept().await;
         });
-        let listen = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let proxy = Proxy::start(listen, upstream, Duration::ZERO)
-            .await
-            .unwrap();
+        let proxy = Proxy::start(ANY, upstream, Duration::ZERO).await.unwrap();
+        let listen = proxy.addr;
         proxy.stall();
         let mut s = TcpStream::connect(listen).await.unwrap();
         let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -304,14 +303,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             s.write_all(b"bye").await.unwrap();
         });
-        let listen = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let _proxy = Proxy::start(listen, upstream, Duration::ZERO)
-            .await
-            .unwrap();
+        let proxy = Proxy::start(ANY, upstream, Duration::ZERO).await.unwrap();
+        let listen = proxy.addr;
         let mut s = TcpStream::connect(listen).await.unwrap();
         s.write_all(b"xx").await.unwrap();
         let mut got = Vec::new();
@@ -321,13 +314,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_latency_delays_every_byte_each_way() {
-        let listen = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
         let latency = Duration::from_millis(150);
-        let _proxy = Proxy::start(listen, echo().await, latency).await.unwrap();
+        let proxy = Proxy::start(ANY, echo().await, latency).await.unwrap();
+        let listen = proxy.addr;
         let mut s = TcpStream::connect(listen).await.unwrap();
         for _ in 0..2 {
             let sent = tokio::time::Instant::now();
@@ -342,14 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_stall_holds_back_what_the_peer_sends_until_it_ends() {
-        let listen = TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let proxy = Proxy::start(listen, echo().await, Duration::ZERO)
+        let proxy = Proxy::start(ANY, echo().await, Duration::ZERO)
             .await
             .unwrap();
+        let listen = proxy.addr;
         let mut s = TcpStream::connect(listen).await.unwrap();
         proxy.stall();
         s.write_all(b"ping").await.unwrap();
