@@ -260,40 +260,40 @@ impl Core {
                 .into_iter()
                 .filter(|u| r.users.get(u).is_some_and(is_live))
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
-            let form = signed.map(|s| s.form);
-            let (to, ev) = if messengers.is_empty() {
-                let ev = Event::Msg {
-                    from: uid,
-                    from_nick: nick,
-                    from_login: Some(me.mailbox.login.clone()),
-                    text,
-                    id: None,
-                    sent_at: now,
-                    queued: false,
-                    media: None,
-                    signed: form,
-                };
-                (plain, ev)
-            } else {
-                let ev = Event::Im(Box::new(Im {
-                    from_login: me.mailbox.login.clone(),
-                    from_fingerprint: me.mailbox.fingerprint,
-                    from_nick: nick,
-                    text,
-                    id: None,
-                    guid: guid.clone(),
-                    sent_at: now,
-                    queued: false,
-                    signed: form,
-                    approval: false,
-                }));
-                (messengers, ev)
-            };
-            if to.is_empty() {
+            if messengers.is_empty() && plain.is_empty() {
                 return Err(MessagingError::RateLimited);
             }
-            for u in to {
-                r.send_to(u, ev.clone());
+            // No row, so a plain session beside a messenger has nothing
+            // to be handed later: it hears it now, as mail.
+            let form = signed.map(|s| s.form);
+            let mail = Event::Msg {
+                from: uid,
+                from_nick: nick.clone(),
+                from_login: Some(me.mailbox.login.clone()),
+                text: text.clone(),
+                id: None,
+                sent_at: now,
+                queued: false,
+                media: None,
+                signed: form.clone(),
+            };
+            let im = Event::Im(Box::new(Im {
+                from_login: me.mailbox.login.clone(),
+                from_fingerprint: me.mailbox.fingerprint,
+                from_nick: nick,
+                text,
+                id: None,
+                guid: guid.clone(),
+                sent_at: now,
+                queued: false,
+                signed: form,
+                approval: false,
+            }));
+            for u in messengers {
+                r.send_to(u, im.clone());
+            }
+            for u in plain {
+                r.send_to(u, mail.clone());
             }
             return Ok(ImSent {
                 id: None,

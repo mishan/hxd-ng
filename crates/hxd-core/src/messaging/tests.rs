@@ -1187,6 +1187,21 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
             .any(|e| matches!(e, Event::Im(im) if im.id.is_none() && !im.queued)),
         "handed over live, with no row"
     );
+    // A plain session beside the messenger is kept nothing to be handed
+    // later, so it hears it now, as mail.
+    let (beside, mut rbeside) = attach_identified(&s.core, "bob", key(2));
+    assert_eq!(
+        im(
+            "bob",
+            "to both kinds",
+            &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000017").unwrap(),
+            None
+        ),
+        Ok(())
+    );
+    assert_eq!(ims(&drain(&mut rb)), [("to both kinds".into(), false)]);
+    assert_eq!(msgs(&drain(&mut rbeside)), ["to both kinds"]);
+    s.core.end_session(beside);
     s.core.end_session(b);
     // With no messenger there, as a private message to every session.
     let plain: Vec<(Uid, Events)> = (0..2)

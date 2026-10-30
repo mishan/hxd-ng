@@ -254,7 +254,8 @@ pub struct StoredMessage {
     pub delivered_at: Option<SystemTime>,
     /// When a client said it had been read. A legacy session has no way to
     /// say so, so delivery that reaches only legacy sessions is the read
-    /// (the flush sets both); one an ng session also got waits for it.
+    /// (the flush sets both); a row an ng session also received stays
+    /// unread until that client marks it.
     pub read_at: Option<SystemTime>,
 }
 

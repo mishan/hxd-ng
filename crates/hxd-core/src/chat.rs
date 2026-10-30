@@ -2761,6 +2761,7 @@ impl Core {
                     continue;
                 }
                 let s = &r.users[&uid];
+                let serial = s.serial;
                 let Some((_, batch)) = batches.iter().find(|(w, _)| *w == which) else {
                     continue;
                 };
@@ -2823,7 +2824,7 @@ impl Core {
                         unread.insert(m.id);
                     }
                 }
-                reached.push((uid, which, messenger));
+                reached.push((uid, serial, which, messenger));
             }
         }
 
@@ -2850,7 +2851,7 @@ impl Core {
         // one place a client of either wire will see it, rather than
         // inventing a digest format.
         let mut notices = Vec::new();
-        for (uid, which, messenger) in reached {
+        for (uid, serial, which, messenger) in reached {
             let left = match (messenger, which) {
                 (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
                 (true, w) if w != crate::inbox::Pending::MailApproved => store
@@ -2862,13 +2863,17 @@ impl Core {
             };
             match left {
                 Ok(0) => {}
-                Ok(n) => notices.push((uid, n)),
+                Ok(n) => notices.push((uid, serial, n)),
                 Err(e) => warn!("inbox: counting what is left for {}: {e}", mailbox.login),
             }
         }
         if !notices.is_empty() {
             let mut r = self.roster.lock().unwrap();
-            for (uid, n) in notices {
+            for (uid, serial, n) in notices {
+                // The uid may have been reused while the counts were read.
+                if !holds(&r, mailbox, &uid) || r.users[&uid].serial != serial {
+                    continue;
+                }
                 r.send_to(
                     uid,
                     Event::Notice {
