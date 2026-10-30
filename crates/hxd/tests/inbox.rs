@@ -986,6 +986,38 @@ async fn a_message_reaches_the_attached_session_of_two() {
     assert_eq!(m["queued"], false, "it did not wait");
 }
 
+/// An account open in two ng clients and a period one: a message by
+/// login reaches each of them once, is stored once, and stays unread for
+/// an ng client to mark, since one of the sessions it reached can.
+#[tokio::test]
+async fn a_message_by_login_reaches_every_session_of_the_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start(dir.path(), InboxPolicy::default()).await;
+
+    let (mut tab, _) = Ng::login(srv.ng, "bob").await;
+    let (mut phone, _) = Ng::login(srv.ng, "bob").await;
+    let mut legacy = Legacy::login(srv.legacy, "bob").await;
+
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+    let ok = alice
+        .request_ok("msg", json!({ "to_login": "bob", "text": "you up?" }))
+        .await;
+    assert_eq!(ok["queued"], false);
+    let (t, p) = (tab.msg_event().await, phone.msg_event().await);
+    assert_eq!(
+        (&t["text"], &p["text"]),
+        (&json!("you up?"), &json!("you up?"))
+    );
+    assert_eq!(t["id"], p["id"], "one message, one row");
+    assert!(legacy.body().await.ends_with("you up?"));
+    for ng in [&mut tab, &mut phone] {
+        ng.request_ok("ping", json!({})).await;
+        assert!(ng.queued.iter().all(|v| v["ev"] != "msg"), "once each");
+    }
+    let inbox = phone.request_ok("inbox", json!({})).await;
+    assert_eq!((&inbox["unread"], &inbox["total"]), (&json!(1), &json!(1)));
+}
+
 /// The by-login live path stores nothing, so it has to reach a session
 /// that can actually take the message — there is no second copy.
 #[tokio::test]

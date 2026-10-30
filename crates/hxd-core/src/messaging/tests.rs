@@ -986,8 +986,10 @@ fn a_family_session_waits_for_its_roster_read_and_any_other_is_handed_a_message(
         "a session that speaks no friend family reads it as a private message"
     );
     assert!(s.inbox.all()[1].delivered_at.is_some());
+    let (_b2, mut rb2) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.3");
     s.core.im_send(a, "bob", "live".into(), None, None).unwrap();
     assert_eq!(msgs(&drain(&mut rb)), ["live"]);
+    assert_eq!(msgs(&drain(&mut rb2)), ["live"], "and every other one");
 }
 
 #[test]
@@ -1185,7 +1187,39 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
             .any(|e| matches!(e, Event::Im(im) if im.id.is_none() && !im.queued)),
         "handed over live, with no row"
     );
+    // A plain session beside the messenger is kept nothing to be handed
+    // later, so it hears it now, as mail.
+    let (beside, mut rbeside) = attach_identified(&s.core, "bob", key(2));
+    assert_eq!(
+        im(
+            "bob",
+            "to both kinds",
+            &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000017").unwrap(),
+            None
+        ),
+        Ok(())
+    );
+    assert_eq!(ims(&drain(&mut rb)), [("to both kinds".into(), false)]);
+    assert_eq!(msgs(&drain(&mut rbeside)), ["to both kinds"]);
+    s.core.end_session(beside);
     s.core.end_session(b);
+    // With no messenger there, as a private message to every session.
+    let plain: Vec<(Uid, Events)> = (0..2)
+        .map(|_| attach_identified(&s.core, "bob", key(2)))
+        .collect();
+    assert_eq!(
+        im(
+            "bob",
+            "to the plain ones",
+            &MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000016").unwrap(),
+            None
+        ),
+        Ok(())
+    );
+    for (uid, mut rx) in plain {
+        assert_eq!(msgs(&drain(&mut rx)), ["to the plain ones"]);
+        s.core.end_session(uid);
+    }
     assert_eq!(
         im(
             "bob",
@@ -1730,6 +1764,8 @@ fn a_classic_party_is_sent_an_approval_as_private_messages() {
         }
         let mut family_rx = (case.ends_with("family") && case != "later family")
             .then(|| family(&s.core, "plain").1);
+        // Every such session, not the first.
+        let mut second_rx = (case == "attached family").then(|| family(&s.core, "plain").1);
         assert!(matches!(
             send(&s.core, b, "plain", "welcome"),
             Ok(crate::MsgOutcome::Queued(_))
@@ -1737,6 +1773,9 @@ fn a_classic_party_is_sent_an_approval_as_private_messages() {
         let mut heard = drain(&mut rp);
         if let Some(rx) = family_rx.as_mut() {
             heard.extend(drain(rx));
+        }
+        if let Some(rx) = second_rx.as_mut() {
+            assert_eq!(msgs(&drain(rx)), ["welcome"], "{case}: the second session");
         }
         if case == "later family" {
             let (f, mut rf) = family(&s.core, "plain");

@@ -263,7 +263,7 @@ CREATE TABLE message (
   guid         TEXT,                  -- the client's own id, when it gave one
   sent_at      INTEGER NOT NULL,      -- unix seconds
   delivered_at INTEGER,               -- handed to a live connection, on either wire
-  read_at      INTEGER                -- an ng client said so (`msg_read`); never the legacy wire (§8)
+  read_at      INTEGER                -- an ng client said so, or delivery reached only legacy sessions (§8)
 );
 -- Retry safety: one message per (sender, recipient, guid), keyed on the
 -- *mailbox* rather than on its two columns — see below.
@@ -372,7 +372,7 @@ server, exactly. Two entry points:
 | | |
 |---|---|
 | `msg(from: Uid, to: Uid, text)` | What both wires call. Resolves `to`'s mailbox and status, then §6.1. |
-| `msg_login(from: Uid, to: &str, text)` | Address an account. Delivers live to the session that account holds if any, stores otherwise. |
+| `msg_login(from: Uid, to: &str, text)` | Address an account. Delivers live to every session that account holds attached but the sender's, stores otherwise. |
 
 ### 6.1 The rule
 
@@ -564,29 +564,19 @@ Three timestamps, each meaning one thing: `sent_at`, `delivered_at` (the
 server handed it to a live connection), `read_at` (a client said so, via
 `msg_read`).
 
-A legacy session has no way to say it read something, and an earlier
-draft of this section made delivery the read on that wire — the flush
-set both — on the argument that a permanently unread inbox for every 1.x
-user would make the count useless. The consequence it did not state is
-the one a person with a phone and a period client meets: the phone's
-badge drops to zero because the Mac received the message. So the two
-are split.
-**Delivery to a legacy session sets `delivered_at` only.** `read_at` is
-set by the ng `msg_read` request, and by nothing on the legacy wire.
-`inbox.unread`, and the login reply's count, are messages with no
-`read_at` — which is what a badge means anyway, and the same split XMPP
-made between delivery and display receipts.
+A legacy session has no way to say it read something, so delivery is
+the read on that wire: a permanently unread inbox for every 1.x user
+would make the count useless. But a person with a phone and a period
+client should not see the phone's badge drop to zero because the Mac
+received the message, so the rule turns on who was handed the row.
+**Delivery to a legacy session is its read** — unless an ng session of the account was handed the same row in that flush, in which case it is stamped delivered only and left to that client's `msg_read`.
 
 Said plainly, because a client author and an operator will both meet
-it: **mail delivered to a period client stays unread on the ng side
-until an ng client marks it.** An account used only from 1.x has a
-count that only grows, and nothing on that wire can lower it; that is
-the truth about what the wire can express, and the badge it would have
-zeroed is on a client that wire's user does not have. Retention follows
-the same fact: `retain_read` never applies to mail only a legacy client
-has seen, and `retain_unread` does — thirty days from `sent_at` rather
-than seven from a read that never happened. The flush no longer needs
-to know which wire it is writing to.
+it: **mail handed to period clients alone is read; mail an ng session
+of the account was also handed stays unread until an ng client marks
+it.** An account used only from 1.x keeps a count that delivery lowers.
+Retention follows the stamps: `retain_read` applies to mail delivery
+marked read, and `retain_unread` to mail still waiting on an ng client.
 
 And one more thing that wire cannot do, said here rather than discovered:
 **`delivered_at` on the legacy wire means "handed to the writer task"**,
@@ -896,10 +886,12 @@ Each stage is a branch with tests, in the house style.
   real client has two devices. *Half-answered:* a message that **names a
   uid** goes to that session when it is attached, and to the lowest
   attached one otherwise — naming a uid names a device, and a legacy
-  user clicking a name in the user list means that one. Never to the
-  sender's own session, though: mail to one's own account is for its
-  other sessions, and stays pending if there are none. Read state is
-  still shared, which is the half that remains.
+  user clicking a name in the user list means that one. A message that
+  **names the account** goes to every attached session, and is read on
+  delivery only when each of them is on a wire that cannot say it read
+  it. Never to the sender's own session, though: mail to one's own
+  account is for its other sessions, and stays pending if there are
+  none. Read state is still shared, which is the half that remains.
 - **Retention defaults.** 30 days unread and 7 read are guesses; the spec
   says 30 for its queue. The number that matters is whichever one an
   operator notices.

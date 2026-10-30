@@ -260,40 +260,40 @@ impl Core {
                 .into_iter()
                 .filter(|u| r.users.get(u).is_some_and(is_live))
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
-            let form = signed.map(|s| s.form);
-            let (to, ev) = if messengers.is_empty() {
-                let ev = Event::Msg {
-                    from: uid,
-                    from_nick: nick,
-                    from_login: Some(me.mailbox.login.clone()),
-                    text,
-                    id: None,
-                    sent_at: now,
-                    queued: false,
-                    media: None,
-                    signed: form,
-                };
-                (plain.into_iter().take(1).collect(), ev)
-            } else {
-                let ev = Event::Im(Box::new(Im {
-                    from_login: me.mailbox.login.clone(),
-                    from_fingerprint: me.mailbox.fingerprint,
-                    from_nick: nick,
-                    text,
-                    id: None,
-                    guid: guid.clone(),
-                    sent_at: now,
-                    queued: false,
-                    signed: form,
-                    approval: false,
-                }));
-                (messengers, ev)
-            };
-            if to.is_empty() {
+            if messengers.is_empty() && plain.is_empty() {
                 return Err(MessagingError::RateLimited);
             }
-            for u in to {
-                r.send_to(u, ev.clone());
+            // No row, so a plain session beside a messenger has nothing
+            // to be handed later: it hears it now, as mail.
+            let form = signed.map(|s| s.form);
+            let mail = Event::Msg {
+                from: uid,
+                from_nick: nick.clone(),
+                from_login: Some(me.mailbox.login.clone()),
+                text: text.clone(),
+                id: None,
+                sent_at: now,
+                queued: false,
+                media: None,
+                signed: form.clone(),
+            };
+            let im = Event::Im(Box::new(Im {
+                from_login: me.mailbox.login.clone(),
+                from_fingerprint: me.mailbox.fingerprint,
+                from_nick: nick,
+                text,
+                id: None,
+                guid: guid.clone(),
+                sent_at: now,
+                queued: false,
+                signed: form,
+                approval: false,
+            }));
+            for u in messengers {
+                r.send_to(u, im.clone());
+            }
+            for u in plain {
+                r.send_to(u, mail.clone());
             }
             return Ok(ImSent {
                 id: None,
@@ -354,7 +354,7 @@ impl Core {
 
     /// Hand `to`'s waiting instant messages over live: to every attached
     /// messenger session, what an approval carries to those that
-    /// understand requests alone, or, where it has none, to an attached
+    /// understand requests alone, or, where it has none, to every attached
     /// session as private messages. `under_approval` says an approval's
     /// rows may be among them. Returns the ids handed over.
     pub(crate) fn im_deliver(
@@ -380,14 +380,11 @@ impl Core {
             let understood = m
                 .iter()
                 .any(|u| r.users.get(u).is_some_and(understands_requests));
-            (m, p.first().copied(), understood)
+            (m, p, understood)
         };
         if messengers.is_empty() {
             drop(flushing);
-            return match plain {
-                Some(uid) => self.flush_named(uid, to, fresh, sender),
-                None => Vec::new(),
-            };
+            return self.flush_each(plain, to, fresh, sender);
         }
         let batch = match store.pending_of(
             to,
@@ -440,7 +437,7 @@ impl Core {
         // go as private messages to a party that never took requests.
         if under_approval && !understood && self.never_took_requests(to) {
             drop(flushing);
-            handed.extend(self.flush_named(messengers[0], to, fresh, sender));
+            handed.extend(self.flush_each(messengers, to, fresh, sender));
         }
         handed
     }

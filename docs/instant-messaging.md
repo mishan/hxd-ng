@@ -469,16 +469,18 @@ request, rather than with the rest of the inbox at login
 (`private-messages.md` §6.3). A session that negotiated neither bit 6
 nor the ng friend family never sends either, so it is handed a friend's
 IMs as private messages: live as `private-messages.md` §6.1 hands a
-stored message to an attached session, and at the login flush for those
-still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
+stored message to every attached session, and at the login flush for
+those still waiting, a 1.5 client with the `[queued …]` stamp (§7 there).
+A plain session attached beside a messenger that has not read its
+roster can be handed the account's waiting IMs as mail this way.
 Approval rows go that way only to a party whose account never took
 requests (§4.6). Every drain is capped by
 `deliver_at_flush`, as the login flush is, the rest pulled or waiting
 for the next. A request's rows are never drained. IM rows count toward
 the sender's daily quota as offline private messages do
-(`private-messages.md` §9): past it, a friend's IM reaches an attached
-session live with no row, as mail does, and is refused only with none
-there.
+(`private-messages.md` §9): past it, a friend's IM reaches every
+attached session live with no row, as mail does, and is refused only
+with none there.
 
 **`delivered_at`** is stamped at the 812 ack from a session that can
 send one, and at the handover for a session that cannot. A row handed
@@ -720,9 +722,15 @@ Each stage is a branch with tests, in the house style.
    request's id held to one content by the ledger;
    a released request counted once toward the daily quota; a link
    made while the account has sessions re-keying them, or ending them;
-   and a status text changed while invisible, which friends read once
+   a status text changed while invisible, which friends read once
    the last session leaves, kept from them by persisting the last text
-   shown or deferring the write until the account is visible.
+   shown or deferring the write until the account is visible; and a
+   message by login reaching every eligible session of the account
+   when their reads differ and the backlog passes `deliver_at_flush`,
+   where today a row in one session's batch is stamped delivered for
+   the mailbox and the other session never reads it, closed by
+   delivery tracked per session or a stamp deferred until each has
+   been handed the row.
 3. **IM3, the ng wire and hx-ng.** The friend family and requests in the
    JSON protocol (`hotline-ng.md` §7.5) and their `request_weight`s,
    with two of IM2b's: the `[messaging]` section, its `max_offline`,
