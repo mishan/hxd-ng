@@ -48,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
             cfg: env.cfg.clone(),
             files: None,
             banner: None,
+            device_proof: None,
         };
         let peer = SocketAddr::from(([127, 0, 0, 1], 5500));
         let place = ctx.core.admit_connection(peer.ip()).unwrap();

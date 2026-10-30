@@ -115,6 +115,7 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
         cfg: Arc::new(ServerConfig::default()),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

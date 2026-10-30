@@ -86,6 +86,7 @@ async fn start_stoppable(
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

@@ -48,6 +48,7 @@ async fn start_server(dir: &Path, supported: Caps, ng_caps: &[&str]) -> (SocketA
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),

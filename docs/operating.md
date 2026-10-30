@@ -1067,6 +1067,12 @@ trtp = true                         # serve the tunnel at /trtp; never with
                                     # [server] classic = false
 trtp_login = "verify"               # verify | trust: how a tunnelled classic
                                     # login meets the socket's identity
+classic_hosts = []                  # e.g. ["hl.example:5500", "hl.example:5600"];
+                                    # the names classic clients dial, each port
+                                    # a classic listener's: what a client that
+                                    # holds its device key proves it for there
+classic_proof = "any"               # any | encrypted: encrypted lets only the
+                                    # TLS port and a HOPE cipher prove a device
 enroll = true                       # serve the enrollment mailbox at
                                     # /identity/enroll; off, a device enrolls
                                     # by the paste

@@ -345,7 +345,12 @@ pub struct LocalUser {
 
 impl LocalUser {
     fn of(sess: &UserSession) -> LocalUser {
-        let id = sess.info.transport.identity.as_ref();
+        let id = sess
+            .info
+            .transport
+            .identity
+            .as_ref()
+            .filter(|_| !sess.proved_late);
         LocalUser {
             uid: sess.info.uid,
             nick: sess.info.nick.clone(),
@@ -1375,6 +1380,40 @@ mod tests {
         assert!(events
             .iter()
             .any(|(n, e)| *n <= seq && matches!(e, PeerEvent::Shown(u) if u.uid == b)));
+    }
+
+    #[test]
+    fn a_device_proved_after_joining_is_shown_here_and_not_to_the_links() {
+        let core = Core::new();
+        let mut feed = core.peer_feed(16);
+        let (ann, mut rx) = test_attach(&core, "ann", chatter());
+        let tag = crate::IdentityTag {
+            fingerprint: [1; 32],
+            device: [2; 32],
+            handle: None,
+            quiet_until: None,
+            signs: false,
+            can_sign: false,
+            device_expires: u64::MAX,
+            sealed: None,
+            device_cert: None,
+        };
+        assert!(core.device_proved(ann, tag.clone()));
+        assert!(!core.device_proved(ann, tag), "one device, once");
+        assert!(drain(&mut rx).iter().any(
+            |e| matches!(e, Event::Changed(u) if u.transport.identity.as_ref().is_some_and(|t| t.fingerprint == [1; 32]))
+        ));
+        core.update(ann, Some("anne".into()), None);
+        let mut exported = vec![];
+        while let Ok((_, e)) = feed.try_recv() {
+            if let PeerEvent::Shown(u) | PeerEvent::Changed(u) = e {
+                exported.push((u.nick, u.fingerprint));
+            }
+        }
+        assert_eq!(
+            exported,
+            [("ann".to_string(), None), ("anne".to_string(), None)]
+        );
     }
 
     #[test]

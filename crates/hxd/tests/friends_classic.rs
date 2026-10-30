@@ -136,6 +136,7 @@ async fn start_held(dir: &Path, policy: MessagingPolicy, flood: FloodLimits) -> 
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

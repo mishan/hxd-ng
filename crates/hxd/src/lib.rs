@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 pub mod accounts;
 pub mod banner;
+pub mod device;
 #[cfg(feature = "feeds")]
 pub mod feeds;
 pub mod files;
@@ -1908,6 +1909,14 @@ pub struct IdentitySection {
     /// relayed (§6.2).
     #[serde(default)]
     pub login_proof_v1: bool,
+    /// The `host:port` names the classic ports answer as, which Get Device
+    /// Challenge signs for (`docs/proposals/portable-friends.md` §3).
+    /// Empty is none, and no classic session proves a device.
+    #[serde(default)]
+    pub classic_hosts: Vec<String>,
+    /// `any` or `encrypted`: which classic sessions may prove a device.
+    #[serde(default = "default_classic_proof")]
+    pub classic_proof: String,
     /// Serve the TRTP-over-WebSocket path.
     #[serde(default = "default_true")]
     pub trtp: bool,
@@ -2009,6 +2018,9 @@ fn default_max_new_accounts() -> usize {
 }
 fn default_anchors() -> PathBuf {
     "identity-successors".into()
+}
+fn default_classic_proof() -> String {
+    "any".into()
 }
 fn default_trtp_login() -> String {
     "verify".into()
@@ -2938,6 +2950,38 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 impl IdentitySection {
+    /// `classic_hosts`, in the form a challenge is signed for, each with
+    /// its port. Two that differ only in 80 and 443, which that form
+    /// leaves off, would sign one challenge for both ports.
+    pub fn classic_hosts(&self) -> Result<Vec<(String, u16)>, String> {
+        let mut hosts: Vec<(String, u16)> = Vec::new();
+        for h in &self.classic_hosts {
+            let (Some(host), Some(port)) = (
+                hl_identity::proof::canonical_host(h),
+                hxd_ng_session::identity::host_port(h),
+            ) else {
+                return Err(format!("[identity] classic_hosts: {h:?} is not host:port"));
+            };
+            if hosts.iter().any(|(other, _)| *other == host) {
+                return Err(format!(
+                    "[identity] classic_hosts: {h:?} names {host:?} again, with 80 and 443 left off"
+                ));
+            }
+            hosts.push((host, port));
+        }
+        Ok(hosts)
+    }
+
+    pub fn classic_proof(&self) -> Result<hxd_ng_session::ClassicProof, String> {
+        match self.classic_proof.as_str() {
+            "any" => Ok(hxd_ng_session::ClassicProof::Any),
+            "encrypted" => Ok(hxd_ng_session::ClassicProof::Encrypted),
+            other => Err(format!(
+                "[identity] classic_proof: unknown value {other:?}, not any or encrypted"
+            )),
+        }
+    }
+
     /// The two revocation lists, as the core holds them. Every entry must
     /// be a fingerprint in its display form: a typo that silently revoked
     /// nothing would leave a stolen key in, so it is a startup error, and
@@ -3290,6 +3334,8 @@ fn build_identity(
             newcomer_delay: section.newcomer_delay,
             hosts,
             login_proof_v1: section.login_proof_v1,
+            classic_hosts: section.classic_hosts()?,
+            classic_proof: section.classic_proof()?,
         },
         auth,
         core,
@@ -3351,6 +3397,8 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     }
     if let Some(identity) = &config.identity {
         identity.revocations()?;
+        identity.classic_hosts()?;
+        identity.classic_proof()?;
     }
     if config.server.logins_in_flight == 0
         || config.server.logins_in_flight > tokio::sync::Semaphore::MAX_PERMITS
@@ -4543,6 +4591,7 @@ pub fn build_ctx(
         }),
         files: files.map(|value| value.service.clone()),
         banner,
+        device_proof: None,
     })
 }
 

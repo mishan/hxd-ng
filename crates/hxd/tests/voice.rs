@@ -121,6 +121,7 @@ async fn start_with(
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: ctx.core.clone(),

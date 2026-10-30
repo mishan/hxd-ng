@@ -95,6 +95,7 @@ async fn start_full(dir: &Path, policy: InboxPolicy, who: &[&str], inbox: bool) 
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

@@ -98,6 +98,7 @@ async fn start(dir: &Path) -> (SocketAddr, SocketAddr) {
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

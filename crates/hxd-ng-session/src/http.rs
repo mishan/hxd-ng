@@ -2130,7 +2130,7 @@ fn refused(e: AuthRefused) -> Resp {
     let mut body = json!({ "error": e.code(), "text": match e {
             AuthRefused::BadCard => "the user card did not verify",
             AuthRefused::BadCert => "the device certificate did not verify or is not valid now",
-            AuthRefused::BadProof => "the login proof did not verify",
+            AuthRefused::BadProof | AuthRefused::ClockSkew => "the login proof did not verify",
             AuthRefused::Revoked => "the device or identity is revoked",
             AuthRefused::Denied => "refused by server policy",
             AuthRefused::CardTooLarge => "the user card exceeds 16 KiB",

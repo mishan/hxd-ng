@@ -842,7 +842,46 @@ pub struct LoginAttempt {
     held: Option<(IpAddr, String)>,
 }
 
+/// Get Device Challenge and Prove Device ([`Core::device_proof_spend`]):
+/// as many as one account may ask at once, earned back over
+/// [`DEVICE_PROOFS_PER`], a few logins' worth, since a login that proves
+/// asks both. An address may ask four times as many, for the people
+/// behind one carrier's address.
+pub(crate) const DEVICE_PROOFS: u32 = 10;
+pub(crate) const DEVICE_PROOFS_PER: Duration = Duration::from_secs(60);
+
 impl Core {
+    /// Spend one of the device proofs `uid`'s account and its address may
+    /// ask (`docs/proposals/portable-friends.md` §3), or say how long
+    /// until there is one: a challenge costs a signature, and a proof
+    /// several checks and perhaps a registrar's fetch. Counted by account
+    /// and by address rather than by session, so that reconnecting buys
+    /// nothing. An account that `can_spam` is held to neither, and an
+    /// address `[limits]` exempts to its account's alone.
+    pub fn device_proof_spend(&self, uid: crate::Uid) -> Result<(), Duration> {
+        let Some(key) = self.post_key(uid) else {
+            return Ok(());
+        };
+        let addr = {
+            let r = self.roster.lock().unwrap();
+            r.users.get(&uid).and_then(|s| s.addr)
+        };
+        let now = Instant::now();
+        self.device_proofs
+            .reserve(key.clone(), (DEVICE_PROOFS, DEVICE_PROOFS_PER), now)?;
+        match addr.filter(|a| !self.conn_gate.exempt(*a)) {
+            Some(addr) => self
+                .device_proof_addrs
+                .reserve(
+                    PostKey::Guest(limit_key(addr)),
+                    (4 * DEVICE_PROOFS, DEVICE_PROOFS_PER),
+                    now,
+                )
+                .inspect_err(|_| self.device_proofs.refund(&key, now)),
+            None => Ok(()),
+        }
+    }
+
     /// Take one folder from what `uid`'s account may make
     /// ([`RequestLimits::folders`]), or say how long until one is there.
     /// Taken before the folder is made, and given back by

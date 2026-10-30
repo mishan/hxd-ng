@@ -265,11 +265,15 @@ generate() {
         str HXD_IDENTITY_UNATTESTED unattested
         str HXD_IDENTITY_WEB web
         kvlist hosts "$HXD_IDENTITY_HOSTS"
+        [ -z "${HXD_IDENTITY_CLASSIC_HOSTS:-}" ] || kvlist classic_hosts "$HXD_IDENTITY_CLASSIC_HOSTS"
+        str HXD_IDENTITY_CLASSIC_PROOF classic_proof
         # The generated file is rewritten at every start, so these are the
         # only lists that last; `hxd identity revoke` is refused below.
         fingerprints HXD_REVOKED_IDENTITIES revoked_identities
         fingerprints HXD_REVOKED_DEVICES revoked_devices
     else
+        unused HXD_IDENTITY_CLASSIC_HOSTS "HXD_IDENTITY is off"
+        unused HXD_IDENTITY_CLASSIC_PROOF "HXD_IDENTITY is off"
         unused HXD_REVOKED_IDENTITIES "HXD_IDENTITY is off"
         unused HXD_REVOKED_DEVICES "HXD_IDENTITY is off"
     fi

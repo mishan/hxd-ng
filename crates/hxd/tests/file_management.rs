@@ -136,6 +136,7 @@ async fn start_with(writable: bool) -> Running {
         }),
         files: Some(service.clone()),
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core,

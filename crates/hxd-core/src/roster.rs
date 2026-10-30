@@ -1067,6 +1067,10 @@ pub(crate) struct UserSession {
     /// This session's identity fingerprint — the durable half of its
     /// mailbox key. See [`AttachInfo::identity`].
     pub(crate) identity: Option<[u8; 32]>,
+    /// It proved a device after it was announced ([`Core::device_proved`]),
+    /// so linked servers keep the row they were shown, which had no
+    /// fingerprint.
+    pub(crate) proved_late: bool,
     /// History request throttling is session state, so it survives an ng
     /// transport detach/resume instead of resetting on every WebSocket.
     pub(crate) history_refill: Instant,
@@ -1554,6 +1558,10 @@ pub struct Core {
     pub(crate) post_rates: crate::limits::PostRates,
     /// What each account has left of the folders it may make, likewise.
     pub(crate) folder_rates: crate::limits::PostRates,
+    /// What each account and each address have left of the device proofs
+    /// they may ask, likewise ([`Core::device_proof_spend`]).
+    pub(crate) device_proofs: crate::limits::PostRates,
+    pub(crate) device_proof_addrs: crate::limits::PostRates,
     /// Every standing ban, for matching without the store
     /// (`crate::ban`).
     pub(crate) bans: std::sync::RwLock<crate::ban::BanMatcher>,
@@ -2207,6 +2215,7 @@ impl Core {
                 reads_on_delivery: info.reads_on_delivery,
                 system: info.system,
                 identity: info.identity,
+                proved_late: false,
                 history_refill: Instant::now(),
                 history_tokens: 10.0,
                 search_refill: Instant::now(),
@@ -2303,6 +2312,41 @@ impl Core {
         if r.set_signs(uid, signs, can_sign) {
             r.row_changed(uid);
         }
+    }
+
+    /// `uid` proved a device with Prove Device
+    /// (`docs/proposals/portable-friends.md` §3): its transport identity
+    /// is `tag` from now on, as a tunnelled session's is from its login.
+    /// Proved before it is announced, it is announced with it, and where
+    /// its account linked no identity at login (a proof that linked it)
+    /// its mailbox is the identity's. After, its row is told to the users
+    /// here and not to the links, and its mailbox stays the one its
+    /// presence was taken under. `false`, and nothing changed, for a
+    /// session that proved a device already, the tunnel's included, for
+    /// a tag the revocations refuse, and for a session that has gone.
+    pub fn device_proved(&self, uid: Uid, tag: IdentityTag) -> bool {
+        let mut r = self.roster.lock().unwrap();
+        if self.revoked.read().unwrap().refuses(&tag) {
+            return false;
+        }
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return false;
+        };
+        if sess.info.transport.identity.is_some() {
+            return false;
+        }
+        let fingerprint = tag.fingerprint;
+        sess.info.transport.identity = Some(tag);
+        if !sess.visible && sess.messaging.is_none() {
+            sess.identity.get_or_insert(fingerprint);
+            return true;
+        }
+        sess.proved_late = true;
+        if sess.visible {
+            let ev = Event::Changed(sess.info.clone());
+            r.broadcast(&ev, None);
+        }
+        true
     }
 
     /// End a session outright: leave every private chat (announcing the

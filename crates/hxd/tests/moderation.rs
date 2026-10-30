@@ -129,6 +129,7 @@ async fn start_full(dir: &Path, policy: ModerationPolicy, handle_ttl: Duration) 
         }),
         files: None,
         banner: None,
+        device_proof: None,
     };
     let ng_ctx = NgCtx {
         core: core.clone(),

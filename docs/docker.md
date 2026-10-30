@@ -282,6 +282,8 @@ the same way with `hxd-entrypoint room …` and applied on SIGHUP.
 | `HXD_IDENTITY_UNATTESTED` | `guest` | `deny`, `guest` or `allow`. |
 | `HXD_IDENTITY_WEB` | | Where a web client for this server lives, e.g. `https://hl.example/app/`. |
 | `HXD_IDENTITY_HOSTS` | | The names clients reach the server by, comma-separated `host[:port]` with the port left off for 80 and 443, e.g. `hl.example`: a login proof must name one ([operating.md](operating.md#identity)). Needed while `HXD_IDENTITY` is on. Without it, a container with `HXD_IDENTITY=on`, or with a volume that already holds the server key, stops at start and says so, since that volume's users may have linked identities: a volume from before this variable was needed must set it to start again. |
+| `HXD_IDENTITY_CLASSIC_HOSTS` | | The names classic clients reach the server by, comma-separated `host:port` with the port they dial, e.g. `hl.example:5500,hl.example:5600`: what a client that holds its own device key proves it for on the classic ports ([portable-friends.md](proposals/portable-friends.md) §3). Each port must be the one a listener binds inside the container, so publish it on the same number. Unset, no classic session proves a device. |
+| `HXD_IDENTITY_CLASSIC_PROOF` | `any` | Or `encrypted`, which lets only a session on the TLS port, or one that agreed a HOPE cipher, prove a device. |
 | `HXD_REVOKED_IDENTITIES` | | Identity fingerprints refused, every device of each, comma-separated in the 52-character form `hlid` prints. |
 | `HXD_REVOKED_DEVICES` | | Device fingerprints refused: one stolen device, leaving the identity's others in. |
 
