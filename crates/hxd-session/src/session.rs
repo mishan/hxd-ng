@@ -669,11 +669,25 @@ fn type_label(ty: u32) -> Kind<'static> {
     }
 }
 
+/// Ends the session of a writer that panics, which would otherwise leave
+/// it listed and deaf behind a reader still open: as a writer that stalls
+/// does, by lagging.
+struct LagOnUnwind(Arc<Backlog>);
+
+impl Drop for LagOnUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.lag();
+        }
+    }
+}
+
 pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     mut wr: W,
     mut rx: UnboundedReceiver<Outbound>,
     backlog: Arc<Backlog>,
 ) {
+    let _unwind = LagOnUnwind(backlog.clone());
     // Server pushes count their own transactions, starting at 1 (mhxd's
     // convention; clients ignore the value everywhere but task replies).
     let mut push_trans: u32 = 1;
@@ -1475,6 +1489,9 @@ fn resends_icon_untasked(req: &LoginRequest) -> bool {
 /// Per-session protocol state after a successful login.
 struct Session {
     uid: Uid,
+    /// Lets the session go should this connection's task unwind before
+    /// it reaches `end_session`.
+    _held: hxd_core::HeldSession,
     account: Account,
     /// Visible on the roster yet? False while a 1.5 client is still inside
     /// the agreement dance.
@@ -2505,6 +2522,7 @@ async fn login_phase(
         );
         return None;
     };
+    let held = ctx.core.hold(uid, &events, None);
     // Asked again now the session is on the roster: a ban placed since
     // the check above found no session to end. Ended here, before the
     // login is answered or anyone told of the join.
@@ -2591,6 +2609,7 @@ async fn login_phase(
 
     let mut sess = Session {
         uid,
+        _held: held,
         account,
         announced: false,
         caps,

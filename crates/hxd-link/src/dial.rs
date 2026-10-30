@@ -213,8 +213,13 @@ async fn dial_once(hub: &Hub, entry: &PeerEntry, linked: &mut bool) -> Next {
     }
 
     let (io, tasks) = hxd_session::peer::dialed(tls, peer_addr, hub.budget());
-    let end = crate::link::run(hub.clone(), entry.clone(), io).await;
+    // On a task of its own, so a link that panics, which its guard holds
+    // as interrupted, leaves this dialer to try again after a backoff.
+    let end = tokio::spawn(crate::link::run(hub.clone(), entry.clone(), io)).await;
     tasks.close().await;
+    let Ok(end) = end else {
+        return Next::Backoff;
+    };
     *linked |= end.established;
     match end.peer_reason {
         Some(Reason::Unlinked | Reason::VersionUnsupported | Reason::Replaced) => Next::Stop,

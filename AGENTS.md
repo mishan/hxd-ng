@@ -176,7 +176,10 @@ release, consult, reacquire) — keep it that way.
 **A session must never outlive its transport silently.** Any handshake
 send failure after attach routes through `end_session` (login) or
 `connection_lost` (resume). A ghost on the roster with a dropped receiver
-is the bug class to fear here.
+is the bug class to fear here. And a connection's task holds
+`Core::hold`'s guard from the moment it has the session's `Events`, so a
+panic that unwinds past those calls still lets the session go; a new
+frontend holds one too.
 
 **A client that will not drain is disconnected, not buffered for.**
 Everything held for a connection is bounded: an attached session's
