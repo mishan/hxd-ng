@@ -840,7 +840,7 @@ from then on. `msg` is not one of them.
 
 **Classic messengers.** A classic session that negotiated capability
 bit 8, a pure messenger (instant-messaging.md §7), is on no roster: no
-`users`, `user_joined`, `user_changed` or `user_left` names it, and it
+`users`, `user_joined`, `user_changed` or `user_parted` names it, and it
 is reached through this family alone.
 
 **Taking part.** Only an account that holds `AccessMessaging` (bit 58,

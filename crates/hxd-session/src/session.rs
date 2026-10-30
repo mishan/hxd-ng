@@ -1184,6 +1184,11 @@ fn err_text(e: ChatError) -> &'static str {
     }
 }
 
+/// The longest instant message a classic client can be handed as mail:
+/// the queued stamp and the text share one field, whose length is 16
+/// bits, and a Mac Roman body is never longer than its UTF-8.
+pub const MAX_IM_BYTES: usize = u16::MAX as usize - "[queued 0000-00-00 00:00 UTC]\r".len();
+
 /// `YYYY-MM-DD HH:MM UTC`, for the queued-message stamp and the
 /// operator's moderation listings.
 ///

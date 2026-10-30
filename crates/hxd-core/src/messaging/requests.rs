@@ -222,6 +222,10 @@ impl Core {
         guid: Option<MessageGuid>,
     ) -> Result<MsgOutcome, MessagingError> {
         let me = self.messenger(uid)?;
+        // As an ng `msg` from it would never be routed as one.
+        if !self.has_inbox(uid) {
+            return Err(MessagingError::NotEnabled);
+        }
         let them = self.other(&me, to)?;
         if text.len() > self.messaging_policy.max_message_bytes {
             return Err(MessagingError::MessageTooLong);

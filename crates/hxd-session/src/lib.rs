@@ -28,6 +28,6 @@ pub use news::{FlatNews, FlatPushes, FlatReply, LegacyNews};
 pub use peer::{LinkGrant, LinkIo, LinkLogin, LinkOut, PeerAcceptor};
 pub use session::{
     run_session, serve, serve_tls, serve_tls_with_peers, ServerConfig, ServerCtx, TrtpLogin,
-    NAMES_A_USER,
+    MAX_IM_BYTES, NAMES_A_USER,
 };
 pub use tls::LegacyTls;

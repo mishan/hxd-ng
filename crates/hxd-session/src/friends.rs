@@ -631,13 +631,21 @@ fn listing_chunks(l: &RequestsListing, takes: bool, from: usize, enc: TextEncodi
     let mut groups: Vec<Chunks> = Vec::new();
     for g in &l.requests {
         let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(&g.from.login))];
+        let mut size = REQUEST_GROUP_FIELDS;
         for m in &g.messages {
             // Every request is stored with a guid.
             let Some(guid) = &m.guid else {
                 continue;
             };
+            // A group stored under larger limits than today's is listed
+            // as far as a page holds it: approving it delivers it all.
+            let body = enc.body(&m.body);
+            size += REQUEST_MESSAGE_FIELDS + body.len();
+            if body.len() > usize::from(u16::MAX) || size > PAGE_BUDGET {
+                break;
+            }
             c.push((tag::MESSAGE_GUID, guid_bytes(guid).to_vec()));
-            c.push((tag::MESSAGE_BODY, enc.body(&m.body)));
+            c.push((tag::MESSAGE_BODY, body));
             c.push((
                 tag::MESSAGE_TIMESTAMP,
                 unix(m.sent_at).to_be_bytes().to_vec(),
@@ -851,13 +859,15 @@ mod tests {
         assert_eq!(guid_of(&[0u8; 15]), None);
     }
 
-    #[test]
-    fn a_listing_pages_by_the_frame_and_resumes_at_its_cursor() {
-        let sender = |n: usize| Mailbox {
+    fn sender(n: usize) -> Mailbox {
+        Mailbox {
             login: format!("s{n}"),
             fingerprint: None,
-        };
-        let msg = |n: u8| StoredMessage {
+        }
+    }
+
+    fn msg(n: u8) -> StoredMessage {
+        StoredMessage {
             id: n.into(),
             recipient: sender(99),
             sender: Some(sender(n.into())),
@@ -871,7 +881,11 @@ mod tests {
             friendship: None,
             delivered_at: None,
             read_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_listing_pages_by_the_frame_and_resumes_at_its_cursor() {
         let listing = RequestsListing {
             requests: (0..6)
                 .map(|n| RequestGroup {
@@ -902,5 +916,25 @@ mod tests {
             .chain([(b"s9".to_vec(), true)])
             .collect();
         assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn a_group_larger_than_a_frame_is_listed_as_far_as_one_holds() {
+        let listing = RequestsListing {
+            requests: vec![RequestGroup {
+                from: sender(1),
+                messages: (10..16).map(msg).collect(),
+            }],
+            approvals: vec![],
+            dropped: 0,
+        };
+        let m = message(&listing_chunks(&listing, true, 0, TextEncoding::Utf8));
+        assert!(m.len() <= MAX_FRAME_DATA as usize + hxproto::HL_HDR_LEN);
+        let page = parse_message_requests(&m, m.len()).unwrap();
+        assert_eq!(page.cursor, None);
+        let groups: Vec<_> = page.groups().collect();
+        assert_eq!(groups.len(), 1);
+        let listed = groups[0].messages().count();
+        assert!((1..6).contains(&listed), "{listed} of 6");
     }
 }

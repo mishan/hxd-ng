@@ -838,7 +838,7 @@ per account rather than two to keep in step. They follow IM4.
 
 **Settings**: a `[messaging]` section with the extension's settings
 (`enabled`, off by default; `max_roster`; `max_message_bytes`, at most
-65535, the most one classic field carries, and with `request_messages`
+what one classic field carries beside the queued stamp, and with `request_messages`
 no more than one page of Get Message Requests holds for one sender;
 `offline_retention_days`; `max_offline`, aligned with `[inbox]`;
 `max_sessions_per_login`, default 0, unlimited) and the requests'
