@@ -1475,6 +1475,9 @@ fn resends_icon_untasked(req: &LoginRequest) -> bool {
 /// Per-session protocol state after a successful login.
 struct Session {
     uid: Uid,
+    /// Lets the session go should this connection's task unwind before
+    /// it reaches `end_session`.
+    _held: hxd_core::HeldSession,
     account: Account,
     /// Visible on the roster yet? False while a 1.5 client is still inside
     /// the agreement dance.
@@ -2505,6 +2508,7 @@ async fn login_phase(
         );
         return None;
     };
+    let held = ctx.core.hold(uid, &events, None);
     // Asked again now the session is on the roster: a ban placed since
     // the check above found no session to end. Ended here, before the
     // login is answered or anyone told of the join.
@@ -2591,6 +2595,7 @@ async fn login_phase(
 
     let mut sess = Session {
         uid,
+        _held: held,
         account,
         announced: false,
         caps,

@@ -94,9 +94,9 @@ pub use rooms::{
     Topic,
 };
 pub use roster::{
-    AttachInfo, Census, Core, Event, Events, IdentityTag, InboxPolicy, Lag, LoginPermit, Resume,
-    SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo, LIVE_QUEUE_BYTES,
-    LIVE_QUEUE_CAP, LOGINS_IN_FLIGHT, OUTBOX_BUFFER_CAP,
+    AttachInfo, Census, Core, Event, Events, HeldSession, IdentityTag, InboxPolicy, Lag,
+    LoginPermit, Resume, SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo,
+    LIVE_QUEUE_BYTES, LIVE_QUEUE_CAP, LOGINS_IN_FLIGHT, OUTBOX_BUFFER_CAP,
 };
 pub use sealed::{SealedDevice, SealedError, SealedHolds};
 pub use system::SystemPolicy;

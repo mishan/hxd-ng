@@ -2524,11 +2524,35 @@ impl Core {
         // One hold of the lock for the look and the act, so that a resume
         // cannot take the session over in between.
         let mut r = self.roster.lock().unwrap();
-        let ours = r.users.get(&uid).is_some_and(|s| match &s.outbox.sink {
-            Sink::Live(_, c) | Sink::Lagged(c) => Arc::ptr_eq(c, &events.conn),
-            Sink::Buffering { .. } => false,
-        });
-        ours.then(|| self.lose(&mut r, uid, max_detached_per_addr))
+        holds(&r, uid, &events.conn).then(|| self.lose(&mut r, uid, max_detached_per_addr))
+    }
+
+    /// What a frontend keeps for as long as one connection carries a
+    /// session, from the moment `attach` or `resume` hands it `events`:
+    /// should the task unwind, the session is let go as this connection
+    /// losing it would let it go, through [`Core::connection_lost`] where
+    /// `detach` gives the frontend's per-address cap, and
+    /// [`Core::end_session`] where it is `None`.
+    pub fn hold(self: &Arc<Self>, uid: Uid, events: &Events, detach: Option<usize>) -> HeldSession {
+        HeldSession {
+            core: self.clone(),
+            uid,
+            conn: events.conn.clone(),
+            detach,
+        }
+    }
+
+    fn let_go(&self, uid: Uid, conn: &Arc<ConnState>, detach: Option<usize>) {
+        let mut r = self.roster.lock().unwrap();
+        if !holds(&r, uid, conn) {
+            return;
+        }
+        match detach {
+            Some(cap) => {
+                self.lose(&mut r, uid, cap);
+            }
+            None => r.end_session(uid),
+        }
     }
 
     /// Is this session currently detached? (Moderation and tests.)
@@ -2656,6 +2680,44 @@ pub(crate) fn is_buffering(sess: &UserSession) -> bool {
 /// on a sink that drops.
 pub(crate) fn is_live(sess: &UserSession) -> bool {
     matches!(sess.outbox.sink, Sink::Live(..))
+}
+
+/// Whether `conn` is the connection `uid`'s session is attached to: one
+/// taken over has handed it to the connection that took it.
+fn holds(r: &RosterInner, uid: Uid, conn: &Arc<ConnState>) -> bool {
+    r.users.get(&uid).is_some_and(|s| match &s.outbox.sink {
+        Sink::Live(_, c) | Sink::Lagged(c) => Arc::ptr_eq(c, conn),
+        Sink::Buffering { .. } => false,
+    })
+}
+
+/// [`Core::hold`]'s guard. A frontend task that panics mid-request is
+/// unwound past the `end_session` or `connection_lost` it would have
+/// reached, which would leave its session on the roster with nothing
+/// behind it; this lets the session go instead. It does nothing when
+/// dropped otherwise, and nothing to a session another connection has
+/// taken over.
+pub struct HeldSession {
+    core: Arc<Core>,
+    uid: Uid,
+    conn: Arc<ConnState>,
+    detach: Option<usize>,
+}
+
+impl Drop for HeldSession {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // On a thread of its own, not here: a panic during an unwind
+        // aborts the process, and the lock that panicked may be the
+        // roster's, poisoned.
+        let (core, uid, conn, detach) =
+            (self.core.clone(), self.uid, self.conn.clone(), self.detach);
+        let _ = std::thread::Builder::new()
+            .name("let-go".into())
+            .spawn(move || core.let_go(uid, &conn, detach));
+    }
 }
 
 #[cfg(test)]
@@ -3220,6 +3282,72 @@ mod tests {
         // The new connection's own loss still counts.
         assert_eq!(core.connection_lost_from(&new, uid, 2), Some(true));
         assert!(core.is_detached(uid));
+    }
+
+    /// Whether `uid` is on the roster, once the guard's thread has had
+    /// its chance to let it go.
+    fn on_roster_after_unwind(core: &Core, uid: Uid) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let here = core.roster.lock().unwrap().users.contains_key(&uid);
+            if !here || Instant::now() >= deadline {
+                return here;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Hold `uid`'s session through `events` on a thread that panics.
+    fn panic_holding(core: &Arc<Core>, uid: Uid, events: &Events, detach: Option<usize>) {
+        let held = core.hold(uid, events, detach);
+        let unwound = std::thread::spawn(move || {
+            let _held = held;
+            panic!("a frontend bug, mid-request");
+        })
+        .join();
+        assert!(unwound.is_err());
+    }
+
+    #[test]
+    fn a_task_that_unwinds_holding_a_session_lets_it_go() {
+        let core = Arc::new(Core::new());
+        let (classic, classic_rx) = test_attach(&core, "classic", AccessBits::empty());
+        panic_holding(&core, classic, &classic_rx, None);
+        assert!(!on_roster_after_unwind(&core, classic), "ended");
+
+        let (ng, ng_rx) = ng_attach(&core, "ng", "10.0.0.1");
+        panic_holding(&core, ng, &ng_rx, Some(2));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !core.is_detached(ng) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            core.is_detached(ng),
+            "detached, as a dropped socket would be"
+        );
+    }
+
+    #[test]
+    fn a_held_session_is_let_go_only_by_an_unwind_and_only_by_its_connection() {
+        let core = Arc::new(Core::new());
+        let (uid, rx) = test_attach(&core, "fine", AccessBits::empty());
+        drop(core.hold(uid, &rx, None));
+        assert!(
+            core.roster.lock().unwrap().users.contains_key(&uid),
+            "an ordinary drop"
+        );
+
+        let (uid, old) = ng_attach(&core, "two-devices", "10.0.0.2");
+        let _new = match core.resume(uid, 0) {
+            Resume::Replayed(rx, _) | Resume::ResyncRequired(rx) => rx,
+            Resume::Gone => panic!("the session is there"),
+        };
+        panic_holding(&core, uid, &old, None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            core.roster.lock().unwrap().users.contains_key(&uid) && !core.is_detached(uid),
+            "the connection that took it over keeps it"
+        );
     }
 
     #[test]
