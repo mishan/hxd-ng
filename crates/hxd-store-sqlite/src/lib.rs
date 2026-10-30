@@ -1862,6 +1862,32 @@ fn collect(
         .collect()
 }
 
+/// What `which` reads of a mailbox's rows, as a `WHERE` clause beside
+/// the mailbox's own.
+fn pending_where(which: Pending) -> String {
+    match which {
+        Pending::All => WAITING.to_string(),
+        Pending::Unapproved => format!(
+            "{WAITING} AND (friendship IS NULL
+                 OR friendship IN (SELECT id FROM relation WHERE kind = 1))"
+        ),
+        Pending::Mail => format!("{WAITING} AND friendship IS NULL"),
+        Pending::MailApproved => format!(
+            "{WAITING} AND (friendship IS NULL
+                 OR friendship IN (SELECT id FROM relation WHERE kind = 2))"
+        ),
+        Pending::Instant { again, approvals } => format!(
+            "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}{}",
+            if again { "" } else { " AND handed_at IS NULL" },
+            friendships_unless(approvals)
+        ),
+        Pending::Receipts { approvals } => format!(
+            "kind = 1 AND delivered_at IS NULL AND {LIVE}{}",
+            friendships_unless(approvals)
+        ),
+    }
+}
+
 impl MessageStore for SqliteStore {
     fn push(&self, m: &NewMessage, cap: usize) -> Result<Pushed, StoreError> {
         let mut conn = self.conn.lock().unwrap();
@@ -1964,38 +1990,32 @@ impl MessageStore for SqliteStore {
         which: Pending,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let which = match which {
-            Pending::All => WAITING.to_string(),
-            Pending::Unapproved => format!(
-                "{WAITING} AND (friendship IS NULL
-                     OR friendship IN (SELECT id FROM relation WHERE kind = 1))"
-            ),
-            Pending::Mail => format!("{WAITING} AND friendship IS NULL"),
-            Pending::MailApproved => format!(
-                "{WAITING} AND (friendship IS NULL
-                     OR friendship IN (SELECT id FROM relation WHERE kind = 2))"
-            ),
-            Pending::Instant { again, approvals } => format!(
-                "{MAIL_ONLY} AND delivered_at IS NULL AND friendship IN (SELECT id FROM relation){}{}",
-                if again { "" } else { " AND handed_at IS NULL" },
-                friendships_unless(approvals)
-            ),
-            Pending::Receipts { approvals } => format!(
-                "kind = 1 AND delivered_at IS NULL AND {LIVE}{}",
-                friendships_unless(approvals)
-            ),
-        };
         let sql = format!(
             "SELECT {COLUMNS} FROM message
-             WHERE {} AND {which}
+             WHERE {} AND {}
              ORDER BY id LIMIT ?2",
-            mailbox_sql(to, "recipient", 1)
+            mailbox_sql(to, "recipient", 1),
+            pending_where(which)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
         let rows = stmt
             .query_map(params![bind(to), limit as i64], row)
             .map_err(StoreError::new)?;
         collect(rows)
+    }
+
+    fn pending_count_of(&self, to: &Mailbox, which: Pending) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT COUNT(*) FROM message WHERE {} AND {}",
+            mailbox_sql(to, "recipient", 1),
+            pending_where(which)
+        );
+        let n: i64 = conn
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| stmt.query_row(params![bind(to)], |r| r.get(0)))
+            .map_err(StoreError::new)?;
+        Ok(n as usize)
     }
 
     fn mark_handed(&self, ids: &[MessageId], at: SystemTime) -> Result<(), StoreError> {

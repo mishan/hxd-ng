@@ -363,11 +363,13 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
         );
     }
     let read = |which| -> Vec<String> {
-        s.pending_of(&dave, 10, which)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.body)
-            .collect()
+        let rows = s.pending_of(&dave, 10, which).unwrap();
+        assert_eq!(
+            s.pending_count_of(&dave, which).unwrap(),
+            rows.len(),
+            "{case}: {which:?} counted as read"
+        );
+        rows.into_iter().map(|m| m.body).collect()
     };
     assert_eq!(read(Pending::All), ["mail", "friend", "approved"], "{case}");
     assert_eq!(read(Pending::Mail), ["mail"], "{case}");

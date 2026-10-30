@@ -200,11 +200,13 @@ fn attached_sessions_of(r: &RosterInner, mailbox: &Mailbox, sender: Uid) -> Vec<
 
 /// Is `uid` an attached session holding `mailbox`, as it stands now? A
 /// uid resolved under an earlier hold of the roster lock may have been
-/// reused since.
+/// reused since. [`Mailbox`]'s rule, as [`sessions_of`] has it: an
+/// identity's session keeps its mailbox under a login it has not
+/// caught up with.
 fn holds(r: &RosterInner, mailbox: &Mailbox, uid: &Uid) -> bool {
     r.users
         .get(uid)
-        .is_some_and(|s| s.mailbox() == *mailbox && is_live(s))
+        .is_some_and(|s| mailbox.matches(&s.login, s.identity.as_ref()) && is_live(s))
 }
 
 /// Who [`Target::Named`] hands mail to: the named session if it is
@@ -2851,15 +2853,27 @@ impl Core {
         // one place a client of either wire will see it, rather than
         // inventing a digest format.
         let mut notices = Vec::new();
+        let mut counted: Vec<(Option<crate::inbox::Pending>, Result<usize, StoreError>)> =
+            Vec::new();
         for (uid, serial, which, messenger) in reached {
-            let left = match (messenger, which) {
-                (false, crate::inbox::Pending::All) => store.pending_count(mailbox),
-                (true, w) if w != crate::inbox::Pending::MailApproved => store
-                    .pending_of(mailbox, usize::MAX, crate::inbox::Pending::Mail)
-                    .map(|m| m.len()),
-                (_, which) => store
-                    .pending_of(mailbox, usize::MAX, which)
-                    .map(|m| m.len()),
+            // `None` is the count the mailbox cap is measured against.
+            let of = match (messenger, which) {
+                (false, crate::inbox::Pending::All) => None,
+                (true, w) if w != crate::inbox::Pending::MailApproved => {
+                    Some(crate::inbox::Pending::Mail)
+                }
+                (_, which) => Some(which),
+            };
+            let left = match counted.iter().find(|(o, _)| *o == of) {
+                Some((_, left)) => left.clone(),
+                None => {
+                    let left = match of {
+                        None => store.pending_count(mailbox),
+                        Some(which) => store.pending_count_of(mailbox, which),
+                    };
+                    counted.push((of, left.clone()));
+                    left
+                }
             };
             match left {
                 Ok(0) => {}
@@ -6029,6 +6043,15 @@ mod inbox_tests {
             &msgs(drain(&mut r_alicia))[..],
             [Event::Msg { text, .. }] if text == "private"
         ));
+        // And live, under the login the directory still has.
+        assert_eq!(
+            core.msg_login(s, "alice", "again".into(), None, None),
+            Ok(MsgOutcome::Delivered)
+        );
+        assert!(matches!(
+            &msgs(drain(&mut r_alicia))[..],
+            [Event::Msg { text, .. }] if text == "again"
+        ));
         core.end_session(alicia);
 
         // Someone else takes the freed login — with an identity of their
@@ -6288,6 +6311,13 @@ mod inbox_tests {
             which: crate::inbox::Pending,
         ) -> Result<Vec<StoredMessage>, StoreError> {
             self.inner.pending_of(to, limit, which)
+        }
+        fn pending_count_of(
+            &self,
+            to: &Mailbox,
+            which: crate::inbox::Pending,
+        ) -> Result<usize, StoreError> {
+            self.inner.pending_count_of(to, which)
         }
         fn mark_handed(
             &self,

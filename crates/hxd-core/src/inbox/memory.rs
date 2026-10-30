@@ -70,6 +70,33 @@ impl MemoryStore {
     }
 
     /// Mail waiting to be handed over, through the gate.
+    /// Is `m` one of `to`'s rows that `which` reads?
+    fn pends(&self, inner: &Inner, m: &StoredMessage, to: &Mailbox, which: Pending) -> bool {
+        let instant = matches!(m.friendship, Some(SentOn::Relation(_)));
+        is(&m.recipient, to)
+            && m.delivered_at.is_none()
+            && match which {
+                Pending::All => self.waiting(inner, m),
+                Pending::Unapproved => self.waiting(inner, m) && !self.on_approval(m),
+                Pending::Mail => self.waiting(inner, m) && m.friendship.is_none(),
+                Pending::MailApproved => {
+                    self.waiting(inner, m) && (m.friendship.is_none() || self.on_approval(m))
+                }
+                Pending::Instant { again, approvals } => {
+                    is_mail(m)
+                        && instant
+                        && self.live(m)
+                        && (again || !inner.handed.contains(&m.id))
+                        && (approvals || !self.on_approval(m))
+                }
+                Pending::Receipts { approvals } => {
+                    m.kind == MessageKind::ReadReceipt
+                        && self.live(m)
+                        && (approvals || !self.on_approval(m))
+                }
+            }
+    }
+
     fn waiting(&self, inner: &Inner, m: &StoredMessage) -> bool {
         is_mail(m) && m.delivered_at.is_none() && !inner.handed.contains(&m.id) && self.live(m)
     }
@@ -304,34 +331,22 @@ impl MessageStore for MemoryStore {
         which: Pending,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        let instant = |m: &StoredMessage| matches!(m.friendship, Some(SentOn::Relation(_)));
         Ok(inner
             .msgs
             .iter()
-            .filter(|m| is(&m.recipient, to) && m.delivered_at.is_none())
-            .filter(|m| match which {
-                Pending::All => self.waiting(&inner, m),
-                Pending::Unapproved => self.waiting(&inner, m) && !self.on_approval(m),
-                Pending::Mail => self.waiting(&inner, m) && m.friendship.is_none(),
-                Pending::MailApproved => {
-                    self.waiting(&inner, m) && (m.friendship.is_none() || self.on_approval(m))
-                }
-                Pending::Instant { again, approvals } => {
-                    is_mail(m)
-                        && instant(m)
-                        && self.live(m)
-                        && (again || !inner.handed.contains(&m.id))
-                        && (approvals || !self.on_approval(m))
-                }
-                Pending::Receipts { approvals } => {
-                    m.kind == MessageKind::ReadReceipt
-                        && self.live(m)
-                        && (approvals || !self.on_approval(m))
-                }
-            })
+            .filter(|m| self.pends(&inner, m, to, which))
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    fn pending_count_of(&self, to: &Mailbox, which: Pending) -> Result<usize, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .msgs
+            .iter()
+            .filter(|m| self.pends(&inner, m, to, which))
+            .count())
     }
 
     fn mark_handed(&self, ids: &[MessageId], _at: SystemTime) -> Result<(), StoreError> {

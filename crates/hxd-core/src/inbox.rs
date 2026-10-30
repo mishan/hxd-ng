@@ -411,6 +411,10 @@ pub trait MessageStore: Send + Sync + 'static {
         which: Pending,
     ) -> Result<Vec<StoredMessage>, StoreError>;
 
+    /// How many rows [`MessageStore::pending_of`] would read with no
+    /// limit.
+    fn pending_count_of(&self, to: &Mailbox, which: Pending) -> Result<usize, StoreError>;
+
     /// Instant messages handed to a session that acknowledges them
     /// (`docs/instant-messaging.md` §5): counted as delivered toward the
     /// queue cap, and handed over again at Get Roster until one is
