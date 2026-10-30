@@ -629,3 +629,17 @@ async fn a_classic_client_beside_friends_hears_nothing_of_them() {
         .collect();
     assert!(stray.is_empty(), "{stray:x?}");
 }
+
+#[tokio::test]
+async fn a_span_past_what_a_clock_holds_is_refused() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), true).await;
+    let (mut dave, _) = messenger(&s, "dave").await;
+    for span in [json!({ "since": u64::MAX }), json!({ "before": u64::MAX })] {
+        assert_eq!(
+            refused(&mut dave, "requests_clear", span).await,
+            "bad_request"
+        );
+    }
+    ok(&mut dave, "ping", json!({})).await;
+}

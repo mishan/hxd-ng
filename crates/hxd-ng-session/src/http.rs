@@ -907,6 +907,7 @@ async fn upgrade(
                     joins_rooms: false,
                     roles: false,
                     messaging: false,
+                    messenger_session: false,
                     friendships: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a

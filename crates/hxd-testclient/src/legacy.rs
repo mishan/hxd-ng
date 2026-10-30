@@ -95,6 +95,11 @@ impl Frame {
     pub fn wire_len(&self) -> usize {
         self.buf.len()
     }
+
+    /// The frame as it came, header and all, for `hxproto`'s parsers.
+    pub fn wire(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 /// Pack one transaction.
@@ -518,7 +523,7 @@ impl Client {
             name: login.nick.as_bytes(),
             icon: login.icon,
             version: login.version,
-            caps: login.caps.unwrap_or(0),
+            caps: login.caps.map_or(0, u64::from),
         };
         // Where Blowfish's rekey markers go; nothing secret rides on it.
         let mut x = 0x9e37_79b9u32;

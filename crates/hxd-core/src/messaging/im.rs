@@ -104,6 +104,19 @@ pub(crate) fn understands_requests(s: &UserSession) -> bool {
         .is_some_and(|m| m.messenger && m.understands_requests)
 }
 
+/// The sessions of `to` an instant message reaches: the visible ones,
+/// and the messenger sessions no user list shows
+/// (`Transport::messenger_session`), which the friend family alone does.
+fn im_sessions(r: &RosterInner, to: &Mailbox) -> Vec<Uid> {
+    let mut uids = sessions_of(r, to);
+    uids.extend(
+        r.taking_part(to)
+            .into_iter()
+            .filter(|u| r.users.get(u).is_some_and(|s| !s.visible)),
+    );
+    uids
+}
+
 impl Core {
     pub(crate) fn inbox_store(&self) -> Result<&Arc<dyn MessageStore>, MessagingError> {
         self.inbox.as_ref().ok_or(MessagingError::NotEnabled)
@@ -256,7 +269,7 @@ impl Core {
             // Behind any hand-over under way, so it overtakes nothing older.
             let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
             let mut r = self.roster.lock().unwrap();
-            let (messengers, plain): (Vec<Uid>, Vec<Uid>) = sessions_of(&r, them)
+            let (messengers, plain): (Vec<Uid>, Vec<Uid>) = im_sessions(&r, them)
                 .into_iter()
                 .filter(|u| r.users.get(u).is_some_and(is_live))
                 .partition(|u| r.users.get(u).is_some_and(is_messenger));
@@ -370,7 +383,7 @@ impl Core {
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
         let (messengers, plain, understood) = {
             let r = self.roster.lock().unwrap();
-            let attached: Vec<Uid> = sessions_of(&r, to)
+            let attached: Vec<Uid> = im_sessions(&r, to)
                 .into_iter()
                 .filter(|u| *u != sender && r.users.get(u).is_some_and(is_live))
                 .collect();
@@ -434,7 +447,9 @@ impl Core {
             warn!("inbox: marking {} messages handed over: {e}", handed.len());
         }
         // An approval's rows, which no session here can be handed as IMs,
-        // go as private messages to a party that never took requests.
+        // go as private messages to a party that never took requests;
+        // only to its visible sessions, as all mail goes, so a messenger
+        // session's waits for one, as it does at that session's login.
         if under_approval && !understood && self.never_took_requests(to) {
             drop(flushing);
             handed.extend(self.flush_each(messengers, to, fresh, sender));
@@ -655,7 +670,7 @@ impl Core {
         };
         let (attentive, busy) = {
             let r = self.roster.lock().unwrap();
-            let sessions: Vec<_> = sessions_of(&r, to)
+            let sessions: Vec<_> = im_sessions(&r, to)
                 .into_iter()
                 .filter_map(|u| r.users.get(&u))
                 .collect();

@@ -47,6 +47,7 @@ use crate::encoding::TextEncoding;
 use crate::file_manage;
 use crate::files;
 use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
+use crate::friends;
 use crate::media;
 use crate::news::{self, LegacyNews};
 use crate::video;
@@ -659,6 +660,7 @@ fn type_label(ty: u32) -> Kind<'static> {
         || news::handles(ty)
         || file_manage::handles(ty)
         || accounts::handles(ty)
+        || friends::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -2441,8 +2443,23 @@ async fn login_phase(
     if caps.has(cap::INLINE_MEDIA) && !ctx.core.media_enabled() {
         caps = Caps::from_bits(caps.bits() & !(1u64 << cap::INLINE_MEDIA));
     }
+    // Bits 6 and 8 are the account's as much as the server's, so the
+    // domain decides them rather than `ServerConfig::caps`, and bit 8 only
+    // beside bit 6 (`docs/instant-messaging.md` §7).
+    if req.caps.has(cap::MESSAGING)
+        && ctx
+            .core
+            .account_takes_part(&account.login, account.access, account.is_person())
+    {
+        caps = caps.with(cap::MESSAGING);
+        if req.caps.has(cap::MESSENGER_SESSION) {
+            caps = caps.with(cap::MESSENGER_SESSION);
+        }
+    }
     let transport = Transport {
         inline_media: caps.has(cap::INLINE_MEDIA),
+        messaging: caps.has(cap::MESSAGING),
+        messenger_session: caps.has(cap::MESSENGER_SESSION),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -2554,6 +2571,9 @@ async fn login_phase(
         if let Some(cfg) = ctx.core.media_config() {
             login_reply.extend(media::limits_chunks(cfg));
         }
+    }
+    if caps.has(cap::MESSAGING) {
+        login_reply.extend(friends::limits(&ctx.core, enc));
     }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
@@ -2702,6 +2722,11 @@ async fn complete_login(
     ctx.core.announce(sess.uid);
     sess.announced = true;
     drop(permit);
+    // A pure messenger takes no private messages (bit 8), so its
+    // account's mail waits for a session that does.
+    if sess.has_cap(cap::MESSENGER_SESSION) {
+        return;
+    }
     // Mail waiting from before this login, now that the roster is
     // coherent. On this wire each one opens a window, which is why the
     // domain caps a single flush and leaves the rest for next time.
@@ -3159,15 +3184,21 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport shows roles, which this one does
         // not.
         Event::RolesChanged(_) | Event::RosterStale => {}
-        // Sent only to a session that asked something of the friend
-        // family, which this wire cannot ask until its 800-block lands.
-        Event::FriendEntry(_)
+        // Sent only to a session that speaks the friend family, which on
+        // this wire is one that negotiated bit 6.
+        ev @ (Event::FriendEntry(_)
         | Event::FriendRequest { .. }
         | Event::Presence { .. }
         | Event::Im(_)
         | Event::Receipt { .. }
         | Event::Typing { .. }
-        | Event::RequestsChanged { .. } => {}
+        | Event::RequestsChanged { .. }) => {
+            if let Some((ty, chunks)) =
+                friends::event(&ev, sess.enc).filter(|_| sess.has_cap(cap::MESSAGING))
+            {
+                notify(tx, ty, chunks);
+            }
+        }
         Event::Kicked => return false,
         Event::AccountChanged(account) => {
             sess.account = *account;
@@ -3249,6 +3280,17 @@ async fn session_loop(
         if !spend(&f, ctx, sess).await {
             continue;
         }
+        // The spec's pure messenger never chats, lists users or takes
+        // part in the classic world, and must not: a session no list
+        // shows that could chat, message, invite or fetch files would
+        // make bit 8 a stealth mode for any messaging account. A chat
+        // line has no reply to refuse it with, and is dropped.
+        if sess.has_cap(cap::MESSENGER_SESSION) && !messenger_may(f.ty) {
+            if f.ty != ClientHdr::Chat.as_u32() {
+                reply_error(tx, f.trans, "A messenger session may not do that.");
+            }
+            continue;
+        }
         let Some(cid) = public_chat_frame(&f, ctx) else {
             dispatch(&f, tx, ctx, sess).await;
             continue;
@@ -3283,6 +3325,20 @@ async fn session_loop(
             .collect();
         public_chat(tx, ctx, sess, cid, lines).await;
     }
+}
+
+/// What a messenger session (bit 8) may ask: the friend family, and what
+/// any session needs to finish its login and stay up.
+fn messenger_may(ty: u32) -> bool {
+    friends::handles(ty)
+        || [
+            ClientHdr::Ping,
+            ClientHdr::AgreementAgree,
+            // A 1.5 client may send its name here to finish its login.
+            ClientHdr::UserChange,
+        ]
+        .iter()
+        .any(|h| h.as_u32() == ty)
 }
 
 /// The most public lines one gathering takes.
@@ -3323,7 +3379,10 @@ fn public_chat_frame(f: &Frame, ctx: &ServerCtx) -> Option<u32> {
 /// the kick and closes, so it stands by the time the client can
 /// reconnect.
 async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
-    match ctx.core.spend_spam(sess.uid, spam_points(f.ty), f.ty) {
+    let points = friends::price(f.ty)
+        .filter(|_| sess.has_cap(cap::MESSAGING))
+        .unwrap_or_else(|| spam_points(f.ty));
+    match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
         Err(flooded) => {
             if let Some(ban) = flooded.ban {
@@ -4921,10 +4980,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            if ctx
-                .core
-                .access_of(target)
-                .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
+            // A session no list shows is left to the kick, which answers
+            // it as a uid nobody holds.
+            if ctx.core.user_details(target).is_some()
+                && ctx
+                    .core
+                    .access_of(target)
+                    .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
             {
                 reply_error(tx, f.trans, "That user cannot be disconnected.");
                 return;
@@ -5577,6 +5639,39 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 }
                 Some(Err(e)) => reply_error(tx, f.trans, e.text()),
                 None => reply_error(tx, f.trans, hxd_core::media::MediaReject::Busy.text()),
+            }
+        }
+
+        // The friend family, for a session that negotiated bit 6; any
+        // other is answered below, as before the family existed.
+        t if friends::handles(t) && sess.has_cap(cap::MESSAGING) => {
+            if t == ClientHdr::ImSend.as_u32() && !sess.can(bit::SEND_MSGS) {
+                reply_error(tx, f.trans, "You are not allowed to send private messages.");
+                return;
+            }
+            let op = match friends::parse(f, sess.enc) {
+                Ok(op) => op,
+                Err(text) => {
+                    if friends::answers(t) {
+                        reply_error(tx, f.trans, text);
+                    }
+                    return;
+                }
+            };
+            let (uid, enc) = (sess.uid, sess.enc);
+            match off_reactor(&ctx.core, move |c| friends::act(c, uid, enc, op)).await {
+                Some(friends::Answer::Reply { chunks, then }) => {
+                    reply(tx, f.trans, chunks);
+                    for (ty, chunks) in then {
+                        notify(tx, ty, chunks);
+                    }
+                }
+                Some(friends::Answer::Refused { text, reason }) => {
+                    reply_error_with(tx, f.trans, text, friends::Answer::reason_chunks(reason))
+                }
+                Some(friends::Answer::Silent) => {}
+                None if friends::answers(t) => reply_error(tx, f.trans, "Server error."),
+                None => {}
             }
         }
 

@@ -586,7 +586,8 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     json!({ "hidden_here": true, "network": done, "banned": banning && done }),
                 );
             }
-            if core.user(p.uid).is_none() {
+            // A session no list shows is nobody to kick.
+            if core.user_details(p.uid).is_none() {
                 return refused(ModError::NoSuchUser);
             }
             if core

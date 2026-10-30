@@ -245,6 +245,11 @@ pub struct Transport {
     /// arriving as private messages, and friend events reach it from
     /// login on.
     pub messaging: bool,
+    /// A pure messenger, capability bit 8 on the classic wire: never
+    /// announced, so on no user list and in no join, change or part, and
+    /// reached through the friend family alone
+    /// (`docs/instant-messaging.md` §7).
+    pub messenger_session: bool,
     /// It asked for portable friendships and proved a device that may
     /// make them (`docs/proposals/portable-friends.md` §7): the only kind
     /// of session sent an offer, a friendship hash or a withdrawal, and
@@ -1853,6 +1858,11 @@ impl Core {
         self
     }
 
+    /// What `[inbox]` says.
+    pub fn inbox_policy(&self) -> InboxPolicy {
+        self.inbox_policy
+    }
+
     /// Keep blocks, and every other relationship, in `store`.
     pub fn with_relationships(
         mut self,
@@ -2213,20 +2223,23 @@ impl Core {
     }
 
     /// Make an attached session visible and broadcast its join to everyone
-    /// else. Idempotent.
+    /// else, or for a messenger session (`Transport::messenger_session`)
+    /// only take its place in presence. Idempotent.
     pub fn announce(&self, uid: Uid) {
         let load = self.presence_load(uid);
         let mut r = self.roster.lock().unwrap();
         let Some(sess) = r.users.get_mut(&uid) else {
             return;
         };
-        if sess.visible {
+        if sess.visible || sess.messaging.is_some() {
             return;
         }
-        sess.visible = true;
-        let ev = Event::Joined(sess.info.clone());
-        r.broadcast(&ev, Some(uid));
-        r.export_shown(uid);
+        if !sess.info.transport.messenger_session {
+            sess.visible = true;
+            let ev = Event::Joined(sess.info.clone());
+            r.broadcast(&ev, Some(uid));
+            r.export_shown(uid);
+        }
         if let Some(load) = load {
             r.presence_join(uid, load);
         }

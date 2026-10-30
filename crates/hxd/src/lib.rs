@@ -1502,6 +1502,24 @@ impl MessagingSection {
         if let Some((key, _)) = counts.iter().find(|(_, n)| *n == 0) {
             return Err(format!("[messaging] {key} must be above 0"));
         }
+        // An instant message travels in one field of the classic wire,
+        // whose length is 16 bits, and a Mac Roman body is never longer
+        // than its UTF-8.
+        if self.max_message_bytes > usize::from(u16::MAX) {
+            return Err(format!(
+                "[messaging] max_message_bytes must be at most {}",
+                u16::MAX
+            ));
+        }
+        // A page of the classic wire's Get Message Requests holds one
+        // sender's group whole.
+        if !hxd_session::request_group_fits(self.request_messages, self.max_message_bytes) {
+            return Err(
+                "[messaging] request_messages times max_message_bytes is more than one \
+                 page of message requests holds: lower either"
+                    .into(),
+            );
+        }
         // Added to the clock as a deadline, so it is bounded well short of
         // where the arithmetic would overflow.
         if !(1..=MAX_REQUEST_RETENTION_DAYS).contains(&self.request_retention_days) {
@@ -4993,6 +5011,18 @@ sync = "full"
             (
                 format!("{INBOX}[messaging]\nrequest_retention_days = 3650\n"),
                 None,
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65535\nrequest_messages = 3\n"),
+                None,
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65535\nrequest_messages = 4\n"),
+                Some("request_messages times max_message_bytes"),
+            ),
+            (
+                format!("{INBOX}[messaging]\nmax_message_bytes = 65536\n"),
+                Some("max_message_bytes must be at most 65535"),
             ),
             (
                 format!("{INBOX}[messaging]\nrequest_retention_days = 0\n"),

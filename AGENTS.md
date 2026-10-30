@@ -53,7 +53,7 @@ been exercised on newer toolchains; CI runs stable.
 | Crate | Role |
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
-| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
+| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`), the friend family of fogWraith's instant messaging extension and the message requests draft (`friends.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs, and the registrar's requests, records and signed lists (with the one record verifier they all share), and the signed messages of `docs/e2e-messages.md` §3 (`message.rs`) and their sealing with HPKE (`sealed.rs`), and the server key handover of `docs/server-key-handover.md` with a client's check of a served chain (`handover.rs`), and the friendship objects of `docs/proposals/friendship-objects.md` (`friendship.rs`) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, user groups (`users.rs`), the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins, the task fanning the core's export feed out to the links, and each link's ghosts), one session loop per link, the dialer, and the user keys draft's certificates fetched by hash, the checks of a ghost's signed line or message, and the sessions seen to sign (`keys.rs`). Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
@@ -69,7 +69,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-feeds` | The feed reader (`docs/news-feeds.md` §5, §7): the fetch, through `hxd-fetch`; the parse of RSS, RDF, Atom and JSON Feed into items oldest first, each known by a hash of its identity; and the conversion of a feed's HTML into markdown that holds none, over a tokenizer and a stack it bounds itself. Hands its caller normalized items and knows nothing about Hotline. |
 | `hxd-fetch` | The outbound GET to a URL the operator chose (`docs/news-feeds.md` §4), for feeds and, by `docs/identity-records.md`, registrars: conditional and bounded in time and in bytes after decompression, a URL on the local network fetched as configured and any other's every hop of a redirect resolved once and checked by the push sender's classifier before it is connected to, and a proxy only when one is configured. |
 | `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar. |
-| `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
+| `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, with the instant messaging extension's requests built and replies read by `hxproto`'s own (`messaging.rs`), and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
 | `hxd` | The binary: config, wiring, the ng sweeper task, the voice media pump, the news feed poller (`feeds.rs`), `HXD_DEBUG` tracing, the operator's commands (`hxd account` in `accounts.rs`, `hxd role` in `roles.rs`, `hxd ban` and the rest of moderation in `moderation.rs`, `hxd link` in `link.rs`, `hxd room` and the rooms file in `rooms.rs`, `hxd identity successor` and `handover` and the files the server key's handovers are served from in `handover.rs`), and behind the `metrics` feature the recorder `GET /metrics` renders (`metrics.rs`, `docs/metrics.md`). Its `tests/` hold the e2e suites. |
@@ -423,12 +423,30 @@ Three layers, all `cargo test --workspace`:
   friends, presence through the binary's flusher, instant messages
   with receipts and typing, one sent while away handed over at the
   roster read, a block reading as a missing account on every request
-  naming one, a request listed, approved and answered, crossing
-  requests, Invisible hiding presence alone, an account without the bit
+  naming one, a request listed, approved and answered, a span no clock
+  holds refused, crossing requests, Invisible hiding presence alone, an account without the bit
   taking no part, a client that never declared the family hearing
   nothing of it across a resume until it asks, a server
   without messaging answering as before, and a classic client beside
-  it all hearing nothing),
+  it all hearing nothing), `friends_classic.rs` (the friend family on
+  the classic wire, its requests built and its replies read by
+  `hxproto`: two classic clients made friends, presence through the
+  binary's flusher, an instant message with receipts and typing, one
+  sent while away handed over at Get Roster, and text crossing between
+  Mac Roman and UTF-8; a block read as a missing account by 802, 803,
+  805, 810, 822, 824 and 825, while 806, 807 and 812 answer as usual;
+  a request listed, approved and answered, requests paged across
+  frames with their dropped count said by the first page alone, a
+  clearing that declines and deletes, and a span no clock
+  holds refused; a roster past a frame going on in Roster Entries; a
+  classic client and an ng client friends both ways; a bit-8 messenger
+  on no user list on either wire, answered as nobody to 108, invites
+  and kicks, refused the classic world itself, kicked for flooding
+  without a word to the lobby, and its mail waiting for a visible
+  session; 810 without `send_msgs` refused; bit 6 confirmed
+  only to an account that takes part, never `admin` or `guest`, on a
+  server with messaging; and a period client beside it all hearing
+  nothing new),
   `portable_friends.rs` (portable friendships signed with real device
   keys: one made on a server and in place on the next once both
   present it, a withdrawal on one ending it on the other and refusing
