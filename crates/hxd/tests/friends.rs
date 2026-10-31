@@ -39,6 +39,27 @@ const FAMILY_EVENTS: &[&str] = &[
 struct Server {
     ng: SocketAddr,
     classic: SocketAddr,
+    core: Arc<Core>,
+    serving: [tokio::task::JoinHandle<()>; 3],
+}
+
+impl Server {
+    /// Stop serving and let go of the store, as a process that exits
+    /// would, so a restart is the only server on its file. A connection
+    /// logged out may take a moment to let go of its context.
+    async fn stop(self) {
+        for task in self.serving {
+            task.abort();
+            assert!(task.await.is_err_and(|e| e.is_cancelled()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&self.core) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stopped server's core is let go");
+    }
 }
 
 /// Both frontends on one core keeping mail and relationships in SQLite,
@@ -75,7 +96,7 @@ async fn start(dir: &Path, messaging: bool) -> Server {
             ..MessagingPolicy::default()
         });
     let core = Arc::new(core);
-    tokio::spawn(hxd::presence_flusher(core.clone()));
+    let flusher = tokio::spawn(hxd::presence_flusher(core.clone()));
     let legacy_ctx = ServerCtx {
         core: core.clone(),
         auth: auth.clone(),
@@ -85,7 +106,7 @@ async fn start(dir: &Path, messaging: bool) -> Server {
         device_proof: None,
     };
     let ng_ctx = NgCtx {
-        core,
+        core: core.clone(),
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "friends".into(),
@@ -108,9 +129,17 @@ async fn start(dir: &Path, messaging: bool) -> Server {
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (classic, ng) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
-    tokio::spawn(hxd_session::serve(l1, legacy_ctx));
-    tokio::spawn(hxd_ng_session::serve(l2, ng_ctx));
-    Server { ng, classic }
+    let serving = [
+        flusher,
+        tokio::spawn(hxd_session::serve(l1, legacy_ctx)),
+        tokio::spawn(hxd_ng_session::serve(l2, ng_ctx)),
+    ];
+    Server {
+        ng,
+        classic,
+        core,
+        serving,
+    }
 }
 
 /// A client that speaks the family, and its login reply.
@@ -576,6 +605,37 @@ async fn invisible_hides_presence_and_nothing_else() {
     .await;
     assert_eq!(sent["queued"], false);
     event(&mut alice, "im", |d| d["text"] == "you there?").await;
+}
+
+#[tokio::test]
+async fn a_text_set_while_invisible_stays_hidden_after_its_last_session_and_a_restart() {
+    let td = tempfile::tempdir().unwrap();
+    let first = start(td.path(), true).await;
+    let (mut alice, _) = messenger(&first, "alice").await;
+    let (mut bob, _) = messenger(&first, "bob").await;
+    befriend(&mut alice, &mut bob, "bob", "alice").await;
+    ok(&mut alice, "presence", json!({ "status_text": "here" })).await;
+    event(&mut bob, "presence", |d| d["status_text"] == "here").await;
+    ok(&mut alice, "presence", json!({ "state": "invisible" })).await;
+    event(&mut bob, "presence", |d| d["state"] == "offline").await;
+    ok(&mut alice, "presence", json!({ "status_text": "secret" })).await;
+    alice.logout().await.unwrap();
+    bob.logout().await.unwrap();
+    first.stop().await;
+
+    let second = start(td.path(), true).await;
+    let (mut bob, _) = messenger(&second, "bob").await;
+    let rows = ok(&mut bob, "friends", json!({})).await;
+    assert_eq!(rows["friends"][0]["login"], "alice");
+    assert_eq!(rows["friends"][0]["presence"], "offline");
+    assert_eq!(rows["friends"][0]["status_text"], "here");
+    let found = ok(&mut bob, "find_user", json!({ "login": "alice" })).await;
+    assert_eq!(found["user"]["status_text"], "here");
+
+    // Signing on shows it, as being visible does.
+    let (_alice, _) = messenger(&second, "alice").await;
+    let seen = event(&mut bob, "presence", |d| d["state"] == "online").await;
+    assert_eq!(seen["status_text"], "secret");
 }
 
 #[tokio::test]

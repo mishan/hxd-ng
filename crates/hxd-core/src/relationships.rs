@@ -326,6 +326,10 @@ pub const MAX_LANGUAGES: usize = 3;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessagingAccount {
     pub status_text: Option<String>,
+    /// The text friends were last shown, which a friend reads while the
+    /// account has no session: what was set while Invisible stays the
+    /// account's own until it is next visible.
+    pub shown_text: Option<String>,
     /// Found by User Search (823). Off until the account turns it on.
     pub discoverable: bool,
     /// The profile's switch for message requests (§4.1): off until a
@@ -343,6 +347,7 @@ pub struct MessagingAccount {
 pub struct AccountUpdate {
     /// `Some(None)` clears the text.
     pub status_text: Option<Option<String>>,
+    pub shown_text: Option<Option<String>>,
     pub discoverable: Option<bool>,
     /// `Some(Some(at))`: a session opted in to requests at `at`;
     /// `Some(None)`: one opted out, which keeps when it last opted in.

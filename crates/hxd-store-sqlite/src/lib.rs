@@ -75,7 +75,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -891,6 +891,19 @@ CREATE TABLE identity_rotation (
 CREATE INDEX identity_rotation_successor ON identity_rotation (successor);
 ";
 
+/// The text an account's friends were last shown, which they read while
+/// it has no session, so that text set while Invisible is not; it starts
+/// as the status text. And a request's row marked for good, so that once
+/// released onto an approval or a friendship the request ledger alone
+/// still counts it; a row released before this cannot be told from other
+/// mail, and counts twice for what is left of its day.
+const SCHEMA_V31: &str = "
+ALTER TABLE messaging_account ADD COLUMN shown_text TEXT;
+UPDATE messaging_account SET shown_text = status_text;
+ALTER TABLE message ADD COLUMN requested INTEGER NOT NULL DEFAULT 0;
+UPDATE message SET requested = 1 WHERE friendship = 0;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1626,6 +1639,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 30 {
         steps.push_str(SCHEMA_V30);
     }
+    if version < 31 {
+        steps.push_str(SCHEMA_V31);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1981,9 +1997,9 @@ impl MessageStore for SqliteStore {
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
                 media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
-                friendship)
+                friendship, requested)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18)",
+                     ?18, ?18 IS 0)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -2452,7 +2468,7 @@ impl MessageStore for SqliteStore {
         // the window's rows and not the sender's whole retention.
         let sql = format!(
             "SELECT COUNT(*), IFNULL(SUM(length(CAST(body AS BLOB))), 0) FROM message
-              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2 AND IFNULL(friendship, 1) <> 0",
+              WHERE {} AND {MAIL_ONLY} AND sent_at >= ?2 AND requested = 0",
             mailbox_sql(from, "sender", 1)
         );
         let (messages, bytes): (i64, i64) = conn
@@ -3425,6 +3441,53 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_v30_database_shows_friends_its_stored_text_and_marks_its_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO messaging_account (owner, status_text) VALUES ('alice', 'here');
+                 INSERT INTO message (recipient, sender, sender_nick, body, sent_at, friendship)
+                 VALUES ('bob', 'alice', 'alice', 'may I?', 1, 0),
+                        ('carol', 'alice', 'alice', 'mail', 1, NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 30).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        assert_eq!(
+            store.account(&alice).unwrap().shown_text.as_deref(),
+            Some("here")
+        );
+        let approval = store.approve(&bob, &alice, from_unix(2)).unwrap();
+        assert_eq!(
+            store
+                .release_requests(&bob, &alice, approval, UNIX_EPOCH)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.sent_since(&alice, UNIX_EPOCH).unwrap(),
+            Sent {
+                messages: 1,
+                bytes: 4,
+            },
+            "the request released is the ledger's to count"
+        );
     }
 
     #[test]

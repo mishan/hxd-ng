@@ -240,7 +240,7 @@ fn ledger_row(r: &Row<'_>) -> rusqlite::Result<Result<LedgerEntry, StoreError>> 
 const ACCOUNT_COLUMNS: &str = "id, status_text, discoverable, takes_requests, \
                                requests_opted_at, requests_dropped, nickname, first_name, \
                                last_name, email, gender, birth_year, birth_month, birth_day, \
-                               country, postcode, language1, language2, language3";
+                               country, postcode, language1, language2, language3, shown_text";
 
 fn load_account(
     conn: &Connection,
@@ -257,6 +257,7 @@ fn load_account(
                 r.get::<_, i64>(0)?,
                 MessagingAccount {
                     status_text: r.get(1)?,
+                    shown_text: r.get(19)?,
                     discoverable: r.get(2)?,
                     takes_requests: r.get(3)?,
                     requests_opted_at: r.get::<_, Option<i64>>(4)?.map(from_unix),
@@ -312,6 +313,7 @@ fn write_account(
         lang(0),
         lang(1),
         lang(2),
+        a.shown_text,
         id,
     ];
     sql(match id {
@@ -321,18 +323,18 @@ fn write_account(
                     requests_dropped = ?7, nickname = ?8, first_name = ?9, last_name = ?10,
                     email = ?11, gender = ?12, birth_year = ?13, birth_month = ?14,
                     birth_day = ?15, country = ?16, postcode = ?17, language1 = ?18,
-                    language2 = ?19, language3 = ?20
-              WHERE id = ?21",
+                    language2 = ?19, language3 = ?20, shown_text = ?21
+              WHERE id = ?22",
             values,
         ),
         None => conn.execute(
             "INSERT INTO messaging_account (owner, owner_fp, status_text, discoverable,
                     takes_requests, requests_opted_at, requests_dropped, nickname, first_name,
                     last_name, email, gender, birth_year, birth_month, birth_day, country,
-                    postcode, language1, language2, language3)
+                    postcode, language1, language2, language3, shown_text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20)",
-            &values[..20],
+                     ?17, ?18, ?19, ?20, ?21)",
+            &values[..21],
         ),
     })?;
     Ok(())
@@ -1004,6 +1006,9 @@ impl RelationshipStore for SqliteStore {
         self.account_edit(of, |a, _| {
             if let Some(text) = &update.status_text {
                 a.status_text = text.clone();
+            }
+            if let Some(text) = &update.shown_text {
+                a.shown_text = text.clone();
             }
             if let Some(on) = update.discoverable {
                 a.discoverable = on;

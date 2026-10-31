@@ -2240,22 +2240,27 @@ impl Core {
     /// else, or for a messenger session (`Transport::messenger_session`)
     /// only take its place in presence. Idempotent.
     pub fn announce(&self, uid: Uid) {
-        let load = self.presence_load(uid);
-        let mut r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get_mut(&uid) else {
-            return;
-        };
-        if sess.visible || sess.messaging.is_some() {
-            return;
-        }
-        if !sess.info.transport.messenger_session {
-            sess.visible = true;
-            let ev = Event::Joined(sess.info.clone());
-            r.broadcast(&ev, Some(uid));
-            r.export_shown(uid);
+        let mut load = self.presence_load(uid);
+        {
+            let mut r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get_mut(&uid) else {
+                return;
+            };
+            if sess.visible || sess.messaging.is_some() {
+                return;
+            }
+            if !sess.info.transport.messenger_session {
+                sess.visible = true;
+                let ev = Event::Joined(sess.info.clone());
+                r.broadcast(&ev, Some(uid));
+                r.export_shown(uid);
+            }
+            if let Some(load) = load.as_mut() {
+                r.presence_join(uid, load);
+            }
         }
         if let Some(load) = load {
-            r.presence_join(uid, load);
+            self.presence_shown(load);
         }
     }
 

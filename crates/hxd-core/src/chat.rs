@@ -2140,7 +2140,7 @@ impl Core {
     pub(crate) fn send_quota_spent(
         &self,
         store: &dyn MessageStore,
-        from: &Mailbox,
+        from: &crate::relationships::Requester,
         adds: usize,
         now: SystemTime,
     ) -> Result<bool, ChatError> {
@@ -2151,16 +2151,18 @@ impl Core {
         let since = now
             .checked_sub(Duration::from_secs(24 * 3600))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mut sent = store.sent_since(from, since).map_err(store_failed)?;
+        let mut sent = match from {
+            crate::relationships::Requester::Account(m) => {
+                store.sent_since(m, since).map_err(store_failed)?
+            }
+            // Mail is stored under an account; an address's only sends
+            // are requests.
+            crate::relationships::Requester::Address(_) => crate::inbox::Sent::default(),
+        };
         // Message requests count toward it by what was sent
         // (`docs/instant-messaging.md` §4.4).
         if let Some(rel) = self.relationships.as_ref() {
-            let asked = rel
-                .requested_since(
-                    &crate::relationships::Requester::Account(from.clone()),
-                    since,
-                )
-                .map_err(store_failed)?;
+            let asked = rel.requested_since(from, since).map_err(store_failed)?;
             sent.messages += asked.messages;
             sent.bytes += asked.bytes;
         }
@@ -2364,7 +2366,8 @@ impl Core {
                 None => Ok(false),
             }
         };
-        if self.send_quota_spent(&**store, &from_mailbox, text.len(), now)? && !retry(&guid)? {
+        let quota = crate::relationships::Requester::Account(from_mailbox.clone());
+        if self.send_quota_spent(&**store, &quota, text.len(), now)? && !retry(&guid)? {
             let mut r = self.roster.lock().unwrap();
             // Attached only: a detached session's outbox is not a place
             // to leave what the store was just refused.

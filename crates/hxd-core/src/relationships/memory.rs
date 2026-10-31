@@ -999,6 +999,9 @@ impl RelationshipStore for MemoryRelationships {
         if let Some(text) = &update.status_text {
             state.status_text = text.clone();
         }
+        if let Some(text) = &update.shown_text {
+            state.shown_text = text.clone();
+        }
         if let Some(on) = update.discoverable {
             state.discoverable = on;
         }

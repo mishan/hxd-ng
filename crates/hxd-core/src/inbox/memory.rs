@@ -28,6 +28,20 @@ struct Inner {
     handed: HashSet<MessageId>,
     /// Messages whose read receipt was told.
     receipted: HashSet<MessageId>,
+    /// Messages stored as requests, released since or not, which the
+    /// request ledger counts toward the sender's quota instead.
+    requested: HashSet<MessageId>,
+}
+
+impl Inner {
+    /// After rows are removed, so a long-lived store does not keep marks
+    /// for rows it no longer holds.
+    fn forget_removed(&mut self) {
+        let held: HashSet<MessageId> = self.msgs.iter().map(|m| m.id).collect();
+        for marks in [&mut self.handed, &mut self.receipted, &mut self.requested] {
+            marks.retain(|id| held.contains(id));
+        }
+    }
 }
 
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
@@ -284,6 +298,9 @@ impl MessageStore for MemoryStore {
             // without prune needing to know what kinds exist.
             read_at: (m.kind != MessageKind::Message).then_some(m.sent_at),
         });
+        if m.friendship == Some(SentOn::Request) {
+            inner.requested.insert(id);
+        }
         Ok(Pushed::Stored(id))
     }
 
@@ -477,6 +494,7 @@ impl MessageStore for MemoryStore {
                 }
             },
         );
+        inner.forget_removed();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if claim_one(&mut m.recipient, login, fingerprint) {
@@ -507,6 +525,7 @@ impl MessageStore for MemoryStore {
                 }
             },
         );
+        inner.forget_removed();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if rotate_one(&mut m.recipient, from, to) {
@@ -527,6 +546,7 @@ impl MessageStore for MemoryStore {
         inner
             .msgs
             .retain(|m| !is(&m.recipient, of) && !m.sender.as_ref().is_some_and(|s| is(s, of)));
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
@@ -551,6 +571,7 @@ impl MessageStore for MemoryStore {
             Some(read_at) => elapsed(now, read_at) < read,
             None => elapsed(now, m.sent_at) < unread,
         });
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
@@ -614,6 +635,7 @@ impl MessageStore for MemoryStore {
                 && is(&m.recipient, to)
                 && m.sender.as_ref().is_some_and(|s| is(s, from)))
         });
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
@@ -622,7 +644,11 @@ impl MessageStore for MemoryStore {
         Ok(inner
             .msgs
             .iter()
-            .filter(|x| x.kind == MessageKind::Message && x.sent_at >= since && !is_request(x))
+            .filter(|x| {
+                x.kind == MessageKind::Message
+                    && x.sent_at >= since
+                    && !inner.requested.contains(&x.id)
+            })
             .filter(|x| x.sender.as_ref().is_some_and(|s| is(s, from)))
             .fold(Sent::default(), |sent, x| Sent {
                 messages: sent.messages + 1,

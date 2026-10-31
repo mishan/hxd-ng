@@ -1281,7 +1281,7 @@ async fn a_roster_past_a_frame_goes_on_in_roster_entries() {
         };
         s.store.befriend(&me, &f, SystemTime::now()).unwrap();
         let update = AccountUpdate {
-            status_text: Some(Some(status.clone())),
+            shown_text: Some(Some(status.clone())),
             ..AccountUpdate::default()
         };
         s.store.update_account(&f, &update).unwrap();
