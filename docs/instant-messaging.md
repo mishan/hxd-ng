@@ -376,8 +376,7 @@ listing. Listing makes a session one that understands requests
 (§4.1), to send approvals and `requests_changed` to (§4.6), and leaves
 whether its account takes them as it was, though for an account that
 takes them a listing's first page renews the opt-in as a 1 would: a client that shows
-requests keeps them from lapsing without sending a classic Set
-Presence, whose state it must carry.
+requests keeps them from lapsing without sending Set Presence.
 
 ### 4.6 Approvals
 
@@ -690,7 +689,7 @@ take or leave, and until he does, nothing here is the extension's.
 | Transaction | Message Requests Changed | 832 | above |
 | Transaction | Present Friendships | 833 | portable friends §4.3 |
 | Transaction | Get Friendships | 834 | portable friends §4.2 |
-| Field | `DATA_TAKES_REQUESTS` | `0x0650`, UInt16 | 808, beside `DATA_DISCOVERABLE`, and Get Message Requests' first page |
+| Field | `DATA_TAKES_REQUESTS` | `0x0650`, UInt16 | 808, beside `DATA_DISCOVERABLE`, and Get Message Requests' first page; an 808 may carry it without `DATA_PRESENCE_STATE`, changing the setting alone, since a state ends an Invisible set from another client |
 | Field | `DATA_REQUEST_CURSOR` | `0x0651`, Binary | Get Message Requests and its reply |
 | Field | `DATA_REQUEST_ACTION` | `0x0652`, UInt16: 1 approve, 2 delete, 3 end | Answer Message Request |
 | Field | `DATA_REQUEST_COUNT` | `0x0653`, UInt32 | Get Message Requests, Clear Message Requests and Message Requests Changed replies, as each says |

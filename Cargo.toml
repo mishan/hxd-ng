@@ -39,11 +39,11 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Shared with GtkHx (see the note at the top of this file).
-hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "e1a430338fb4d6d56eb2f5d00fa1d0a1ead709d3" }
-hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "e1a430338fb4d6d56eb2f5d00fa1d0a1ead709d3" }
-hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "e1a430338fb4d6d56eb2f5d00fa1d0a1ead709d3" }
-hxhope = { git = "https://github.com/mishan/hx-libs.git", rev = "e1a430338fb4d6d56eb2f5d00fa1d0a1ead709d3" }
-hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "e1a430338fb4d6d56eb2f5d00fa1d0a1ead709d3" }
+hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d20039fb19096470a9be64a960568463" }
+hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d20039fb19096470a9be64a960568463" }
+hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d20039fb19096470a9be64a960568463" }
+hxhope = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d20039fb19096470a9be64a960568463" }
+hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d20039fb19096470a9be64a960568463" }
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }

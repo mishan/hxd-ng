@@ -299,16 +299,18 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<O
         }
         ClientHdr::UnblockUser => Op::Block(login()?, false, None),
         ClientHdr::SetPresence => {
+            // Absent changes the settings alone: a state would end an
+            // Invisible set from another client.
             let state = match uint(tag::PRESENCE_STATE)
-                .and_then(|v| PresenceState::from_wire(u16::try_from(v).ok()?))
-                .ok_or(MALFORMED)?
+                .map(|v| u16::try_from(v).ok().and_then(PresenceState::from_wire))
             {
-                PresenceState::Online => Presence::Online,
-                PresenceState::Away => Presence::Away,
-                PresenceState::Invisible => Presence::Invisible,
-                PresenceState::Busy => Presence::Busy,
+                None => None,
+                Some(Some(PresenceState::Online)) => Some(Presence::Online),
+                Some(Some(PresenceState::Away)) => Some(Presence::Away),
+                Some(Some(PresenceState::Invisible)) => Some(Presence::Invisible),
+                Some(Some(PresenceState::Busy)) => Some(Presence::Busy),
                 // Never a state a client sets for itself.
-                _ => return Err(MALFORMED),
+                Some(_) => return Err(MALFORMED),
             };
             // Present and empty, or only whitespace, clears the text;
             // absent leaves it as it was.
@@ -317,7 +319,7 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<O
                 (!t.trim().is_empty()).then_some(t)
             });
             Op::Presence(PresenceUpdate {
-                state: Some(state),
+                state,
                 status_text,
                 discoverable: uint(tag::DISCOVERABLE).map(|v| v != 0),
                 takes_requests: uint(tag::TAKES_REQUESTS).map(|v| v != 0),
