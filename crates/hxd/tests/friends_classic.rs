@@ -314,7 +314,7 @@ fn ng_guid(n: u8) -> String {
 
 fn presence(state: PresenceState, text: Option<&[u8]>, takes: Option<bool>) -> im::Chunks {
     im::set_presence(&Presence {
-        state,
+        state: Some(state),
         status_text: text,
         discoverable: None,
         takes_requests: takes,
@@ -528,6 +528,48 @@ async fn an_instant_message_sent_while_away_arrives_at_get_roster() {
     // Handed over as an instant message alone, never as mail too.
     bob.ping().await.unwrap();
     assert!(!bob.rx.take_backlog().iter().any(|f| f.ty == push::MSG));
+}
+
+#[tokio::test]
+async fn a_setting_changed_without_a_state_leaves_invisible_alone() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), true).await;
+    let mut alice = messenger(&s, "alice").await;
+    let mut bob = messenger(&s, "bob").await;
+    befriend(&mut alice, "alice", &mut bob, "bob").await;
+    for (set, seen) in [
+        (PresenceState::Online, PresenceState::Online),
+        (PresenceState::Invisible, PresenceState::Offline),
+    ] {
+        ok(&mut bob, ClientHdr::SetPresence, presence(set, None, None)).await;
+        told(&mut alice, ServerHdr::PresenceChanged, "bob", |e| {
+            e.presence_state() == Some(seen)
+        })
+        .await;
+    }
+    let takes = im::set_presence(&Presence {
+        state: None,
+        status_text: None,
+        discoverable: None,
+        takes_requests: Some(true),
+    });
+    ok(&mut bob, ClientHdr::SetPresence, takes).await;
+
+    // Well past the debounce, what a friend was last told stands: offline,
+    // which an entry carries no state for.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let rows = ok(&mut alice, ClientHdr::GetRoster, Vec::new()).await;
+    let roster = parse_roster(rows.wire(), rows.wire().len()).unwrap();
+    let bob_shown = roster.entries().find(|e| e.login == b"bob").unwrap();
+    assert_eq!(bob_shown.presence_state(), None);
+    let listed = ok(
+        &mut bob,
+        ClientHdr::GetMessageRequests,
+        im::get_message_requests(None),
+    )
+    .await;
+    let l = parse_message_requests(listed.wire(), listed.wire().len()).unwrap();
+    assert_eq!(l.takes_requests, Some(true));
 }
 
 #[tokio::test]
