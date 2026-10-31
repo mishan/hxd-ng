@@ -698,6 +698,7 @@ row says otherwise; each is whatever its key names.
 | `rooms.toml` | `[rooms] file` | Every room, its gates and topic; their lines stay in the database with no room to read them in. |
 | The SQLite database, with its `-wal` | `[inbox] db`, `[history] db`, `[news] db`, `[avatars] db`, `[push] db` | Private messages, chat history, news, avatars, push devices, the moderation trail, reports and bans, and the registrars' records the server has fetched. Copy it with the server stopped or with `sqlite3 .backup`, never mid-write. |
 | `news-guest.key`, beside the news database | `[news] guest_secret` | The guests' articles already kept are counted against no address. |
+| `messaging-requests.key`, beside the inbox database | `[messaging] request_secret` | Every address's count of requests sent today starts again. |
 | `news-blobs/` | `[news] blobs` | Every image attached to an article. |
 | `vapid.key` | `[push] vapid_key` | Every push subscription, which is bound to it: pushes are accepted by nobody and no client can tell why. The server refuses to start without it while devices are registered. |
 | `identity-server.key` | `[identity] key` | The server key discovery publishes and every login proof is bound to; a new one is made in its place. |
@@ -1197,6 +1198,9 @@ requests_per_day = 20        # distinct people one account sends requests in a d
 max_requests = 50            # senders waiting with requests, per recipient
 max_friend_requests = 50     # friend requests waiting, per recipient
 request_retention_days = 30  # how long a request waits, and a refused sender is held; at most 3650
+# request_secret = "/srv/hxd/messaging-requests.key"  # e.g.; the key a request's address
+                             # is hashed under. Absent, messaging-requests.key beside
+                             # [inbox] db; made on first start, mode 0600
 ```
 
 Once it is on, an ng `msg` by `to_login`, and a classic `/msg <login>`,

@@ -1622,6 +1622,7 @@ pub struct Core {
     pub(crate) inbox_policy: InboxPolicy,
     /// What `[messaging]` says (`crate::messaging`).
     pub(crate) messaging_policy: crate::messaging::MessagingPolicy,
+    pub(crate) request_keyer: crate::relationships::RequestKeyer,
     /// Held across a relationship store write and the roster's copy of
     /// what it changed, and across loading a mailbox's friends, so the
     /// two agree. Taken before `roster`, never while it is held.

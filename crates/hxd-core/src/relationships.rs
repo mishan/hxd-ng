@@ -36,6 +36,47 @@ pub mod memory;
 
 pub use memory::MemoryRelationships;
 
+/// Turns the address a request came from into the opaque key the ledger
+/// and the holds keep (§4.4), under a secret of the server's own, kept
+/// apart from news's so either may be off or rotated alone. A secret
+/// lost or replaced starts every address's count again.
+#[derive(Clone)]
+pub struct RequestKeyer([u8; 32]);
+
+impl RequestKeyer {
+    pub fn new(secret: [u8; 32]) -> RequestKeyer {
+        RequestKeyer(secret)
+    }
+
+    /// A secret of this process's own, forgotten when it stops.
+    pub fn ephemeral() -> RequestKeyer {
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).expect("the OS CSPRNG");
+        RequestKeyer(secret)
+    }
+
+    /// The key of `addr`'s [`crate::limits::limit_key`], in hex.
+    pub fn key(&self, addr: std::net::IpAddr) -> String {
+        crate::limits::hmac_address(&self.0, b"hxd-ng request address\0", addr)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+impl Default for RequestKeyer {
+    fn default() -> Self {
+        RequestKeyer::ephemeral()
+    }
+}
+
+impl std::fmt::Debug for RequestKeyer {
+    /// Never the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestKeyer(..)")
+    }
+}
+
 /// A friendship's or an approval's id: never reused, so a queued message
 /// that carries one belongs to that friendship and to no later one.
 pub type RelationId = u64;
