@@ -181,7 +181,8 @@ A message to a non-friend is then answered, in this order:
 3. **Otherwise**: a **request**, answered `Requested` (§4.2), and
    stored, held or dropped by the bounds (§4.4).
 
-An account that takes requests, whose last 1 is older than
+An account that takes requests, whose last 1 and last listing (§4.5,
+a first page on the classic wire) are older than
 `request_retention_days` and none of whose sessions that understand
 requests is on the roster, detached ones included, is **lapsed**: it
 is still answered as taking requests, and the request is dropped, answered and counted as
@@ -373,7 +374,10 @@ row for its recipient alone, past the gate of §5. The listing also gives
 the approvals, and how many requests were dropped since the last
 listing. Listing makes a session one that understands requests
 (§4.1), to send approvals and `requests_changed` to (§4.6), and leaves
-whether its account takes them as it was.
+whether its account takes them as it was, though for an account that
+takes them a listing's first page renews the opt-in as a 1 would: a client that shows
+requests keeps them from lapsing without sending a classic Set
+Presence, whose state it must carry.
 
 ### 4.6 Approvals
 

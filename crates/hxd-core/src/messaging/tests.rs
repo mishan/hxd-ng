@@ -2264,6 +2264,32 @@ fn a_retry_of_a_request_is_answered_as_one_whatever_came_after() {
 }
 
 #[test]
+fn listing_renews_an_opt_in_and_never_makes_one() {
+    let s = server(&["alice", "bob", "carol"]);
+    let retention = policy().request_retention;
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
+    let (c, _rc) = messenger(&s.core, "carol");
+    s.core.clock.advance(retention - Duration::from_secs(3600));
+    waiting(&s.core, b);
+    waiting(&s.core, c);
+    s.core.end_session(b);
+    s.core.end_session(c);
+    s.core.clock.advance(Duration::from_secs(7200));
+    send(&s.core, a, "bob", "still taking?").unwrap();
+    assert_eq!(
+        send(&s.core, a, "carol", "and you?"),
+        Err(crate::ChatError::NotFriends),
+        "carol never opted in"
+    );
+    let (b, _rb) = messenger(&s.core, "bob");
+    assert_eq!(
+        waiting(&s.core, b),
+        [("alice".into(), vec!["still taking?".into()])]
+    );
+}
+
+#[test]
 fn an_opt_in_held_by_a_session_still_there_never_lapses() {
     let s = server(&["alice", "bob"]);
     let (a, _ra) = taker(&s.core, "alice");

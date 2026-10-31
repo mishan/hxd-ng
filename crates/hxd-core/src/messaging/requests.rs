@@ -15,7 +15,7 @@ use super::im::understands_requests;
 use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
 use crate::inbox::{Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
-use crate::relationships::{LedgerEntry, Recorded, RequestKind, Requester, SentOn};
+use crate::relationships::{AccountUpdate, LedgerEntry, Recorded, RequestKind, Requester, SentOn};
 use crate::roster::{Event, Uid};
 use crate::Core;
 
@@ -514,7 +514,7 @@ impl Core {
 
     /// The caller's message requests and approvals (§4.5). Listing makes
     /// the session one that understands requests, and leaves whether its
-    /// account takes them as it was (§4.1).
+    /// account takes them as it was, renewing an opt-in it has (§4.1).
     pub fn requests_list(&self, uid: Uid) -> Result<RequestsListing, MessagingError> {
         self.requests_list_page(uid, true)
     }
@@ -542,6 +542,21 @@ impl Core {
         }
         let now = self.clock.wall();
         let dropped = if first {
+            // Under the lock 808 writes with, so a 0 sent meanwhile is
+            // never undone by renewing what it turned off.
+            let _writing = self.friend_writes();
+            if rel
+                .account(&me.mailbox)
+                .map_err(store_failed)?
+                .takes_requests
+            {
+                let renew = AccountUpdate {
+                    takes_requests: Some(Some(self.clock.wall())),
+                    ..AccountUpdate::default()
+                };
+                rel.update_account(&me.mailbox, &renew)
+                    .map_err(store_failed)?;
+            }
             rel.requests_listed(&me.mailbox).map_err(store_failed)?
         } else {
             0
