@@ -33,6 +33,17 @@ struct Inner {
     requested: HashSet<MessageId>,
 }
 
+impl Inner {
+    /// After rows are removed, so a long-lived store does not keep marks
+    /// for rows it no longer holds.
+    fn forget_removed(&mut self) {
+        let held: HashSet<MessageId> = self.msgs.iter().map(|m| m.id).collect();
+        for marks in [&mut self.handed, &mut self.receipted, &mut self.requested] {
+            marks.retain(|id| held.contains(id));
+        }
+    }
+}
+
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
 #[derive(Default)]
 pub struct MemoryStore {
@@ -533,6 +544,7 @@ impl MessageStore for MemoryStore {
         inner
             .msgs
             .retain(|m| !is(&m.recipient, of) && !m.sender.as_ref().is_some_and(|s| is(s, of)));
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
@@ -557,6 +569,7 @@ impl MessageStore for MemoryStore {
             Some(read_at) => elapsed(now, read_at) < read,
             None => elapsed(now, m.sent_at) < unread,
         });
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
@@ -620,6 +633,7 @@ impl MessageStore for MemoryStore {
                 && is(&m.recipient, to)
                 && m.sender.as_ref().is_some_and(|s| is(s, from)))
         });
+        inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
 
