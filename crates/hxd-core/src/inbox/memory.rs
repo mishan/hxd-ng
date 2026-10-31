@@ -28,6 +28,9 @@ struct Inner {
     handed: HashSet<MessageId>,
     /// Messages whose read receipt was told.
     receipted: HashSet<MessageId>,
+    /// Messages stored as requests, released since or not, which the
+    /// request ledger counts toward the sender's quota instead.
+    requested: HashSet<MessageId>,
 }
 
 /// A [`MessageStore`] in a `Vec`. Ordered by id, which is insertion order.
@@ -284,6 +287,9 @@ impl MessageStore for MemoryStore {
             // without prune needing to know what kinds exist.
             read_at: (m.kind != MessageKind::Message).then_some(m.sent_at),
         });
+        if m.friendship == Some(SentOn::Request) {
+            inner.requested.insert(id);
+        }
         Ok(Pushed::Stored(id))
     }
 
@@ -622,7 +628,11 @@ impl MessageStore for MemoryStore {
         Ok(inner
             .msgs
             .iter()
-            .filter(|x| x.kind == MessageKind::Message && x.sent_at >= since && !is_request(x))
+            .filter(|x| {
+                x.kind == MessageKind::Message
+                    && x.sent_at >= since
+                    && !inner.requested.contains(&x.id)
+            })
             .filter(|x| x.sender.as_ref().is_some_and(|s| is(s, from)))
             .fold(Sent::default(), |sent, x| Sent {
                 messages: sent.messages + 1,

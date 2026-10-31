@@ -381,7 +381,7 @@ impl Core {
         let addr = self.request_address(uid);
         self.request_bounds(rel, &sender, addr.as_deref(), them, now)?;
         if self
-            .send_quota_spent(&**inbox, me, text.len(), now)
+            .send_quota_spent(&**inbox, &sender, text.len(), now)
             .map_err(|_| MessagingError::ServerError)?
         {
             return Err(MessagingError::RateLimited);

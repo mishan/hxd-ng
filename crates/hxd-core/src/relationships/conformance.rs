@@ -1024,6 +1024,7 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
         &me,
         &AccountUpdate {
             status_text: Some(Some("out".into())),
+            shown_text: Some(Some("in".into())),
             discoverable: Some(true),
             takes_requests: Some(None),
             profile: Some(profile.clone()),
@@ -1041,6 +1042,7 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
     .unwrap();
     let got = s.account(&me).unwrap();
     assert_eq!(got.status_text, None, "{case}: cleared");
+    assert_eq!(got.shown_text.as_deref(), Some("in"), "{case}: kept apart");
     assert!(got.discoverable && !got.takes_requests, "{case}: kept");
     assert_eq!(
         got.requests_opted_at,
@@ -1054,6 +1056,20 @@ fn an_account_keeps_what_it_was_told_and_nothing_else(s: &dyn RelationshipStore)
             ..profile
         },
         "{case}: the profile whole, with at most three languages"
+    );
+    s.update_account(
+        &me,
+        &AccountUpdate {
+            shown_text: Some(None),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cleared = s.account(&me).unwrap();
+    assert_eq!(
+        (cleared.shown_text, cleared.discoverable),
+        (None, true),
+        "{case}: the shown text cleared alone"
     );
 }
 

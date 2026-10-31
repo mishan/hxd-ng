@@ -26,7 +26,7 @@ use crate::inbox::{
     Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage, Pending,
     Pushed, StoredMessage,
 };
-use crate::relationships::{RelationId, SentOn};
+use crate::relationships::{RelationId, Requester, SentOn};
 use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
@@ -236,7 +236,12 @@ impl Core {
         }
         // A retry stores nothing and is not the quota's to refuse.
         let spent = self
-            .send_quota_spent(&**store, &me.mailbox, text.len(), now)
+            .send_quota_spent(
+                &**store,
+                &Requester::Account(me.mailbox.clone()),
+                text.len(),
+                now,
+            )
             .map_err(|_| MessagingError::ServerError)?
             && match &guid {
                 Some(g) => store

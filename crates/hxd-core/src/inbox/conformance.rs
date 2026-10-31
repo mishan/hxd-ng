@@ -69,6 +69,7 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     a_handed_message_waits_for_its_ack(&new_store());
     a_receipt_waits_behind_the_gate(&new_store());
     requests_are_listed_released_and_deleted_by_sender(&new_store());
+    a_request_released_onto_a_relation_is_not_counted_as_sent(&new_store());
 }
 
 /// A store under test, and the relationship store its gate reads: for
@@ -257,6 +258,42 @@ fn a_merge_restamps_what_was_sent_on_the_id_it_ended(s: &dyn MessageStore) {
             None,
         ],
         "{case}: a chain of merges lands on its last id, and nothing else moves"
+    );
+}
+
+/// The ledger counts a request toward its sender's quota, so the row
+/// it stored is never counted again, waiting or released.
+fn a_request_released_onto_a_relation_is_not_counted_as_sent(g: &Gated) {
+    let case = "a_request_released_onto_a_relation_is_not_counted_as_sent";
+    let (s, rel) = (&*g.inbox, &*g.relationships);
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    push(
+        s,
+        &NewMessage {
+            friendship: Some(SentOn::Request),
+            ..msg(&dave, &alice, "may I?", at(1))
+        },
+    );
+    let approval = rel.approve(&dave, &alice, at(2)).unwrap();
+    assert_eq!(
+        s.release_requests(&dave, &alice, approval, at(0)).unwrap(),
+        1,
+        "{case}"
+    );
+    push(
+        s,
+        &NewMessage {
+            friendship: Some(SentOn::Relation(approval)),
+            ..msg(&dave, &alice, "thanks", at(3))
+        },
+    );
+    assert_eq!(
+        s.sent_since(&alice, at(0)).unwrap(),
+        Sent {
+            messages: 1,
+            bytes: 6,
+        },
+        "{case}: what was sent on the approval alone"
     );
 }
 

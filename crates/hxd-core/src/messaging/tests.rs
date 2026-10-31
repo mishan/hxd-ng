@@ -120,32 +120,42 @@ fn attach_on(
     transport: crate::Transport,
     classic: bool,
 ) -> (Uid, Events) {
-    let (uid, rx) = core
-        .attach(AttachInfo {
-            account: None,
-            nick: login.to_string(),
-            icon: 1,
-            admin: false,
-            access,
-            login: login.to_string(),
-            addr: Some(addr.parse().unwrap()),
-            can_detach: true,
-            transport,
-            has_inbox: true,
-            attach_news: false,
-            set_avatar: false,
-            moderate: false,
-            can_spam: false,
-            manage_rooms: false,
-            set_subject: false,
-            is_person: true,
-            reads_on_delivery: classic,
-            identity: None,
-            system: false,
-        })
-        .unwrap();
+    let (uid, rx) = unannounced(core, login, access, addr, transport, classic);
     core.announce(uid);
     (uid, rx)
+}
+
+fn unannounced(
+    core: &Core,
+    login: &str,
+    access: AccessBits,
+    addr: &str,
+    transport: crate::Transport,
+    classic: bool,
+) -> (Uid, Events) {
+    core.attach(AttachInfo {
+        account: None,
+        nick: login.to_string(),
+        icon: 1,
+        admin: false,
+        access,
+        login: login.to_string(),
+        addr: Some(addr.parse().unwrap()),
+        can_detach: true,
+        transport,
+        has_inbox: true,
+        attach_news: false,
+        set_avatar: false,
+        moderate: false,
+        can_spam: false,
+        manage_rooms: false,
+        set_subject: false,
+        is_person: true,
+        reads_on_delivery: classic,
+        identity: None,
+        system: false,
+    })
+    .unwrap()
 }
 
 /// A session taking part that has read its roster, so it is told.
@@ -1969,9 +1979,10 @@ fn a_sign_on_racing_the_last_session_out_keeps_its_friends() {
             system: false,
         })
         .unwrap();
-    let load = s.core.presence_load(a2).unwrap();
+    let mut load = s.core.presence_load(a2).unwrap();
     s.core.end_session(a1);
-    s.core.roster.lock().unwrap().presence_join(a2, load);
+    s.core.roster.lock().unwrap().presence_join(a2, &mut load);
+    s.core.presence_shown(load);
     assert_eq!(
         presences(&drain(&mut rb)),
         [
@@ -2481,5 +2492,206 @@ fn a_friends_status_text_is_read_as_it_was_told() {
         read(),
         (Presence::Offline, Some("lunch".into())),
         "invisible reads as offline, with what it last showed"
+    );
+}
+
+fn set(core: &Core, uid: Uid, state: Option<Presence>, text: Option<&str>) {
+    core.set_presence(
+        uid,
+        PresenceUpdate {
+            state,
+            status_text: text.map(|t| Some(t.into())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+fn alice_as_read(core: &Core, uid: Uid) -> Shown {
+    core.friends_roster(uid)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.login == "alice")
+        .map(|e| (e.presence, e.status_text))
+        .unwrap()
+}
+
+#[test]
+fn a_text_set_while_invisible_is_not_read_once_the_last_session_leaves() {
+    type Read = fn(&Core, Uid, &mut Events) -> Shown;
+    let readers: [(&str, Read); 4] = [
+        ("the roster", |core, b, _| alice_as_read(core, b)),
+        ("Find User", |core, b, _| {
+            core.find_user(b, "alice").unwrap().presence.unwrap()
+        }),
+        ("Get User Info", |core, b, _| {
+            core.messaging_user_info(b, "alice")
+                .unwrap()
+                .presence
+                .unwrap()
+        }),
+        ("an entry told", |core, b, rb| {
+            core.friend_alias(b, "alice", Some("al")).unwrap();
+            drain(rb)
+                .into_iter()
+                .find_map(|e| match e {
+                    Event::FriendEntry(e) => Some((e.presence, e.status_text)),
+                    _ => None,
+                })
+                .unwrap()
+        }),
+    ];
+    for (case, read) in readers {
+        let s = server(&["alice", "bob"]);
+        let (a, mut ra) = messenger(&s.core, "alice");
+        let (b, mut rb) = messenger(&s.core, "bob");
+        friends(&s, a, &mut ra, b, &mut rb);
+        set(&s.core, a, None, Some("here"));
+        set(&s.core, a, Some(Presence::Invisible), Some("secret"));
+        assert_eq!(
+            s.core.find_user(a, "alice").unwrap().presence,
+            Some((Presence::Invisible, Some("secret".into()))),
+            "{case}: the account reads what it set"
+        );
+        s.core.end_session(a);
+        drain(&mut rb);
+        assert_eq!(
+            read(&s.core, b, &mut rb),
+            (Presence::Offline, Some("here".into())),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn signing_on_shows_the_text_set_while_invisible() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    set(&s.core, a, Some(Presence::Invisible), Some("secret"));
+    s.core.end_session(a);
+    drain(&mut rb);
+
+    let (a, _ra) = messenger(&s.core, "alice");
+    let told: Vec<Shown> = drain(&mut rb)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Presence {
+                state, status_text, ..
+            } => Some((state, status_text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told, [(Presence::Online, Some("secret".into()))]);
+    s.core.end_session(a);
+    assert_eq!(
+        alice_as_read(&s.core, b),
+        (Presence::Offline, Some("secret".into())),
+        "shown once, and read so after"
+    );
+}
+
+#[test]
+fn a_text_never_told_before_going_invisible_is_not_read_after() {
+    let s = server_with(
+        MessagingPolicy {
+            presence_debounce: Duration::from_secs(5),
+            ..policy()
+        },
+        &[("alice", messaging_bits()), ("bob", messaging_bits())],
+    );
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    let mut later = Instant::now() + Duration::from_secs(60);
+    let mut flush = || {
+        s.core.presence_flush(later);
+        later += Duration::from_secs(60);
+    };
+    set(&s.core, a, None, Some("here"));
+    flush();
+    // Within the debounce, so friends are never told it.
+    set(&s.core, a, None, Some("lunch"));
+    set(&s.core, a, Some(Presence::Invisible), None);
+    flush();
+    s.core.end_session(a);
+    flush();
+    assert_eq!(
+        alice_as_read(&s.core, b),
+        (Presence::Offline, Some("here".into()))
+    );
+}
+
+#[test]
+fn a_released_request_counts_once_toward_the_daily_quota() {
+    use crate::{ChatError, MsgOutcome};
+    let dir = Directory(
+        ["alice", "bob"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let quota = InboxPolicy {
+        max_sent_per_day: 2,
+        ..InboxPolicy::default()
+    };
+    let s = server_of(dir, policy(), quota, None);
+    let (a, _ra) = taker(&s.core, "alice");
+    let (b, _rb) = taker(&s.core, "bob");
+    assert_eq!(send(&s.core, a, "bob", "may I?"), Ok(MsgOutcome::Requested));
+    s.core
+        .request_answer(b, "alice", RequestAction::Approve)
+        .unwrap();
+    assert!(matches!(
+        send(&s.core, a, "bob", "thanks"),
+        Ok(MsgOutcome::Queued(_))
+    ));
+    assert_eq!(
+        send(&s.core, a, "bob", "and another"),
+        Err(ChatError::SendQuota)
+    );
+}
+
+#[test]
+fn a_session_gone_before_its_join_shows_nothing_set_while_invisible() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    set(&s.core, a, None, Some("here"));
+    set(&s.core, a, Some(Presence::Invisible), Some("secret"));
+    s.core.end_session(a);
+    // Loaded for an announce that finds the session gone.
+    let (a, _ra) = unannounced(
+        &s.core,
+        "alice",
+        messaging_bits(),
+        "10.0.0.1",
+        crate::Transport::default(),
+        false,
+    );
+    let load = s.core.presence_load(a);
+    s.core.end_session(a);
+    drop(load);
+    assert_eq!(
+        alice_as_read(&s.core, b),
+        (Presence::Offline, Some("here".into()))
+    );
+}
+
+#[test]
+fn coming_back_from_invisible_shows_the_text_set_there() {
+    let s = server(&["alice", "bob"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    set(&s.core, a, None, Some("here"));
+    set(&s.core, a, Some(Presence::Invisible), Some("secret"));
+    set(&s.core, a, Some(Presence::Online), None);
+    s.core.end_session(a);
+    assert_eq!(
+        alice_as_read(&s.core, b),
+        (Presence::Offline, Some("secret".into()))
     );
 }

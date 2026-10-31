@@ -116,6 +116,15 @@ Everything the extension says about an accepted entry (presence, what
 non-friends see, Invisible, typing, receipts, the offline queue's
 bounds) holds as written. The Login stays the address on the wire.
 
+**A friend with no session is read from its account's record**, by the
+text its friends were last shown, which the record keeps apart from
+the text the account set. A text set while Invisible is the account's
+own, read back by its sessions alone, until it is next visible (a
+session signs on, or one sets Online, Away or Busy); going
+Invisible keeps the text friends were told, not one still waiting out
+the presence debounce. A text cleared while invisible likewise stays
+shown until then.
+
 **Expiry is lazy.** Whatever lapses (an ignore, a hold, a friend
 request, a request, a queued message past retention) is stored with
 when it lapses, and is found lapsed when it is next read: the read
@@ -307,7 +316,9 @@ is written, and the message row, `requests_changed` and any lazy delete
 - **Per sender**: at most `requests_per_day` distinct recipients in a
   rolling day, refused `RateLimited` (ng `quota_exceeded`). Requests
   count toward the inbox's daily quota (`private-messages.md` §9) from
-  the ledger, by what was sent, not from the rows that survive.
+  the ledger, by what was sent, not from the rows that survive, and
+  once: a request's row is never counted, even once an approval or a
+  friendship releases it.
 - **Per address**: `[limits] requests_per_address`, a looser ceiling on
   the distinct recipients requested from one address in a rolling day,
   so that new accounts are not new budgets, and loose because
@@ -803,13 +814,9 @@ Each stage is a branch with tests, in the house style.
    `message.friendship` in the transaction that merged, so a failed
    one is not lost; `account_delete`'s purge safe against a send in
    flight, the deleting session and a store that fails; a signed
-   request's id held to one content by the ledger;
-   a released request counted once toward the daily quota; a link
+   request's id held to one content by the ledger; a link
    made while the account has sessions re-keying them, or ending them;
-   a status text changed while invisible, which friends read once
-   the last session leaves, kept from them by persisting the last text
-   shown or deferring the write until the account is visible; and a
-   message by login reaching every eligible session of the account
+   and a message by login reaching every eligible session of the account
    when their reads differ and the backlog passes `deliver_at_flush`,
    where today a row in one session's batch is stamped delivered for
    the mailbox and the other session never reads it, closed by

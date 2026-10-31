@@ -378,7 +378,8 @@ impl RosterInner {
     /// change undone within the debounce is never announced, so a read
     /// that showed it would stay wrong. An invisible account reads as
     /// one with no session: offline, with the text it last had to them;
-    /// `stored` is that text for an account with no session at all.
+    /// `stored` is that text, as the store keeps it, for an account with
+    /// no session at all.
     fn friend_view(&self, of: &Mailbox, stored: Option<String>) -> Shown {
         match self.presences.by.get(&Key::of(of)) {
             Some(e) => (e.told.0, e.told_text.clone()),
@@ -505,7 +506,7 @@ impl RosterInner {
 
     /// The roster row `owner` has about `other`, as it would list it:
     /// `asked` is the other's request to the owner, where one waits, and
-    /// `text` a friend's stored status text.
+    /// `text` the stored text a friend was last shown with.
     fn entry_of(
         &self,
         row: &Relationship,
@@ -732,7 +733,7 @@ impl Core {
             .flatten()
             .and_then(|t| t.pending_out)
             .filter(|p| p.delivered);
-        let text = self.status_text(row.as_ref());
+        let text = self.shown_text(row.as_ref());
         let mut entry = {
             let r = self.roster.lock().unwrap();
             row.and_then(|row| r.entry_of(&row, asked.as_ref(), text))
@@ -749,14 +750,14 @@ impl Core {
             .tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
     }
 
-    /// A friend's stored status text, for its roster row.
-    fn status_text(&self, row: Option<&Relationship>) -> Option<String> {
+    /// The stored text a friend was last shown with, for its roster row.
+    fn shown_text(&self, row: Option<&Relationship>) -> Option<String> {
         let row = row.filter(|r| r.friendship.is_some())?;
         self.relationships
             .as_ref()?
             .account(&row.other)
             .ok()?
-            .status_text
+            .shown_text
     }
 
     // --- Presence ------------------------------------------------------
@@ -794,17 +795,33 @@ impl Core {
                     HashSet::new()
                 }
             };
-            let status_text = store
-                .account(&mailbox)
-                .map(|a| a.status_text)
-                .unwrap_or_default();
-            (friends, status_text)
+            let account = store.account(&mailbox).unwrap_or_default();
+            (friends, account.shown_text, account.status_text)
         };
         Some(PresenceLoad {
             _guard: guard,
             mailbox,
             fresh,
+            shown: None,
         })
+    }
+
+    /// A join made the account visible, so what it set while Invisible is
+    /// shown from now on: written once the join is in, so a session gone
+    /// before it shows nothing, and outside the roster lock, still under
+    /// `friend_writes`. Should the write fail, friends with no session of
+    /// the account read older text they have already been shown.
+    pub(crate) fn presence_shown(&self, load: PresenceLoad<'_>) {
+        let (Some(text), Some(store)) = (load.shown, self.relationships.as_ref()) else {
+            return;
+        };
+        let shown = AccountUpdate {
+            shown_text: Some(text),
+            ..AccountUpdate::default()
+        };
+        if let Err(e) = store.update_account(&load.mailbox, &shown) {
+            warn!("relationships: {}'s shown text: {e}", load.mailbox.login);
+        }
     }
 
     /// Set what the caller's presence, status text and settings say
@@ -815,10 +832,31 @@ impl Core {
         // So two updates land in the store and in the entry in one order,
         // and an entry being loaded reads the text either before or after.
         let _writing = self.friend_writes();
+        let key = Key::of(&me.mailbox);
+        // What friends read once the account has no session follows only
+        // what it shows them while visible. Going Invisible keeps what
+        // they were told, which a text still inside the debounce is not.
+        let shown_text = {
+            let r = self.roster.lock().unwrap();
+            let e = r.presences.by.get(&key);
+            let invisible = e.is_some_and(|e| e.invisible);
+            match update.state {
+                Some(Presence::Invisible) => e.map(|e| e.told_text.clone()),
+                Some(Presence::Online | Presence::Away | Presence::Busy) if invisible => Some(
+                    update
+                        .status_text
+                        .clone()
+                        .unwrap_or_else(|| e.and_then(|e| e.status_text.clone())),
+                ),
+                _ if invisible => None,
+                _ => update.status_text.clone(),
+            }
+        };
         // Taking requests is an opt-in, by a session, that lapses
         // (`docs/instant-messaging.md` §4.1).
         let account = AccountUpdate {
             status_text: update.status_text.clone(),
+            shown_text,
             discoverable: update.discoverable,
             takes_requests: update
                 .takes_requests
@@ -839,7 +877,6 @@ impl Core {
         ) {
             m.understands_requests = true;
         }
-        let key = Key::of(&me.mailbox);
         match update.state {
             Some(Presence::Invisible) => {
                 if let Some(e) = r.presences.by.get_mut(&key) {
@@ -901,7 +938,7 @@ impl Core {
             .relationships(&me.mailbox, now)
             .map_err(store_failed)?;
         let waiting = store.pending_in(&me.mailbox, now).map_err(store_failed)?;
-        let texts: Vec<Option<String>> = rows.iter().map(|r| self.status_text(Some(r))).collect();
+        let texts: Vec<Option<String>> = rows.iter().map(|r| self.shown_text(Some(r))).collect();
         let r = self.roster.lock().unwrap();
         let mut out: Vec<FriendEntry> = rows
             .iter()
@@ -1611,7 +1648,7 @@ impl Core {
             if mine {
                 (r.own_state(&them), account.status_text.clone())
             } else {
-                r.friend_view(&them, account.status_text.clone())
+                r.friend_view(&them, account.shown_text.clone())
             }
         });
         let portable = self
@@ -1636,14 +1673,17 @@ impl Core {
 pub(crate) struct PresenceLoad<'a> {
     _guard: std::sync::MutexGuard<'a, ()>,
     mailbox: Mailbox,
-    /// The friends and status text read, for an entry made by the join.
-    fresh: (HashSet<Key>, Option<String>),
+    /// The friends, the text they were last shown and the account's own,
+    /// read for an entry made by the join.
+    fresh: (HashSet<Key>, Option<String>, Option<String>),
+    /// The text to store as shown, once the join is in.
+    shown: Option<Option<String>>,
 }
 
 impl RosterInner {
     /// `uid` is announced, taking part: in its mailbox's entry, and its
     /// friends told.
-    pub(crate) fn presence_join(&mut self, uid: Uid, load: PresenceLoad<'_>) {
+    pub(crate) fn presence_join(&mut self, uid: Uid, load: &mut PresenceLoad<'_>) {
         let key = Key::of(&load.mailbox);
         if let Some(sess) = self.users.get_mut(&uid) {
             sess.messaging = Some(SessionState {
@@ -1651,7 +1691,10 @@ impl RosterInner {
                 ..SessionState::default()
             });
         }
-        let (friends, status_text) = load.fresh;
+        let (friends, shown_text, status_text) = std::mem::take(&mut load.fresh);
+        if shown_text != status_text {
+            load.shown = Some(status_text.clone());
+        }
         let e = match self.presences.by.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => v.insert(Entry {
@@ -1659,7 +1702,7 @@ impl RosterInner {
                 uids: Vec::new(),
                 friends,
                 invisible: false,
-                told_text: status_text.clone(),
+                told_text: shown_text,
                 status_text,
                 told: (Presence::Offline, None),
             }),

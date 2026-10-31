@@ -642,7 +642,9 @@ seconds — grows the database by whatever that is for a month. The quota
 is per sender over a rolling day, in messages and in bytes, and it
 counts every row the sender has stored in that day, delivered or not,
 read from the store (two indexes on `(sender, sent_at)`, schema version
-11), so a restart forgets nothing.
+11), so a restart forgets nothing. A message request is the exception:
+it is counted from the request ledger (`instant-messaging.md` §4.4),
+and its row never, even once an approval or a friendship releases it.
 
 It bounds storage and never conversation. Past it, a message to someone
 attached is still handed to them — live, with no row and no id, exactly
