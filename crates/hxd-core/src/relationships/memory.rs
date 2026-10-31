@@ -946,6 +946,28 @@ impl RelationshipStore for MemoryRelationships {
             .len())
     }
 
+    fn request_addresses(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        before: Option<SystemTime>,
+    ) -> Result<Vec<String>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: Vec<String> = Vec::new();
+        for e in &inner.ledger {
+            if let Some(a) = e.address.as_ref().filter(|a| {
+                e.sender.is_none()
+                    && e.at >= floor(since)
+                    && before.is_none_or(|b| e.at < floor(b))
+                    && is(&e.recipient, to)
+                    && !out.contains(a)
+            }) {
+                out.push(a.clone());
+            }
+        }
+        Ok(out)
+    }
+
     fn recipients_from_address(
         &self,
         address: &str,

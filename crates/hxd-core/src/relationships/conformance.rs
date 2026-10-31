@@ -30,6 +30,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     an_alias_lives_only_beside_a_friendship_or_a_block(&*new_store());
     what_lapses_reads_as_gone_and_counts_for_nothing(&*new_store());
     a_hold_matches_either_key_and_lapses(&*new_store());
+    request_addresses_lists_each_guest_address_once_within_its_span(&*new_store());
     the_ledger_counts_what_was_sent_and_answers_a_retry(&*new_store());
     a_listing_takes_the_dropped_count(&*new_store());
     an_account_keeps_what_it_was_told_and_nothing_else(&*new_store());
@@ -858,6 +859,36 @@ fn a_hold_matches_either_key_and_lapses(s: &dyn RelationshipStore) {
         s.is_held(&dave, &Requester::Account(Mailbox::login("pest")), at(50))
             .unwrap(),
         "{case}: linking does not shed it"
+    );
+}
+
+fn request_addresses_lists_each_guest_address_once_within_its_span(s: &dyn RelationshipStore) {
+    let case = "request_addresses_lists_each_guest_address_once_within_its_span";
+    let (dave, erin) = (Mailbox::login("dave"), Mailbox::login("erin"));
+    let from = |sender: Option<&Mailbox>, addr: &str, to: &Mailbox, secs| LedgerEntry {
+        address: Some(addr.into()),
+        ..entry(RequestKind::Message, sender, to, secs)
+    };
+    for e in [
+        from(None, "before", &dave, 5),
+        from(None, "a1", &dave, 10),
+        from(None, "a2", &dave, 20),
+        from(None, "a1", &dave, 30),
+        from(None, "to erin", &erin, 30),
+        from(Some(&Mailbox::login("alice")), "an account's", &dave, 30),
+        from(None, "after", &dave, 40),
+    ] {
+        s.record_request(&e).unwrap();
+    }
+    assert_eq!(
+        s.request_addresses(&dave, at(10), None).unwrap(),
+        ["a1", "a2", "after"],
+        "{case}"
+    );
+    assert_eq!(
+        s.request_addresses(&dave, at(10), Some(at(40))).unwrap(),
+        ["a1", "a2"],
+        "{case}: what was sent from `before` on is outside it"
     );
 }
 

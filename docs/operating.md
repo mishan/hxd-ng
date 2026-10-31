@@ -698,7 +698,7 @@ row says otherwise; each is whatever its key names.
 | `rooms.toml` | `[rooms] file` | Every room, its gates and topic; their lines stay in the database with no room to read them in. |
 | The SQLite database, with its `-wal` | `[inbox] db`, `[history] db`, `[news] db`, `[avatars] db`, `[push] db` | Private messages, chat history, news, avatars, push devices, the moderation trail, reports and bans, and the registrars' records the server has fetched. Copy it with the server stopped or with `sqlite3 .backup`, never mid-write. |
 | `news-guest.key`, beside the news database | `[news] guest_secret` | The guests' articles already kept are counted against no address. |
-| `messaging-requests.key`, beside the inbox database | `[messaging] request_secret` | Every address's count of requests sent today starts again. |
+| `messaging-requests.key`, beside the inbox database | `[messaging] request_secret` | Every address's count of requests sent today starts again, no guest is held by its address any more, and approving a guest no longer releases what it had waiting. |
 | `news-blobs/` | `[news] blobs` | Every image attached to an article. |
 | `vapid.key` | `[push] vapid_key` | Every push subscription, which is bound to it: pushes are accepted by nobody and no client can tell why. The server refuses to start without it while devices are registered. |
 | `identity-server.key` | `[identity] key` | The server key discovery publishes and every login proof is bound to; a new one is made in its place. |

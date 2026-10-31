@@ -324,6 +324,17 @@ pub(crate) struct SessionState {
     pub(crate) understands_requests: bool,
 }
 
+/// A guest session's part in message requests (§4.1): on the session,
+/// since a guest has no account of its own to keep it on, and gone with
+/// it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GuestRequests {
+    /// Every recipient it asked, whatever became of the request.
+    pub(crate) asked: HashSet<Key>,
+    /// The recipients that approved it, or wrote back.
+    pub(crate) approved: HashSet<Key>,
+}
+
 /// What friends are told of a login: its state and its text.
 type Shown = (Presence, Option<String>);
 
@@ -1397,6 +1408,13 @@ impl Core {
         if self.conn_gate.exempt(addr) {
             return None;
         }
+        self.address_key(uid)
+    }
+
+    /// The opaque key of the address `uid` connected from, `[limits]
+    /// exempt` or not: what a plain guest is bounded and held by.
+    fn address_key(&self, uid: Uid) -> Option<String> {
+        let addr = self.roster.lock().unwrap().users.get(&uid)?.addr?;
         Some(self.request_keyer.key(addr))
     }
 

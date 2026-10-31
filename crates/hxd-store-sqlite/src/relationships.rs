@@ -954,6 +954,29 @@ impl RelationshipStore for SqliteStore {
         Ok(n.max(0) as usize)
     }
 
+    fn request_addresses(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        before: Option<SystemTime>,
+    ) -> Result<Vec<String>, StoreError> {
+        let text = format!(
+            "SELECT address FROM request_ledger
+              WHERE sender IS NULL AND address IS NOT NULL AND {} AND at >= ?2
+                AND (?3 IS NULL OR at < ?3)
+              GROUP BY address ORDER BY MIN(id)",
+            mailbox_sql(to, "recipient", 1)
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare(&text))?;
+        let rows = sql(
+            stmt.query_map(params![bind(to), unix(since), before.map(unix)], |r| {
+                r.get(0)
+            }),
+        )?;
+        rows.map(sql).collect()
+    }
+
     fn recipients_from_address(
         &self,
         address: &str,

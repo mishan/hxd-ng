@@ -699,7 +699,12 @@ same `no_such_user` every other unreachable address gets; one addressing
 a session that is on the roster but detached reaches its outbox and is
 answered `Delivered`, which is the pre-inbox behaviour on that path and
 is bounded by the outbox rather than by `max_queued`. Nothing durable is
-written either way.
+written either way. Where messaging is on, a plain guest's message by
+login to an account taking part is a message request instead
+(`instant-messaging.md` §4.1): a request is not mail, takes no place in
+the mailbox and is bounded by the guest's address, and what an approval
+turns into mail is mail the recipient chose to take; the guest's
+messages after it go as above.
 
 **An identity guest can.** Under `new_accounts = guest` an identity user
 is a guest session *with a fingerprint*, and a fingerprint is exactly

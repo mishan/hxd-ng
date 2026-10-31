@@ -847,6 +847,7 @@ fn a_claim_restamps_what_was_sent_on_a_friendship_it_merged() {
                 media: None,
                 signed: None,
                 friendship: Some(SentOn::Relation(lost)),
+                sender_address: None,
             },
             10,
         )
@@ -1487,7 +1488,7 @@ fn who_may_ask_and_who_is_answered_otherwise() {
     use crate::{ChatError, MsgOutcome};
     let without = AccessBits::empty().with(bit::SEND_MSGS);
     type Setup = fn(&Server) -> Uid;
-    let cases: [(&str, Setup, Result<MsgOutcome, ChatError>); 8] = [
+    let cases: [(&str, Setup, Result<MsgOutcome, ChatError>); 10] = [
         (
             "both opted in",
             |s| taker(&s.core, "alice").0,
@@ -1522,6 +1523,28 @@ fn who_may_ask_and_who_is_answered_otherwise() {
                     "10.0.0.4",
                 )
                 .0
+            },
+            Err(ChatError::NotFriends),
+        ),
+        (
+            "a guest",
+            |s| guest_at(&s.core, "10.0.1.1").0,
+            Ok(MsgOutcome::Requested),
+        ),
+        (
+            "a guest, to a recipient that turned requests off",
+            |s| {
+                let (bob, _) = taker(&s.core, "bob");
+                s.core
+                    .set_presence(
+                        bob,
+                        PresenceUpdate {
+                            takes_requests: Some(false),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                guest_at(&s.core, "10.0.1.1").0
             },
             Err(ChatError::NotFriends),
         ),
@@ -1921,6 +1944,7 @@ fn a_backlog_the_flush_must_skip_never_starves_private_mail() {
             media: None,
             signed: None,
             friendship,
+            sender_address: None,
         };
         let backlog = InboxPolicy::default().deliver_at_flush + 5;
         for i in 0..backlog {
@@ -2135,6 +2159,7 @@ fn a_request_to_a_full_mailbox_is_dropped_and_counted() {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 usize::MAX,
             )
@@ -2233,6 +2258,7 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
                     media: None,
                     signed: None,
                     friendship: Some(SentOn::Relation(on)),
+                    sender_address: None,
                 },
                 1000,
             )
@@ -2650,6 +2676,301 @@ fn a_released_request_counts_once_toward_the_daily_quota() {
     assert_eq!(
         send(&s.core, a, "bob", "and another"),
         Err(ChatError::SendQuota)
+    );
+}
+
+// --- A guest's requests (§4.1) ------------------------------------------
+
+/// A classic guest session from `addr`.
+fn guest_at(core: &Core, addr: &str) -> (Uid, Events) {
+    guest_as(core, addr, None)
+}
+
+/// [`guest_at`], proving `identity` where given.
+fn guest_as(core: &Core, addr: &str, identity: Option<[u8; 32]>) -> (Uid, Events) {
+    let (uid, mut rx) = core
+        .attach(AttachInfo {
+            account: None,
+            nick: "visitor".into(),
+            icon: 1,
+            admin: false,
+            access: AccessBits::empty().with(bit::SEND_MSGS),
+            login: "guest".into(),
+            addr: Some(addr.parse().unwrap()),
+            can_detach: false,
+            transport: crate::Transport::default(),
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
+            is_person: false,
+            reads_on_delivery: true,
+            identity,
+            system: false,
+        })
+        .unwrap();
+    core.announce(uid);
+    drain(&mut rx);
+    (uid, rx)
+}
+
+fn guests(texts: &[&str]) -> Vec<(String, Vec<String>)> {
+    vec![(
+        "guest".into(),
+        texts.iter().map(|t| t.to_string()).collect(),
+    )]
+}
+
+#[test]
+fn a_guests_message_by_login_is_a_request_bounded_by_its_address() {
+    use crate::{ChatError, MsgOutcome};
+    let p = MessagingPolicy {
+        request_messages: 2,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (one, _r1) = guest_at(&s.core, "10.0.1.1");
+    let (two, _r2) = guest_at(&s.core, "10.0.1.1");
+    let (elsewhere, _r3) = guest_at(&s.core, "10.0.1.2");
+    assert_eq!(send(&s.core, one, "bob", "one"), Ok(MsgOutcome::Requested));
+    assert_eq!(send(&s.core, two, "bob", "two"), Ok(MsgOutcome::Requested));
+    assert_eq!(
+        send(&s.core, two, "bob", "three"),
+        Err(ChatError::RequestFull),
+        "two guests from one address share its count"
+    );
+    assert_eq!(
+        send(&s.core, elsewhere, "bob", "other"),
+        Ok(MsgOutcome::Requested)
+    );
+    assert!(msgs(&drain(&mut rb)).is_empty(), "nothing went live");
+    assert_eq!(waiting(&s.core, b), guests(&["one", "two", "other"]));
+}
+
+#[test]
+fn a_guest_that_reconnects_earns_no_new_requests_and_stays_held() {
+    use crate::{ChatError, MsgOutcome};
+    let p = MessagingPolicy {
+        request_messages: 3,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    let again = |text: &str| {
+        let (g, _rx) = guest_at(&s.core, "10.0.1.1");
+        let sent = send(&s.core, g, "bob", text);
+        s.core.end_session(g);
+        sent
+    };
+    assert_eq!(again("one"), Ok(MsgOutcome::Requested));
+    assert_eq!(again("two"), Ok(MsgOutcome::Requested));
+    s.core
+        .request_answer(b, "guest", RequestAction::Delete)
+        .unwrap();
+    assert_eq!(again("three"), Ok(MsgOutcome::Requested));
+    assert!(waiting(&s.core, b).is_empty(), "held");
+    assert_eq!(again("four"), Err(ChatError::RequestFull), "and counted");
+}
+
+#[test]
+fn an_approval_of_guest_lets_in_the_session_that_asked_and_no_other_guest() {
+    use crate::{ChatError, MsgOutcome};
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (asked, _ra) = guest_at(&s.core, "10.0.1.1");
+    let (other, _ro) = guest_at(&s.core, "10.0.1.2");
+    let (gone, _rg) = guest_at(&s.core, "10.0.1.3");
+    assert_eq!(
+        send(&s.core, gone, "bob", "gone"),
+        Ok(MsgOutcome::Requested)
+    );
+    s.core.end_session(gone);
+    assert_eq!(send(&s.core, asked, "bob", "hi"), Ok(MsgOutcome::Requested));
+    drain(&mut rb);
+    s.core
+        .request_answer(b, "guest", RequestAction::Approve)
+        .unwrap();
+    assert_eq!(
+        msgs(&drain(&mut rb)),
+        ["hi"],
+        "what waited is handed over at once, as mail"
+    );
+    assert_eq!(
+        waiting(&s.core, b),
+        guests(&["gone"]),
+        "a guest that left is let in by nobody"
+    );
+    assert_eq!(
+        s.core.requests_list(b).unwrap().approvals,
+        [Mailbox::login("guest")]
+    );
+    assert_eq!(
+        send(&s.core, asked, "bob", "thanks"),
+        Ok(MsgOutcome::Delivered)
+    );
+    assert_eq!(msgs(&drain(&mut rb)), ["thanks"]);
+    assert_eq!(
+        send(&s.core, other, "bob", "me too"),
+        Ok(MsgOutcome::Requested),
+        "another guest is not let in"
+    );
+    s.core.end_session(b);
+    assert_eq!(
+        send(&s.core, asked, "bob", "anyone?"),
+        Err(ChatError::NoSuchUser),
+        "an approved guest reaches a session that is there or nobody"
+    );
+}
+
+#[test]
+fn writing_back_by_uid_approves_the_guest_that_asked() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (g, mut rg) = guest_at(&s.core, "10.0.1.1");
+    let (other, _ro) = guest_at(&s.core, "10.0.1.2");
+    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    assert_eq!(
+        send(&s.core, other, "bob", "other"),
+        Ok(MsgOutcome::Requested)
+    );
+    drain(&mut rb);
+    s.core.msg(b, g, "hello".into(), None, None).unwrap();
+    assert_eq!(msgs(&drain(&mut rg)), ["hello"]);
+    assert_eq!(
+        msgs(&drain(&mut rb)),
+        ["hi"],
+        "what it asked is handed over, and no other address's"
+    );
+    assert_eq!(waiting(&s.core, b), guests(&["other"]));
+    assert_eq!(send(&s.core, g, "bob", "thanks"), Ok(MsgOutcome::Delivered));
+    assert_eq!(msgs(&drain(&mut rb)), ["thanks"]);
+}
+
+#[test]
+fn a_send_to_the_guest_login_never_approves() {
+    use crate::MsgOutcome;
+    let s = server_with(
+        policy(),
+        &[("bob", messaging_bits()), ("guest", messaging_bits())],
+    );
+    let (b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    let _ = send(&s.core, b, "guest", "who is this?");
+    let listed = s.core.requests_list(b).unwrap();
+    assert!(listed.approvals.is_empty());
+    assert_eq!(waiting(&s.core, b), guests(&["hi"]));
+}
+
+#[test]
+fn clearing_a_span_takes_and_holds_the_guests_that_asked_within_it() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    let mut at = Vec::new();
+    let mut sessions = Vec::new();
+    for (addr, text) in [("10.0.1.1", "a"), ("10.0.1.2", "b"), ("10.0.1.3", "c")] {
+        at.push(s.core.clock.wall());
+        let (g, rx) = guest_at(&s.core, addr);
+        assert_eq!(send(&s.core, g, "bob", text), Ok(MsgOutcome::Requested));
+        sessions.push((g, rx));
+        s.core.clock.advance(Duration::from_secs(60));
+    }
+    let cleared = s.core.requests_clear(b, Some(at[1]), Some(at[2])).unwrap();
+    assert_eq!(cleared.deleted, 1);
+    assert_eq!(
+        waiting(&s.core, b),
+        guests(&["a", "c"]),
+        "the guests before and after the span keep theirs"
+    );
+    for ((g, _), text) in sessions.iter().zip(["a again", "b again", "c again"]) {
+        assert_eq!(send(&s.core, *g, "bob", text), Ok(MsgOutcome::Requested));
+    }
+    assert_eq!(
+        waiting(&s.core, b),
+        guests(&["a", "c", "a again", "c again"]),
+        "only the address that asked within the span is held"
+    );
+}
+
+#[test]
+fn an_identity_guests_message_by_login_goes_as_mail() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    s.core.end_session(b);
+    assert!(matches!(
+        send(&s.core, g, "bob", "hi"),
+        Ok(MsgOutcome::Queued(_))
+    ));
+    let (b, _rb) = taker(&s.core, "bob");
+    assert!(waiting(&s.core, b).is_empty(), "no request");
+}
+
+#[test]
+fn deleting_guest_holds_each_address_that_asked_and_ending_holds_who_it_let_in() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    for addr in ["10.0.1.1", "10.0.1.2"] {
+        let (g, _rx) = guest_at(&s.core, addr);
+        assert_eq!(send(&s.core, g, "bob", addr), Ok(MsgOutcome::Requested));
+    }
+    s.core
+        .request_answer(b, "guest", RequestAction::Delete)
+        .unwrap();
+    for addr in ["10.0.1.1", "10.0.1.2"] {
+        let (g, _rx) = guest_at(&s.core, addr);
+        assert_eq!(send(&s.core, g, "bob", "again"), Ok(MsgOutcome::Requested));
+    }
+    assert!(waiting(&s.core, b).is_empty(), "both held");
+
+    let (g, _rx) = guest_at(&s.core, "10.0.1.3");
+    assert_eq!(send(&s.core, g, "bob", "new"), Ok(MsgOutcome::Requested));
+    s.core
+        .request_answer(b, "guest", RequestAction::Approve)
+        .unwrap();
+    s.core
+        .request_answer(b, "guest", RequestAction::End)
+        .unwrap();
+    assert_eq!(send(&s.core, g, "bob", "still?"), Ok(MsgOutcome::Requested));
+    assert!(waiting(&s.core, b).is_empty(), "let out and held");
+    assert_eq!(
+        s.core.request_answer(b, "guest", RequestAction::End),
+        Err(MessagingError::NoSuchRequest)
+    );
+}
+
+#[test]
+fn the_guests_hold_two_senders_worth_and_count_as_one() {
+    use crate::MsgOutcome;
+    let p = MessagingPolicy {
+        request_messages: 1,
+        max_requests: 2,
+        ..policy()
+    };
+    let s = server_with(p, &[("alice", messaging_bits()), ("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    for n in 1..=3 {
+        let (g, _rx) = guest_at(&s.core, &format!("10.0.1.{n}"));
+        let text = n.to_string();
+        assert_eq!(send(&s.core, g, "bob", &text), Ok(MsgOutcome::Requested));
+    }
+    let (a, _ra) = taker(&s.core, "alice");
+    assert_eq!(send(&s.core, a, "bob", "a"), Ok(MsgOutcome::Requested));
+    assert_eq!(s.core.requests_list(b).unwrap().dropped, 1);
+    assert_eq!(
+        waiting(&s.core, b),
+        [
+            ("guest".into(), vec!["1".into(), "2".into()]),
+            ("alice".into(), vec!["a".into()]),
+        ]
     );
 }
 

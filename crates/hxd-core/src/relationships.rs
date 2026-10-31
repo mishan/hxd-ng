@@ -609,6 +609,16 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// kind since `since`.
     fn recipients_since(&self, from: &Requester, since: SystemTime) -> Result<usize, StoreError>;
 
+    /// The addresses guests have sent `to` requests from since `since`,
+    /// and before `before` where given, each once, oldest first: what a
+    /// delete or a clearing of the guests' group holds.
+    fn request_addresses(
+        &self,
+        to: &Mailbox,
+        since: SystemTime,
+        before: Option<SystemTime>,
+    ) -> Result<Vec<String>, StoreError>;
+
     /// How many distinct recipients have been sent requests from
     /// `address` since `since`, whoever sent them.
     fn recipients_from_address(

@@ -1527,11 +1527,15 @@ impl MessagingSection {
             ));
         }
         // A page of the classic wire's Get Message Requests holds one
-        // sender's group whole.
-        if !hxd_session::request_group_fits(self.request_messages, self.max_message_bytes) {
+        // sender's group whole, and the guests', which holds two
+        // senders' worth.
+        if !hxd_session::request_group_fits(
+            self.request_messages.saturating_mul(2),
+            self.max_message_bytes,
+        ) {
             return Err(
-                "[messaging] request_messages times max_message_bytes is more than one \
-                 page of message requests holds: lower either"
+                "[messaging] request_messages times max_message_bytes, doubled for the \
+                 guests' group, is more than one page of message requests holds: lower either"
                     .into(),
             );
         }
@@ -5132,11 +5136,11 @@ sync = "full"
                 None,
             ),
             (
-                format!("{INBOX}[messaging]\nmax_message_bytes = 65505\nrequest_messages = 3\n"),
+                format!("{INBOX}[messaging]\nmax_message_bytes = 50000\nrequest_messages = 2\n"),
                 None,
             ),
             (
-                format!("{INBOX}[messaging]\nmax_message_bytes = 65505\nrequest_messages = 4\n"),
+                format!("{INBOX}[messaging]\nmax_message_bytes = 50000\nrequest_messages = 3\n"),
                 Some("request_messages times max_message_bytes"),
             ),
             (
@@ -5946,6 +5950,7 @@ sync = "full"
                         media: None,
                         signed: None,
                         friendship: None,
+                        sender_address: None,
                     },
                     usize::MAX,
                 )

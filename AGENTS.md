@@ -427,7 +427,8 @@ Three layers, all `cargo test --workspace`:
   with receipts and typing, one sent while away handed over at the
   roster read, a block reading as a missing account on every request
   naming one, a request listed, approved and answered, a span no clock
-  holds refused, crossing requests, Invisible hiding presence alone, an account without the bit
+  holds refused, crossing requests, a guest's message by login refused
+  by an account taking no requests, Invisible hiding presence alone, an account without the bit
   taking no part, a client that never declared the family hearing
   nothing of it across a resume until it asks, a server
   without messaging answering as before, and a classic client beside
@@ -448,8 +449,9 @@ Three layers, all `cargo test --workspace`:
   without a word to the lobby, and its mail waiting for a visible
   session; 810 without `send_msgs` refused; bit 6 confirmed
   only to an account that takes part, never `admin` or `guest`, on a
-  server with messaging; and a period client beside it all hearing
-  nothing new),
+  server with messaging; a guest's `/msg` refused, then a request
+  approved with 830 and what waited heard at once; and a period client
+  beside it all hearing nothing new),
   `portable_friends.rs` (portable friendships signed with real device
   keys: one made on a server and in place on the next once both
   present it, a withdrawal on one ending it on the other and refusing

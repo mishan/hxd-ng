@@ -332,6 +332,7 @@ impl Core {
                     media: None,
                     signed,
                     friendship: Some(SentOn::Relation(on)),
+                    sender_address: None,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -635,6 +636,7 @@ impl Core {
                         media: None,
                         signed: None,
                         friendship: Some(SentOn::Relation(id)),
+                        sender_address: None,
                     },
                     self.inbox_policy.max_queued,
                 )
