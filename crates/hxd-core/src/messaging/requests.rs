@@ -551,7 +551,7 @@ impl Core {
                 .takes_requests
             {
                 let renew = AccountUpdate {
-                    takes_requests: Some(Some(now)),
+                    takes_requests: Some(Some(self.clock.wall())),
                     ..AccountUpdate::default()
                 };
                 rel.update_account(&me.mailbox, &renew)
