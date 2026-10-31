@@ -305,6 +305,8 @@ async fn a_user_who_chose_no_color_is_drawn_in_their_roles() {
         .await
         .unwrap();
     set_color(&mut bob, 0x0000_80ff).await;
+    let bob_uid = bob.uid.unwrap();
+    assert_eq!(change_color(&mut bob, bob_uid).await, 0x0000_80ff);
     let mut tess = legacy::Client::login_at(server.legacy, &Login::account("tess", "tess", "pw"))
         .await
         .unwrap();
