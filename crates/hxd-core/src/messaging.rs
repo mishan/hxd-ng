@@ -603,6 +603,13 @@ impl Core {
         self
     }
 
+    /// Key requests' addresses under `keyer` rather than a secret this
+    /// process made up, so the per-address bound outlasts a restart.
+    pub fn with_request_keyer(mut self, keyer: crate::relationships::RequestKeyer) -> Self {
+        self.request_keyer = keyer;
+        self
+    }
+
     pub fn messaging_enabled(&self) -> bool {
         self.messaging_policy.enabled && self.relationships.is_some() && self.directory.is_some()
     }
@@ -1390,7 +1397,7 @@ impl Core {
         if self.conn_gate.exempt(addr) {
             return None;
         }
-        Some(self.news_guest_keyer.key(addr).to_hex())
+        Some(self.request_keyer.key(addr))
     }
 
     /// The per-sender and per-address bounds a new request is held to,

@@ -61,7 +61,7 @@ layout under `/srv/hxd-ng`:
 
 | On the host | In the container | What | Mounted |
 |---|---|---|---|
-| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the rooms file, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, and the secret guests' news is counted under. | Always, or the named volume instead. |
+| `/srv/hxd-ng/data` | `/var/lib/hxd-ng` | All state: accounts, the rooms file, the SQLite store, news blobs, the identity, VAPID and self-signed TLS keys, the secret guests' news is counted under, and the one requests' addresses are counted under. | Always, or the named volume instead. |
 | `/srv/hxd-ng/etc` | `/etc/hxd-ng` | A config file of the operator's own. | Only for [a mounted config](#configuration). |
 | `/srv/hxd-ng/tls` | `/etc/hxd-ng/tls`, read-only | A certificate and key from a CA. | Only for [TLS certificates](#tls-certificates). |
 | `/srv/hxd-ng/files` | `/srv/files` | The file area, with `HXD_FILES_ROOT=/srv/files`. | Only for files. |

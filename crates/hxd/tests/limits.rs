@@ -30,6 +30,26 @@ struct Server {
     tls: SocketAddr,
     /// The TLS port's certificate, for the client's trust store.
     cert: CertificateDer<'static>,
+    core: Arc<hxd_core::Core>,
+    serving: [tokio::task::JoinHandle<()>; 3],
+}
+
+impl Server {
+    /// Stop serving and let go of the stores, as a process that exits
+    /// would, so a restart is the only server on its files.
+    async fn stop(self) {
+        for task in self.serving {
+            task.abort();
+            assert!(task.await.is_err_and(|e| e.is_cancelled()));
+        }
+        timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&self.core) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stopped server's core is let go");
+    }
 }
 
 /// A server whose `[limits]` are `limits`, exempting `exempt` (a TOML
@@ -60,16 +80,18 @@ async fn start_exempting(dir: &Path, exempt: &str, limits: &str) -> Server {
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let secure = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = Server {
+    Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
         tls: secure.local_addr().unwrap(),
         cert: issued.cert.der().clone(),
-    };
-    tokio::spawn(hxd_session::serve(legacy, ctx.clone()));
-    tokio::spawn(hxd_session::serve_tls(secure, ctx, tls));
-    tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
-    server
+        core: ctx.core.clone(),
+        serving: [
+            tokio::spawn(hxd_session::serve(legacy, ctx.clone())),
+            tokio::spawn(hxd_session::serve_tls(secure, ctx, tls)),
+            tokio::spawn(hxd_ng_session::serve(ng, ng_ctx)),
+        ],
+    }
 }
 
 /// A classic connection over TLS that gets as far as the server's
@@ -1014,4 +1036,50 @@ async fn the_request_limit_survives_a_resume() {
     );
     let wait = refused["error"]["retry_after"].as_u64().unwrap();
     assert!((1..=15).contains(&wait), "{refused}");
+}
+
+/// The per-address bound on requests is kept under a secret the server
+/// keeps beside its inbox, so a restart neither forgets what an address
+/// has sent nor lets another account behind it start again.
+#[tokio::test]
+async fn requests_per_address_outlasts_a_restart() {
+    let td = tempfile::tempdir().unwrap();
+    let accounts = td.path().join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    for login in ["alice", "bob", "dave", "erin"] {
+        std::fs::write(
+            accounts.join(format!("{login}.toml")),
+            format!(
+                "name = \"{login}\"\npassword = \"pw\"\n[access]\nsend_msgs = true\n\
+                 messaging = true\n"
+            ),
+        )
+        .unwrap();
+    }
+    let d = td.path().display();
+    let limits = format!(
+        "connections_per_addr = 0\nreconnect_seconds = 0\nrequests_per_address = 1\n\
+         [inbox]\ndb = \"{d}/hx.db\"\n[messaging]\nenabled = true"
+    );
+    let ask_friend = |addr: SocketAddr, login: &'static str, to: &'static str| async move {
+        let mut ws = ng(addr).await.expect("admitted");
+        let hello = ask(
+            &mut ws,
+            1,
+            "login",
+            json!({ "login": login, "password": "pw", "messaging": true }),
+        )
+        .await;
+        assert!(hello.get("ok").is_some(), "{hello}");
+        ask(&mut ws, 2, "friend_add", json!({ "login": to })).await
+    };
+
+    let first = start(td.path(), &limits).await;
+    let asked = ask_friend(first.ng, "alice", "dave").await;
+    assert_eq!(asked["ok"]["state"], "pending_out", "{asked}");
+    first.stop().await;
+
+    let second = start(td.path(), &limits).await;
+    let refused = ask_friend(second.ng, "bob", "erin").await;
+    assert_eq!(refused["error"]["code"], "quota_exceeded", "{refused}");
 }

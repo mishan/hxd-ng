@@ -1488,9 +1488,26 @@ pub struct MessagingSection {
     /// Days a request waits, and a declined or deleted sender is held.
     #[serde(default = "default_request_retention_days")]
     pub request_retention_days: u64,
+    /// The secret a request's address is kept under in the ledger and
+    /// the holds (§4.4): 32 bytes in hex, created owner-only on first
+    /// start. Absent, `messaging-requests.key` in the directory of
+    /// `[inbox] db`. Lost or replaced, every address's count starts
+    /// again.
+    pub request_secret: Option<PathBuf>,
 }
 
 impl MessagingSection {
+    /// Where the requests' secret lives, as [`NewsSection::guest_secret_path`]
+    /// finds the news's; `None` without an inbox, which keeps no requests.
+    pub fn request_secret_path(&self, config: &Config) -> Option<PathBuf> {
+        let db = &config.inbox.as_ref()?.db;
+        Some(self.request_secret.clone().unwrap_or_else(|| {
+            db.parent()
+                .unwrap_or(Path::new(""))
+                .join("messaging-requests.key")
+        }))
+    }
+
     pub fn policy(&self, limits: &LimitsSection) -> Result<hxd_core::MessagingPolicy, String> {
         let counts = [
             ("max_roster", self.max_roster),
@@ -4500,7 +4517,15 @@ pub fn build_ctx(
         None => core,
     };
     let core = match &config.messaging {
-        Some(messaging) => core.with_messaging(messaging.policy(&config.limits)?),
+        Some(messaging) => {
+            let core = core.with_messaging(messaging.policy(&config.limits)?);
+            match messaging.request_secret_path(config) {
+                Some(path) => core.with_request_keyer(hxd_core::relationships::RequestKeyer::new(
+                    load_secret(&path, "request address secret")?,
+                )),
+                None => core,
+            }
+        }
         None => core,
     };
     let core = match (stores.history, config.history.as_ref()) {
@@ -4660,6 +4685,54 @@ mod tests {
             named.news.as_ref().unwrap().guest_secret_path(&named),
             dir.path().join("elsewhere.key")
         );
+    }
+
+    /// The secret a request's address is kept under is made by the first
+    /// start, owner-only, and read back unchanged by the next, so the
+    /// per-address bound outlasts a restart; one that does not parse
+    /// refuses the start.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn the_request_secret_is_made_once_owner_only_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let path = dir.path().join("requests.key");
+        let config: Config = toml::from_str(&format!(
+            "[paths]\naccounts = \"{d}/accounts\"\n[inbox]\ndb = \"{d}/hx.db\"\n\
+             [messaging]\nenabled = true\nrequest_secret = \"{}\"\n",
+            path.display()
+        ))
+        .unwrap();
+        build_ctx(&config, None, None, None, None).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only from its first byte");
+        }
+        build_ctx(&config, None, None, None, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first, "kept");
+        std::fs::write(&path, "not hex\n").unwrap();
+        assert!(build_ctx(&config, None, None, None, None).is_err());
+    }
+
+    /// Unnamed, the requests' secret lives beside the inbox's database.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn the_request_secret_defaults_to_beside_the_inbox_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let config: Config = toml::from_str(&format!(
+            "[paths]\naccounts = \"{d}/accounts\"\n[inbox]\ndb = \"{d}/hx.db\"\n[messaging]\n"
+        ))
+        .unwrap();
+        let path = dir.path().join("messaging-requests.key");
+        let messaging = config.messaging.as_ref().unwrap();
+        assert_eq!(messaging.request_secret_path(&config), Some(path.clone()));
+        assert!(!path.exists());
+        build_ctx(&config, None, None, None, None).unwrap();
+        assert!(path.exists(), "made at start");
     }
 
     /// `hxd identity revoke` against a file an operator wrote by hand.

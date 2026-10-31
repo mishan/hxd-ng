@@ -2695,3 +2695,14 @@ fn coming_back_from_invisible_shows_the_text_set_there() {
         (Presence::Offline, Some("secret".into()))
     );
 }
+
+#[test]
+fn a_request_address_key_is_not_the_news_key_of_the_same_address_and_secret() {
+    let core = Core::new()
+        .with_request_keyer(crate::relationships::RequestKeyer::new([9; 32]))
+        .with_news_guest_keyer(crate::news::GuestKeyer::new([9; 32]));
+    let (ann, _rx) = attach_as(&core, "ann", messaging_bits(), "10.0.0.1");
+    let news = core.news_guest_keyer.key("10.0.0.1".parse().unwrap());
+    let request = core.request_address(ann).expect("not exempt");
+    assert_ne!(request, news.to_hex());
+}

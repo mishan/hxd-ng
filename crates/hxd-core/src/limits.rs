@@ -178,6 +178,30 @@ pub fn limit_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// An address's [`limit_key`] under `secret`: HMAC-SHA-256, domain
+/// separated by `label`, cut to 128 bits. One address keyed for two
+/// purposes under two labels gives two keys that cannot be matched.
+pub(crate) fn hmac_address(secret: &[u8], label: &[u8], addr: IpAddr) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(label);
+    match limit_key(addr) {
+        IpAddr::V4(v4) => {
+            mac.update(&[4]);
+            mac.update(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            mac.update(&[6]);
+            mac.update(&v6.octets());
+        }
+    }
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&tag[..16]);
+    out
+}
+
 /// The IPv6 /48 an address is in, whose connections are counted
 /// together as well as by /64; `None` for IPv4, which has no wider count
 /// (`crate::limits`).

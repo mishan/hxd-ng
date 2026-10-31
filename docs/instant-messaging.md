@@ -326,6 +326,9 @@ is written, and the message row, `requests_changed` and any lazy delete
   against the address of the connection the request arrived on, as
   `[ng] trusted_proxies` give it, an IPv6 address as its /64, and
   `[limits] exempt` is held to none of it, as for a login's attempts.
+  The ledger keeps not the address but a keyed hash of it, under a
+  secret of the server's own, by default beside the inbox, so the count
+  outlasts a restart and is not news's guest key for the same address.
 - **Held senders**: after the recipient deletes a sender's request,
   declines its friend request, removes it as a friend (803) or ends its
   approval, that sender's requests to the recipient are held for
@@ -805,9 +808,7 @@ Each stage is a branch with tests, in the house style.
    **IM2b**, what IM2 leaves open: suspension on a revoked
    `AccessMessaging` (§6); User Search (823); a guest's `/msg <login>`
    request, by its address; unlinking telling the friends `Removed`;
-   `max_offline` on held rows; `max_sessions_per_login` eviction; a
-   request address keyer of its own, persisted and under its own HMAC
-   label rather than news's; a request
+   `max_offline` on held rows; `max_sessions_per_login` eviction; a request
    answered once its ledger row is written, the rest off its path;
    clearing in bulk as one transaction; a merge's re-stamp of
    `message.friendship` in the transaction that merged, so a failed
@@ -885,7 +886,8 @@ no more than one page of Get Message Requests holds for one sender;
 `offline_retention_days`; `max_offline`, aligned with `[inbox]`;
 `max_sessions_per_login`, default 0, unlimited) and the requests'
 (`request_messages`, `requests_per_day`, `max_requests`,
-`max_friend_requests`, `request_retention_days`), with
+`max_friend_requests`, `request_retention_days`, and `request_secret`,
+the file the per-address key's secret is kept in), with
 `requests_per_address` under `[limits]`.
 
 **Deliberate deviations from the extension**, in two groups. The first

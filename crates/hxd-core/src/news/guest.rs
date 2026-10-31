@@ -14,9 +14,6 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
 /// The length of the secret a [`GuestKeyer`] is made from.
 pub const GUEST_SECRET_LEN: usize = 32;
 
@@ -75,23 +72,11 @@ impl GuestKeyer {
     /// The key of the guests at `addr`: its [`crate::limits::limit_key`]
     /// (IPv4 whole, IPv6 its /64), hashed under the secret.
     pub fn key(&self, addr: IpAddr) -> GuestKey {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes a key of any length");
-        mac.update(b"hxd-ng news guest\0");
-        match crate::limits::limit_key(addr) {
-            IpAddr::V4(v4) => {
-                mac.update(&[4]);
-                mac.update(&v4.octets());
-            }
-            IpAddr::V6(v6) => {
-                mac.update(&[6]);
-                mac.update(&v6.octets());
-            }
-        }
-        let tag = mac.finalize().into_bytes();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&tag[..16]);
-        GuestKey(out)
+        GuestKey(crate::limits::hmac_address(
+            &self.0,
+            b"hxd-ng news guest\0",
+            addr,
+        ))
     }
 }
 
@@ -144,5 +129,19 @@ mod tests {
         assert_eq!(GuestKey::from_hex(&hex), Some(here));
         assert_eq!(GuestKey::from_hex("192.0.2.7"), None);
         assert_eq!(format!("{keyer:?}"), "GuestKeyer(..)");
+    }
+
+    #[test]
+    fn the_news_guest_key_is_pinned() {
+        let keyer = GuestKeyer::new([7; GUEST_SECRET_LEN]);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            keyer.key(ip("192.0.2.7")).to_hex(),
+            "47d51e003179070cb1befd049e22696a"
+        );
+        assert_eq!(
+            keyer.key(ip("2001:db8:1:2::1")).to_hex(),
+            "61b6bc1c0bdb0c7c8bfad98f6a8144b3"
+        );
     }
 }
