@@ -494,6 +494,7 @@ impl MessageStore for MemoryStore {
                 }
             },
         );
+        inner.forget_removed();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if claim_one(&mut m.recipient, login, fingerprint) {
@@ -524,6 +525,7 @@ impl MessageStore for MemoryStore {
                 }
             },
         );
+        inner.forget_removed();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if rotate_one(&mut m.recipient, from, to) {
