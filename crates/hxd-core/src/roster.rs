@@ -1093,6 +1093,8 @@ pub(crate) struct UserSession {
     /// Its part in instant messaging, from its announce, where it takes
     /// part (`crate::messaging`).
     pub(crate) messaging: Option<crate::messaging::SessionState>,
+    /// For a guest, who it asked and who let it in.
+    pub(crate) guest: crate::messaging::GuestRequests,
 }
 
 /// What a transport hands the roster at login.
@@ -2232,6 +2234,7 @@ impl Core {
                 account: info.account,
                 mask: Default::default(),
                 messaging: None,
+                guest: Default::default(),
             },
         );
         Some((uid, rx))

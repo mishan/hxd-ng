@@ -9,7 +9,7 @@
 //! Where the SQLite store expresses a rule in SQL, this expresses it in
 //! Rust, and [`super::conformance`] holds them to the same answer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -31,6 +31,8 @@ struct Inner {
     /// Messages stored as requests, released since or not, which the
     /// request ledger counts toward the sender's quota instead.
     requested: HashSet<MessageId>,
+    /// The address keys guests' requests were sent from.
+    addresses: HashMap<MessageId, String>,
 }
 
 impl Inner {
@@ -41,6 +43,7 @@ impl Inner {
         for marks in [&mut self.handed, &mut self.receipted, &mut self.requested] {
             marks.retain(|id| held.contains(id));
         }
+        self.addresses.retain(|id, _| held.contains(id));
     }
 }
 
@@ -300,6 +303,9 @@ impl MessageStore for MemoryStore {
         });
         if m.friendship == Some(SentOn::Request) {
             inner.requested.insert(id);
+        }
+        if let Some(a) = &m.sender_address {
+            inner.addresses.insert(id, a.clone());
         }
         Ok(Pushed::Stored(id))
     }
@@ -627,6 +633,51 @@ impl MessageStore for MemoryStore {
         Ok(n)
     }
 
+    fn requests_to_mail(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
+        since: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let mut n = 0;
+        for m in inner.msgs.iter_mut() {
+            if is_request(m)
+                && is(&m.recipient, to)
+                && m.sent_at >= since
+                && m.sender.as_ref().is_some_and(|s| is(s, from))
+                && inner.addresses.get(&m.id).is_some_and(|a| a == address)
+            {
+                m.friendship = None;
+                inner.addresses.remove(&m.id);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    fn delete_requests_from(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
+    ) -> Result<usize, StoreError> {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        let before = inner.msgs.len();
+        let addresses = &inner.addresses;
+        inner.msgs.retain(|m| {
+            !(is_request(m)
+                && is(&m.recipient, to)
+                && m.sender.as_ref().is_some_and(|s| is(s, from))
+                && addresses.get(&m.id).is_some_and(|a| a == address))
+        });
+        inner.forget_removed();
+        Ok(before - inner.msgs.len())
+    }
+
     fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let before = inner.msgs.len();
@@ -696,6 +747,7 @@ mod tests {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 usize::MAX,
             )

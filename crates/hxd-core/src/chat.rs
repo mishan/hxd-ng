@@ -2044,7 +2044,11 @@ impl Core {
                 },
             )
         };
-        self.deliver(sender, recipient, text, guid, media, signed)
+        let sent = self.deliver(sender, recipient, text, guid, media, signed);
+        if sent.is_ok() {
+            self.guest_written_back(from, to);
+        }
+        sent
     }
 
     /// A private message to an *account*, whether or not it holds a
@@ -2419,6 +2423,7 @@ impl Core {
                     media: media.as_ref().map(|m| m.to_meta()),
                     signed: signed.clone(),
                     friendship: None,
+                    sender_address: None,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -2578,6 +2583,19 @@ impl Core {
             }
         };
         self.flush_to(Target::Only(uid), &mailbox, None).len()
+    }
+
+    /// Hand every attached session of `mailbox` its waiting mail, as a
+    /// message by login is handed over.
+    pub(crate) fn flush_mailbox(&self, mailbox: &Mailbox) {
+        self.flush_to(
+            Target::Named {
+                uid: None,
+                sender: 0,
+            },
+            mailbox,
+            None,
+        );
     }
 
     /// [`Self::flush_to`] those of `uids` still attached, for a message
@@ -2805,7 +2823,12 @@ impl Core {
                     let from = sending
                         .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
                         .or_else(|| {
-                            let s = m.sender.as_ref()?;
+                            // The plain guests share one mailbox, which
+                            // names none of their sessions.
+                            let s = m
+                                .sender
+                                .as_ref()
+                                .filter(|s| s.fingerprint.is_some() || s.login != "guest")?;
                             sessions_of(&r, s).into_iter().find(|u| *u != uid)
                         })
                         .unwrap_or(0);
@@ -6442,6 +6465,23 @@ mod inbox_tests {
             since: SystemTime,
         ) -> Result<usize, StoreError> {
             self.inner.release_requests(to, from, on, since)
+        }
+        fn requests_to_mail(
+            &self,
+            to: &Mailbox,
+            from: &Mailbox,
+            address: &str,
+            since: SystemTime,
+        ) -> Result<usize, StoreError> {
+            self.inner.requests_to_mail(to, from, address, since)
+        }
+        fn delete_requests_from(
+            &self,
+            to: &Mailbox,
+            from: &Mailbox,
+            address: &str,
+        ) -> Result<usize, StoreError> {
+            self.inner.delete_requests_from(to, from, address)
         }
         fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
             self.inner.delete_requests(to, from)

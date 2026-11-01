@@ -222,13 +222,9 @@ that would approve (§4.3) past the replier's `MaxRosterSize` is refused
 The classic `/msg <login>` (`system-account.md` §3) is the same call,
 `Core::msg_login`, and follows the same rule, under the same holds and
 bounds. Its sender is a classic session, which need not understand
-requests, nor hold `AccessMessaging`, so a
-guest or an account without the bit makes a request as anyone does.
-Guests share one account, so a guest sender is bounded and held by its
-address rather than its account, at the per-sender values, so that
-reconnecting earns it nothing, and an approval of one is kept on that
-session for its life, as a ghost's block is (§3), so that it lets in
-no other guest. The recipient's answer, which approves the conversation
+requests, nor hold `AccessMessaging`, so an account without the bit
+makes a request as anyone does, and so does a guest (below). The
+recipient's answer, which approves the conversation
 (§4.3), reaches the sender as an ordinary private message, which a 1.5
 client shows, through the inbox's flush if it has gone
 (`private-messages.md` §6.3), as all of an approval's traffic does for
@@ -238,6 +234,39 @@ users off from messaging accounts they could write to before,
 and letting it bypass requests would let any classic session skip the
 holds and bounds. `/block` and `/unblock` are the relationship store's
 block (§3).
+
+**Guests**, on either wire, are no way around requests: a plain guest's
+(`guest` with no identity) message by login to an account taking part
+is a request where the account takes them, and refused `NotFriends`
+(ng `not_friends`) where it does not. Guests share one account, so a
+plain guest is bounded and held by its address, at the per-sender
+values, so that reconnecting earns it nothing. The plain guests are
+listed as one group, `guest`, which counts as one sender toward
+`max_requests` and holds at most two senders' worth of messages, twice
+`request_messages`; past it a guest's request is dropped, answered and
+counted as one stored (§4.4). Each waiting message keeps the key of
+the address it came from, and what follows is by that key, so guests
+behind one address, a NAT's or one IPv6 /64, are one guest to it. A guest that proved an identity has a
+fingerprint a block holds against, and its message by login goes as
+mail, as it always has (`private-messages.md` §9).
+
+No approval of a guest is written, since one would let in every guest
+to come. Approving `guest` lets in the live guest sessions that asked
+and whose address is not held, each for its life, as a ghost's block
+is kept (§3), and turns what each of them has waiting, by its address,
+into ordinary mail, handed to the approver's sessions at once; what
+a guest that has left sent waits on. Deleting holds every address that
+asked within `request_retention_days`. Clearing a span (§4.3) takes
+the guests by address rather than by their group's first message:
+what each address that asked within the span has waiting is deleted
+and the address held, and every other address's stays. Ending lets out
+the sessions let in, and holds their addresses. A reply by uid, from a session that understands
+requests, to a guest that asked approves that guest as writing back
+does (§4.3), and hands over what its address has waiting and no other
+address's.
+A message by login naming `guest` approves nothing. Under an approval a
+guest's messages reach a session of the recipient that is there, or
+are answered `no_such_user`, as a guest's always were.
 
 A `to_login` to an account without `AccessMessaging`, a `msg` to a uid
 on the roster, and a classic private message (108) to a user on the
@@ -289,7 +318,7 @@ deletes every message request received in a span of time, `since` to
 `before`, each optional, so that a recipient who has been flooded can
 clear the flood and keep what came before it, or clear everything. A
 message request is in the span by its first waiting message, so a
-flood's opener decides. Each sender is held, and told, as one decline
+flood's opener decides; the guests by address instead (§4.1). Each sender is held, and told, as one decline
 or delete would hold and tell it (§4.4). Approvals and friendships are
 untouched. It is one transaction of the store, answered with how many
 of each it cleared, and the recipient's sessions hear it once:
@@ -337,8 +366,9 @@ is written, and the message row, `requests_changed` and any lazy delete
   is the extension's reason for mutual removal. A hold is recorded
   against both keys of the mailbox it was placed on, Login and
   fingerprint, so that linking or unlinking an identity does not shed
-  it.
-- **Per recipient**: at most `max_requests` senders waiting. Past it a
+  it; a guest's against its address.
+- **Per recipient**: at most `max_requests` senders waiting, the plain
+  guests one among them (§4.1). Past it a
   new request is dropped, answered and counted the same, so that a
   burst of new accounts cannot flush out the requests the recipient
   already has. The listing says how many were dropped (§4.5).
@@ -384,9 +414,10 @@ its fingerprint where its link is shown (the identity draft) or one of
 its messages is signed, whose certificate names it anyway,
 and each message with its inbox id, so that a request can be reported as
 any message is (`moderation.md` §4.2); the report path reads a request
-row for its recipient alone, past the gate of §5. The listing also gives
-the approvals, and how many requests were dropped since the last
-listing. Listing makes a session one that understands requests
+row for its recipient alone, past the gate of §5. The plain guests are
+listed as one group, `guest` (§4.1). The listing also gives the
+approvals, `guest` among them while a guest session holds the caller's,
+and how many requests were dropped since the last listing. Listing makes a session one that understands requests
 (§4.1), to send approvals and `requests_changed` to (§4.6), and leaves
 whether its account takes them as it was, though for an account that
 takes them a listing's first page renews the opt-in as a 1 would: a client that shows
@@ -806,8 +837,9 @@ Each stage is a branch with tests, in the house style.
    store.
 
    **IM2b**, what IM2 leaves open: suspension on a revoked
-   `AccessMessaging` (§6); User Search (823); a guest's `/msg <login>`
-   request, by its address; unlinking telling the friends `Removed`;
+   `AccessMessaging` (§6); User Search (823); an identity guest's
+   message by login as a request of its own; unlinking telling the
+   friends `Removed`;
    `max_offline` on held rows; `max_sessions_per_login` eviction; a request
    answered once its ledger row is written, the rest off its path;
    clearing in bulk as one transaction; a merge's re-stamp of
@@ -881,8 +913,8 @@ per account rather than two to keep in step. They follow IM4.
 
 **Settings**: a `[messaging]` section with the extension's settings
 (`enabled`, off by default; `max_roster`; `max_message_bytes`, at most
-what one classic field carries beside the queued stamp, and with `request_messages`
-no more than one page of Get Message Requests holds for one sender;
+what one classic field carries beside the queued stamp, and with twice `request_messages`,
+what the guests' group holds, no more than one page of Get Message Requests holds;
 `offline_retention_days`; `max_offline`, aligned with `[inbox]`;
 `max_sessions_per_login`, default 0, unlimited) and the requests'
 (`request_messages`, `requests_per_day`, `max_requests`,
@@ -925,8 +957,9 @@ hxd-ng's own policy and is not.
 - **Account addressing** (§4.1): once messaging is on, an ng `to_login`
   or a classic `/msg <login>` to a non-friend holding `AccessMessaging`
   makes a request or is refused, where it used to go to the inbox from
-  anyone not blocked; a classic one makes a request from a guest or an
-  account without the bit too.
+  anyone not blocked; a classic one makes a request from an account
+  without the bit too, and a plain guest's on either wire makes one or
+  is refused.
 - **Sessions.** The extension says a server that bounds a Login's
   sessions evicts the oldest rather than refusing the login. `[limits]`
   refuses: past `connections_per_account`, and for logins faster than

@@ -228,6 +228,9 @@ pub struct NewMessage {
     /// that it is a message request (`docs/instant-messaging.md` §5);
     /// `None` for a private message.
     pub friendship: Option<crate::relationships::SentOn>,
+    /// A guest's request: the key of the address it came from, which an
+    /// approval of that guest releases its rows by (§4.1).
+    pub sender_address: Option<String>,
 }
 
 /// A message as the store holds it.
@@ -560,6 +563,27 @@ pub trait MessageStore: Send + Sync + 'static {
         from: &Mailbox,
         on: RelationId,
         since: SystemTime,
+    ) -> Result<usize, StoreError>;
+
+    /// `from`'s requests to `to` sent since `since` from the address
+    /// `address` are now mail, on no friendship or approval, still not
+    /// counted as sent: what an approval of a guest, which writes no
+    /// approval, makes of them. Returns how many.
+    fn requests_to_mail(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
+        since: SystemTime,
+    ) -> Result<usize, StoreError>;
+
+    /// Delete `from`'s requests to `to` sent from the address `address`.
+    /// Returns how many went.
+    fn delete_requests_from(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
     ) -> Result<usize, StoreError>;
 
     /// Delete `from`'s requests to `to`. Returns how many went.

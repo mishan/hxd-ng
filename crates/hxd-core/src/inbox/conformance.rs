@@ -70,6 +70,8 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     a_receipt_waits_behind_the_gate(&new_store());
     requests_are_listed_released_and_deleted_by_sender(&new_store());
     a_request_released_onto_a_relation_is_not_counted_as_sent(&new_store());
+    requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(&*new_store().inbox);
+    a_guests_requests_are_deleted_by_address(&*new_store().inbox);
 }
 
 /// A store under test, and the relationship store its gate reads: for
@@ -116,6 +118,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         media: None,
         signed: None,
         friendship: None,
+        sender_address: None,
     }
 }
 
@@ -162,6 +165,7 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
                 content: [4; 32],
             }),
             friendship: None,
+            sender_address: None,
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -294,6 +298,85 @@ fn a_request_released_onto_a_relation_is_not_counted_as_sent(g: &Gated) {
             bytes: 6,
         },
         "{case}: what was sent on the approval alone"
+    );
+}
+
+fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &dyn MessageStore) {
+    let case = "requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent";
+    let (dave, guest, alice) = (
+        Mailbox::login("dave"),
+        Mailbox::login("guest"),
+        Mailbox::login("alice"),
+    );
+    for (from, address, body, t) in [
+        (&guest, Some("k1"), "lapsed", 0),
+        (&guest, Some("k1"), "g1", 1),
+        (&alice, None, "a1", 2),
+        (&guest, Some("k2"), "another guest", 3),
+        (&guest, Some("k1"), "g2", 4),
+    ] {
+        push(
+            s,
+            &NewMessage {
+                friendship: Some(SentOn::Request),
+                sender_address: address.map(str::to_owned),
+                ..msg(&dave, from, body, at(t))
+            },
+        );
+    }
+    assert_eq!(
+        s.requests_to_mail(&dave, &guest, "k1", at(1)).unwrap(),
+        2,
+        "{case}"
+    );
+    assert_eq!(
+        bodies(&s.requests(&dave, at(0), 10).unwrap()),
+        ["lapsed", "a1", "another guest"],
+        "{case}: the rest still requests, another guest's among them"
+    );
+    assert_eq!(
+        bodies(&s.pending(&dave, 10).unwrap()),
+        ["g1", "g2"],
+        "{case}: through the gate as mail"
+    );
+    assert_eq!(
+        s.sent_since(&guest, at(0)).unwrap(),
+        Sent::default(),
+        "{case}: the ledger counted them"
+    );
+}
+
+fn a_guests_requests_are_deleted_by_address(s: &dyn MessageStore) {
+    let case = "a_guests_requests_are_deleted_by_address";
+    let (dave, guest, alice) = (
+        Mailbox::login("dave"),
+        Mailbox::login("guest"),
+        Mailbox::login("alice"),
+    );
+    for (from, address, body) in [
+        (&guest, Some("k1"), "g1"),
+        (&guest, Some("k2"), "another guest"),
+        (&alice, None, "a1"),
+        (&guest, Some("k1"), "g2"),
+    ] {
+        push(
+            s,
+            &NewMessage {
+                friendship: Some(SentOn::Request),
+                sender_address: address.map(str::to_owned),
+                ..msg(&dave, from, body, at(1))
+            },
+        );
+    }
+    assert_eq!(
+        s.delete_requests_from(&dave, &guest, "k1").unwrap(),
+        2,
+        "{case}"
+    );
+    assert_eq!(
+        bodies(&s.requests(&dave, at(0), 10).unwrap()),
+        ["another guest", "a1"],
+        "{case}: another address's and an account's stay"
     );
 }
 

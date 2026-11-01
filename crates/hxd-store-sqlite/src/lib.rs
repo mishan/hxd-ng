@@ -75,7 +75,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -904,6 +904,12 @@ ALTER TABLE message ADD COLUMN requested INTEGER NOT NULL DEFAULT 0;
 UPDATE message SET requested = 1 WHERE friendship = 0;
 ";
 
+/// The address key a guest's request came from, so an approval of one
+/// guest releases its rows and no other address's.
+const SCHEMA_V32: &str = "
+ALTER TABLE message ADD COLUMN sender_address TEXT;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1642,6 +1648,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 31 {
         steps.push_str(SCHEMA_V31);
     }
+    if version < 32 {
+        steps.push_str(SCHEMA_V32);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1997,9 +2006,9 @@ impl MessageStore for SqliteStore {
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
                 media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
-                friendship, requested)
+                friendship, requested, sender_address)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?18 IS 0)",
+                     ?18, ?18 IS 0, ?19)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -2025,6 +2034,7 @@ impl MessageStore for SqliteStore {
                 m.signed.as_ref().map(|x| &x.form),
                 m.signed.as_ref().map(|x| &x.content[..]),
                 m.friendship.map(SentOn::as_i64),
+                m.sender_address,
             ],
         )
         .map_err(StoreError::new)?;
@@ -2428,6 +2438,40 @@ impl MessageStore for SqliteStore {
             ],
         )
         .map_err(StoreError::new)
+    }
+
+    fn requests_to_mail(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
+        since: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "UPDATE message SET friendship = NULL, sender_address = NULL
+              WHERE {} AND {} AND friendship = 0 AND sender_address = ?3 AND sent_at >= ?4",
+            mailbox_sql(to, "recipient", 1),
+            mailbox_sql(from, "sender", 2)
+        );
+        conn.execute(&sql, params![bind(to), bind(from), address, unix(since)])
+            .map_err(StoreError::new)
+    }
+
+    fn delete_requests_from(
+        &self,
+        to: &Mailbox,
+        from: &Mailbox,
+        address: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "DELETE FROM message WHERE {} AND {} AND friendship = 0 AND sender_address = ?3",
+            mailbox_sql(to, "recipient", 1),
+            mailbox_sql(from, "sender", 2)
+        );
+        conn.execute(&sql, params![bind(to), bind(from), address])
+            .map_err(StoreError::new)
     }
 
     fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
@@ -4394,6 +4438,7 @@ mod tests {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 100,
             )
@@ -4527,6 +4572,7 @@ mod tests {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 100,
             )
@@ -4575,6 +4621,7 @@ mod tests {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 100,
             )
@@ -4601,6 +4648,7 @@ mod tests {
             media: None,
             signed: None,
             friendship: None,
+            sender_address: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored(_)));
         m.body = "twice".into();
@@ -4632,6 +4680,7 @@ mod tests {
             media: None,
             signed: None,
             friendship: None,
+            sender_address: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -4691,6 +4740,7 @@ mod tests {
                     media: None,
                     signed: None,
                     friendship: None,
+                    sender_address: None,
                 },
                 100,
             )

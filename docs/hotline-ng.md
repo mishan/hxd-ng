@@ -976,7 +976,10 @@ before.
   `id` the inbox id a `report` names it by (moderation.md §4.2) and
   `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
   `dropped` is how many requests were dropped since the last listing,
-  and `takes_requests` whether this account takes them now.
+  and `takes_requests` whether this account takes them now. The plain
+  guests are one group, `{ login: "guest" }` (instant-messaging.md
+  §4.1), among the `approvals` while a guest session holds the
+  caller's.
   `cursor`, an opaque string where present, is passed back to read
   the rest; a client
   MUST read on while it is present. *hxd-ng* bounds what can wait
@@ -986,7 +989,9 @@ before.
   waiting messages then arrive as `im` events with `approval`;
   deletes its request, telling the sender nothing; or ends an
   approval. Deleting and ending hold the sender (instant-messaging.md
-  §4.4).
+  §4.4). `guest` names the plain guests: approving lets in the guest
+  sessions that asked, for their lives, and what they have waiting
+  arrives as `msg` events, as mail.
 - **`requests_clear`** declines every friend request and deletes every
   message request received from `since` up to `before`, each bound
   optional, and answers how many of each (instant-messaging.md §4.3).

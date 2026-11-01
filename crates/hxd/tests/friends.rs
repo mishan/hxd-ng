@@ -704,3 +704,19 @@ async fn a_span_past_what_a_clock_holds_is_refused() {
     }
     ok(&mut dave, "ping", json!({})).await;
 }
+
+#[tokio::test]
+async fn a_guests_msg_by_login_is_refused_by_an_account_taking_no_requests() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), true).await;
+    let (_dave, _) = messenger(&s, "dave").await;
+    let mut guest = Client::connect(s.ng).await.unwrap();
+    guest.login(json!({ "nick": "visitor" })).await.unwrap();
+    let code = refused(
+        &mut guest,
+        "msg",
+        json!({ "to_login": "dave", "text": "hello?" }),
+    )
+    .await;
+    assert_eq!(code, "not_friends");
+}

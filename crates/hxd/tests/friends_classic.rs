@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use hxd_core::inbox::Mailbox;
 use hxd_core::relationships::{AccountUpdate, RelationshipStore};
-use hxd_core::{Core, FloodLimits, InboxPolicy, MessagingPolicy, Room, RoomStore};
+use hxd_core::{Core, FloodLimits, InboxPolicy, MessagingPolicy, Room, RoomStore, SystemPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::frame::MAX_FRAME_DATA;
 use hxd_session::{cap, Caps, ServerConfig, ServerCtx};
@@ -74,11 +74,17 @@ async fn start(dir: &Path, messaging: bool) -> Server {
 /// and `vip` cannot be kicked; `admin` and `guest` hold the bit, which
 /// never lets them take part.
 async fn start_with(dir: &Path, policy: MessagingPolicy) -> Server {
-    start_held(dir, policy, FloodLimits::default()).await
+    start_held(dir, policy, FloodLimits::default(), false).await
 }
 
-/// [`start_with`], each session held to `flood`.
-async fn start_held(dir: &Path, policy: MessagingPolicy, flood: FloodLimits) -> Server {
+/// [`start_with`], each session held to `flood`, with the system
+/// account where `system`.
+async fn start_held(
+    dir: &Path,
+    policy: MessagingPolicy,
+    flood: FloodLimits,
+    system: bool,
+) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let senders = (0..7).map(|n| (format!("s{n}"), MESSAGES.to_string()));
@@ -117,7 +123,11 @@ async fn start_held(dir: &Path, policy: MessagingPolicy, flood: FloodLimits) -> 
     let config: hxd::Config = toml::from_str(&format!("[rooms]\nfile = {rooms_file:?}\n")).unwrap();
     let auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
-    let core = Core::new()
+    let mut core = Core::new();
+    if system {
+        core = core.with_system(SystemPolicy::default());
+    }
+    let core = core
         .with_flood_limits(flood)
         .with_inbox(store.clone(), auth.clone(), InboxPolicy::default())
         .with_relationships(store.clone())
@@ -126,6 +136,9 @@ async fn start_held(dir: &Path, policy: MessagingPolicy, flood: FloodLimits) -> 
             ..policy
         });
     let core = Arc::new(hxd::rooms::with_rooms(core, &config).unwrap());
+    if system {
+        core.start_system_session().unwrap();
+    }
     tokio::spawn(hxd::presence_flusher(core.clone()));
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -1406,6 +1419,7 @@ async fn a_messenger_kicked_for_flooding_is_not_announced() {
             spam_per: Duration::from_secs(5),
             ..FloodLimits::default()
         },
+        false,
     )
     .await;
     let mut erin = legacy::Client::login_at(s.classic, &Login::account("erin", "erin", "pw"))
@@ -1436,4 +1450,86 @@ async fn a_messenger_kicked_for_flooding_is_not_announced() {
         .take_backlog()
         .iter()
         .any(|f| f.ty == push::CHAT && heard(f, b"spam_max")));
+}
+
+/// What the system account answers `command` with.
+async fn command(c: &mut legacy::Client, server: hxd_core::Uid, command: &str) -> String {
+    let chunks = [
+        (tag::UID, u32::from(server).to_be_bytes().to_vec()),
+        (tag::BODY, command.as_bytes().to_vec()),
+    ];
+    let trans = c.send(ClientHdr::Msg.as_u32(), &chunks).await.unwrap();
+    c.reply(trans).await.unwrap();
+    let answer = c
+        .recv_where(|f| f.ty == ServerHdr::Msg.as_u32())
+        .await
+        .unwrap();
+    String::from_utf8(answer.bytes(tag::BODY).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_classic_guests_msg_to_a_messaging_account_is_a_request_it_is_answered_after_approval() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_held(
+        td.path(),
+        MessagingPolicy {
+            enabled: true,
+            ..MessagingPolicy::default()
+        },
+        FloodLimits::default(),
+        true,
+    )
+    .await;
+    let server = s.core.system_uid().unwrap();
+    let mut dave = messenger(&s, "dave").await;
+    let mut guest = legacy::Client::login_at(s.classic, &Login::guest("visitor"))
+        .await
+        .unwrap();
+    assert_eq!(
+        command(&mut guest, server, "/msg dave hello?").await,
+        "error: that account takes no messages from you",
+        "a guest is no way around requests"
+    );
+    ok(
+        &mut dave,
+        ClientHdr::SetPresence,
+        presence(PresenceState::Online, None, Some(true)),
+    )
+    .await;
+    assert_eq!(
+        command(&mut guest, server, "/msg dave hello?").await,
+        "ok: queued"
+    );
+
+    let listed = ok(
+        &mut dave,
+        ClientHdr::GetMessageRequests,
+        im::get_message_requests(None),
+    )
+    .await;
+    let l = parse_message_requests(listed.wire(), listed.wire().len()).unwrap();
+    let groups: Vec<_> = l.groups().collect();
+    assert_eq!(groups.len(), 1);
+    assert_eq!((groups[0].login, groups[0].identity), (&b"guest"[..], None));
+    let bodies: Vec<_> = groups[0].messages().map(|m| m.body).collect();
+    assert_eq!(bodies, [&b"hello?"[..]]);
+
+    ok(
+        &mut dave,
+        ClientHdr::AnswerMessageRequest,
+        im::answer_message_request(b"guest", RequestAction::Approve),
+    )
+    .await;
+    // What waited arrives at once, with the queued stamp before it.
+    let said = |text: &'static [u8]| {
+        move |f: &Frame| {
+            f.ty == ServerHdr::Msg.as_u32() && f.bytes(tag::BODY).is_some_and(|b| b.ends_with(text))
+        }
+    };
+    dave.recv_where(said(b"hello?")).await.unwrap();
+    assert_eq!(
+        command(&mut guest, server, "/msg dave thanks").await,
+        "ok: sent"
+    );
+    dave.recv_where(said(b"thanks")).await.unwrap();
 }
