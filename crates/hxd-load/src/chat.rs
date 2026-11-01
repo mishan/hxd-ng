@@ -98,8 +98,8 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
 /// The same, the first line due at `start` on the run's clock, and with
 /// `split`, the lines due before and from that moment timed apart as
 /// `chat.delivery.before` and `chat.delivery.after`. With `control`, a
-/// server, the lines from the split on that another server delivers to
-/// its own members are timed apart from `.after`, as
+/// server, the lines another server delivers to its own members are
+/// left out of both, and from the split on timed as
 /// `chat.delivery.control`.
 pub async fn speak_at(
     ctx: &Arc<Ctx>,

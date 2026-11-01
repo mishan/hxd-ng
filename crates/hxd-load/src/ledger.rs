@@ -60,9 +60,10 @@ pub struct Heard {
     pub before: Histogram<u64>,
     pub after: Histogram<u64>,
     /// Whether each sender's lines reach this reader without passing
-    /// `[target]`, the server the split concerns, and those lines'
-    /// delivery from the split on apart from `after`: what the machine
-    /// alone cost then.
+    /// `[target]`, the server the split concerns: those lines are left
+    /// out of `before` and `after`, so the two time the same paths, and
+    /// from the split on timed as `control`, what the machine alone cost
+    /// then.
     pub apart: Vec<bool>,
     pub control: Histogram<u64>,
 }
@@ -100,10 +101,12 @@ impl Heard {
             stats::sample(&mut self.cross, late);
         }
         match self.split {
-            Some(at) if due < at => stats::sample(&mut self.before, late),
-            Some(_) if self.apart.get(sender) == Some(&true) => {
-                stats::sample(&mut self.control, late)
+            Some(at) if self.apart.get(sender) == Some(&true) => {
+                if due >= at {
+                    stats::sample(&mut self.control, late)
+                }
             }
+            Some(at) if due < at => stats::sample(&mut self.before, late),
             Some(_) => stats::sample(&mut self.after, late),
             None => {}
         }
