@@ -47,7 +47,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | | Period client | Extended client (GtkHx) | ng client (hx-ng) |
 |---|---|---|---|
 | Public chat, user list, private messages | yes | yes | yes |
-| Private chats — invite-only, made on the spot | yes | yes | — |
+| Private chats — made on the spot | yes | yes | — |
 | Kick, ban, broadcast, server notices | yes | yes | kick and ban; receives broadcasts and notices |
 | **Chat rooms** — curated and persistent, open to everyone or to a list | by `/join` to the server account, which invites them in | the same | yes, on the wire; hx-ng does not show them yet |
 | **Moderation** — reports, redacting a chat line, revoking an image, purging someone's last hour | reports by `/report` to the server account; moderators get reports as messages | the same | yes |
@@ -121,7 +121,7 @@ maintainer:
 | Client | Platforms | Wire | Notes |
 |---|---|---|---|
 | [GtkHx](https://github.com/mishan/gtkhx) | Linux, macOS, Windows | classic, with extensions | Voice and video, inline images, chat history, UTF-8, TLS, large files. The reference for the extended tier above |
-| [hx-ng](https://github.com/mishan/hx-ng) | any browser, including phones | ng; classic through a relay | Chat, user list, private messages, news, files, identity, voice and video. Static files; put it in front of your server |
+| [hx-ng](https://github.com/mishan/hx-ng) | any browser, including phones | ng; classic through a relay | Chat, user list, private messages, news and files; identity, voice and video on an ng server. Static files; put it in front of your server |
 | [Hotline Navigator](https://hotlinenavigator.com/) | macOS, Windows, Linux, iOS, Android | classic | A modern cross-platform client with TLS and inline previews; [source](https://github.com/fuzzywalrus/Hotline-Navigator) |
 | [Hotline](https://github.com/mierau/hotline) by Dustin Mierau | macOS, iOS, iPadOS | classic | A remake by the original author |
 | [Hermes](https://github.com/fogWraith/Hotline) by fogWraith | — | classic, with extensions | Alpha, alongside the Janus server and the extension specs |
