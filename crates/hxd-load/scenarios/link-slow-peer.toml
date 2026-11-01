@@ -3,7 +3,8 @@
 # stops reading what a sends it. a must drop b as a slow consumer within
 # `drop_within`, hold its queues under `max_queued_bytes` meanwhile, and
 # cost the room nothing: its p99 from the stall on within `contained`
-# times its p99 before.
+# times its p99 before, or the p99 of c's lines to c's members then if
+# higher.
 #
 #   baseline/link-run.sh link-slow-peer scenarios/link-slow-peer.toml
 

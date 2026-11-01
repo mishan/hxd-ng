@@ -90,18 +90,23 @@ pub async fn speak(ctx: &Arc<Ctx>, room: Room) -> (Vec<Member>, Vec<u64>) {
         room,
         ctx.t0.elapsed() + Duration::from_millis(100),
         None,
+        None,
     )
     .await
 }
 
 /// The same, the first line due at `start` on the run's clock, and with
 /// `split`, the lines due before and from that moment timed apart as
-/// `chat.delivery.before` and `chat.delivery.after`.
+/// `chat.delivery.before` and `chat.delivery.after`. With `control`, a
+/// server, the lines another server delivers to its own members are
+/// left out of both, and from the split on timed as
+/// `chat.delivery.control`.
 pub async fn speak_at(
     ctx: &Arc<Ctx>,
     room: Room,
     start: Duration,
     split: Option<Duration>,
+    control: Option<usize>,
 ) -> (Vec<Member>, Vec<u64>) {
     let c = &ctx.scenario.chat;
     let (done_tx, done_rx) = watch::channel(None::<Arc<Vec<u64>>>);
@@ -117,6 +122,10 @@ pub async fn speak_at(
             .map(|&s| s != room.on[k])
             .collect();
         heard.split = split;
+        heard.apart = room.on[..room.talkers]
+            .iter()
+            .map(|&s| control.is_some_and(|around| s != around && s == room.on[k]))
+            .collect();
         readers.push(tokio::spawn(read(
             ctx.clone(),
             rx,
@@ -170,6 +179,9 @@ pub async fn speak_at(
         if split.is_some() {
             ctx.stats.merge("chat.delivery.before", &heard.before);
             ctx.stats.merge("chat.delivery.after", &heard.after);
+        }
+        if control.is_some() {
+            ctx.stats.merge("chat.delivery.control", &heard.control);
         }
         if k < room.talkers {
             ctx.stats.merge("chat.echo", &heard.echo);
@@ -272,22 +284,35 @@ pub async fn leave(ctx: &Ctx, members: Vec<Member>) {
 const CONTAINED_FLOOR_MS: f64 = 10.0;
 
 /// The room's p99 delivery from the split `speak_at` was given on, held
-/// to `factor` times its p99 before (`link.contained`): what happened
-/// then, `what`, must cost the room nothing.
+/// to `factor` times its p99 before or, if higher, the control's p99
+/// over the same time (`link.contained`): what happened then, `what`,
+/// must cost the room nothing. The control is lines that never pass the
+/// server `speak_at` measured around, `[target]`, so a machine that
+/// slowed down then slows them alike and is not counted against `what`.
+/// By the same token, a cost the whole host pays, CPU the control's
+/// server shares, is not told apart from a slow host. A control that
+/// heard nothing, with no talker off `[target]`, leaves the room held to
+/// its p99 before alone, and the message says how many lines it had.
 pub fn contained(ctx: &Ctx, factor: f64, what: &str) {
     let ops = ctx.stats.summary();
+    let lines = ops.get("chat.delivery.control");
+    let control = lines.filter(|l| l.count > 0).map_or(0.0, |l| l.p99_ms);
+    let of_control = lines.map_or(String::new(), |l| {
+        format!(" (the control's {control:.2}ms over {} lines)", l.count)
+    });
     match (
         ops.get("chat.delivery.before"),
         ops.get("chat.delivery.after"),
     ) {
         (Some(calm), Some(after)) if calm.count > 0 && after.count > 0 => {
-            let allowed = calm.p99_ms * factor + CONTAINED_FLOOR_MS;
+            let allowed = calm.p99_ms.max(control) * factor + CONTAINED_FLOOR_MS;
             ctx.checks
                 .check("link.contained", after.p99_ms <= allowed, || {
                     format!(
-                    "the room's p99 went from {:.2}ms to {:.2}ms once {what}, past {allowed:.2}ms",
-                    calm.p99_ms, after.p99_ms
-                )
+                        "the room's p99 went from {:.2}ms to {:.2}ms once {what}{of_control}, \
+                         past {allowed:.2}ms",
+                        calm.p99_ms, after.p99_ms
+                    )
                 });
         }
         _ => ctx.checks.violated(

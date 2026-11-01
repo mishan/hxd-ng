@@ -76,7 +76,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let acts_at = start + Duration::from_secs_f64(m.acts_after);
     let end = start + ctx.duration();
     let ((mut members, sent), (moderator, acts)) = tokio::join!(
-        chat::speak_at(ctx, room, start, Some(acts_at)),
+        chat::speak_at(ctx, room, start, Some(acts_at), None),
         act(ctx, moderator, &victims, &uids, acts_at, end),
     );
     carried(ctx, &seen, &acts).await;
