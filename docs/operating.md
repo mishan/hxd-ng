@@ -574,9 +574,12 @@ An account has an inbox if it has a password or a linked identity — either is
 proof of one person, where a bare `guest` login is shared. `[extra] inbox` in
 the account file overrides it either way.
 
-A guest can send to whoever is on the roster and cannot queue anything: it
-has no account, so nothing can be blocked, and a sender that cannot be
-blocked must not be able to fill a mailbox. `block`/`unblock` keep an account
+A plain guest can send to whoever is on the roster and cannot queue
+anything: it has no account, so nothing can be blocked, and a sender that
+cannot be blocked must not be able to fill a mailbox. A guest that proved
+an identity can be blocked by its fingerprint; once approved, its messages
+to an account taking part in messaging reach a session that is there, or
+queue where `[messaging] queue_identity_guests = true`. `block`/`unblock` keep an account
 addressable without making it reachable by everyone.
 
 **The database holds every private message on the server in the clear.** It
