@@ -152,7 +152,7 @@ impl Core {
     ) -> Option<Result<MsgOutcome, ChatError>> {
         // The guests are answered by `request_answer`, never by writing
         // back: an approval of `guest` would let every guest in.
-        if !self.messaging_enabled() || to == "guest" {
+        if !self.messaging_enabled() || to.eq_ignore_ascii_case("guest") {
             return None;
         }
         let (them, takes_part) = match self.messaging_account(to) {
@@ -675,7 +675,7 @@ impl Core {
         action: RequestAction,
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
-        if login == "guest" {
+        if login.eq_ignore_ascii_case("guest") {
             return self.answer_guests(&me.mailbox, action);
         }
         let them = self

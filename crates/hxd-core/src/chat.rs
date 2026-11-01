@@ -2823,7 +2823,12 @@ impl Core {
                     let from = sending
                         .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
                         .or_else(|| {
-                            let s = m.sender.as_ref()?;
+                            // The plain guests share one mailbox, which
+                            // names none of their sessions.
+                            let s = m
+                                .sender
+                                .as_ref()
+                                .filter(|s| s.fingerprint.is_some() || s.login != "guest")?;
                             sessions_of(&r, s).into_iter().find(|u| *u != uid)
                         })
                         .unwrap_or(0);

@@ -17,7 +17,8 @@ impl AccountDirectory for Directory {
     fn inbox_account(&self, login: &str) -> Option<Mailbox> {
         self.0
             .iter()
-            .find(|(m, _)| m.login == login)
+            // As the accounts directory resolves one, whatever its case.
+            .find(|(m, _)| m.login.eq_ignore_ascii_case(login))
             .map(|(m, _)| m.clone())
     }
 
@@ -2852,19 +2853,65 @@ fn writing_back_by_uid_approves_the_guest_that_asked() {
 }
 
 #[test]
-fn a_send_to_the_guest_login_never_approves() {
+fn naming_guest_in_any_case_never_writes_an_approval() {
     use crate::MsgOutcome;
-    let s = server_with(
-        policy(),
-        &[("bob", messaging_bits()), ("guest", messaging_bits())],
-    );
-    let (b, _rb) = taker(&s.core, "bob");
-    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
-    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
-    let _ = send(&s.core, b, "guest", "who is this?");
-    let listed = s.core.requests_list(b).unwrap();
-    assert!(listed.approvals.is_empty());
-    assert_eq!(waiting(&s.core, b), guests(&["hi"]));
+    type Act = fn(&Core, Uid, &str);
+    let acts: [(&str, Act); 2] = [
+        ("a send to it", |core, b, guest| {
+            let _ = send(core, b, guest, "who is this?");
+        }),
+        ("an approval of it", |core, b, guest| {
+            core.request_answer(b, guest, RequestAction::Approve)
+                .unwrap();
+        }),
+    ];
+    for (what, act) in acts {
+        for guest in ["guest", "Guest", "GUEST"] {
+            let s = server_with(
+                policy(),
+                &[("bob", messaging_bits()), ("guest", messaging_bits())],
+            );
+            let (b, _rb) = taker(&s.core, "bob");
+            let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+            assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+            act(&s.core, b, guest);
+            let row = s
+                .rel
+                .relationship(
+                    &Mailbox::login("bob"),
+                    &Mailbox::login("guest"),
+                    s.core.clock.wall(),
+                )
+                .unwrap();
+            assert!(
+                row.is_none_or(|r| r.approval.is_none()),
+                "{what}, as {guest}"
+            );
+        }
+    }
+}
+
+#[test]
+fn what_an_approval_hands_over_from_a_guest_names_no_session() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, mut rb) = taker(&s.core, "bob");
+    let (other, _ro) = guest_at(&s.core, "10.0.1.2");
+    let (asked, _ra) = guest_at(&s.core, "10.0.1.1");
+    assert!(other < asked);
+    assert_eq!(send(&s.core, asked, "bob", "hi"), Ok(MsgOutcome::Requested));
+    drain(&mut rb);
+    s.core
+        .request_answer(b, "guest", RequestAction::Approve)
+        .unwrap();
+    let from: Vec<Uid> = drain(&mut rb)
+        .iter()
+        .filter_map(|e| match e {
+            Event::Msg { from, .. } => Some(*from),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(from, [0], "the guests' shared mailbox is nobody's uid");
 }
 
 #[test]
