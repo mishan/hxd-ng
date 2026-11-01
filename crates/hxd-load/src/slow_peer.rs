@@ -5,8 +5,10 @@
 //! §8.3).
 //!
 //! The room is held to everything public chat is, and its delivery from
-//! the stall on to no worse than `contained` times its p99 before
-//! (`link.contained`): the slow peer must cost everyone else nothing.
+//! the stall on to no worse than `contained` times its p99 before, or
+//! the control's over the same time, the lines a server other than
+//! `[target]` delivers to its own members (`link.contained`): the slow
+//! peer must cost everyone else nothing.
 //! With metrics, `[target]` must drop the stalled link as a slow consumer
 //! within `drop_within` (`link.peer_dropped`), its writers' queues must
 //! stay under `max_queued_bytes` meanwhile (`link.bounded`), and every
@@ -58,8 +60,10 @@ pub async fn run(
         proxy.unstall();
         seen
     };
-    let ((mut members, sent), seen) =
-        tokio::join!(chat::speak_at(ctx, room, start, Some(stall_at)), watch);
+    let ((mut members, sent), seen) = tokio::join!(
+        chat::speak_at(ctx, room, start, Some(stall_at), Some(0)),
+        watch
+    );
     let links_back = crate::interruption::links_back(
         ctx,
         before,
@@ -99,6 +103,7 @@ pub async fn run(
     chat::leave(ctx, members).await;
     Ok(json!({
         "lines_sent": sent,
+        "control_lines": ctx.stats.count("chat.delivery.control"),
         "dropped_after_s": seen.as_ref().and_then(|s| s.dropped_after).map(|d| d.as_secs_f64()),
         "peak_queued_bytes": seen.as_ref().map(|s| s.peak_queued),
         "peak_resident_bytes": seen.as_ref().map(|s| s.peak_resident),

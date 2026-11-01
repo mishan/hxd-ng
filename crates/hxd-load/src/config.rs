@@ -594,8 +594,8 @@ pub struct SlowPeer {
     /// talking ends.
     pub stall_after: f64,
     /// How much worse the room's p99 delivery may get once the stall
-    /// begins, as a factor of its p99 before: past it, a slow peer cost
-    /// everyone else.
+    /// begins, as a factor of its p99 before or of the control's then,
+    /// whichever is higher: past it, a slow peer cost everyone else.
     pub contained: f64,
     /// Seconds from the stall by which, with metrics, `[target]` must
     /// have dropped the stalled link as a slow consumer.

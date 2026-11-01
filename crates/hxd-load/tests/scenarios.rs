@@ -488,6 +488,7 @@ async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
     done.store(true, std::sync::atomic::Ordering::Relaxed);
     assert_clean(&report);
     assert!(report.checks["link.contained"].held == 1);
+    assert!(report.ops["chat.delivery.control"].count > 0);
     assert!(watched.await.unwrap(), "a never dropped b");
 }
 
