@@ -757,14 +757,16 @@ impl Core {
                     {
                         continue;
                     }
+                    // Let in once what it sent is mail, so a failure leaves
+                    // it asking, to be approved again.
+                    inbox
+                        .requests_to_mail(me, &group, &key, self.requests_since())
+                        .map_err(store_failed)?;
                     if let Some(s) = self.roster.lock().unwrap().users.get_mut(&uid) {
                         if plain(s) {
                             s.guest.approved.insert(Key::of(me));
                         }
                     }
-                    inbox
-                        .requests_to_mail(me, &group, &key, self.requests_since())
-                        .map_err(store_failed)?;
                 }
                 self.requests_changed(me);
                 self.flush_mailbox(me);
@@ -828,8 +830,20 @@ impl Core {
         if !self.messaging_enabled() {
             return;
         }
+        let Some(inbox) = self.inbox.as_ref() else {
+            return;
+        };
+        let _writing = self.friend_writes();
+        let asking = |r: &crate::roster::RosterInner, me: &Mailbox| {
+            r.users.get(&to).is_some_and(|s| {
+                s.login == "guest"
+                    && s.identity.is_none()
+                    && s.guest.asked.contains(&Key::of(me))
+                    && !s.guest.approved.contains(&Key::of(me))
+            })
+        };
         let me = {
-            let mut r = self.roster.lock().unwrap();
+            let r = self.roster.lock().unwrap();
             let Some(me) = r
                 .users
                 .get(&from)
@@ -838,27 +852,39 @@ impl Core {
             else {
                 return;
             };
-            let Some(guest) = r.users.get_mut(&to).filter(|s| {
-                s.login == "guest" && s.identity.is_none() && s.guest.asked.contains(&Key::of(&me))
-            }) else {
-                return;
-            };
-            if !guest.guest.approved.insert(Key::of(&me)) {
+            if !asking(&r, &me) {
                 return;
             }
             me
         };
-        let (Some(inbox), Some(key)) = (self.inbox.as_ref(), self.address_key(to)) else {
+        let Some(key) = self.address_key(to) else {
             return;
         };
-        let _writing = self.friend_writes();
-        match inbox.requests_to_mail(&me, &Mailbox::login("guest"), &key, self.requests_since()) {
-            Ok(0) => {}
-            Ok(_) => {
-                self.requests_changed(&me);
-                self.flush_mailbox(&me);
+        // Let in once what it sent is mail, so a failure leaves it asking
+        // and the next reply tries again.
+        let handed = match inbox.requests_to_mail(
+            &me,
+            &Mailbox::login("guest"),
+            &key,
+            self.requests_since(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("inbox: handing over what a guest asked: {e}");
+                return;
             }
-            Err(e) => tracing::warn!("inbox: handing over what a guest asked: {e}"),
+        };
+        {
+            let mut r = self.roster.lock().unwrap();
+            if asking(&r, &me) {
+                if let Some(s) = r.users.get_mut(&to) {
+                    s.guest.approved.insert(Key::of(&me));
+                }
+            }
+        }
+        if handed > 0 {
+            self.requests_changed(&me);
+            self.flush_mailbox(&me);
         }
     }
 
