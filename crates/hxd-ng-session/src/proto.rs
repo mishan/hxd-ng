@@ -44,6 +44,9 @@ pub struct LoginParams {
     /// Whether it names identity guests apart (§7.5).
     #[serde(default)]
     pub guest_identities: bool,
+    /// Whether it sends and reads `re` (§7.3).
+    #[serde(default)]
+    pub replies: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +106,9 @@ pub struct ChatParams {
     /// The line's detached form, base64url (`docs/e2e-messages.md` §4.7).
     #[serde(default)]
     pub signed: Option<String>,
+    /// What it answers, with `replies` (§7.3).
+    #[serde(default)]
+    pub re: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +163,9 @@ pub struct MsgParams {
     pub sealed: Option<String>,
     #[serde(default)]
     pub cert: Option<String>,
+    /// What it answers, with `replies` (§7.3).
+    #[serde(default)]
+    pub re: Option<Value>,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -182,6 +191,11 @@ pub struct HistoryParams {
     pub after: Option<u64>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Lines by id in place of the cursors, with `replies` (§7.3). Read
+    /// as it came, so that a session without `replies` has it ignored
+    /// whatever it holds, as an unknown param is (§5).
+    #[serde(default)]
+    pub ids: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -722,6 +736,8 @@ struct ChatData<'a> {
     guid: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    re: Option<Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -739,7 +755,10 @@ struct FromData<'a> {
 /// couldn't distinguish from loss. They become a placeholder frame
 /// instead, which clients ignore per the unknown-`ev` rule, keeping
 /// `last_seq` accounting exact.
-pub fn event_json(se: &SeqEvent) -> String {
+///
+/// `replies` is whether this session declared `replies`: only such a
+/// session is sent what a line or message answers.
+pub fn event_json(se: &SeqEvent, replies: bool) -> String {
     // The presence events first, written without a tree: every login and
     // every departure is one of these to everyone present.
     let out = |ev, data| {
@@ -770,6 +789,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         media,
         guid,
         signed,
+        re,
     } = &se.event
     {
         let data = ChatData {
@@ -785,6 +805,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             media: media.as_ref().map(crate::media::media_json),
             guid: guid.as_ref().map(|g| g.as_str()),
             signed: signed.as_deref().map(b64url),
+            re: re.as_deref().filter(|_| replies).map(crate::replies::json),
         };
         return serde_json::to_string(&EventOut {
             seq: se.seq,
@@ -815,6 +836,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             queued,
             media,
             signed,
+            re,
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -847,6 +869,7 @@ pub fn event_json(se: &SeqEvent) -> String {
             if let Some(signed) = signed {
                 data["signed"] = json!(b64url(signed));
             }
+            crate::replies::add(&mut data, re.as_deref(), replies);
             ("msg", data)
         }
         // `id` and `queued: true` never: a sealed message is never stored.
@@ -985,7 +1008,7 @@ pub fn event_json(se: &SeqEvent) -> String {
         Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
         // A room's, only ever to a session that asked about rooms
         // (`docs/chat-rooms.md` §7.3); the lobby's never carry `room`.
-        Event::InRoom { room, event } => in_room_json(*room, event),
+        Event::InRoom { room, event } => in_room_json(*room, event, replies),
         Event::RoomAdded(v) => ("room_added", json!({ "room": crate::rooms::room_json(v) })),
         Event::RoomChanged(v) => (
             "room_changed",
@@ -1027,7 +1050,11 @@ pub fn event_json(se: &SeqEvent) -> String {
                 status_text.as_deref(),
             ),
         ),
-        Event::Im(m) => ("im", crate::friends::im_json(m)),
+        Event::Im(m) => {
+            let mut data = crate::friends::im_json(m);
+            crate::replies::add(&mut data, m.re.as_ref(), replies);
+            ("im", data)
+        }
         Event::Receipt {
             login,
             fingerprint,
@@ -1059,7 +1086,7 @@ pub fn event_json(se: &SeqEvent) -> String {
 
 /// An event about a room, as the lobby's would be with `room` added, or
 /// the placeholder for one this wire does not carry.
-fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
+fn in_room_json(room: u32, event: &Event, replies: bool) -> (&'static str, Value) {
     let (ev, mut data) = match event {
         Event::Chat {
             from,
@@ -1070,6 +1097,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
             media,
             guid,
             signed,
+            re,
             ..
         } => {
             let data = ChatData {
@@ -1085,6 +1113,7 @@ fn in_room_json(room: u32, event: &Event) -> (&'static str, Value) {
                 media: media.as_ref().map(crate::media::media_json),
                 guid: guid.as_ref().map(|g| g.as_str()),
                 signed: signed.as_deref().map(b64url),
+                re: re.as_deref().filter(|_| replies).map(crate::replies::json),
             };
             (
                 "chat",
@@ -1297,20 +1326,26 @@ mod tests {
                 });
             }
             assert_eq!(user_json(&u), want);
-            let joined: Value = serde_json::from_str(&event_json(&SeqEvent {
-                seq: 9,
-                event: Event::Joined(u.clone()),
-            }))
+            let joined: Value = serde_json::from_str(&event_json(
+                &SeqEvent {
+                    seq: 9,
+                    event: Event::Joined(u.clone()),
+                },
+                false,
+            ))
             .unwrap();
             assert_eq!(
                 joined,
                 json!({ "seq": 9, "ev": "user_joined", "data": { "user": want } })
             );
         }
-        let parted: Value = serde_json::from_str(&event_json(&SeqEvent {
-            seq: 10,
-            event: Event::Parted(7),
-        }))
+        let parted: Value = serde_json::from_str(&event_json(
+            &SeqEvent {
+                seq: 10,
+                event: Event::Parted(7),
+            },
+            false,
+        ))
         .unwrap();
         assert_eq!(
             parted,

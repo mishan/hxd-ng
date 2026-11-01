@@ -16,6 +16,7 @@ use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
 use crate::inbox::{Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
 use crate::relationships::{AccountUpdate, LedgerEntry, Recorded, RequestKind, Requester, SentOn};
+use crate::reply::Reply;
 use crate::roster::{Event, Uid};
 use crate::Core;
 
@@ -166,6 +167,7 @@ impl Core {
     /// approval. `None` where it is none of these and goes as a private
     /// message always has: messaging off, any other account outside it,
     /// a guest let in, or mail to oneself.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn messaging_route(
         &self,
         uid: Uid,
@@ -174,6 +176,7 @@ impl Core {
         guid: &Option<MessageGuid>,
         media: bool,
         signed: &Option<SignedMsg>,
+        re: &Option<Reply>,
     ) -> Option<Result<MsgOutcome, ChatError>> {
         // The guests are answered by `request_answer`, never by writing
         // back: an approval of `guest` would let every guest in.
@@ -264,8 +267,28 @@ impl Core {
         if media || text.len() > self.messaging_policy.max_message_bytes {
             return friend.is_none().then_some(Err(ChatError::NotFriends));
         }
+        // Out of scope is told only to a sender `them` has not blocked,
+        // which `route` answers as the block.
+        if let Some(re) = re {
+            let login = if sending.guest {
+                ""
+            } else {
+                sending.mailbox.login.as_str()
+            };
+            if let Err(e) = Self::reply_in_scope(re, login, &them.login) {
+                match self
+                    .friends_store()
+                    .ok()?
+                    .is_blocked(&them, &sending.mailbox)
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Some(Err(e)),
+                    Err(e) => return Some(Err(chat_error(store_failed(e)))),
+                }
+            }
+        }
         Some(
-            self.route(uid, sending, them, friend, text, guid, signed)
+            self.route(uid, sending, them, friend, text, guid, signed, re)
                 .map_err(chat_error),
         )
     }
@@ -301,7 +324,7 @@ impl Core {
             understands: me.understands,
             classic: false,
         };
-        self.route(uid, sending, them, friend, &text, &guid, &None)
+        self.route(uid, sending, them, friend, &text, &guid, &None, &None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,6 +337,7 @@ impl Core {
         text: &str,
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
+        re: &Option<Reply>,
     ) -> Result<MsgOutcome, MessagingError> {
         let rel = self.friends_store()?;
         let me = Me {
@@ -350,6 +374,7 @@ impl Core {
                 text.to_string(),
                 guid.clone(),
                 signed.clone(),
+                re.clone(),
             )
             .map(|sent| match (sent.delivered, sent.reference) {
                 (false, Some(r)) => MsgOutcome::Queued(r),
@@ -394,6 +419,7 @@ impl Core {
             text,
             guid,
             signed,
+            re,
             account.requests_opted_at,
         )?;
         Ok(MsgOutcome::Requested)
@@ -410,6 +436,7 @@ impl Core {
         text: &str,
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
+        re: &Option<Reply>,
         opted_at: Option<SystemTime>,
     ) -> Result<(), MessagingError> {
         let rel = self.friends_store()?;
@@ -548,6 +575,7 @@ impl Core {
                         Requester::Address(key) => Some(key.clone()),
                         _ => None,
                     },
+                    re: re.clone(),
                 },
                 self.inbox_policy.max_queued,
             )

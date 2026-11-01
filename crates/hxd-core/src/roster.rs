@@ -261,6 +261,10 @@ pub struct Transport {
     /// shown an identity guest's requests and may answer them
     /// (`docs/instant-messaging.md` §4.1).
     pub guest_identities: bool,
+    /// It declared the ng wire's `replies`, so what a line or message
+    /// answers is worth sending it (`docs/hotline-ng.md` §7.3). Kept
+    /// here so a resume keeps what the login was granted.
+    pub replies: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -406,6 +410,11 @@ pub enum Event {
         /// (`docs/e2e-messages.md` §4.7). A wire with nowhere to put it
         /// carries the text alone.
         signed: Option<Vec<u8>>,
+
+        /// What the line answers, as its sender named it. A wire with
+        /// nowhere to put it carries the text alone. Boxed, so that
+        /// every event does not grow by a target's size.
+        re: Option<Box<crate::reply::Reply>>,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -483,6 +492,9 @@ pub enum Event {
         /// A signed message's detached form, as it came
         /// (`docs/e2e-messages.md` §4.9).
         signed: Option<Vec<u8>>,
+
+        /// What the message answers, as its sender named it.
+        re: Option<Box<crate::reply::Reply>>,
     },
     /// A sealed private message (`docs/e2e-messages.md` §4.4), only ever
     /// to the session of the device it was sealed to, and never stored.
@@ -718,8 +730,17 @@ impl Event {
     pub fn weight(&self) -> usize {
         let text = match self {
             Event::Chat {
-                text, from, signed, ..
-            } => text.len() + from.nick.len() + signed.as_ref().map_or(0, Vec::len),
+                text,
+                from,
+                signed,
+                re,
+                ..
+            } => {
+                text.len()
+                    + from.nick.len()
+                    + signed.as_ref().map_or(0, Vec::len)
+                    + re.as_ref().map_or(0, |r| r.pack().len())
+            }
             Event::Notice { text, .. } => text.len(),
             Event::ChatSubject { subject, .. } => subject.len(),
             Event::Msg {
@@ -727,12 +748,14 @@ impl Event {
                 text,
                 from_login,
                 signed,
+                re,
                 ..
             } => {
                 from_nick.len()
                     + text.len()
                     + from_login.as_ref().map_or(0, String::len)
                     + signed.as_ref().map_or(0, Vec::len)
+                    + re.as_ref().map_or(0, |r| r.pack().len())
             }
             Event::Sealed {
                 from_nick,
@@ -799,6 +822,7 @@ impl Event {
                     + im.from_nick.len()
                     + im.text.len()
                     + im.signed.as_ref().map_or(0, Vec::len)
+                    + im.re.as_ref().map_or(0, |r| r.pack().len())
             }
             Event::Receipt { login, .. } | Event::Typing { login, .. } => login.len(),
             _ => 0,
@@ -3202,6 +3226,7 @@ mod tests {
             media: None,
             guid: None,
             signed: None,
+            re: None,
         }
         .weight();
         assert_eq!(

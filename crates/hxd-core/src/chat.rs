@@ -32,6 +32,7 @@ use crate::inbox::{
     MessageStore, NewMessage, StoreError, StoredMessage,
 };
 use crate::relationships::RelationshipStore;
+use crate::reply::Reply;
 use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
 use crate::Core;
 
@@ -350,6 +351,8 @@ pub(crate) struct Staged {
     /// A signed lobby line's link form, the only form it may cross a
     /// link in (`docs/e2e-messages.md` §4.11).
     link: Option<crate::server_link::LinkForm>,
+    /// What it answers. Never a ghost's: no reference crosses a link.
+    re: Option<Reply>,
 }
 
 impl Staged {
@@ -373,6 +376,7 @@ impl Staged {
             guid: None,
             signed,
             link: None,
+            re: None,
         }
     }
 }
@@ -734,6 +738,9 @@ pub enum ChatError {
     /// schema 33 was the server's, larger than any cursor, and read as
     /// one would page or mark mail the client never saw.
     UnknownCursor,
+    /// A reply naming a line of another room, or a message outside the
+    /// conversation it is sent in (`docs/hotline-ng.md` §7.3).
+    ReplyScope,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -802,7 +809,7 @@ impl Core {
         self.chat_public_lines(
             from,
             room,
-            lines.into_iter().map(|l| (l, None, None)).collect(),
+            lines.into_iter().map(|l| (l, None, None, None)).collect(),
         )
     }
 
@@ -820,7 +827,7 @@ impl Core {
         line: (String, u16, Option<crate::media::Handle>),
         guid: Option<MessageGuid>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_signed(from, room, line, guid, None)
+        self.chat_public_signed(from, room, line, guid, None, None)
     }
 
     /// [`Core::chat_public_guid`], for a line that may be signed: its
@@ -829,7 +836,8 @@ impl Core {
     /// said under that id is answered as that line when it says the same
     /// thing in the same room, and refused as an equivocation otherwise
     /// (`docs/e2e-messages.md` §4.7), as far as the log and the room's
-    /// memory of guids remember.
+    /// memory of guids remember. `re` is what it answers, which must be
+    /// a line of this room, if a line at all.
     pub fn chat_public_signed(
         &self,
         from: Uid,
@@ -837,8 +845,9 @@ impl Core {
         line: (String, u16, Option<crate::media::Handle>),
         guid: Option<MessageGuid>,
         signed: Option<SignedLine>,
+        re: Option<Reply>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_lines(from, room, vec![(line, guid, signed)])
+        self.chat_public_lines(from, room, vec![(line, guid, signed, re)])
             .pop()
             .expect("an answer for each line")
     }
@@ -934,6 +943,7 @@ impl Core {
             (String, u16, Option<crate::media::Handle>),
             Option<MessageGuid>,
             Option<SignedLine>,
+            Option<Reply>,
         )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
@@ -953,7 +963,16 @@ impl Core {
         // heard before the room hears of the kick, as they would have
         // been sent one at a time.
         let mut tipped = None;
-        for (i, ((mut text, style, media), guid, signed)) in lines.into_iter().enumerate() {
+        for (i, ((mut text, style, media), guid, signed, re)) in lines.into_iter().enumerate() {
+            let in_room = |re: &Reply| match re {
+                Reply::Line { room: r, .. } => *r == room,
+                Reply::Signed { .. } => true,
+                Reply::Im(_) | Reply::Pm(_) => false,
+            };
+            if re.as_ref().is_some_and(|re| !in_room(re)) {
+                results[i] = Some(Err(ChatError::ReplyScope));
+                continue;
+            }
             let (signed, link) = match signed {
                 Some(s) => (Some(s.signature), s.link),
                 None => (None, None),
@@ -1058,6 +1077,7 @@ impl Core {
                 guid,
                 signed,
                 link,
+                re,
             });
             at.push(i);
         }
@@ -1225,6 +1245,7 @@ impl Core {
                                 tag: r.home_tag.clone(),
                                 tagged: r.tagged,
                             }),
+                            re: s.re.clone(),
                         }
                     })
                     .collect();
@@ -1298,6 +1319,7 @@ impl Core {
                 media: s.media.as_ref().map(|(_, r)| r.clone()),
                 guid: None,
                 signed: s.signed.map(|s| s.form),
+                re: s.re.map(Box::new),
             };
             // The sender's own copy carries its guid; nobody else's does.
             let mine = s.guid.as_ref().map(|(_, g)| {
@@ -1426,6 +1448,7 @@ impl Core {
             media: media.as_ref().map(|(_, r)| r.clone()),
             guid: None,
             signed: None,
+            re: None,
         };
         for uid in &members {
             r.send_to(*uid, ev.clone());
@@ -1453,6 +1476,28 @@ impl Core {
             .as_ref()
             .ok_or(ChatError::ServerError)?
             .query(&query)
+            .map_err(history_store_failed)
+    }
+
+    /// The lines of `room` among `ids`, ascending, under the same checks
+    /// as [`Core::history`]: the quotes a page of replies draws. A line of
+    /// another room is left out as one that does not exist is.
+    pub fn history_ids(
+        &self,
+        uid: Uid,
+        room: u32,
+        ids: &[crate::history::LineId],
+    ) -> Result<Vec<crate::history::LogLine>, ChatError> {
+        if !self.roster.lock().unwrap().users.contains_key(&uid) {
+            return Err(ChatError::NoSuchUser);
+        }
+        if room != 0 && !self.room_readable(uid, room) {
+            return Err(ChatError::NoSuchChat);
+        }
+        self.history
+            .as_ref()
+            .ok_or(ChatError::ServerError)?
+            .lines(room, ids)
             .map_err(history_store_failed)
     }
 
@@ -2017,13 +2062,15 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_signed(from, to, text, guid, media, None)
+        self.msg_signed(from, to, text, guid, media, None, None)
     }
 
     /// [`Core::msg`], for a message that may be signed: its frontend
     /// checked the signature, and that its id is `guid` and its signer
     /// the sender's identity; `to` is the recipient fingerprint it names,
     /// which must be the recipient's (`docs/e2e-messages.md` §4.9).
+    /// `re` is what it answers, which must be between the two of them.
+    #[allow(clippy::too_many_arguments)]
     pub fn msg_signed(
         &self,
         from: Uid,
@@ -2032,6 +2079,7 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
+        re: Option<Reply>,
     ) -> Result<MsgOutcome, ChatError> {
         // A message to the reserved account is a command line, not mail
         // (`docs/system-account.md` §1). Answered, never delivered and
@@ -2068,7 +2116,7 @@ impl Core {
                 },
             )
         };
-        let sent = self.deliver(sender, recipient, text, guid, media, signed);
+        let sent = self.deliver(sender, recipient, text, guid, media, signed, re);
         if sent.is_ok() {
             self.guest_written_back(from, to);
         }
@@ -2087,11 +2135,12 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_login_signed(from, to, text, guid, media, None)
+        self.msg_login_signed(from, to, text, guid, media, None, None)
     }
 
     /// [`Core::msg_login`], as [`Core::msg_signed`] is [`Core::msg`]:
     /// the account's linked identity is the fingerprint it must name.
+    #[allow(clippy::too_many_arguments)]
     pub fn msg_login_signed(
         &self,
         from: Uid,
@@ -2100,6 +2149,7 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
+        re: Option<Reply>,
     ) -> Result<MsgOutcome, ChatError> {
         // The same account by name, for a client that addresses by login.
         if self.is_system_login(to) {
@@ -2108,7 +2158,8 @@ impl Core {
             }
             return self.run_system_command(from, &text);
         }
-        if let Some(routed) = self.messaging_route(from, to, &text, &guid, media.is_some(), &signed)
+        if let Some(routed) =
+            self.messaging_route(from, to, &text, &guid, media.is_some(), &signed, &re)
         {
             return routed;
         }
@@ -2131,6 +2182,7 @@ impl Core {
             guid,
             media,
             signed,
+            re,
         )
     }
 
@@ -2223,6 +2275,28 @@ impl Core {
         Ok(MsgOutcome::Delivered(None))
     }
 
+    /// Does a private message's `re` stay between `me` and `them`? By
+    /// what it names alone, never by what the store holds, which would
+    /// tell the sender whether a message still exists. A `pm` is any
+    /// reference: a reader resolves it from its own mail, where another
+    /// pair's resolves to nothing. A signed target is bound by its own
+    /// signature.
+    pub(crate) fn reply_in_scope(re: &Reply, me: &str, them: &str) -> Result<(), ChatError> {
+        let ok = match re {
+            Reply::Line { .. } => false,
+            Reply::Signed { .. } | Reply::Pm(_) => true,
+            Reply::Im(im) => {
+                im.login().eq_ignore_ascii_case(me) || im.login().eq_ignore_ascii_case(them)
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(ChatError::ReplyScope)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn deliver(
         &self,
         sender: Sender,
@@ -2231,9 +2305,12 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
+        re: Option<Reply>,
     ) -> Result<MsgOutcome, ChatError> {
         let now = SystemTime::now();
         let from = sender.uid;
+        let sender_login = sender.reply_login.clone().unwrap_or_default();
+        let sender_login = sender_login.as_str();
         // Against the recipient as resolved here, which is who the message
         // goes to: a uid named a moment ago may be someone else's now.
         let signed = match signed {
@@ -2289,6 +2366,10 @@ impl Core {
                 {
                     return Err(ChatError::NoSuchUser);
                 }
+            }
+            // After the block, so a blocked sender hears the block.
+            if let Some(re) = &re {
+                Self::reply_in_scope(re, sender_login, &to.mailbox.login)?;
             }
             // A recipient with no session cannot be reached this way.
             let mut r = self.roster.lock().unwrap();
@@ -2350,6 +2431,7 @@ impl Core {
                 queued: false,
                 media,
                 signed: signed.map(|s| s.form),
+                re: re.map(Box::new),
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -2368,6 +2450,9 @@ impl Core {
             .map_err(store_failed)?
         {
             return Err(ChatError::Blocked);
+        }
+        if let Some(re) = &re {
+            Self::reply_in_scope(re, sender_login, &to.mailbox.login)?;
         }
         // A signed id is its signer's across recipients (§3.6): one this
         // sender used toward someone else is another message. Toward this
@@ -2433,6 +2518,7 @@ impl Core {
                 queued: false,
                 media,
                 signed: signed.map(|s| s.form),
+                re: re.map(Box::new),
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -2465,6 +2551,7 @@ impl Core {
                     signed: signed.clone(),
                     friendship: None,
                     sender_address: None,
+                    re,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -2894,6 +2981,7 @@ impl Core {
                             queued: Some(m.id) != fresh,
                             media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
                             signed: m.signed.as_ref().map(|s| s.form.clone()),
+                            re: m.re.clone().map(Box::new),
                         },
                     );
                     if !delivered.contains(&m.id) {
@@ -3476,6 +3564,13 @@ mod tests {
     }
 
     impl crate::history::ChatLog for SlowLog {
+        fn lines(
+            &self,
+            channel: u32,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines(channel, ids)
+        }
         fn lines_by_ghost(
             &self,
             channel: Option<u32>,
@@ -3732,6 +3827,13 @@ mod tests {
     }
 
     impl crate::history::ChatLog for GatedLog {
+        fn lines(
+            &self,
+            channel: u32,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.inner.lines(channel, ids)
+        }
         fn lines_by_ghost(
             &self,
             channel: Option<u32>,
@@ -4056,6 +4158,13 @@ mod tests {
     struct ForgetfulLog(crate::history::MemoryLog);
 
     impl crate::history::ChatLog for ForgetfulLog {
+        fn lines(
+            &self,
+            channel: u32,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<crate::history::LogLine>, StoreError> {
+            self.0.lines(channel, ids)
+        }
         fn append_all(
             &self,
             lines: &[NewLine],
@@ -4162,6 +4271,7 @@ mod tests {
             .append(&NewLine {
                 home_key: None,
                 home: None,
+                re: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "alice".into(),
@@ -4973,6 +5083,27 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_names_a_line_of_its_own_room_and_is_never_refused_as_dangling() {
+        use crate::reply::Reply;
+        let core = Core::new();
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (_b, mut rx_b) = test_attach(&core, "bob", chatter());
+        let say = |re| core.chat_public_signed(a, 0, ("yes".into(), 0, None), None, None, Some(re));
+        for re in [Reply::Line { room: 7, id: 1 }, Reply::Pm([1; 16])] {
+            assert_eq!(say(re.clone()), Err(ChatError::ReplyScope), "{re:?}");
+        }
+        drain(&mut rx_a);
+        drain(&mut rx_b);
+        let never_said = Reply::Line { room: 0, id: 4242 };
+        say(never_said.clone()).unwrap();
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(
+                matches!(&drain(rx)[..], [Event::Chat { re: Some(re), .. }] if **re == never_said)
+            );
+        }
+    }
+
+    #[test]
     fn private_chat_lifecycle_create_invite_join_part() {
         let core = Core::new();
         let (a, mut rx_a) = test_attach(&core, "alice", chatter());
@@ -5268,6 +5399,56 @@ mod inbox_tests {
         evs.into_iter()
             .filter(|e| matches!(e, Event::Msg { .. }))
             .collect()
+    }
+
+    #[test]
+    fn a_reply_is_kept_and_held_to_what_it_names() {
+        let (core, store) = server(&["alice", "dave", "carol"]);
+        let (a, mut ra) = attach(&core, "alice", true);
+        let (d, _rd) = attach(&core, "dave", true);
+        let (c, _rc) = attach(&core, "carol", true);
+        let Ok(MsgOutcome::Delivered(Some(asked))) = core.msg(a, d, "lunch?".into(), None, None)
+        else {
+            panic!("stored and delivered");
+        };
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        let send = |from, to, re: Reply| {
+            core.msg_signed(from, to, "yes".into(), None, None, None, Some(re))
+        };
+        let carols = Reply::im("carol".into(), guid.clone()).unwrap();
+        for (case, re) in [
+            ("an im of a third party's", carols),
+            ("a public line", Reply::Line { room: 0, id: 1 }),
+        ] {
+            assert_eq!(send(d, a, re), Err(ChatError::ReplyScope), "{case}");
+        }
+        // Whatever the store holds: refusing another pair's reference
+        // would tell the sender whether that message still exists.
+        assert!(send(c, d, Reply::Pm(asked)).is_ok());
+        core.inbox_block(c, "dave", true).unwrap();
+        assert_eq!(
+            send(d, c, Reply::Line { room: 0, id: 1 }),
+            Err(ChatError::Blocked),
+            "a blocked sender hears the block"
+        );
+        drain(&mut ra);
+        for re in [
+            Reply::Pm(asked),
+            Reply::Pm([0xee; 16]),
+            Reply::im("alice".into(), guid).unwrap(),
+        ] {
+            assert!(send(d, a, re.clone()).is_ok(), "{re:?}");
+            assert!(
+                matches!(&msgs(drain(&mut ra))[..], [Event::Msg { re: Some(got), .. }] if **got == re),
+                "{re:?} reaches its reader as sent"
+            );
+            let kept = store.list(&Mailbox::login("alice"), None, 1).unwrap();
+            assert_eq!(
+                kept[0].re.as_ref(),
+                Some(&re),
+                "and is kept with the message"
+            );
+        }
     }
 
     #[test]
@@ -6403,7 +6584,7 @@ mod inbox_tests {
                 mailbox: dave,
                 has_inbox: true,
             };
-            core.deliver(sender, to, text.into(), None, None, None)
+            core.deliver(sender, to, text.into(), None, None, None, None)
         };
         assert!(matches!(send("hi"), Ok(MsgOutcome::Delivered(None))));
         core.inbox_block_uid(m, g, true).unwrap();

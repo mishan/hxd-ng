@@ -248,6 +248,8 @@ pub struct NewMessage {
     /// A guest's request: the key of the address it came from, which an
     /// approval of that guest releases its rows by (§4.1).
     pub sender_address: Option<String>,
+    /// What it answers, as its sender named it.
+    pub re: Option<crate::reply::Reply>,
 }
 
 /// A message as the store holds it.
@@ -270,6 +272,7 @@ pub struct StoredMessage {
     pub media: Option<crate::history::MediaMeta>,
     pub signed: Option<crate::history::Signature>,
     pub friendship: Option<crate::relationships::SentOn>,
+    pub re: Option<crate::reply::Reply>,
     /// When the server handed this to a live connection — *not* when a
     /// client rendered it. A stronger guarantee needs per-message client
     /// acks, which is what fogWraith's `IM Acknowledge (812)` is for and

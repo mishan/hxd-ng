@@ -5217,6 +5217,7 @@ sync = "full"
             .append(&NewLine {
                 home_key: None,
                 home: None,
+                re: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "n".into(),
@@ -5957,6 +5958,7 @@ sync = "full"
                         signed: None,
                         friendship: None,
                         sender_address: None,
+                        re: None,
                     },
                     usize::MAX,
                 )

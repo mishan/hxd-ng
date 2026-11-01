@@ -95,6 +95,8 @@ pub struct NewLine {
     /// For any linked server's user's line, where it was from when it was
     /// heard, so a replay does not pass it off as a local user's.
     pub home: Option<LineHome>,
+    /// What the line answers, as its sender named it.
+    pub re: Option<crate::reply::Reply>,
 }
 
 /// A linked server's user's home server, as its line was logged
@@ -168,6 +170,8 @@ pub struct LogLine {
     pub home_key: Option<[u8; 32]>,
     /// [`NewLine::home`]; none on a line logged before it was kept.
     pub home: Option<LineHome>,
+    /// [`NewLine::re`], until the line is redacted.
+    pub re: Option<crate::reply::Reply>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +243,10 @@ pub trait ChatLog: Send + Sync + 'static {
     /// One line by id, tombstone or not: what a redaction reads before it
     /// clears the line, and what a report names.
     fn line(&self, id: LineId) -> Result<Option<LogLine>, StoreError>;
+    /// The lines of `channel` among `ids`, tombstones too, ascending: the
+    /// quotes a page of replies draws, fetched at once. An id of another
+    /// channel, or of no line, is left out.
+    fn lines(&self, channel: u32, ids: &[LineId]) -> Result<Vec<LogLine>, StoreError>;
     /// Every live line `who` sent into `channel`, or into any channel
     /// for `None`, at or after `since`, oldest first ([`sent_by`]'s rule):
     /// what a purge selects (`docs/moderation.md` §3.3). By sender
@@ -250,8 +258,8 @@ pub trait ChatLog: Send + Sync + 'static {
         who: &Mailbox,
         since: SystemTime,
     ) -> Result<Vec<LogLine>, StoreError>;
-    /// Clear a line down to its tombstone: id and time stay, nick, text
-    /// and home server go. `by` is who did it, the column's fast answer to what the
+    /// Clear a line down to its tombstone: id and time stay, nick, text,
+    /// home server and what it answered go. `by` is who did it, the column's fast answer to what the
     /// moderation record says at length.
     fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError>;
     fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError>;
@@ -348,6 +356,7 @@ impl MemoryInner {
             signed: line.signed.as_ref().map(|s| s.form.clone()),
             home_key: line.home_key,
             home: line.home.clone(),
+            re: line.re.clone(),
         });
         if let Some(key) = line.ghost {
             self.ghosts.insert(id, key);
@@ -403,6 +412,16 @@ impl ChatLog for MemoryLog {
         Ok(inner.lines.iter().find(|line| line.id == id).cloned())
     }
 
+    fn lines(&self, channel: u32, ids: &[LineId]) -> Result<Vec<LogLine>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .lines
+            .iter()
+            .filter(|line| line.channel == channel && ids.contains(&line.id))
+            .cloned()
+            .collect())
+    }
+
     fn lines_by_ghost(
         &self,
         channel: Option<u32>,
@@ -452,6 +471,7 @@ impl ChatLog for MemoryLog {
         line.text.clear();
         line.signed = None;
         line.home = None;
+        line.re = None;
         line.flags = line.flags.with(LineFlags::DELETED);
         inner.signed.retain(|_, at| at.id != id);
         // The public timestamp is the original receive time; who and
@@ -609,6 +629,7 @@ pub mod conformance {
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(100 + n),
             guid: None,
             signed: None,
+            re: None,
         }
     }
 
@@ -630,6 +651,58 @@ pub mod conformance {
         a_signed_line_is_found_by_its_signer_in_any_channel(new_log());
         a_rooms_mark_is_kept_and_its_unsigned_lines_are_found(new_log());
         a_linked_lines_signature_is_restored_beside_its_home_key(new_log());
+        a_reply_is_kept_until_its_own_line_is_redacted(new_log());
+        lines_are_fetched_by_id_in_their_channel_alone(new_log());
+    }
+
+    /// What a line answers is kept as sent and goes with the line's
+    /// words; a reply to a line redacted since keeps its own.
+    fn a_reply_is_kept_until_its_own_line_is_redacted(log: Box<dyn ChatLog>) {
+        use crate::reply::Reply;
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        let replies = [
+            Reply::Line { room: 0, id: 1 },
+            Reply::im("alice".into(), guid).unwrap(),
+            Reply::Signed {
+                signer: [1; 32],
+                id: [2; 16],
+                hash: [3; 32],
+            },
+        ];
+        log.append(&line(1)).unwrap();
+        for (n, re) in (2..).zip(&replies) {
+            log.append(&NewLine {
+                re: Some(re.clone()),
+                ..line(n)
+            })
+            .unwrap();
+        }
+        let kept = |id| log.line(id).unwrap().unwrap().re;
+        for (id, re) in (2..).zip(&replies) {
+            assert_eq!(kept(id).as_ref(), Some(re));
+        }
+        assert!(log.tombstone(1, "carol", SystemTime::now()).unwrap());
+        assert!(log.tombstone(3, "carol", SystemTime::now()).unwrap());
+        assert_eq!(kept(2).as_ref(), Some(&replies[0]));
+        assert_eq!(kept(3), None);
+    }
+
+    fn lines_are_fetched_by_id_in_their_channel_alone(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        log.append(&in_channel(4, 7)).unwrap();
+        assert!(log.tombstone(2, "carol", SystemTime::now()).unwrap());
+        let got = log.lines(0, &[4, 3, 99, 2, 1]).unwrap();
+        assert_eq!(got.iter().map(|l| l.id).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(got[1].flags.contains(LineFlags::DELETED));
+        assert_eq!(
+            log.lines(7, &[4, 1])
+                .unwrap()
+                .iter()
+                .map(|l| l.id)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        assert!(log.lines(0, &[]).unwrap().is_empty());
     }
 
     /// A linked server's signed line, logged in its link form with its

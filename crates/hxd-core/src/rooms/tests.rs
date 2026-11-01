@@ -714,6 +714,7 @@ fn a_room_id_is_never_drawn_again() {
     log.append(&NewLine {
         home_key: None,
         home: None,
+        re: None,
         channel: 77,
         ghost: None,
         from_nick: "old".into(),
@@ -983,6 +984,7 @@ fn line_in(channel: u32, signed: bool) -> NewLine {
     NewLine {
         home_key: None,
         home: None,
+        re: None,
         channel,
         ghost: None,
         from_nick: "old".into(),

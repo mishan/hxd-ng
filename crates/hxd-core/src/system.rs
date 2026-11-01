@@ -739,6 +739,7 @@ impl Core {
                 queued: false,
                 media: None,
                 signed: None,
+                re: None,
             },
         );
     }

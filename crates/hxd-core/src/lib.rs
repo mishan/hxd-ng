@@ -28,6 +28,7 @@ pub mod news;
 pub mod notify;
 pub mod push;
 pub mod relationships;
+pub mod reply;
 pub mod revoked;
 pub mod rooms;
 pub mod roster;
@@ -88,6 +89,7 @@ pub use news::{
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use relationships::{MemoryRelationships, RelationId, RelationshipStore, SentOn};
+pub use reply::Reply;
 pub use revoked::{Published, Revocations};
 pub use rooms::{
     MemoryRooms, PartReason, Room, RoomEdit, RoomError, RoomFile, RoomPolicy, RoomStore, RoomView,

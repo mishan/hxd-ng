@@ -51,6 +51,8 @@ pub struct Im {
     pub signed: Option<Vec<u8>>,
     /// Sent under an approval rather than a friendship.
     pub approval: bool,
+    /// What it answers, as its sender named it.
+    pub re: Option<crate::reply::Reply>,
 }
 
 /// What became of an instant message: `OK` where a messenger session
@@ -89,6 +91,7 @@ fn im_of(m: StoredMessage, queued: bool, approval: bool) -> Option<Event> {
         queued,
         signed: m.signed.map(|s| s.form),
         approval,
+        re: m.re,
     })))
 }
 
@@ -200,7 +203,7 @@ impl Core {
         let id = self
             .friendship(&me.mailbox, &them)?
             .ok_or(MessagingError::NotFriends)?;
-        self.im_store(uid, &me, &them, (id, false), text, guid, signed)
+        self.im_store(uid, &me, &them, (id, false), text, guid, signed, None)
     }
 
     /// Store a message on the friendship or approval `on` (`true` for an
@@ -216,6 +219,7 @@ impl Core {
         text: String,
         guid: Option<MessageGuid>,
         signed: Option<SignedMsg>,
+        re: Option<crate::reply::Reply>,
     ) -> Result<ImSent, MessagingError> {
         let (on, approval) = on;
         if text.len() > self.messaging_policy.max_message_bytes {
@@ -298,6 +302,7 @@ impl Core {
                 queued: false,
                 media: None,
                 signed: form.clone(),
+                re: re.clone().map(Box::new),
             };
             let im = Event::Im(Box::new(Im {
                 from_login: me.mailbox.login.clone(),
@@ -311,6 +316,7 @@ impl Core {
                 queued: false,
                 signed: form,
                 approval: false,
+                re,
             }));
             for u in messengers {
                 r.send_to(u, im.clone());
@@ -338,6 +344,7 @@ impl Core {
                     signed,
                     friendship: Some(SentOn::Relation(on)),
                     sender_address: None,
+                    re,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -646,6 +653,7 @@ impl Core {
                         signed: None,
                         friendship: Some(SentOn::Relation(id)),
                         sender_address: None,
+                        re: None,
                     },
                     self.inbox_policy.max_queued,
                 )

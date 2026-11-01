@@ -974,6 +974,7 @@ impl Core {
                 queued: false,
                 media: None,
                 signed,
+                re: None,
             },
         );
         Ok(())
