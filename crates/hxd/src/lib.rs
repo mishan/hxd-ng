@@ -3014,10 +3014,9 @@ fn write_private(path: &Path, text: &str) -> Result<bool, String> {
         rand_core::OsRng
             .try_fill_bytes(&mut nonce)
             .map_err(|e| format!("{}: the OS CSPRNG: {e}", path.display()))?;
-        let mut name = std::ffi::OsString::from(".");
-        name.push(path.file_name().unwrap_or_default());
-        name.push(format!(".{:016x}.tmp", u64::from_be_bytes(nonce)));
-        let tmp = dir.join(name);
+        // Not spelled from the target's name, which may already be as
+        // long as a directory entry can be.
+        let tmp = dir.join(format!(".hxd-{:016x}.tmp", u64::from_be_bytes(nonce)));
         match opts.open(&tmp) {
             Ok(f) => break (tmp, f),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -3029,21 +3028,23 @@ fn write_private(path: &Path, text: &str) -> Result<bool, String> {
         .map(|()| std::fs::hard_link(&tmp, path))
         .map_err(|e| format!("{}: {e}", tmp.display()));
     let _ = std::fs::remove_file(&tmp);
-    match linked? {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+    // Whichever start placed the file, its entry is synced before it is
+    // used.
+    let placed = match linked? {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(e) => {
             return Err(format!(
                 "{}: {e} (placing it needs a filesystem with hard links)",
                 path.display()
             ));
         }
-        Ok(()) => {}
-    }
+        Ok(()) => true,
+    };
     #[cfg(unix)]
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(true)
+    Ok(placed)
 }
 
 impl IdentitySection {
@@ -4764,6 +4765,16 @@ mod tests {
         assert!(!write_private(&path, "other").unwrap(), "not replaced");
         assert_eq!(load_secret(&path, "news guest secret").unwrap(), made);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    /// A secret is made under the longest name a directory entry can
+    /// have, which leaves no room to spell a temporary name from it.
+    #[test]
+    fn a_secret_is_made_under_the_longest_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.key", "k".repeat(251)));
+        let made = load_secret(&path, "news guest secret").unwrap();
+        assert_eq!(load_secret(&path, "news guest secret").unwrap(), made);
     }
 
     /// A secret readable beyond its owner is still read, with a warning
