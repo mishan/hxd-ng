@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::access::bit;
 use crate::history::{LineFlags, LineId, LogLine};
-use crate::inbox::{Mailbox, MessageId, StoreError};
+use crate::inbox::{Cursor, Mailbox, MessageRef, StoreError};
 use crate::media::{Handle, Principal};
 use crate::news::{ArticleId, Author, NewsError};
 use crate::roster::{reads_public_chat, Core, Event, Uid, UserSession};
@@ -293,8 +293,10 @@ impl Subject {
 pub enum ReportTarget {
     Line(LineId),
     Media(Handle),
-    /// An inbox row, reported by its recipient.
-    Msg(MessageId),
+    /// An inbox row, reported by its recipient, by its reference: `None`
+    /// for a report from before references whose message was gone by
+    /// then (`docs/moderation.md` §4.2).
+    Msg(Option<MessageRef>),
     /// A person, named by the report's [`Report::about`].
     User,
     Article(ArticleId),
@@ -664,7 +666,8 @@ pub enum PersonRef {
 pub enum ReportRequest {
     Line(LineId),
     Media(Handle),
-    Msg(MessageId),
+    /// By its place in the reporter's own mailbox.
+    Msg(Cursor),
     User(PersonRef),
     Article(ArticleId),
 }
@@ -1621,16 +1624,28 @@ impl Core {
                 media = Some(handle);
                 (ReportTarget::Media(handle), about, gone, None, true)
             }
-            ReportRequest::Msg(id) => {
+            ReportRequest::Msg(cursor) => {
                 // Only the recipient may show a moderator their mail,
                 // and the store already scopes reads by mailbox (§4.2).
                 let inbox = self.inbox.as_ref().ok_or(ModError::NoSuchTarget)?;
                 let mine = reporter.as_ref().ok_or(ModError::NoSuchTarget)?;
-                let msg = inbox
-                    .list(mine, id.checked_add(1), 1)?
+                if cursor > inbox.last_cursor(mine)? {
+                    return Err(ModError::BadRequest("No message of yours has that id."));
+                }
+                let mut msg = inbox
+                    .list(mine, cursor.checked_add(1), 1)?
                     .into_iter()
-                    .find(|m| m.id == id)
-                    .ok_or(ModError::NoSuchTarget)?;
+                    .find(|m| m.cursor == cursor);
+                // A request is no inbox row the gate lets through, and is
+                // its recipient's to show all the same (instant-messaging.md
+                // §4.5).
+                if msg.is_none() {
+                    msg = inbox
+                        .requests(mine, std::time::UNIX_EPOCH, i64::MAX as usize)?
+                        .into_iter()
+                        .find(|m| m.cursor == cursor);
+                }
+                let msg = msg.ok_or(ModError::NoSuchTarget)?;
                 let about = match &msg.sender {
                     Some(m) => Subject::of_mailbox(m, msg.sender_nick.clone()),
                     None => Subject {
@@ -1639,7 +1654,13 @@ impl Core {
                     },
                 };
                 signed = msg.signed.map(|s| s.form);
-                (ReportTarget::Msg(id), about, false, Some(msg.body), true)
+                (
+                    ReportTarget::Msg(Some(msg.reference)),
+                    about,
+                    false,
+                    Some(msg.body),
+                    true,
+                )
             }
             ReportRequest::User(who) => {
                 let about = match &who {

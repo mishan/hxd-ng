@@ -354,7 +354,8 @@ fn report_line(r: &Report) -> String {
     let target = match r.target {
         ReportTarget::Line(id) => format!(" (line {id})"),
         ReportTarget::Media(h) => format!(" (image {})", hxd_core::media::handle_str(&h)),
-        ReportTarget::Msg(id) => format!(" (message {id})"),
+        ReportTarget::Msg(Some(r)) => format!(" (message {})", hxd_core::inbox::ref_str(&r)),
+        ReportTarget::Msg(None) => String::new(),
         ReportTarget::User | ReportTarget::Article(_) => String::new(),
     };
     let mut out = format!(

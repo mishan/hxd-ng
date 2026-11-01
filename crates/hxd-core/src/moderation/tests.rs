@@ -945,18 +945,27 @@ fn only_its_recipient_may_report_a_private_message_and_the_body_goes_with_it() {
     s.core
         .msg(bob, alice, "a threat".into(), None, None)
         .unwrap();
-    let id = drain(&mut alice_rx)
+    let (id, reference) = drain(&mut alice_rx)
         .into_iter()
         .find_map(|e| match e {
-            Event::Msg { id, .. } => id,
+            Event::Msg {
+                cursor: Some(c),
+                reference,
+                ..
+            } => Some((c, reference)),
             _ => None,
         })
         .expect("a stored message");
     drain(&mut carol_rx);
     assert_eq!(
         s.core.report(dave, ReportRequest::Msg(id), "x", None),
-        Err(ModError::NoSuchTarget),
-        "someone else's mail is not theirs to show"
+        Err(ModError::BadRequest("No message of yours has that id.")),
+        "a cursor dave's mailbox never issued"
+    );
+    assert_eq!(
+        s.core.report(alice, ReportRequest::Msg(id + 1), "x", None),
+        Err(ModError::BadRequest("No message of yours has that id.")),
+        "nor alice's"
     );
     let filed = s
         .core
@@ -965,6 +974,11 @@ fn only_its_recipient_may_report_a_private_message_and_the_body_goes_with_it() {
     let got = reports_in(drain(&mut carol_rx));
     assert_eq!(got[0].id, filed.id);
     assert_eq!(got[0].evidence.as_deref(), Some("a threat"));
+    assert_eq!(
+        got[0].target,
+        ReportTarget::Msg(reference),
+        "kept by its reference"
+    );
     assert!(got[0].verified);
     assert_eq!(got[0].about.login.as_deref(), Some("bob"));
 }

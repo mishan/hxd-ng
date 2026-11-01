@@ -204,15 +204,21 @@ still ends.
 can't express would leave a gap in the seq stream a client could not
 tell from loss, and resume's `last_seq` accounting would break.
 
-**The `msg` reply names a queued message to a sender with an inbox**
-(spec §7.1). The id is the *recipient's* handle for marking read, and
-it is monotonic, so it says something about how much mail the server
-carries; but an account with an inbox can already learn as much by
-mailing itself and reading its own inbox, so its reply gives nothing
-away that was not there to take, and it lets a client with a send queue
-record which stored message each send became. A sender with no inbox,
-such as an identity admitted as a guest, may still leave mail, has no
-inbox to read the counter from, and is not told it.
+**A stored message has a reference and a cursor, and the sender is
+given only the first** (spec §7.1). One id for both, a row's in a
+table for the whole server, would let anyone with an inbox read off how
+much private mail the server carries by watching the ids of what
+arrives. The reference is random and the same for both parties, so a
+client with a send queue records which stored message each send became,
+and a later extension can name the message on either side. The cursor
+counts one mailbox's mail, which its owner pages and marks read by; it
+tells that owner how much mail they have been sent, which they knew.
+
+The reply carries `ref` exactly when the message was stored, so its
+presence tells a sender nothing the reply's `queued` and its own inbox
+do not. A future answer that only looks stored — an ignore answered as
+queued (instant-messaging.md §10) — must carry a `ref` too, or its
+absence gives the ignore away.
 
 **`guid` answers as of now** (spec §7.1). A retry of a message that
 queued, sent after the recipient arrived, is delivered by that retry; the

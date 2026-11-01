@@ -161,7 +161,7 @@ pub struct MsgParams {
 /// is not, which is why the handler treats a null as `{}`.
 #[derive(Debug, Default, Deserialize)]
 pub struct InboxParams {
-    /// Page backwards from this id, exclusive.
+    /// Page backwards from this cursor, exclusive.
     #[serde(default)]
     pub before: Option<u64>,
     #[serde(default)]
@@ -806,7 +806,8 @@ pub fn event_json(se: &SeqEvent) -> String {
             from_nick,
             from_login,
             text,
-            id,
+            cursor,
+            reference,
             sent_at,
             queued,
             media,
@@ -816,8 +817,8 @@ pub fn event_json(se: &SeqEvent) -> String {
             // now; `login` is the account that survives either way, and
             // is *absent* when there is nobody to reply to — a guest, or
             // a sender whose account has since gone. Absent rather than
-            // null, so a client can test for the key; likewise `id`,
-            // which only exists for a message the store holds.
+            // null, so a client can test for the key; likewise `id` and
+            // `ref`, which only exist for a message the store holds.
             let mut from_obj = json!({ "uid": from, "nick": from_nick });
             if let Some(login) = from_login {
                 from_obj["login"] = json!(login);
@@ -828,8 +829,11 @@ pub fn event_json(se: &SeqEvent) -> String {
                 "at": unix(*sent_at),
                 "queued": queued,
             });
-            if let Some(id) = id {
-                data["id"] = json!(id);
+            if let Some(cursor) = cursor {
+                data["id"] = json!(cursor);
+            }
+            if let Some(r) = reference {
+                data["ref"] = json!(b64url(r));
             }
             // Present without an `id` for a message whose handle died
             // while it waited: the placeholder is still worth rendering
@@ -1203,7 +1207,8 @@ pub fn stored_msg_json(m: &hxd_core::StoredMessage, media: Option<&MediaRef>) ->
         from["login"] = json!(login);
     }
     let mut value = json!({
-        "id": m.id,
+        "id": m.cursor,
+        "ref": b64url(&m.reference),
         "from": from,
         "text": m.body,
         "at": unix(m.sent_at),

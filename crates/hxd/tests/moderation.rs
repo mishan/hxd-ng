@@ -886,14 +886,18 @@ async fn a_private_message_is_reported_by_its_recipient_with_its_body() {
     assert_eq!(
         dave.refused("report", json!({ "msg": id, "reason": "x" }))
             .await,
-        "no_such_target",
-        "someone else's mail is not theirs to show"
+        "bad_request",
+        "a cursor dave's mailbox never issued names nothing of anyone's"
     );
     alice
         .ok("report", json!({ "msg": id, "reason": "threat" }))
         .await;
     let report = carol.event("report").await;
     assert_eq!(report["target"]["kind"], "msg");
+    assert_eq!(
+        report["target"]["msg"], msg["ref"],
+        "named by its reference"
+    );
     assert_eq!(report["evidence"], "I know where you live");
     assert_eq!(report["verified"], true);
     assert_eq!(report["target"]["from"]["login"], "bob");

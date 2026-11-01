@@ -542,7 +542,7 @@ impl Core {
             return "error: that is me".into();
         }
         match self.msg_login(from, who, body, None, None) {
-            Ok(crate::MsgOutcome::Delivered) => "ok: sent".into(),
+            Ok(crate::MsgOutcome::Delivered(_)) => "ok: sent".into(),
             // A request is answered as a queued message is, so nothing
             // here tells it apart (`docs/instant-messaging.md` §4.2).
             Ok(crate::MsgOutcome::Queued { .. } | crate::MsgOutcome::Requested) => {
@@ -733,7 +733,8 @@ impl Core {
                 from_nick: system.policy.nick.clone(),
                 from_login: Some(system.policy.login.clone()),
                 text,
-                id: None,
+                cursor: None,
+                reference: None,
                 sent_at: SystemTime::now(),
                 queued: false,
                 media: None,

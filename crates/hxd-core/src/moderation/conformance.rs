@@ -143,7 +143,9 @@ fn evidence_is_scrubbed_and_the_row_stays(s: &dyn ModerationStore) {
 fn reports_round_trip_and_filter(s: &dyn ModerationStore) {
     let line = s.file(&report(ReportTarget::Line(17), 100)).unwrap();
     let media = s.file(&report(ReportTarget::Media([9; 16]), 110)).unwrap();
-    let msg = s.file(&report(ReportTarget::Msg(5), 120)).unwrap();
+    let msg = s
+        .file(&report(ReportTarget::Msg(Some([5; 16])), 120))
+        .unwrap();
     let user = s
         .file(&Report {
             reporter: None,
@@ -177,7 +179,10 @@ fn reports_round_trip_and_filter(s: &dyn ModerationStore) {
         s.report(media).unwrap().unwrap().target,
         ReportTarget::Media([9; 16])
     );
-    assert_eq!(s.report(msg).unwrap().unwrap().target, ReportTarget::Msg(5));
+    assert_eq!(
+        s.report(msg).unwrap().unwrap().target,
+        ReportTarget::Msg(Some([5; 16]))
+    );
     let u = s.report(user).unwrap().unwrap();
     assert_eq!(u.reporter, None);
     assert_eq!(u.about.fingerprint, Some([2; 32]));

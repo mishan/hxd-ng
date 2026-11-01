@@ -320,9 +320,9 @@ impl Core {
                 guid.clone(),
                 signed.clone(),
             )
-            .map(|sent| match (sent.delivered, sent.id) {
-                (false, Some(id)) => MsgOutcome::Queued(id),
-                _ => MsgOutcome::Delivered,
+            .map(|sent| match (sent.delivered, sent.reference) {
+                (false, Some(r)) => MsgOutcome::Queued(r),
+                (_, r) => MsgOutcome::Delivered(r),
             })
         };
         if let Some(id) = friend {

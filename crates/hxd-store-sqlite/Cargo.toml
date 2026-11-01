@@ -14,6 +14,8 @@ hxd-registrar = { workspace = true }
 # skew against whatever version the host happens to ship. See
 # docs/private-messages.md §4 for why rusqlite rather than sqlx.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# A message's reference (`docs/private-messages.md` §5).
+getrandom = "0.2"
 sha2 = "0.10"
 tracing = { workspace = true }
 

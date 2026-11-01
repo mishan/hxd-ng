@@ -179,7 +179,7 @@ describe('instant messaging', () => {
     const guid = randomUUID();
     const sent = await eve.conn.msg({ to_login: 'finn', text: 'while you were out', guid });
     assert.equal(sent.queued, true);
-    assert.equal(typeof sent.id, 'number');
+    assert.equal(typeof sent.ref, 'string');
 
     // The library reads the roster after the login unasked, and that
     // read is what hands it over.
@@ -188,7 +188,7 @@ describe('instant messaging', () => {
     assert.deepEqual(roster.data.friends.map((f) => [f.login, f.state]), [['eve', 'accepted']]);
     const im = await back.waitFor('im', { guid });
     assert.equal(im.data.queued, true);
-    assert.equal(im.data.id, sent.id);
+    assert.equal(im.data.ref, sent.ref);
     assert.equal(im.data.text, 'while you were out');
     await back.expectNo('msg', { text: 'while you were out' });
 

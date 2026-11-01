@@ -318,7 +318,12 @@ A PM is private, so a moderator sees it only because its recipient chose
 to show it. Reporting a message copies its stored body into the report
 at that moment; the inbox row is untouched. Only the recipient may
 report it — the store already scopes `inbox` reads by mailbox, and the
-same check applies. A message with no inbox row (a server without one,
+same check applies — and it names the message by its cursor in that
+mailbox, a message request (instant-messaging.md §4.5) as any other.
+The report keeps the message's reference (private-messages.md §5), as
+`target.msg`, never the store's own row id. A report filed before
+references whose message was gone by then names none, and its object
+carries no `msg`; its evidence is what it always had. A message with no inbox row (a server without one,
 or a PM to a guest) can still be reported by pasting: as built, that is
 a report on its sender (`user`) with the text as `evidence`, which the
 server marks `verified: false` and the moderator sees. It is the
@@ -416,7 +421,7 @@ Requests, all `access_denied` without `moderate` except `report`:
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox id), `user` (`uid` \| `login` \| `fingerprint`), `article` (id), or none with `signed`; `reason`; `evidence?` (text, for a PM with no row); `signed?` (§4.2) | `{ "id", "outcome": "open" \| "removed", "follow_up" }` | `bad_request`, `bad_signature`, `no_such_target`, `rate_limited`, `not_available` |
+| `report` | exactly one of `line` (id), `media` (handle), `msg` (inbox cursor, `bad_request` past the last its mailbox issued), `user` (`uid` \| `login` \| `fingerprint`), `article` (id), or none with `signed`; `reason`; `evidence?` (text, for a PM with no row); `signed?` (§4.2) | `{ "id", "outcome": "open" \| "removed", "follow_up" }` | `bad_request`, `bad_signature`, `no_such_target`, `rate_limited`, `not_available` |
 | `reports` | `status?` (`open` default \| `closed` \| `all`), `before?`, `limit?` (1–100) | `{ "reports": [ … ], "has_more" }` | |
 | `report_close` | `id`, `outcome` (`dismissed` \| `duplicate`), `note?`, `of?` (id, for duplicate) | `{}` | `no_such_report`, `own_report` |
 | `redact` | `id` (line), `reason` | `{}` | `no_such_line`, `protected` |
@@ -440,6 +445,7 @@ A `report` object:
 { "id": 17, "at": 1729137541, "status": "open",
   "by": { "login": "alice" },                // absent for a guest reporter
   "target": { "kind": "media", "media": "…", "from": { "login": "bob" } },
+                                             // a msg's: { "kind": "msg", "msg": "<ref>", … }
   "reason": "…", "evidence": "…",            // evidence for msg reports
   "signed": "…",                             // a signed msg's, or pasted (§4.2)
   "closed": { "at": …, "by": "carol", "outcome": "removed", "note": "…" } }
@@ -556,6 +562,12 @@ ALTER TABLE moderation ADD COLUMN target_report INTEGER;
 ALTER TABLE report ADD COLUMN target_article INTEGER;
 ALTER TABLE report ADD COLUMN target_nick TEXT;
 ```
+
+Version 33 keeps a msg report by the message's reference,
+`target_ref BLOB`, filled for the reports already there from their
+rows where the row is still the reporter's message, and `target_msg`
+emptied where it was; a report whose row is gone keeps its old row id,
+which nothing reads.
 
 Version 10 added the bans (§3.5). `kind` is address, login, identity
 or registrar; `target` is the address's sixteen bytes (IPv4 mapped),

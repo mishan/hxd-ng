@@ -28,8 +28,8 @@ use tracing::{debug, warn};
 
 use crate::history::{HistoryPage, HistoryQuery, LineFlags, LineHome, NewLine, Signature};
 use crate::inbox::{
-    Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    StoreError, StoredMessage,
+    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, StoreError, StoredMessage,
 };
 use crate::relationships::RelationshipStore;
 use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
@@ -226,6 +226,20 @@ fn named_sessions(r: &RosterInner, mailbox: &Mailbox, named: Option<Uid>, sender
 /// A store that would not answer is a server-side failure, not the
 /// client's fault. The detail goes to the log; the client gets the
 /// generic error, like every other backend failure here.
+/// Refuse a cursor `mailbox` never issued ([`ChatError::UnknownCursor`]).
+fn issued(
+    store: &dyn MessageStore,
+    mailbox: &Mailbox,
+    cursor: Option<Cursor>,
+) -> Result<(), ChatError> {
+    match cursor {
+        Some(c) if c > store.last_cursor(mailbox).map_err(store_failed)? => {
+            Err(ChatError::UnknownCursor)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn store_failed(e: StoreError) -> ChatError {
     warn!("inbox: {e}");
     ChatError::ServerError
@@ -711,6 +725,10 @@ pub enum ChatError {
     /// A reply that would approve a conversation past the replier's
     /// roster limit.
     RosterFull,
+    /// A cursor the caller's mailbox never issued. An id from before
+    /// schema 33 was the server's, larger than any cursor, and read as
+    /// one would page or mark mail the client never saw.
+    UnknownCursor,
     /// The server couldn't complete the operation — a chat id the OS
     /// CSPRNG refused to produce, or an inbox that would not write. Not
     /// the client's fault and not something it can retry usefully.
@@ -733,13 +751,14 @@ pub struct SignedMsg {
     pub to: [u8; 32],
 }
 
-/// What became of a private message.
+/// What became of a private message, and the reference a stored one is
+/// named by, which the sender holds as the recipient does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgOutcome {
-    /// Handed to a live connection.
-    Delivered,
+    /// Handed to a live connection; `None` when nothing was stored.
+    Delivered(Option<MessageRef>),
     /// Stored for a recipient who wasn't there to take it.
-    Queued(MessageId),
+    Queued(MessageRef),
     /// A message request (`docs/instant-messaging.md` §4.2), however it
     /// was stored, held or dropped.
     Requested,
@@ -2192,7 +2211,7 @@ impl Core {
         if let Some(answer) = self.system_command(from, text) {
             self.system_reply(from, answer);
         }
-        Ok(MsgOutcome::Delivered)
+        Ok(MsgOutcome::Delivered(None))
     }
 
     fn deliver(
@@ -2305,7 +2324,8 @@ impl Core {
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
-                id: None,
+                cursor: None,
+                reference: None,
                 sent_at: now,
                 queued: false,
                 media,
@@ -2314,7 +2334,7 @@ impl Core {
             for uid in uids {
                 r.send_to(uid, ev.clone());
             }
-            return Ok(MsgOutcome::Delivered);
+            return Ok(MsgOutcome::Delivered(None));
         };
 
         // Blocking, before anything is written. It applies to a message
@@ -2387,7 +2407,8 @@ impl Core {
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
-                id: None,
+                cursor: None,
+                reference: None,
                 sent_at: now,
                 queued: false,
                 media,
@@ -2396,7 +2417,7 @@ impl Core {
             for uid in uids {
                 r.send_to(uid, ev.clone());
             }
-            return Ok(MsgOutcome::Delivered);
+            return Ok(MsgOutcome::Delivered(None));
         }
 
         // The store decides both of the questions that used to be asked
@@ -2410,7 +2431,7 @@ impl Core {
         // second one. Answering it what the first send was answered is
         // what makes a client safe to retry after a socket died mid-ack.
         let (sender_nick, body) = (sender.nick.clone(), text);
-        let id = match store
+        let (id, reference, cursor) = match store
             .push(
                 &NewMessage {
                     recipient: to.mailbox.clone(),
@@ -2434,11 +2455,15 @@ impl Core {
             // fetch the bytes. A retry (`Existing`) captured on its
             // original send, and re-capturing here would grant the
             // recipient a *different* handle if the retry named one.
-            crate::inbox::Pushed::Stored(id) => {
+            crate::inbox::Pushed::Stored {
+                id,
+                reference,
+                cursor,
+            } => {
                 if let Some(handle) = &image {
                     self.media_capture(handle, audience.clone());
                 }
-                id
+                (id, reference, cursor)
             }
             crate::inbox::Pushed::Existing(m) => {
                 // An unsigned message under the id says something else.
@@ -2455,7 +2480,7 @@ impl Core {
                 // sitting right there. No notification — the original
                 // send already decided that question.
                 if m.delivered_at.is_some() {
-                    return Ok(MsgOutcome::Delivered);
+                    return Ok(MsgOutcome::Delivered(Some(m.reference)));
                 }
                 // `fresh` is `None`: this row has been in the inbox
                 // since the original send, however short a time that
@@ -2477,9 +2502,9 @@ impl Core {
                         .map_err(store_failed)
                         .unwrap_or(true);
                 return Ok(if delivered {
-                    MsgOutcome::Delivered
+                    MsgOutcome::Delivered(Some(m.reference))
                 } else {
-                    MsgOutcome::Queued(m.id)
+                    MsgOutcome::Queued(m.reference)
                 });
             }
             crate::inbox::Pushed::Full => return Err(ChatError::MailboxFull),
@@ -2550,7 +2575,7 @@ impl Core {
                         from: Some(&from_mailbox),
                         from_nick: &sender_nick,
                         text: &body,
-                        id,
+                        id: cursor,
                         unread,
                     },
                 ));
@@ -2558,9 +2583,9 @@ impl Core {
         }
 
         if delivered {
-            return Ok(MsgOutcome::Delivered);
+            return Ok(MsgOutcome::Delivered(Some(reference)));
         }
-        Ok(MsgOutcome::Queued(id))
+        Ok(MsgOutcome::Queued(reference))
     }
 
     /// Hand a session its waiting mail. Called at login completion (after
@@ -2843,7 +2868,8 @@ impl Core {
                             from_nick: m.sender_nick.clone(),
                             from_login,
                             text: m.body.clone(),
-                            id: Some(m.id),
+                            cursor: Some(m.cursor),
+                            reference: Some(m.reference),
                             sent_at: m.sent_at,
                             queued: Some(m.id) != fresh,
                             media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
@@ -2939,10 +2965,11 @@ impl Core {
     pub fn inbox_list(
         &self,
         uid: Uid,
-        before: Option<MessageId>,
+        before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, ChatError> {
         let (store, mailbox) = self.inbox_of(uid)?;
+        issued(store.as_ref(), &mailbox, before)?;
         let mut rows = store.list(&mailbox, before, limit).map_err(store_failed)?;
         // The same reply-address rule the delivered event carries: a row
         // whose sender no longer names an account a reply can reach
@@ -2982,12 +3009,11 @@ impl Core {
     /// Mark one session's mail read up to and including `up_to`, and
     /// answer with what is left.
     ///
-    /// `up_to` is a cursor in this mailbox, not a key: ids are
-    /// server-wide, so one the caller never received still marks
-    /// everything of *theirs* below it. What the store scopes is the
-    /// mailbox — no call here can mark another account's mail read.
-    pub fn inbox_mark_read(&self, uid: Uid, up_to: MessageId) -> Result<InboxCounts, ChatError> {
+    /// `up_to` is a cursor in this mailbox, and what the store scopes is
+    /// the mailbox — no call here can mark another account's mail read.
+    pub fn inbox_mark_read(&self, uid: Uid, up_to: Cursor) -> Result<InboxCounts, ChatError> {
         let (store, mailbox) = self.inbox_of(uid)?;
+        issued(store.as_ref(), &mailbox, Some(up_to))?;
         store
             .mark_read(&mailbox, up_to, SystemTime::now())
             .map_err(store_failed)?;
@@ -3083,6 +3109,15 @@ impl Core {
             .map_err(store_failed)?;
         self.block_changed(&mailbox, &other, false);
         Ok(())
+    }
+
+    /// An account gave up its link to `fingerprint`: its bare login's
+    /// cursors count on past the identity mailbox's
+    /// ([`MessageStore::unlinked`]).
+    pub fn inbox_unlinked(&self, login: &str, fingerprint: &[u8; 32]) {
+        if let Some(Err(e)) = self.inbox.as_ref().map(|s| s.unlinked(login, fingerprint)) {
+            warn!("inbox: {login} unlinking: {e}");
+        }
     }
 
     /// An account has linked an identity: move its mail onto the
@@ -5222,24 +5257,25 @@ mod inbox_tests {
         let (m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
 
-        assert_eq!(
-            core.msg(a, m, "hi".into(), None, None).unwrap(),
-            MsgOutcome::Delivered,
-            "a recipient who is there gets it now"
-        );
+        let MsgOutcome::Delivered(Some(sent)) = core.msg(a, m, "hi".into(), None, None).unwrap()
+        else {
+            panic!("a recipient who is there gets it now, and it is stored");
+        };
         match &msgs(drain(&mut rm))[..] {
             [Event::Msg {
                 from,
                 from_login,
                 text,
-                id,
+                cursor,
+                reference,
                 queued,
                 ..
             }] => {
                 assert_eq!(*from, a);
                 assert_eq!(from_login.as_deref(), Some("alice"));
                 assert_eq!(text, "hi");
-                assert!(id.is_some(), "stored, so it has a handle to mark read");
+                assert!(cursor.is_some(), "stored, so it has a cursor to mark read");
+                assert_eq!(*reference, Some(sent), "and the name its sender holds");
                 assert!(!queued, "it did not wait for anything");
             }
             other => panic!("expected one message, got {other:?}"),
@@ -5326,12 +5362,19 @@ mod inbox_tests {
         let (g, mut rg) = attach(&core, "guest", false);
         drain(&mut rg);
 
-        assert_eq!(
+        assert!(matches!(
             core.msg(a, g, "hi".into(), None, None).unwrap(),
-            MsgOutcome::Delivered
-        );
+            MsgOutcome::Delivered(_)
+        ));
         assert!(
-            matches!(&msgs(drain(&mut rg))[..], [Event::Msg { id: None, .. }]),
+            matches!(
+                &msgs(drain(&mut rg))[..],
+                [Event::Msg {
+                    cursor: None,
+                    reference: None,
+                    ..
+                }]
+            ),
             "nothing stored means no handle to mark read"
         );
         assert!(store.all().is_empty());
@@ -5353,13 +5396,13 @@ mod inbox_tests {
 
         // Live delivery to a session that is right there: fine, and the
         // nick shows, as it always did.
-        assert_eq!(
+        assert!(matches!(
             core.msg(g, m, "hello".into(), None, None).unwrap(),
-            MsgOutcome::Delivered
-        );
+            MsgOutcome::Delivered(_)
+        ));
         match &msgs(drain(&mut rm))[..] {
             [Event::Msg {
-                id: None,
+                cursor: None,
                 from_nick,
                 from_login,
                 ..
@@ -5438,8 +5481,8 @@ mod inbox_tests {
         let mut ids = Vec::new();
         let mut bodies = Vec::new();
         for e in msgs(drain(&mut rm)) {
-            if let Event::Msg { id, text, .. } = e {
-                ids.push(id.expect("stored mail carries an id"));
+            if let Event::Msg { cursor, text, .. } = e {
+                ids.push(cursor.expect("stored mail carries a cursor"));
                 bodies.push(text);
             }
         }
@@ -5478,10 +5521,12 @@ mod inbox_tests {
         // Dave logs in. The retry finds him.
         let (_m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
-        assert_eq!(
-            core.msg_login(a, "dave", "you there?".into(), Some(g), None)
-                .unwrap(),
-            MsgOutcome::Delivered,
+        assert!(
+            matches!(
+                core.msg_login(a, "dave", "you there?".into(), Some(g), None)
+                    .unwrap(),
+                MsgOutcome::Delivered(_)
+            ),
             "the retry is answered as of now, not as of the first send"
         );
         assert!(
@@ -5508,10 +5553,12 @@ mod inbox_tests {
         drain(&mut rl);
         assert!(core.connection_lost(phone, 8));
 
-        assert_eq!(
-            core.msg_login(a, "dave", "dinner?".into(), None, None)
-                .unwrap(),
-            MsgOutcome::Delivered,
+        assert!(
+            matches!(
+                core.msg_login(a, "dave", "dinner?".into(), None, None)
+                    .unwrap(),
+                MsgOutcome::Delivered(_)
+            ),
             "the laptop is right there"
         );
         assert!(
@@ -5541,9 +5588,11 @@ mod inbox_tests {
                 drain(rx);
             }
 
-            assert_eq!(
-                core.msg_login(a, "dave", "dinner?".into(), None, None),
-                Ok(MsgOutcome::Delivered),
+            assert!(
+                matches!(
+                    core.msg_login(a, "dave", "dinner?".into(), None, None),
+                    Ok(MsgOutcome::Delivered(_))
+                ),
                 "{wires:?}"
             );
             let stored = store.all();
@@ -5552,8 +5601,8 @@ mod inbox_tests {
                 assert!(
                     matches!(
                         &msgs(drain(rx))[..],
-                        [Event::Msg { text, id: Some(id), queued: false, .. }]
-                            if text == "dinner?" && *id == stored[0].id
+                        [Event::Msg { text, reference: Some(r), queued: false, .. }]
+                            if text == "dinner?" && *r == stored[0].reference
                     ),
                     "{wires:?}: every session hears it, once"
                 );
@@ -5613,16 +5662,18 @@ mod inbox_tests {
             let rows = store.all().len();
             let (_d1, mut r1) = attach(&core, "dave", true);
             let (_d2, mut r2) = attach_wire(&core, "dave", true, true);
-            assert_eq!(
-                core.msg_login(from, "dave", "live".into(), None, None),
-                Ok(MsgOutcome::Delivered),
+            assert!(
+                matches!(
+                    core.msg_login(from, "dave", "live".into(), None, None),
+                    Ok(MsgOutcome::Delivered(_))
+                ),
                 "{what}"
             );
             for rx in [&mut r1, &mut r2] {
                 assert!(
                     matches!(
                         &msgs(drain(rx))[..],
-                        [Event::Msg { id: None, text, .. }] if text == "live"
+                        [Event::Msg { cursor: None, text, .. }] if text == "live"
                     ),
                     "{what}: each session hears it, with no row"
                 );
@@ -5651,10 +5702,12 @@ mod inbox_tests {
             drain(&mut rp);
             drain(&mut rl);
 
-            assert_eq!(
-                core.msg(guest, laptop, "over here".into(), None, None)
-                    .unwrap(),
-                MsgOutcome::Delivered,
+            assert!(
+                matches!(
+                    core.msg(guest, laptop, "over here".into(), None, None)
+                        .unwrap(),
+                    MsgOutcome::Delivered(_)
+                ),
                 "{what}"
             );
             assert!(
@@ -5707,10 +5760,10 @@ mod inbox_tests {
         let (m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
 
-        assert_eq!(
+        assert!(matches!(
             core.msg_login(a, "dave", "hi".into(), None, None).unwrap(),
-            MsgOutcome::Delivered
-        );
+            MsgOutcome::Delivered(_)
+        ));
         assert!(matches!(
             &msgs(drain(&mut rm))[..],
             [Event::Msg { queued: false, .. }]
@@ -5792,13 +5845,13 @@ mod inbox_tests {
         // Someone who is there hears it, with no row kept and no id.
         let (m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
-        assert_eq!(
+        assert!(matches!(
             core.msg_login(a, "dave", "live".into(), None, None),
-            Ok(MsgOutcome::Delivered)
-        );
+            Ok(MsgOutcome::Delivered(_))
+        ));
         assert!(matches!(
             &msgs(drain(&mut rm))[..],
-            [Event::Msg { id: None, text, .. }] if text == "live"
+            [Event::Msg { cursor: None, text, .. }] if text == "live"
         ));
         assert_eq!(store.all().len(), 2, "nothing stored past the quota");
         core.end_session(m);
@@ -5845,12 +5898,13 @@ mod inbox_tests {
         drain(&mut rm);
         assert_eq!(
             core.msg_login(a, "dave", "last one".into(), Some(g), None),
-            Ok(MsgOutcome::Delivered)
+            Ok(MsgOutcome::Delivered(Some(id))),
+            "the one stored"
         );
         assert!(
             matches!(
                 &msgs(drain(&mut rm))[..],
-                [Event::Msg { id: Some(got), .. }] if *got == id
+                [Event::Msg { reference: Some(got), .. }] if *got == id
             ),
             "one copy, the stored one"
         );
@@ -5948,6 +6002,34 @@ mod inbox_tests {
         assert_eq!(core.flush_inbox(m), 0);
     }
 
+    /// An id from before schema 33 was the server's, so larger than any
+    /// cursor: read as one, it would mark or page mail the client never
+    /// saw. A cursor the mailbox never issued is refused instead.
+    #[test]
+    fn a_cursor_the_mailbox_never_issued_is_refused() {
+        let (core, store) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        for text in ["one", "two"] {
+            core.msg_login(a, "alice", text.into(), None, None).unwrap();
+        }
+        let (m, _rm) = attach(&core, "dave", true);
+        core.msg_login(m, "alice", "three".into(), None, None)
+            .unwrap();
+        assert_eq!(store.all().len(), 3);
+        assert_eq!(
+            core.inbox_mark_read(a, 4),
+            Err(ChatError::UnknownCursor),
+            "past the last"
+        );
+        assert_eq!(core.inbox_counts(a).unwrap().unread, 3, "nothing marked");
+        assert_eq!(
+            core.inbox_list(a, Some(4), 10),
+            Err(ChatError::UnknownCursor)
+        );
+        assert_eq!(core.inbox_mark_read(a, 3).unwrap().unread, 0, "the last is");
+        assert_eq!(core.inbox_list(a, Some(3), 10).unwrap().len(), 2);
+    }
+
     #[test]
     fn counts_and_marking_read_are_scoped_to_the_callers_own_account() {
         let (core, store) = server(&["alice", "dave"]);
@@ -5955,11 +6037,10 @@ mod inbox_tests {
         core.msg_login(a, "dave", "one".into(), None, None).unwrap();
         core.msg_login(a, "alice", "to myself".into(), None, None)
             .unwrap();
-        let dave_msg = store.all()[0].id;
-        let alice_msg = store.all()[1].id;
-        assert!(alice_msg > dave_msg);
+        let (dave_msg, alice_msg) = (store.all()[0].cursor, store.all()[1].cursor);
+        assert_eq!(alice_msg, dave_msg, "each the first of its mailbox");
 
-        // Alice naming an id that is not hers marks only her own mail.
+        // Alice naming a cursor dave's mail has too marks only her own.
         let left = core.inbox_mark_read(a, alice_msg).unwrap();
         assert_eq!(left.unread, 0, "alice's own is read");
         let (m, _rm) = attach(&core, "dave", true);
@@ -5977,14 +6058,14 @@ mod inbox_tests {
         let (m, mut rm) = attach(&core, "dave", true);
         drain(&mut rm);
 
-        assert_eq!(
+        assert!(matches!(
             core.msg(a, m, "hi".into(), None, None).unwrap(),
-            MsgOutcome::Delivered
-        );
+            MsgOutcome::Delivered(_)
+        ));
         assert!(matches!(
             &msgs(drain(&mut rm))[..],
             [Event::Msg {
-                id: None,
+                cursor: None,
                 queued: false,
                 ..
             }]
@@ -6088,10 +6169,10 @@ mod inbox_tests {
             [Event::Msg { text, .. }] if text == "private"
         ));
         // And live, under the login the directory still has.
-        assert_eq!(
+        assert!(matches!(
             core.msg_login(s, "alice", "again".into(), None, None),
-            Ok(MsgOutcome::Delivered)
-        );
+            Ok(MsgOutcome::Delivered(_))
+        ));
         assert!(matches!(
             &msgs(drain(&mut r_alicia))[..],
             [Event::Msg { text, .. }] if text == "again"
@@ -6391,7 +6472,7 @@ mod inbox_tests {
         fn mark_read(
             &self,
             to: &Mailbox,
-            up_to: MessageId,
+            up_to: Cursor,
             at: std::time::SystemTime,
         ) -> Result<usize, StoreError> {
             self.inner.mark_read(to, up_to, at)
@@ -6399,13 +6480,19 @@ mod inbox_tests {
         fn list(
             &self,
             to: &Mailbox,
-            before: Option<MessageId>,
+            before: Option<Cursor>,
             limit: usize,
         ) -> Result<Vec<StoredMessage>, StoreError> {
             self.inner.list(to, before, limit)
         }
         fn counts(&self, to: &Mailbox) -> Result<InboxCounts, StoreError> {
             self.inner.counts(to)
+        }
+        fn last_cursor(&self, of: &Mailbox) -> Result<Cursor, StoreError> {
+            self.inner.last_cursor(of)
+        }
+        fn unlinked(&self, login: &str, fingerprint: &[u8; 32]) -> Result<(), StoreError> {
+            self.inner.unlinked(login, fingerprint)
         }
         fn find_guid(
             &self,
@@ -6513,9 +6600,11 @@ mod inbox_tests {
             }
         }));
 
-        assert_eq!(
-            core.msg(a, m, "are you there".into(), None, None).unwrap(),
-            MsgOutcome::Delivered,
+        assert!(
+            matches!(
+                core.msg(a, m, "are you there".into(), None, None).unwrap(),
+                MsgOutcome::Delivered(_)
+            ),
             "the re-check after the write is what catches this"
         );
         let mut rx = resumed.lock().unwrap().take().expect("resumed");
@@ -6549,10 +6638,12 @@ mod inbox_tests {
             *slot.lock().unwrap() = Some(rx);
         }));
 
-        assert_eq!(
-            core.msg_login(a, "dave", "still up?".into(), None, None)
-                .unwrap(),
-            MsgOutcome::Delivered,
+        assert!(
+            matches!(
+                core.msg_login(a, "dave", "still up?".into(), None, None)
+                    .unwrap(),
+                MsgOutcome::Delivered(_)
+            ),
             "they were there by the time the row existed"
         );
         let mut rx = arrived.lock().unwrap().take().expect("attached");
@@ -6638,10 +6729,10 @@ mod notify_tests {
         let (a, _ra) = attach(&core, "alice", true);
         let (m, _rm) = attach(&core, "dave", true);
 
-        assert_eq!(
+        assert!(matches!(
             core.msg(a, m, "hi".into(), None, None).unwrap(),
-            MsgOutcome::Delivered
-        );
+            MsgOutcome::Delivered(_)
+        ));
         assert!(
             gw.sent().is_empty(),
             "a connection is attached and it got the event"

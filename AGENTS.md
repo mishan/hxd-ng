@@ -351,7 +351,8 @@ Three layers, all `cargo test --workspace`:
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
   blocks, retention, the sender's daily quota refusing only
-  what would have to wait), `news.rs` (threaded news on
+  what would have to wait, and a message named by one reference for
+  sender and recipient and paged by its mailbox's own cursor), `news.rs` (threaded news on
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
   hears that the news changed and who hears that it is theirs, following

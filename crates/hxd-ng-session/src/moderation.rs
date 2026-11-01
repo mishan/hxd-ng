@@ -118,7 +118,8 @@ pub fn report_json(r: &Report) -> Value {
             }
         }
         ReportTarget::Media(h) => target["media"] = json!(hxd_core::media::handle_str(&h)),
-        ReportTarget::Msg(id) => target["msg"] = json!(id),
+        ReportTarget::Msg(Some(r)) => target["msg"] = json!(crate::proto::b64url(&r)),
+        ReportTarget::Msg(None) => {}
         ReportTarget::Article(id) => target["article"] = json!(id),
         ReportTarget::User => {}
     }

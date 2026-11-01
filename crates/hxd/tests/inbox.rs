@@ -435,7 +435,7 @@ async fn ng_addresses_an_absent_account_and_a_legacy_client_reads_it() {
         )
         .await;
     assert_eq!(ok["queued"], true, "nobody was there to take it");
-    assert!(ok["id"].is_u64(), "and which stored message it became");
+    assert!(ok["ref"].is_string(), "and which stored message it became");
 
     // And the sender is gone by the time it is read — which is the case
     // the frame shape below has to answer.
@@ -590,13 +590,10 @@ async fn the_inbox_pages_backwards_and_read_state_is_scoped_to_its_owner() {
             .request_ok("msg", json!({ "to_login": "bob", "text": format!("m{i}") }))
             .await;
     }
-    // One for alice too, so "someone else's id" is a real id.
+    // One for alice too, under a cursor bob's mailbox has as well.
     let (mut bob, _) = Ng::login(srv.ng, "bob").await;
     bob.request_ok("msg", json!({ "to_login": "alice", "text": "for alice" }))
         .await;
-    let hers = alice.request_ok("inbox", json!({})).await["messages"][0]["id"]
-        .as_u64()
-        .unwrap();
 
     // Newest first, `limit` bounded, `before` walking backwards.
     let page = bob.request_ok("inbox", json!({ "limit": 2 })).await;
@@ -620,14 +617,84 @@ async fn the_inbox_pages_backwards_and_read_state_is_scoped_to_its_owner() {
         .collect();
     assert_eq!(texts, ["m2", "m1"], "the next page continues backwards");
 
-    // `up_to` is a cursor in the caller's own mailbox, so an id the
-    // caller never received cannot reach the mailbox it belongs to.
-    let left = bob.request_ok("msg_read", json!({ "up_to": hers })).await;
+    // `up_to` is a cursor in the caller's own mailbox, so the same
+    // number in another mailbox is not reached.
+    let newest = page["messages"][0]["id"].clone();
+    let left = bob.request_ok("msg_read", json!({ "up_to": newest })).await;
     assert_eq!(left["unread"], 0, "it moves the caller's own cursor");
     assert_eq!(
         alice.request_ok("inbox", json!({})).await["unread"],
         1,
-        "and marks nothing of the mailbox the id belongs to"
+        "and marks nothing of another mailbox"
+    );
+}
+
+/// A stored message is named by a reference its sender and its recipient
+/// both hold, and its recipient pages it by a cursor of that mailbox's
+/// own: neither says anything about anyone else's mail
+/// (`docs/private-messages.md` §5).
+#[tokio::test]
+async fn a_message_is_named_by_its_reference_and_counted_by_its_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = start_with(
+        dir.path(),
+        InboxPolicy::default(),
+        &["bob", "alice", "carol"],
+    )
+    .await;
+    let (mut bob, _) = Ng::login(srv.ng, "bob").await;
+    let (mut alice, _) = Ng::login(srv.ng, "alice").await;
+
+    let mut sent = Vec::new();
+    for (to, text) in [("bob", "one"), ("carol", "between"), ("bob", "two")] {
+        let ok = alice
+            .request_ok("msg", json!({ "to_login": to, "text": text }))
+            .await;
+        assert!(ok["ref"].is_string(), "{text}: stored, so named: {ok}");
+        assert!(
+            ok.get("id").is_none(),
+            "{text}: and no cursor of theirs: {ok}"
+        );
+        sent.push(ok["ref"].clone());
+    }
+    let (one, two) = (bob.msg_event().await, bob.msg_event().await);
+    assert_eq!(
+        (&one["ref"], &two["ref"]),
+        (&sent[0], &sent[2]),
+        "the recipient holds the name the sender was told"
+    );
+    assert_eq!(
+        (&one["id"], &two["id"]),
+        (&json!(1), &json!(2)),
+        "carol's mail in between is nothing to bob's cursors"
+    );
+    let rows = bob.request_ok("inbox", json!({})).await["messages"].clone();
+    let listed: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["id"].clone(), m["ref"].clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [(json!(2), sent[2].clone()), (json!(1), sent[0].clone())],
+        "and the inbox says the same"
+    );
+
+    // A cursor bob's mailbox never issued, such as an id from before
+    // there were cursors, which was the server's and larger, is refused
+    // rather than read: as an `up_to` it would mark what bob never saw.
+    for (req, params) in [
+        ("msg_read", json!({ "up_to": 3 })),
+        ("inbox", json!({ "before": 3 })),
+    ] {
+        let refused = bob.request(req, params).await;
+        assert_eq!(refused["error"]["code"], "bad_request", "{req}: {refused}");
+    }
+    assert_eq!(
+        bob.request_ok("inbox", json!({})).await["unread"],
+        2,
+        "nothing marked"
     );
 }
 
@@ -723,7 +790,10 @@ async fn the_same_guid_sent_twice_is_one_message() {
     assert_eq!(hello["inbox"]["unread"], 1, "one message, not two");
     let delivered = bob.msg_event().await;
     assert_eq!(delivered["text"], "did that send?");
-    assert_eq!(delivered["id"], first["id"], "the id the sender was told");
+    assert_eq!(
+        delivered["ref"], first["ref"],
+        "the reference the sender was told"
+    );
 
     // Anything that is not a uuid is refused rather than indexed.
     let junk = alice
