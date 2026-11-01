@@ -46,9 +46,10 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 
 | | Period client | Extended client (GtkHx) | ng client (hx-ng) |
 |---|---|---|---|
-| Public chat, private chats, user list, private messages | yes | yes | yes |
-| Kick, ban, broadcast, server notices | yes | yes | yes |
-| **Chat rooms** — curated and persistent, open to everyone or to a list | by `/join` to the server account, which invites them in | the same | yes |
+| Public chat, user list, private messages | yes | yes | yes |
+| Private chats — invite-only, made on the spot | yes | yes | — |
+| Kick, ban, broadcast, server notices | yes | yes | kick and ban; receives broadcasts |
+| **Chat rooms** — curated and persistent, open to everyone or to a list | by `/join` to the server account, which invites them in | the same | yes, on the wire; hx-ng does not show them yet |
 | **Moderation** — reports, redacting a chat line, revoking an image, purging someone's last hour | reports by `/report` to the server account; moderators get reports as messages | the same | yes |
 | **Private messages that wait for you** while you are away | receives them | receives them | sends, receives, reads later, blocks |
 | **Sessions that survive the network** — close the app, reopen, nothing missed | shown as away | shown as away | yes |
@@ -57,7 +58,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 | **Images in chat**, re-encoded and metadata-stripped by the server | sees the caption | yes | yes |
 | **Nick colors** — a color for your name, for the session (Colored Nicknames) | — | yes | sees them |
 | **Voice chat** — one room, one UDP port, no transcoding | — | yes | yes |
-| **Video** — camera and screen share on the voice connection, opt-in per stream | — | when GtkHx adds it | yes |
+| **Video** — camera and screen share on the voice connection, opt-in per stream | — | yes | yes |
 | **The file area** — browse, Get Info, download; upload into upload folders and drop boxes; whole folders either way; new folder, delete, rename, move, comments | yes | yes, plus files over 4 GiB and verified resume | yes, a file at a time |
 | **Threaded news** — markdown, references between articles, follows, search | reads and posts as plain text; 1.2 sees one category | reads and posts as plain text | yes |
 | **Push notifications** — a private message or a news reply while the app is closed | — | — | yes, as Web Push, sent by the server itself or through a uniqush-push sidecar |
@@ -69,9 +70,8 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 
 No official Hotline software ever had voice or video; they are community
 extensions, and today GtkHx and hx-ng are the two clients that speak them.
-Between them that is voice on Linux, macOS and Windows desktops and in
-the browser on a phone, in one room. Video is in hx-ng now and reaches
-GtkHx when its rendering lands.
+Between them that is voice and video on Linux, macOS and Windows
+desktops and in the browser on a phone, in one room.
 
 **Not built yet, and worth knowing before you run this:**
 
@@ -90,8 +90,8 @@ GtkHx when its rendering lands.
 
 If you need a complete classic Hotline server today,
 [Mobius](https://github.com/jhalter/mobius) is the one to run. If you want
-the ng wire — phones, surviving sessions, offline messages, voice with
-GtkHx — this is the only server that has it.
+the ng wire — phones, surviving sessions, offline messages, voice and
+video with GtkHx — this is the only server that has it.
 
 ## What it aims to offer
 
@@ -120,8 +120,8 @@ maintainer:
 
 | Client | Platforms | Wire | Notes |
 |---|---|---|---|
-| [GtkHx](https://github.com/mishan/gtkhx) | Linux, macOS, Windows | classic, with extensions | Voice, inline images, chat history, UTF-8, TLS, large files. The reference for the extended tier above |
-| [hx-ng](https://github.com/mishan/hx-ng) | any browser, including phones | ng | Chat, user list, private messages, news, files, identity, voice and video. Static files; put it in front of your server |
+| [GtkHx](https://github.com/mishan/gtkhx) | Linux, macOS, Windows | classic, with extensions | Voice and video, inline images, chat history, UTF-8, TLS, large files. The reference for the extended tier above |
+| [hx-ng](https://github.com/mishan/hx-ng) | any browser, including phones | ng; classic through a relay | Chat, user list, private messages, news, files, identity, voice and video. Static files; put it in front of your server |
 | [Hotline Navigator](https://hotlinenavigator.com/) | macOS, Windows, Linux, iOS, Android | classic | A modern cross-platform client with TLS and inline previews; [source](https://github.com/fuzzywalrus/Hotline-Navigator) |
 | [Hotline](https://github.com/mierau/hotline) by Dustin Mierau | macOS, iOS, iPadOS | classic | A remake by the original author |
 | [Hermes](https://github.com/fogWraith/Hotline) by fogWraith | — | classic, with extensions | Alpha, alongside the Janus server and the extension specs |
