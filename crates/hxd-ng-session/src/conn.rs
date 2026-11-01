@@ -1917,16 +1917,21 @@ async fn dispatch(
                         match off_reactor(&ctx.core, move |c| c.history_ids(uid, room, &ids)).await
                         {
                             Some(Ok(lines)) => {
-                                let mut bytes = 0;
+                                // The whole reply is held to the bound: its
+                                // envelope, at its longest, and each line
+                                // with the comma before it.
+                                let empty = json!({ "lines": [], "has_more": false });
+                                let mut bytes = reply_ok(req.id, empty).len();
                                 let mut shown = Vec::with_capacity(lines.len());
                                 for line in &lines {
                                     let fetchable = ctx.core.history_media_fetchable(uid, line);
                                     let mut v = history_line_json(line, fetchable);
                                     crate::replies::add(&mut v, line.re.as_ref(), true);
-                                    bytes += v.to_string().len();
-                                    if bytes > IDS_REPLY_BYTES && !shown.is_empty() {
+                                    let more = v.to_string().len() + usize::from(!shown.is_empty());
+                                    if bytes + more > IDS_REPLY_BYTES && !shown.is_empty() {
                                         break;
                                     }
+                                    bytes += more;
                                     shown.push(v);
                                 }
                                 let has_more = shown.len() < lines.len();

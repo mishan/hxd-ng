@@ -524,6 +524,39 @@ async fn history_ids_answer_under_the_readers_own_checks_and_bound() {
     );
 }
 
+/// The bound is on the reply as it is written, envelope and commas
+/// included: lines that fit it alone and not with those are cut short.
+#[tokio::test]
+async fn history_ids_hold_the_whole_reply_to_its_bound() {
+    const BOUND: usize = 64 * 1024;
+    const LINES: usize = 16;
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    // Ids of two digits from here, so every line is written as long.
+    for _ in 0..9 {
+        say(&mut alice, json!({ "text": "filler" })).await;
+    }
+    let probe = say(&mut alice, json!({ "text": "x" })).await;
+    let one = ok(&mut alice, "history", json!({ "ids": [probe] })).await;
+    let base = one["lines"][0].to_string().len() - 1;
+    // Lines that together come within a few bytes of the bound.
+    let text = "x".repeat((BOUND - 4) / LINES - base);
+    let mut said = Vec::new();
+    for _ in 0..LINES {
+        said.push(say(&mut alice, json!({ "text": text })).await);
+    }
+    let got = ok(&mut alice, "history", json!({ "ids": said })).await;
+    let lines = got["lines"].as_array().unwrap();
+    let written = json!({ "reply": u64::MAX, "ok": got }).to_string().len();
+    assert!(
+        written <= BOUND,
+        "{written} bytes for {} lines",
+        lines.len()
+    );
+    assert_eq!(got["has_more"], true);
+}
+
 #[tokio::test]
 async fn a_redacted_reply_loses_its_target_and_a_reply_to_a_redacted_line_keeps_it() {
     let td = tempfile::tempdir().unwrap();
