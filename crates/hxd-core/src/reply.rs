@@ -18,8 +18,8 @@ pub enum Reply {
     /// the lobby), which is the room the reply is said in.
     Line { room: u32, id: LineId },
     /// An instant message, by its sender's login and its guid, which
-    /// both parties hold.
-    Im { login: String, guid: MessageGuid },
+    /// both parties hold. Made by [`Reply::im`] alone.
+    Im(ImTarget),
     /// A stored private or instant message, by its reference.
     Pm(MessageRef),
     /// A signed line or message, by its signer, its id and the hash of
@@ -30,6 +30,24 @@ pub enum Reply {
         id: [u8; 16],
         hash: [u8; 32],
     },
+}
+
+/// An instant message target, its fields private so that every one
+/// made is one [`Reply::pack`] can keep and [`Reply::unpack`] read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImTarget {
+    login: String,
+    guid: MessageGuid,
+}
+
+impl ImTarget {
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+
+    pub fn guid(&self) -> &MessageGuid {
+        &self.guid
+    }
 }
 
 const LINE: u8 = 1;
@@ -53,9 +71,11 @@ pub fn guid_of(b: &[u8]) -> Option<MessageGuid> {
 }
 
 impl Reply {
-    /// An instant message target, unless its login is too long to keep.
+    /// An instant message target, unless its login is empty or too long
+    /// to keep.
     pub fn im(login: String, guid: MessageGuid) -> Option<Self> {
-        (!login.is_empty() && 18 + login.len() <= MAX_PACKED).then_some(Reply::Im { login, guid })
+        (!login.is_empty() && 18 + login.len() <= MAX_PACKED)
+            .then_some(Reply::Im(ImTarget { login, guid }))
     }
 
     /// How the stores keep it: a kind byte and the kind's fields.
@@ -67,7 +87,7 @@ impl Reply {
                 out.extend_from_slice(&room.to_be_bytes());
                 out.extend_from_slice(&id.to_be_bytes());
             }
-            Reply::Im { login, guid } => {
+            Reply::Im(ImTarget { login, guid }) => {
                 out.push(IM);
                 out.extend_from_slice(&guid_bytes(guid));
                 out.push(login.len() as u8);
@@ -134,10 +154,21 @@ mod tests {
         }
     }
 
+    /// The only way to an instant message target, so none that `unpack`
+    /// would refuse can reach a store.
+    #[test]
+    fn an_im_target_is_made_only_as_pack_can_keep_it() {
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        for (case, login) in [
+            ("an empty login", String::new()),
+            ("past the bound", "a".repeat(MAX_PACKED - 17)),
+        ] {
+            assert_eq!(Reply::im(login, guid.clone()), None, "{case}");
+        }
+    }
+
     #[test]
     fn what_was_never_packed_does_not_unpack() {
-        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
-        assert_eq!(Reply::im("a".repeat(MAX_PACKED - 17), guid), None);
         let line = Reply::Line { room: 0, id: 1 }.pack();
         for bad in [&[][..], &[0], &[4, 0], &line[..12], &[PM; 16]] {
             assert_eq!(Reply::unpack(bad), None, "{bad:?}");

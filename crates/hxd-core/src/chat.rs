@@ -967,7 +967,7 @@ impl Core {
             let in_room = |re: &Reply| match re {
                 Reply::Line { room: r, .. } => *r == room,
                 Reply::Signed { .. } => true,
-                Reply::Im { .. } | Reply::Pm(_) => false,
+                Reply::Im(_) | Reply::Pm(_) => false,
             };
             if re.as_ref().is_some_and(|re| !in_room(re)) {
                 results[i] = Some(Err(ChatError::ReplyScope));
@@ -2285,8 +2285,8 @@ impl Core {
         let ok = match re {
             Reply::Line { .. } => false,
             Reply::Signed { .. } | Reply::Pm(_) => true,
-            Reply::Im { login, .. } => {
-                login.eq_ignore_ascii_case(me) || login.eq_ignore_ascii_case(them)
+            Reply::Im(im) => {
+                im.login().eq_ignore_ascii_case(me) || im.login().eq_ignore_ascii_case(them)
             }
         };
         if ok {

@@ -32,7 +32,7 @@ fn kind(re: &Reply) -> &'static str {
     match re {
         Reply::Line { .. } => "line",
         Reply::Pm(_) => "pm",
-        Reply::Im { .. } => "im",
+        Reply::Im(_) => "im",
         Reply::Signed { .. } => "signed",
     }
 }
@@ -104,7 +104,7 @@ pub(crate) fn json(re: &Reply) -> Value {
         Reply::Line { room: 0, id } => json!({ "line": id }),
         Reply::Line { room, id } => json!({ "line": id, "room": room }),
         Reply::Pm(r) => json!({ "pm": b64url(r) }),
-        Reply::Im { login, guid } => json!({ "im": { "login": login, "guid": guid.as_str() } }),
+        Reply::Im(im) => json!({ "im": { "login": im.login(), "guid": im.guid().as_str() } }),
         Reply::Signed { signer, id, hash } => json!({ "signed": {
             "signer": Fingerprint(*signer).to_string(),
             "id": guid_of(id).expect("any 16 bytes are a guid").as_str(),
