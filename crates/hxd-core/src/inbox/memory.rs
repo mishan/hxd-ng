@@ -192,10 +192,9 @@ fn renumber(inner: &mut Inner, moves: impl Fn(&Mailbox) -> bool, from: &str, int
         .iter_mut()
         .filter(|m| is_mail(m) && moves(&m.recipient))
         .collect();
-    if moving.is_empty() {
-        return;
-    }
     moving.sort_by_key(|m| m.cursor);
+    // Raised even when nothing moves: `from` issued its cursors whether
+    // or not its rows are still here.
     let mut last = from_last.max(into_last);
     for m in moving {
         last += 1;

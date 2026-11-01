@@ -314,7 +314,9 @@ carries over, so no client's go stale. Into one that did, what moves is
 numbered after the last place of either, in the order it had: the kept
 mailbox's rows keep theirs, and no place either mailbox showed its owner
 is handed out twice. A claim with nothing to move, which every login of
-a linked account makes, changes nothing to the kept mailbox. A claim
+a linked account makes, changes no place; it still raises the kept
+mailbox's count to the login's, whose mail may have been pruned after
+issuing its places. A claim
 drops the login's own count with its mail, so whoever holds the login
 next starts from nothing; an unlink (§4) raises it past the identity's
 again, so the owner is never shown a place twice.

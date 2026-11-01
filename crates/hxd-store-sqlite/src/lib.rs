@@ -1865,12 +1865,14 @@ fn renumber(
             params![into, from, fresh, from_last.max(into_last)],
         )
         .map_err(StoreError::new)?;
+    // Raised even when nothing moves: `from` issued its cursors whether
+    // or not its rows are still here.
     let into_now = if fresh {
         from_last
     } else {
         into_last.max(from_last) + moved as i64
     };
-    if into_now > into_last && (fresh || moved > 0) {
+    if into_now > into_last {
         tx.execute(
             "INSERT INTO mailbox_seq (mailbox, last) VALUES (?1, ?2)
                ON CONFLICT (mailbox) DO UPDATE SET last = excluded.last",

@@ -47,6 +47,7 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     a_merge_numbers_what_it_moves_after_both_mailboxes(&*new_store().inbox);
     an_unlinked_login_counts_on_past_its_identity(&*new_store().inbox);
     a_merge_into_a_fresh_mailbox_keeps_its_cursors(&*new_store().inbox);
+    a_claim_that_moves_nothing_keeps_the_logins_count(&*new_store().inbox);
     counts_of_a_mailbox_with_no_mail_are_zero(&*new_store().inbox);
     prune_ages_unread_from_sent_and_read_from_read(&*new_store().inbox);
     a_retention_window_older_than_the_clock_prunes_nothing(&*new_store().inbox);
@@ -335,6 +336,42 @@ fn a_merge_into_a_fresh_mailbox_keeps_its_cursors(s: &dyn MessageStore) {
         place(s, &msg(&bare, &alice, "to whoever holds dave now", at(6))),
         1,
         "{case}: the claimed login's count went with its mail"
+    );
+}
+
+/// A login whose mail was all pruned has still issued its cursors: a
+/// claim that moves nothing carries its count all the same, so the
+/// owner is never shown one of them again, by the identity or after an
+/// unlink.
+fn a_claim_that_moves_nothing_keeps_the_logins_count(s: &dyn MessageStore) {
+    let case = "a_claim_that_moves_nothing_keeps_the_logins_count";
+    let alice = Mailbox::login("alice");
+    let (bare, linked) = (Mailbox::login("dave"), Mailbox::identified("dave", fp(1)));
+    let day = Duration::from_secs(86_400);
+    place(s, &msg(&linked, &alice, "kept", at(10) + day));
+    for i in 0..3 {
+        place(s, &msg(&bare, &alice, "pruned", at(i)));
+    }
+    assert_eq!(
+        s.prune(at(10) + day, day, day).unwrap(),
+        3,
+        "{case}: pruned"
+    );
+    assert_eq!(
+        s.claim("dave", &fp(1)).unwrap(),
+        0,
+        "{case}: nothing to move"
+    );
+    assert_eq!(
+        place(s, &msg(&linked, &alice, "next", at(11) + day)),
+        4,
+        "{case}: past the login's three"
+    );
+    s.unlinked("dave", &fp(1)).unwrap();
+    assert_eq!(
+        place(s, &msg(&bare, &alice, "after", at(12) + day)),
+        5,
+        "{case}: and past the identity's after an unlink"
     );
 }
 
