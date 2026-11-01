@@ -36,6 +36,7 @@ use hxd_core::inbox::{
     Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
     MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
 };
+use hxd_core::reaction::{reactor_key, ReactAct, Reacted, ReactionKey, Reactions};
 use hxd_core::relationships::{RelationId, SentOn};
 use hxd_core::reply::Reply;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -76,7 +77,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -962,6 +963,31 @@ ALTER TABLE chat_line ADD COLUMN re BLOB;
 ALTER TABLE message ADD COLUMN re BLOB;
 ";
 
+/// Reactions on public lines (`hxd_core::reaction`), one row each: a key
+/// as `ReactionKey::pack` writes it, and its account by the mailbox rule
+/// in one column, `f:` and the fingerprint's hex or `l:` and the login,
+/// so that one account holds a key on a line once. The nick is the one
+/// it reacted under, for saying who reacted without a join. A line's go
+/// with it, however it goes: no foreign keys are enforced here, so a
+/// trigger rather than a cascade.
+const SCHEMA_V35: &str = "
+CREATE TABLE chat_reaction (
+  id      INTEGER PRIMARY KEY,
+  line    INTEGER NOT NULL,
+  key     BLOB    NOT NULL,
+  reactor TEXT    NOT NULL,
+  nick    TEXT    NOT NULL,
+  at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX chat_reaction_one ON chat_reaction (line, key, reactor);
+CREATE INDEX chat_reaction_who ON chat_reaction (line, key, at);
+CREATE INDEX chat_reaction_by ON chat_reaction (reactor, at);
+CREATE TRIGGER chat_reaction_line_gone AFTER DELETE ON chat_line
+BEGIN
+  DELETE FROM chat_reaction WHERE line = old.id;
+END;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1710,6 +1736,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 34 {
         steps.push_str(SCHEMA_V34);
+    }
+    if version < 35 {
+        steps.push_str(SCHEMA_V35);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -2829,6 +2858,21 @@ fn collect_history(
         .collect()
 }
 
+impl SqliteStore {
+    /// How many reactions `who`'s account holds: what `hxd inbox purge`
+    /// would take of them.
+    pub fn reactions_held(&self, who: &Mailbox) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM chat_reaction WHERE reactor = ?1",
+            params![reactor_key(who)],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .map_err(StoreError::new)
+    }
+}
+
 impl ChatLog for SqliteStore {
     /// One transaction: one commit, and one write of each page the lines
     /// touch, where a commit each wrote the table's and its indexes' last
@@ -2998,10 +3042,11 @@ impl ChatLog for SqliteStore {
     }
 
     fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
         // A second redaction of the same line keeps the first one's who
         // and when: the record of a removal is of the removal.
-        let changed = conn
+        let changed = tx
             .execute(
                 "UPDATE chat_line
                     SET nick = '', body = '', signed = NULL, signed_content = NULL,
@@ -3018,6 +3063,12 @@ impl ChatLog for SqliteStore {
                 ],
             )
             .map_err(StoreError::new)?;
+        tx.execute(
+            "DELETE FROM chat_reaction WHERE line = ?1",
+            params![clamp_id(id)],
+        )
+        .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
         Ok(changed != 0)
     }
 
@@ -3164,6 +3215,194 @@ impl ChatLog for SqliteStore {
             |r| r.get(0),
         )
         .map_err(StoreError::new)
+    }
+
+    fn react(&self, act: &ReactAct) -> Result<Reacted, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        // Immediate, as `prune` is: the first statement is a read.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let (line, key, reactor) = (clamp_id(act.line), act.key.pack(), reactor_key(act.who));
+        let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64, StoreError> {
+            tx.query_row(sql, p, |r| r.get(0)).map_err(StoreError::new)
+        };
+        let live = one(
+            "SELECT COUNT(*) FROM chat_line WHERE id = ?1 AND channel = ?2 AND flags & ?3 = 0",
+            params![
+                line,
+                i64::from(act.channel),
+                i64::from(LineFlags::DELETED.bits())
+            ],
+        )?;
+        if live == 0 {
+            return Ok(Reacted::NoSuchLine);
+        }
+        let held = one(
+            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
+            params![line, key, reactor],
+        )? > 0;
+        if act.add && !held {
+            let keyed = one(
+                "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
+                params![line, key],
+            )? > 0;
+            let keys = one(
+                "SELECT COUNT(DISTINCT key) FROM chat_reaction WHERE line = ?1",
+                params![line],
+            )?;
+            if !keyed && keys as usize >= act.max_keys {
+                return Ok(Reacted::TooManyKeys);
+            }
+            let yours = one(
+                "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND reactor = ?2",
+                params![line, reactor],
+            )?;
+            if yours as usize >= act.max_per_user {
+                return Ok(Reacted::TooManyOfYours);
+            }
+            tx.execute(
+                "INSERT INTO chat_reaction (line, key, reactor, nick, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![line, key, reactor, act.nick, unix(act.at)],
+            )
+            .map_err(StoreError::new)?;
+        } else if !act.add && held {
+            tx.execute(
+                "DELETE FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
+                params![line, key, reactor],
+            )
+            .map_err(StoreError::new)?;
+        }
+        let count = one(
+            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
+            params![line, key],
+        )?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(Reacted::Count(u32::try_from(count).unwrap_or(u32::MAX)))
+    }
+
+    /// Two queries for a page, whatever its length: every line's keys
+    /// and counts, and the reader's own.
+    fn reactions(
+        &self,
+        ids: &[LineId],
+        reader: Option<&hxd_core::inbox::Mailbox>,
+    ) -> Result<HashMap<LineId, Reactions>, StoreError> {
+        let mut out: HashMap<LineId, Reactions> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().unwrap();
+        let marks = vec!["?"; ids.len()].join(", ");
+        let binds = || ids.iter().map(|&id| clamp_id(id));
+        let sql = format!(
+            "SELECT line, key, COUNT(*) FROM chat_reaction WHERE line IN ({marks})
+              GROUP BY line, key ORDER BY line, MIN(id)"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(StoreError::new)?;
+        for row in rows {
+            let (line, key, count) = row.map_err(StoreError::new)?;
+            if let (Ok(line), Some(key)) = (LineId::try_from(line), ReactionKey::unpack(&key)) {
+                let count = u32::try_from(count).unwrap_or(u32::MAX);
+                out.entry(line).or_default().keys.push((key, count));
+            }
+        }
+        let Some(reader) = reader.filter(|_| !out.is_empty()) else {
+            return Ok(out);
+        };
+        let sql =
+            format!("SELECT line, key FROM chat_reaction WHERE line IN ({marks}) AND reactor = ?");
+        let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+        let reactor = rusqlite::types::Value::Text(reactor_key(reader));
+        let binds = binds()
+            .map(rusqlite::types::Value::Integer)
+            .chain(std::iter::once(reactor));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(StoreError::new)?;
+        for row in rows {
+            let (line, key) = row.map_err(StoreError::new)?;
+            let (Ok(line), Some(key)) = (LineId::try_from(line), ReactionKey::unpack(&key)) else {
+                continue;
+            };
+            if let Some(shown) = out.get_mut(&line) {
+                if let Some(i) = shown.keys.iter().position(|(k, _)| *k == key) {
+                    shown.mine.extend(u8::try_from(i).ok());
+                }
+            }
+        }
+        for shown in out.values_mut() {
+            shown.mine.sort_unstable();
+        }
+        Ok(out)
+    }
+
+    fn forget_reactions(
+        &self,
+        who: &hxd_core::inbox::Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let reactor = reactor_key(who);
+        let lines: Vec<i64> = tx
+            .prepare(
+                "SELECT DISTINCT line FROM chat_reaction WHERE reactor = ?1 AND at >= ?2
+                  ORDER BY line",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![reactor, unix(since)], |r| r.get(0))?
+                    .collect()
+            })
+            .map_err(StoreError::new)?;
+        tx.execute(
+            "DELETE FROM chat_reaction WHERE reactor = ?1 AND at >= ?2",
+            params![reactor, unix(since)],
+        )
+        .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(lines
+            .into_iter()
+            .filter_map(|l| LineId::try_from(l).ok())
+            .collect())
+    }
+
+    fn rekey_reactions(
+        &self,
+        from: &hxd_core::inbox::Mailbox,
+        to: &hxd_core::inbox::Mailbox,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(StoreError::new)?;
+        let (from, to) = (reactor_key(from), reactor_key(to));
+        tx.execute(
+            "DELETE FROM chat_reaction WHERE reactor = ?1 AND EXISTS (
+               SELECT 1 FROM chat_reaction AS held
+                WHERE held.line = chat_reaction.line AND held.key = chat_reaction.key
+                  AND held.reactor = ?2)",
+            params![from, to],
+        )
+        .map_err(StoreError::new)?;
+        tx.execute(
+            "UPDATE chat_reaction SET reactor = ?2 WHERE reactor = ?1",
+            params![from, to],
+        )
+        .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)
     }
 
     fn find_guid(
@@ -3703,6 +3942,60 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_thirty_four_migrates_into_lines_that_take_reactions_and_lose_them() {
+        use hxd_core::history::Retention;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'old', 1);
+                 INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'new', 2);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 34).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let bob = Mailbox::login("bob");
+        let key = ReactionKey::emoji("👍").unwrap();
+        for line in [1, 2] {
+            let act = ReactAct {
+                channel: 0,
+                line,
+                who: &bob,
+                nick: "bob",
+                key: &key,
+                add: true,
+                at: UNIX_EPOCH,
+                max_keys: 20,
+                max_per_user: 5,
+            };
+            assert_eq!(store.react(&act).unwrap(), Reacted::Count(1));
+        }
+        let keep = Retention {
+            max_lines: 1,
+            max_age: None,
+            channels: Vec::new(),
+        };
+        assert_eq!(ChatLog::prune(&store, &keep, UNIX_EPOCH).unwrap(), 1);
+        let left: Vec<LineId> = store
+            .reactions(&[1, 2], None)
+            .unwrap()
+            .into_keys()
+            .collect();
+        assert_eq!(left, [2]);
     }
 
     #[test]

@@ -109,7 +109,9 @@ has to be typed.
    act, with §3.2's default block, and the one audit row records the
    hash; the media metadata columns stay, so a history entry can still
    say "[image removed]".
-4. `Event::ChatRedacted { id }` to every session that reads public
+4. Its reactions (hotline-ng.md §7.3) are deleted with its words: a
+   tombstone has none.
+5. `Event::ChatRedacted { id }` to every session that reads public
    chat.
 
 A signed line's detached form goes with its words, into the audit
@@ -167,7 +169,10 @@ fingerprint for exactly this (chat-history.md §3.3). A uid names the
 identity behind the session; a plain guest has none, and is kicked
 rather than purged. The purge also answers every open report on the
 person, and the news arm of news.md §11 deletes their articles in the
-window under the same row.
+window under the same row. The reactions they made in the window go
+too, wherever they are, by the same identity (hotline-ng.md §7.3); the
+lines they were on are not announced yet, and a client sees the counts
+fall the next time it reads them.
 
 Every path that bans — `kick { ban }` on the ng wire, a legacy kick
 with ban, an entry added to the ban list, and `kick { purge }` — also

@@ -3261,6 +3261,7 @@ impl Core {
             warn!("inbox: re-stamping {login}'s merged friendships: {e}");
         }
         let claimed = Mailbox::identified(login, *fingerprint);
+        self.rekey_reactions(&Mailbox::login(login), &claimed);
         self.rekey_friends(&Mailbox::login(login), &claimed);
         // A claim runs at every login of a linked account; only one
         // that moved rows can have folded a block beside a friendship.
@@ -3289,6 +3290,7 @@ impl Core {
     /// `hxd inbox purge` purges the stores from a process of its own (see
     /// `news_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
+        self.forget_reactions(of, Duration::MAX);
         self.news_subs_purge(of);
         self.devices_purge(of);
         self.purge_relationships(of);
@@ -3659,6 +3661,30 @@ mod tests {
         fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
             self.inner.holds_home_key(key)
         }
+        fn react(
+            &self,
+            act: &crate::reaction::ReactAct,
+        ) -> Result<crate::reaction::Reacted, StoreError> {
+            self.inner.react(act)
+        }
+        fn reactions(
+            &self,
+            ids: &[crate::history::LineId],
+            reader: Option<&Mailbox>,
+        ) -> Result<HashMap<crate::history::LineId, crate::reaction::Reactions>, StoreError>
+        {
+            self.inner.reactions(ids, reader)
+        }
+        fn forget_reactions(
+            &self,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
+            self.inner.forget_reactions(who, since)
+        }
+        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+            self.inner.rekey_reactions(from, to)
+        }
         fn attach_media(
             &self,
             id: crate::history::LineId,
@@ -3923,6 +3949,30 @@ mod tests {
         }
         fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
             self.inner.holds_home_key(key)
+        }
+        fn react(
+            &self,
+            act: &crate::reaction::ReactAct,
+        ) -> Result<crate::reaction::Reacted, StoreError> {
+            self.inner.react(act)
+        }
+        fn reactions(
+            &self,
+            ids: &[crate::history::LineId],
+            reader: Option<&Mailbox>,
+        ) -> Result<HashMap<crate::history::LineId, crate::reaction::Reactions>, StoreError>
+        {
+            self.inner.reactions(ids, reader)
+        }
+        fn forget_reactions(
+            &self,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
+            self.inner.forget_reactions(who, since)
+        }
+        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+            self.inner.rekey_reactions(from, to)
         }
         fn attach_media(
             &self,
@@ -4257,6 +4307,30 @@ mod tests {
         }
         fn holds_home_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
             self.0.holds_home_key(key)
+        }
+        fn react(
+            &self,
+            act: &crate::reaction::ReactAct,
+        ) -> Result<crate::reaction::Reacted, StoreError> {
+            self.0.react(act)
+        }
+        fn reactions(
+            &self,
+            ids: &[crate::history::LineId],
+            reader: Option<&Mailbox>,
+        ) -> Result<HashMap<crate::history::LineId, crate::reaction::Reactions>, StoreError>
+        {
+            self.0.reactions(ids, reader)
+        }
+        fn forget_reactions(
+            &self,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
+            self.0.forget_reactions(who, since)
+        }
+        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+            self.0.rekey_reactions(from, to)
         }
     }
 

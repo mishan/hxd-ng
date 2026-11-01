@@ -306,6 +306,12 @@ generate() {
         num HXD_HISTORY_MAX_DAYS max_days
         db=
     fi
+    if on HXD_REACTIONS off; then
+        on HXD_HISTORY on || die "HXD_REACTIONS needs HXD_HISTORY"
+        echo
+        echo "[reactions]"
+        echo "enabled = true"
+    fi
     if on HXD_NEWS on; then
         echo
         echo "[news]"

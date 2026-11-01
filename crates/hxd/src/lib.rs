@@ -77,6 +77,10 @@ pub struct Config {
     pub messaging: Option<MessagingSection>,
     /// Server-held public-chat scrollback. Absent = disabled.
     pub history: Option<HistorySection>,
+    /// Reactions on public lines, on the ng wire (`docs/hotline-ng.md`
+    /// §7.3). Absent, or `enabled` left off, = none. Lines take them only
+    /// where `[history]` keeps lines.
+    pub reactions: Option<ReactionsSection>,
     /// Inline media (`docs/inline-media.md` §11). Absent = disabled: no
     /// capability bit 3 on the legacy wire, no `media` cap on the ng
     /// one, and no `/media` routes.
@@ -1456,6 +1460,68 @@ fn default_max_sent_per_day() -> usize {
 }
 fn default_max_sent_bytes_per_day() -> u64 {
     hxd_core::InboxPolicy::default().max_sent_bytes_per_day
+}
+
+/// `[reactions]`: the draft's `Reactions.*` settings, its defaults
+/// [`hxd_core::ReactionPolicy`]'s.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReactionsSection {
+    /// Off unless turned on, as the draft has it.
+    pub enabled: bool,
+    /// Distinct keys one line may carry, 1 to 255.
+    pub max_keys: usize,
+    /// Keys one account may hold on one line, 1 to `max_keys`.
+    pub max_per_user: usize,
+    /// One account's reactions at once, and how many a second it earns
+    /// back.
+    pub burst: u32,
+    pub per_second: u32,
+    /// Whether a reader who may not post in a room may react there:
+    /// `allow` or `deny`.
+    pub read_only_rooms: AllowDeny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllowDeny {
+    Allow,
+    Deny,
+}
+
+impl Default for ReactionsSection {
+    fn default() -> Self {
+        let p = hxd_core::ReactionPolicy::default();
+        ReactionsSection {
+            enabled: false,
+            max_keys: p.max_keys,
+            max_per_user: p.max_per_user,
+            burst: p.burst,
+            per_second: p.per_second,
+            read_only_rooms: AllowDeny::Allow,
+        }
+    }
+}
+
+impl ReactionsSection {
+    pub fn policy(&self) -> Result<hxd_core::ReactionPolicy, String> {
+        if !(1..=hxd_core::reaction::MAX_KEYS_CEILING).contains(&self.max_keys) {
+            return Err("[reactions] max_keys must be 1 to 255".into());
+        }
+        if !(1..=self.max_keys).contains(&self.max_per_user) {
+            return Err("[reactions] max_per_user must be 1 to max_keys".into());
+        }
+        if self.burst == 0 || self.per_second == 0 {
+            return Err("[reactions] burst and per_second must be above 0".into());
+        }
+        Ok(hxd_core::ReactionPolicy {
+            max_keys: self.max_keys,
+            max_per_user: self.max_per_user,
+            burst: self.burst,
+            per_second: self.per_second,
+            read_only_rooms: self.read_only_rooms == AllowDeny::Allow,
+        })
+    }
 }
 
 /// Instant messaging (`docs/instant-messaging.md` §8), the extension's
@@ -3454,6 +3520,12 @@ pub fn check_config(config: &Config) -> Result<(), String> {
     if let Some(inbox) = &config.inbox {
         inbox.policy().check()?;
     }
+    if let Some(reactions) = &config.reactions {
+        reactions.policy()?;
+        if reactions.enabled && config.history.is_none() {
+            return Err("[reactions] needs [history]: reactions are kept beside the lines".into());
+        }
+    }
     if let Some(messaging) = &config.messaging {
         messaging.policy(&config.limits)?;
         if messaging.enabled && config.inbox.is_none() {
@@ -3966,8 +4038,9 @@ pub fn inbox_purge(
     // database of its own, and a later holder of the login must not
     // inherit what the previous one followed, or their phone, on a
     // server that keeps no mail.
-    let others =
-        news_db(config).is_some_and(|p| p.exists()) || push_db(config).is_some_and(|p| p.exists());
+    let others = [news_db(config), push_db(config), history_db(config)]
+        .iter()
+        .any(|p| p.as_ref().is_some_and(|p| p.exists()));
     let mail = match (dry_run, open_inbox_kind(config)?) {
         (_, InboxKind::Unconfigured | InboxKind::Missing(_)) if others => 0,
         (_, InboxKind::Unconfigured) => {
@@ -4000,7 +4073,43 @@ pub fn inbox_purge(
     };
     Ok(mail
         + purge_news_subs(config, &mailbox, dry_run)?
-        + purge_devices(config, &mailbox, dry_run)?)
+        + purge_devices(config, &mailbox, dry_run)?
+        + purge_reactions(config, &mailbox, dry_run)?)
+}
+
+/// Where the chat log is: `[history]`'s own `db`, else the file
+/// `[inbox]` names, as the server opens it.
+#[cfg(feature = "inbox")]
+fn history_db(config: &Config) -> Option<PathBuf> {
+    config
+        .history
+        .as_ref()
+        .and_then(|h| h.db.clone())
+        .or_else(|| config.inbox.as_ref().map(|i| i.db.clone()))
+}
+
+/// The reactions half of a purge (`docs/hotline-ng.md` §7.3): keyed as
+/// mail is, so a later holder of the login does not hold the previous
+/// one's. Counted on a dry run.
+#[cfg(feature = "inbox")]
+fn purge_reactions(
+    config: &Config,
+    mailbox: &hxd_core::inbox::Mailbox,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let Some(path) = history_db(config).filter(|p| p.exists()) else {
+        return Ok(0);
+    };
+    let store = match dry_run {
+        true => open_read_only(&path)?,
+        false => open_sqlite(&path, hxd_store_sqlite::Synchronous::Normal)?,
+    };
+    let held = store.reactions_held(mailbox).map_err(|e| e.to_string())?;
+    if !dry_run {
+        hxd_core::ChatLog::forget_reactions(&*store, mailbox, SystemTime::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(held)
 }
 
 /// Where the shared store file is: `[news]`'s own `db`, or the file
@@ -4550,6 +4659,10 @@ pub fn build_ctx(
         ),
         (None, None) => core,
         _ => return Err("[history] store was not opened".into()),
+    };
+    let core = match config.reactions.as_ref().filter(|r| r.enabled) {
+        Some(reactions) => core.with_reactions(reactions.policy()?),
+        None => core,
     };
     // After the log, whose channels no room's id may be.
     let core = rooms::with_rooms(core, config)?;
@@ -5120,6 +5233,43 @@ sync = "full"
         assert!(check_config(&zero_page).unwrap_err().contains("max_page"));
         let huge_page = parse("[history]\ndb = \"h.sqlite\"\nmax_page = 201\n").unwrap();
         assert!(check_config(&huge_page).unwrap_err().contains("max_page"));
+    }
+
+    #[test]
+    fn reactions_are_held_to_counts_a_line_can_take() {
+        const HISTORY: &str = "[history]\ndb = \"h.sqlite\"\n";
+        for (toml, refused) in [
+            (format!("{HISTORY}[reactions]\nenabled = true\n"), None),
+            ("[reactions]\nenabled = true\n".into(), Some("[history]")),
+            (
+                "[reactions]\nmax_keys = 255\nmax_per_user = 255\nread_only_rooms = \"deny\"\n"
+                    .into(),
+                None,
+            ),
+            (
+                "[reactions]\nmax_keys = 256\n".into(),
+                Some("max_keys must be 1 to 255"),
+            ),
+            (
+                "[reactions]\nmax_keys = 0\n".into(),
+                Some("max_keys must be 1 to 255"),
+            ),
+            (
+                "[reactions]\nmax_keys = 3\nmax_per_user = 4\n".into(),
+                Some("max_per_user must be 1 to max_keys"),
+            ),
+            (
+                "[reactions]\nper_second = 0\n".into(),
+                Some("must be above 0"),
+            ),
+        ] {
+            let checked = check_config(&parse(&toml).unwrap());
+            match refused {
+                None => checked.unwrap_or_else(|e| panic!("{toml:?}: {e}")),
+                Some(why) => assert!(checked.unwrap_err().contains(why), "{toml:?}"),
+            }
+        }
+        assert!(parse("[reactions]\nread_only_rooms = \"maybe\"\n").is_err());
     }
 
     #[test]
@@ -5806,6 +5956,74 @@ sync = "full"
             1,
             "a server that keeps push and no mail is purged too, not refused"
         );
+    }
+
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn a_purge_takes_the_reactions_too() {
+        use hxd_core::history::{ChatLog, NewLine};
+        use hxd_core::reaction::{ReactAct, ReactionKey};
+
+        // A chat log at `path` with one line alice reacted to.
+        fn alice_reacted(path: &Path) {
+            let store =
+                hxd_store_sqlite::SqliteStore::open(path, hxd_store_sqlite::Synchronous::Normal)
+                    .unwrap();
+            let line = store
+                .append(&NewLine {
+                    channel: 0,
+                    ghost: None,
+                    from_nick: "bob".into(),
+                    from_login: Some("bob".into()),
+                    from_fingerprint: None,
+                    icon: 0,
+                    text: "hi".into(),
+                    flags: Default::default(),
+                    at: SystemTime::now(),
+                    guid: None,
+                    signed: None,
+                    home_key: None,
+                    home: None,
+                    re: None,
+                })
+                .unwrap();
+            store
+                .react(&ReactAct {
+                    channel: 0,
+                    line,
+                    who: &hxd_core::inbox::Mailbox::login("alice"),
+                    nick: "alice",
+                    key: &ReactionKey::emoji("\u{1F44D}").unwrap(),
+                    add: true,
+                    at: SystemTime::now(),
+                    max_keys: 20,
+                    max_per_user: 5,
+                })
+                .unwrap();
+        }
+
+        // Beside the mail, and in a file of `[history]`'s own on a server
+        // that keeps no mail.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("server.sqlite");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n[history]\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        cfg.paths.accounts = dir.path().join("accounts");
+        alice_reacted(&db);
+        let own = dir.path().join("chat.sqlite");
+        let mut alone = parse("[history]\n").unwrap();
+        alone.history.as_mut().unwrap().db = Some(own.clone());
+        alone.paths.accounts = dir.path().join("accounts");
+        alice_reacted(&own);
+        for cfg in [cfg, alone] {
+            assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 1);
+            assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 1);
+            assert_eq!(
+                inbox_purge(&cfg, "alice", None, true).unwrap(),
+                0,
+                "a later alice holds none of them"
+            );
+        }
     }
 
     #[cfg(feature = "inbox")]

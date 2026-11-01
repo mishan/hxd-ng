@@ -1175,6 +1175,7 @@ impl Core {
 
         let ids: Vec<(LineId, u32)> = lines.iter().map(|l| (l.id, l.channel)).collect();
         self.tombstone_lines(&acting, &ids)?;
+        self.forget_reactions(&mailbox, within);
         for handle in &purged.media {
             if let Some(record) = self.media_record(handle) {
                 self.revoke_quietly(&acting, handle, record.hash, true);

@@ -21,6 +21,7 @@ pub mod news;
 mod news_blob;
 pub mod proto;
 pub mod push;
+mod reactions;
 mod registrar;
 pub mod registrars;
 mod registry;

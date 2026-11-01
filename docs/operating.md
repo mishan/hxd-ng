@@ -1243,6 +1243,24 @@ max_page = 200            # maximum rows in one request
 replay = 0                # plain chat lines replayed to old legacy clients
 ```
 
+### `[reactions]`
+
+Absent, or `enabled` left off, means no reactions: the ng wire never
+offers the `reactions` cap, and classic clients see nothing new either
+way. It needs `[history]`: reactions are kept beside the lines, in the
+same database, and `hxd inbox purge` takes an account's. Who may react is an account of one person that may send chat;
+guests never may. See [hotline-ng.md](hotline-ng.md) §7.3.
+
+```toml
+[reactions]
+enabled = false           # off unless turned on
+max_keys = 20             # distinct emoji one line may carry, 1 to 255
+max_per_user = 5          # emoji one account may hold on one line, 1 to max_keys
+burst = 10                # one account's reactions at once,
+per_second = 1            # then this many a second
+read_only_rooms = "allow" # or "deny": may a reader who may not post in a room react
+```
+
 ### `[media]`
 
 Absent means no images: the legacy wire never confirms capability bit 3

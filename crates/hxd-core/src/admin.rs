@@ -655,6 +655,7 @@ fn give_account(
     account: &Account,
     roles: &[RoleView],
 ) -> Option<Row> {
+    let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
     let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
     s.account = Some(Box::new(account.clone()));
@@ -666,6 +667,20 @@ fn give_account(
             .take(FIELD_MAX_CHARS)
             .collect::<String>()
     });
+    // What it hears of the lobby starts again with the right to read it
+    // (`crate::reaction`).
+    match (
+        s.access.has(bit::READ_CHAT),
+        effective.access.has(bit::READ_CHAT),
+    ) {
+        (true, false) => {
+            s.heard_from.remove(&0);
+        }
+        (false, true) => {
+            s.heard_from.insert(0, lobby);
+        }
+        _ => {}
+    }
     s.access = effective.access;
     s.can_detach = effective.can_detach;
     s.has_inbox = effective.has_inbox;
