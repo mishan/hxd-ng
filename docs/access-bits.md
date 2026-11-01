@@ -178,7 +178,7 @@ the ROADMAP notes these numbers are already reserved for it.
 |---:|---|---|---|
 | 22 | `disconnect_users` | Kick a user. Also what sets `admin` on the roster on both wires, and the default for `[extra] set_subject` | **Enforced**; the kick itself is legacy-wire |
 | 23 | `cant_be_disconnected` | Cannot be kicked — checked on the *target* of a kick | **Enforced**, legacy wire |
-| 24 | `get_user_info` | Read another user's info. Reading your own never needs it | **Enforced**, legacy wire |
+| 24 | `get_user_info` | Read another user's info. Reading your own never needs it; another's login and address are shown only with `disconnect_users` | **Enforced**, legacy wire |
 | 26 | `use_any_name` | Choose a nickname rather than being given the account's name | **Enforced**, both wires |
 | 27 | `dont_show_agreement` | Skip the agreement at login | **Enforced**, legacy wire — ng has no agreement dance, it publishes the text in the server info |
 | 32 | `can_broadcast` | Send a server-wide broadcast | **Enforced**, legacy wire |
