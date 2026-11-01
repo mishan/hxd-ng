@@ -1705,6 +1705,15 @@ device added after the mail was sent, which cannot read it.
   to another server? Its scope names the server it was posted on, so it
   would be shown as signed for elsewhere, which is true, and keeps it
   attributable after the move.
+- **Where does a signed reply's `re` go?** A reply names its target
+  beside the text (`hotline-ng.md` §7.3), and a signed one should carry
+  it inside the signed object, so the signature binds the reply to what
+  it answers. Neither §3.2 nor §3.3 has a key for it yet, and adding one
+  is a change to both objects and their test vectors; until then a
+  signed line or message cannot carry `re`. A reply that names a signed
+  target names it by the SHA-256 of the whole map, text and `cert`
+  included, which a reader holding a line in its link form (§5) can
+  compute only once it has fetched the certificate.
 - **Should lines bind the host too?** The login proof binds the host the
   client connected to (`hotline-ng-auth.md` §6.2). Should a signed
   line's or article's scope also name the host, as WebAuthn binds the

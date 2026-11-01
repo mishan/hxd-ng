@@ -183,6 +183,7 @@ over them.
 | `messaging` | Friends, presence, instant messages and message requests: `friends`, `friend_*`, `presence`, `find_user`, `user_profile`, `receipt`, `typing`, `requests`, `request_answer`, `requests_clear`, their events, and `msg` by `to_login` as an instant message or a request | §7.5 here; instant-messaging.md | `messaging` |
 | `friendships` | Portable friendships: offers, friendships and withdrawals on the `messaging` family's requests and events, `friendships_present` and `friendships_fetch`. Listed only to a login that asked for it (§7.5) | §7.5 here; proposals/portable-friends.md | — |
 | `guest_identities` | Identity guests' message requests: listed apart by `fingerprint` on `requests`, counted in `requests_changed`, and answered by `fingerprint` on `request_answer`. Listed only to a login that asked for it (§7.5) | §7.5 here; instant-messaging.md §4.1 | — |
+| `replies` | `re` on `chat` and `msg`, on the events, listings and pages that carry them, and `ids` on `history`. Listed only to a login that asked for it (§7.3) | §7.3 here | `replies` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -284,7 +285,8 @@ Starts a new session.
     "sealed": true,          // optional: it can open sealed messages (e2e-messages.md §4.1)
     "messaging": true,       // optional: it speaks the friend family (§7.5)
     "friendships": true,     // optional: with messaging, its portable part (§7.5)
-    "guest_identities": true // optional: with messaging, identity guests' requests (§7.5)
+    "guest_identities": true, // optional: with messaging, identity guests' requests (§7.5)
+    "replies": true          // optional: it sends and reads `re` (§7.3)
 } }
 ```
 
@@ -322,6 +324,7 @@ hotline-ng-identity.md §8.1 says.
 | `messaging` | Not echoed: the `messaging` block (§7.5) is present whenever the capability is. With the capability, `true` makes this a session that speaks the friend family from its login on (§7.5); without it, it is ignored. |
 | `friendships` | Not echoed: `caps` lists `friendships` when it is granted (§7.5). Without `messaging`, it is ignored. |
 | `guest_identities` | Not echoed: `caps` lists `guest_identities` when it is granted, to a session that takes part (§7.5). Without `messaging`, it is ignored. A resume keeps what the login was granted. |
+| `replies` | Not echoed: `caps` lists `replies` when it is granted, which is whenever the server keeps any kind of target, and the `replies` block says which (§7.3). A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -657,13 +660,13 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?`, `re?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
-| `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
+| `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message cursor) | `{ "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `block` | exactly one of `uid` / `login`; `withdraw?` with `login` (§7.5) | `{}` | `no_such_user`, `no_inbox`, `server_error` |
@@ -747,9 +750,58 @@ family document. Each family of §4 adds its own.
   `bad_request`; a server MAY cap `limit` below 200. The login reply's
   `history` block, `{ max_lines, max_days }`, is the server's retention
   (chat-history.md §7). A server MAY rate-limit this request.
+- **`re`** on `chat` and `msg`, with the `replies` capability, names
+  the message a line or message answers. The server keeps it as sent,
+  once parsed, and never resolves or quotes it: a client that draws a
+  quote fetches the target itself, through `history` or the inbox,
+  under its own access. One key names the kind:
+
+  ```jsonc
+  { "line": 98124, "room": 27 }                      // room absent or 0: the lobby
+  { "pm": "Xq3…" }                                   // a stored message's `ref` (§7.1)
+  { "im": { "login": "alice", "guid": "7d4fa8e2-…" } } // an instant message (§7.5)
+  { "signed": { "signer": "6htgz65…", "id": "…", "hash": "…" } }
+  ```
+
+  `signed` names a signed line or message by its signer's fingerprint,
+  its id as a UUID and the base64url SHA-256 of its signed object, the
+  whole map with its text and `cert` (e2e-messages.md §3.1): a reader
+  holding a linked server's line in its link form computes it only once
+  it has fetched the certificate (§5 there). The login reply's `replies` block, `{
+  "targets": [ … ] }`, lists the kinds this server keeps: `line` where it
+  keeps history, `pm` where it has an inbox, `im` with `messaging`,
+  `signed` with `signed`.
+  - `chat` takes `line` and `signed`, and `msg` takes `pm`, `im` and
+    `signed`. A `line` names the room the line is sent in; an `im` names
+    the sender's or the recipient's login. Anything else, a malformed
+    `re`, and a kind the block does not list are `bad_request`. The
+    server checks what a target names, never what it holds: a target
+    retired, redacted or never seen is kept as sent, and so is any
+    `pm`, which its reader resolves from its own mail, where another
+    pair's resolves to nothing, so that a reply cannot ask the server
+    whether a message still exists.
+  - A message the server did not store has no `ref` and cannot be
+    named yet (unstored messages' references are deferred). A `signed` line or message cannot carry `re` yet, which is
+    `bad_request`: its `re` belongs inside its signed object
+    (e2e-messages.md §12).
+  - It is carried as kept on the `chat`, `msg` and `im` events, on
+    `history` lines, `inbox` rows and the messages of a `requests`
+    listing, to sessions that declared `replies` alone. A redaction
+    takes a line's `re` with its words; a reply to a redacted line
+    keeps its own. A session that did not declare `replies` has its
+    `re` ignored (§5). Nothing changes on the classic wire, and no `re`
+    crosses a server link.
+  - `history` with `ids`, 1 to 50 line ids, from a session that
+    declared `replies`, answers the lines of `room` among them, under
+    the reader's checks as a page is, ascending; one of another room
+    and one that does not exist are left out alike, and a tombstone is
+    sent as one. `ids` beside `before` or `after`, or empty, or longer,
+    is `bad_request`; from any other session it is ignored. When the lines do not fit one reply (*hxd-ng:* 64
+    KiB of them) the highest ids are left out and `has_more` is `true`,
+    for the client to ask again for those.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
-  at, read, media?, signed? }`, `id` and `ref` as on the `msg` event
+  at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event
   (§7.1); there is no uid, which may have been reused since.
 - **`msg_read`** marks every message of this account's with an `id` at or
   below `up_to` read, and returns the counts after it.
@@ -785,11 +837,11 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
+| `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"?, "re"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
+| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"?, "re"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
@@ -984,7 +1036,7 @@ before.
   `typing: false` when they stop, send or leave the conversation.
 - **`requests`** lists the message requests waiting for this account,
   by sender, oldest first, and its approvals: `requests` is `[{ login,
-  fingerprint?, messages: [{ id, ref, text, at, guid, signed? }] }]`, with
+  fingerprint?, messages: [{ id, ref, text, at, guid, signed?, re? }] }]`, with
   `id` the inbox cursor a `report` names it by (moderation.md §4.2), `ref`
   its reference, and
   `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
@@ -1039,7 +1091,7 @@ before.
 | `friend` | `{ "friend": {…} }` | A row changed, whole, as it now stands, or went (`removed`): to every session of the account that speaks the family, the one whose request changed it included, so all of them agree. A client replaces its copy. |
 | `friend_request` | `{ "login", "fingerprint"?, "note"? }` | Someone asked this account for friendship (804). |
 | `presence` | `{ "login", "fingerprint"?, "state", "status_text"? }` | A friend's presence changed (809): `state` as on the `friend` object. *hxd-ng* tells a burst of changes once, with its final state. |
-| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "ref"?, "signed"?, "approval"? }` | An instant message (811). `id` and `ref` are its inbox row's, as on `msg` (§7.1), absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
+| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "ref"?, "signed"?, "approval"?, "re"? }` | An instant message (811). `id` and `ref` are its inbox row's, as on `msg` (§7.1), absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
 | `receipt` | `{ "login", "fingerprint"?, "guid", "read" }` | A friend received (`read` false) or read a message this account sent it under `guid`. Under an approval only reads are told. |
 | `typing` | `{ "login", "fingerprint"?, "typing" }` | A friend started or stopped typing to this account. |
 | `requests_changed` | `{ "count" }` | The number of senders whose requests wait changed: to sessions that understand requests alone. |

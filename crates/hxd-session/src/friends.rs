@@ -1238,6 +1238,7 @@ mod tests {
             media: None,
             signed: None,
             friendship: None,
+            re: None,
             delivered_at: None,
             read_at: None,
         }

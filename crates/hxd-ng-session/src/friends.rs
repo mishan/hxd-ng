@@ -272,7 +272,7 @@ fn user_json(u: &FoundUser) -> Value {
     v
 }
 
-fn listing_json(l: &RequestsListing) -> Value {
+fn listing_json(l: &RequestsListing, replies: bool) -> Value {
     let requests: Vec<Value> = l
         .requests
         .iter()
@@ -293,6 +293,7 @@ fn listing_json(l: &RequestsListing) -> Value {
                     if let Some(signed) = &m.signed {
                         msg["signed"] = json!(b64url(&signed.form));
                     }
+                    crate::replies::add(&mut msg, m.re.as_ref(), replies);
                     msg
                 })
                 .collect();
@@ -693,7 +694,7 @@ fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
 
 /// What one request of the family answers, done off the reactor: each is
 /// a store read or write.
-fn act(core: &Core, uid: Uid, op: Op) -> Result<Value, MessagingError> {
+fn act(core: &Core, uid: Uid, op: Op, replies: bool) -> Result<Value, MessagingError> {
     let done = |r: Result<(), MessagingError>| r.map(|()| json!({}));
     let state = |s: RosterState| json!({ "state": state_name(s) });
     match op {
@@ -735,7 +736,7 @@ fn act(core: &Core, uid: Uid, op: Op) -> Result<Value, MessagingError> {
         Op::Receipt(login, guid, read) => done(core.im_ack(uid, &login, &guid, read)),
         Op::Typing(login, typing) => done(core.im_typing(uid, &login, typing)),
         Op::Requests => {
-            let mut listed = listing_json(&core.requests_list(uid)?);
+            let mut listed = listing_json(&core.requests_list(uid)?, replies);
             listed["takes_requests"] = json!(core.own_presence(uid)?.takes_requests);
             Ok(listed)
         }
@@ -754,8 +755,8 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
         Ok(op) => op,
         Err(text) => return reply_err(id, "bad_request", text),
     };
-    let uid = state.uid;
-    match off_reactor(&ctx.core, move |c| act(c, uid, op)).await {
+    let (uid, replies) = (state.uid, state.replies);
+    match off_reactor(&ctx.core, move |c| act(c, uid, op, replies)).await {
         Some(Ok(ok)) => reply_ok(id, ok),
         Some(Err(e)) => messaging_err(id, e),
         None => reply_err(id, "server_error", "Server error."),

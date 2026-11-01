@@ -459,7 +459,7 @@ survives a re-login, a second device, and a lapsed grace window.
 
 | `req` | params | ok | errors |
 |---|---|---|---|
-| `history` | `room?`, `before?` (id), `after?` (id), `limit?` (1–200, default 50) | `{ "lines": [ … ], "has_more": bool }` | `access_denied`, `not_available` (no `[history]`), `no_such_room`, `bad_request`, `rate_limited`, `server_error` |
+| `history` | `room?`, `before?` (id), `after?` (id), `limit?` (1–200, default 50); or `room?` and `ids` (1–50 ids) | `{ "lines": [ … ], "has_more": bool }` | `access_denied`, `not_available` (no `[history]`), `no_such_room`, `bad_request`, `rate_limited`, `server_error` |
 
 Supplying both cursors requests the exclusive range `after < id < before`.
 It pages forward from `after`, and `has_more` refers only to more rows before
@@ -473,7 +473,8 @@ id and time, and a `deleted` flag when tombstoned:
   "from": { "nick": "alice", "icon": 128 },
   "text": "What's up?", "style": "normal",
   "media": { … },                // inline-media.md §8, when the line had one
-  "signed": "pmF2AWJpZFA…" }     // e2e-messages.md §4.7, when it was signed
+  "signed": "pmF2AWJpZFA…",      // e2e-messages.md §4.7, when it was signed
+  "re": { "line": 998 } }        // hotline-ng.md §7.3, what it answers, with `replies`
 ```
 
 A linked server's user's line carries its `remote` in `from`, as the
@@ -493,6 +494,15 @@ The same clamps as the legacy wire: 200 lines a page, 10 requests a
 second. `room` is the channel: absent or 0 is the lobby, and any other
 is a room the session may read (chat-rooms.md §7.2), its line ids a
 cursor for that room alone.
+
+**By id.** With `replies` (hotline-ng.md §7.3), `ids` in place of the
+cursors answers those lines of `room`, ascending, under the same checks
+and the same rate as a page: what a client draws a page of replies'
+quotes from, in one request. One of another room or of no line is left
+out as the other is, a tombstone is sent as one, and past what one
+reply may hold the highest ids are left out with `has_more`. The log
+keeps a line's `re` (schema 34) until it is redacted, which takes it
+with the words; a reply to a redacted line keeps its own.
 
 The shape is built for a client that loads as the user scrolls, which
 is what hx-ng is expected to do where GtkHx has a button: each page's

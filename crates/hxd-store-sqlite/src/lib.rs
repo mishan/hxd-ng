@@ -37,6 +37,7 @@ use hxd_core::inbox::{
     MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
 };
 use hxd_core::relationships::{RelationId, SentOn};
+use hxd_core::reply::Reply;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 /// How hard a commit tries to survive the machine losing power.
@@ -75,7 +76,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -954,6 +955,13 @@ UPDATE report SET target_ref = (
 UPDATE report SET target_msg = NULL WHERE target_ref IS NOT NULL;
 ";
 
+/// What a line or a message answers (`docs/hotline-ng.md` §7.3), as
+/// `hxd_core::Reply` packs it.
+const SCHEMA_V34: &str = "
+ALTER TABLE chat_line ADD COLUMN re BLOB;
+ALTER TABLE message ADD COLUMN re BLOB;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1001,8 +1009,9 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
         .prepare_cached(
             "INSERT INTO chat_line
            (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from,
-            signed, signed_content, home_key, home_name, home_tag, home_tagged)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            signed, signed_content, home_key, home_name, home_tag, home_tagged, re)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18)
          ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
         )
         .and_then(|mut stmt| {
@@ -1024,6 +1033,7 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
                 line.home.as_ref().map(|h| &h.name),
                 line.home.as_ref().map(|h| &h.tag),
                 line.home.as_ref().map(|h| h.tagged),
+                line.re.as_ref().map(Reply::pack),
             ])
         })
         .map_err(StoreError::new)?;
@@ -1698,6 +1708,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 33 {
         steps.push_str(SCHEMA_V33);
     }
+    if version < 34 {
+        steps.push_str(SCHEMA_V34);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1915,7 +1928,7 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
                        sender_nick, body, guid, sent_at, delivered_at, read_at, \
                        media_id, media_type, media_w, media_h, media_bytes, \
-                       signed, signed_content, friendship, ref, seq";
+                       signed, signed_content, friendship, ref, seq, re";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -1993,6 +2006,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let signed: (Option<Vec<u8>>, Option<Vec<u8>>) = (r.get(17)?, r.get(18)?);
     let friendship: Option<i64> = r.get(19)?;
     let (reference, seq): (Option<Vec<u8>>, Option<i64>) = (r.get(20)?, r.get(21)?);
+    let re: Option<Vec<u8>> = r.get(22)?;
     Ok((|| {
         Ok(StoredMessage {
             reference: reference
@@ -2046,6 +2060,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
                         .ok_or_else(|| StoreError(format!("message friendship {n} is not one")))
                 })
                 .transpose()?,
+            re: unpack_reply(re)?,
         })
     })())
 }
@@ -2132,9 +2147,9 @@ impl MessageStore for SqliteStore {
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
                 media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
-                friendship, requested, sender_address, ref, seq)
+                friendship, requested, sender_address, ref, seq, re)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?18 IS 0, ?19, ?20, ?21)",
+                     ?18, ?18 IS 0, ?19, ?20, ?21, ?22)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -2163,6 +2178,7 @@ impl MessageStore for SqliteStore {
                 m.sender_address,
                 &reference[..],
                 seq,
+                m.re.as_ref().map(Reply::pack),
             ],
         )
         .map_err(StoreError::new)?;
@@ -2748,7 +2764,7 @@ fn clamp_id(id: MessageId) -> i64 {
 
 const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
                                media_id, media_type, media_w, media_h, media_bytes, signed, \
-                               home_key, home_name, home_tag, home_tagged";
+                               home_key, home_name, home_tag, home_tagged, re";
 
 fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -2768,6 +2784,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
         (Some(name), Some(tag), Some(tagged)) => Some(LineHome { name, tag, tagged }),
         _ => None,
     };
+    let re: Option<Vec<u8>> = r.get(19)?;
     Ok((|| {
         let media = media?;
         Ok(LogLine {
@@ -2793,8 +2810,16 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
                 .transpose()
                 .map_err(|_| StoreError::new("a chat line's home key is not 32 bytes"))?,
             home,
+            re: unpack_reply(re)?,
         })
     })())
+}
+
+/// A `re` column as this file wrote it, or the row is refused: these
+/// bytes are this file's alone.
+fn unpack_reply(re: Option<Vec<u8>>) -> Result<Option<Reply>, StoreError> {
+    re.map(|b| Reply::unpack(&b).ok_or_else(|| StoreError::new("a stored reply is not one")))
+        .transpose()
 }
 
 fn collect_history(
@@ -2905,6 +2930,24 @@ impl ChatLog for SqliteStore {
             .transpose()
     }
 
+    fn lines(&self, channel: u32, ids: &[LineId]) -> Result<Vec<LogLine>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HISTORY_COLUMNS} FROM chat_line
+              WHERE channel = ?1 AND id IN ({}) ORDER BY id ASC",
+            vec!["?"; ids.len()].join(", ")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+        let binds = std::iter::once(i64::from(channel)).chain(ids.iter().map(|&id| clamp_id(id)));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds), history_row)
+            .map_err(StoreError::new)?;
+        collect_history(rows)
+    }
+
     fn lines_by_ghost(
         &self,
         channel: Option<u32>,
@@ -2962,7 +3005,7 @@ impl ChatLog for SqliteStore {
             .execute(
                 "UPDATE chat_line
                     SET nick = '', body = '', signed = NULL, signed_content = NULL,
-                        home_name = NULL, home_tag = NULL, home_tagged = NULL,
+                        home_name = NULL, home_tag = NULL, home_tagged = NULL, re = NULL,
                         flags = flags | ?1,
                         deleted_at = IFNULL(deleted_at, ?2),
                         deleted_by = IFNULL(deleted_by, ?3)
@@ -3223,6 +3266,7 @@ mod tests {
                 .append(&NewLine {
                     home_key: None,
                     home: None,
+                    re: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -3294,6 +3338,7 @@ mod tests {
                 .append(&NewLine {
                     home_key: None,
                     home: None,
+                    re: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -3337,6 +3382,7 @@ mod tests {
         let line = || NewLine {
             home_key: None,
             home: None,
+            re: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -3470,6 +3516,7 @@ mod tests {
         let line = NewLine {
             home_key: None,
             home: None,
+            re: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -3659,6 +3706,58 @@ mod tests {
     }
 
     #[test]
+    fn version_thirty_three_migrates_its_lines_and_mail_answering_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO message (recipient, sender_nick, body, sent_at, ref, seq)
+                   VALUES ('dave', 'bob', 'before replies', 1, randomblob(16), 1);
+                 INSERT INTO mailbox_seq (mailbox, last) VALUES ('dave', 1);
+                 INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'a line', 1);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 33).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let dave = Mailbox::login("dave");
+        let mail = store.list(&dave, None, 1).unwrap().remove(0);
+        assert_eq!((mail.body.as_str(), mail.re), ("before replies", None));
+        let line = store.line(1).unwrap().unwrap();
+        assert_eq!((line.text.as_str(), line.re), ("a line", None));
+        let re = Reply::Line { room: 0, id: 1 };
+        let id = store
+            .append(&NewLine {
+                channel: 0,
+                ghost: None,
+                from_nick: "bob".into(),
+                from_login: None,
+                from_fingerprint: None,
+                icon: 0,
+                text: "yes".into(),
+                flags: LineFlags::default(),
+                at: UNIX_EPOCH,
+                guid: None,
+                signed: None,
+                home_key: None,
+                home: None,
+                re: Some(re.clone()),
+            })
+            .unwrap();
+        assert_eq!(store.line(id).unwrap().unwrap().re, Some(re));
+    }
+
+    #[test]
     fn version_thirty_two_names_its_mail_by_reference_and_numbers_each_mailbox() {
         use hxd_core::moderation::{ModerationStore, ReportTarget};
         let dir = tempfile::tempdir().unwrap();
@@ -3780,6 +3879,7 @@ mod tests {
             signed: None,
             friendship: None,
             sender_address: None,
+            re: None,
         };
         assert!(
             matches!(
@@ -4742,6 +4842,7 @@ mod tests {
                     signed: None,
                     friendship: None,
                     sender_address: None,
+                    re: None,
                 },
                 100,
             )
@@ -4876,6 +4977,7 @@ mod tests {
                     signed: None,
                     friendship: None,
                     sender_address: None,
+                    re: None,
                 },
                 100,
             )
@@ -4925,6 +5027,7 @@ mod tests {
                     signed: None,
                     friendship: None,
                     sender_address: None,
+                    re: None,
                 },
                 100,
             )
@@ -4952,6 +5055,7 @@ mod tests {
             signed: None,
             friendship: None,
             sender_address: None,
+            re: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored { .. }));
         m.body = "twice".into();
@@ -4984,6 +5088,7 @@ mod tests {
             signed: None,
             friendship: None,
             sender_address: None,
+            re: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -5044,6 +5149,7 @@ mod tests {
                     signed: None,
                     friendship: None,
                     sender_address: None,
+                    re: None,
                 },
                 100,
             )

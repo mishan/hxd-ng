@@ -132,6 +132,13 @@ fn request_weight(req: &str) -> u32 {
     }
 }
 
+/// The most line ids one `history` names (§7.3), and what the lines it
+/// answers may take: past it the highest ids are left for the client to
+/// ask for again, so one request reads a bounded part of the log and
+/// writes a bounded frame.
+const IDS_MAX: usize = 50;
+const IDS_REPLY_BYTES: usize = 64 * 1024;
+
 /// How often a quiet connection is pinged, and how long it may stay
 /// silent before the ping is treated as unanswered. The deadline is
 /// three periods so that one lost ping, or one tick delayed behind a
@@ -159,6 +166,8 @@ pub(crate) struct SessState {
     pub(crate) file_list: bool,
     pub(crate) file_getinfo: bool,
     pub(crate) set_subject: bool,
+    /// It declared `replies` (§7.3), as the session's transport keeps.
+    pub(crate) replies: bool,
 }
 
 impl SessState {
@@ -807,6 +816,7 @@ async fn handle_login(
                         && i.tag().device_cert.is_some()
                 }),
             guest_identities: p.guest_identities && p.messaging && ctx.core.messaging_enabled(),
+            replies: p.replies && !crate::replies::targets(ctx).is_empty(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -838,6 +848,7 @@ async fn handle_login(
         .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
     let attach_friendships = attach.transport.friendships;
     let attach_guest_identities = attach.transport.guest_identities;
+    let replies = attach.transport.replies;
     let attached = if revoked {
         None
     } else {
@@ -1024,6 +1035,9 @@ async fn handle_login(
     if attach_guest_identities && ctx.core.takes_part(uid) {
         caps.push("guest_identities".into());
     }
+    if replies {
+        caps.push("replies".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -1140,6 +1154,9 @@ async fn handle_login(
     if let Some(messaging) = messaging {
         ok["messaging"] = messaging;
     }
+    if replies {
+        ok["replies"] = json!({ "targets": crate::replies::targets(ctx) });
+    }
     let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
     drop(permit);
@@ -1169,6 +1186,7 @@ async fn handle_login(
             file_list: account.file_list,
             file_getinfo: account.file_getinfo,
             set_subject: account.set_subject,
+            replies,
         },
         events,
     ))
@@ -1280,6 +1298,7 @@ async fn handle_resume(
         file_list: account.as_ref().is_some_and(|account| account.file_list),
         file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
         set_subject: account.as_ref().is_some_and(|account| account.set_subject),
+        replies: ctx.core.user(uid).is_some_and(|u| u.transport.replies),
     };
 
     // From here the session is attached: any send failure means the new
@@ -1309,7 +1328,7 @@ async fn handle_resume(
                 return None;
             }
             for se in &replay {
-                if !send_frame(ws_tx, Message::Text(event_json(se))).await {
+                if !send_frame(ws_tx, Message::Text(event_json(se, state.replies))).await {
                     lost(ctx);
                     return None;
                 }
@@ -1430,13 +1449,13 @@ async fn send_events(
     instrument::queue_depth(WIRE, events.len());
     let mut kicked = matches!(first.event, hxd_core::Event::Kicked);
     state.note(&first.event);
-    let mut batch = vec![event_json(&first)];
+    let mut batch = vec![event_json(&first, state.replies)];
     let mut bytes = batch[0].len();
     while !kicked && bytes < WRITE_BATCH {
         let Ok(se) = events.try_recv() else { break };
         kicked = matches!(se.event, hxd_core::Event::Kicked);
         state.note(&se.event);
-        let text = event_json(&se);
+        let text = event_json(&se, state.replies);
         bytes += text.len();
         batch.push(text);
     }
@@ -1563,7 +1582,7 @@ async fn handle_sync(
                 seq = seq.max(se.seq);
                 kicked |= matches!(se.event, hxd_core::Event::Kicked);
                 state.note(&se.event);
-                if !send_frame(ws_tx, Message::Text(event_json(&se))).await {
+                if !send_frame(ws_tx, Message::Text(event_json(&se, state.replies))).await {
                     return Flow::Dead;
                 }
             }
@@ -1789,6 +1808,18 @@ async fn dispatch(
                         .await
                     }
                 };
+                let re = match crate::replies::param(
+                    ctx,
+                    state.replies,
+                    p.re.as_ref(),
+                    p.signed.is_some(),
+                    &["line", "signed"],
+                ) {
+                    Ok(re) => re,
+                    Err(text) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
+                    }
+                };
                 let (uid, room) = (state.uid, p.room);
                 // Refused rather than cut over its limit: cutting would
                 // break the signature (`docs/e2e-messages.md` §4.7).
@@ -1805,7 +1836,7 @@ async fn dispatch(
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
                 let said = off_reactor(&ctx.core, move |c| {
-                    c.chat_public_signed(uid, room, (text, style, media), guid, signed)
+                    c.chat_public_signed(uid, room, (text, style, media), guid, signed, re)
                 })
                 .await;
                 match said {
@@ -1838,6 +1869,9 @@ async fn dispatch(
                         reply_err(req.id, "flooding", "You were kicked for flooding.")
                     }
                     Some(Err(ChatError::Equivocation)) => equivocation(req.id),
+                    Some(Err(ChatError::ReplyScope)) => {
+                        reply_err(req.id, "bad_request", "`re` names no line of this room.")
+                    }
                     _ => reply_err(req.id, "server_error", "Server error."),
                 }
             }
@@ -1863,6 +1897,45 @@ async fn dispatch(
                 reply_err(req.id, "rate_limited", "Slow down.")
             } else {
                 match params_or_default::<HistoryParams>(&req.params) {
+                    // Lines by id in place of the cursors, for the quotes
+                    // of a page of replies (§7.3).
+                    Ok(HistoryParams {
+                        room,
+                        before: None,
+                        after: None,
+                        ids: Some(ids),
+                        ..
+                    }) if state.replies && (1..=IDS_MAX).contains(&ids.len()) => {
+                        let uid = state.uid;
+                        match off_reactor(&ctx.core, move |c| c.history_ids(uid, room, &ids)).await
+                        {
+                            Some(Ok(lines)) => {
+                                let mut bytes = 0;
+                                let mut shown = Vec::with_capacity(lines.len());
+                                for line in &lines {
+                                    let fetchable = ctx.core.history_media_fetchable(uid, line);
+                                    let mut v = history_line_json(line, fetchable);
+                                    crate::replies::add(&mut v, line.re.as_ref(), true);
+                                    bytes += v.to_string().len();
+                                    if bytes > IDS_REPLY_BYTES && !shown.is_empty() {
+                                        break;
+                                    }
+                                    shown.push(v);
+                                }
+                                let has_more = shown.len() < lines.len();
+                                reply_ok(req.id, json!({ "lines": shown, "has_more": has_more }))
+                            }
+                            Some(Err(ChatError::NoSuchChat)) => {
+                                reply_err(req.id, "no_such_room", "No such room.")
+                            }
+                            _ => reply_err(req.id, "server_error", "Server error."),
+                        }
+                    }
+                    Ok(HistoryParams { ids: Some(_), .. }) if state.replies => reply_err(
+                        req.id,
+                        "bad_request",
+                        "`ids` takes 1 to 50 line ids, and no cursors.",
+                    ),
                     Ok(p) if p.limit.is_none_or(|n| n != 0) => {
                         let query = hxd_core::HistoryQuery {
                             channel: p.room,
@@ -1878,7 +1951,13 @@ async fn dispatch(
                                     .iter()
                                     .map(|line| {
                                         let fetchable = ctx.core.history_media_fetchable(uid, line);
-                                        history_line_json(line, fetchable)
+                                        let mut v = history_line_json(line, fetchable);
+                                        crate::replies::add(
+                                            &mut v,
+                                            line.re.as_ref(),
+                                            state.replies,
+                                        );
+                                        v
                                     })
                                     .collect();
                                 reply_ok(
@@ -1949,6 +2028,18 @@ async fn dispatch(
                             reply_err(req.id, "bad_request", "`guid` is not a UUID."),
                         )
                         .await
+                    }
+                };
+                let re = match crate::replies::param(
+                    ctx,
+                    state.replies,
+                    p.re.as_ref(),
+                    p.signed.is_some(),
+                    &["pm", "im", "signed"],
+                ) {
+                    Ok(re) => re,
+                    Err(text) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
                     }
                 };
                 let signed = match p.signed.as_deref() {
@@ -2047,13 +2138,13 @@ async fn dispatch(
                             return finish(ws_tx, out).await;
                         }
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_signed(from, uid, text, guid, media, signed)
+                            c.msg_signed(from, uid, text, guid, media, signed, re)
                         })
                         .await
                     }
                     (None, Some(login)) => {
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_login_signed(from, &login, text, guid, media, signed)
+                            c.msg_login_signed(from, &login, text, guid, media, signed, re)
                         })
                         .await
                     }
@@ -2144,6 +2235,11 @@ async fn dispatch(
                     Err(ChatError::RosterFull) => {
                         reply_err(req.id, "roster_full", "Your roster is full.")
                     }
+                    Err(ChatError::ReplyScope) => reply_err(
+                        req.id,
+                        "bad_request",
+                        "`re` names an instant message of neither of you.",
+                    ),
                     // One answer for "no such user", "no such account" and
                     // "that account takes no offline messages", so none of
                     // them can be told apart from outside.
@@ -2190,7 +2286,9 @@ async fn dispatch(
                                         .media
                                         .as_ref()
                                         .and_then(|meta| media_now(&ctx.core, meta));
-                                    stored_msg_json(m, media.as_ref())
+                                    let mut v = stored_msg_json(m, media.as_ref());
+                                    crate::replies::add(&mut v, m.re.as_ref(), state.replies);
+                                    v
                                 })
                                 .collect::<Vec<_>>(),
                             "unread": counts.unread,

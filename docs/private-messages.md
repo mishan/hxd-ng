@@ -267,7 +267,8 @@ CREATE TABLE message (
   delivered_at INTEGER,               -- handed to a live connection, on either wire
   read_at      INTEGER,               -- an ng client said so, or delivery reached only legacy sessions (§8)
   ref          BLOB,                  -- 16 random bytes: the message's name (below)
-  seq          INTEGER                -- its place in the recipient's mailbox; NULL for a receipt
+  seq          INTEGER,               -- its place in the recipient's mailbox; NULL for a receipt
+  re           BLOB                   -- what it answers, packed (hotline-ng.md §7.3; schema 34)
 );
 CREATE UNIQUE INDEX message_ref ON message (ref);
 -- Unique per mailbox, one index per kind of mailbox key, as below.
@@ -557,7 +558,16 @@ neither rather than guessing — a client that sent both meant something.
 | `blocks` | — | `{ blocked: [{ login, fingerprint? }] }` | the fingerprint is what `unblock` takes back |
 
 The `msg` event gains `at`, `queued`, `id` (the cursor), `ref`, and
-`from.login`; an `inbox` row carries `id` and `ref` too. The login
+`from.login`; an `inbox` row carries `id` and `ref` too. With
+`replies`, `msg` takes `re`, a stored message's `ref` among the targets
+it may name, and the event and the row carry it (`hotline-ng.md` §7.3).
+Any reference is kept as sent, never looked up: refusing one the store
+holds between another pair would tell the sender whether that message
+still exists, and a reader resolves it from its own mail, where another
+pair's resolves to nothing. A reference is the one name a reply can
+use, since a cursor is the recipient's alone. A message that was not
+stored has none and cannot be named yet: the draft's references for
+unstored messages are not built. The login
 reply gains `inbox: { unread, total }` and `"inbox"` in `caps`.
 
 A block on an identity guest is the reason `blocks` lists objects rather

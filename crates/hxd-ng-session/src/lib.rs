@@ -24,6 +24,7 @@ pub mod push;
 mod registrar;
 pub mod registrars;
 mod registry;
+mod replies;
 pub mod rooms;
 mod sealed;
 mod signed;

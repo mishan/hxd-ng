@@ -849,6 +849,7 @@ fn a_claim_restamps_what_was_sent_on_a_friendship_it_merged() {
                 signed: None,
                 friendship: Some(SentOn::Relation(lost)),
                 sender_address: None,
+                re: None,
             },
             10,
         )
@@ -1162,7 +1163,8 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
             "hello?".into(),
             Some(g4.clone()),
             None,
-            signed(4, 4)
+            signed(4, 4),
+            None
         ),
         Ok(crate::MsgOutcome::Requested)
     );
@@ -1946,6 +1948,7 @@ fn a_backlog_the_flush_must_skip_never_starves_private_mail() {
             signed: None,
             friendship,
             sender_address: None,
+            re: None,
         };
         let backlog = InboxPolicy::default().deliver_at_flush + 5;
         for i in 0..backlog {
@@ -2161,6 +2164,7 @@ fn a_request_to_a_full_mailbox_is_dropped_and_counted() {
                     signed: None,
                     friendship: None,
                     sender_address: None,
+                    re: None,
                 },
                 usize::MAX,
             )
@@ -2260,6 +2264,7 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
                     signed: None,
                     friendship: Some(SentOn::Relation(on)),
                     sender_address: None,
+                    re: None,
                 },
                 1000,
             )

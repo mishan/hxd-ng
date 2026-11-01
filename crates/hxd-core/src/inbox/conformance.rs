@@ -43,6 +43,7 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     // A message's names (`docs/private-messages.md` §5).
     each_mailbox_numbers_its_own_mail(&*new_store().inbox);
     references_are_random_and_follow_the_row(&*new_store().inbox);
+    a_message_keeps_what_it_answers(&*new_store().inbox);
     a_cursor_is_not_handed_out_again(&*new_store().inbox);
     a_merge_numbers_what_it_moves_after_both_mailboxes(&*new_store().inbox);
     an_unlinked_login_counts_on_past_its_identity(&*new_store().inbox);
@@ -127,6 +128,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         signed: None,
         friendship: None,
         sender_address: None,
+        re: None,
     }
 }
 
@@ -193,6 +195,15 @@ fn each_mailbox_numbers_its_own_mail(s: &dyn MessageStore) {
         2,
         "{case}: and so is `up_to`"
     );
+}
+
+fn a_message_keeps_what_it_answers(s: &dyn MessageStore) {
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::identified("alice", fp(1)));
+    let re = crate::reply::Reply::im("dave".into(), guid(7)).unwrap();
+    let mut m = msg(&dave, &alice, "yes", at(1));
+    m.re = Some(re.clone());
+    push(s, &m);
+    assert_eq!(s.list(&dave, None, 1).unwrap()[0].re, Some(re));
 }
 
 fn references_are_random_and_follow_the_row(s: &dyn MessageStore) {
@@ -494,6 +505,7 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
             }),
             friendship: None,
             sender_address: None,
+            re: None,
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -650,6 +662,7 @@ fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &d
             &NewMessage {
                 friendship: Some(SentOn::Request),
                 sender_address: address.map(str::to_owned),
+                re: None,
                 ..msg(&dave, from, body, at(t))
             },
         );
@@ -700,6 +713,7 @@ fn a_guests_requests_are_deleted_by_address(s: &dyn MessageStore) {
             &NewMessage {
                 friendship: Some(SentOn::Request),
                 sender_address: address.map(str::to_owned),
+                re: None,
                 ..msg(&dave, from, body, at(1))
             },
         );
