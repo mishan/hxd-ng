@@ -1201,6 +1201,9 @@ request_retention_days = 30  # how long a request waits, and a refused sender is
 # request_secret = "/srv/hxd/messaging-requests.key"  # e.g.; the key a request's address
                              # is hashed under. Absent, messaging-requests.key beside
                              # [inbox] db; made on first start, mode 0600
+queue_identity_guests = false  # an approved identity guest's messages wait
+                             # for a recipient that is not there; off, they
+                             # reach a session that is there or nobody
 ```
 
 Once it is on, an ng `msg` by `to_login`, and a classic `/msg <login>`,

@@ -182,10 +182,12 @@ over them.
 | `chat_guid` | `guid` on `chat` honored: a repeat is the line it repeats, and the reply carries the line's `id` | §7.3 here | — |
 | `messaging` | Friends, presence, instant messages and message requests: `friends`, `friend_*`, `presence`, `find_user`, `user_profile`, `receipt`, `typing`, `requests`, `request_answer`, `requests_clear`, their events, and `msg` by `to_login` as an instant message or a request | §7.5 here; instant-messaging.md | `messaging` |
 | `friendships` | Portable friendships: offers, friendships and withdrawals on the `messaging` family's requests and events, `friendships_present` and `friendships_fetch`. Listed only to a login that asked for it (§7.5) | §7.5 here; proposals/portable-friends.md | — |
+| `guest_identities` | Identity guests' message requests: listed apart by `fingerprint` on `requests`, counted in `requests_changed`, and answered by `fingerprint` on `request_answer`. Listed only to a login that asked for it (§7.5) | §7.5 here; instant-messaging.md §4.1 | — |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
-- `friendships` MUST NOT appear without `messaging`.
+- `friendships` and `guest_identities` MUST NOT appear without
+  `messaging`.
 - A login reply block is present exactly when its capability is, except
   where the family's own document says otherwise.
 - Each family's document is normative for its requests, events, error
@@ -281,7 +283,8 @@ Starts a new session.
     "signs": "default",      // optional: "default" | "able" (e2e-messages.md §4.6)
     "sealed": true,          // optional: it can open sealed messages (e2e-messages.md §4.1)
     "messaging": true,       // optional: it speaks the friend family (§7.5)
-    "friendships": true      // optional: with messaging, its portable part (§7.5)
+    "friendships": true,     // optional: with messaging, its portable part (§7.5)
+    "guest_identities": true // optional: with messaging, identity guests' requests (§7.5)
 } }
 ```
 
@@ -318,6 +321,7 @@ hotline-ng-identity.md §8.1 says.
 | `signs` | The client's own `signs`, echoed when the server has the `signed` capability and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. `"default"` puts `signs: true` in the session's roster `identity` (e2e-messages.md §4.6). Any other value of `signs` is `bad_request`. |
 | `messaging` | Not echoed: the `messaging` block (§7.5) is present whenever the capability is. With the capability, `true` makes this a session that speaks the friend family from its login on (§7.5); without it, it is ignored. |
 | `friendships` | Not echoed: `caps` lists `friendships` when it is granted (§7.5). Without `messaging`, it is ignored. |
+| `guest_identities` | Not echoed: `caps` lists `guest_identities` when it is granted, to a session that takes part (§7.5). Without `messaging`, it is ignored. A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -925,7 +929,7 @@ before.
 | `receipt` | `login`, `guid`, `read?` (default `false`) | `{}` | — |
 | `typing` | `login`, `typing` (bool) | `{}` | — |
 | `requests` | `cursor?` | `{ "requests": […], "approvals": […], "dropped", "takes_requests", "cursor"? }` | — |
-| `request_answer` | `login`, `action` (`approve` \| `delete` \| `end`) | `{}` | `no_such_request`, `roster_full` |
+| `request_answer` | `login` **or** `fingerprint`, `action` (`approve` \| `delete` \| `end`) | `{}` | `no_such_request`, `roster_full` |
 | `requests_clear` | `since?`, `before?` (Unix seconds) | `{ "declined", "deleted" }` | — |
 
 - **`friends`** is Get Roster (800): every row of this account's, a
@@ -986,8 +990,11 @@ before.
   `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
   `dropped` is how many requests were dropped since the last listing,
   and `takes_requests` whether this account takes them now. The plain
-  guests are one group, `{ login: "guest" }` (instant-messaging.md
-  §4.1), among the `approvals` while a guest session holds the
+  guests are one group, `{ login: "guest" }`, and to a session granted
+  `guest_identities` each guest that proved an identity a group of its
+  own, `{ login: "guest", fingerprint }`, which no other session is
+  shown or counted (instant-messaging.md §4.1); either is among the
+  `approvals` while a session of it holds the
   caller's.
   `cursor`, an opaque string where present, is passed back to read
   the rest; a client
@@ -1000,10 +1007,15 @@ before.
   approval. Deleting and ending hold the sender (instant-messaging.md
   §4.4). `guest` names the plain guests: approving lets in the guest
   sessions that asked, for their lives, and what they have waiting
-  arrives as `msg` events, as mail.
+  arrives as `msg` events, as mail. `fingerprint` in place of `login`
+  names the account linking it, or else, to a session granted
+  `guest_identities`, the identity guest that proved it, answered as
+  the plain guests are; to any other session that guest is
+  `no_such_request`.
 - **`requests_clear`** declines every friend request and deletes every
   message request received from `since` up to `before`, each bound
-  optional, and answers how many of each (instant-messaging.md §4.3).
+  optional, and answers how many of each (instant-messaging.md §4.3),
+  of those this session is shown.
 
 **The `friend` object** is one row as its owner sees it:
 
@@ -1068,8 +1080,9 @@ beside `"messaging": true`. It is granted to a session that takes part,
 whose socket authenticated with an identity its account links
 (hotline-ng-identity.md §8.1), on a device whose certificate allows
 messages and is at most 512 bytes; the login reply's `caps` then lists
-`friendships`. Unlike every other name in `caps`, `friendships` is
-listed only in reply to a login that asked for it, so that a client
+`friendships`. Unlike every other name in `caps` but
+`guest_identities`, `friendships` is listed only in reply to a login
+that asked for it, so that a client
 that never asks is sent the reply it always was. Asked for and not
 granted, it is not listed, and the session is answered as if it had not
 asked. A resume keeps what the login was granted. Such a session is a

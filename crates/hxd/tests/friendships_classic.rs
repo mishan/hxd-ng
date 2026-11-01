@@ -125,7 +125,8 @@ async fn start(dir: &Path) -> Server {
         .iter()
         .map(|p| format!("\"{}\"", fp(p)))
         .collect();
-    // A case logs one account in more often than a person would.
+    // A case logs one account in more often than a person would, and an
+    // identity guest sends at once.
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n\
          [limits]\nconnections_per_account = 0\nreconnect_seconds = 0\n\
@@ -134,7 +135,7 @@ async fn start(dir: &Path) -> Server {
          [ng]\nbind = \"{n}\"\n\
          [identity]\nkey = \"{d}/identity.key\"\nnext_key = \"{d}/identity.next\"\n\
          handovers = \"{d}/identity.handovers\"\nsuccessors = \"{d}/identity.successors\"\n\
-         hosts = [\"{n}\"]\nclassic_hosts = [\"{p}\"]\nallow_list = [{}]\n",
+         newcomer_delay = 0\nhosts = [\"{n}\"]\nclassic_hosts = [\"{p}\"]\nallow_list = [{}]\n",
         allowed.join(", "),
         d = dir.display(),
     );
@@ -235,6 +236,23 @@ fn unb64(s: &str) -> Vec<u8> {
 /// An ng session of `who`'s device 0 with `card`, `extra` beside the
 /// challenge binding, speaking the friend family and its portable part.
 async fn ng_device(s: &Server, who: &Person, card: &[u8], extra: Value) -> ng::Client {
+    let mut c = ng_socket(s, who, card, extra).await;
+    let hello = c
+        .login(json!({ "messaging": true, "friendships": true }))
+        .await
+        .unwrap();
+    assert!(
+        hello["caps"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("friendships")),
+        "{hello}"
+    );
+    c
+}
+
+/// An ng socket authenticated with `who`'s device 0, not yet logged in.
+async fn ng_socket(s: &Server, who: &Person, card: &[u8], extra: Value) -> ng::Client {
     let ch = http_json(s.ng, "/identity/challenge", b"").await;
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
     let key: [u8; 32] = unb64(ch["server_key"].as_str().unwrap())
@@ -249,21 +267,9 @@ async fn ng_device(s: &Server, who: &Person, card: &[u8], extra: Value) -> ng::C
     let auth = http_json(s.ng, "/identity/auth", body.to_string().as_bytes()).await;
     let token = auth["token"].as_str().unwrap_or_else(|| panic!("{auth}"));
     let tcp = TcpStream::connect(s.ng).await.unwrap();
-    let mut c = ng::Client::over(Box::new(tcp), &format!("ws://{}/ng?token={token}", s.ng))
+    ng::Client::over(Box::new(tcp), &format!("ws://{}/ng?token={token}", s.ng))
         .await
-        .unwrap();
-    let hello = c
-        .login(json!({ "messaging": true, "friendships": true }))
-        .await
-        .unwrap();
-    assert!(
-        hello["caps"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("friendships")),
-        "{hello}"
-    );
-    c
+        .unwrap()
 }
 
 async fn ask(c: &mut Client, hdr: ClientHdr, chunks: im::Chunks) -> Frame {
@@ -1172,4 +1178,114 @@ async fn an_upgrade_offer_reaches_bit_15_sessions_alone_and_is_canceled_alone() 
             .await;
         }
     }
+}
+
+#[tokio::test]
+async fn an_identity_guest_is_listed_and_answered_only_where_it_can_be_named() {
+    use hxproto::messaging::{parse_message_requests, Presence, RequestAction};
+    let (bob, next) = (bob(), successor());
+    let d = tempfile::tempdir().unwrap();
+    let s = start(d.path()).await;
+    let erin_ng = |naming: bool| async move {
+        let mut c = ng::Client::connect(s.ng).await.unwrap();
+        let hello = c
+            .login(
+                json!({ "login": "erin", "password": "pw", "messaging": true,
+                           "guest_identities": naming }),
+            )
+            .await
+            .unwrap();
+        let caps = hello["caps"].as_array().unwrap().clone();
+        assert_eq!(caps.contains(&json!("guest_identities")), naming, "{hello}");
+        c
+    };
+    let (mut erin, mut erin_plain) = (erin_ng(true).await, erin_ng(false).await);
+    erin.request("presence", json!({ "takes_requests": true }))
+        .await
+        .unwrap();
+    let mut bob15 = classic_device(&s, "bob", &bob, 0).await;
+    let (mut bob6, _) = classic(&s, "bob", CAP_MESSAGING).await;
+    let takes = im::set_presence(&Presence {
+        state: None,
+        status_text: None,
+        discoverable: None,
+        takes_requests: Some(true),
+    });
+    ok(&mut bob15, ClientHdr::SetPresence, takes).await;
+
+    let mut plain = ng::Client::connect(s.ng).await.unwrap();
+    plain.login(json!({ "nick": "visitor" })).await.unwrap();
+    let mut guest = ng_socket(&s, &next, &card(&next, "next"), json!({})).await;
+    guest.login(json!({})).await.unwrap();
+    for to in ["erin", "bob"] {
+        for c in [&mut plain, &mut guest] {
+            let sent = c
+                .request("msg", json!({ "to_login": to, "text": "hi" }))
+                .await
+                .unwrap();
+            assert_eq!(sent["requested"], true, "{to}");
+        }
+    }
+
+    // On the ng wire, by the capability.
+    let key = fp(&next).to_string();
+    let named = |listed: &Value| -> Vec<Value> {
+        listed["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g.get("fingerprint").cloned().unwrap_or(Value::Null))
+            .collect()
+    };
+    let listed = erin.request("requests", json!({})).await.unwrap();
+    assert_eq!(named(&listed), [Value::Null, json!(key)]);
+    let listed = erin_plain.request("requests", json!({})).await.unwrap();
+    assert_eq!(named(&listed), [Value::Null]);
+    let answer = json!({ "fingerprint": key, "action": "approve" });
+    match erin_plain.request("request_answer", answer.clone()).await {
+        Err(hxd_testclient::Error::Refused { code, .. }) => assert_eq!(code, "no_such_request"),
+        other => panic!("{other:?}"),
+    }
+    erin.request("request_answer", answer).await.unwrap();
+    let listed = erin.request("requests", json!({})).await.unwrap();
+    assert_eq!(
+        listed["approvals"],
+        json!([{ "login": "guest", "fingerprint": key }])
+    );
+    guest
+        .request("msg", json!({ "to_login": "erin", "text": "let in" }))
+        .await
+        .unwrap();
+    ng_event(&mut erin, "msg", |d| d["text"] == "let in").await;
+
+    // On the classic wire, by bit 15.
+    let groups = |f: &Frame| -> Vec<Option<[u8; 32]>> {
+        parse_message_requests(f.wire(), f.wire().len())
+            .unwrap()
+            .groups()
+            .map(|g| g.identity.copied())
+            .collect()
+    };
+    let listed = ok(&mut bob15, ClientHdr::GetMessageRequests, Vec::new()).await;
+    assert_eq!(groups(&listed), [None, Some(fp(&next).0)]);
+    let listed = ok(&mut bob6, ClientHdr::GetMessageRequests, Vec::new()).await;
+    assert_eq!(groups(&listed), [None]);
+    let delete = RequestAction::Delete.wire().to_be_bytes().to_vec();
+    // Without bit 15 the identity is no field of its, and `guest` names
+    // the plain guests as it always did.
+    let answer = vec![
+        (tag::FRIEND_LOGIN, b"guest".to_vec()),
+        (tag::FRIEND_IDENTITY, fp(&next).0.to_vec()),
+        (tag::REQUEST_ACTION, delete.clone()),
+    ];
+    ok(&mut bob6, ClientHdr::AnswerMessageRequest, answer).await;
+    let listed = ok(&mut bob15, ClientHdr::GetMessageRequests, Vec::new()).await;
+    assert_eq!(groups(&listed), [Some(fp(&next).0)]);
+    let answer = vec![
+        (tag::FRIEND_IDENTITY, fp(&next).0.to_vec()),
+        (tag::REQUEST_ACTION, delete),
+    ];
+    ok(&mut bob15, ClientHdr::AnswerMessageRequest, answer).await;
+    let listed = ok(&mut bob15, ClientHdr::GetMessageRequests, Vec::new()).await;
+    assert!(groups(&listed).is_empty());
 }

@@ -14,7 +14,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use hxd_core::inbox::MessageGuid;
+use hxd_core::inbox::{Mailbox, MessageGuid};
 use hxd_core::messaging::{Fetched, PresentResult, Presented, RequestAction, RequestsListing};
 use hxd_core::relationships::Profile;
 use hxd_core::{
@@ -172,7 +172,7 @@ pub(crate) enum Op {
     Find(Named, bool),
     Alias(String, Option<String>),
     Requests(usize),
-    Answer(String, RequestAction),
+    Answer(Named, RequestAction),
     Clear(Option<SystemTime>, Option<SystemTime>),
     Present(Vec<Vec<u8>>, Vec<Vec<u8>>),
     Fetch(Vec<[u8; 32]>, Vec<[u8; 32]>),
@@ -374,7 +374,13 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<O
                 Some(WireAction::EndApproval) => RequestAction::End,
                 _ => return Err(MALFORMED),
             };
-            Op::Answer(login()?, action)
+            // An identity guest is named by its fingerprint alone (§4.5).
+            let named = match (field(tag::FRIEND_LOGIN), key()?) {
+                (None, Some(k)) => Named::Key(k),
+                (Some(_), Some(_)) => return Err(MALFORMED),
+                _ => Named::Login(login()?),
+            };
+            Op::Answer(named, action)
         }
         ClientHdr::ClearMessageRequests => Op::Clear(at(tag::SPAN_SINCE)?, at(tag::SPAN_BEFORE)?),
         ClientHdr::PresentFriendships => {
@@ -560,11 +566,12 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
                 Ok((l, takes))
             });
             match listed {
-                Ok((l, takes)) => Answer::ok(listing_chunks(&l, takes, from, enc)),
+                Ok((l, takes)) => Answer::ok(listing_chunks(&l, takes, from, enc, friendships)),
                 Err(e) => refusal(e),
             }
         }
-        Op::Answer(login, action) => done(core.request_answer(uid, &login, action)),
+        Op::Answer(Named::Login(login), action) => done(core.request_answer(uid, &login, action)),
+        Op::Answer(Named::Key(fp), action) => done(core.request_answer_by_key(uid, &fp, action)),
         Op::Clear(since, before) => match core.requests_clear(uid, since, before) {
             Ok(c) => Answer::ok(vec![
                 reason_chunk(ReasonCode::Ok),
@@ -941,10 +948,16 @@ fn profile_chunks(p: &Profile, enc: TextEncoding) -> Chunks {
 /// approvals, as many as fit a frame, with what the first page alone
 /// carries before them and the cursor where there is more. A listing is
 /// read whole each time, so a cursor is a group's place in it.
-fn listing_chunks(l: &RequestsListing, takes: bool, from: usize, enc: TextEncoding) -> Chunks {
+fn listing_chunks(
+    l: &RequestsListing,
+    takes: bool,
+    from: usize,
+    enc: TextEncoding,
+    friendships: bool,
+) -> Chunks {
     let mut groups: Vec<Chunks> = Vec::new();
     for g in &l.requests {
-        let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(&g.from.login))];
+        let mut c = named_group(&g.from, enc, friendships);
         let mut size = REQUEST_GROUP_FIELDS;
         for m in &g.messages {
             // Every request is stored with a guid.
@@ -968,10 +981,9 @@ fn listing_chunks(l: &RequestsListing, takes: bool, from: usize, enc: TextEncodi
         groups.push(c);
     }
     for a in &l.approvals {
-        groups.push(vec![
-            (tag::FRIEND_LOGIN, enc.encode(&a.login)),
-            (tag::ROSTER_STATE, u16_bytes(WireState::Accepted.wire())),
-        ]);
+        let mut c = named_group(a, enc, friendships);
+        c.push((tag::ROSTER_STATE, u16_bytes(WireState::Accepted.wire())));
+        groups.push(c);
     }
     let (end, next) = page(&groups, from, PAGE_BUDGET);
     let mut out = Chunks::new();
@@ -989,6 +1001,20 @@ fn listing_chunks(l: &RequestsListing, takes: bool, from: usize, enc: TextEncodi
     out
 }
 
+/// A group's head: its Login, and to a bit-15 session an identity
+/// guest's fingerprint, its one name apart from the other guests'
+/// (§4.5).
+fn named_group(from: &Mailbox, enc: TextEncoding, friendships: bool) -> Chunks {
+    let mut c = vec![(tag::FRIEND_LOGIN, enc.encode(&from.login))];
+    if let Some(fp) = from
+        .fingerprint
+        .filter(|_| friendships && from.login == "guest")
+    {
+        c.push((tag::FRIEND_IDENTITY, fp.to_vec()));
+    }
+    c
+}
+
 /// The fields a reply of groups may hold: a frame, with room for what
 /// goes before the groups.
 const PAGE_BUDGET: usize = MAX_FRAME_DATA as usize - 64;
@@ -999,7 +1025,8 @@ const PAGE_BUDGET: usize = MAX_FRAME_DATA as usize - 64;
 const REQUEST_MESSAGE_FIELDS: usize = (4 + 16) + (4 + 8) + 4;
 
 /// What a group adds before its messages: its Login's field, a Login
-/// being a nick's length.
+/// being a nick's length, within which an identity guest's `guest` and
+/// fingerprint fit too.
 const REQUEST_GROUP_FIELDS: usize = 4 + 3 * ALIAS_MAX_CHARS;
 
 /// Does one sender's group of Get Message Requests always fit a page, as
@@ -1100,7 +1127,7 @@ fn cut(s: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hxd_core::inbox::{Mailbox, StoredMessage};
+    use hxd_core::inbox::StoredMessage;
     use hxd_core::messaging::RequestGroup;
     use hxproto::messaging::{parse_entry, parse_message_requests};
 
@@ -1231,7 +1258,13 @@ mod tests {
         let mut from = 0;
         let mut seen = Vec::new();
         loop {
-            let m = message(&listing_chunks(&listing, true, from, TextEncoding::Utf8));
+            let m = message(&listing_chunks(
+                &listing,
+                true,
+                from,
+                TextEncoding::Utf8,
+                false,
+            ));
             assert!(m.len() <= MAX_FRAME_DATA as usize + hxproto::HL_HDR_LEN);
             let page = parse_message_requests(&m, m.len()).unwrap();
             let first = from == 0;
@@ -1260,7 +1293,13 @@ mod tests {
             approvals: vec![],
             dropped: 0,
         };
-        let m = message(&listing_chunks(&listing, true, 0, TextEncoding::Utf8));
+        let m = message(&listing_chunks(
+            &listing,
+            true,
+            0,
+            TextEncoding::Utf8,
+            false,
+        ));
         assert!(m.len() <= MAX_FRAME_DATA as usize + hxproto::HL_HDR_LEN);
         let page = parse_message_requests(&m, m.len()).unwrap();
         assert_eq!(page.cursor, None);

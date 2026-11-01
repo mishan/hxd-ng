@@ -2614,13 +2614,14 @@ impl MessageStore for SqliteStore {
         &self,
         to: &Mailbox,
         from: &Mailbox,
-        address: &str,
+        address: Option<&str>,
         since: SystemTime,
     ) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
             "UPDATE message SET friendship = NULL, sender_address = NULL
-              WHERE {} AND {} AND friendship = 0 AND sender_address = ?3 AND sent_at >= ?4",
+              WHERE {} AND {} AND friendship = 0 AND (?3 IS NULL OR sender_address = ?3)
+                AND sent_at >= ?4",
             mailbox_sql(to, "recipient", 1),
             mailbox_sql(from, "sender", 2)
         );

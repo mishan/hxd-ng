@@ -806,6 +806,7 @@ async fn handle_login(
                     account.identity.fingerprint == Some(i.fingerprint.0)
                         && i.tag().device_cert.is_some()
                 }),
+            guest_identities: p.guest_identities && p.messaging && ctx.core.messaging_enabled(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -836,6 +837,7 @@ async fn handle_login(
         .as_ref()
         .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
     let attach_friendships = attach.transport.friendships;
+    let attach_guest_identities = attach.transport.guest_identities;
     let attached = if revoked {
         None
     } else {
@@ -1018,6 +1020,9 @@ async fn handle_login(
     // answered as it always was (§7.5).
     if attach_friendships && ctx.core.takes_part(uid) {
         caps.push("friendships".into());
+    }
+    if attach_guest_identities && ctx.core.takes_part(uid) {
+        caps.push("guest_identities".into());
     }
     let mut ok = json!({
         "session": session_id,

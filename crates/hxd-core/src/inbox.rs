@@ -596,15 +596,15 @@ pub trait MessageStore: Send + Sync + 'static {
         since: SystemTime,
     ) -> Result<usize, StoreError>;
 
-    /// `from`'s requests to `to` sent since `since` from the address
-    /// `address` are now mail, on no friendship or approval, still not
-    /// counted as sent: what an approval of a guest, which writes no
-    /// approval, makes of them. Returns how many.
+    /// `from`'s requests to `to` sent since `since`, from the address
+    /// `address` where given, are now mail, on no friendship or approval,
+    /// still not counted as sent: what an approval of a guest, which
+    /// writes no approval, makes of them. Returns how many.
     fn requests_to_mail(
         &self,
         to: &Mailbox,
         from: &Mailbox,
-        address: &str,
+        address: Option<&str>,
         since: SystemTime,
     ) -> Result<usize, StoreError>;
 

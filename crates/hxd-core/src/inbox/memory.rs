@@ -711,7 +711,7 @@ impl MessageStore for MemoryStore {
         &self,
         to: &Mailbox,
         from: &Mailbox,
-        address: &str,
+        address: Option<&str>,
         since: SystemTime,
     ) -> Result<usize, StoreError> {
         let mut guard = self.inner.lock().unwrap();
@@ -722,7 +722,7 @@ impl MessageStore for MemoryStore {
                 && is(&m.recipient, to)
                 && m.sent_at >= since
                 && m.sender.as_ref().is_some_and(|s| is(s, from))
-                && inner.addresses.get(&m.id).is_some_and(|a| a == address)
+                && address.is_none_or(|a| inner.addresses.get(&m.id).is_some_and(|k| k == a))
             {
                 m.friendship = None;
                 inner.addresses.remove(&m.id);

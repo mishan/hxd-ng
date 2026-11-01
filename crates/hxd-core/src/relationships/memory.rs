@@ -77,12 +77,17 @@ impl Held {
         match r {
             Requester::Account(m) => Held::Account(HoldKey::of(m)),
             Requester::Address(a) => Held::Address(a.clone()),
+            Requester::Identity(fp) => Held::Account(HoldKey {
+                login: None,
+                fingerprint: Some(*fp),
+            }),
         }
     }
 
     fn matches(&self, r: &Requester) -> bool {
         match (self, r) {
             (Held::Account(h), Requester::Account(m)) => h.loosely(m),
+            (Held::Account(h), Requester::Identity(fp)) => h.fingerprint == Some(*fp),
             (Held::Address(h), Requester::Address(a)) => h == a,
             _ => false,
         }
@@ -157,6 +162,7 @@ fn sent_by(e: &LedgerEntry, from: &Requester) -> bool {
     match (from, &e.sender) {
         (Requester::Account(m), Some(s)) => is(s, m),
         (Requester::Address(a), None) => e.address.as_deref() == Some(a),
+        (Requester::Identity(fp), Some(s)) => s.fingerprint == Some(*fp),
         _ => false,
     }
 }
@@ -966,6 +972,26 @@ impl RelationshipStore for MemoryRelationships {
             }
         }
         Ok(out)
+    }
+
+    fn guest_requests_to(
+        &self,
+        address: &str,
+        to: &Mailbox,
+        since: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .ledger
+            .iter()
+            .filter(|e| {
+                e.kind == RequestKind::Message
+                    && e.address.as_deref() == Some(address)
+                    && e.sender.as_ref().is_none_or(|s| s.login == "guest")
+                    && e.at >= floor(since)
+                    && is(&e.recipient, to)
+            })
+            .count())
     }
 
     fn recipients_from_address(

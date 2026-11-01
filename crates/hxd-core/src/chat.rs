@@ -2112,7 +2112,10 @@ impl Core {
         // offline messages", so this path cannot be used to tell them
         // apart — see AccountDirectory::inbox_account.
         let mailbox = directory.inbox_account(to).ok_or(ChatError::NoSuchUser)?;
-        let sender = Sender::resolve(&self.roster.lock().unwrap(), from)?;
+        let mut sender = Sender::resolve(&self.roster.lock().unwrap(), from)?;
+        if self.guest_live_only(from, to) {
+            sender.mailbox = None;
+        }
         self.deliver(
             sender,
             Recipient {
@@ -2178,6 +2181,9 @@ impl Core {
             crate::relationships::Requester::Account(m) => {
                 store.sent_since(m, since).map_err(store_failed)?
             }
+            crate::relationships::Requester::Identity(fp) => store
+                .sent_since(&Mailbox::identified("guest", *fp), since)
+                .map_err(store_failed)?,
             // Mail is stored under an account; an address's only sends
             // are requests.
             crate::relationships::Requester::Address(_) => crate::inbox::Sent::default(),
@@ -6557,7 +6563,7 @@ mod inbox_tests {
             &self,
             to: &Mailbox,
             from: &Mailbox,
-            address: &str,
+            address: Option<&str>,
             since: SystemTime,
         ) -> Result<usize, StoreError> {
             self.inner.requests_to_mail(to, from, address, since)
