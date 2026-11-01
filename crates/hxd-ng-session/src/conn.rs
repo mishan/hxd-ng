@@ -139,6 +139,12 @@ fn request_weight(req: &str) -> u32 {
 const IDS_MAX: usize = 50;
 const IDS_REPLY_BYTES: usize = 64 * 1024;
 
+/// `history`'s `ids`: 1 to [`IDS_MAX`] line ids, or `None`.
+fn line_ids(v: &Value) -> Option<Vec<u64>> {
+    let ids: Option<Vec<u64>> = v.as_array()?.iter().map(Value::as_u64).collect();
+    ids.filter(|ids| (1..=IDS_MAX).contains(&ids.len()))
+}
+
 /// How often a quiet connection is pinged, and how long it may stay
 /// silent before the ping is treated as unanswered. The deadline is
 /// three periods so that one lost ping, or one tick delayed behind a
@@ -1905,7 +1911,8 @@ async fn dispatch(
                         after: None,
                         ids: Some(ids),
                         ..
-                    }) if state.replies && (1..=IDS_MAX).contains(&ids.len()) => {
+                    }) if state.replies && line_ids(&ids).is_some() => {
+                        let ids = line_ids(&ids).expect("checked by the guard");
                         let uid = state.uid;
                         match off_reactor(&ctx.core, move |c| c.history_ids(uid, room, &ids)).await
                         {

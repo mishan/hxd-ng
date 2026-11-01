@@ -475,15 +475,23 @@ async fn history_ids_answer_under_the_readers_own_checks_and_bound() {
     assert_eq!(got["lines"][0]["id"], hidden);
     assert_eq!(got["lines"].as_array().unwrap().len(), 1);
     // A session that did not declare `replies` is served a page, as an
-    // unknown param is ignored.
+    // unknown param is ignored, whatever `ids` holds; one that did is
+    // refused a malformed one.
     let (mut dave, _) = login(addr, "dave", false).await;
-    let page = ok(&mut dave, "history", json!({ "ids": [first] })).await;
-    assert!(page["lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|l| l["id"] == second));
+    for ids in [json!([first]), json!("x"), json!([-1])] {
+        let page = ok(&mut dave, "history", json!({ "ids": ids })).await;
+        assert!(
+            page["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["id"] == second),
+            "{ids}"
+        );
+    }
     for params in [
+        json!({ "ids": "x" }),
+        json!({ "ids": [-1] }),
         json!({ "ids": [] }),
         json!({ "ids": (1..=51).collect::<Vec<u64>>() }),
         json!({ "ids": [first], "before": second }),

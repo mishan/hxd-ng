@@ -191,9 +191,11 @@ pub struct HistoryParams {
     pub after: Option<u64>,
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Lines by id in place of the cursors, with `replies` (§7.3).
+    /// Lines by id in place of the cursors, with `replies` (§7.3). Read
+    /// as it came, so that a session without `replies` has it ignored
+    /// whatever it holds, as an unknown param is (§5).
     #[serde(default)]
-    pub ids: Option<Vec<u64>>,
+    pub ids: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
