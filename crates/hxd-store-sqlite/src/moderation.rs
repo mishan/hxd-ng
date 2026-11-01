@@ -376,7 +376,7 @@ impl ModerationStore for SqliteStore {
         // the column narrow what it hands back.
         let mut stmt = sql(conn.prepare_cached(&format!(
             "SELECT {REPORT_COLUMNS} FROM report
-              WHERE closed_at IS NULL AND kind = ?1 AND {column} = ?2 ORDER BY id ASC"
+              WHERE closed_at IS NULL AND kind = ?1 AND {column} IS ?2 ORDER BY id ASC"
         )))?;
         let rows = sql(stmt.query_map(params![kind, value], report_of))?;
         collect(rows)
