@@ -57,7 +57,7 @@ to another project.
 | [system-account.md](system-account.md) — the reserved server account: commands and notifications on the classic wire | yes, less `/vouch` and queued mail | all | design |
 | [server-link.md](server-link.md) — joining fogWraith's linked network: ghosts, the link wire, key mode | users, chat, messages, user info and moderation across links, and relaying between them | all (ghosts are users to every client) | design, implements a fogWraith spec |
 | [voice.md](voice.md) — the SFU, one room across both signalling wires | yes | extended, ng | design, implements a fogWraith spec |
-| [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | ng; extended when GtkHx renders | spec, contributed to fogWraith's set |
+| [capabilities-video.md](capabilities-video.md) — video publications and subscriptions | yes | extended, ng | spec, contributed to fogWraith's set |
 | [hope.md](hope.md) — HOPE, the secure login and transport encryption on the classic wire | yes | period and extended clients that speak HOPE | design |
 | [files-plan.md](files-plan.md) — the file area: browsing, downloads, the local area and uploads | yes, less aliases and folder transfers on ng | all | design |
 | [ng-uploads.md](ng-uploads.md) — uploads on the ng wire: `files_upload`, pieces over HTTP, resume | yes, server | ng | design |
