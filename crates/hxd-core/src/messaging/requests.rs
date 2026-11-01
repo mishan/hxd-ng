@@ -725,6 +725,10 @@ impl Core {
     /// sessions that asked, and turns what each of them has waiting into
     /// mail.
     fn answer_guests(&self, me: &Mailbox, action: RequestAction) -> Result<(), MessagingError> {
+        // Under the lock a request is stored with, as an account's answer
+        // is: an approval ended and its hold written are one act to a
+        // reply that would let the guest in again.
+        let _writing = self.friend_writes();
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
         let group = Mailbox::login("guest");
@@ -735,9 +739,6 @@ impl Core {
         let plain = |s: &crate::roster::UserSession| s.login == "guest" && s.identity.is_none();
         match action {
             RequestAction::Approve if waiting => {
-                // Under the lock a request is stored with, as an
-                // account's approval is made.
-                let _writing = self.friend_writes();
                 let asked: Vec<Uid> = {
                     let r = self.roster.lock().unwrap();
                     r.users
