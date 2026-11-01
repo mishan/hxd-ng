@@ -918,9 +918,11 @@ ALTER TABLE message ADD COLUMN sender_address TEXT;
 /// pruning the newest of them never hands its place out again.
 ///
 /// A report on a message is kept by its reference too. One whose row is
-/// gone keeps its row id, which nothing reads: and the reporter's mailbox
-/// and the time are checked as well as the id, since a rowid is handed
-/// out again once the newest row goes, and could name someone else's.
+/// gone keeps its row id, which nothing reads: and the reporter and the
+/// time are checked as well as the id, since a rowid is handed out again
+/// once the newest row goes, and could name someone else's. The reporter
+/// by its login or its key, either: a claim or a rotation since the
+/// report moved the message's key and not the report's.
 const SCHEMA_V33: &str = "
 ALTER TABLE message ADD COLUMN ref BLOB;
 ALTER TABLE message ADD COLUMN seq INTEGER;
@@ -946,8 +948,8 @@ ALTER TABLE report ADD COLUMN target_ref BLOB;
 UPDATE report SET target_ref = (
     SELECT ref FROM message
      WHERE message.id = report.target_msg AND message.sent_at <= report.at
-       AND IFNULL(message.recipient_fp, message.recipient)
-         = IFNULL(report.reporter_fp, report.reporter))
+       AND (message.recipient = report.reporter
+            OR message.recipient_fp = report.reporter_fp))
  WHERE kind = 3;
 UPDATE report SET target_msg = NULL WHERE target_ref IS NOT NULL;
 ";
@@ -3675,6 +3677,9 @@ mod tests {
                 (1, "dave", None, "a receipt"),
                 (0, "alicia", Some(fp_hex(&fp)), "a2"),
                 (0, "dave", None, "d3"),
+                // Reported, and then claimed and rotated (below).
+                (0, "erin", Some(fp_hex(&[0xe1; 32])), "e1"),
+                (0, "fred", Some(fp_hex(&[0xf2; 32])), "f1"),
             ] {
                 conn.execute(
                     "INSERT INTO message (kind, recipient, recipient_fp, sender_nick, body, sent_at)
@@ -3684,28 +3689,42 @@ mod tests {
                 .unwrap();
             }
             // Dave reports his first message; a row id that is alice's;
-            // and one whose row is gone.
-            for target in [1, 2, 99] {
+            // and one whose row is gone. Erin reported hers before she
+            // linked an identity, and fred his under the key he has
+            // since rotated from: the message's key moved, the report's
+            // did not.
+            for (reporter, reporter_fp, target) in [
+                ("dave", None, 1),
+                ("dave", None, 2),
+                ("dave", None, 99),
+                ("erin", None, 7),
+                ("fred", Some(fp_hex(&[0xf1; 32])), 8),
+            ] {
                 conn.execute(
-                    "INSERT INTO report (kind, reporter, target_msg, reason, at)
-                     VALUES (3, 'dave', ?1, 'r', 5)",
-                    params![target],
+                    "INSERT INTO report (kind, reporter, reporter_fp, target_msg, reason, at)
+                     VALUES (3, ?1, ?2, ?3, 'r', 5)",
+                    params![reporter, reporter_fp, target],
                 )
                 .unwrap();
             }
             conn.pragma_update(None, "user_version", 32).unwrap();
         }
         let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
-        let reported: Vec<ReportTarget> = (1..=3)
+        let reported: Vec<ReportTarget> = (1..=5)
             .map(|id| ModerationStore::report(&store, id).unwrap().unwrap().target)
             .collect();
         let d1 = store.list(&Mailbox::login("dave"), Some(2), 1).unwrap()[0].reference;
+        let only = |of: Mailbox| store.list(&of, None, 1).unwrap()[0].reference;
+        let e1 = only(Mailbox::identified("erin", [0xe1; 32]));
+        let f1 = only(Mailbox::identified("fred", [0xf2; 32]));
         assert_eq!(
             reported,
             [
                 ReportTarget::Msg(Some(d1)),
                 ReportTarget::Msg(None),
-                ReportTarget::Msg(None)
+                ReportTarget::Msg(None),
+                ReportTarget::Msg(Some(e1)),
+                ReportTarget::Msg(Some(f1)),
             ],
             "a report takes its own message's reference, and no other's"
         );
@@ -3740,7 +3759,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!((refs, distinct), (6, 6), "every row a reference of its own");
+        assert_eq!((refs, distinct), (8, 8), "every row a reference of its own");
         assert_eq!(receipts, 1, "and the receipt no place");
         let next = NewMessage {
             recipient: dave.clone(),
