@@ -5038,11 +5038,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 [] => String::new(),
                 ref titles => format!("   roles: {}\r", titles.join(", ")),
             };
+            // A login and an address are shown to the user and to a
+            // moderator alone, where mhxd shows them to anyone with the
+            // bit: the bootstrap guest holds it, and an address locates a
+            // person while a login is half of a password guess.
+            let full = target == sess.uid || sess.can(bit::DISCONNECT_USERS);
             let info = format!(
                 "    name: {}\r   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
                 d.info.nick,
-                d.login,
-                d.addr.map_or_else(|| "-".into(), |a| a.to_string()),
+                if full { d.login.as_str() } else { "-" },
+                d.addr
+                    .filter(|_| full)
+                    .map_or_else(|| "-".into(), |a| a.to_string()),
                 secs / 3600,
                 (secs % 3600) / 60,
                 secs % 60,

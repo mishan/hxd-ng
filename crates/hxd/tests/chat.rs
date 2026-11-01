@@ -386,6 +386,48 @@ async fn pm_broadcast_and_access_gates() {
 }
 
 #[tokio::test]
+async fn user_info_shows_a_login_and_address_to_the_user_and_moderators_alone() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, _ctx) = start_server(td.path()).await;
+    let mut admin = Client::login(addr, "boss", "admin", "pw").await;
+    let mut g = Client::login(addr, "guestie", "guest", "").await;
+    admin.recv_type(0x12d).await;
+
+    // The bootstrap guest holds get_user_info, the admin disconnect_users.
+    let (admin_uid, guest_uid) = (admin.uid, g.uid);
+    let cases = [
+        ("a guest of the admin", &mut g, admin_uid, false),
+        ("the admin of a guest", &mut admin, guest_uid, true),
+    ];
+    for (what, viewer, target, shown) in cases {
+        let t = viewer
+            .send(
+                REQ_USER_GETINFO,
+                &[(tag::UID, (target as u32).to_be_bytes().to_vec())],
+            )
+            .await;
+        let info = viewer.recv_type(HDR_TASK).await;
+        assert_eq!((info.trans, info.flag), (t, 0), "{what}");
+        let text = String::from_utf8_lossy(&chunk(&info, tag::BODY).unwrap()).into_owned();
+        assert_eq!(text.contains("127.0.0.1"), shown, "{what}: {text}");
+        assert_eq!(text.contains("login: -"), !shown, "{what}: {text}");
+    }
+    let t = g
+        .send(
+            REQ_USER_GETINFO,
+            &[(tag::UID, (g.uid as u32).to_be_bytes().to_vec())],
+        )
+        .await;
+    let own = g.recv_type(HDR_TASK).await;
+    assert_eq!((own.trans, own.flag), (t, 0));
+    let text = String::from_utf8_lossy(&chunk(&own, tag::BODY).unwrap()).into_owned();
+    assert!(
+        text.contains("login: guest") && text.contains("127.0.0.1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn kick_ban_and_untouchable_targets() {
     let td = tempfile::tempdir().unwrap();
     // Loopback off the exempt list: a kick-with-ban of a guest on an
