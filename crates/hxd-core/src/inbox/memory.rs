@@ -566,6 +566,9 @@ impl MessageStore for MemoryStore {
         );
         inner.forget_removed();
         renumber(&mut inner, moves, login, &hex);
+        // Its count went with its mail: a later holder of the login
+        // must not count on from it. An unlink raises it again.
+        inner.cursors.remove(login);
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if claim_one(&mut m.recipient, login, fingerprint) {

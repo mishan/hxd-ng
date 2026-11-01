@@ -2457,6 +2457,10 @@ impl MessageStore for SqliteStore {
             &fingerprint,
             login,
         )?;
+        // Its count went with its mail: a later holder of the login must
+        // not count on from it. An unlink raises it again.
+        tx.execute("DELETE FROM mailbox_seq WHERE mailbox = ?1", params![login])
+            .map_err(StoreError::new)?;
         for sql in [
             "UPDATE message SET recipient_fp = ?1 WHERE recipient = ?2 AND recipient_fp IS NULL",
             "UPDATE message SET sender_fp = ?1 WHERE sender = ?2 AND sender_fp IS NULL",

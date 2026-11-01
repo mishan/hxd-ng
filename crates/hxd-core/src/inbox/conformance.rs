@@ -268,14 +268,15 @@ fn an_unlinked_login_counts_on_past_its_identity(s: &dyn MessageStore) {
         Mailbox::login("alice"),
     );
     place(s, &msg(&bare, &alice, "before linking", at(1)));
+    s.claim("dave", &fp(1)).unwrap();
     for i in 0..3 {
         place(s, &msg(&identified, &alice, "linked", at(i)));
     }
     s.unlinked("dave", &fp(1)).unwrap();
     assert_eq!(
         place(s, &msg(&bare, &alice, "after", at(4))),
-        4,
-        "{case}: past the identity's three"
+        5,
+        "{case}: past the identity's four, the claimed one among them"
     );
     s.unlinked("erin", &fp(9)).unwrap();
     let erin = Mailbox::login("erin");
@@ -329,6 +330,11 @@ fn a_merge_into_a_fresh_mailbox_keeps_its_cursors(s: &dyn MessageStore) {
         place(s, &msg(&rotated, &alice, "rotated", at(5))),
         5,
         "{case}: counting on from the old key's"
+    );
+    assert_eq!(
+        place(s, &msg(&bare, &alice, "to whoever holds dave now", at(6))),
+        1,
+        "{case}: the claimed login's count went with its mail"
     );
 }
 
