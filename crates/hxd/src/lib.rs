@@ -1494,6 +1494,11 @@ pub struct MessagingSection {
     /// `[inbox] db`. Lost or replaced, every address's count starts
     /// again.
     pub request_secret: Option<PathBuf>,
+    /// An approved identity guest's messages wait for a recipient that
+    /// is not there, as an account's do. Off, they reach a session that
+    /// is there or nobody, as a plain guest's always do.
+    #[serde(default)]
+    pub queue_identity_guests: bool,
 }
 
 impl MessagingSection {
@@ -1559,6 +1564,7 @@ impl MessagingSection {
             max_message_bytes: self.max_message_bytes,
             request_messages: self.request_messages,
             max_requests: self.max_requests,
+            queue_identity_guests: self.queue_identity_guests,
             ..hxd_core::MessagingPolicy::default()
         })
     }

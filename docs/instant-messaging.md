@@ -246,9 +246,24 @@ listed as one group, `guest`, which counts as one sender toward
 `request_messages`; past it a guest's request is dropped, answered and
 counted as one stored (§4.4). Each waiting message keeps the key of
 the address it came from, and what follows is by that key, so guests
-behind one address, a NAT's or one IPv6 /64, are one guest to it. A guest that proved an identity has a
-fingerprint a block holds against, and its message by login goes as
-mail, as it always has (`private-messages.md` §9).
+behind one address, a NAT's or one IPv6 /64, are one guest to it.
+
+An **identity guest**, a guest that proved an identity, is a sender of
+its own: its message by login to an account taking part is a request
+or refused as a plain guest's is, bounded and held by its fingerprint
+alone, and listed apart, as `guest` with that fingerprint, which is how
+an answer names it; `guest` alone names the plain group. Since a
+fingerprint costs nothing to mint, every guest behind one address,
+plain or identity, also shares one sender's `request_messages` toward a
+recipient, and all guests together are the one sender the plain group
+is toward `max_requests`, sharing its two senders' worth. Only a session that can name one is shown an identity
+guest's requests and approvals, counted in its `requests_changed`,
+which it is not sent for an identity guest's alone, and answers,
+clears or writes back to approve them: a classic session that negotiated bit 15, and
+an ng session that declared `guest_identities` (`hotline-ng.md` §7.5).
+To any other they are not there. To an account outside messaging an
+identity guest's message by login goes as mail, as it always has
+(`private-messages.md` §9).
 
 No approval of a guest is written, since one would let in every guest
 to come. Approving `guest` lets in the live guest sessions that asked
@@ -263,10 +278,17 @@ and the address held, and every other address's stays. Ending lets out
 the sessions let in, and holds their addresses. A reply by uid, from a session that understands
 requests, to a guest that asked approves that guest as writing back
 does (§4.3), and hands over what its address has waiting and no other
-address's.
-A message by login naming `guest` approves nothing. Under an approval a
-guest's messages reach a session of the recipient that is there, or
-are answered `no_such_user`, as a guest's always were.
+address's. An identity guest is answered the same way by its
+fingerprint: approving lets in its sessions that asked, deleting and
+ending hold its fingerprint, clearing takes it by its first message as
+it takes an account, and a reply by uid from a session that can name
+it hands over its own messages and no other guest's. A message by login naming `guest` approves
+nothing. Under an approval a guest's messages are still refused by a
+block, and otherwise reach a session of the recipient that is there,
+or are answered `no_such_user`, as a guest's always were;
+`[messaging] queue_identity_guests` lets an identity guest's wait for
+a recipient that is not there, as an account's do, since a
+fingerprint can be blocked.
 
 A `to_login` to an account without `AccessMessaging`, a `msg` to a uid
 on the roster, and a classic private message (108) to a user on the
@@ -318,7 +340,7 @@ deletes every message request received in a span of time, `since` to
 `before`, each optional, so that a recipient who has been flooded can
 clear the flood and keep what came before it, or clear everything. A
 message request is in the span by its first waiting message, so a
-flood's opener decides; the guests by address instead (§4.1). Each sender is held, and told, as one decline
+flood's opener decides; the plain guests by address instead (§4.1). Each sender is held, and told, as one decline
 or delete would hold and tell it (§4.4). Approvals and friendships are
 untouched. It is one transaction of the store, answered with how many
 of each it cleared, and the recipient's sessions hear it once:
@@ -366,9 +388,12 @@ is written, and the message row, `requests_changed` and any lazy delete
   is the extension's reason for mutual removal. A hold is recorded
   against both keys of the mailbox it was placed on, Login and
   fingerprint, so that linking or unlinking an identity does not shed
-  it; a guest's against its address.
-- **Per recipient**: at most `max_requests` senders waiting, the plain
-  guests one among them (§4.1). Past it a
+  it; a guest's against its address, and an identity guest's against
+  its fingerprint alone, so that it holds no other guest.
+- **Per recipient**: at most `max_requests` senders waiting, all the
+  guests together, plain and identity, one among them, holding two
+  senders' worth of messages between them, so that guests crowd only
+  each other (§4.1). Past it a
   new request is dropped, answered and counted the same, so that a
   burst of new accounts cannot flush out the requests the recipient
   already has. The listing says how many were dropped (§4.5).
@@ -415,9 +440,14 @@ its messages is signed, whose certificate names it anyway,
 and each message with its inbox id, so that a request can be reported as
 any message is (`moderation.md` §4.2); the report path reads a request
 row for its recipient alone, past the gate of §5. The plain guests are
-listed as one group, `guest` (§4.1). The listing also gives the
-approvals, `guest` among them while a guest session holds the caller's,
-and how many requests were dropped since the last listing. Listing makes a session one that understands requests
+listed as one group, `guest`, and each identity guest apart with its
+fingerprint, to a session that can name one (§4.1). The listing also
+gives the approvals, a guest's among them while its session holds the
+caller's,
+and how many requests were dropped since the last listing: the
+account's count, an identity guest's dropped requests among them
+whichever session lists it, since dropping happens before anyone is
+shown anything. Listing makes a session one that understands requests
 (§4.1), to send approvals and `requests_changed` to (§4.6), and leaves
 whether its account takes them as it was, though for an account that
 takes them a listing's first page renews the opt-in as a 1 would: a client that shows
@@ -637,8 +667,9 @@ requests add transactions 829–832, under the numbers fogWraith reserved
   signed, the identity draft's `DATA_MESSAGE_SIGNED`; then approvals as
   groups with no messages and `DATA_ROSTER_STATE` `Accepted`; a page
   bounded to fit the frame limit;
-- **Answer Message Request**, `DATA_FRIEND_LOGIN` and
-  `DATA_REQUEST_ACTION`: approve, delete, or end an approval;
+- **Answer Message Request**, `DATA_FRIEND_LOGIN`, or for an identity
+  guest `DATA_FRIEND_IDENTITY` alone, and `DATA_REQUEST_ACTION`:
+  approve, delete, or end an approval;
 - **Clear Message Requests** (§4.3), `DATA_SPAN_SINCE` and
   `DATA_SPAN_BEFORE` each optional, answered with `DATA_REQUEST_COUNT`,
   the message requests deleted, and `DATA_FRIEND_REQUEST_COUNT`, the
@@ -674,8 +705,10 @@ What the classic wire says differently from the documents, on purpose:
 - **What an entry carries.** Roster entries and presence changes carry
   no `FieldUserName` or `DATA_FRIEND_CAPABILITIES` yet, which the
   extension makes optional; a page of Get Message Requests carries
-  no `DATA_FRIEND_IDENTITY` or `DATA_MESSAGE_SIGNED`, which are the
-  identity draft's, unnegotiated here; and, as on the ng wire, Get
+  `DATA_FRIEND_IDENTITY` only on an identity guest's group and its
+  approval, to a session that negotiated bit 15, and no
+  `DATA_MESSAGE_SIGNED`, which is the identity draft's, unnegotiated
+  here; and, as on the ng wire, Get
   Message Requests delivers nothing, where the draft has it hand over
   what waits under the caller's approvals.
 - **Bit 15 without bit 13.** Bit 15 is confirmed beside bit 6 to a
@@ -837,8 +870,7 @@ Each stage is a branch with tests, in the house style.
    store.
 
    **IM2b**, what IM2 leaves open: suspension on a revoked
-   `AccessMessaging` (§6); User Search (823); an identity guest's
-   message by login as a request of its own; unlinking telling the
+   `AccessMessaging` (§6); User Search (823); unlinking telling the
    friends `Removed`;
    `max_offline` on held rows; `max_sessions_per_login` eviction; a request
    answered once its ledger row is written, the rest off its path;
@@ -918,8 +950,10 @@ what the guests' group holds, no more than one page of Get Message Requests hold
 `offline_retention_days`; `max_offline`, aligned with `[inbox]`;
 `max_sessions_per_login`, default 0, unlimited) and the requests'
 (`request_messages`, `requests_per_day`, `max_requests`,
-`max_friend_requests`, `request_retention_days`, and `request_secret`,
-the file the per-address key's secret is kept in), with
+`max_friend_requests`, `request_retention_days`, `request_secret`,
+the file the per-address key's secret is kept in, and
+`queue_identity_guests`, off by default, whether an approved identity
+guest's messages wait for a recipient that is not there), with
 `requests_per_address` under `[limits]`.
 
 **Deliberate deviations from the extension**, in two groups. The first
@@ -958,8 +992,8 @@ hxd-ng's own policy and is not.
   or a classic `/msg <login>` to a non-friend holding `AccessMessaging`
   makes a request or is refused, where it used to go to the inbox from
   anyone not blocked; a classic one makes a request from an account
-  without the bit too, and a plain guest's on either wire makes one or
-  is refused.
+  without the bit too, and a guest's on either wire makes one or is
+  refused.
 - **Sessions.** The extension says a server that bounds a Login's
   sessions evicts the oldest rather than refusing the login. `[limits]`
   refuses: past `connections_per_account`, and for logins faster than

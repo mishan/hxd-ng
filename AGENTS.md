@@ -498,7 +498,9 @@ Three layers, all `cargo test --workspace`:
   whoever it names; an unproved session's friendship acts refused and
   spending nothing; and presenting paced per account across reconnects,
   an empty request too, one past the bound refused before it spends,
-  and none kicked for),
+  and none kicked for; and an identity guest's requests listed apart
+  and answered by fingerprint to an ng session that declared
+  `guest_identities` and a bit-15 one, and to no other),
   `limits.rs` (so many connections from one address across both
   wires, then a burst and a rate, a TLS handshake counted from accept,
   and an exempt address held to neither; a classic user's multi-line

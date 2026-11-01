@@ -41,6 +41,9 @@ pub struct LoginParams {
     /// Whether it speaks the family's portable part (§7.5).
     #[serde(default)]
     pub friendships: bool,
+    /// Whether it names identity guests apart (§7.5).
+    #[serde(default)]
+    pub guest_identities: bool,
 }
 
 #[derive(Debug, Deserialize)]

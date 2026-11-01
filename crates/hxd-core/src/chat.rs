@@ -62,6 +62,10 @@ struct Sender {
     /// is one, and the session itself for a plain guest
     /// (`docs/inline-media.md` §5.1).
     principal: crate::media::Principal,
+    /// Its message is stored nowhere, though its mailbox stays to be
+    /// blocked by: an approved identity guest's, unless
+    /// `queue_identity_guests` (`docs/instant-messaging.md` §4.1).
+    live_only: bool,
 }
 
 impl Sender {
@@ -84,6 +88,7 @@ impl Sender {
             },
             mailbox,
             reply_login: sess.has_inbox.then(|| sess.login.clone()),
+            live_only: false,
         })
     }
 }
@@ -2112,7 +2117,8 @@ impl Core {
         // offline messages", so this path cannot be used to tell them
         // apart — see AccountDirectory::inbox_account.
         let mailbox = directory.inbox_account(to).ok_or(ChatError::NoSuchUser)?;
-        let sender = Sender::resolve(&self.roster.lock().unwrap(), from)?;
+        let mut sender = Sender::resolve(&self.roster.lock().unwrap(), from)?;
+        sender.live_only = self.guest_live_only(from, to);
         self.deliver(
             sender,
             Recipient {
@@ -2178,6 +2184,9 @@ impl Core {
             crate::relationships::Requester::Account(m) => {
                 store.sent_since(m, since).map_err(store_failed)?
             }
+            crate::relationships::Requester::Identity(fp) => store
+                .sent_since(&Mailbox::identified("guest", *fp), since)
+                .map_err(store_failed)?,
             // Mail is stored under an account; an address's only sends
             // are requests.
             crate::relationships::Requester::Address(_) => crate::inbox::Sent::default(),
@@ -2268,8 +2277,19 @@ impl Core {
         // people share), and could therefore fill any mailbox on the
         // server to its cap and stay unstoppable. So a guest may reach a
         // session, live, and may not queue anything.
-        let durable = to.has_inbox && sender.mailbox.is_some();
+        let durable = to.has_inbox && sender.mailbox.is_some() && !sender.live_only;
         let Some(store) = self.inbox.as_ref().filter(|_| durable) else {
+            // A block placed since routing let this sender in is still a
+            // block, answered as routing answers one: no such account.
+            if let Some(m) = sender.mailbox.as_ref().filter(|_| sender.live_only) {
+                if self
+                    .relationships()?
+                    .is_blocked(&to.mailbox, m)
+                    .map_err(store_failed)?
+                {
+                    return Err(ChatError::NoSuchUser);
+                }
+            }
             // A recipient with no session cannot be reached this way.
             let mut r = self.roster.lock().unwrap();
             // The same resolution the durable path does, for the same
@@ -6344,6 +6364,60 @@ mod inbox_tests {
     }
 
     #[test]
+    fn a_live_only_identity_guest_is_refused_by_a_block_placed_after_routing() {
+        let (core, store) = server(&["dave"]);
+        let (m, _rm) = attach(&core, "dave", true);
+        let (g, _rg) = core
+            .attach(AttachInfo {
+                account: None,
+                nick: "drifter".into(),
+                icon: 1,
+                admin: false,
+                access: AccessBits::empty().with(bit::SEND_MSGS),
+                login: "guest".into(),
+                addr: Some("10.0.0.9".parse().unwrap()),
+                can_detach: false,
+                transport: crate::Transport::default(),
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate: false,
+                can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
+                is_person: false,
+                reads_on_delivery: false,
+                identity: Some(fp(7)),
+                system: false,
+            })
+            .unwrap();
+        core.announce(g);
+        // What `msg_login` hands delivery once routing has let it in.
+        let send = |text: &str| {
+            let mut sender = Sender::resolve(&core.roster.lock().unwrap(), g).unwrap();
+            sender.live_only = true;
+            let dave = Mailbox::login("dave");
+            let to = Recipient {
+                principal: crate::media::Principal::Mailbox(dave.clone()),
+                uid: None,
+                mailbox: dave,
+                has_inbox: true,
+            };
+            core.deliver(sender, to, text.into(), None, None, None)
+        };
+        assert!(matches!(send("hi"), Ok(MsgOutcome::Delivered(None))));
+        core.inbox_block_uid(m, g, true).unwrap();
+        assert_eq!(send("again"), Err(ChatError::NoSuchUser));
+        assert!(
+            store
+                .pending(&Mailbox::login("dave"), 10)
+                .unwrap()
+                .is_empty(),
+            "stored nowhere either way"
+        );
+    }
+
+    #[test]
     fn a_block_is_one_way_and_listed_and_says_nothing_about_who_exists() {
         let (core, _store) = server(&["dave", "spammer"]);
         let (m, _rm) = attach(&core, "dave", true);
@@ -6557,7 +6631,7 @@ mod inbox_tests {
             &self,
             to: &Mailbox,
             from: &Mailbox,
-            address: &str,
+            address: Option<&str>,
             since: SystemTime,
         ) -> Result<usize, StoreError> {
             self.inner.requests_to_mail(to, from, address, since)

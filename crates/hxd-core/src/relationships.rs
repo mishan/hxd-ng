@@ -275,14 +275,19 @@ pub struct Rekeyed {
 }
 
 /// Who sent a request, as its bounds and holds count it: an account by
-/// its mailbox, or a guest by its address, since guests share one
-/// account and reconnecting must earn a guest nothing (§4.1).
+/// its mailbox, a guest by its address, since guests share one account
+/// and reconnecting must earn a guest nothing (§4.1), or a guest that
+/// proved an identity by that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requester {
     Account(Mailbox),
     /// The opaque key the domain derives from the address, never the
     /// address itself.
     Address(String),
+    /// An identity guest's fingerprint. Its ledger rows are its guest
+    /// mailbox's, and its holds carry the fingerprint and no login, so
+    /// that holding one holds no other guest.
+    Identity([u8; 32]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,6 +623,16 @@ pub trait RelationshipStore: Send + Sync + 'static {
         since: SystemTime,
         before: Option<SystemTime>,
     ) -> Result<Vec<String>, StoreError>;
+
+    /// How many message requests guests, plain or identity, have sent
+    /// `to` from `address` since `since`: what all the guests behind one
+    /// address share.
+    fn guest_requests_to(
+        &self,
+        address: &str,
+        to: &Mailbox,
+        since: SystemTime,
+    ) -> Result<usize, StoreError>;
 
     /// How many distinct recipients have been sent requests from
     /// `address` since `since`, whoever sent them.

@@ -31,6 +31,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     what_lapses_reads_as_gone_and_counts_for_nothing(&*new_store());
     a_hold_matches_either_key_and_lapses(&*new_store());
     request_addresses_lists_each_guest_address_once_within_its_span(&*new_store());
+    the_guests_behind_an_address_are_counted_together(&*new_store());
     the_ledger_counts_what_was_sent_and_answers_a_retry(&*new_store());
     a_listing_takes_the_dropped_count(&*new_store());
     an_account_keeps_what_it_was_told_and_nothing_else(&*new_store());
@@ -794,6 +795,7 @@ fn a_hold_matches_either_key_and_lapses(s: &dyn RelationshipStore) {
     s.hold(&dave, &pest, at(100)).unwrap();
     s.hold(&dave, &Requester::Address("addr-9".into()), at(100))
         .unwrap();
+    s.hold(&dave, &Requester::Identity(fp(4)), at(100)).unwrap();
     let account = Requester::Account;
     for (what, owner, sender, now, held) in [
         ("as placed", dave.clone(), pest.clone(), 50, true),
@@ -846,6 +848,27 @@ fn a_hold_matches_either_key_and_lapses(s: &dyn RelationshipStore) {
             50,
             false,
         ),
+        (
+            "an identity guest",
+            dave.clone(),
+            Requester::Identity(fp(4)),
+            50,
+            true,
+        ),
+        (
+            "another identity guest",
+            dave.clone(),
+            Requester::Identity(fp(5)),
+            50,
+            false,
+        ),
+        (
+            "a plain guest's mailbox",
+            dave.clone(),
+            account(Mailbox::login("guest")),
+            50,
+            false,
+        ),
         ("lapsed", dave.clone(), pest.clone(), 100, false),
     ] {
         assert_eq!(
@@ -890,6 +913,60 @@ fn request_addresses_lists_each_guest_address_once_within_its_span(s: &dyn Relat
         ["a1", "a2"],
         "{case}: what was sent from `before` on is outside it"
     );
+}
+
+fn the_guests_behind_an_address_are_counted_together(s: &dyn RelationshipStore) {
+    let case = "the_guests_behind_an_address_are_counted_together";
+    let (dave, erin) = (Mailbox::login("dave"), Mailbox::login("erin"));
+    let (seven, eight) = (
+        Mailbox::identified("guest", fp(7)),
+        Mailbox::identified("guest", fp(8)),
+    );
+    let from = |sender: Option<&Mailbox>, addr: &str, to: &Mailbox, secs| LedgerEntry {
+        address: Some(addr.into()),
+        ..entry(RequestKind::Message, sender, to, secs)
+    };
+    for e in [
+        from(None, "k1", &dave, 5),
+        from(None, "k1", &dave, 10),
+        from(Some(&seven), "k1", &dave, 10),
+        from(Some(&eight), "k1", &dave, 10),
+        from(Some(&seven), "k2", &dave, 10),
+        from(None, "k2", &dave, 10),
+        from(None, "k1", &erin, 10),
+        from(Some(&Mailbox::login("alice")), "k1", &dave, 10),
+    ] {
+        s.record_request(&e).unwrap();
+    }
+    for (what, n, expected) in [
+        (
+            "every guest behind k1, and no account",
+            s.guest_requests_to("k1", &dave, at(10)),
+            3,
+        ),
+        (
+            "an identity guest from any address",
+            s.requests_to(
+                &Requester::Identity(fp(7)),
+                &dave,
+                RequestKind::Message,
+                at(0),
+            ),
+            2,
+        ),
+        (
+            "the plain guests behind k1 alone",
+            s.requests_to(
+                &Requester::Address("k1".into()),
+                &dave,
+                RequestKind::Message,
+                at(0),
+            ),
+            2,
+        ),
+    ] {
+        assert_eq!(n.unwrap(), expected, "{case}: {what}");
+    }
 }
 
 fn the_ledger_counts_what_was_sent_and_answers_a_retry(s: &dyn RelationshipStore) {

@@ -500,7 +500,8 @@ enum ActionParam {
 
 #[derive(Deserialize)]
 struct AnswerParams {
-    login: String,
+    login: Option<String>,
+    fingerprint: Option<String>,
     action: ActionParam,
 }
 
@@ -538,7 +539,7 @@ enum Op {
     Receipt(String, MessageGuid, bool),
     Typing(String, bool),
     Requests,
-    Answer(String, RequestAction),
+    Answer(Named, RequestAction),
     Clear(Option<SystemTime>, Option<SystemTime>),
 }
 
@@ -681,7 +682,7 @@ fn parse(req: &ReqEnvelope) -> Result<Op, &'static str> {
                 ActionParam::Delete => RequestAction::Delete,
                 ActionParam::End => RequestAction::End,
             };
-            Op::Answer(p.login, action)
+            Op::Answer(named_one(p.login, p.fingerprint)?, action)
         }
         _ => {
             let p: ClearParams = crate::conn::params_or_default(p).map_err(|_| bad)?;
@@ -738,7 +739,8 @@ fn act(core: &Core, uid: Uid, op: Op) -> Result<Value, MessagingError> {
             listed["takes_requests"] = json!(core.own_presence(uid)?.takes_requests);
             Ok(listed)
         }
-        Op::Answer(login, action) => done(core.request_answer(uid, &login, action)),
+        Op::Answer(Named::Login(login), action) => done(core.request_answer(uid, &login, action)),
+        Op::Answer(Named::Key(fp), action) => done(core.request_answer_by_key(uid, &fp, action)),
         Op::Clear(since, before) => core.requests_clear(uid, since, before).map(
             |Cleared { declined, deleted }| json!({ "declined": declined, "deleted": deleted }),
         ),

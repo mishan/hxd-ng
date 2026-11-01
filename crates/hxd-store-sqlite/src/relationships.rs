@@ -194,6 +194,7 @@ fn held_sql(who: &Requester, n: usize) -> (String, Vec<Value>) {
     match who {
         Requester::Account(m) => (loosely("held", n), loose_binds(m).to_vec()),
         Requester::Address(a) => (format!("held_address = ?{n}"), vec![Value::Text(a.clone())]),
+        Requester::Identity(fp) => (format!("held_fp = ?{n}"), vec![Value::Text(fp_hex(fp))]),
     }
 }
 
@@ -205,6 +206,7 @@ fn sender_sql(who: &Requester, n: usize) -> (String, Value) {
             format!("sender IS NULL AND address = ?{n}"),
             Value::Text(a.clone()),
         ),
+        Requester::Identity(fp) => (format!("sender_fp = ?{n}"), Value::Text(fp_hex(fp))),
     }
 }
 
@@ -812,6 +814,7 @@ impl RelationshipStore for SqliteStore {
         let (login, fp, address) = match held {
             Requester::Account(m) => (Some(&m.login), m.fingerprint.as_ref().map(fp_hex), None),
             Requester::Address(a) => (None, None, Some(a)),
+            Requester::Identity(fp) => (None, Some(fp_hex(fp)), None),
         };
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
@@ -975,6 +978,32 @@ impl RelationshipStore for SqliteStore {
             }),
         )?;
         rows.map(sql).collect()
+    }
+
+    fn guest_requests_to(
+        &self,
+        address: &str,
+        to: &Mailbox,
+        since: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let text = format!(
+            "SELECT COUNT(*) FROM request_ledger
+              WHERE address = ?1 AND (sender IS NULL OR sender = 'guest') AND {}
+                AND kind = ?3 AND at >= ?4",
+            mailbox_sql(to, "recipient", 2)
+        );
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = sql(conn.query_row(
+            &text,
+            params![
+                address,
+                bind(to),
+                RequestKind::Message.as_i64(),
+                unix(since)
+            ],
+            |r| r.get(0),
+        ))?;
+        Ok(n.max(0) as usize)
     }
 
     fn recipients_from_address(

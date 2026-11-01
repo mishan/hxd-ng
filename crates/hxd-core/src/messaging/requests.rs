@@ -119,18 +119,43 @@ impl Core {
     }
 
     /// Tell `of`'s sessions that understand requests how many senders
-    /// wait.
+    /// wait, of those each can be shown.
     fn requests_changed(&self, of: &Mailbox) {
-        let count = self.requesters(of).len();
+        self.told_requests(of, false);
+    }
+
+    /// [`Self::requests_changed`] by what `from`'s requests became: a
+    /// session that cannot be shown `from` is told nothing, since
+    /// nothing it can count changed.
+    fn requests_changed_from(&self, of: &Mailbox, from: &Mailbox) {
+        self.told_requests(of, identity_guest(from));
+    }
+
+    fn told_requests(&self, of: &Mailbox, naming_only: bool) {
+        let waiting = self.requesters(of);
+        let plain = waiting.iter().filter(|m| !identity_guest(m)).count();
         let mut r = self.roster.lock().unwrap();
-        let to: Vec<Uid> = r
+        let to: Vec<(Uid, bool)> = r
             .messengers(&Key::of(of))
             .into_iter()
-            .filter(|u| r.users.get(u).is_some_and(understands_requests))
+            .filter_map(|u| {
+                let s = r.users.get(&u).filter(|s| understands_requests(s))?;
+                let names = s.info.transport.guest_identities;
+                (names || !naming_only).then_some((u, names))
+            })
             .collect();
-        for uid in to {
+        for (uid, names) in to {
+            let count = if names { waiting.len() } else { plain };
             r.send_to(uid, Event::RequestsChanged { count });
         }
+    }
+
+    /// Can `uid` name an identity guest, and so be shown one (§4.1)?
+    fn names_identities(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.users
+            .get(&uid)
+            .is_some_and(|s| s.info.transport.guest_identities)
     }
 
     /// A message by login to an account taking part
@@ -159,34 +184,36 @@ impl Core {
             Ok(them) => (them, true),
             Err(_) => (self.any_account(to)?, false),
         };
-        let mut sending = {
+        let (mut sending, let_in) = {
             let r = self.roster.lock().unwrap();
             let s = r.users.get(&uid)?;
             let guest = s.login == "guest";
-            // A guest that proved an identity has a fingerprint a block
-            // holds against, and mails as it always has
+            // A guest is no loophole (§4.1): to an account taking part it
+            // makes a request or is refused, until it is let in. To any
+            // other, an identity guest mails as it always has
             // (`private-messages.md` §9).
-            if guest && s.identity.is_some() {
-                return None;
-            }
-            // A plain guest is no loophole (§4.1): to an account taking
-            // part it makes a request or is refused, until it is let in.
-            if guest && (!takes_part || s.guest.approved.contains(&Key::of(&them))) {
+            if guest && !takes_part {
                 return None;
             }
             if !guest && !s.has_inbox {
                 return None;
             }
-            Sending {
-                mailbox: s.mailbox(),
-                requester: Requester::Account(s.mailbox()),
-                guest,
-                takes_part: s.messaging.is_some(),
-                understands: s.messaging.as_ref().is_some_and(|m| m.understands_requests),
-                classic: s.reads_on_delivery,
-            }
+            (
+                Sending {
+                    mailbox: s.mailbox(),
+                    requester: match s.identity.filter(|_| guest) {
+                        Some(fp) => Requester::Identity(fp),
+                        None => Requester::Account(s.mailbox()),
+                    },
+                    guest,
+                    takes_part: s.messaging.is_some(),
+                    understands: s.messaging.as_ref().is_some_and(|m| m.understands_requests),
+                    classic: s.reads_on_delivery,
+                },
+                guest && s.guest.approved.contains(&Key::of(&them)),
+            )
         };
-        if sending.guest {
+        if sending.guest && sending.mailbox.fingerprint.is_none() {
             match self.address_key(uid) {
                 Some(key) => sending.requester = Requester::Address(key),
                 None => return Some(Err(ChatError::NotFriends)),
@@ -226,6 +253,10 @@ impl Core {
                 Ok(false) => {}
                 Err(e) => return Some(Err(chat_error(store_failed(e)))),
             }
+        }
+        // An approval lets a guest past requests, never past a block.
+        if let_in {
+            return None;
         }
         // An image, or text too long for an instant message, goes to a
         // friend as a private message, as it always has, and is no
@@ -406,11 +437,23 @@ impl Core {
         let retained = now
             .checked_sub(p.request_retention)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        if rel
+        // Every guest behind one address is one sender to a recipient, so
+        // that fingerprints minted at will crowd out nobody (§4.4).
+        let guest_key = match sender {
+            Requester::Address(key) => Some(key.clone()),
+            Requester::Identity(_) => self.address_key(uid),
+            Requester::Account(_) => None,
+        };
+        let mut sent = rel
             .requests_to(sender, them, RequestKind::Message, retained)
-            .map_err(store_failed)?
-            >= p.request_messages
-        {
+            .map_err(store_failed)?;
+        if let Some(key) = &guest_key {
+            sent = sent.max(
+                rel.guest_requests_to(key, them, retained)
+                    .map_err(store_failed)?,
+            );
+        }
+        if sent >= p.request_messages {
             return Err(MessagingError::RequestFull);
         }
         let addr = self.request_address(uid);
@@ -425,13 +468,11 @@ impl Core {
         if let Recorded::Retry(_) = rel
             .record_request(&LedgerEntry {
                 kind: RequestKind::Message,
-                // A plain guest is its address alone, whether or not the
-                // per-address bound holds it.
+                // A plain guest is its address alone, and every guest is
+                // counted by its address, whether or not the per-address
+                // bound holds it.
                 sender: (!matches!(sender, Requester::Address(_))).then(|| me.clone()),
-                address: match sender {
-                    Requester::Address(key) => Some(key.clone()),
-                    _ => addr,
-                },
+                address: guest_key.or(addr),
                 recipient: them.clone(),
                 guid: guid.clone(),
                 bytes: text.len() as u64,
@@ -459,19 +500,27 @@ impl Core {
                 .iter()
                 .any(|u| r.users.get(u).is_some_and(understands_requests))
         };
+        // Every guest, plain or identity, is one sender toward
+        // `max_requests`, the guests holding two senders' worth between
+        // them, so that they crowd only each other (§4.4).
         let waiting = self.requesters(them);
-        let new = !waiting.iter().any(|s| Key::of(s) == Key::of(me));
-        // The guests are one sender toward `max_requests`, holding two
-        // senders' worth between them (§4.4).
-        let guests_full = matches!(sender, Requester::Address(_))
+        let guests_waiting = waiting.iter().any(|s| s.login == "guest");
+        let new = if sending.guest {
+            !guests_waiting
+        } else {
+            !waiting.iter().any(|s| Key::of(s) == Key::of(me))
+        };
+        let senders =
+            waiting.iter().filter(|s| s.login != "guest").count() + usize::from(guests_waiting);
+        let guests_full = sending.guest
             && inbox
                 .requests(them, retained, self.requests_bound())
                 .map_err(store_failed)?
                 .iter()
-                .filter(|m| m.sender.as_ref().is_some_and(|s| Key::of(s) == Key::of(me)))
+                .filter(|m| m.sender.as_ref().is_some_and(|s| s.login == "guest"))
                 .count()
                 >= p.request_messages.saturating_mul(2);
-        if lapsed || guests_full || (new && waiting.len() >= p.max_requests) {
+        if lapsed || guests_full || (new && senders >= p.max_requests) {
             rel.request_dropped(them).map_err(store_failed)?;
             return Ok(());
         }
@@ -497,7 +546,7 @@ impl Core {
                     friendship: Some(SentOn::Request),
                     sender_address: match sender {
                         Requester::Address(key) => Some(key.clone()),
-                        Requester::Account(_) => None,
+                        _ => None,
                     },
                 },
                 self.inbox_policy.max_queued,
@@ -507,7 +556,7 @@ impl Core {
             rel.request_dropped(them).map_err(store_failed)?;
             return Ok(());
         }
-        self.requests_changed(them);
+        self.requests_changed_from(them, me);
         Ok(())
     }
 
@@ -620,12 +669,13 @@ impl Core {
         } else {
             0
         };
+        let names = self.names_identities(uid);
         let mut requests: Vec<RequestGroup> = Vec::new();
         for m in inbox
             .requests(&me.mailbox, self.requests_since(), self.requests_bound())
             .map_err(store_failed)?
         {
-            let Some(from) = m.sender.clone() else {
+            let Some(from) = m.sender.clone().filter(|f| names || !identity_guest(f)) else {
                 continue;
             };
             match requests
@@ -653,6 +703,7 @@ impl Core {
             for s in uids.into_iter().filter_map(|u| r.users.get(u)) {
                 let guest = s.mailbox();
                 if s.guest.approved.contains(&Key::of(&me.mailbox))
+                    && (names || !identity_guest(&guest))
                     && !approvals.iter().any(|a| Key::of(a) == Key::of(&guest))
                 {
                     approvals.push(guest);
@@ -676,12 +727,36 @@ impl Core {
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
         if login.eq_ignore_ascii_case("guest") {
-            return self.answer_guests(&me.mailbox, action);
+            return self.answer_guests(&me.mailbox, &Mailbox::login("guest"), action);
         }
         let them = self
             .any_account(login)
             .ok_or(MessagingError::NoSuchRequest)?;
         self.answer_account(&me, them, action)
+    }
+
+    /// [`Self::request_answer`] naming the sender by fingerprint: the
+    /// account linking it, or else, to a session that can name one, the
+    /// guest that proved it.
+    pub fn request_answer_by_key(
+        &self,
+        uid: Uid,
+        fingerprint: &[u8; 32],
+        action: RequestAction,
+    ) -> Result<(), MessagingError> {
+        let me = self.messenger(uid)?;
+        if let Some((them, _)) = self
+            .directory
+            .as_ref()
+            .and_then(|d| d.account_by_key(fingerprint))
+        {
+            return self.answer_account(&me, them, action);
+        }
+        if !self.names_identities(uid) {
+            return Err(MessagingError::NoSuchRequest);
+        }
+        let group = Mailbox::identified("guest", *fingerprint);
+        self.answer_guests(&me.mailbox, &group, action)
     }
 
     fn answer_account(
@@ -720,62 +795,68 @@ impl Core {
         Ok(())
     }
 
-    /// Answer the plain guests' group. No approval is written, which
-    /// would let in every guest to come: approving lets in the live
-    /// sessions that asked, and turns what each of them has waiting into
-    /// mail.
-    fn answer_guests(&self, me: &Mailbox, action: RequestAction) -> Result<(), MessagingError> {
+    /// Answer the plain guests' group, `guest`, or the identity guest
+    /// `group` names. No approval is written, which would let in every
+    /// guest to come: approving lets in the live sessions that asked, and
+    /// turns what each of them has waiting into mail.
+    fn answer_guests(
+        &self,
+        me: &Mailbox,
+        group: &Mailbox,
+        action: RequestAction,
+    ) -> Result<(), MessagingError> {
         // Under the lock a request is stored with, as an account's answer
         // is: an approval ended and its hold written are one act to a
         // reply that would let the guest in again.
         let _writing = self.friend_writes();
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
-        let group = Mailbox::login("guest");
         let waiting = self
             .requesters(me)
             .iter()
-            .any(|s| Key::of(s) == Key::of(&group));
-        let plain = |s: &crate::roster::UserSession| s.login == "guest" && s.identity.is_none();
+            .any(|s| Key::of(s) == Key::of(group));
+        let of_group =
+            |s: &crate::roster::UserSession| s.login == "guest" && s.identity == group.fingerprint;
         match action {
             RequestAction::Approve if waiting => {
                 let asked: Vec<Uid> = {
                     let r = self.roster.lock().unwrap();
                     r.users
                         .iter()
-                        .filter(|(_, s)| plain(s) && s.guest.asked.contains(&Key::of(me)))
+                        .filter(|(_, s)| of_group(s) && s.guest.asked.contains(&Key::of(me)))
                         .map(|(u, _)| *u)
                         .collect()
                 };
                 let now = self.clock.wall();
                 for uid in asked {
-                    let Some(key) = self.address_key(uid) else {
+                    let Some(held) = self.guest_requester(uid, group) else {
                         continue;
                     };
-                    if rel
-                        .is_held(me, &Requester::Address(key.clone()), now)
-                        .map_err(store_failed)?
-                    {
+                    if rel.is_held(me, &held, now).map_err(store_failed)? {
                         continue;
                     }
+                    let address = match &held {
+                        Requester::Address(key) => Some(key.as_str()),
+                        _ => None,
+                    };
                     // Let in once what it sent is mail, so a failure leaves
                     // it asking, to be approved again.
                     inbox
-                        .requests_to_mail(me, &group, &key, self.requests_since())
+                        .requests_to_mail(me, group, address, self.requests_since())
                         .map_err(store_failed)?;
                     if let Some(s) = self.roster.lock().unwrap().users.get_mut(&uid) {
-                        if plain(s) {
+                        if of_group(s) {
                             s.guest.approved.insert(Key::of(me));
                         }
                     }
                 }
-                self.requests_changed(me);
+                self.requests_changed_from(me, group);
                 self.flush_mailbox(me);
             }
             RequestAction::Delete if waiting => {
-                inbox.delete_requests(me, &group).map_err(store_failed)?;
-                self.hold_sender(me, &group)?;
-                self.requests_changed(me);
+                inbox.delete_requests(me, group).map_err(store_failed)?;
+                self.hold_sender(me, group)?;
+                self.requests_changed_from(me, group);
             }
             RequestAction::End => {
                 let ended: Vec<Uid> = {
@@ -783,7 +864,7 @@ impl Core {
                     r.users
                         .iter_mut()
                         .filter_map(|(u, s)| {
-                            (plain(s) && s.guest.approved.remove(&Key::of(me))).then_some(*u)
+                            (of_group(s) && s.guest.approved.remove(&Key::of(me))).then_some(*u)
                         })
                         .collect()
                 };
@@ -791,9 +872,11 @@ impl Core {
                     return Err(MessagingError::NoSuchRequest);
                 }
                 let until = self.clock.wall() + self.messaging_policy.request_retention;
-                for key in ended.into_iter().filter_map(|u| self.address_key(u)) {
-                    rel.hold(me, &Requester::Address(key), until)
-                        .map_err(store_failed)?;
+                for held in ended
+                    .into_iter()
+                    .filter_map(|u| self.guest_requester(u, group))
+                {
+                    rel.hold(me, &held, until).map_err(store_failed)?;
                 }
             }
             RequestAction::Approve | RequestAction::Delete => {
@@ -803,19 +886,29 @@ impl Core {
         Ok(())
     }
 
+    /// What a guest session of `group` is bounded and held by.
+    fn guest_requester(&self, uid: Uid, group: &Mailbox) -> Option<Requester> {
+        match group.fingerprint {
+            Some(fp) => Some(Requester::Identity(fp)),
+            None => self.address_key(uid).map(Requester::Address),
+        }
+    }
+
     /// Hold `them` from `me`: the plain guests by every address that
-    /// asked within the window, and an account by its mailbox.
+    /// asked within the window, an identity guest by its fingerprint
+    /// alone, and an account by its mailbox.
     fn hold_sender(&self, me: &Mailbox, them: &Mailbox) -> Result<(), MessagingError> {
         let rel = self.friends_store()?;
         let until = self.clock.wall() + self.messaging_policy.request_retention;
-        let held = if Key::of(them) == Key::of(&Mailbox::login("guest")) {
-            rel.request_addresses(me, self.requests_since(), None)
+        let held = match them.fingerprint {
+            Some(fp) if identity_guest(them) => vec![Requester::Identity(fp)],
+            _ if Key::of(them) == Key::of(&Mailbox::login("guest")) => rel
+                .request_addresses(me, self.requests_since(), None)
                 .map_err(store_failed)?
                 .into_iter()
                 .map(Requester::Address)
-                .collect()
-        } else {
-            vec![Requester::Account(them.clone())]
+                .collect(),
+            _ => vec![Requester::Account(them.clone())],
         };
         for h in held {
             rel.hold(me, &h, until).map_err(store_failed)?;
@@ -824,9 +917,10 @@ impl Core {
     }
 
     /// A reply by uid from a session that understands requests to a
-    /// plain guest that asked its account approves that guest, as
-    /// writing back approves any request (§4.3), and turns what it has
-    /// waiting into mail.
+    /// guest that asked its account approves that guest, as writing back
+    /// approves any request (§4.3), and turns what it has waiting into
+    /// mail: a plain guest's from its address, an identity guest's from
+    /// its fingerprint.
     pub(crate) fn guest_written_back(&self, from: Uid, to: Uid) {
         if !self.messaging_enabled() {
             return;
@@ -834,21 +928,20 @@ impl Core {
         let Some(inbox) = self.inbox.as_ref() else {
             return;
         };
-        let asking = |r: &crate::roster::RosterInner, me: &Mailbox| {
+        let asking = |r: &crate::roster::RosterInner, me: &Mailbox, names: bool| {
             r.users.get(&to).is_some_and(|s| {
                 s.login == "guest"
-                    && s.identity.is_none()
+                    // An approval this session could never be shown, nor end.
+                    && (s.identity.is_none() || names)
                     && s.guest.asked.contains(&Key::of(me))
                     && !s.guest.approved.contains(&Key::of(me))
             })
         };
         let replier = || {
             let r = self.roster.lock().unwrap();
-            r.users
-                .get(&from)
-                .filter(|s| understands_requests(s))
-                .map(|s| s.mailbox())
-                .filter(|me| asking(&r, me))
+            let s = r.users.get(&from).filter(|s| understands_requests(s))?;
+            let me = s.mailbox();
+            asking(&r, &me, s.info.transport.guest_identities).then(|| (me, r.users[&to].mailbox()))
         };
         // Most replies by uid are to nobody that asked, and are spared
         // the lock.
@@ -856,29 +949,28 @@ impl Core {
             return;
         }
         let _writing = self.friend_writes();
-        let Some(me) = replier() else {
+        let Some((me, group)) = replier() else {
             return;
         };
-        let Some(key) = self.address_key(to) else {
+        let Some(held) = self.guest_requester(to, &group) else {
             return;
         };
         // A guest the recipient holds is let in by no reply, as a held
         // account's request is never waiting to be written back to.
-        let held = self.friends_store().and_then(|rel| {
-            rel.is_held(&me, &Requester::Address(key.clone()), self.clock.wall())
+        let is_held = self.friends_store().and_then(|rel| {
+            rel.is_held(&me, &held, self.clock.wall())
                 .map_err(store_failed)
         });
-        if held.unwrap_or(true) {
+        if is_held.unwrap_or(true) {
             return;
         }
+        let address = match &held {
+            Requester::Address(key) => Some(key.as_str()),
+            _ => None,
+        };
         // Let in once what it sent is mail, so a failure leaves it asking
         // and the next reply tries again.
-        let handed = match inbox.requests_to_mail(
-            &me,
-            &Mailbox::login("guest"),
-            &key,
-            self.requests_since(),
-        ) {
+        let handed = match inbox.requests_to_mail(&me, &group, address, self.requests_since()) {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!("inbox: handing over what a guest asked: {e}");
@@ -887,16 +979,38 @@ impl Core {
         };
         {
             let mut r = self.roster.lock().unwrap();
-            if asking(&r, &me) {
+            let names = r
+                .users
+                .get(&from)
+                .is_some_and(|s| s.info.transport.guest_identities);
+            if asking(&r, &me, names) {
                 if let Some(s) = r.users.get_mut(&to) {
                     s.guest.approved.insert(Key::of(&me));
                 }
             }
         }
         if handed > 0 {
-            self.requests_changed(&me);
+            self.requests_changed_from(&me, &group);
             self.flush_mailbox(&me);
         }
+    }
+
+    /// An identity guest's message by login to an account taking part,
+    /// which routing lets through only under an approval, goes only to a
+    /// session that is there, as a plain guest's always does, unless
+    /// `queue_identity_guests` lets it wait. Not the approval again,
+    /// which an end may have taken since routing read it.
+    pub(crate) fn guest_live_only(&self, uid: Uid, to: &str) -> bool {
+        if !self.messaging_enabled()
+            || self.messaging_policy.queue_identity_guests
+            || self.messaging_account(to).is_err()
+        {
+            return false;
+        }
+        let r = self.roster.lock().unwrap();
+        r.users
+            .get(&uid)
+            .is_some_and(|s| s.login == "guest" && s.identity.is_some())
     }
 
     /// Decline every friend request and delete every message request
@@ -914,6 +1028,7 @@ impl Core {
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
         let now = self.clock.wall();
+        let names = self.names_identities(uid);
         let within = |t: SystemTime| since.is_none_or(|s| t >= s) && before.is_none_or(|b| t < b);
         let mut cleared = Cleared::default();
         let guests = Mailbox::login("guest");
@@ -941,7 +1056,9 @@ impl Core {
             .requests(&me.mailbox, self.requests_since(), self.requests_bound())
             .map_err(store_failed)?
         {
-            let Some(from) = m.sender else {
+            // Each identity guest by its own first row, as an account is;
+            // what this session cannot be shown it cannot clear.
+            let Some(from) = m.sender.filter(|f| names || !identity_guest(f)) else {
                 continue;
             };
             if !seen.insert(Key::of(&from)) || !within(m.sent_at) {
@@ -980,12 +1097,18 @@ impl Core {
         match deleted {
             Ok(0) => {}
             Ok(_) => {
-                self.requests_changed(blocker);
+                self.requests_changed_from(blocker, blocked);
                 self.requests_changed(blocked);
             }
             Err(e) => tracing::warn!("inbox: deleting what a block ends: {e}"),
         }
     }
+}
+
+/// A guest that proved an identity, as its requests are stored: a
+/// sender of its own, apart from the plain guests (§4.1).
+fn identity_guest(m: &Mailbox) -> bool {
+    m.login == "guest" && m.fingerprint.is_some()
 }
 
 /// A messaging refusal on the private-message path, by the names that

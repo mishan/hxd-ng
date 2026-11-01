@@ -763,7 +763,13 @@ what a block holds against — so its sender fingerprint is recorded even
 though it has no inbox of its own, which also makes §6.4's
 delivery-time uid resolution work for it. Naming one is the reason
 `block` takes a uid as well as a login: an identity guest has a roster
-row to point at and no account login to name.
+row to point at and no account login to name. Where messaging is on,
+its message by login to an account taking part is a message request
+of its own, bounded and held by its fingerprint and charged to its
+address beside the plain guests' (`instant-messaging.md` §4.1). Once
+approved, its messages reach a session of the recipient that is there,
+or nobody, as a plain guest's do, unless `[messaging]
+queue_identity_guests` lets them wait as an account's mail does.
 
 Pruning runs hourly in the binary, next to the existing detached sweeper.
 

@@ -83,6 +83,10 @@ pub struct MessagingPolicy {
     /// Senders whose requests one recipient may have waiting; past it a
     /// new one is dropped.
     pub max_requests: usize,
+    /// An approved identity guest's messages wait for a recipient with
+    /// no session, as an account's do; off, they reach a session that is
+    /// there or nobody, as a plain guest's do (§4.1).
+    pub queue_identity_guests: bool,
 }
 
 impl Default for MessagingPolicy {
@@ -98,6 +102,7 @@ impl Default for MessagingPolicy {
             max_message_bytes: 4096,
             request_messages: 5,
             max_requests: 50,
+            queue_identity_guests: false,
         }
     }
 }

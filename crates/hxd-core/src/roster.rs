@@ -256,6 +256,11 @@ pub struct Transport {
     /// sent an offer, a friendship hash or a withdrawal, and the only one
     /// that may make a friendship act, once it has proved its device.
     pub friendships: bool,
+    /// It can name a guest by the identity it proved: classic capability
+    /// bit 15, or the ng wire's `guest_identities`. Only such a session is
+    /// shown an identity guest's requests and may answer them
+    /// (`docs/instant-messaging.md` §4.1).
+    pub guest_identities: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and

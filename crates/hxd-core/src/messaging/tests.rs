@@ -2718,6 +2718,42 @@ fn guest_as(core: &Core, addr: &str, identity: Option<[u8; 32]>) -> (Uid, Events
     (uid, rx)
 }
 
+/// [`taker`] on a wire that can name an identity guest.
+fn namer(core: &Core, login: &str) -> (Uid, Events) {
+    let transport = crate::Transport {
+        guest_identities: true,
+        ..Default::default()
+    };
+    let (uid, mut rx) = attach_on(core, login, messaging_bits(), "10.0.0.1", transport, false);
+    core.friends_roster(uid).unwrap();
+    core.set_presence(
+        uid,
+        PresenceUpdate {
+            takes_requests: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drain(&mut rx);
+    (uid, rx)
+}
+
+/// Each waiting group by its login and fingerprint.
+fn groups(core: &Core, uid: Uid) -> Vec<(String, Option<[u8; 32]>, Vec<String>)> {
+    core.requests_list(uid)
+        .unwrap()
+        .requests
+        .into_iter()
+        .map(|g| {
+            (
+                g.from.login,
+                g.from.fingerprint,
+                g.messages.into_iter().map(|m| m.body).collect(),
+            )
+        })
+        .collect()
+}
+
 fn guests(texts: &[&str]) -> Vec<(String, Vec<String>)> {
     vec![(
         "guest".into(),
@@ -2856,18 +2892,29 @@ fn writing_back_by_uid_approves_the_guest_that_asked() {
 }
 
 #[test]
-fn writing_back_lets_in_no_guest_whose_address_is_held() {
+fn writing_back_lets_in_no_held_guest() {
     use crate::MsgOutcome;
-    let s = server_with(policy(), &[("bob", messaging_bits())]);
-    let (b, _rb) = taker(&s.core, "bob");
-    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
-    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
-    s.core
-        .request_answer(b, "guest", RequestAction::Delete)
+    for (what, identity) in [
+        ("by its address", None),
+        ("by its fingerprint", Some([7; 32])),
+    ] {
+        let s = server_with(policy(), &[("bob", messaging_bits())]);
+        let (b, _rb) = namer(&s.core, "bob");
+        let (g, _rg) = guest_as(&s.core, "10.0.1.1", identity);
+        assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+        match identity {
+            Some(fp) => s.core.request_answer_by_key(b, &fp, RequestAction::Delete),
+            None => s.core.request_answer(b, "guest", RequestAction::Delete),
+        }
         .unwrap();
-    s.core.msg(b, g, "go away".into(), None, None).unwrap();
-    assert_eq!(send(&s.core, g, "bob", "again"), Ok(MsgOutcome::Requested));
-    assert!(waiting(&s.core, b).is_empty(), "still held");
+        s.core.msg(b, g, "go away".into(), None, None).unwrap();
+        assert_eq!(
+            send(&s.core, g, "bob", "again"),
+            Ok(MsgOutcome::Requested),
+            "{what}"
+        );
+        assert!(waiting(&s.core, b).is_empty(), "still held {what}");
+    }
 }
 
 #[test]
@@ -2964,21 +3011,6 @@ fn clearing_a_span_takes_and_holds_the_guests_that_asked_within_it() {
 }
 
 #[test]
-fn an_identity_guests_message_by_login_goes_as_mail() {
-    use crate::MsgOutcome;
-    let s = server_with(policy(), &[("bob", messaging_bits())]);
-    let (b, _rb) = taker(&s.core, "bob");
-    let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
-    s.core.end_session(b);
-    assert!(matches!(
-        send(&s.core, g, "bob", "hi"),
-        Ok(MsgOutcome::Queued(_))
-    ));
-    let (b, _rb) = taker(&s.core, "bob");
-    assert!(waiting(&s.core, b).is_empty(), "no request");
-}
-
-#[test]
 fn deleting_guest_holds_each_address_that_asked_and_ending_holds_who_it_let_in() {
     use crate::MsgOutcome;
     let s = server_with(policy(), &[("bob", messaging_bits())]);
@@ -3036,6 +3068,314 @@ fn the_guests_hold_two_senders_worth_and_count_as_one() {
             ("guest".into(), vec!["1".into(), "2".into()]),
             ("alice".into(), vec!["a".into()]),
         ]
+    );
+}
+
+#[test]
+fn an_identity_guest_is_a_requester_of_its_own() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, mut rb) = namer(&s.core, "bob");
+    let (plain, _rp) = guest_at(&s.core, "10.0.1.1");
+    let (seven, _r7) = guest_as(&s.core, "10.0.1.2", Some([7; 32]));
+    let (eight, _r8) = guest_as(&s.core, "10.0.1.3", Some([8; 32]));
+    for (g, text) in [(plain, "plain"), (seven, "seven")] {
+        assert_eq!(send(&s.core, g, "bob", text), Ok(MsgOutcome::Requested));
+    }
+    assert_eq!(
+        groups(&s.core, b),
+        [
+            ("guest".into(), None, vec!["plain".into()]),
+            ("guest".into(), Some([7; 32]), vec!["seven".into()]),
+        ]
+    );
+    s.core
+        .request_answer_by_key(b, &[7; 32], RequestAction::Delete)
+        .unwrap();
+    for (g, text) in [(seven, "again"), (eight, "eight")] {
+        assert_eq!(send(&s.core, g, "bob", text), Ok(MsgOutcome::Requested));
+    }
+    assert_eq!(
+        groups(&s.core, b),
+        [
+            ("guest".into(), None, vec!["plain".into()]),
+            ("guest".into(), Some([8; 32]), vec!["eight".into()]),
+        ],
+        "held by its fingerprint alone"
+    );
+    s.core
+        .request_answer(b, "guest", RequestAction::Approve)
+        .unwrap();
+    assert_eq!(
+        groups(&s.core, b),
+        [("guest".into(), Some([8; 32]), vec!["eight".into()])],
+        "`guest` names the plain guests alone"
+    );
+    s.core
+        .request_answer_by_key(b, &[8; 32], RequestAction::Approve)
+        .unwrap();
+    assert_eq!(
+        s.core.requests_list(b).unwrap().approvals,
+        [
+            Mailbox::login("guest"),
+            Mailbox::identified("guest", [8; 32])
+        ]
+    );
+    drain(&mut rb);
+    assert!(matches!(
+        send(&s.core, eight, "bob", "let in"),
+        Ok(MsgOutcome::Delivered(_))
+    ));
+    assert_eq!(msgs(&drain(&mut rb)), ["let in"]);
+}
+
+#[test]
+fn an_approved_identity_guest_waits_for_an_absent_recipient_only_where_configured() {
+    use crate::{ChatError, MsgOutcome};
+    for queue in [false, true] {
+        let p = MessagingPolicy {
+            queue_identity_guests: queue,
+            ..policy()
+        };
+        let s = server_with(p, &[("bob", messaging_bits())]);
+        let (b, _rb) = namer(&s.core, "bob");
+        let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+        assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+        s.core
+            .request_answer_by_key(b, &[7; 32], RequestAction::Approve)
+            .unwrap();
+        s.core.end_session(b);
+        let sent = send(&s.core, g, "bob", "later");
+        if queue {
+            assert!(matches!(sent, Ok(MsgOutcome::Queued(_))), "{sent:?}");
+        } else {
+            assert_eq!(sent, Err(ChatError::NoSuchUser));
+        }
+    }
+}
+
+#[test]
+fn an_approved_identity_guest_is_still_refused_by_a_block() {
+    use crate::{ChatError, MsgOutcome};
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = namer(&s.core, "bob");
+    let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    s.core
+        .request_answer_by_key(b, &[7; 32], RequestAction::Approve)
+        .unwrap();
+    assert!(matches!(
+        send(&s.core, g, "bob", "let in"),
+        Ok(MsgOutcome::Delivered(_))
+    ));
+    s.core.inbox_block_uid(b, g, true).unwrap();
+    assert_eq!(
+        send(&s.core, g, "bob", "still?"),
+        Err(ChatError::NoSuchUser),
+        "answered as a block always is"
+    );
+}
+
+#[test]
+fn identity_guests_are_shown_and_answered_only_where_they_can_be_named() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (period, mut rp) = taker(&s.core, "bob");
+    let (naming, mut rn) = namer(&s.core, "bob");
+    let (plain, _rg) = guest_at(&s.core, "10.0.1.1");
+    let (seven, _r7) = guest_as(&s.core, "10.0.1.2", Some([7; 32]));
+    let (eight, _r8) = guest_as(&s.core, "10.0.1.3", Some([8; 32]));
+    for (g, text) in [(plain, "plain"), (seven, "seven"), (eight, "eight")] {
+        assert_eq!(send(&s.core, g, "bob", text), Ok(MsgOutcome::Requested));
+    }
+    assert_eq!(
+        changed(&drain(&mut rp)),
+        [1],
+        "told only when what it can count changes"
+    );
+    assert_eq!(changed(&drain(&mut rn)), [1, 2, 3]);
+    assert_eq!(waiting(&s.core, period), guests(&["plain"]));
+    assert_eq!(
+        s.core
+            .request_answer_by_key(period, &[7; 32], RequestAction::Approve),
+        Err(MessagingError::NoSuchRequest),
+        "nothing it can be shown"
+    );
+    s.core
+        .request_answer_by_key(naming, &[7; 32], RequestAction::Approve)
+        .unwrap();
+    assert!(s.core.requests_list(period).unwrap().approvals.is_empty());
+    let cleared = s.core.requests_clear(period, None, None).unwrap();
+    assert_eq!(cleared.deleted, 1, "what it can be shown, and no more");
+    assert_eq!(
+        groups(&s.core, naming),
+        [("guest".into(), Some([8; 32]), vec!["eight".into()])]
+    );
+    assert_eq!(
+        s.core.requests_list(naming).unwrap().approvals,
+        [Mailbox::identified("guest", [7; 32])]
+    );
+}
+
+#[test]
+fn a_reply_from_a_session_that_cannot_name_an_identity_guest_approves_nothing() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (period, _rp) = taker(&s.core, "bob");
+    let (naming, _rn) = namer(&s.core, "bob");
+    let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    s.core.msg(period, g, "who?".into(), None, None).unwrap();
+    assert_eq!(
+        send(&s.core, g, "bob", "again"),
+        Ok(MsgOutcome::Requested),
+        "still asking"
+    );
+    assert_eq!(
+        groups(&s.core, naming),
+        [(
+            "guest".into(),
+            Some([7; 32]),
+            vec!["hi".into(), "again".into()]
+        )]
+    );
+}
+
+#[test]
+fn an_identity_guest_mails_an_account_outside_messaging_as_before() {
+    use crate::MsgOutcome;
+    let s = server_with(
+        policy(),
+        &[
+            ("bob", messaging_bits()),
+            ("carol", AccessBits::empty().with(bit::SEND_MSGS)),
+        ],
+    );
+    let (g, _rg) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    let sent = send(&s.core, g, "carol", "hi");
+    assert!(matches!(sent, Ok(MsgOutcome::Queued(_))), "{sent:?}");
+}
+
+#[test]
+fn all_guests_together_are_one_sender_and_crowd_no_account() {
+    use crate::MsgOutcome;
+    let p = MessagingPolicy {
+        request_messages: 2,
+        max_requests: 2,
+        ..policy()
+    };
+    let s = server_with(p, &[("alice", messaging_bits()), ("bob", messaging_bits())]);
+    let (b, _rb) = namer(&s.core, "bob");
+    let mut held = Vec::new();
+    let mut guest = |addr: &str, identity: Option<[u8; 32]>| {
+        let (g, rx) = guest_as(&s.core, addr, identity);
+        held.push(rx);
+        assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    };
+    for (n, addr) in ["10.0.1.1", "10.0.1.2", "10.0.1.3"].iter().enumerate() {
+        for k in 0..2 {
+            guest(addr, Some([(n * 2 + k + 1) as u8; 32]));
+        }
+    }
+    guest("10.0.2.1", None);
+    let (a, _ra) = taker(&s.core, "alice");
+    assert_eq!(send(&s.core, a, "bob", "a"), Ok(MsgOutcome::Requested));
+    let listed = s.core.requests_list(b).unwrap();
+    assert!(
+        listed.requests.iter().any(|g| g.from.login == "alice"),
+        "an account is never crowded out by guests"
+    );
+    let guest_rows: usize = listed
+        .requests
+        .iter()
+        .filter(|g| g.from.login == "guest")
+        .map(|g| g.messages.len())
+        .sum();
+    assert_eq!(guest_rows, 4, "two senders' worth between every guest");
+    assert_eq!(listed.dropped, 3);
+}
+
+#[test]
+fn the_guests_behind_one_address_share_one_senders_allowance() {
+    use crate::{ChatError, MsgOutcome};
+    let p = MessagingPolicy {
+        request_messages: 2,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (b, _rb) = namer(&s.core, "bob");
+    let mut held = Vec::new();
+    for (n, sent) in [
+        (0, Ok(MsgOutcome::Requested)),
+        (1, Ok(MsgOutcome::Requested)),
+        (2, Err(ChatError::RequestFull)),
+        (0, Err(ChatError::RequestFull)),
+    ] {
+        let (g, rx) = guest_as(&s.core, "10.0.1.1", (n > 0).then_some([n; 32]));
+        held.push(rx);
+        assert_eq!(send(&s.core, g, "bob", "hi"), sent, "guest {n}");
+    }
+    let (elsewhere, _rx) = guest_as(&s.core, "10.0.1.2", Some([3; 32]));
+    assert_eq!(
+        send(&s.core, elsewhere, "bob", "hi"),
+        Ok(MsgOutcome::Requested)
+    );
+    assert_eq!(groups(&s.core, b).len(), 3);
+}
+
+#[test]
+fn writing_back_to_an_identity_guest_hands_over_only_its_own() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, mut rb) = namer(&s.core, "bob");
+    let (seven, mut r7) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    let (eight, _r8) = guest_as(&s.core, "10.0.1.1", Some([8; 32]));
+    for (g, text) in [(seven, "seven"), (eight, "eight")] {
+        assert_eq!(send(&s.core, g, "bob", text), Ok(MsgOutcome::Requested));
+    }
+    drain(&mut rb);
+    s.core.msg(b, seven, "hello".into(), None, None).unwrap();
+    assert_eq!(msgs(&drain(&mut r7)), ["hello"]);
+    assert_eq!(msgs(&drain(&mut rb)), ["seven"]);
+    assert_eq!(
+        groups(&s.core, b),
+        [("guest".into(), Some([8; 32]), vec!["eight".into()])]
+    );
+    assert!(matches!(
+        send(&s.core, seven, "bob", "thanks"),
+        Ok(MsgOutcome::Delivered(_))
+    ));
+}
+
+#[test]
+fn clearing_a_span_takes_each_identity_guest_by_its_own_first_message() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = namer(&s.core, "bob");
+    let (seven, _r7) = guest_as(&s.core, "10.0.1.1", Some([7; 32]));
+    let (eight, _r8) = guest_as(&s.core, "10.0.1.2", Some([8; 32]));
+    assert_eq!(send(&s.core, seven, "bob", "7"), Ok(MsgOutcome::Requested));
+    s.core.clock.advance(Duration::from_secs(60));
+    let from = s.core.clock.wall();
+    assert_eq!(send(&s.core, eight, "bob", "8"), Ok(MsgOutcome::Requested));
+    assert_eq!(
+        send(&s.core, seven, "bob", "7 again"),
+        Ok(MsgOutcome::Requested)
+    );
+    let cleared = s.core.requests_clear(b, Some(from), None).unwrap();
+    assert_eq!(cleared.deleted, 1);
+    assert_eq!(
+        send(&s.core, eight, "bob", "8 again"),
+        Ok(MsgOutcome::Requested)
+    );
+    assert_eq!(
+        groups(&s.core, b),
+        [(
+            "guest".into(),
+            Some([7; 32]),
+            vec!["7".into(), "7 again".into()]
+        )],
+        "the one that began within the span went, and is held"
     );
 }
 

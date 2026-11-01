@@ -636,12 +636,14 @@ fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &d
         Mailbox::login("guest"),
         Mailbox::login("alice"),
     );
+    let identified = Mailbox::identified("guest", fp(4));
     for (from, address, body, t) in [
         (&guest, Some("k1"), "lapsed", 0),
         (&guest, Some("k1"), "g1", 1),
         (&alice, None, "a1", 2),
         (&guest, Some("k2"), "another guest", 3),
         (&guest, Some("k1"), "g2", 4),
+        (&identified, None, "identity", 5),
     ] {
         push(
             s,
@@ -653,9 +655,15 @@ fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &d
         );
     }
     assert_eq!(
-        s.requests_to_mail(&dave, &guest, "k1", at(1)).unwrap(),
+        s.requests_to_mail(&dave, &guest, Some("k1"), at(1))
+            .unwrap(),
         2,
         "{case}"
+    );
+    assert_eq!(
+        s.requests_to_mail(&dave, &identified, None, at(0)).unwrap(),
+        1,
+        "{case}: an identity guest's by its fingerprint alone"
     );
     assert_eq!(
         bodies(&s.requests(&dave, at(0), 10).unwrap()),
@@ -664,7 +672,7 @@ fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &d
     );
     assert_eq!(
         bodies(&s.pending(&dave, 10).unwrap()),
-        ["g1", "g2"],
+        ["g1", "g2", "identity"],
         "{case}: through the gate as mail"
     );
     assert_eq!(

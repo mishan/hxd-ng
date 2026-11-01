@@ -2537,6 +2537,8 @@ async fn login_phase(
         messaging: caps.has(cap::MESSAGING),
         messenger_session: caps.has(cap::MESSENGER_SESSION),
         friendships: caps.has(cap::FRIENDSHIPS),
+        // Bit 15 is what lets this wire carry `DATA_FRIEND_IDENTITY`.
+        guest_identities: caps.has(cap::FRIENDSHIPS),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),

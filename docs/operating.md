@@ -574,9 +574,12 @@ An account has an inbox if it has a password or a linked identity — either is
 proof of one person, where a bare `guest` login is shared. `[extra] inbox` in
 the account file overrides it either way.
 
-A guest can send to whoever is on the roster and cannot queue anything: it
-has no account, so nothing can be blocked, and a sender that cannot be
-blocked must not be able to fill a mailbox. `block`/`unblock` keep an account
+A plain guest can send to whoever is on the roster and cannot queue
+anything: it has no account, so nothing can be blocked, and a sender that
+cannot be blocked must not be able to fill a mailbox. A guest that proved
+an identity can be blocked by its fingerprint; once approved, its messages
+to an account taking part in messaging reach a session that is there, or
+queue where `[messaging] queue_identity_guests = true`. `block`/`unblock` keep an account
 addressable without making it reachable by everyone.
 
 **The database holds every private message on the server in the clear.** It
@@ -1201,6 +1204,9 @@ request_retention_days = 30  # how long a request waits, and a refused sender is
 # request_secret = "/srv/hxd/messaging-requests.key"  # e.g.; the key a request's address
                              # is hashed under. Absent, messaging-requests.key beside
                              # [inbox] db; made on first start, mode 0600
+queue_identity_guests = false  # an approved identity guest's messages wait
+                             # for a recipient that is not there; off, they
+                             # reach a session that is there or nobody
 ```
 
 Once it is on, an ng `msg` by `to_login`, and a classic `/msg <login>`,
