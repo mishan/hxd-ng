@@ -190,8 +190,10 @@ locking discipline.
   purge <login> [--fingerprint HEX]`, which reads the account file for
   the mailbox key while it is still there and takes the fingerprint by
   hand when it is not.
-- **Unlinking owes nothing**, and that is a decision rather than an
-  oversight. Mail is addressed to a person; under the strict rule the
+- **Unlinking owes the mail nothing**, and that is a decision rather
+  than an oversight; it owes the cursors one call, `Core::inbox_unlinked`,
+  which counts the bare login's mailbox on past the identity's so its
+  owner is never shown a place twice (§5). Mail is addressed to a person; under the strict rule the
   fingerprint *is* the person, so an account that gives up its link gives
   up the mailbox that link addressed, and that mail travels with the
   identity to wherever it links next. The alternative — an `unclaim` that
@@ -220,9 +222,9 @@ pub trait MessageStore: Send + Sync + 'static {
     // the delivered/read split lands nothing passes it and it goes.
     fn mark_delivered(&self, ids: &[MessageId], at: SystemTime, what: Delivery)
         -> Result<(), StoreError>;
-    fn mark_read(&self, to: &Mailbox, up_to: MessageId, at: SystemTime)
+    fn mark_read(&self, to: &Mailbox, up_to: Cursor, at: SystemTime)
         -> Result<usize, StoreError>;
-    fn list(&self, to: &Mailbox, before: Option<MessageId>, limit: usize)
+    fn list(&self, to: &Mailbox, before: Option<Cursor>, limit: usize)
         -> Result<Vec<StoredMessage>, StoreError>;
     fn counts(&self, to: &Mailbox) -> Result<InboxCounts, StoreError>;
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
@@ -252,7 +254,7 @@ needs no `libsqlite3-dev` and cannot skew against the system's version.
 
 ```sql
 CREATE TABLE message (
-  id           INTEGER PRIMARY KEY,   -- rowid: the order and the cursor
+  id           INTEGER PRIMARY KEY,   -- rowid: the store's own handle, never on a wire
   kind         INTEGER NOT NULL,      -- 0 message, 1 read receipt
   recipient    TEXT    NOT NULL,      -- canonical account login
   recipient_fp TEXT,                  -- identity fingerprint, when linked
@@ -263,8 +265,18 @@ CREATE TABLE message (
   guid         TEXT,                  -- the client's own id, when it gave one
   sent_at      INTEGER NOT NULL,      -- unix seconds
   delivered_at INTEGER,               -- handed to a live connection, on either wire
-  read_at      INTEGER                -- an ng client said so, or delivery reached only legacy sessions (§8)
+  read_at      INTEGER,               -- an ng client said so, or delivery reached only legacy sessions (§8)
+  ref          BLOB,                  -- 16 random bytes: the message's name (below)
+  seq          INTEGER                -- its place in the recipient's mailbox; NULL for a receipt
 );
+CREATE UNIQUE INDEX message_ref ON message (ref);
+-- Unique per mailbox, one index per kind of mailbox key, as below.
+CREATE UNIQUE INDEX message_seq_fp ON message (recipient_fp, seq)
+  WHERE recipient_fp IS NOT NULL AND seq IS NOT NULL;
+CREATE UNIQUE INDEX message_seq_login ON message (recipient, seq)
+  WHERE recipient_fp IS NULL AND seq IS NOT NULL;
+-- Each mailbox's last place, keyed IFNULL(fp, login) as message_guid is.
+CREATE TABLE mailbox_seq (mailbox TEXT PRIMARY KEY, last INTEGER NOT NULL);
 -- Retry safety: one message per (sender, recipient, guid), keyed on the
 -- *mailbox* rather than on its two columns — see below.
 CREATE UNIQUE INDEX message_guid ON message (
@@ -276,6 +288,45 @@ CREATE UNIQUE INDEX message_guid ON message (
 -- The block list was a `block` table here until schema 28 moved it
 -- into the relationship store's `relationship` (`instant-messaging.md` §3).
 ```
+
+**A message has two names, and the rowid is neither.** The rowid is one
+counter for the whole server, so a client that saw two of them could
+read off how much private mail the server carried in between. What a
+wire is given instead (schema 33):
+
+- **`ref`**, 16 random bytes made when the row is stored: the message's
+  name wherever it is named, given to its sender and its recipient
+  alike, the same whether it was delivered at once or waited. Nothing
+  changes it, a claim or a rotation included, and it says nothing about
+  how much mail anyone has.
+- **`seq`**, its place in its recipient's mailbox: that mailbox's own
+  sequence, what `inbox` pages by and `msg_read` marks up to. It tells
+  the mailbox's owner how much mail that mailbox has been sent and
+  nothing else, and only the owner is shown it. Only mail takes a place,
+  so a receipt leaves none missing. A mailbox's last place is kept in
+  `mailbox_seq` apart from its rows, so pruning the newest of them never
+  hands its place out again; a purge forgets it with the rest.
+
+A claim or a rotation makes two mailboxes one, in one transaction. The
+usual one — a first link, a rotation to a fresh key — is into a mailbox
+that never issued a place: what moves keeps its places, and the count
+carries over, so no client's go stale. Into one that did, what moves is
+numbered after the last place of either, in the order it had: the kept
+mailbox's rows keep theirs, and no place either mailbox showed its owner
+is handed out twice. A claim with nothing to move, which every login of
+a linked account makes, changes no place; it still raises the kept
+mailbox's count to the login's, whose mail may have been pruned after
+issuing its places. A claim
+drops the login's own count with its mail, so whoever holds the login
+next starts from nothing; an unlink (§4) raises it past the identity's
+again, so the owner is never shown a place twice.
+
+A place the mailbox never issued is refused (`bad_request` on the ng
+wire, for `inbox`'s `before`, `msg_read`'s `up_to` and `report`'s
+`msg`) rather than read: an id from before schema 33 was the server's,
+larger than any place, and as an `up_to` would mark mail its client
+never saw. The migration gives every row a reference and numbers each
+mailbox's mail in rowid order.
 
 **`guid` is the client's own id, and it is parsed rather than stored as
 it arrives.** fogWraith has clients generate one per message and retry
@@ -488,7 +539,7 @@ queued_from_system`, off by default until it has been seen on a real
 way.
 
 Concretely `Event::Msg` carries `from`, `from_nick`, `from_login`, the
-text, the stored `id`, `sent_at`, and `queued` — one boolean rather than
+text, the stored row's cursor and reference, `sent_at`, and `queued` — one boolean rather than
 a timestamp comparison against a threshold, because a threshold is a bug
 waiting for a slow network.
 
@@ -499,13 +550,14 @@ neither rather than guessing — a client that sent both meant something.
 
 | `req` | params | ok | notes |
 |---|---|---|---|
-| `msg` | `to` (uid) **or** `to_login`, `text`, `guid?` | `{ "queued": bool, "id"? }`, `id` when queued and the sender has an inbox | exactly one address; a repeated `guid` is the same message (§5) |
-| `inbox` | `before?` (id), `limit?` (default 50, max 200) | `{ messages, unread, total }` | newest first, paginating backwards |
-| `msg_read` | `up_to` (id) | `{ unread, total }` | marks everything of the caller's up to that id |
+| `msg` | `to` (uid) **or** `to_login`, `text`, `guid?` | `{ "queued": bool, "ref"? }`, `ref` whenever the message was stored | exactly one address; a repeated `guid` is the same message (§5) |
+| `inbox` | `before?` (cursor), `limit?` (default 50, max 200) | `{ messages, unread, total }` | newest first, paginating backwards |
+| `msg_read` | `up_to` (cursor) | `{ unread, total }` | marks everything of the caller's up to that cursor |
 | `block` / `unblock` | `uid` **or** `login` (`unblock` may instead use `fingerprint`) | `{}` | §9; the uid form names a sender with no account login |
 | `blocks` | — | `{ blocked: [{ login, fingerprint? }] }` | the fingerprint is what `unblock` takes back |
 
-The `msg` event gains `at`, `queued`, `id`, and `from.login`. The login
+The `msg` event gains `at`, `queued`, `id` (the cursor), `ref`, and
+`from.login`; an `inbox` row carries `id` and `ref` too. The login
 reply gains `inbox: { unread, total }` and `"inbox"` in `caps`.
 
 A block on an identity guest is the reason `blocks` lists objects rather
@@ -524,9 +576,9 @@ own: it was 31 Mac Roman bytes to begin with, so it is at most 31
 characters and at most a few hundred UTF-8 bytes by construction.
 
 Two things the reply deliberately does not say. `msg` answers whether the
-message waited **and nothing else**: the id is the *recipient's* handle
-for marking read, and handing a monotonic id to a sender would tell them
-how much mail this server carries. And `inbox` lists no uids — a stored
+message waited and the reference it was stored under, **and nothing
+else**: the cursor is the *recipient's*, a count of their mail, and
+never the sender's to see. And `inbox` lists no uids — a stored
 message's sender may be long gone, and a uid from then may belong to
 someone else now, so a client that wants to reply names the login.
 
@@ -591,10 +643,9 @@ to put it. Per-message client acks — fogWraith's `IM Acknowledge (812)`
 `msg_read` takes `up_to` rather than a list because that is how a reader
 moves through a conversation, and because it makes the operation
 idempotent and one statement. It is a *cursor in the caller's own
-mailbox*: ids are server-wide, so an id the caller did not receive is
-still a number, and everything of theirs below it is marked. What it
-cannot do is reach another mailbox — that is what the store scopes, and
-it is the part that would be a bug.
+mailbox* (§5), and another mailbox has the same numbers: what it cannot
+do is reach that mailbox — that is what the store scopes, and it is the
+part that would be a bug.
 
 That asymmetry has a consequence worth writing down before someone files
 it as a bug: **the legacy wire never generates a receipt.** When receipts
@@ -802,7 +853,7 @@ exists for. What that costs, concretely:
 | Cap | `max_queued` 200 | `MaxOfflineQueue` 500 | Same measure; a default to align |
 | Retention | 30d unread / 7d read | `OfflineRetentionDays` 30 | Compatible |
 | Sender told | `queued: true` | `OfflineQueued` (7) | Same fact |
-| Message id | server rowid | client `DATA_MESSAGE_GUID` | Needs a column (§15) |
+| Message id | a random reference, and a cursor per mailbox (§5) | client `DATA_MESSAGE_GUID` | Needs a column (§15) |
 | Gate | block list | friendship + blocks + discoverable | Ours is the subset that protects the mailbox |
 | Eligibility | has a password | `AccessMessaging` (58); admin/guest barred | Agree in practice (§2) |
 

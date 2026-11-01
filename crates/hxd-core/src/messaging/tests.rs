@@ -1217,7 +1217,7 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
     assert!(
         drain(&mut rb)
             .iter()
-            .any(|e| matches!(e, Event::Im(im) if im.id.is_none() && !im.queued)),
+            .any(|e| matches!(e, Event::Im(im) if im.cursor.is_none() && !im.queued)),
         "handed over live, with no row"
     );
     // A plain session beside the messenger is kept nothing to be handed
@@ -1306,11 +1306,11 @@ fn a_message_by_login_to_a_friend_is_an_instant_message() {
     friends(&s, a, &mut ra, b, &mut rb);
     let (plain, _rp) = attach_as(&s.core, "alice", messaging_bits(), "10.0.0.2");
 
-    assert_eq!(
+    assert!(matches!(
         s.core
             .msg_login(plain, "bob", "by login".into(), None, None),
-        Ok(crate::MsgOutcome::Delivered)
-    );
+        Ok(crate::MsgOutcome::Delivered(_))
+    ));
     assert_eq!(ims(&drain(&mut rb)), [("by login".into(), false)]);
     s.core
         .msg_login(plain, "carol", "outside messaging".into(), None, None)
@@ -2809,10 +2809,10 @@ fn an_approval_of_guest_lets_in_the_session_that_asked_and_no_other_guest() {
         s.core.requests_list(b).unwrap().approvals,
         [Mailbox::login("guest")]
     );
-    assert_eq!(
+    assert!(matches!(
         send(&s.core, asked, "bob", "thanks"),
-        Ok(MsgOutcome::Delivered)
-    );
+        Ok(MsgOutcome::Delivered(_))
+    ));
     assert_eq!(msgs(&drain(&mut rb)), ["thanks"]);
     assert_eq!(
         send(&s.core, other, "bob", "me too"),
@@ -2848,7 +2848,10 @@ fn writing_back_by_uid_approves_the_guest_that_asked() {
         "what it asked is handed over, and no other address's"
     );
     assert_eq!(waiting(&s.core, b), guests(&["other"]));
-    assert_eq!(send(&s.core, g, "bob", "thanks"), Ok(MsgOutcome::Delivered));
+    assert!(matches!(
+        send(&s.core, g, "bob", "thanks"),
+        Ok(MsgOutcome::Delivered(_))
+    ));
     assert_eq!(msgs(&drain(&mut rb)), ["thanks"]);
 }
 
@@ -3088,4 +3091,45 @@ fn a_request_address_key_is_not_the_news_key_of_the_same_address_and_secret() {
     let news = core.news_guest_keyer.key("10.0.0.1".parse().unwrap());
     let request = core.request_address(ann).expect("not exempt");
     assert_ne!(request, news.to_hex());
+}
+
+/// A request is an inbox row like any other, listed with its cursor, and
+/// its recipient reports it by that, past the gate that keeps it out of
+/// the inbox (`docs/instant-messaging.md` §4.5).
+#[test]
+fn a_request_is_reported_by_its_recipient_by_its_cursor() {
+    use crate::moderation::{
+        MemoryModeration, ModerationPolicy, ModerationStore, ReportRequest, ReportTarget,
+    };
+    let dir = Directory(
+        ["alice", "bob"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let rel = Arc::new(MemoryRelationships::new());
+    let reports = Arc::new(MemoryModeration::default());
+    let core = Core::new()
+        .with_inbox(
+            Arc::new(MemoryStore::gated(rel.clone())),
+            Arc::new(dir),
+            InboxPolicy::default(),
+        )
+        .with_relationships(rel)
+        .with_messaging(policy())
+        .with_moderation(reports.clone(), ModerationPolicy::default());
+    let (a, _ra) = taker(&core, "alice");
+    let (b, _rb) = taker(&core, "bob");
+    assert_eq!(
+        send(&core, a, "bob", "buy now"),
+        Ok(crate::MsgOutcome::Requested)
+    );
+    let listed = core.requests_list(b).unwrap();
+    let asked = &listed.requests[0].messages[0];
+    let filed = core
+        .report(b, ReportRequest::Msg(asked.cursor), "spam", None)
+        .unwrap();
+    let report = reports.report(filed.id).unwrap().unwrap();
+    assert_eq!(report.target, ReportTarget::Msg(Some(asked.reference)));
+    assert_eq!(report.evidence.as_deref(), Some("buy now"));
 }

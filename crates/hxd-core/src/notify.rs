@@ -31,7 +31,7 @@
 //! that means the same thing are one state too many; a `Core` with no
 //! gateway configured is the no-op, and that is the default.
 
-use crate::inbox::{Mailbox, MessageId};
+use crate::inbox::{Cursor, Mailbox};
 use crate::news::{ArticleId, NodeId, NotifyReason, SubScope};
 
 /// Something happened that someone who is not watching should hear about.
@@ -84,8 +84,9 @@ pub struct MessageNotice<'a> {
     /// The sender's nickname as displayed when it was sent.
     pub from_nick: &'a str,
     pub text: &'a str,
-    /// The stored message, so a client woken by this can name it.
-    pub id: MessageId,
+    /// The stored message's place in the recipient's mailbox, so a
+    /// client woken by this can find it there.
+    pub id: Cursor,
     /// The recipient's unread count *after* this message — a badge number
     /// the gateway can pass through without asking us again.
     pub unread: usize,

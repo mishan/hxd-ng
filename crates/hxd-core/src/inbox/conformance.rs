@@ -22,8 +22,8 @@ use std::sync::Arc;
 use crate::relationships::{RelationshipStore, SentOn};
 
 use super::{
-    Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pending, Pushed, Sent,
+    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent,
 };
 
 /// Run every case against a freshly built store. `new_store` is called
@@ -40,6 +40,14 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     reading_stamps_delivery_so_it_is_never_flushed_later(&*new_store().inbox);
     mark_read_never_reaches_another_mailbox(&*new_store().inbox);
     list_is_newest_first_and_pages_backwards(&*new_store().inbox);
+    // A message's names (`docs/private-messages.md` §5).
+    each_mailbox_numbers_its_own_mail(&*new_store().inbox);
+    references_are_random_and_follow_the_row(&*new_store().inbox);
+    a_cursor_is_not_handed_out_again(&*new_store().inbox);
+    a_merge_numbers_what_it_moves_after_both_mailboxes(&*new_store().inbox);
+    an_unlinked_login_counts_on_past_its_identity(&*new_store().inbox);
+    a_merge_into_a_fresh_mailbox_keeps_its_cursors(&*new_store().inbox);
+    a_claim_that_moves_nothing_keeps_the_logins_count(&*new_store().inbox);
     counts_of_a_mailbox_with_no_mail_are_zero(&*new_store().inbox);
     prune_ages_unread_from_sent_and_read_from_read(&*new_store().inbox);
     a_retention_window_older_than_the_clock_prunes_nothing(&*new_store().inbox);
@@ -126,9 +134,329 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
 /// below is about something other than the cap, and the cap has its own.
 fn push(s: &dyn MessageStore, m: &NewMessage) -> MessageId {
     match s.push(m, usize::MAX).unwrap() {
-        Pushed::Stored(id) => id,
+        Pushed::Stored { id, .. } => id,
         other => panic!("expected a new row, got {other:?}"),
     }
+}
+
+/// [`push`], for the row's place in its recipient's mailbox.
+fn place(s: &dyn MessageStore, m: &NewMessage) -> Cursor {
+    match s.push(m, usize::MAX).unwrap() {
+        Pushed::Stored { cursor, .. } => cursor,
+        other => panic!("expected a new row, got {other:?}"),
+    }
+}
+
+/// Each listed row's cursor, as `list` orders them.
+fn cursors(s: &dyn MessageStore, of: &Mailbox) -> Vec<Cursor> {
+    s.list(of, None, 100)
+        .unwrap()
+        .iter()
+        .map(|m| m.cursor)
+        .collect()
+}
+
+fn each_mailbox_numbers_its_own_mail(s: &dyn MessageStore) {
+    let case = "each_mailbox_numbers_its_own_mail";
+    let (dave, bob, alice) = (
+        Mailbox::login("dave"),
+        Mailbox::login("bob"),
+        Mailbox::identified("alice", fp(1)),
+    );
+    let mut receipt = msg(&dave, &bob, "read", at(0));
+    receipt.kind = MessageKind::ReadReceipt;
+    // Interleaved across three mailboxes and both kinds of key, with a
+    // receipt, which is not mail, in the middle.
+    let got: Vec<Cursor> = [
+        msg(&dave, &bob, "d1", at(1)),
+        msg(&bob, &dave, "b1", at(2)),
+        msg(&alice, &dave, "a1", at(3)),
+        receipt,
+        msg(&dave, &bob, "d2", at(4)),
+        msg(&bob, &dave, "b2", at(5)),
+        msg(&dave, &alice, "d3", at(6)),
+    ]
+    .iter()
+    .map(|m| place(s, m))
+    .collect();
+    assert_eq!(got, [1, 1, 1, 0, 2, 2, 3], "{case}: as pushed");
+    assert_eq!(cursors(s, &dave), [3, 2, 1], "{case}: dave's, gapless");
+    assert_eq!(cursors(s, &bob), [2, 1], "{case}: bob's, his own");
+    assert_eq!(cursors(s, &alice), [1], "{case}: alice's, her own");
+    assert_eq!(
+        bodies(&s.list(&dave, Some(3), 1).unwrap()),
+        ["d2"],
+        "{case}: `before` is dave's cursor"
+    );
+    assert_eq!(
+        s.mark_read(&dave, 2, at(9)).unwrap(),
+        2,
+        "{case}: and so is `up_to`"
+    );
+}
+
+fn references_are_random_and_follow_the_row(s: &dyn MessageStore) {
+    let case = "references_are_random_and_follow_the_row";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let pushed: Vec<MessageRef> = (0..16u8)
+        .map(|i| {
+            let mut m = msg(&dave, &alice, &format!("m{i}"), at(i.into()));
+            m.guid = Some(guid(i));
+            match s.push(&m, usize::MAX).unwrap() {
+                Pushed::Stored { reference, .. } => reference,
+                other => panic!("{case}: expected a new row, got {other:?}"),
+            }
+        })
+        .collect();
+    let distinct: std::collections::HashSet<_> = pushed.iter().collect();
+    assert_eq!(distinct.len(), pushed.len(), "{case}: no two alike");
+    let mut sorted = pushed.clone();
+    sorted.sort();
+    assert_ne!(sorted, pushed, "{case}: not counted up");
+    sorted.reverse();
+    assert_ne!(sorted, pushed, "{case}: nor down");
+
+    let mut listed: Vec<MessageRef> = s
+        .list(&dave, None, 100)
+        .unwrap()
+        .iter()
+        .map(|m| m.reference)
+        .collect();
+    listed.reverse();
+    assert_eq!(listed, pushed, "{case}: the row keeps the one it was given");
+    let mut retry = msg(&dave, &alice, "m3", at(3));
+    retry.guid = Some(guid(3));
+    match s.push(&retry, usize::MAX).unwrap() {
+        Pushed::Existing(m) => assert_eq!(m.reference, pushed[3], "{case}: a retry's"),
+        other => panic!("{case}: expected the stored row, got {other:?}"),
+    }
+}
+
+fn a_cursor_is_not_handed_out_again(s: &dyn MessageStore) {
+    let case = "a_cursor_is_not_handed_out_again";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    place(s, &msg(&dave, &alice, "one", at(1)));
+    place(s, &msg(&dave, &alice, "two", at(2)));
+    let day = Duration::from_secs(86_400);
+    assert_eq!(
+        s.prune(at(10) + day, day, day).unwrap(),
+        2,
+        "{case}: pruned"
+    );
+    assert_eq!(s.last_cursor(&dave).unwrap(), 2, "{case}: what it issued");
+    assert_eq!(s.last_cursor(&alice).unwrap(), 0, "{case}: and none");
+    assert_eq!(
+        place(s, &msg(&dave, &alice, "three", at(3))),
+        3,
+        "{case}: a client that saw two is never shown another two"
+    );
+    s.purge(&dave).unwrap();
+    assert_eq!(
+        place(s, &msg(&dave, &alice, "anew", at(4))),
+        1,
+        "{case}: a purged mailbox is a new one, counting nothing of before"
+    );
+}
+
+/// An account that unlinks reads its bare login's mailbox again: that
+/// counts on past the identity's, and a login that never had one is left
+/// as it was.
+fn an_unlinked_login_counts_on_past_its_identity(s: &dyn MessageStore) {
+    let case = "an_unlinked_login_counts_on_past_its_identity";
+    let (bare, identified, alice) = (
+        Mailbox::login("dave"),
+        Mailbox::identified("dave", fp(1)),
+        Mailbox::login("alice"),
+    );
+    place(s, &msg(&bare, &alice, "before linking", at(1)));
+    s.claim("dave", &fp(1)).unwrap();
+    for i in 0..3 {
+        place(s, &msg(&identified, &alice, "linked", at(i)));
+    }
+    s.unlinked("dave", &fp(1)).unwrap();
+    assert_eq!(
+        place(s, &msg(&bare, &alice, "after", at(4))),
+        5,
+        "{case}: past the identity's four, the claimed one among them"
+    );
+    s.unlinked("erin", &fp(9)).unwrap();
+    let erin = Mailbox::login("erin");
+    assert_eq!(
+        place(s, &msg(&erin, &alice, "first", at(5))),
+        1,
+        "{case}: no identity mailbox, nothing to pass"
+    );
+}
+
+/// The usual merge — a first link, a rotation to a fresh key — is into a
+/// mailbox that never issued a cursor: what moves keeps its cursors, so
+/// no client's go stale, and the count carries over. A claim with
+/// nothing to move, which every login of a linked account makes,
+/// changes nothing.
+fn a_merge_into_a_fresh_mailbox_keeps_its_cursors(s: &dyn MessageStore) {
+    let case = "a_merge_into_a_fresh_mailbox_keeps_its_cursors";
+    let alice = Mailbox::login("alice");
+    let (bare, linked, rotated) = (
+        Mailbox::login("dave"),
+        Mailbox::identified("dave", fp(1)),
+        Mailbox::identified("dave", fp(2)),
+    );
+    for i in 0..3 {
+        place(s, &msg(&bare, &alice, "before linking", at(i)));
+    }
+    s.claim("dave", &fp(1)).unwrap();
+    assert_eq!(
+        cursors(s, &linked),
+        [3, 2, 1],
+        "{case}: claimed as they were"
+    );
+    s.claim("dave", &fp(1)).unwrap();
+    assert_eq!(
+        cursors(s, &linked),
+        [3, 2, 1],
+        "{case}: claimed again, unmoved"
+    );
+    assert_eq!(
+        place(s, &msg(&linked, &alice, "linked", at(4))),
+        4,
+        "{case}: counting on from the login's"
+    );
+    s.rotate(&fp(1), &fp(2)).unwrap();
+    assert_eq!(
+        cursors(s, &rotated),
+        [4, 3, 2, 1],
+        "{case}: rotated as they were"
+    );
+    assert_eq!(
+        place(s, &msg(&rotated, &alice, "rotated", at(5))),
+        5,
+        "{case}: counting on from the old key's"
+    );
+    assert_eq!(
+        place(s, &msg(&bare, &alice, "to whoever holds dave now", at(6))),
+        1,
+        "{case}: the claimed login's count went with its mail"
+    );
+}
+
+/// A login whose mail was all pruned has still issued its cursors: a
+/// claim that moves nothing carries its count all the same, so the
+/// owner is never shown one of them again, by the identity or after an
+/// unlink.
+fn a_claim_that_moves_nothing_keeps_the_logins_count(s: &dyn MessageStore) {
+    let case = "a_claim_that_moves_nothing_keeps_the_logins_count";
+    let alice = Mailbox::login("alice");
+    let (bare, linked) = (Mailbox::login("dave"), Mailbox::identified("dave", fp(1)));
+    let day = Duration::from_secs(86_400);
+    place(s, &msg(&linked, &alice, "kept", at(10) + day));
+    for i in 0..3 {
+        place(s, &msg(&bare, &alice, "pruned", at(i)));
+    }
+    assert_eq!(
+        s.prune(at(10) + day, day, day).unwrap(),
+        3,
+        "{case}: pruned"
+    );
+    assert_eq!(
+        s.claim("dave", &fp(1)).unwrap(),
+        0,
+        "{case}: nothing to move"
+    );
+    assert_eq!(
+        place(s, &msg(&linked, &alice, "next", at(11) + day)),
+        4,
+        "{case}: past the login's three"
+    );
+    s.unlinked("dave", &fp(1)).unwrap();
+    assert_eq!(
+        place(s, &msg(&bare, &alice, "after", at(12) + day)),
+        5,
+        "{case}: and past the identity's after an unlink"
+    );
+}
+
+/// A claim or a rotation makes two mailboxes one: what it moves is
+/// numbered after the cursors of both, in the order it had, and what was
+/// already there keeps its numbers. References do not move at all.
+fn a_merge_numbers_what_it_moves_after_both_mailboxes(s: &dyn MessageStore) {
+    let case = "a_merge_numbers_what_it_moves_after_both_mailboxes";
+    let alice = Mailbox::login("alice");
+    let identified = Mailbox::identified("dave", fp(1));
+    let bare = Mailbox::login("dave");
+    let refs = |of: &Mailbox| -> Vec<(String, MessageRef)> {
+        let mut r: Vec<_> = s
+            .list(of, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.body, m.reference))
+            .collect();
+        r.sort();
+        r
+    };
+    for (to, body) in [
+        (&identified, "linked 1"),
+        (&bare, "bare 1"),
+        (&bare, "bare 2"),
+        (&identified, "linked 2"),
+        (&bare, "bare 3"),
+    ] {
+        place(s, &msg(to, &alice, body, at(1)));
+    }
+    let mut before = refs(&identified);
+    before.extend(refs(&bare));
+    before.sort();
+
+    s.claim("dave", &fp(1)).unwrap();
+    let listed: Vec<(Cursor, String)> = s
+        .list(&identified, None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.cursor, m.body))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (6, "bare 3".to_string()),
+            (5, "bare 2".to_string()),
+            (4, "bare 1".to_string()),
+            (2, "linked 2".to_string()),
+            (1, "linked 1".to_string()),
+        ],
+        "{case}: claimed after the larger of the two"
+    );
+    assert_eq!(refs(&identified), before, "{case}: references unmoved");
+    assert_eq!(
+        place(s, &msg(&identified, &alice, "next", at(2))),
+        7,
+        "{case}: and the mailbox counts on from there"
+    );
+
+    let successor = Mailbox::identified("dave", fp(2));
+    place(s, &msg(&successor, &alice, "already there", at(3)));
+    let before = refs(&identified);
+    s.rotate(&fp(1), &fp(2)).unwrap();
+    assert_eq!(
+        cursors(s, &successor),
+        [13, 12, 11, 10, 9, 8, 1],
+        "{case}: rotated after the old key's"
+    );
+    assert_eq!(
+        bodies(&s.list(&successor, None, 1).unwrap()),
+        ["next"],
+        "{case}: in the order they had"
+    );
+    assert_eq!(
+        s.list(&successor, None, 100)
+            .unwrap()
+            .iter()
+            .find(|m| m.body == "already there")
+            .map(|m| m.cursor),
+        Some(1),
+        "{case}: what was there keeps its place"
+    );
+    let mut after = refs(&successor);
+    after.retain(|(b, _)| b != "already there");
+    assert_eq!(after, before, "{case}: references unmoved by a rotation");
 }
 
 fn bodies(msgs: &[super::StoredMessage]) -> Vec<&str> {
@@ -534,7 +862,7 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
     assert!(
         matches!(
             s.push(&msg(&dave, &alice, "one more", at(9)), 4).unwrap(),
-            Pushed::Stored(_)
+            Pushed::Stored { .. }
         ),
         "{case}"
     );
@@ -545,7 +873,7 @@ fn the_gate_holds_what_was_sent_on_nothing_live(g: &Gated) {
     rel.unfriend(&dave, &alice).unwrap();
     assert_eq!(read(INSTANT), ["approved"], "{case}");
     assert_eq!(
-        s.mark_read(&dave, MessageId::MAX, at(11)).unwrap(),
+        s.mark_read(&dave, Cursor::MAX, at(11)).unwrap(),
         3,
         "{case}: a read cursor skips what the gate holds"
     );
@@ -678,7 +1006,7 @@ fn delivery_is_idempotent_and_removes_from_pending(s: &dyn MessageStore) {
 fn reading_stamps_delivery_so_it_is_never_flushed_later(s: &dyn MessageStore) {
     let case = "reading_stamps_delivery_so_it_is_never_flushed_later";
     let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
-    let id = push(s, &msg(&dave, &alice, "hi", at(1)));
+    let id = place(s, &msg(&dave, &alice, "hi", at(1)));
     assert_eq!(s.mark_read(&dave, id, at(5)).unwrap(), 1, "{case}: marked");
     assert!(
         s.pending(&dave, 10).unwrap().is_empty(),
@@ -704,8 +1032,8 @@ fn mark_read_never_reaches_another_mailbox(s: &dyn MessageStore) {
         Mailbox::login("alice"),
     );
     push(s, &msg(&dave, &alice, "for dave", at(1)));
-    let theirs = push(s, &msg(&bob, &alice, "for bob", at(2)));
-    // A client naming an id it does not own marks only its own mail.
+    let theirs = place(s, &msg(&bob, &alice, "for bob", at(2)));
+    // A client naming a cursor of another mailbox marks only its own mail.
     assert_eq!(
         s.mark_read(&dave, theirs, at(5)).unwrap(),
         1,
@@ -721,8 +1049,8 @@ fn mark_read_never_reaches_another_mailbox(s: &dyn MessageStore) {
 fn list_is_newest_first_and_pages_backwards(s: &dyn MessageStore) {
     let case = "list_is_newest_first_and_pages_backwards";
     let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
-    let ids: Vec<MessageId> = (0..5)
-        .map(|i| push(s, &msg(&dave, &alice, &format!("m{i}"), at(i))))
+    let ids: Vec<Cursor> = (0..5)
+        .map(|i| place(s, &msg(&dave, &alice, &format!("m{i}"), at(i))))
         .collect();
     let page = s.list(&dave, None, 2).unwrap();
     assert_eq!(bodies(&page), ["m4", "m3"], "{case}: first page");
@@ -746,11 +1074,11 @@ fn counts_of_a_mailbox_with_no_mail_are_zero(s: &dyn MessageStore) {
 fn prune_ages_unread_from_sent_and_read_from_read(s: &dyn MessageStore) {
     let case = "prune_ages_unread_from_sent_and_read_from_read";
     let (dave, a) = (Mailbox::login("dave"), Mailbox::login("a"));
-    // Pushed and read in id order, because mark_read sweeps everything up
-    // to the id it is given.
-    let ancient = push(s, &msg(&dave, &a, "ancient", at(0)));
+    // Pushed and read in cursor order, because mark_read sweeps everything
+    // up to the cursor it is given.
+    let ancient = place(s, &msg(&dave, &a, "ancient", at(0)));
     s.mark_read(&dave, ancient, at(100)).unwrap();
-    let recent = push(s, &msg(&dave, &a, "recent", at(0)));
+    let recent = place(s, &msg(&dave, &a, "recent", at(0)));
     s.mark_read(&dave, recent, at(890)).unwrap();
     push(s, &msg(&dave, &a, "old unread", at(0)));
     push(s, &msg(&dave, &a, "fresh", at(900)));
@@ -970,8 +1298,8 @@ fn a_collapse_keeps_what_the_duplicate_knew(s: &dyn MessageStore) {
     push(s, &waiting);
     let mut retry = msg(&bare, &bob, "the retry on the bare login", at(2));
     retry.guid = Some(guid(9));
-    let read_id = push(s, &retry);
-    s.mark_read(&bare, read_id, at(3)).unwrap();
+    let read_at = place(s, &retry);
+    s.mark_read(&bare, read_at, at(3)).unwrap();
 
     s.claim("dave", &fp(1)).unwrap();
     assert_eq!(
@@ -1140,7 +1468,7 @@ fn pushing_the_same_guid_twice_stores_one_row(s: &dyn MessageStore) {
     let mut m = msg(&dave, &alice, "sent once", at(1));
     m.guid = Some(guid(9));
     let first = match s.push(&m, usize::MAX).unwrap() {
-        Pushed::Stored(id) => id,
+        Pushed::Stored { id, .. } => id,
         other => panic!("{case}: {other:?}"),
     };
     // Same guid, different body — a retry, not a new message.
@@ -1165,7 +1493,7 @@ fn pushing_the_same_guid_twice_stores_one_row(s: &dyn MessageStore) {
     anon.sender = None;
     anon.guid = Some(guid(10));
     let id = match s.push(&anon, usize::MAX).unwrap() {
-        Pushed::Stored(id) => id,
+        Pushed::Stored { id, .. } => id,
         other => panic!("{case}: {other:?}"),
     };
     match s.push(&anon, usize::MAX).unwrap() {
@@ -1184,7 +1512,7 @@ fn the_cap_is_enforced_by_the_insert(s: &dyn MessageStore) {
             matches!(
                 s.push(&msg(&dave, &alice, &format!("m{i}"), at(i)), 3)
                     .unwrap(),
-                Pushed::Stored(_)
+                Pushed::Stored { .. }
             ),
             "{case}: under the cap"
         );
@@ -1203,7 +1531,7 @@ fn the_cap_is_enforced_by_the_insert(s: &dyn MessageStore) {
         matches!(
             s.push(&msg(&dave, &alice, "room again", at(11)), 3)
                 .unwrap(),
-            Pushed::Stored(_)
+            Pushed::Stored { .. }
         ),
         "{case}: delivery makes room"
     );
@@ -1211,7 +1539,7 @@ fn the_cap_is_enforced_by_the_insert(s: &dyn MessageStore) {
     let mut receipt = msg(&dave, &alice, "ack", at(12));
     receipt.kind = MessageKind::ReadReceipt;
     assert!(
-        matches!(s.push(&receipt, 3).unwrap(), Pushed::Stored(_)),
+        matches!(s.push(&receipt, 3).unwrap(), Pushed::Stored { .. }),
         "{case}: receipts are not capped as mail"
     );
 }

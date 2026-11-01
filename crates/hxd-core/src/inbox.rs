@@ -36,9 +36,26 @@ pub mod memory;
 
 pub use memory::MemoryStore;
 
-/// A stored message's identity and its ordering: monotonic per store,
-/// which is also what makes it a pagination cursor.
+/// A stored row's handle inside the store and the domain: one counter
+/// for the whole server, so it never reaches a wire, where it would say
+/// how much mail the server carries (`docs/private-messages.md` §5).
 pub type MessageId = u64;
+
+/// A stored message's name wherever it is named: random bytes made when
+/// the row is stored, held by sender and recipient alike, and never
+/// changed by a claim or a rotation.
+pub type MessageRef = [u8; 16];
+
+/// A reference's spelling outside the store: unpadded base64url, the way
+/// a media handle, which is as long, is spelled.
+pub fn ref_str(r: &MessageRef) -> String {
+    crate::media::handle_str(r)
+}
+
+/// A message's place in its recipient's mailbox: that mailbox's own
+/// sequence, which pages it and marks it read, and which tells its owner
+/// nothing but how much mail it has been sent. Only the owner sees one.
+pub type Cursor = u64;
 
 /// Whose mailbox this is — the durable answer to "who".
 ///
@@ -237,6 +254,9 @@ pub struct NewMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
     pub id: MessageId,
+    pub reference: MessageRef,
+    /// 0 for a row that is not mail, which no mailbox numbers.
+    pub cursor: Cursor,
     pub recipient: Mailbox,
     pub sender: Option<Mailbox>,
     pub sender_nick: String,
@@ -272,8 +292,12 @@ pub struct InboxCounts {
 /// What [`MessageStore::push`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pushed {
-    /// A new row, with its id.
-    Stored(MessageId),
+    /// A new row.
+    Stored {
+        id: MessageId,
+        reference: MessageRef,
+        cursor: Cursor,
+    },
     /// This sender had already sent this recipient this guid; here is
     /// the row that exists. Nothing was written. Boxed because it dwarfs
     /// the other two variants and this is a hot return value.
@@ -464,36 +488,42 @@ pub trait MessageStore: Send + Sync + 'static {
     /// recipient is reading it.
     fn is_pending(&self, to: &Mailbox, id: MessageId) -> Result<bool, StoreError>;
 
-    /// Mark everything belonging to `to` up to and including `up_to` as
-    /// read, stamping `delivered_at` too where it is unset (a message read
-    /// straight out of [`MessageStore::list`] was never flushed, and must
-    /// not be flushed later). Returns how many rows this marked.
+    /// Mark everything belonging to `to` up to and including the cursor
+    /// `up_to` as read, stamping `delivered_at` too where it is unset (a
+    /// message read straight out of [`MessageStore::list`] was never
+    /// flushed, and must not be flushed later). Returns how many rows this
+    /// marked.
     ///
     /// **Scoped by mailbox on purpose**: a client can only ever mark its
     /// own mail, whatever id it names.
-    fn mark_read(
-        &self,
-        to: &Mailbox,
-        up_to: MessageId,
-        at: SystemTime,
-    ) -> Result<usize, StoreError>;
+    fn mark_read(&self, to: &Mailbox, up_to: Cursor, at: SystemTime) -> Result<usize, StoreError>;
 
-    /// One mailbox's messages, **newest first**, paginating backwards from
-    /// `before` (exclusive). This is what a client that woke to a push
-    /// calls to find out what it was woken for.
+    /// One mailbox's messages, **newest first** by cursor, paginating
+    /// backwards from the cursor `before` (exclusive). This is what a
+    /// client that woke to a push calls to find out what it was woken for.
     fn list(
         &self,
         to: &Mailbox,
-        before: Option<MessageId>,
+        before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError>;
 
     /// Unread and total for one mailbox.
     fn counts(&self, to: &Mailbox) -> Result<InboxCounts, StoreError>;
 
+    /// The last cursor `of` has issued, 0 for none: what a cursor a client
+    /// names is held to.
+    fn last_cursor(&self, of: &Mailbox) -> Result<Cursor, StoreError>;
+
+    /// An account gave up its link to `fingerprint`: its bare login's
+    /// mailbox counts on past the identity's, so the account's owner is
+    /// never shown a cursor twice. Nothing moves (`Mailbox` says why).
+    fn unlinked(&self, login: &str, fingerprint: &[u8; 32]) -> Result<(), StoreError>;
+
     /// The link moved to a successor key (`docs/hotline-ng-identity.md`
-    /// §8.5): re-stamp everything keyed by `from` with `to`. Returns how
-    /// many rows moved.
+    /// §8.5): re-stamp everything keyed by `from` with `to`, the mail it
+    /// moves into `to`'s mailbox numbered after both mailboxes' cursors.
+    /// Returns how many rows moved.
     ///
     /// **Key rotation must call this**, or a rotated identity loses its
     /// mailbox. `Core::rotate_identity` calls it, and the relationship
@@ -502,8 +532,9 @@ pub trait MessageStore: Send + Sync + 'static {
 
     /// An account has linked an identity: stamp everything currently
     /// keyed by its bare login — mail to it and mail from it — with the
-    /// fingerprint, so the mailbox follows the identity from here on.
-    /// Returns how many rows moved.
+    /// fingerprint, so the mailbox follows the identity from here on, the
+    /// mail it moves numbered after both mailboxes' cursors so that none
+    /// is one its owner has seen before. Returns how many rows moved.
     ///
     /// **The account-linking path must call this**, or an account's
     /// existing mail is stranded the moment it gains an identity ([`Mailbox`]

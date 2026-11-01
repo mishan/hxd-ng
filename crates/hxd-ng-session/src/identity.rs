@@ -1603,6 +1603,7 @@ impl IdentityState {
         match outcome {
             UnlinkOutcome::Unlinked(a) => {
                 self.core.friendships_unlinked(&ident.fingerprint.0);
+                self.core.inbox_unlinked(&a.login, &ident.fingerprint.0);
                 let stays = self
                     .core
                     .inbox_counts_of(&hxd_core::inbox::Mailbox::identified(

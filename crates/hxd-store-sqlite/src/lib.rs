@@ -33,8 +33,8 @@ use hxd_core::history::{
     NewLine, Retention, Signature, SignedAt,
 };
 use hxd_core::inbox::{
-    Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pending, Pushed, Sent, StoreError, StoredMessage,
+    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
 };
 use hxd_core::relationships::{RelationId, SentOn};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -75,7 +75,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -910,6 +910,50 @@ const SCHEMA_V32: &str = "
 ALTER TABLE message ADD COLUMN sender_address TEXT;
 ";
 
+/// A message's names (`docs/private-messages.md` §5): `ref`, random and
+/// the only name either party is given, and `seq`, its place in its
+/// recipient's mailbox, numbered per mailbox in the order the rows came.
+/// Receipts are not mail and take no place. A mailbox's last place is
+/// kept apart from its rows, keyed as `message_guid` keys a mailbox, so
+/// pruning the newest of them never hands its place out again.
+///
+/// A report on a message is kept by its reference too. One whose row is
+/// gone keeps its row id, which nothing reads: and the reporter and the
+/// time are checked as well as the id, since a rowid is handed out again
+/// once the newest row goes, and could name someone else's. The reporter
+/// by its login or its key, either: a claim or a rotation since the
+/// report moved the message's key and not the report's.
+const SCHEMA_V33: &str = "
+ALTER TABLE message ADD COLUMN ref BLOB;
+ALTER TABLE message ADD COLUMN seq INTEGER;
+UPDATE message SET ref = randomblob(16);
+UPDATE message SET seq = n.seq
+  FROM (SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY IFNULL(recipient_fp, recipient) ORDER BY id) AS seq
+          FROM message WHERE kind = 0) AS n
+ WHERE message.id = n.id;
+CREATE UNIQUE INDEX message_ref ON message (ref);
+CREATE UNIQUE INDEX message_seq_fp ON message (recipient_fp, seq)
+  WHERE recipient_fp IS NOT NULL AND seq IS NOT NULL;
+CREATE UNIQUE INDEX message_seq_login ON message (recipient, seq)
+  WHERE recipient_fp IS NULL AND seq IS NOT NULL;
+CREATE TABLE mailbox_seq (
+  mailbox TEXT    PRIMARY KEY,
+  last    INTEGER NOT NULL
+) WITHOUT ROWID;
+INSERT INTO mailbox_seq (mailbox, last)
+  SELECT IFNULL(recipient_fp, recipient), MAX(seq) FROM message
+   WHERE seq IS NOT NULL GROUP BY 1;
+ALTER TABLE report ADD COLUMN target_ref BLOB;
+UPDATE report SET target_ref = (
+    SELECT ref FROM message
+     WHERE message.id = report.target_msg AND message.sent_at <= report.at
+       AND (message.recipient = report.reporter
+            OR message.recipient_fp = report.reporter_fp))
+ WHERE kind = 3;
+UPDATE report SET target_msg = NULL WHERE target_ref IS NOT NULL;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1651,6 +1695,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 32 {
         steps.push_str(SCHEMA_V32);
     }
+    if version < 33 {
+        steps.push_str(SCHEMA_V33);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1783,6 +1830,59 @@ impl Collapse {
     }
 }
 
+/// Move the mail `moving` names (with `?2` bound to `from`) into the
+/// mailbox keyed `into`, and stamp it `into`'s. Into one that never
+/// issued a cursor — a first link, a fresh key — it keeps its cursors and
+/// `from`'s count carries over, so no client's go stale. Into one that
+/// did, it is numbered after the last cursor of either, in the order it
+/// had, so no cursor its owner saw in either is handed out again: in one
+/// statement, so the unique `message_seq_*` indexes never see a row in
+/// its new mailbox under its old number. Returns how many rows moved.
+fn renumber(
+    tx: &rusqlite::Transaction<'_>,
+    moving: &str,
+    into: &str,
+    from: &str,
+) -> Result<usize, StoreError> {
+    let last = |key: &str| -> Result<i64, StoreError> {
+        tx.query_row(
+            "SELECT IFNULL(MAX(last), 0) FROM mailbox_seq WHERE mailbox = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .map_err(StoreError::new)
+    };
+    let (from_last, into_last) = (last(from)?, last(into)?);
+    let fresh = into_last == 0;
+    let moved = tx
+        .execute(
+            &format!(
+                "UPDATE message SET recipient_fp = ?1, seq = IIF(?3, seq, ?4 + n.place)
+                   FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY seq) AS place FROM message
+                          WHERE {moving} AND seq IS NOT NULL) AS n
+                  WHERE message.id = n.id"
+            ),
+            params![into, from, fresh, from_last.max(into_last)],
+        )
+        .map_err(StoreError::new)?;
+    // Raised even when nothing moves: `from` issued its cursors whether
+    // or not its rows are still here.
+    let into_now = if fresh {
+        from_last
+    } else {
+        into_last.max(from_last) + moved as i64
+    };
+    if into_now > into_last {
+        tx.execute(
+            "INSERT INTO mailbox_seq (mailbox, last) VALUES (?1, ?2)
+               ON CONFLICT (mailbox) DO UPDATE SET last = excluded.last",
+            params![into, into_now],
+        )
+        .map_err(StoreError::new)?;
+    }
+    Ok(moved)
+}
+
 /// A fingerprint's storage spelling: lowercase hex, chosen here and
 /// nowhere else. The domain's key is the raw 32 bytes (see `Mailbox`), so
 /// this is the only place a fingerprint is text at all — which is what
@@ -1815,7 +1915,7 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
                        sender_nick, body, guid, sent_at, delivered_at, read_at, \
                        media_id, media_type, media_w, media_h, media_bytes, \
-                       signed, signed_content, friendship";
+                       signed, signed_content, friendship, ref, seq";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -1892,8 +1992,18 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let media = media_columns(r, 12)?;
     let signed: (Option<Vec<u8>>, Option<Vec<u8>>) = (r.get(17)?, r.get(18)?);
     let friendship: Option<i64> = r.get(19)?;
+    let (reference, seq): (Option<Vec<u8>>, Option<i64>) = (r.get(20)?, r.get(21)?);
     Ok((|| {
         Ok(StoredMessage {
+            reference: reference
+                .and_then(|r| MessageRef::try_from(r).ok())
+                .ok_or_else(|| StoreError::new(format!("message {id} has no reference")))?,
+            cursor: match (kind, seq) {
+                (0, Some(n)) => Cursor::try_from(n)
+                    .map_err(|_| StoreError::new(format!("message cursor {n} is not one")))?,
+                (0, None) => return Err(StoreError::new(format!("message {id} has no cursor"))),
+                _ => 0,
+            },
             // `INTEGER PRIMARY KEY` is signed and `MessageId` is not, so
             // a hand-edited negative id would wrap. It is not a mailbox
             // key, so it cannot misdeliver anything, but a wrapped id is
@@ -2001,14 +2111,30 @@ impl MessageStore for SqliteStore {
                 return Ok(Pushed::Full);
             }
         }
+        let mut reference: MessageRef = [0; 16];
+        getrandom::getrandom(&mut reference).map_err(StoreError::new)?;
+        let seq: Option<i64> = if m.kind == MessageKind::Message {
+            Some(
+                tx.query_row(
+                    "INSERT INTO mailbox_seq (mailbox, last) VALUES (?1, 1)
+                       ON CONFLICT (mailbox) DO UPDATE SET last = last + 1
+                     RETURNING last",
+                    params![bind(&m.recipient)],
+                    |r| r.get(0),
+                )
+                .map_err(StoreError::new)?,
+            )
+        } else {
+            None
+        };
         tx.execute(
             "INSERT INTO message
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
                 media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
-                friendship, requested, sender_address)
+                friendship, requested, sender_address, ref, seq)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?18 IS 0, ?19)",
+                     ?18, ?18 IS 0, ?19, ?20, ?21)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -2035,12 +2161,18 @@ impl MessageStore for SqliteStore {
                 m.signed.as_ref().map(|x| &x.content[..]),
                 m.friendship.map(SentOn::as_i64),
                 m.sender_address,
+                &reference[..],
+                seq,
             ],
         )
         .map_err(StoreError::new)?;
         let id = tx.last_insert_rowid() as MessageId;
         tx.commit().map_err(StoreError::new)?;
-        Ok(Pushed::Stored(id))
+        Ok(Pushed::Stored {
+            id,
+            reference,
+            cursor: seq.unwrap_or(0) as Cursor,
+        })
     }
 
     fn find_guid(
@@ -2198,12 +2330,7 @@ impl MessageStore for SqliteStore {
         tx.commit().map_err(StoreError::new)
     }
 
-    fn mark_read(
-        &self,
-        to: &Mailbox,
-        up_to: MessageId,
-        at: SystemTime,
-    ) -> Result<usize, StoreError> {
+    fn mark_read(&self, to: &Mailbox, up_to: Cursor, at: SystemTime) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
         // COALESCE on delivered_at: a message read straight out of `list`
         // was never flushed, and stamping it here is what keeps `pending`
@@ -2211,7 +2338,7 @@ impl MessageStore for SqliteStore {
         let sql = format!(
             "UPDATE message
                 SET read_at = ?2, delivered_at = COALESCE(delivered_at, ?2)
-              WHERE {} AND {MAIL_ONLY} AND {LIVE} AND id <= ?3 AND read_at IS NULL",
+              WHERE {} AND {MAIL_ONLY} AND {LIVE} AND seq <= ?3 AND read_at IS NULL",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -2222,14 +2349,17 @@ impl MessageStore for SqliteStore {
     fn list(
         &self,
         to: &Mailbox,
-        before: Option<MessageId>,
+        before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
+        // `seq IS NOT NULL` is what lets the `message_seq_*` index serve
+        // the first page, whose bound is the OR's other half.
         let sql = format!(
             "SELECT {COLUMNS} FROM message
-             WHERE {} AND {MAIL_ONLY} AND {LIVE} AND (?2 IS NULL OR id < ?2)
-             ORDER BY id DESC LIMIT ?3",
+             WHERE {} AND {MAIL_ONLY} AND {LIVE} AND seq IS NOT NULL
+               AND (?2 IS NULL OR seq < ?2)
+             ORDER BY seq DESC LIMIT ?3",
             mailbox_sql(to, "recipient", 1)
         );
         let mut stmt = conn.prepare_cached(&sql).map_err(StoreError::new)?;
@@ -2259,6 +2389,32 @@ impl MessageStore for SqliteStore {
             unread: unread as usize,
             total: total as usize,
         })
+    }
+
+    fn last_cursor(&self, of: &Mailbox) -> Result<Cursor, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let last: Option<i64> = conn
+            .query_row(
+                "SELECT last FROM mailbox_seq WHERE mailbox = ?1",
+                params![bind(of)],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::new)?;
+        Ok(last.unwrap_or(0) as Cursor)
+    }
+
+    fn unlinked(&self, login: &str, fingerprint: &[u8; 32]) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO mailbox_seq (mailbox, last)
+               SELECT ?1, MAX(last) FROM mailbox_seq WHERE mailbox IN (?1, ?2)
+               HAVING MAX(last) IS NOT NULL
+               ON CONFLICT (mailbox) DO UPDATE SET last = excluded.last",
+            params![login, fp_hex(fingerprint)],
+        )
+        .map_err(StoreError::new)?;
+        Ok(())
     }
 
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
@@ -2297,7 +2453,16 @@ impl MessageStore for SqliteStore {
                 "claim: duplicate guids merged with the identity's mailbox"
             );
         }
-        let mut moved = 0;
+        let mut moved = renumber(
+            &tx,
+            "recipient = ?2 AND recipient_fp IS NULL",
+            &fingerprint,
+            login,
+        )?;
+        // Its count went with its mail: a later holder of the login must
+        // not count on from it. An unlink raises it again.
+        tx.execute("DELETE FROM mailbox_seq WHERE mailbox = ?1", params![login])
+            .map_err(StoreError::new)?;
         for sql in [
             "UPDATE message SET recipient_fp = ?1 WHERE recipient = ?2 AND recipient_fp IS NULL",
             "UPDATE message SET sender_fp = ?1 WHERE sender = ?2 AND sender_fp IS NULL",
@@ -2334,7 +2499,7 @@ impl MessageStore for SqliteStore {
                 "rotate: duplicate guids merged with the successor"
             );
         }
-        let mut moved = 0;
+        let mut moved = renumber(&tx, "recipient_fp = ?2", &to, &from)?;
         for sql in [
             "UPDATE message SET recipient_fp = ?1 WHERE recipient_fp = ?2",
             "UPDATE message SET sender_fp = ?1 WHERE sender_fp = ?2",
@@ -2362,6 +2527,11 @@ impl MessageStore for SqliteStore {
                 .execute(&sql, params![bind(of)])
                 .map_err(StoreError::new)?;
         }
+        tx.execute(
+            "DELETE FROM mailbox_seq WHERE mailbox = ?1",
+            params![bind(of)],
+        )
+        .map_err(StoreError::new)?;
         tx.commit().map_err(StoreError::new)?;
         Ok(gone)
     }
@@ -3485,6 +3655,138 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn version_thirty_two_names_its_mail_by_reference_and_numbers_each_mailbox() {
+        use hxd_core::moderation::{ModerationStore, ReportTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let fp = [0x2bu8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // Interleaved by id, the identified mailbox under two logins
+            // (a rename), and a receipt, which is not mail.
+            for (kind, to, to_fp, body) in [
+                (0, "dave", None, "d1"),
+                (0, "alice", Some(fp_hex(&fp)), "a1"),
+                (0, "dave", None, "d2"),
+                (1, "dave", None, "a receipt"),
+                (0, "alicia", Some(fp_hex(&fp)), "a2"),
+                (0, "dave", None, "d3"),
+                // Reported, and then claimed and rotated (below).
+                (0, "erin", Some(fp_hex(&[0xe1; 32])), "e1"),
+                (0, "fred", Some(fp_hex(&[0xf2; 32])), "f1"),
+            ] {
+                conn.execute(
+                    "INSERT INTO message (kind, recipient, recipient_fp, sender_nick, body, sent_at)
+                     VALUES (?1, ?2, ?3, 'bob', ?4, 1)",
+                    params![kind, to, to_fp, body],
+                )
+                .unwrap();
+            }
+            // Dave reports his first message; a row id that is alice's;
+            // and one whose row is gone. Erin reported hers before she
+            // linked an identity, and fred his under the key he has
+            // since rotated from: the message's key moved, the report's
+            // did not.
+            for (reporter, reporter_fp, target) in [
+                ("dave", None, 1),
+                ("dave", None, 2),
+                ("dave", None, 99),
+                ("erin", None, 7),
+                ("fred", Some(fp_hex(&[0xf1; 32])), 8),
+            ] {
+                conn.execute(
+                    "INSERT INTO report (kind, reporter, reporter_fp, target_msg, reason, at)
+                     VALUES (3, ?1, ?2, ?3, 'r', 5)",
+                    params![reporter, reporter_fp, target],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 32).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let reported: Vec<ReportTarget> = (1..=5)
+            .map(|id| ModerationStore::report(&store, id).unwrap().unwrap().target)
+            .collect();
+        let d1 = store.list(&Mailbox::login("dave"), Some(2), 1).unwrap()[0].reference;
+        let only = |of: Mailbox| store.list(&of, None, 1).unwrap()[0].reference;
+        let e1 = only(Mailbox::identified("erin", [0xe1; 32]));
+        let f1 = only(Mailbox::identified("fred", [0xf2; 32]));
+        assert_eq!(
+            reported,
+            [
+                ReportTarget::Msg(Some(d1)),
+                ReportTarget::Msg(None),
+                ReportTarget::Msg(None),
+                ReportTarget::Msg(Some(e1)),
+                ReportTarget::Msg(Some(f1)),
+            ],
+            "a report takes its own message's reference, and no other's"
+        );
+        let listed = |of: &Mailbox| -> Vec<(Cursor, String)> {
+            store
+                .list(of, None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| (m.cursor, m.body))
+                .collect()
+        };
+        let (dave, alice) = (Mailbox::login("dave"), Mailbox::identified("alice", fp));
+        let named = |v: &[(Cursor, &str)]| -> Vec<(Cursor, String)> {
+            v.iter().map(|(c, b)| (*c, b.to_string())).collect()
+        };
+        assert_eq!(
+            listed(&dave),
+            named(&[(3, "d3"), (2, "d2"), (1, "d1")]),
+            "dave's, numbered in the order they came"
+        );
+        assert_eq!(
+            listed(&alice),
+            named(&[(2, "a2"), (1, "a1")]),
+            "alice's, one mailbox under both logins"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let (refs, distinct, receipts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT ref), SUM(kind = 1 AND seq IS NULL)
+                   FROM message WHERE length(ref) = 16",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((refs, distinct), (8, 8), "every row a reference of its own");
+        assert_eq!(receipts, 1, "and the receipt no place");
+        let next = NewMessage {
+            recipient: dave.clone(),
+            sender: None,
+            sender_nick: "bob".into(),
+            body: "d4".into(),
+            sent_at: UNIX_EPOCH + Duration::from_secs(2),
+            guid: None,
+            kind: MessageKind::Message,
+            media: None,
+            signed: None,
+            friendship: None,
+            sender_address: None,
+        };
+        assert!(
+            matches!(
+                store.push(&next, 100).unwrap(),
+                Pushed::Stored { cursor: 4, .. }
+            ),
+            "the mailbox counts on from what it had"
+        );
     }
 
     #[test]
@@ -4650,7 +4952,7 @@ mod tests {
             friendship: None,
             sender_address: None,
         };
-        assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored(_)));
+        assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored { .. }));
         m.body = "twice".into();
         assert!(
             matches!(b.push(&m, 100).unwrap(), Pushed::Existing(_)),

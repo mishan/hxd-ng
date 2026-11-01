@@ -1211,6 +1211,8 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NotFriends | ChatError::RequestFull | ChatError::RosterFull => {
             "That user is not accepting messages from you."
         }
+        // This wire names no stored message.
+        ChatError::UnknownCursor => "No such message.",
         ChatError::ServerError => "Server error.",
     }
 }

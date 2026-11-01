@@ -23,8 +23,8 @@ use tracing::warn;
 use super::{is_messenger, store_failed, Key, Me, MessagingError, Presence};
 use crate::chat::{sessions_of, SignedMsg};
 use crate::inbox::{
-    Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage, Pending,
-    Pushed, StoredMessage,
+    Cursor, Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef, MessageStore,
+    NewMessage, Pending, Pushed, StoredMessage,
 };
 use crate::relationships::{RelationId, Requester, SentOn};
 use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
@@ -38,9 +38,11 @@ pub struct Im {
     pub from_fingerprint: Option<[u8; 32]>,
     pub from_nick: String,
     pub text: String,
-    /// The inbox row, which a client marks read by; `None` for one
-    /// handed over live past the sender's quota, with no row.
-    pub id: Option<MessageId>,
+    /// Its place in the recipient's mailbox, which a client marks read
+    /// by, and its reference; `None` for one handed over live past the
+    /// sender's quota, with no row.
+    pub cursor: Option<Cursor>,
+    pub reference: Option<MessageRef>,
     pub guid: MessageGuid,
     pub sent_at: SystemTime,
     /// It waited rather than arriving in the moment.
@@ -57,7 +59,7 @@ pub struct Im {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImSent {
     /// `None` where nothing was stored.
-    pub id: Option<MessageId>,
+    pub reference: Option<MessageRef>,
     pub guid: MessageGuid,
     pub delivered: bool,
 }
@@ -80,7 +82,8 @@ fn im_of(m: StoredMessage, queued: bool, approval: bool) -> Option<Event> {
         from_fingerprint: sender.fingerprint,
         from_nick: m.sender_nick,
         text: m.body,
-        id: Some(m.id),
+        cursor: Some(m.cursor),
+        reference: Some(m.reference),
         guid: m.guid?,
         sent_at: m.sent_at,
         queued,
@@ -289,7 +292,8 @@ impl Core {
                 from_nick: nick.clone(),
                 from_login: Some(me.mailbox.login.clone()),
                 text: text.clone(),
-                id: None,
+                cursor: None,
+                reference: None,
                 sent_at: now,
                 queued: false,
                 media: None,
@@ -300,7 +304,8 @@ impl Core {
                 from_fingerprint: me.mailbox.fingerprint,
                 from_nick: nick,
                 text,
-                id: None,
+                cursor: None,
+                reference: None,
                 guid: guid.clone(),
                 sent_at: now,
                 queued: false,
@@ -314,7 +319,7 @@ impl Core {
                 r.send_to(u, mail.clone());
             }
             return Ok(ImSent {
-                id: None,
+                reference: None,
                 guid,
                 delivered: true,
             });
@@ -337,8 +342,12 @@ impl Core {
                 self.inbox_policy.max_queued,
             )
             .map_err(store_failed)?;
-        let (id, fresh) = match pushed {
-            Pushed::Stored(id) => (id, true),
+        let (id, reference, cursor, fresh) = match pushed {
+            Pushed::Stored {
+                id,
+                reference,
+                cursor,
+            } => (id, reference, cursor, true),
             // A signed message whose id was used for other words.
             Pushed::Existing(m)
                 if content.is_some() && m.signed.as_ref().map(|was| was.content) != content =>
@@ -349,12 +358,12 @@ impl Core {
             // approval's as queued whatever became of it.
             Pushed::Existing(m) if m.delivered_at.is_some() => {
                 return Ok(ImSent {
-                    id: Some(m.id),
+                    reference: Some(m.reference),
                     guid,
                     delivered: !approval,
                 })
             }
-            Pushed::Existing(m) => (m.id, false),
+            Pushed::Existing(m) => (m.id, m.reference, m.cursor, false),
             Pushed::Full => return Err(MessagingError::QueueFull),
         };
         let delivered = self
@@ -362,10 +371,10 @@ impl Core {
             .contains(&id)
             && !approval;
         if fresh {
-            self.im_notify(them, &me.mailbox, &nick, &text, id);
+            self.im_notify(them, &me.mailbox, &nick, &text, cursor);
         }
         Ok(ImSent {
-            id: Some(id),
+            reference: Some(reference),
             guid,
             delivered,
         })
@@ -671,7 +680,7 @@ impl Core {
     /// with no attentive session hears of it, unless it is busy, which
     /// is what do-not-disturb means. Invisible still pushes: it hides the
     /// user from others, not from their own devices.
-    fn im_notify(&self, to: &Mailbox, from: &Mailbox, nick: &str, text: &str, id: MessageId) {
+    fn im_notify(&self, to: &Mailbox, from: &Mailbox, nick: &str, text: &str, id: Cursor) {
         let Some(gateway) = self.gateway.as_ref() else {
             return;
         };

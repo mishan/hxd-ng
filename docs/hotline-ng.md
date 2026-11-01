@@ -447,19 +447,22 @@ belong to the `inbox` capability (§4).
   for the retry receives it, and the retry is answered `queued: false`
   where the first send was answered `true`. That is delivery, not an
   error.
-- **The reply** is `{ "queued": bool, "id"? }`: `queued` is `true` when
+- **The reply** is `{ "queued": bool, "ref"? }`: `queued` is `true` when
   the message waited in the recipient's inbox rather than going straight
-  to a live session. A queued message's reply carries `id`, the stored
-  message's id as the recipient's `msg` event will carry it, when the
-  sender's own account has an inbox (rationale §5); a sender without one,
-  such as an identity admitted as a guest, is answered `queued` alone, as
-  is a message delivered at once.
+  to a live session. `ref` is present whenever the message was stored,
+  queued or not: the stored message's reference, an opaque string, as
+  the recipient's `msg` event and `inbox` row carry it (rationale §5).
+  It is the one name sender and recipient share for the message.
 - **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
-  `at`, `queued` and, when the message was stored, `id`. `from.uid` is 0
-  when a queued message's sender no longer has a session. `from.login` is
-  absent when there is nobody to reply to — a guest, or an account since
-  deleted. `id` is absent when nothing durable was stored. `at` is when
-  the message was sent, not when it arrived.
+  `at`, `queued` and, when the message was stored, `id` and `ref`.
+  `from.uid` is 0 when a queued message's sender no longer has a
+  session. `from.login` is absent when there is nobody to reply to — a
+  guest, or an account since deleted. `id` is the message's place in
+  the recipient's own mailbox, a cursor that ascends with each message
+  that mailbox is sent and that `inbox` and `msg_read` take; it is shown
+  only to the mailbox's owner, and counts nothing of anyone else's mail.
+  Both are absent when nothing durable was stored. `at` is when the
+  message was sent, not when it arrived.
 - **The login reply's `inbox`** block, `{ unread, total }`, is present
   whenever the server has an inbox, so a client can show a badge before
   any mail arrives.
@@ -653,12 +656,12 @@ family document. Each family of §4 adds its own.
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "id"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
-| `inbox` | `before?` (message id), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `no_inbox`, `server_error` |
-| `msg_read` | `up_to` (message id) | `{ "unread", "total" }` | `no_inbox`, `server_error` |
+| `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
+| `msg_read` | `up_to` (message cursor) | `{ "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `block` | exactly one of `uid` / `login`; `withdraw?` with `login` (§7.5) | `{}` | `no_such_user`, `no_inbox`, `server_error` |
 | `unblock` | exactly one of `uid` / `login` / `fingerprint` | `{}` | `no_such_user`, `no_inbox`, `server_error` |
 | `blocks` | — | `{ "blocked": [ { "login", "fingerprint"? } ] }` | `no_inbox`, `server_error` |
@@ -741,10 +744,15 @@ family document. Each family of §4 adds its own.
   `history` block, `{ max_lines, max_days }`, is the server's retention
   (chat-history.md §7). A server MAY rate-limit this request.
 - **`inbox`** lists this account's stored messages, newest first, paging
-  backward from `before`. Each is `{ id, from: { nick, login? }, text, at,
-  read, media?, signed? }`; there is no uid, which may have been reused since.
-- **`msg_read`** marks every message of this account's with an id at or
+  backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
+  at, read, media?, signed? }`, `id` and `ref` as on the `msg` event
+  (§7.1); there is no uid, which may have been reused since.
+- **`msg_read`** marks every message of this account's with an `id` at or
   below `up_to` read, and returns the counts after it.
+- **A cursor this account's mailbox never issued** — past the last `id`
+  it has been sent, such as an id from a server before cursors — is
+  `bad_request` as `inbox`'s `before`, `msg_read`'s `up_to` and
+  `report`'s `msg` (moderation.md §5), and nothing is read or marked.
 - **`block`** refuses mail from an account, or from the identity of a
   session on the roster; **`unblock`** accepts it again. `fingerprint`
   names an existing block by the 52-character fingerprint `blocks`
@@ -777,7 +785,7 @@ blind (identity-registrar.md §7.3).
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "media"?, "signed"?, "sealed"?, "sealed_lost"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
+| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
@@ -972,8 +980,9 @@ before.
   `typing: false` when they stop, send or leave the conversation.
 - **`requests`** lists the message requests waiting for this account,
   by sender, oldest first, and its approvals: `requests` is `[{ login,
-  fingerprint?, messages: [{ id, text, at, guid, signed? }] }]`, with
-  `id` the inbox id a `report` names it by (moderation.md §4.2) and
+  fingerprint?, messages: [{ id, ref, text, at, guid, signed? }] }]`, with
+  `id` the inbox cursor a `report` names it by (moderation.md §4.2), `ref`
+  its reference, and
   `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
   `dropped` is how many requests were dropped since the last listing,
   and `takes_requests` whether this account takes them now. The plain
@@ -1018,7 +1027,7 @@ before.
 | `friend` | `{ "friend": {…} }` | A row changed, whole, as it now stands, or went (`removed`): to every session of the account that speaks the family, the one whose request changed it included, so all of them agree. A client replaces its copy. |
 | `friend_request` | `{ "login", "fingerprint"?, "note"? }` | Someone asked this account for friendship (804). |
 | `presence` | `{ "login", "fingerprint"?, "state", "status_text"? }` | A friend's presence changed (809): `state` as on the `friend` object. *hxd-ng* tells a burst of changes once, with its final state. |
-| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "signed"?, "approval"? }` | An instant message (811). `id` is the inbox row, absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
+| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "ref"?, "signed"?, "approval"? }` | An instant message (811). `id` and `ref` are its inbox row's, as on `msg` (§7.1), absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
 | `receipt` | `{ "login", "fingerprint"?, "guid", "read" }` | A friend received (`read` false) or read a message this account sent it under `guid`. Under an approval only reads are told. |
 | `typing` | `{ "login", "fingerprint"?, "typing" }` | A friend started or stopped typing to this account. |
 | `requests_changed` | `{ "count" }` | The number of senders whose requests wait changed: to sessions that understand requests alone. |

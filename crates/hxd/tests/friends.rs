@@ -339,14 +339,14 @@ async fn an_instant_message_sent_while_away_arrives_at_the_roster_read() {
     )
     .await;
     assert_eq!(sent["queued"], true);
-    assert!(sent["id"].is_u64());
+    assert!(sent["ref"].is_string());
 
     let (mut bob, _) = messenger(&s, "bob").await;
     let rows = ok(&mut bob, "friends", json!({})).await;
     assert_eq!(rows["friends"][0]["login"], "alice");
     let im = event(&mut bob, "im", |d| d["text"] == "while you were out").await;
     assert_eq!(im["queued"], true);
-    assert_eq!(im["id"], sent["id"]);
+    assert_eq!(im["ref"], sent["ref"]);
     // Handed over as an instant message alone, never as mail too.
     assert!(!bob.rx.take_backlog().iter().any(|e| e.ev == "msg"));
 }

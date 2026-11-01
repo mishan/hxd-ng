@@ -205,8 +205,11 @@ pub(crate) fn im_json(m: &Im) -> Value {
         "guid": m.guid.as_str(),
         "queued": m.queued,
     });
-    if let Some(id) = m.id {
-        v["id"] = json!(id);
+    if let Some(cursor) = m.cursor {
+        v["id"] = json!(cursor);
+    }
+    if let Some(r) = &m.reference {
+        v["ref"] = json!(b64url(r));
     }
     if let Some(signed) = &m.signed {
         v["signed"] = json!(b64url(signed));
@@ -280,7 +283,8 @@ fn listing_json(l: &RequestsListing) -> Value {
                 .iter()
                 .map(|m| {
                     let mut msg = json!({
-                        "id": m.id,
+                        "id": m.cursor,
+                        "ref": b64url(&m.reference),
                         "text": m.body,
                         "at": unix(m.sent_at),
                     });

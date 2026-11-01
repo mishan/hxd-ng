@@ -221,7 +221,8 @@ it:
 ```
 
 `from` is the sender's login, and absent for a sender with no mailbox
-(a guest); `from_nick` is the nick they sent under. A news notice names
+(a guest); `from_nick` is the nick they sent under; `id` is the
+message's cursor in the recipient's mailbox, as its `inbox` row has it. A news notice names
 its scope the way the `news_notify` event does (news.md §10.6), `scope`
 and `target` as two fields, so a client parses one shape whichever way
 the notice reached it.

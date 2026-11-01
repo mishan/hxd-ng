@@ -30,8 +30,8 @@ use tracing::{debug, info, warn};
 
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
-    blocked_json, event_json, history_line_json, parse_streams, participants_json, reply_err,
-    reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
+    b64url, blocked_json, event_json, history_line_json, parse_streams, participants_json,
+    reply_err, reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
     stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
     ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
     ReqEnvelope, ResumeParams, Signs, SignsParams, VideoStartParams, VideoStateParams,
@@ -2073,13 +2073,15 @@ async fn dispatch(
                 // One mapping for both ways of addressing, so a code
                 // cannot be added to one and forgotten on the other.
                 match outcome {
-                    Ok(MsgOutcome::Delivered) => reply_ok(req.id, json!({ "queued": false })),
-                    // Only to a sender with an inbox, which could read the
-                    // same counter by mailing itself (rationale §5).
-                    Ok(MsgOutcome::Queued(id)) if ctx.core.has_inbox(from) => {
-                        reply_ok(req.id, json!({ "queued": true, "id": id }))
+                    // The reference, never the recipient's cursor, which
+                    // is theirs alone (`docs/private-messages.md` §5).
+                    Ok(MsgOutcome::Delivered(None)) => reply_ok(req.id, json!({ "queued": false })),
+                    Ok(MsgOutcome::Delivered(Some(r))) => {
+                        reply_ok(req.id, json!({ "queued": false, "ref": b64url(&r) }))
                     }
-                    Ok(MsgOutcome::Queued(_)) => reply_ok(req.id, json!({ "queued": true })),
+                    Ok(MsgOutcome::Queued(r)) => {
+                        reply_ok(req.id, json!({ "queued": true, "ref": b64url(&r) }))
+                    }
                     // The one answer a request has (`docs/instant-messaging.md`
                     // §4.2).
                     Ok(MsgOutcome::Requested) => {
@@ -2192,6 +2194,9 @@ async fn dispatch(
                     ),
                     Err(ChatError::ServerError) => {
                         reply_err(req.id, "server_error", "Server error.")
+                    }
+                    Err(ChatError::UnknownCursor) => {
+                        reply_err(req.id, "bad_request", "No message of yours has that id.")
                     }
                     Err(_) => reply_err(req.id, "no_inbox", "This account has no inbox."),
                 }
@@ -2330,6 +2335,9 @@ async fn dispatch(
                         req.id,
                         json!({ "unread": counts.unread, "total": counts.total }),
                     ),
+                    Some(Err(ChatError::UnknownCursor)) => {
+                        reply_err(req.id, "bad_request", "No message of yours has that id.")
+                    }
                     Some(Err(_)) => reply_err(req.id, "no_inbox", "This account has no inbox."),
                 }
             }

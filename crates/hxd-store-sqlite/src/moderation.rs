@@ -107,7 +107,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
 const REPORT_COLUMNS: &str = "id, kind, reporter, reporter_fp, target_line, target_media, \
                               target_msg, target_article, target_login, target_fp, \
                               target_nick, reason, evidence, verified, at, closed_at, \
-                              closed_by, outcome, note, duplicate_of, signed";
+                              closed_by, outcome, note, duplicate_of, signed, target_ref";
 
 fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -116,7 +116,6 @@ fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
     let reporter_fp: Option<String> = r.get(3)?;
     let line: Option<i64> = r.get(4)?;
     let media: Option<Vec<u8>> = r.get(5)?;
-    let msg: Option<i64> = r.get(6)?;
     let article: Option<i64> = r.get(7)?;
     let login: Option<String> = r.get(8)?;
     let target_fp: Option<String> = r.get(9)?;
@@ -131,13 +130,22 @@ fn report_of(r: &Row<'_>) -> rusqlite::Result<Result<Report, StoreError>> {
     let note: Option<String> = r.get(18)?;
     let duplicate_of: Option<i64> = r.get(19)?;
     let signed: Option<Vec<u8>> = r.get(20)?;
+    let msg: Option<Vec<u8>> = r.get(21)?;
     Ok((|| {
         let missing = || StoreError::new(format!("stored report {id} names no target"));
         let media = handle(media)?;
         let target = match kind {
             1 => ReportTarget::Line(id_of(line.ok_or_else(missing)?, "line id")?),
             2 => ReportTarget::Media(media.ok_or_else(missing)?),
-            3 => ReportTarget::Msg(id_of(msg.ok_or_else(missing)?, "message id")?),
+            // No reference: a report from before them, on a message
+            // that was gone by then.
+            3 => ReportTarget::Msg(
+                msg.map(|r| {
+                    <[u8; 16]>::try_from(r.as_slice())
+                        .map_err(|_| StoreError::new("a stored reference is not 16 bytes"))
+                })
+                .transpose()?,
+            ),
             4 => ReportTarget::User,
             5 => {
                 let n = article.ok_or_else(missing)?;
@@ -204,7 +212,11 @@ fn target_where(t: &ReportTarget) -> (i64, &'static str, rusqlite::types::Value)
     match t {
         ReportTarget::Line(id) => (t.kind_i64(), "target_line", Value::Integer(clamp(*id))),
         ReportTarget::Media(h) => (t.kind_i64(), "target_media", Value::Blob(h.to_vec())),
-        ReportTarget::Msg(id) => (t.kind_i64(), "target_msg", Value::Integer(clamp(*id))),
+        ReportTarget::Msg(r) => (
+            t.kind_i64(),
+            "target_ref",
+            r.map_or(Value::Null, |r| Value::Blob(r.to_vec())),
+        ),
         ReportTarget::Article(id) => (
             t.kind_i64(),
             "target_article",
@@ -270,14 +282,14 @@ impl ModerationStore for SqliteStore {
                 None,
             ),
             ReportTarget::Media(h) => (None, Some(h.to_vec()), None, None),
-            ReportTarget::Msg(id) => (None, None, Some(clamp(id)), None),
+            ReportTarget::Msg(r) => (None, None, r.map(|r| r.to_vec()), None),
             ReportTarget::Article(id) => (None, None, None, Some(i64::from(id))),
             ReportTarget::User => (None, None, None, None),
         };
         let closed = report.closed.as_ref();
         sql(conn.execute(
             "INSERT INTO report
-               (kind, reporter, reporter_fp, target_line, target_media, target_msg,
+               (kind, reporter, reporter_fp, target_line, target_media, target_ref,
                 target_article, target_login, target_fp, target_nick, reason, evidence,
                 verified, at, closed_at, closed_by, outcome, note, duplicate_of, signed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
@@ -364,7 +376,7 @@ impl ModerationStore for SqliteStore {
         // the column narrow what it hands back.
         let mut stmt = sql(conn.prepare_cached(&format!(
             "SELECT {REPORT_COLUMNS} FROM report
-              WHERE closed_at IS NULL AND kind = ?1 AND {column} = ?2 ORDER BY id ASC"
+              WHERE closed_at IS NULL AND kind = ?1 AND {column} IS ?2 ORDER BY id ASC"
         )))?;
         let rows = sql(stmt.query_map(params![kind, value], report_of))?;
         collect(rows)

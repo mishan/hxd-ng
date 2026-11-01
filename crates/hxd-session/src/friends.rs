@@ -528,7 +528,7 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
         Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid)) {
             Ok(outcome) => {
                 let reason = match outcome {
-                    MsgOutcome::Delivered => ReasonCode::Ok,
+                    MsgOutcome::Delivered(_) => ReasonCode::Ok,
                     MsgOutcome::Queued(_) => ReasonCode::OfflineQueued,
                     MsgOutcome::Requested => ReasonCode::Requested,
                 };
@@ -1199,6 +1199,8 @@ mod tests {
     fn msg(n: u8) -> StoredMessage {
         StoredMessage {
             id: n.into(),
+            reference: [n; 16],
+            cursor: n.into(),
             recipient: sender(99),
             sender: Some(sender(n.into())),
             sender_nick: String::new(),

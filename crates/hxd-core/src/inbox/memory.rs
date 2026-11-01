@@ -16,14 +16,17 @@ use std::time::{Duration, SystemTime};
 use crate::relationships::{MemoryRelationships, RelationId, SentOn};
 
 use super::{
-    Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageStore, NewMessage,
-    Pending, Pushed, Sent, StoreError, StoredMessage,
+    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
 };
 
 #[derive(Default)]
 struct Inner {
     next_id: MessageId,
     msgs: Vec<StoredMessage>,
+    /// Each mailbox's last cursor, by [`index_key`]: kept apart from the
+    /// rows so pruning the newest never hands its cursor out again.
+    cursors: HashMap<String, Cursor>,
     /// Instant messages handed over and not yet acknowledged.
     handed: HashSet<MessageId>,
     /// Messages whose read receipt was told.
@@ -168,6 +171,38 @@ fn merged_key(
     )
 }
 
+/// The cursors of a merge of the mailbox keyed `from` into the one keyed
+/// `into`. Into one that never issued a cursor — a first link, a fresh
+/// key — the moved mail keeps its cursors and `from`'s count carries
+/// over, so no client's go stale. Into one that did, the moved mail is
+/// numbered after the last cursor of either, in the order it had, so no
+/// cursor its owner saw in either is handed out again. Runs before the
+/// rows are re-stamped, while `moves` still knows them.
+fn renumber(inner: &mut Inner, moves: impl Fn(&Mailbox) -> bool, from: &str, into: &str) {
+    let last = |k: &str| inner.cursors.get(k).copied().unwrap_or(0);
+    let (from_last, into_last) = (last(from), last(into));
+    if into_last == 0 {
+        if from_last > 0 {
+            inner.cursors.insert(into.to_string(), from_last);
+        }
+        return;
+    }
+    let mut moving: Vec<&mut StoredMessage> = inner
+        .msgs
+        .iter_mut()
+        .filter(|m| is_mail(m) && moves(&m.recipient))
+        .collect();
+    moving.sort_by_key(|m| m.cursor);
+    // Raised even when nothing moves: `from` issued its cursors whether
+    // or not its rows are still here.
+    let mut last = from_last.max(into_last);
+    for m in moving {
+        last += 1;
+        m.cursor = last;
+    }
+    inner.cursors.insert(into.to_string(), last);
+}
+
 /// Merge duplicate guids when two mailboxes become one, keeping the row
 /// that is already at the destination.
 ///
@@ -281,10 +316,21 @@ impl MessageStore for MemoryStore {
                 return Ok(Pushed::Full);
             }
         }
+        let mut reference: MessageRef = [0; 16];
+        getrandom::getrandom(&mut reference).map_err(StoreError::new)?;
+        let cursor = if m.kind == MessageKind::Message {
+            let last = inner.cursors.entry(index_key(&m.recipient)).or_default();
+            *last += 1;
+            *last
+        } else {
+            0
+        };
         inner.next_id += 1;
         let id = inner.next_id;
         inner.msgs.push(StoredMessage {
             id,
+            reference,
+            cursor,
             recipient: m.recipient.clone(),
             sender: m.sender.clone(),
             sender_nick: m.sender_nick.clone(),
@@ -307,7 +353,11 @@ impl MessageStore for MemoryStore {
         if let Some(a) = &m.sender_address {
             inner.addresses.insert(id, a.clone());
         }
-        Ok(Pushed::Stored(id))
+        Ok(Pushed::Stored {
+            id,
+            reference,
+            cursor,
+        })
     }
 
     fn find_guid(
@@ -420,18 +470,13 @@ impl MessageStore for MemoryStore {
             .any(|m| m.id == id && is(&m.recipient, to) && self.waiting(&inner, m)))
     }
 
-    fn mark_read(
-        &self,
-        to: &Mailbox,
-        up_to: MessageId,
-        at: SystemTime,
-    ) -> Result<usize, StoreError> {
+    fn mark_read(&self, to: &Mailbox, up_to: Cursor, at: SystemTime) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if is_mail(m)
                 && is(&m.recipient, to)
-                && m.id <= up_to
+                && m.cursor <= up_to
                 && m.read_at.is_none()
                 && self.live(m)
             {
@@ -449,23 +494,26 @@ impl MessageStore for MemoryStore {
     fn list(
         &self,
         to: &Mailbox,
-        before: Option<MessageId>,
+        before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
+        let mut mine: Vec<StoredMessage> = inner
             .msgs
             .iter()
-            .rev()
             .filter(|m| {
                 is_mail(m)
                     && is(&m.recipient, to)
-                    && before.is_none_or(|b| m.id < b)
+                    && before.is_none_or(|b| m.cursor < b)
                     && self.live(m)
             })
-            .take(limit)
             .cloned()
-            .collect())
+            .collect();
+        // Not insertion order: a claim or a rotation numbers what it
+        // moves after what was already there.
+        mine.sort_by_key(|m| std::cmp::Reverse(m.cursor));
+        mine.truncate(limit);
+        Ok(mine)
     }
 
     fn counts(&self, to: &Mailbox) -> Result<InboxCounts, StoreError> {
@@ -482,6 +530,21 @@ impl MessageStore for MemoryStore {
             }
         }
         Ok(counts)
+    }
+
+    fn last_cursor(&self, of: &Mailbox) -> Result<Cursor, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.cursors.get(&index_key(of)).copied().unwrap_or(0))
+    }
+
+    fn unlinked(&self, login: &str, fingerprint: &[u8; 32]) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let identity = index_key(&Mailbox::identified(login, *fingerprint));
+        if let Some(&past) = inner.cursors.get(&identity) {
+            let bare = inner.cursors.entry(login.to_string()).or_default();
+            *bare = (*bare).max(past);
+        }
+        Ok(())
     }
 
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {
@@ -501,6 +564,10 @@ impl MessageStore for MemoryStore {
             },
         );
         inner.forget_removed();
+        renumber(&mut inner, moves, login, &hex);
+        // Its count went with its mail: a later holder of the login
+        // must not count on from it. An unlink raises it again.
+        inner.cursors.remove(login);
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if claim_one(&mut m.recipient, login, fingerprint) {
@@ -532,6 +599,12 @@ impl MessageStore for MemoryStore {
             },
         );
         inner.forget_removed();
+        renumber(
+            &mut inner,
+            moves,
+            &index_key(&Mailbox::identified("", *from)),
+            &hex,
+        );
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if rotate_one(&mut m.recipient, from, to) {
@@ -552,6 +625,7 @@ impl MessageStore for MemoryStore {
         inner
             .msgs
             .retain(|m| !is(&m.recipient, of) && !m.sender.as_ref().is_some_and(|s| is(s, of)));
+        inner.cursors.remove(&index_key(of));
         inner.forget_removed();
         Ok(before - inner.msgs.len())
     }

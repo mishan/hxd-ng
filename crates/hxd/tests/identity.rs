@@ -3325,10 +3325,67 @@ async fn linking_an_identity_takes_the_accounts_mail_with_it() {
     assert_eq!(m["data"]["queued"], true, "it had been waiting");
 }
 
-/// An identity admitted as a guest may leave mail, and has no inbox of
-/// its own: its reply says the message waited and does not name it.
+/// An account that unlinks reads its bare login's mailbox again, which
+/// counts on past every cursor the identity's showed it, so a client
+/// that keeps them never meets one twice (`docs/private-messages.md` §5).
 #[tokio::test]
-async fn an_identity_guest_is_not_told_its_queued_messages_id() {
+async fn an_unlinked_account_is_never_shown_a_cursor_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server_with_inbox(dir.path()).await;
+    let (mut alice, _) = ng_password_login(ng, "alice").await;
+    let p = person(53, "Bob");
+    let auth = try_authenticate(ng, &p, json!({ "login": "bob", "password": "s3cret" })).await;
+    assert_eq!(auth.json()["outcome"], "linked");
+    let token = auth.json()["token"].as_str().unwrap().to_owned();
+    let (mut linked, _) = ng_login(ng, &token, "Bob").await;
+    for text in ["one", "two"] {
+        let ok = alice
+            .request("msg", json!({ "to_login": "bob", "text": text }))
+            .await;
+        assert!(ok.get("ok").is_some(), "{ok}");
+    }
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(linked.event("msg").await["data"]["id"].as_u64().unwrap());
+    }
+
+    let fresh = authenticate(ng, &p).await;
+    let r = http(
+        ng,
+        "POST",
+        "/identity/unlink",
+        &[(
+            "Authorization",
+            &format!("Bearer {}", fresh["token"].as_str().unwrap()),
+        )],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+        .await
+        .unwrap();
+    let mut bare = Ng::from_ws(ws).await;
+    let ok = bare
+        .request("login", json!({ "login": "bob", "password": "s3cret" }))
+        .await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let ok = alice
+        .request("msg", json!({ "to_login": "bob", "text": "after" }))
+        .await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let after = bare.event("msg").await["data"]["id"].as_u64().unwrap();
+    assert!(
+        seen.iter().all(|c| after > *c),
+        "{after} counts on past {seen:?}"
+    );
+}
+
+/// An identity admitted as a guest may leave mail, and has no inbox of
+/// its own: its reply names the message by its reference, as any
+/// sender's does, and never by the recipient's cursor.
+#[tokio::test]
+async fn an_identity_guest_is_told_its_queued_messages_reference_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, _ctx) = start_server_with_inbox(dir.path()).await;
     let p = person(41, "Drifter");
@@ -3338,7 +3395,9 @@ async fn an_identity_guest_is_not_told_its_queued_messages_id() {
     let ok = drifter
         .request("msg", json!({ "to_login": "alice", "text": "hello" }))
         .await;
-    assert_eq!(ok["ok"], json!({ "queued": true }), "{ok}");
+    assert_eq!(ok["ok"]["queued"], true, "{ok}");
+    assert!(ok["ok"]["ref"].is_string(), "{ok}");
+    assert!(ok["ok"].get("id").is_none(), "{ok}");
 }
 
 #[tokio::test]

@@ -457,10 +457,12 @@ pub enum Event {
         /// login several people share, not an address.
         from_login: Option<String>,
         text: String,
-        /// The inbox row this came from, and the handle a client marks
-        /// read. `None` when nothing was stored (the recipient has no
-        /// inbox, or the server has none configured).
-        id: Option<crate::inbox::MessageId>,
+        /// Its place in the recipient's mailbox, which a client pages and
+        /// marks read by, and its reference, which the sender holds too.
+        /// `None` when nothing was stored (the recipient has no inbox, or
+        /// the server has none configured).
+        cursor: Option<crate::inbox::Cursor>,
+        reference: Option<crate::inbox::MessageRef>,
         /// When the sender sent it — not when it arrived.
         sent_at: std::time::SystemTime,
         /// It waited in the inbox rather than arriving in the moment.
