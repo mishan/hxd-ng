@@ -2853,6 +2853,21 @@ fn writing_back_by_uid_approves_the_guest_that_asked() {
 }
 
 #[test]
+fn writing_back_lets_in_no_guest_whose_address_is_held() {
+    use crate::MsgOutcome;
+    let s = server_with(policy(), &[("bob", messaging_bits())]);
+    let (b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+    assert_eq!(send(&s.core, g, "bob", "hi"), Ok(MsgOutcome::Requested));
+    s.core
+        .request_answer(b, "guest", RequestAction::Delete)
+        .unwrap();
+    s.core.msg(b, g, "go away".into(), None, None).unwrap();
+    assert_eq!(send(&s.core, g, "bob", "again"), Ok(MsgOutcome::Requested));
+    assert!(waiting(&s.core, b).is_empty(), "still held");
+}
+
+#[test]
 fn naming_guest_in_any_case_never_writes_an_approval() {
     use crate::MsgOutcome;
     type Act = fn(&Core, Uid, &str);

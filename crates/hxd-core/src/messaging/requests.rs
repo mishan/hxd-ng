@@ -833,7 +833,6 @@ impl Core {
         let Some(inbox) = self.inbox.as_ref() else {
             return;
         };
-        let _writing = self.friend_writes();
         let asking = |r: &crate::roster::RosterInner, me: &Mailbox| {
             r.users.get(&to).is_some_and(|s| {
                 s.login == "guest"
@@ -842,24 +841,35 @@ impl Core {
                     && !s.guest.approved.contains(&Key::of(me))
             })
         };
-        let me = {
+        let replier = || {
             let r = self.roster.lock().unwrap();
-            let Some(me) = r
-                .users
+            r.users
                 .get(&from)
                 .filter(|s| understands_requests(s))
                 .map(|s| s.mailbox())
-            else {
-                return;
-            };
-            if !asking(&r, &me) {
-                return;
-            }
-            me
+                .filter(|me| asking(&r, me))
+        };
+        // Most replies by uid are to nobody that asked, and are spared
+        // the lock.
+        if replier().is_none() {
+            return;
+        }
+        let _writing = self.friend_writes();
+        let Some(me) = replier() else {
+            return;
         };
         let Some(key) = self.address_key(to) else {
             return;
         };
+        // A guest the recipient holds is let in by no reply, as a held
+        // account's request is never waiting to be written back to.
+        let held = self.friends_store().and_then(|rel| {
+            rel.is_held(&me, &Requester::Address(key.clone()), self.clock.wall())
+                .map_err(store_failed)
+        });
+        if held.unwrap_or(true) {
+            return;
+        }
         // Let in once what it sent is mail, so a failure leaves it asking
         // and the next reply tries again.
         let handed = match inbox.requests_to_mail(
