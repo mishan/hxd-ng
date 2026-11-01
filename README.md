@@ -48,7 +48,7 @@ the Hotline-ng wire — today that is [hx-ng](https://github.com/mishan/hx-ng).
 |---|---|---|---|
 | Public chat, user list, private messages | yes | yes | yes |
 | Private chats — invite-only, made on the spot | yes | yes | — |
-| Kick, ban, broadcast, server notices | yes | yes | kick and ban; receives broadcasts |
+| Kick, ban, broadcast, server notices | yes | yes | kick and ban; receives broadcasts and notices |
 | **Chat rooms** — curated and persistent, open to everyone or to a list | by `/join` to the server account, which invites them in | the same | yes, on the wire; hx-ng does not show them yet |
 | **Moderation** — reports, redacting a chat line, revoking an image, purging someone's last hour | reports by `/report` to the server account; moderators get reports as messages | the same | yes |
 | **Private messages that wait for you** while you are away | receives them | receives them | sends, receives, reads later, blocks |
