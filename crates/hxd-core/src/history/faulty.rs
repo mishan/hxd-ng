@@ -198,6 +198,9 @@ impl ChatLog for FaultyLog {
     }
 
     fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
+        if self.fails("panic").is_err() {
+            panic!("the log panicked, as the test asked");
+        }
         self.fails("react_all")?;
         self.runs.lock().unwrap().push(acts.len());
         let out = self.inner.react_all(acts);

@@ -33,6 +33,9 @@ pub const MAX_KEYS_CEILING: usize = 255;
 /// one of them in a statement.
 pub const MAX_LIVE_WINDOW: usize = 500;
 
+/// Lines one op tombstones at most.
+const GONE_CHUNK: usize = 256;
+
 /// Instant-message reactions kept for one party while it has no session
 /// to hear them; past it, the reactor holding the most gives up its
 /// oldest.
@@ -507,11 +510,51 @@ pub(crate) struct Live {
 /// deletion or its new key.
 struct Drain {
     to: Key,
+    /// The session it is for, by its serial, since a uid is reused.
+    uid: Uid,
+    serial: u64,
+    /// What it took, by its reactors as they are now named.
     taken: Vec<(Key, Reply, ReactionKey)>,
-    told: Vec<(Key, Reply, ReactionKey, Instant)>,
+    /// What happened to it since, in order, replayed in that order.
+    events: Vec<DrainEvent>,
     gone: bool,
-    purged: Vec<Key>,
-    renamed: Vec<(Key, Mailbox)>,
+}
+
+/// What a drain under way gives way to.
+enum DrainEvent {
+    /// A change of one of the keys it took was told live then.
+    Told(Key, Reply, ReactionKey, Instant),
+    /// A reactor of what it took was deleted.
+    Purged(Key),
+    /// A reactor of what it took is now named so.
+    Renamed(Key, Mailbox),
+}
+
+impl Drain {
+    /// What of `w` is left once every event since it was taken has been
+    /// played over it in order.
+    fn replay(&self, mut w: Waiting) -> Option<Waiting> {
+        for ev in &self.events {
+            match ev {
+                DrainEvent::Renamed(old, to) => rename(&mut w, old, to),
+                DrainEvent::Purged(k) => {
+                    if Key::of(&w.from) == *k {
+                        return None;
+                    }
+                }
+                DrainEvent::Told(r, t, k, at) => {
+                    if identity_of(&w) == Some((r.clone(), t, k)) && *at >= w.at {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(w)
+    }
+
+    fn took_from(&self, reactor: &Key) -> bool {
+        self.taken.iter().any(|(r, _, _)| r == reactor)
+    }
 }
 
 /// Which reactor, message and key a waiting change is of: the latest of
@@ -588,6 +631,13 @@ impl Live {
         }
     }
 
+    /// `line` owes nothing.
+    fn unowe(&mut self, line: LineId) {
+        if let Some(owed) = (self.room_of.get(&line)).and_then(|room| self.owed.get_mut(room)) {
+            owed.lines.remove(&line);
+        }
+    }
+
     /// `room`'s batch went at `at`: the next is due a whole batch after.
     fn sent(&mut self, room: u32, at: Instant) {
         self.sent.insert(room, at);
@@ -625,7 +675,7 @@ impl Live {
 
     /// What waits for `to`, taken to hand over, and the drain that took
     /// it, which what happens meanwhile is noted against.
-    fn take(&mut self, to: &Key) -> Option<(u64, VecDeque<Waiting>)> {
+    fn take(&mut self, to: &Key, uid: Uid, serial: u64) -> Option<(u64, VecDeque<Waiting>)> {
         let queue = self.waiting.remove(to)?;
         self.waiting_len -= queue.len();
         self.next_drain += 1;
@@ -634,11 +684,11 @@ impl Live {
             .collect();
         let drain = Drain {
             to: to.clone(),
+            uid,
+            serial,
             taken,
-            told: Vec::new(),
+            events: Vec::new(),
             gone: false,
-            purged: Vec::new(),
-            renamed: Vec::new(),
         };
         self.drains.insert(self.next_drain, drain);
         Some((self.next_drain, queue))
@@ -661,8 +711,8 @@ impl Live {
         for d in self.drains.values_mut().filter(|d| d.to == *to) {
             let took = (d.taken.iter()).any(|(r, t, k)| *r == reactor && t == target && k == key);
             if took {
-                d.told
-                    .push((reactor.clone(), target.clone(), key.clone(), w.at));
+                let ev = DrainEvent::Told(reactor.clone(), target.clone(), key.clone(), w.at);
+                d.events.push(ev);
             }
         }
     }
@@ -680,7 +730,12 @@ impl Live {
             if d.to == old {
                 d.to = new.clone();
             }
-            d.renamed.push((old.clone(), to.clone()));
+            if d.took_from(&old) {
+                d.events.push(DrainEvent::Renamed(old.clone(), to.clone()));
+                for (r, _, _) in d.taken.iter_mut().filter(|(r, _, _)| *r == old) {
+                    *r = new.clone();
+                }
+            }
         }
         let touched: Vec<Key> = (self.waiting.iter())
             .filter(|(k, q)| **k == old || q.iter().any(|w| Key::of(&w.from) == old))
@@ -708,7 +763,9 @@ impl Live {
             if d.to == key {
                 d.gone = true;
             }
-            d.purged.push(key.clone());
+            if d.took_from(&key) {
+                d.events.push(DrainEvent::Purged(key.clone()));
+            }
         }
         self.waiting.remove(&key);
         self.waiting.retain(|_, queue| {
@@ -1058,32 +1115,45 @@ impl Core {
         by: String,
         at: SystemTime,
     ) -> Result<Vec<LineId>, StoreError> {
-        self.desk(move |c, live| {
-            let log = c
-                .history
-                .as_ref()
-                .ok_or_else(|| StoreError::new("no chat log"))?;
-            let live_ids: Vec<LineId> =
-                ids.iter().copied().filter(|id| live.is_live(*id)).collect();
-            let reacted = match (c.reactions, live_ids.is_empty()) {
-                (Some(_), false) => log.reactions(&live_ids, None).unwrap_or_else(|e| {
-                    tracing::warn!("chat log would not read reactions: {e}");
-                    HashMap::new()
-                }),
-                _ => HashMap::new(),
-            };
-            let mut gone = Vec::with_capacity(ids.len());
-            for id in ids {
-                if log.tombstone(id, &by, at)? {
-                    gone.push(id);
-                }
+        let mut gone = Vec::with_capacity(ids.len());
+        // An op a chunk, so a purge of a flood keeps the desk, which
+        // other rooms' serials may be waiting on, for a moment at a time.
+        for chunk in ids.chunks(GONE_CHUNK) {
+            let chunk = chunk.to_vec();
+            let by = by.clone();
+            gone.extend(self.desk(move |c, live| c.chunk_gone(live, chunk, &by, at))?);
+        }
+        Ok(gone)
+    }
+
+    fn chunk_gone(
+        &self,
+        live: &mut Live,
+        ids: Vec<LineId>,
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let log = (self.history.as_ref()).ok_or_else(|| StoreError::new("no chat log"))?;
+        let live_ids: Vec<LineId> = ids.iter().copied().filter(|id| live.is_live(*id)).collect();
+        let reacted = match (self.reactions, live_ids.is_empty()) {
+            (Some(_), false) => log.reactions(&live_ids, None).unwrap_or_else(|e| {
+                tracing::warn!("chat log would not read reactions: {e}");
+                HashMap::new()
+            }),
+            _ => HashMap::new(),
+        };
+        let gone = log.tombstone_all(&ids, by, at)?;
+        let now = self.clock.now();
+        for id in &gone {
+            // A tombstone is told as cleared if it had reactions, and is
+            // owed nothing else: a summary of none after the redaction
+            // would be the line told of after it went.
+            match reacted.contains_key(id) {
+                true => live.owe(*id, Owe::Gone, now),
+                false => live.unowe(*id),
             }
-            let now = c.clock.now();
-            for id in reacted.keys() {
-                live.owe(*id, Owe::Gone, now);
-            }
-            Ok(gone)
-        })
+        }
+        Ok(gone)
     }
 
     /// A moderator's clear: every reaction on line `line` of `room` taken,
@@ -1323,19 +1393,24 @@ impl Core {
         let keep = self.reactions.map_or(Duration::ZERO, |p| p.im_keep);
         let key = Key::of(me);
         let taken = self.desk(move |c, live| {
-            let understands = {
+            let (understands, serial) = {
                 let r = c.roster.lock().unwrap();
                 let s = r.users.get(&uid)?;
                 if !im_hears(s, false) {
                     return None;
                 }
-                im_hears(s, true)
+                (im_hears(s, true), s.serial)
             };
-            let (drain, queue) = live.take(&key)?;
+            let (drain, queue) = live.take(&key, uid, serial)?;
             Some((drain, understands, queue))
         });
         let Some((drain, understands, queue)) = taken else {
             return;
+        };
+        // A relationship check that panics still ends the drain.
+        let mut ended = DrainEnd {
+            core: self,
+            drain: Some(drain),
         };
         let now = self.clock.now();
         let mut conversations: Vec<(Mailbox, Vec<Waiting>)> = Vec::new();
@@ -1348,12 +1423,13 @@ impl Core {
         let judged: Vec<_> = (conversations.into_iter())
             .map(|(from, kept)| (relation(&from), kept))
             .collect();
-        self.desk(move |c, live| c.hand_over(live, uid, drain, understands, judged));
+        ended.drain = None;
+        self.desk(move |c, live| c.hand_over(live, drain, understands, judged));
     }
 
     /// At the desk, the second half of a drain: what it took, as what
     /// happened since leaves it, handed over or kept again.
-    fn hand_over(&self, live: &mut Live, uid: Uid, drain: u64, understands: bool, judged: Judged) {
+    fn hand_over(&self, live: &mut Live, drain: u64, understands: bool, judged: Judged) {
         let Some(d) = live.drains.remove(&drain) else {
             return;
         };
@@ -1363,24 +1439,19 @@ impl Core {
         let now = self.clock.now();
         let mut back = Vec::new();
         let mut r = self.roster.lock().unwrap();
+        // The session it was taken for, still there and still hearing;
+        // otherwise all of it waits again.
+        let there =
+            (r.users.get(&d.uid)).is_some_and(|s| s.serial == d.serial && im_hears(s, false));
+        let uid = d.uid;
         for (relation, kept) in judged {
-            let kept: Vec<Waiting> = (kept.into_iter())
-                .filter(|w| !d.purged.contains(&Key::of(&w.from)))
-                .map(|mut w| {
-                    for (old, to) in &d.renamed {
-                        rename(&mut w, old, to);
-                    }
-                    w
-                })
-                .filter(|w| {
-                    let Some((reactor, target, key)) = identity_of(w) else {
-                        return true;
-                    };
-                    !(d.told.iter()).any(|(r, t, k, at)| {
-                        *r == reactor && t == target && k == key && *at >= w.at
-                    })
-                })
-                .collect();
+            let kept: Vec<Waiting> = kept.into_iter().filter_map(|w| d.replay(w)).collect();
+            if !there {
+                if !matches!(relation, Ok(None)) {
+                    back.extend(kept);
+                }
+                continue;
+            }
             let deliver = match relation {
                 // Confirmed gone: given up.
                 Ok(None) => continue,
@@ -1427,6 +1498,23 @@ impl Core {
             }
             Ok(())
         })
+    }
+}
+
+/// Ends a drain whose hand-over never comes, as a panicking
+/// relationship check's does not.
+struct DrainEnd<'a> {
+    core: &'a Core,
+    drain: Option<u64>,
+}
+
+impl Drop for DrainEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(drain) = self.drain.take() {
+            self.core.desk(move |_, live| {
+                live.drains.remove(&drain);
+            });
+        }
     }
 }
 

@@ -863,8 +863,9 @@ family document. Each family of §4 adds its own.
     a room a batch at most, a group in it for each line that changed:
     `{ "target", "action": "summary", "keys", "mine"? }`, the line as it
     stands when the batch is sent, `keys` as on `history` and `mine` this
-    reader's indexes into them, absent when empty; or `{ "target",
-    "action": "clear" }` once every reaction on the line is gone. A
+    reader's indexes into them, absent when empty, and `keys` empty once
+    the last reaction is taken away; or `{ "target", "action": "clear" }`
+    for a moderator's clear or a redaction, and for nothing else. A
     summary names no reactor. Only a room's most recent lines are told
     (*hxd-ng:* `[reactions] live_window`, and `batch_seconds` for the
     batch); a client reads an older line's again with `history` when it

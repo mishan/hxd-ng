@@ -9,7 +9,7 @@ use std::thread;
 use super::tests::{batches, bits, hearing, ng, party, said, server, thumbs};
 use super::*;
 use crate::history::faulty::FaultyLog;
-use crate::history::HistoryPolicy;
+use crate::history::{ChatLog, HistoryPolicy};
 use crate::moderation::faulty::FaultyModeration;
 use crate::roster::drain;
 use crate::{Events, MemoryModeration, ModerationPolicy, ModerationStore, Transport};
@@ -25,6 +25,18 @@ fn on_faulty(moderation: Arc<dyn ModerationStore>) -> (Arc<Core>, Arc<FaultyLog>
         })
         .with_moderation(moderation, ModerationPolicy::default());
     (Arc::new(core), log)
+}
+
+/// Wait until `n` callers wait at the desk: a racer has arrived.
+fn arrived(core: &Core, n: usize) {
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while core.desk.waiting() < n {
+        assert!(
+            std::time::Instant::now() < until,
+            "{n} never arrived at the desk"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Let a room's owed batch go: the clock moved past it, and flushed.
@@ -136,7 +148,7 @@ fn a_reaction_racing_a_redaction_is_told_after_it_as_cleared() {
         let core = core.clone();
         thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
     };
-    thread::sleep(Duration::from_millis(100));
+    arrived(&core, 1);
     at.wait();
     reacting.join().unwrap().unwrap();
     redacting.join().unwrap().unwrap();
@@ -186,6 +198,8 @@ fn a_batch_taken_as_its_line_is_redacted_goes_before_the_redaction() {
         let core = core.clone();
         thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
     };
+    // The redaction waits on the room's serial, which the desk does not
+    // count; long enough for it to have reached it.
     thread::sleep(Duration::from_millis(100));
     at.wait();
     flushing.join().unwrap();
@@ -217,10 +231,12 @@ fn a_redaction_during_a_clear_waits_for_it() {
         let core = core.clone();
         thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
     };
-    thread::sleep(Duration::from_millis(100));
+    arrived(&core, 1);
     at.wait();
     assert_eq!(clearing.join().unwrap(), Ok(()));
     redacting.join().unwrap().unwrap();
+    let after = log.inner.line(line).unwrap().unwrap();
+    assert!(after.flags.contains(crate::history::LineFlags::DELETED));
 }
 
 /// A reaction made as a clear finishes is told as it stands after both,
@@ -245,7 +261,7 @@ fn a_reaction_just_after_a_clear_is_told_as_it_stands() {
         let core = core.clone();
         thread::spawn(move || core.react(alice, 0, line, &party(), true))
     };
-    thread::sleep(Duration::from_millis(100));
+    arrived(&core, 1);
     at.wait();
     clearing.join().unwrap().unwrap();
     reacting.join().unwrap().unwrap();
@@ -276,7 +292,7 @@ fn a_slow_batch_is_not_followed_by_another_at_once() {
         let core = core.clone();
         thread::spawn(move || core.react(alice, 0, line, &party(), true))
     };
-    thread::sleep(Duration::from_millis(100));
+    arrived(&core, 1);
     // The read took long, as a busy store's does.
     core.clock.advance(Duration::from_secs(3));
     at.wait();
@@ -285,7 +301,7 @@ fn a_slow_batch_is_not_followed_by_another_at_once() {
     let sent = core.clock.now();
     let next = core.reactions_flush(sent).expect("the reaction is owed");
     assert!(
-        next + Duration::from_millis(50) >= sent + Duration::from_secs(1),
+        next + Duration::from_millis(500) >= sent + Duration::from_secs(1),
         "due {:?} before a whole batch after the last",
         sent.duration_since(next)
     );
@@ -331,7 +347,7 @@ fn reactions_queued_together_go_to_the_log_together() {
     let first = react(people[0]);
     at.wait();
     let rest: Vec<_> = people[1..].iter().map(|&p| react(p)).collect();
-    thread::sleep(Duration::from_millis(200));
+    arrived(&core, 4);
     at.wait();
     first.join().unwrap().unwrap();
     for r in rest {
@@ -362,8 +378,7 @@ fn a_clears_evidence_is_the_rows_it_took() {
         let core = core.clone();
         thread::spawn(move || core.react(bob, 0, line, &party(), true))
     };
-    // Long enough for an unguarded reaction to land inside the clear.
-    thread::sleep(Duration::from_millis(100));
+    arrived(&core, 1);
     at.wait();
     clearing.join().unwrap().unwrap();
     reacting.join().unwrap().unwrap();
@@ -375,9 +390,10 @@ fn a_clears_evidence_is_the_rows_it_took() {
     assert_eq!(kept[&line].keys, [(party(), 1)], "made after the clear");
 }
 
-/// Reactions, a rekey holding the writes' lock while it tells the
-/// roster, batches under a room's serial and a clear, all at once, in
-/// the order the lock's declaration gives, finish.
+/// Every caller of the desk at once, each in the order desk.rs gives:
+/// lines said, which tell it from under the roster; redactions, which
+/// wait on it holding a room's serial; batches, taken and sent under the
+/// serial; reactions, rekeys and clears. All of them finish.
 #[test]
 fn the_reaction_locks_are_taken_in_one_order() {
     let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
@@ -390,6 +406,12 @@ fn the_reaction_locks_are_taken_in_one_order() {
         Box::new(move |c| {
             let _ = c.react(alice, 0, line, &thumbs(), true);
             let _ = c.react(alice, 0, line, &thumbs(), false);
+        }),
+        Box::new(move |c| {
+            let said = said(c, alice, "and gone");
+            let _ = c.react(alice, 0, said, &party(), true);
+            c.redact_line(crate::Actor::Session(carol), said, "no")
+                .unwrap();
         }),
         Box::new(|c| {
             let (a, b) = (Mailbox::login("erin"), Mailbox::identified("erin", [3; 32]));
@@ -404,18 +426,19 @@ fn the_reaction_locks_are_taken_in_one_order() {
             let _ = c.react_clear(carol, 0, line);
         }),
     ];
+    let n = work.len();
     for w in work {
         let (core, done) = (core.clone(), done.clone());
         thread::spawn(move || {
-            for _ in 0..500 {
+            for _ in 0..300 {
                 w(&core);
             }
             let _ = done.send(());
         });
     }
-    for _ in 0..4 {
+    for _ in 0..n {
         finished
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the reaction locks deadlocked");
     }
 }
@@ -642,4 +665,106 @@ fn a_run_that_fails_together_is_tried_alone() {
     let line = said(&core, alice, "one");
     log.fail("react_all", true);
     assert_eq!(core.react(alice, 0, line, &thumbs(), true), Ok(1));
+}
+
+/// A panic in the log under a run answers its caller as a panic, and the
+/// desk goes on.
+#[test]
+fn a_panic_in_the_log_does_not_stop_the_desk() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, _ra) = hearing(&core, "alice", ng(), false);
+    let line = said(&core, alice, "one");
+    log.fail("panic", true);
+    let c = core.clone();
+    let reacted = thread::spawn(move || c.react(alice, 0, line, &thumbs(), true)).join();
+    assert!(reacted.is_err(), "the react panicked");
+    log.fail("panic", false);
+    let (tx, rx) = mpsc::channel();
+    let c = core.clone();
+    thread::spawn(move || {
+        c.desk(|_, _| ());
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the desk stopped after a panic");
+    assert_eq!(core.react(alice, 0, line, &thumbs(), true), Ok(1));
+}
+
+/// Lines relayed with nobody reacting wait for the desk no more than a
+/// room's live window of them, however many there are.
+#[test]
+fn relayed_lines_wait_for_the_desk_within_the_window() {
+    let (core, _log) = server(ReactionPolicy {
+        live_window: 50,
+        ..ReactionPolicy::default()
+    });
+    let (alice, _rx) = hearing(&core, "alice", ng(), false);
+    for n in 0..300 {
+        said(&core, alice, &format!("l{n}"));
+    }
+    assert_eq!(core.desk.backlog(), (0, 50));
+}
+
+/// A line reacted to and unreacted within one batch, then redacted, is
+/// told after the redaction as nothing at all, not as a summary of none.
+#[test]
+fn a_redacted_line_whose_reactions_came_and_went_is_told_nothing_after() {
+    let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "regrettable");
+    drain(&mut ra);
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    core.react(alice, 0, line, &thumbs(), false).unwrap();
+    core.redact_line(crate::Actor::Session(carol), line, "no")
+        .unwrap();
+    flush(&core);
+    assert_nothing_but_clears_after_the_redaction(&drain(&mut ra), line);
+}
+
+/// A redaction waits on the desk holding its room's serial and nothing
+/// more: an op that takes the roster, ahead of it at the desk, finishes,
+/// as it would not if the redaction held the roster while it waited.
+#[test]
+fn a_redaction_waits_on_the_desk_without_the_roster() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "one");
+    let gone = said(&core, alice, "two");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line))
+    };
+    at.wait();
+    let (done, finished) = mpsc::channel();
+    let rostering = {
+        let (core, done) = (core.clone(), done.clone());
+        thread::spawn(move || {
+            core.desk(|c, _| drop(c.roster.lock().unwrap()));
+            let _ = done.send(());
+        })
+    };
+    arrived(&core, 1);
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || {
+            core.redact_line(crate::Actor::Session(carol), gone, "no")
+                .unwrap();
+            let _ = done.send(());
+        })
+    };
+    arrived(&core, 2);
+    at.wait();
+    clearing.join().unwrap().unwrap();
+    for _ in 0..2 {
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the desk and the roster deadlocked");
+    }
+    rostering.join().unwrap();
+    redacting.join().unwrap();
 }

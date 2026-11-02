@@ -4532,7 +4532,10 @@ pub async fn reactions_flusher(core: Arc<Core>) {
                 }
             } => {}
             _ = wake.notified() => {}
-            _ = prune.tick() => core.reactions_prune(),
+            _ = prune.tick() => {
+                let c = core.clone();
+                let _ = crate::spawn_blocking("reactions", move || c.reactions_prune()).await;
+            }
         }
     }
 }

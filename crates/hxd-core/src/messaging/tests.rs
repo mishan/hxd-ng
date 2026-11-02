@@ -3984,3 +3984,35 @@ fn a_purge_during_a_drain_keeps_nothing_for_the_account() {
     s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
     assert!(im_reactions(&drain(&mut rb)).is_empty());
 }
+
+/// A drain hands over only to the session it took for: one that ended
+/// meanwhile leaves what it took waiting for the account's next.
+#[test]
+fn a_drain_for_a_session_gone_meanwhile_keeps_what_it_took() {
+    let (s, _, b, _) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.end_session(b);
+        Ok(Some(false))
+    });
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// What happens during a drain is played over what it took in order: a
+/// reactor's new key, then that key's deletion, leaves nothing of it.
+#[test]
+fn a_drain_replays_a_rekey_then_a_deletion_in_order() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    let (bare, linked) = (
+        Mailbox::login("alice"),
+        Mailbox::identified("alice", [5; 32]),
+    );
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.rekey_reactions(&bare, &linked);
+        s.core.forget_waiting_reactions(&linked);
+        Ok(Some(false))
+    });
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+}

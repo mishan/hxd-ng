@@ -318,10 +318,28 @@ pub trait ChatLog: Send + Sync + 'static {
     /// retired line and a room's deletion take a line's reactions with
     /// it.
     fn react(&self, act: &ReactAct) -> Result<Reacted, StoreError>;
-    /// [`ChatLog::react`] for each of `acts` in order, in one transaction
-    /// where the store has them: all applied, or on an error none.
+    /// [`ChatLog::react`] for each of `acts` in order. A store with
+    /// transactions commits them in one, all or none; this default is not
+    /// atomic, and stops at the first error with those before it applied.
     fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
         acts.iter().map(|a| self.react(a)).collect()
+    }
+    /// [`ChatLog::tombstone`] for each of `ids`, answering those there
+    /// are. A store with transactions makes them in one; this default
+    /// stops at the first error.
+    fn tombstone_all(
+        &self,
+        ids: &[LineId],
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let mut gone = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if self.tombstone(id, by, at)? {
+                gone.push(id);
+            }
+        }
+        Ok(gone)
     }
     /// The reactions on those of `ids` that have any, `mine` as
     /// `reader`'s account holds them.
@@ -882,6 +900,8 @@ pub mod conformance {
         reactions_are_forgotten_by_reactor_and_time(new_log());
         reactions_follow_their_account_to_its_identity(new_log());
         reactors_are_listed_on_the_lines_asked_alone(new_log());
+        reactions_together_are_applied_in_order(new_log());
+        tombstones_together_answer_the_lines_they_made(new_log());
         a_clear_takes_every_reaction_on_one_live_line(new_log());
     }
 
@@ -1069,6 +1089,58 @@ pub mod conformance {
         want.sort_by_key(|h| (h.0, h.1.clone(), h.2.pack()));
         assert_eq!(held, want);
         assert!(log.reactors_on(&[2]).unwrap().is_empty());
+    }
+
+    /// Reactions applied together are applied in order, each seeing
+    /// those before it.
+    fn reactions_together_are_applied_in_order(log: Box<dyn ChatLog>) {
+        fill(&*log, 1);
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        let thumbs = key("👍");
+        let act = |who: &'static Mailbox, add| ReactAct {
+            channel: 0,
+            line: 1,
+            who,
+            nick: "n",
+            key: &thumbs,
+            add,
+            at: SystemTime::UNIX_EPOCH,
+            max_keys: 20,
+            max_per_user: 5,
+        };
+        let (alice, bob): (&'static Mailbox, &'static Mailbox) =
+            (Box::leak(Box::new(alice)), Box::leak(Box::new(bob)));
+        let acts = [
+            act(alice, true),
+            act(bob, true),
+            act(alice, true),
+            act(bob, false),
+        ];
+        assert_eq!(
+            log.react_all(&acts).unwrap(),
+            [
+                Reacted::Count(1),
+                Reacted::Count(2),
+                Reacted::Held(2),
+                Reacted::Count(1)
+            ]
+        );
+    }
+
+    /// Tombstones made together answer, as one at a time do, the lines
+    /// there are, and take their reactions.
+    fn tombstones_together_answer_the_lines_they_made(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        let alice = Mailbox::login("alice");
+        react(&*log, &alice, 3, "👍", true, 1);
+        assert!(log.tombstone(2, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        assert_eq!(
+            log.tombstone_all(&[1, 2, 3, 99], "mod", SystemTime::UNIX_EPOCH)
+                .unwrap(),
+            [1, 2, 3]
+        );
+        assert_eq!(ids_in(&*log, 0).len(), 3, "kept as tombstones");
+        assert!(shown(&*log, &[3], &alice).is_empty());
     }
 
     /// A clear empties one line of its channel, and no other; a line of

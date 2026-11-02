@@ -1336,8 +1336,8 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
-                if self.reactions.is_some() {
-                    self.desk_post(move |_, live| live.relayed(room, id));
+                if let Some(policy) = self.reactions {
+                    self.desk.relayed(room, id, policy.live_window);
                 }
             }
             // The authorization set, fixed at relay time: the sender, and

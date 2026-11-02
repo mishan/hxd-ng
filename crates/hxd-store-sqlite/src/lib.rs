@@ -3106,34 +3106,50 @@ impl ChatLog for SqliteStore {
     }
 
     fn tombstone(&self, id: LineId, by: &str, at: SystemTime) -> Result<bool, StoreError> {
+        Ok(!self.tombstone_all(&[id], by, at)?.is_empty())
+    }
+
+    /// One transaction for them all: a purge's chunk of lines.
+    fn tombstone_all(
+        &self,
+        ids: &[LineId],
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(StoreError::new)?;
-        // A second redaction of the same line keeps the first one's who
-        // and when: the record of a removal is of the removal.
-        let changed = tx
-            .execute(
-                "UPDATE chat_line
-                    SET nick = '', body = '', signed = NULL, signed_content = NULL,
-                        home_name = NULL, home_tag = NULL, home_tagged = NULL, re = NULL,
-                        flags = flags | ?1,
-                        deleted_at = IFNULL(deleted_at, ?2),
-                        deleted_by = IFNULL(deleted_by, ?3)
-                  WHERE id = ?4",
-                params![
-                    i64::from(LineFlags::DELETED.bits()),
-                    unix(at),
-                    by,
-                    clamp_id(id)
-                ],
+        let mut gone = Vec::with_capacity(ids.len());
+        for &id in ids {
+            // A second redaction of the same line keeps the first one's who
+            // and when: the record of a removal is of the removal.
+            let changed = tx
+                .execute(
+                    "UPDATE chat_line
+                        SET nick = '', body = '', signed = NULL, signed_content = NULL,
+                            home_name = NULL, home_tag = NULL, home_tagged = NULL, re = NULL,
+                            flags = flags | ?1,
+                            deleted_at = IFNULL(deleted_at, ?2),
+                            deleted_by = IFNULL(deleted_by, ?3)
+                      WHERE id = ?4",
+                    params![
+                        i64::from(LineFlags::DELETED.bits()),
+                        unix(at),
+                        by,
+                        clamp_id(id)
+                    ],
+                )
+                .map_err(StoreError::new)?;
+            tx.execute(
+                "DELETE FROM chat_reaction WHERE line = ?1",
+                params![clamp_id(id)],
             )
             .map_err(StoreError::new)?;
-        tx.execute(
-            "DELETE FROM chat_reaction WHERE line = ?1",
-            params![clamp_id(id)],
-        )
-        .map_err(StoreError::new)?;
+            if changed != 0 {
+                gone.push(id);
+            }
+        }
         tx.commit().map_err(StoreError::new)?;
-        Ok(changed != 0)
+        Ok(gone)
     }
 
     fn prune(&self, keep: &Retention, now: SystemTime) -> Result<usize, StoreError> {
