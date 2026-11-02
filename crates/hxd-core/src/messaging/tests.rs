@@ -3950,6 +3950,30 @@ fn an_approval_beside_a_block_carries_no_reaction() {
     }
 }
 
+/// An instant message queued under an approval stays the approval's
+/// once a block stands beside it: handed over live, it never reaches a
+/// session that does not understand requests as a friend's would.
+#[test]
+fn a_queued_approval_message_beside_a_block_stays_the_approvals() {
+    let s = reacting(&["bob", "carol"], crate::ReactionPolicy::default());
+    let (c, _) = taker(&s.core, "carol");
+    let (b, _) = taker(&s.core, "bob");
+    send(&s.core, c, "bob", "hello?").unwrap();
+    s.core
+        .request_answer(b, "carol", RequestAction::Approve)
+        .unwrap();
+    s.core.end_session(b);
+    send(&s.core, c, "bob", "under approval").unwrap();
+    let (bob, carol) = (Mailbox::login("bob"), Mailbox::login("carol"));
+    s.rel
+        .set_blocked(&bob, &carol, true, std::time::SystemTime::now())
+        .unwrap();
+    let (_plain, mut rplain) = messenger(&s.core, "bob");
+    let (_aware, _raware) = taker(&s.core, "bob");
+    s.core.im_deliver(&bob, None, 0, true);
+    assert!(ims(&drain(&mut rplain)).is_empty());
+}
+
 /// What waits follows its recipient through a link, and is handed to
 /// the account under its new key.
 #[test]
@@ -4098,6 +4122,22 @@ fn a_drain_keeps_what_a_rekeyed_reactor_reacted() {
     });
     assert!(im_reactions(&drain(&mut rb)).is_empty());
     s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// A recipient given a new key while its drain judged a relationship
+/// under the old one is not known to have lost it: what waited is kept
+/// for the next drain.
+#[test]
+fn a_drain_keeps_what_waited_for_a_rekeyed_recipient() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let (bare, linked) = (Mailbox::login("bob"), Mailbox::identified("bob", [6; 32]));
+    s.core.im_reactions_drain(b, &bare, |_| {
+        s.core.rekey_reactions(&bare, &linked);
+        Ok(None)
+    });
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+    s.core.im_reactions_drain(b, &linked, |_| Ok(Some(false)));
     assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
 }
 

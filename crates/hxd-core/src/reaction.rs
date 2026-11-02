@@ -561,6 +561,9 @@ struct Drain {
     /// What happened to it since, in order, replayed in that order.
     events: Vec<DrainEvent>,
     gone: bool,
+    /// The recipient was named anew since the drain began, so what it
+    /// judged under the old name says nothing of the new.
+    rekeyed: bool,
 }
 
 /// What a drain under way gives way to.
@@ -753,6 +756,7 @@ impl Live {
             taken,
             events: Vec::new(),
             gone: false,
+            rekeyed: false,
         };
         self.drains.insert(self.next_drain, drain);
         Some((self.next_drain, queue))
@@ -791,6 +795,7 @@ impl Live {
         for d in self.drains.values_mut() {
             if d.to == old {
                 d.to = new.clone();
+                d.rekeyed = true;
             }
             if d.took_from(&old) {
                 d.events.push(DrainEvent::Renamed(old.clone(), to.clone()));
@@ -1606,8 +1611,9 @@ impl Core {
         );
         let uid = d.uid;
         for (mut relation, kept) in judged {
-            // Judged under a name the reactor no longer has: not known.
-            if kept.first().is_some_and(|w| d.renamed(&Key::of(&w.from))) && relation == Ok(None) {
+            // Judged under a name either party no longer has: not known.
+            let renamed = d.rekeyed || kept.first().is_some_and(|w| d.renamed(&Key::of(&w.from)));
+            if renamed && relation == Ok(None) {
                 relation = Err(());
             }
             let kept: Vec<Waiting> = kept.into_iter().filter_map(|w| d.replay(w)).collect();

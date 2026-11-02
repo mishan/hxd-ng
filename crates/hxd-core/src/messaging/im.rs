@@ -167,14 +167,34 @@ impl Core {
             if row.blocked_at.is_some() || store.is_blocked(other, owner).map_err(store_failed)? {
                 return Ok(None);
             }
-            if let Some(id) = row.approval {
+        }
+        self.approval_on_record(a, b)
+    }
+
+    /// The approval between `a` and `b` as stored, given by either,
+    /// whatever blocks stand: what a message sent under it is, which a
+    /// block does not make it anything else.
+    fn approval_on_record(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+    ) -> Result<Option<RelationId>, MessagingError> {
+        let store = self.friends_store()?;
+        let now = self.clock.wall();
+        for (owner, other) in [(a, b), (b, a)] {
+            if let Some(id) = store
+                .relationship(owner, other, now)
+                .map_err(store_failed)?
+                .and_then(|r| r.approval)
+            {
                 return Ok(Some(id));
             }
         }
         Ok(None)
     }
 
-    /// The approvals among what `rows` were sent on to `to`.
+    /// The approvals among what `rows` were sent on to `to`, as stored:
+    /// a classification, which is never an authorization.
     pub(crate) fn approval_ids(&self, to: &Mailbox, rows: &[StoredMessage]) -> HashSet<RelationId> {
         let mut senders: Vec<&Mailbox> = Vec::new();
         for m in rows.iter().filter(|m| relation_of(m).is_some()) {
@@ -184,7 +204,7 @@ impl Core {
         }
         senders
             .into_iter()
-            .filter_map(|s| self.approval(to, s).ok().flatten())
+            .filter_map(|s| self.approval_on_record(to, s).ok().flatten())
             .collect()
     }
 
