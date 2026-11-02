@@ -54,6 +54,11 @@ impl MemoryModeration {
 
 impl ModerationStore for MemoryModeration {
     fn record(&self, act: &Act) -> Result<ActId, StoreError> {
+        if let ActKind::Unknown(n) = act.kind {
+            return Err(StoreError::new(format!(
+                "act kind {n} is not one to record"
+            )));
+        }
         let mut inner = self.inner.lock().unwrap();
         let id = inner.acts.len() as ActId + 1;
         inner.acts.push(Act { id, ..act.clone() });

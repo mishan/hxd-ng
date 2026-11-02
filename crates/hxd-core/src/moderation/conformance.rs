@@ -10,6 +10,7 @@ use crate::inbox::Mailbox;
 
 pub fn run(new_store: &dyn Fn() -> Box<dyn ModerationStore>) {
     acts_round_trip_and_page_newest_first(&*new_store());
+    an_unknown_kind_is_never_recorded(&*new_store());
     evidence_is_scrubbed_and_the_row_stays(&*new_store());
     reports_round_trip_and_filter(&*new_store());
     open_reports_are_found_by_what_they_name(&*new_store());
@@ -82,6 +83,11 @@ fn closed(outcome: Outcome, at: u64) -> Closed {
         note: Some("seen".into()),
         duplicate_of: (outcome == Outcome::Duplicate).then_some(1),
     }
+}
+
+fn an_unknown_kind_is_never_recorded(s: &dyn ModerationStore) {
+    assert!(s.record(&act(ActKind::Unknown(9999), 100)).is_err());
+    assert!(s.acts(None, 10).unwrap().is_empty());
 }
 
 fn acts_round_trip_and_page_newest_first(s: &dyn ModerationStore) {

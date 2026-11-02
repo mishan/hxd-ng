@@ -439,8 +439,10 @@ Requests, all `access_denied` without `moderate` except `report`:
 
 An act of a kind this server has no name for, one a newer server
 recorded, reads as `unknown` with its number as `kind_number` (in
-`hxd moderation log`, `unknown (N)`), so a log holding one still reads
-after a rollback.
+`hxd moderation log`, `unknown (N)`), and is never recorded. A log
+holding one still reads after a rollback to a server that has this
+reading and can open the database's schema: releases before it refuse
+the row, and any server refuses a schema newer than its own.
 
 `kick` is new to the ng wire — it has only ever *received* `kicked` —
 and needs the kick bit, not `moderate`; `purge` inside it needs both.

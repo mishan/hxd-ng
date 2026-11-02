@@ -228,6 +228,11 @@ fn closes_in(events: Vec<Event>) -> Vec<(ReportId, Outcome, bool)> {
 }
 
 #[test]
+fn memory_passes_the_conformance_suite() {
+    super::conformance::run(&|| Box::new(MemoryModeration::default()));
+}
+
+#[test]
 fn only_a_moderator_acts_and_every_act_needs_a_reason() {
     let s = server();
     let (bob, _) = attach(&s.core, person("bob"));

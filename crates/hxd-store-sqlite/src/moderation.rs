@@ -228,6 +228,11 @@ fn target_where(t: &ReportTarget) -> (i64, &'static str, rusqlite::types::Value)
 
 impl ModerationStore for SqliteStore {
     fn record(&self, act: &Act) -> Result<ActId, StoreError> {
+        if let ActKind::Unknown(n) = act.kind {
+            return Err(StoreError::new(format!(
+                "act kind {n} is not one to record"
+            )));
+        }
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
             "INSERT INTO moderation
