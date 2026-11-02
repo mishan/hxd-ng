@@ -504,9 +504,11 @@ async fn without_history_the_lobby_numbers_its_own_lines() {
     let s = start(td.path(), ON).await;
     let mut alice = classic(&s, "alice", Some(STRUCTURED)).await;
     let mut bob = classic(&s, "bob", Some(STRUCTURED)).await;
+    // Two connections race to the server, so bob speaks once alice's
+    // line has been numbered.
     alice.chat(b"first").await.unwrap();
-    bob.chat(b"second").await.unwrap();
     let first = entry(&line(&mut alice, "first").await).unwrap();
+    bob.chat(b"second").await.unwrap();
     let second = entry(&line(&mut alice, "second").await).unwrap();
     assert_eq!(first.flags, EPHEMERAL);
     assert_eq!((second.id, second.flags), (first.id + 1, EPHEMERAL));
