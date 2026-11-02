@@ -49,8 +49,19 @@ pub fn create(path: &Path, bytes: &[u8]) -> io::Result<bool> {
         Err(e) => return Err(e),
         Ok(()) => true,
     };
-    sync_dir(dir).map_err(unsynced)?;
-    Ok(placed)
+    synced(placed, sync_dir(dir))
+}
+
+/// `placed`, unless syncing the directory failed: then an error, which
+/// says the file is in place only if this call put it there. A file
+/// that was there already may not be durable either, and a caller that
+/// went on to read it would trust what it cannot yet.
+fn synced(placed: bool, sync: io::Result<()>) -> io::Result<bool> {
+    match sync {
+        Ok(()) => Ok(placed),
+        Err(e) if placed => Err(unsynced(e)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write `bytes` to `path` in place of whatever is there, atomically: a
@@ -247,6 +258,17 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), content, "{flavor:?}");
             assert_eq!(mode(&path), after, "{flavor:?} from {before:o}");
             assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    /// A failed directory sync is answered as one that came after the
+    /// file was in place only when this call placed it: one that found
+    /// a file there placed nothing.
+    #[test]
+    fn only_a_file_this_call_placed_is_placed() {
+        for this_call in [true, false] {
+            let err = synced(this_call, Err(io::ErrorKind::PermissionDenied.into())).unwrap_err();
+            assert_eq!(placed(&err), this_call, "{err}");
         }
     }
 

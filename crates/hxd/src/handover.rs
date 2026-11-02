@@ -191,11 +191,16 @@ pub fn hand_over(
                 write_durably(out, &hex(key), false)?;
             }
             let lines: Vec<String> = handovers.chain.iter().map(|h| b64(h)).collect();
-            if let Err(e) = write_durably(&section.handovers, &lines.join("\n"), true) {
-                if let Some(out) = next {
-                    let _ = std::fs::remove_file(out);
+            let chain = format!("{}\n", lines.join("\n"));
+            if let Err(e) = hl_private_file::replace(&section.handovers, chain.as_bytes()) {
+                // A chain in place commits to the next successor, whose key
+                // is then the only way on: kept, and the run again finishes.
+                if !hl_private_file::placed(&e) {
+                    if let Some(out) = next {
+                        let _ = std::fs::remove_file(out);
+                    }
                 }
-                return Err(e);
+                return Err(format!("{}: {e}", section.handovers.display()));
             }
             after
         }
