@@ -331,6 +331,9 @@ impl RoomEdit {
 pub(crate) struct RoomEntry {
     pub(crate) room: Room,
     pub(crate) members: Vec<Uid>,
+    /// Archived or deleted when last reconciled, so its close is
+    /// answered once rather than at every room write.
+    pub(crate) closed: bool,
 }
 
 /// One room's commit queue and the serial it holds from append to
@@ -532,16 +535,18 @@ impl RosterInner {
     /// account changed, a room archived or gone (§5). Each parted session
     /// is told once, and the members who stay hear one part for each, so
     /// a room emptied at once costs each of its members one event.
-    /// Answers the rooms archived or deleted, which keep no live lines
-    /// (`crate::reaction`).
+    /// Answers the rooms archived or deleted since the last reconcile,
+    /// which keep no live lines (`crate::reaction`).
     pub(crate) fn room_reconcile(&mut self) -> Vec<u32> {
         let rooms: Vec<u32> = self.rooms.keys().copied().collect();
         let mut closed = Vec::new();
         for room in rooms {
-            let entry = &self.rooms[&room];
-            if entry.room.archived_at.is_some() || entry.room.deleted {
+            let entry = self.rooms.get_mut(&room).expect("listed above");
+            let is_closed = entry.room.archived_at.is_some() || entry.room.deleted;
+            if is_closed && !entry.closed {
                 closed.push(room);
             }
+            entry.closed = is_closed;
             let entry = &self.rooms[&room];
             let (stay, lost): (Vec<Uid>, Vec<Uid>) = entry
                 .members
@@ -924,16 +929,23 @@ impl Core {
         let mut old = std::mem::take(&mut r.rooms);
         for room in file.rooms.iter().filter(|r| r.id != 0) {
             let mut room = room.clone();
-            let members = match old.remove(&room.id) {
+            let (members, closed) = match old.remove(&room.id) {
                 Some(was) => {
                     if dirty.contains(&room.id) {
                         room.topic = was.room.topic;
                     }
-                    was.members
+                    (was.members, was.closed)
                 }
-                None => Vec::new(),
+                None => (Vec::new(), false),
             };
-            r.rooms.insert(room.id, RoomEntry { room, members });
+            r.rooms.insert(
+                room.id,
+                RoomEntry {
+                    room,
+                    members,
+                    closed,
+                },
+            );
         }
         // A room taken out of the file by hand is a room deleted: its
         // members are parted, and its id stays taken.
@@ -1237,6 +1249,7 @@ impl Core {
         let entry = r.rooms.entry(room.id).or_insert_with(|| RoomEntry {
             room: room.clone(),
             members: Vec::new(),
+            closed: false,
         });
         // A topic set meanwhile is newer than the one this edit read.
         if !topic_set {
