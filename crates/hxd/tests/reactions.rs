@@ -2,30 +2,33 @@
 //! lobby or a room line, held to its caps, its rate and who may react,
 //! counted on `history` for the sessions that declared `reactions`, told
 //! live in `reactions_changed` batches to a room's readers, cleared by a
-//! moderator and taken by a redaction and a purge, between scripted
-//! clients on a real server. Emoji in the test data are the reactions
-//! themselves.
+//! moderator and taken by a redaction and a purge, and on an instant
+//! message relayed to its other party, between scripted clients on a
+//! real server. Emoji in the test data are the reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_core::{Core, HistoryPolicy, InboxPolicy, ModerationPolicy, ReactionPolicy, RoomPolicy};
+use hxd_core::{
+    Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ModerationPolicy, ReactionPolicy, RoomPolicy,
+};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
 use hxd_testclient::ng::{Client, Incoming, Resumed};
 use hxd_testclient::Error;
 use serde_json::{json, Value};
 
-/// History, moderation and rooms on one SQLite file, reactions under
-/// `policy`, their batches sent as the binary sends them.
+/// History, moderation, rooms and messaging on one SQLite file,
+/// reactions under `policy`, their batches sent as the binary sends them.
 /// `carol` moderates, `boss` makes rooms, `reader` may read and not chat,
 /// and the guest may chat.
 async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-    const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n";
+    const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n\
+                           send_msgs = true\nmessaging = true\n";
     for (login, password, access) in [
         ("alice", true, CHATTER.to_string()),
         ("bob", true, CHATTER.to_string()),
@@ -65,6 +68,11 @@ async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
             },
         )
         .with_reactions(policy)
+        .with_relationships(store.clone())
+        .with_messaging(MessagingPolicy {
+            enabled: true,
+            ..MessagingPolicy::default()
+        })
         .with_moderation(store, ModerationPolicy::default())
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
@@ -174,7 +182,7 @@ async fn reactions_are_counted_per_account_and_shown_to_the_readers_that_asked()
     assert!(caps(&hello).contains(&json!("reactions")));
     assert_eq!(
         hello["reactions"],
-        json!({ "targets": ["line"], "max_keys": 20, "max_per_user": 5 })
+        json!({ "targets": ["line", "im"], "max_keys": 20, "max_per_user": 5 })
     );
     let (mut bob, _) = login(addr, "bob", true).await;
     let (mut dave, hello) = login(addr, "dave", false).await;
@@ -540,6 +548,68 @@ async fn a_rooms_reactions_stay_in_the_room() {
     }
 }
 
+/// An instant message's reaction goes to the conversation's other party
+/// as a change, and to nobody else; to a stranger there is no such
+/// target.
+#[tokio::test]
+async fn an_im_reaction_reaches_its_party_and_not_a_stranger() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let messenger = |who: &'static str| async move {
+        let mut c = Client::connect(addr).await.unwrap();
+        c.login(json!({
+            "login": who, "password": "pw", "nick": who,
+            "reactions": true, "messaging": true,
+        }))
+        .await
+        .unwrap();
+        ok(&mut c, "friends", json!({})).await;
+        c
+    };
+    let (mut alice, mut bob, mut erin) = (
+        messenger("alice").await,
+        messenger("bob").await,
+        messenger("erin").await,
+    );
+    ok(&mut alice, "friend_add", json!({ "login": "bob" })).await;
+    bob.event_where("friend_request", |d| d["login"] == "alice")
+        .await
+        .unwrap();
+    ok(
+        &mut bob,
+        "friend_respond",
+        json!({ "login": "alice", "accept": true }),
+    )
+    .await;
+    let target =
+        json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let params = json!({ "target": target, "with": "bob", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(ok(&mut alice, "react", params).await, json!({}));
+    let (_, group) = changed(&mut bob, &target).await;
+    assert_eq!(
+        group,
+        json!({ "target": target, "action": "add", "key": { "emoji": "❤\u{FE0F}" }, "from": { "login": "alice" } })
+    );
+
+    let stranger = json!({ "target": target, "with": "erin", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(refused(&mut alice, "react", stranger).await, "bad_request");
+    let erins =
+        json!({ "im": { "login": "erin", "guid": "5f5e1000-1234-4abc-89ab-000000000002" } });
+    let stranger = json!({ "target": erins, "with": "erin", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(
+        refused(&mut alice, "react", stranger).await,
+        "no_such_target"
+    );
+    let unnamed = json!({ "target": erins, "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(refused(&mut alice, "react", unnamed).await, "bad_request");
+    ok(&mut erin, "ping", json!({})).await;
+    assert!(erin
+        .rx
+        .take_backlog()
+        .iter()
+        .all(|e| e.ev != "reactions_changed"));
+}
+
 /// A batch sent while a session is detached is held for it like any
 /// other event, and replayed in order at its resume.
 #[tokio::test]
@@ -617,6 +687,12 @@ async fn a_clear_is_a_moderators_on_a_line_it_reads() {
             "an instant message",
             true,
             json!({ "target": im, "clear": true, "reason": "spam" }),
+            "bad_request",
+        ),
+        (
+            "with beside a line",
+            true,
+            json!({ "target": { "line": lobby }, "with": "bob", "key": key }),
             "bad_request",
         ),
         (
@@ -704,4 +780,35 @@ async fn a_clear_is_a_moderators_on_a_line_it_reads() {
             ),
         ]
     );
+}
+
+/// An instant message's reactions are held to the account's rate, told
+/// how long to wait.
+#[tokio::test]
+async fn an_im_reaction_past_the_rate_is_told_to_wait() {
+    let td = tempfile::tempdir().unwrap();
+    let policy = ReactionPolicy {
+        burst: 3,
+        per_second: 1,
+        ..ReactionPolicy::default()
+    };
+    let addr = start(td.path(), policy).await;
+    let mut alice = Client::connect(addr).await.unwrap();
+    alice
+        .login(json!({
+            "login": "alice", "password": "pw", "nick": "alice",
+            "reactions": true, "messaging": true,
+        }))
+        .await
+        .unwrap();
+    let target =
+        json!({ "im": { "login": "alice", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let params = json!({ "target": target, "with": "bob", "key": { "emoji": "👍" } });
+    for n in 0..3 {
+        let code = refused(&mut alice, "react", params.clone()).await;
+        assert_eq!(code, "no_such_target", "within the burst, {n}");
+    }
+    let reply = raw(&mut alice, "react", params).await;
+    assert_eq!(reply["error"]["code"], "rate_limited", "{reply}");
+    assert_eq!(reply["error"]["retry_after"], 1, "{reply}");
 }

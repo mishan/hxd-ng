@@ -1,6 +1,7 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
-//! line, a moderator's clear, a line's reactions on the `history` that
-//! shows it, and `reactions_changed`, to sessions that declared it.
+//! line or an instant message, a moderator's clear, a line's reactions on
+//! the `history` that shows it, and `reactions_changed`, to sessions that
+//! declared it.
 
 use hxd_core::{ReactError, ReactionChange, ReactionKey, Reactions, Reply};
 use serde::Deserialize;
@@ -11,12 +12,14 @@ use crate::proto::{reply_err, reply_err_retry, reply_ok};
 use crate::NgCtx;
 
 /// The kinds of target this server takes reactions on: a line where
-/// lines are kept.
+/// lines are kept, and an instant message where they are sent.
 pub(crate) fn targets(ctx: &NgCtx) -> Vec<&'static str> {
-    match ctx.core.reaction_policy() {
-        Some(_) => vec!["line"],
-        None => Vec::new(),
-    }
+    let core = &ctx.core;
+    let on = core.reaction_policy().is_some();
+    [("line", on), ("im", on && core.messaging_enabled())]
+        .into_iter()
+        .filter_map(|(kind, taken)| taken.then_some(kind))
+        .collect()
 }
 
 /// The login reply's `reactions` block.
@@ -79,6 +82,17 @@ pub(crate) fn change_json(change: &ReactionChange) -> Value {
         ReactionChange::Clear { target } => {
             json!({ "target": crate::replies::json(target), "action": "clear" })
         }
+        ReactionChange::Changed {
+            target,
+            key,
+            add,
+            from,
+        } => json!({
+            "target": crate::replies::json(target),
+            "action": if *add { "add" } else { "remove" },
+            "key": key_json(key),
+            "from": { "login": from },
+        }),
     }
 }
 
@@ -88,6 +102,7 @@ struct ReactParams {
     key: Option<Value>,
     #[serde(default)]
     remove: bool,
+    with: Option<String>,
     #[serde(default)]
     clear: bool,
     reason: Option<String>,
@@ -106,35 +121,48 @@ enum Act {
         line: u64,
         reason: String,
     },
+    Im {
+        target: hxd_core::reply::ImTarget,
+        with: String,
+        key: ReactionKey,
+        add: bool,
+    },
 }
 
 /// `react`'s params, or the `bad_request` they earn: a key on every act
-/// but a clear, which takes neither `remove` nor a key, and a reason on
-/// a clear alone.
+/// but a clear, which is of a line and takes neither `remove` nor a key,
+/// a reason on a clear alone, and `with` on an `im` target alone.
 fn act(ctx: &NgCtx, p: ReactParams) -> Result<Act, &'static str> {
     let target = crate::replies::parse(&p.target, &targets(ctx))
         .ok_or("`target` names no kind this server takes.")?;
     let emoji = |k: Option<Value>| k.as_ref().and_then(key).ok_or("`key` is not one emoji.");
-    match (target, p.clear) {
-        (Reply::Line { room, id }, true) if p.key.is_none() && !p.remove => Ok(Act::Clear {
+    match (target, p.clear, p.with) {
+        (Reply::Line { room, id }, true, None) if p.key.is_none() && !p.remove => Ok(Act::Clear {
             room,
             line: id,
             reason: p.reason.unwrap_or_default(),
         }),
-        (_, true) => Err("`clear` takes a line, and no key."),
-        (_, false) if p.reason.is_some() => Err("`reason` goes with `clear` alone."),
-        (Reply::Line { room, id }, false) => Ok(Act::Line {
+        (_, true, _) => Err("`clear` takes a line, and no key."),
+        (_, false, _) if p.reason.is_some() => Err("`reason` goes with `clear` alone."),
+        (Reply::Line { room, id }, false, None) => Ok(Act::Line {
             room,
             line: id,
             key: emoji(p.key)?,
             add: !p.remove,
         }),
-        _ => Err("`target` names no kind this server takes."),
+        (Reply::Im(target), false, Some(with)) => Ok(Act::Im {
+            target,
+            with,
+            key: emoji(p.key)?,
+            add: !p.remove,
+        }),
+        (Reply::Im(_), false, None) => Err("An `im` target needs `with`."),
+        _ => Err("`with` is for an `im` target."),
     }
 }
 
-/// `react`: one key added to, or with `remove` taken from, one line, or
-/// with `clear` every key on it.
+/// `react`: one key added to, or with `remove` taken from, one line or
+/// instant message, or with `clear` every key on a line.
 pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Value) -> String {
     if !state.reactions {
         return reply_err(id, "not_available", "Reactions are not available.");
@@ -156,6 +184,12 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
             add,
         } => c.react(uid, room, line, &key, add).map(Some),
         Act::Clear { room, line, reason } => c.react_clear(uid, room, line, &reason).map(|()| None),
+        Act::Im {
+            target,
+            with,
+            key,
+            add,
+        } => c.react_im(uid, &target, &with, &key, add).map(|()| None),
     })
     .await;
     match reacted {
@@ -164,6 +198,11 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
         Some(Err(ReactError::NotAllowed)) if clearing => {
             reply_err(id, "access_denied", "You may not clear reactions.")
         }
+        Some(Err(ReactError::OutOfScope)) => reply_err(
+            id,
+            "bad_request",
+            "An `im` target names the sender or `with`.",
+        ),
         Some(Err(ReactError::NotAllowed)) => {
             reply_err(id, "access_denied", "You may not react to that.")
         }
@@ -171,7 +210,9 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
         Some(Err(ReactError::Protected)) => {
             reply_err(id, "protected", "That user cannot be moderated by you.")
         }
-        Some(Err(ReactError::NoSuchTarget)) => reply_err(id, "no_such_target", "No such line."),
+        Some(Err(ReactError::NoSuchTarget)) => {
+            reply_err(id, "no_such_target", "No such line or message.")
+        }
         Some(Err(ReactError::TooManyReactions)) => reply_err(
             id,
             "too_many_reactions",

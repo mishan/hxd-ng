@@ -1551,6 +1551,7 @@ impl ReactionsSection {
             read_only_rooms: self.read_only_rooms == AllowDeny::Allow,
             live_window: self.live_window,
             batch: Duration::from_secs(self.batch_seconds),
+            ..hxd_core::ReactionPolicy::default()
         })
     }
 }
@@ -4529,9 +4530,12 @@ pub async fn presence_flusher(core: Arc<Core>) {
 /// Sends each room's reactions once its batch is due
 /// (`hxd_core::Core::reactions_flush`), measured on the core's clock, off
 /// the runtime's workers since a batch takes a room's serial and reads the
-/// log.
+/// log; and hourly gives up the instant-message reactions that have
+/// waited too long.
 pub async fn reactions_flusher(core: Arc<Core>) {
     let wake = core.reactions_wake();
+    let mut prune = tokio::time::interval(Duration::from_secs(3600));
+    prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let c = core.clone();
         // A flush that did not finish leaves rooms owed: try again soon.
@@ -4547,6 +4551,10 @@ pub async fn reactions_flusher(core: Arc<Core>) {
                 }
             } => {}
             _ = wake.notified() => {}
+            _ = prune.tick() => {
+                let c = core.clone();
+                let _ = crate::spawn_blocking("reactions", move || c.reactions_prune()).await;
+            }
         }
     }
 }
@@ -4791,7 +4799,14 @@ pub fn build_ctx(
         _ => return Err("[history] store was not opened".into()),
     };
     let core = match config.reactions.as_ref().filter(|r| r.enabled) {
-        Some(reactions) => core.with_reactions(reactions.policy()?),
+        Some(reactions) => {
+            let mut policy = reactions.policy()?;
+            // An instant message's reactions wait as long as it would.
+            if let Some(inbox) = &config.inbox {
+                policy.im_keep = Duration::from_secs(inbox.retain_unread);
+            }
+            core.with_reactions(policy)
+        }
         None => core,
     };
     // After the log, whose channels no room's id may be.

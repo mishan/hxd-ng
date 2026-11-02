@@ -737,7 +737,8 @@ pub enum Event {
     },
 
     /// Reactions changed (`crate::reaction`): a room's lines in one
-    /// batch. Only to sessions whose transport declared reactions.
+    /// batch, or an instant message's change. Only to sessions whose
+    /// transport declared reactions.
     ReactionsChanged(Vec<crate::reaction::ReactionChange>),
 }
 

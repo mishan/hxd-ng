@@ -669,7 +669,7 @@ family document. Each family of §4 adds its own.
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
-| `react` | `target`, `key`, `remove?`; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
+| `react` | `target`, `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message cursor) | `{ "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
@@ -804,9 +804,9 @@ family document. Each family of §4 adds its own.
     KiB of them) the highest ids are left out and `has_more` is `true`,
     for the client to ask again for those.
 - **`react`**, with the `reactions` capability, adds a reaction, or with
-  `remove: true` takes one away, and answers the key's `count` after.
-  `target` is a `line` as `re` names one (`{ "line", "room"? }`), and
-  `key` one emoji, `{ "emoji": "\u2764\ufe0f" }`: one emoji sequence of at most 64
+  `remove: true` takes one away, and answers a line's key's `count`
+  after. `target` is a `line` as `re` names one (`{ "line", "room"? }`),
+  or an `im`, and `key` one emoji, `{ "emoji": "\u2764\ufe0f" }`: one emoji sequence of at most 64
   bytes of UTF-8 in its fully-qualified form (UTS #51). The server spells
   every key that way before it checks, keeps or compares it: it takes
   out every U+FE0F and puts one back after a keycap's base and after
@@ -817,7 +817,8 @@ family document. Each family of §4 adds its own.
   pictograph that takes none, two regional indicators that name no
   flag, a tag sequence, is kept as sent. Keys come back in that form. The login reply's `reactions` block, `{
   "targets": [ … ], "max_keys", "max_per_user" }`, lists the kinds of
-  target this server takes, `line` where it keeps history, and its caps.
+  target this server takes, `line` where it keeps history and `im` with
+  `messaging` as well, and its caps.
   - A reaction is its **account's**, by the mailbox rule (§7.1), shared
     by every session of the account and kept across a nick change, a
     reconnect and the account linking an identity. So a session of an
@@ -883,6 +884,26 @@ family document. Each family of §4 adds its own.
     is `access_denied`; on the line of someone the moderator may not
     moderate (moderation.md §2), `protected`; without a reason,
     `bad_request`. A `reason` on any other act is `bad_request`.
+  - **An `im` target**, `{ "im": { "login", "guid" } }` as `re` names
+    one, also names the conversation's other party, `with`, its login;
+    the target's `login` is the caller's or `with`'s, or the request is
+    `bad_request`, as is `with` beside any other kind. It is checked as
+    the instant messaging extension's IM Acknowledge (812) is: the two
+    must be friends or share an approval (§7.5), neither blocking the
+    other, or it is `no_such_target`. It is answered `{}`, never kept and
+    never looked up: the message is the clients' to match by its guid.
+    `with`'s attached messenger sessions, those that have read
+    `friends`, that declared `reactions` are told it as a change, `{ "target", "action": "add" | "remove", "key", "from": {
+    "login" } }`, under an approval only those that understand requests,
+    and once one is told nothing is kept. With none attached, the server
+    keeps the latest of each reactor's key on each message for it
+    (*hxd-ng:* in memory, at most 100 for an account, the reactor holding
+    the most giving up its oldest, and 50,000 for everyone, the oldest
+    anywhere going first; none older than `[inbox] retain_unread`), and
+    hands them over at its next `friends`, one `reactions_changed` a
+    conversation, by how the two may message then: none once they may
+    not, and an approval's to a session that understands requests. It
+    carries no presence.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event
@@ -1574,7 +1595,7 @@ news body is different: it declares its own type (news.md §5).
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, `react`, family requests | The server does not offer this. |
-| `no_such_target` | `react` | No such line, or one this session may not react to: one answer for all (§7.3). |
+| `no_such_target` | `react` | No such line, or one this session may not react to, or an instant message's party it may not message: one answer for all (§7.3). |
 | `too_many_reactions` | `react` | The line carries as many keys as it may, or this account as many of them as it may (§7.3). |
 | `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |

@@ -2693,29 +2693,42 @@ fn guest_at(core: &Core, addr: &str) -> (Uid, Events) {
 }
 
 /// [`guest_at`], proving `identity` where given.
+/// The shared guest account's session, as a login without a password
+/// makes one.
+fn guest_info(access: AccessBits, transport: crate::Transport) -> AttachInfo {
+    AttachInfo {
+        account: None,
+        nick: "visitor".into(),
+        icon: 1,
+        admin: false,
+        access,
+        login: "guest".into(),
+        addr: Some("10.0.9.9".parse().unwrap()),
+        can_detach: false,
+        transport,
+        has_inbox: false,
+        attach_news: false,
+        set_avatar: false,
+        moderate: false,
+        can_spam: false,
+        manage_rooms: false,
+        set_subject: false,
+        is_person: false,
+        reads_on_delivery: true,
+        identity: None,
+        system: false,
+    }
+}
+
 fn guest_as(core: &Core, addr: &str, identity: Option<[u8; 32]>) -> (Uid, Events) {
     let (uid, mut rx) = core
         .attach(AttachInfo {
-            account: None,
-            nick: "visitor".into(),
-            icon: 1,
-            admin: false,
-            access: AccessBits::empty().with(bit::SEND_MSGS),
-            login: "guest".into(),
             addr: Some(addr.parse().unwrap()),
-            can_detach: false,
-            transport: crate::Transport::default(),
-            has_inbox: false,
-            attach_news: false,
-            set_avatar: false,
-            moderate: false,
-            can_spam: false,
-            manage_rooms: false,
-            set_subject: false,
-            is_person: false,
-            reads_on_delivery: true,
             identity,
-            system: false,
+            ..guest_info(
+                AccessBits::empty().with(bit::SEND_MSGS),
+                crate::Transport::default(),
+            )
         })
         .unwrap();
     core.announce(uid);
@@ -3477,4 +3490,566 @@ fn a_request_is_reported_by_its_recipient_by_its_cursor() {
     let report = reports.report(filed.id).unwrap().unwrap();
     assert_eq!(report.target, ReportTarget::Msg(Some(asked.reference)));
     assert_eq!(report.evidence.as_deref(), Some("buy now"));
+}
+
+/// A server taking reactions, its accounts allowed to chat as well as
+/// message, the gate a reaction needs.
+fn reacting(logins: &[&str], reactions: crate::ReactionPolicy) -> Server {
+    let bits = messaging_bits().with(bit::SEND_CHAT);
+    let dir = Directory(logins.iter().map(|l| (Mailbox::login(*l), bits)).collect());
+    let rel = Arc::new(MemoryRelationships::new());
+    let inbox = Arc::new(MemoryStore::gated(rel.clone()));
+    let core = Core::new()
+        .with_inbox(inbox.clone(), Arc::new(dir), InboxPolicy::default())
+        .with_relationships(rel.clone())
+        .with_messaging(policy())
+        .with_reactions(reactions);
+    Server {
+        core: Arc::new(core),
+        rel,
+        inbox,
+    }
+}
+
+/// A messenger session that declared reactions, `hears` or not, and has
+/// read its roster.
+fn reactor(core: &Core, login: &str, hears: bool) -> (Uid, Events) {
+    let transport = crate::Transport {
+        reactions: hears,
+        ..Default::default()
+    };
+    let bits = messaging_bits().with(bit::SEND_CHAT);
+    let (uid, mut rx) = attach_on(core, login, bits, "10.0.0.1", transport, false);
+    core.friends_roster(uid).unwrap();
+    drain(&mut rx);
+    (uid, rx)
+}
+
+fn im_on(login: &str, n: u64) -> crate::reply::ImTarget {
+    let guid = MessageGuid::parse(&format!("5f5e1000-1234-4abc-89ab-{n:012x}")).unwrap();
+    match crate::reply::Reply::im(login.into(), guid) {
+        Some(crate::reply::Reply::Im(t)) => t,
+        _ => unreachable!("a login and a guid are a target"),
+    }
+}
+
+/// Instant-message reactions as a session was sent them, batch by batch.
+type ImHeard = Vec<Vec<(String, String, bool, String)>>;
+
+/// Each instant-message reaction a session was sent, as (message, key,
+/// added, reactor), batch by batch.
+fn im_reactions(evs: &[Event]) -> Vec<Vec<(String, String, bool, String)>> {
+    evs.iter()
+        .filter_map(|e| match e {
+            Event::ReactionsChanged(changes) => Some(
+                changes
+                    .iter()
+                    .map(|c| match c {
+                        crate::ReactionChange::Changed {
+                            target: crate::reply::Reply::Im(t),
+                            key: crate::ReactionKey::Emoji(k),
+                            add,
+                            from,
+                        } => (t.guid().to_string(), k.clone(), *add, from.clone()),
+                        other => panic!("not an instant message's: {other:?}"),
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Checked as IM Acknowledge is: to a friend, neither blocking the
+/// other, on a message one of the two sent, relayed to that friend
+/// alone; anyone else is no such target, and a message of neither's out
+/// of scope.
+#[test]
+fn an_im_reaction_reaches_its_party_and_nobody_else() {
+    use crate::ReactError::{NoSuchTarget, OutOfScope};
+    let s = reacting(
+        &["alice", "bob", "carol", "dave", "erin"],
+        crate::ReactionPolicy::default(),
+    );
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    let (c, mut rc) = reactor(&s.core, "carol", true);
+    let (e, mut re) = reactor(&s.core, "erin", true);
+    let (_, mut rd) = reactor(&s.core, "dave", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    friends(&s, a, &mut ra, c, &mut rc);
+    friends(&s, a, &mut ra, e, &mut re);
+    let msg = im_on("bob", 1);
+    assert_eq!(s.core.react_im(a, &msg, "bob", &thumbs, true), Ok(()));
+    let guid = msg.guid().to_string();
+    assert_eq!(
+        im_reactions(&drain(&mut rb)),
+        [vec![(guid, "\u{1F44D}".into(), true, "alice".into())]]
+    );
+    for rx in [&mut ra, &mut rc, &mut rd] {
+        assert!(im_reactions(&drain(rx)).is_empty());
+    }
+
+    s.core.inbox_block(c, "alice", true).unwrap();
+    s.core.inbox_block(a, "erin", true).unwrap();
+    for (case, target, with, want) in [
+        ("neither's", im_on("bob", 2), "carol", OutOfScope),
+        ("a stranger", im_on("alice", 3), "dave", NoSuchTarget),
+        (
+            "blocked by the party",
+            im_on("carol", 4),
+            "carol",
+            NoSuchTarget,
+        ),
+        ("blocking the party", im_on("erin", 5), "erin", NoSuchTarget),
+        ("nobody", im_on("alice", 6), "zed", NoSuchTarget),
+    ] {
+        assert_eq!(
+            s.core.react_im(a, &target, with, &thumbs, true),
+            Err(want),
+            "{case}"
+        );
+    }
+    for rx in [&mut rc, &mut rd, &mut re] {
+        assert!(im_reactions(&drain(rx)).is_empty());
+    }
+}
+
+/// A party with no session that hears reactions is kept the latest of
+/// each of them, within the bound and the inbox's age, and handed them at
+/// its next roster read as one batch a conversation.
+#[test]
+fn an_im_reaction_waits_for_a_party_away_the_latest_within_the_bound() {
+    use crate::reaction::IM_WAITING;
+    let s = reacting(
+        &["alice", "bob", "carol"],
+        crate::ReactionPolicy {
+            burst: 1000,
+            im_keep: Duration::from_secs(3600),
+            ..crate::ReactionPolicy::default()
+        },
+    );
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    let (c, mut rc) = reactor(&s.core, "carol", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    friends(&s, c, &mut rc, b, &mut rb);
+    s.core.end_session(b);
+    s.core
+        .react_im(c, &im_on("carol", 0), "bob", &thumbs, true)
+        .unwrap();
+    let sent = IM_WAITING as u64 + 5;
+    for n in 0..sent {
+        s.core
+            .react_im(a, &im_on("bob", n), "bob", &thumbs, true)
+            .unwrap();
+    }
+    s.core
+        .react_im(a, &im_on("bob", sent - 1), "bob", &thumbs, false)
+        .unwrap();
+
+    // A session that does not hear reactions leaves them waiting.
+    let back = |hears| {
+        let transport = crate::Transport {
+            reactions: hears,
+            ..Default::default()
+        };
+        let (b, mut rb) = attach_on(
+            &s.core,
+            "bob",
+            messaging_bits(),
+            "10.0.0.1",
+            transport,
+            false,
+        );
+        s.core.friends_roster(b).unwrap();
+        let told = im_reactions(&drain(&mut rb));
+        (b, rb, told)
+    };
+    let (plain, _, told) = back(false);
+    assert!(told.is_empty());
+    s.core.end_session(plain);
+    let (b, mut rb, batches) = back(true);
+    // Carol's came first and stays: alice, who holds the most, gives up
+    // her own oldest instead.
+    assert_eq!(batches.len(), 2, "one a conversation");
+    assert_eq!(batches[0].len(), 1);
+    assert_eq!(batches[0][0].3, "carol");
+    let from_alice: Vec<u64> = batches[1]
+        .iter()
+        .map(|(g, ..)| u64::from_str_radix(&g.replace('-', "")[20..], 16).unwrap())
+        .collect();
+    let want: Vec<u64> = (sent + 1 - IM_WAITING as u64..sent).collect();
+    assert_eq!(from_alice, want);
+    assert!(batches[1].iter().all(|(.., from)| from == "alice"));
+    assert_eq!(batches[1].last().map(|r| r.2), Some(false), "the latest");
+    s.core.friends_roster(b).unwrap();
+    assert!(im_reactions(&drain(&mut rb)).is_empty(), "handed over once");
+
+    // And none older than the inbox would keep the message.
+    s.core.end_session(b);
+    s.core
+        .react_im(a, &im_on("bob", 0), "bob", &thumbs, false)
+        .unwrap();
+    s.core.clock.advance(Duration::from_secs(3601));
+    assert!(back(true).2.is_empty());
+}
+
+/// What waits is handed over by how the two may message when it is:
+/// nothing once they are not friends, an approval's only to a session
+/// that understands requests, and a friendship's to any session that
+/// hears reactions, though it waited under an approval.
+#[test]
+fn a_waiting_im_reaction_goes_by_how_the_two_may_message_now() {
+    let s = reacting(&["alice", "bob", "carol"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core.end_session(b);
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core.friend_remove(a, "bob").unwrap();
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert!(
+        im_reactions(&drain(&mut rb)).is_empty(),
+        "no longer friends"
+    );
+
+    // Carol writes to bob, who approves; she reacts while he is away.
+    let (c, _) = taker(&s.core, "carol");
+    let (b, _) = taker(&s.core, "bob");
+    send(&s.core, c, "bob", "hello?").unwrap();
+    s.core
+        .request_answer(b, "carol", RequestAction::Approve)
+        .unwrap();
+    let bobs: Vec<Uid> = (s.core.roster.lock().unwrap().users.iter())
+        .filter(|(_, sess)| sess.login == "bob")
+        .map(|(uid, _)| *uid)
+        .collect();
+    for uid in bobs {
+        s.core.end_session(uid);
+    }
+    let (c, _) = reactor(&s.core, "carol", true);
+    s.core
+        .react_im(c, &im_on("carol", 2), "bob", &thumbs, true)
+        .unwrap();
+    let (plain, mut rb) = reactor_reading(&s.core, "bob");
+    assert!(
+        im_reactions(&drain(&mut rb)).is_empty(),
+        "an approval's waits for a session that understands requests"
+    );
+    s.core.end_session(plain);
+    // Friends now, it is the friendship's.
+    let (bob, mut rbob) = reactor(&s.core, "bob", false);
+    let (carol, mut rcarol) = reactor(&s.core, "carol", false);
+    friends(&s, carol, &mut rcarol, bob, &mut rbob);
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert_eq!(im_reactions(&drain(&mut rb)).len(), 1);
+}
+
+/// A session of `login` that hears reactions and does not understand
+/// requests, its roster read and nothing of it drained.
+fn reactor_reading(core: &Core, login: &str) -> (Uid, Events) {
+    let transport = crate::Transport {
+        reactions: true,
+        ..Default::default()
+    };
+    let bits = messaging_bits().with(bit::SEND_CHAT);
+    let (uid, rx) = attach_on(core, login, bits, "10.0.0.1", transport, false);
+    core.friends_roster(uid).unwrap();
+    (uid, rx)
+}
+
+/// An account's deletion takes what waits for it: a later holder of its
+/// login, made a friend again before the wait is up, is handed nothing
+/// of the one before.
+#[test]
+fn a_deleted_accounts_waiting_im_reactions_go_with_it() {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core.end_session(b);
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core.inbox_purge(&Mailbox::login("bob"));
+
+    // The next bob, quiet until he is alice's friend.
+    let bits = messaging_bits().with(bit::SEND_CHAT);
+    let quiet = crate::Transport::default();
+    let (b, _) = attach_on(&s.core, "bob", bits, "10.0.0.1", quiet, false);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+}
+
+/// A session of `login` under the identity `fp` that hears reactions,
+/// its roster read, and the reactions it was handed there.
+fn identified_reading(core: &Core, login: &str, fp: [u8; 32]) -> (Uid, ImHeard) {
+    let (uid, mut rx) = attach_identified(core, login, fp);
+    {
+        let mut r = core.roster.lock().unwrap();
+        let sess = r.users.get_mut(&uid).unwrap();
+        sess.info.transport.reactions = true;
+        sess.access = sess.access.with(bit::SEND_CHAT);
+    }
+    core.friends_roster(uid).unwrap();
+    (uid, im_reactions(&drain(&mut rx)))
+}
+
+/// A login is matched as the accounts directory matches it, a removal
+/// is told as one, a guest may not react, and an approval's reaction
+/// reaches only a session that understands requests.
+#[test]
+fn an_im_reaction_is_spelled_relayed_and_gated_as_an_acknowledgement_is() {
+    let s = reacting(&["alice", "bob", "carol"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    let told = |rb: &mut Events| {
+        im_reactions(&drain(rb))
+            .concat()
+            .into_iter()
+            .map(|(_, _, add, from)| (add, from))
+            .collect::<Vec<_>>()
+    };
+    for (case, target, with, add) in [
+        ("another case", im_on("BOB", 1), "Bob", true),
+        ("a removal", im_on("bob", 1), "bob", false),
+    ] {
+        assert_eq!(
+            s.core.react_im(a, &target, with, &thumbs, add),
+            Ok(()),
+            "{case}"
+        );
+        assert_eq!(told(&mut rb), [(add, "alice".to_string())], "{case}");
+    }
+    // A real guest, that may chat and hears reactions: refused as one,
+    // not as a server without the feature.
+    let (g, _rg) = {
+        let transport = crate::Transport {
+            reactions: true,
+            ..Default::default()
+        };
+        let bits = messaging_bits().with(bit::SEND_CHAT);
+        let (uid, rx) = s.core.attach(guest_info(bits, transport)).unwrap();
+        s.core.announce(uid);
+        (uid, rx)
+    };
+    assert_eq!(
+        s.core.react_im(g, &im_on("bob", 2), "bob", &thumbs, true),
+        Err(crate::ReactError::NotAllowed),
+        "a guest"
+    );
+
+    // Under an approval, bob's session that understands requests hears it
+    // and his other does not.
+    let (c, _) = taker(&s.core, "carol");
+    let (b2, mut rb2) = taker(&s.core, "bob");
+    send(&s.core, c, "bob", "hello?").unwrap();
+    s.core
+        .request_answer(b2, "carol", RequestAction::Approve)
+        .unwrap();
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&b2)
+        .unwrap()
+        .info
+        .transport
+        .reactions = true;
+    (s.core.roster.lock().unwrap().users.get_mut(&c).unwrap()).access =
+        messaging_bits().with(bit::SEND_CHAT);
+    drain(&mut rb);
+    drain(&mut rb2);
+    s.core
+        .react_im(c, &im_on("carol", 3), "bob", &thumbs, true)
+        .unwrap();
+    assert_eq!(told(&mut rb2), [(true, "carol".to_string())]);
+    assert!(told(&mut rb).is_empty());
+}
+
+/// What waits follows its recipient through a link, and is handed to
+/// the account under its new key.
+#[test]
+fn waiting_im_reactions_follow_a_link() {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    let away = |login: &str| {
+        let gone: Vec<Uid> = (s.core.roster.lock().unwrap().users.iter())
+            .filter(|(_, sess)| sess.login == login)
+            .map(|(uid, _)| *uid)
+            .collect();
+        for uid in gone {
+            s.core.end_session(uid);
+        }
+    };
+    let guid = |n: u64| im_on("bob", n).guid().to_string();
+    let heard = |batches: Vec<Vec<(String, String, bool, String)>>| -> Vec<String> {
+        batches.concat().into_iter().map(|(g, ..)| g).collect()
+    };
+
+    // Waiting for bob as he links an identity.
+    away("bob");
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core.inbox_claim("bob", &[1; 32]);
+    let (_, got) = identified_reading(&s.core, "bob", [1; 32]);
+    assert_eq!(heard(got), [guid(1)], "the link");
+}
+
+/// Alice and bob friends, bob's one session a messenger that does not
+/// hear reactions yet, and alice's thumbs-up on bob's message 1 waiting
+/// for him; bob's session and its events.
+fn waiting_for_bob() -> (Server, Uid, Uid, Events) {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", false);
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&b)
+        .unwrap()
+        .info
+        .transport
+        .reactions = true;
+    drain(&mut rb);
+    (s, a, b, rb)
+}
+
+/// A drain whose relationship could not be read keeps what it took for
+/// the next, and hands it over once it can.
+#[test]
+fn a_drain_that_cannot_read_a_relationship_keeps_what_it_took() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    s.core.im_reactions_drain(b, &bob, |_| Err(()));
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+    s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// A change told live stands in place of what waited of the same key,
+/// whether it waited still or a drain had taken it: an older add is
+/// never handed over after the remove that followed it.
+#[test]
+fn a_live_change_stands_in_place_of_what_waited() {
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let bob = Mailbox::login("bob");
+    for in_flight in [false, true] {
+        let (s, a, b, mut rb) = waiting_for_bob();
+        let remove = || {
+            s.core
+                .react_im(a, &im_on("bob", 1), "bob", &thumbs, false)
+                .unwrap()
+        };
+        if in_flight {
+            s.core.im_reactions_drain(b, &bob, |_| {
+                remove();
+                Ok(Some(false))
+            });
+        } else {
+            remove();
+            s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+        }
+        let told: Vec<bool> = (im_reactions(&drain(&mut rb)).concat().into_iter())
+            .map(|(_, _, add, _)| add)
+            .collect();
+        assert_eq!(told, [false], "in flight: {in_flight}");
+    }
+}
+
+/// An account deleted while a drain of its own checks relationships is
+/// kept nothing of what the drain took.
+#[test]
+fn a_purge_during_a_drain_keeps_nothing_for_the_account() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    // Under an approval to a session that does not understand requests,
+    // what was taken would be kept again.
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.inbox_purge(&bob);
+        Ok(Some(true))
+    });
+    s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+}
+
+/// A drain hands over only to the session it took for: one that ended
+/// meanwhile leaves what it took waiting for the account's next.
+#[test]
+fn a_drain_for_a_session_gone_meanwhile_keeps_what_it_took() {
+    let (s, _, b, _) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.end_session(b);
+        Ok(Some(false))
+    });
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// A reactor given a new key while its drain judged the relationship
+/// under the old one is not known to be gone: what it reacted waits for
+/// the next drain rather than being given up.
+#[test]
+fn a_drain_keeps_what_a_rekeyed_reactor_reacted() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    let (bare, linked) = (
+        Mailbox::login("alice"),
+        Mailbox::identified("alice", [5; 32]),
+    );
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.rekey_reactions(&bare, &linked);
+        Ok(None)
+    });
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+    s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// What happens during a drain is played over what it took in order: a
+/// reactor's new key, then that key's deletion, leaves nothing of it.
+#[test]
+fn a_drain_replays_a_rekey_then_a_deletion_in_order() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    let (bare, linked) = (
+        Mailbox::login("alice"),
+        Mailbox::identified("alice", [5; 32]),
+    );
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.rekey_reactions(&bare, &linked);
+        s.core.forget_waiting_reactions(&linked);
+        Ok(Some(false))
+    });
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
 }

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::access::bit;
 use crate::history::LineId;
 use crate::inbox::{Mailbox, StoreError};
+use crate::messaging::Key;
 use crate::moderation::{Act, ActKind, Actor, ModError, Subject, MAX_ACT_REASON};
 use crate::reply::Reply;
 use crate::roster::{reads_public_chat, Event, RosterInner, Uid, UserSession};
@@ -34,6 +35,15 @@ pub const MAX_LIVE_WINDOW: usize = 500;
 
 /// Lines one op tombstones at most.
 const GONE_CHUNK: usize = 256;
+
+/// Instant-message reactions kept for one party while it has no session
+/// to hear them; past it, the reactor holding the most gives up its
+/// oldest.
+pub const IM_WAITING: usize = 100;
+
+/// Instant-message reactions kept for everyone at once; past it, the
+/// oldest anywhere goes.
+pub const IM_WAITING_ALL: usize = 50_000;
 
 /// What may be reacted with. Packed as the stores keep it, a kind byte
 /// and the kind's bytes, so that a server's own emoji (kind 2, by id)
@@ -364,6 +374,9 @@ pub struct ReactionPolicy {
     /// How long a room's changes are gathered into one announcement: no
     /// session hears more than one a room in it.
     pub batch: Duration,
+    /// How long an instant-message reaction waits for a party with no
+    /// session: the inbox's unread retention, as the messages it is on.
+    pub im_keep: Duration,
 }
 
 impl Default for ReactionPolicy {
@@ -376,6 +389,7 @@ impl Default for ReactionPolicy {
             read_only_rooms: true,
             live_window: 200,
             batch: Duration::from_secs(1),
+            im_keep: Duration::from_secs(30 * 24 * 3600),
         }
     }
 }
@@ -394,6 +408,14 @@ pub enum ReactionChange {
     /// Every reaction on a line is gone: a moderator cleared it, or it
     /// was redacted.
     Clear { target: Reply },
+    /// `from`'s account added (`add`) or removed `key` on an instant
+    /// message, told to the conversation's other party alone.
+    Changed {
+        target: Reply,
+        key: ReactionKey,
+        add: bool,
+        from: String,
+    },
 }
 
 impl ReactionChange {
@@ -412,6 +434,12 @@ impl ReactionChange {
                         + mine.len()
                 }
                 ReactionChange::Clear { .. } => 0,
+                ReactionChange::Changed {
+                    target,
+                    key: k,
+                    from,
+                    ..
+                } => target.pack().len() + key(k) + from.len(),
             }
     }
 }
@@ -448,9 +476,44 @@ struct Owed {
     lines: BTreeMap<LineId, Owe>,
 }
 
+/// An instant-message reaction kept for a party with no session: the
+/// change, told as [`ReactionChange::Changed`] under the reactor's name
+/// when it is handed over.
+struct Waiting {
+    from: Mailbox,
+    target: Reply,
+    key: ReactionKey,
+    add: bool,
+    at: Instant,
+    /// Its place in [`Live::order`], given when it is kept.
+    seq: u64,
+}
+
+impl Waiting {
+    fn new(from: Mailbox, target: Reply, key: ReactionKey, add: bool, at: Instant) -> Self {
+        Waiting {
+            from,
+            target,
+            key,
+            add,
+            at,
+            seq: 0,
+        }
+    }
+
+    fn change(self) -> ReactionChange {
+        ReactionChange::Changed {
+            target: self.target,
+            key: self.key,
+            add: self.add,
+            from: self.from.login,
+        }
+    }
+}
+
 /// What reactions are announced from, at the desk ([`desk`]): which
-/// lines are live, and what has changed on them since their room's last
-/// batch.
+/// lines are live, what has changed on them since their room's last
+/// batch, and the instant-message reactions waiting for their party.
 ///
 /// Bounded by the rooms rather than by anyone's backlog: a room holds at
 /// most its live window's lines, owed or not, however many react and
@@ -466,6 +529,87 @@ pub(crate) struct Live {
     room_of: HashMap<LineId, u32>,
     owed: HashMap<u32, Owed>,
     wake: Arc<tokio::sync::Notify>,
+    waiting: HashMap<Key, VecDeque<Waiting>>,
+    /// How many `waiting` holds, so the server-wide bound costs nothing
+    /// to ask.
+    waiting_len: usize,
+    /// Everything `waiting` holds, oldest first, by whom it waits for:
+    /// what the server-wide bound gives up first. An entry whose change
+    /// has gone since is passed over when it comes up, and the whole is
+    /// rebuilt once such entries outnumber the rest.
+    order: BTreeMap<(Instant, u64), Key>,
+    next_seq: u64,
+    /// How long an instant-message reaction may wait, and how many may
+    /// for everyone at once.
+    im_keep: Duration,
+    waiting_all: usize,
+    /// Drains under way, between taking what waited and handing it over.
+    drains: HashMap<u64, Drain>,
+    next_drain: u64,
+}
+
+/// What a drain took, and what has happened since that it must give way
+/// to when it hands over: a live change to the same key, the account's
+/// deletion or its new key.
+struct Drain {
+    to: Key,
+    /// The session it is for, by its serial, since a uid is reused.
+    uid: Uid,
+    serial: u64,
+    /// What it took, by its reactors as they are now named.
+    taken: Vec<(Key, Reply, ReactionKey)>,
+    /// What happened to it since, in order, replayed in that order.
+    events: Vec<DrainEvent>,
+    gone: bool,
+}
+
+/// What a drain under way gives way to.
+enum DrainEvent {
+    /// A change of one of the keys it took was told live then.
+    Told(Key, Reply, ReactionKey, Instant),
+    /// A reactor of what it took was deleted.
+    Purged(Key),
+    /// A reactor of what it took is now named so.
+    Renamed(Key, Mailbox),
+}
+
+impl Drain {
+    /// What of `w` is left once every event since it was taken has been
+    /// played over it in order.
+    fn replay(&self, mut w: Waiting) -> Option<Waiting> {
+        for ev in &self.events {
+            match ev {
+                DrainEvent::Renamed(old, to) => rename(&mut w, old, to),
+                DrainEvent::Purged(k) => {
+                    if Key::of(&w.from) == *k {
+                        return None;
+                    }
+                }
+                DrainEvent::Told(r, t, k, at) => {
+                    if identity_of(&w) == (r.clone(), t, k) && *at >= w.at {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(w)
+    }
+
+    fn took_from(&self, reactor: &Key) -> bool {
+        self.taken.iter().any(|(r, _, _)| r == reactor)
+    }
+
+    /// Was `reactor` named anew since the drain began: a relationship
+    /// judged under the old name says nothing of the new.
+    fn renamed(&self, reactor: &Key) -> bool {
+        (self.events.iter()).any(|e| matches!(e, DrainEvent::Renamed(old, _) if old == reactor))
+    }
+}
+
+/// Which reactor, message and key a waiting change is of: the latest of
+/// each stands.
+fn identity_of(w: &Waiting) -> (Key, &Reply, &ReactionKey) {
+    (Key::of(&w.from), &w.target, &w.key)
 }
 
 impl Live {
@@ -561,6 +705,206 @@ impl Live {
         }
         self.owed.remove(&room);
     }
+
+    /// Give up the instant-message reactions that have waited too long.
+    fn prune(&mut self, now: Instant) {
+        let keep = self.im_keep;
+        self.waiting.retain(|_, queue| {
+            queue.retain(|w| now.duration_since(w.at) < keep);
+            !queue.is_empty()
+        });
+        self.recount();
+    }
+
+    fn recount(&mut self) {
+        self.waiting_len = self.waiting.values().map(VecDeque::len).sum();
+        if self.order.len() > 2 * self.waiting_len {
+            self.order = (self.waiting.iter())
+                .flat_map(|(k, q)| q.iter().map(move |w| ((w.at, w.seq), k.clone())))
+                .collect();
+        }
+    }
+
+    /// What waits for `to` and has not waited too long, taken to hand
+    /// over, and the drain that took it, which what happens meanwhile is
+    /// noted against.
+    fn take(
+        &mut self,
+        to: &Key,
+        uid: Uid,
+        serial: u64,
+        now: Instant,
+    ) -> Option<(u64, VecDeque<Waiting>)> {
+        let mut queue = self.waiting.remove(to)?;
+        self.waiting_len -= queue.len();
+        let keep = self.im_keep;
+        queue.retain(|w| now.duration_since(w.at) < keep);
+        self.next_drain += 1;
+        let taken = (queue.iter())
+            .map(|w| {
+                let (k, t, key) = identity_of(w);
+                (k, t.clone(), key.clone())
+            })
+            .collect();
+        let drain = Drain {
+            to: to.clone(),
+            uid,
+            serial,
+            taken,
+            events: Vec::new(),
+            gone: false,
+        };
+        self.drains.insert(self.next_drain, drain);
+        Some((self.next_drain, queue))
+    }
+
+    /// `w` was told live to `to`'s sessions: what waits of the same key
+    /// gives way to it, and so does what a drain under way took.
+    fn told_live(&mut self, to: &Key, w: &Waiting) {
+        let (reactor, target, key) = identity_of(w);
+        if let Some(queue) = self.waiting.get_mut(to) {
+            let before = queue.len();
+            queue.retain(|q| identity_of(q) != (reactor.clone(), target, key));
+            self.waiting_len -= before - queue.len();
+            if queue.is_empty() {
+                self.waiting.remove(to);
+            }
+        }
+        for d in self.drains.values_mut().filter(|d| d.to == *to) {
+            let took = (d.taken.iter()).any(|(r, t, k)| *r == reactor && t == target && k == key);
+            if took {
+                let ev = DrainEvent::Told(reactor.clone(), target.clone(), key.clone(), w.at);
+                d.events.push(ev);
+            }
+        }
+    }
+
+    /// `from`'s account is `to`'s now: what waits for it, and what it
+    /// reacted, follow, each kept again as anything new is, so the
+    /// latest of each and the bounds hold across the merge; and a drain
+    /// under way hands over under the new key.
+    fn rekey(&mut self, from: &Mailbox, to: &Mailbox, now: Instant) {
+        let (old, new) = (Key::of(from), Key::of(to));
+        if old == new {
+            return;
+        }
+        for d in self.drains.values_mut() {
+            if d.to == old {
+                d.to = new.clone();
+            }
+            if d.took_from(&old) {
+                d.events.push(DrainEvent::Renamed(old.clone(), to.clone()));
+                for (r, _, _) in d.taken.iter_mut().filter(|(r, _, _)| *r == old) {
+                    *r = new.clone();
+                }
+            }
+        }
+        let touched: Vec<Key> = (self.waiting.iter())
+            .filter(|(k, q)| **k == old || q.iter().any(|w| Key::of(&w.from) == old))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut moved = Vec::new();
+        for k in touched {
+            let queue = self.waiting.remove(&k).unwrap_or_default();
+            self.waiting_len -= queue.len();
+            let k = if k == old { new.clone() } else { k };
+            moved.extend(queue.into_iter().map(|w| (k.clone(), w)));
+        }
+        moved.sort_by_key(|(_, w)| w.at);
+        for (k, mut w) in moved {
+            rename(&mut w, &old, to);
+            self.keep(k, w, now);
+        }
+    }
+
+    /// An account is gone: nothing waits for it or from it, and a drain
+    /// under way for it or with its reactions hands none of them over.
+    fn forget(&mut self, who: &Mailbox) {
+        let key = Key::of(who);
+        for d in self.drains.values_mut() {
+            if d.to == key {
+                d.gone = true;
+            }
+            if d.took_from(&key) {
+                d.events.push(DrainEvent::Purged(key.clone()));
+            }
+        }
+        self.waiting.remove(&key);
+        self.waiting.retain(|_, queue| {
+            queue.retain(|w| Key::of(&w.from) != key);
+            !queue.is_empty()
+        });
+        self.recount();
+    }
+
+    /// Keep `w` for `to`: the one way anything joins the waiting, so its
+    /// rules hold whatever comes in. The latest of each reactor's key on
+    /// each message stands, an older one arriving late giving way;
+    /// nothing older than the policy's age is kept; past [`IM_WAITING`]
+    /// the reactor holding the most gives up its oldest, so one cannot
+    /// crowd the others out; and past the server-wide bound the oldest
+    /// anywhere goes.
+    fn keep(&mut self, to: Key, mut w: Waiting, now: Instant) {
+        let keep = self.im_keep;
+        let queue = self.waiting.entry(to.clone()).or_default();
+        let before = queue.len();
+        queue.retain(|q| now.duration_since(q.at) < keep);
+        let me = identity_of(&w);
+        let superseded = queue.iter().any(|q| identity_of(q) == me && q.at > w.at);
+        if !superseded && now.duration_since(w.at) < keep {
+            queue.retain(|q| identity_of(q) != me);
+            self.next_seq += 1;
+            w.seq = self.next_seq;
+            self.order.insert((w.at, w.seq), to.clone());
+            let at = queue.partition_point(|q| q.at <= w.at);
+            queue.insert(at, w);
+        }
+        while queue.len() > IM_WAITING {
+            let mut held: HashMap<Key, usize> = HashMap::new();
+            for q in queue.iter() {
+                *held.entry(Key::of(&q.from)).or_default() += 1;
+            }
+            let most = held.values().max().copied();
+            let Some(i) = (queue.iter()).position(|q| held.get(&Key::of(&q.from)).copied() == most)
+            else {
+                break;
+            };
+            queue.remove(i);
+        }
+        self.waiting_len = self.waiting_len - before + queue.len();
+        if queue.is_empty() {
+            self.waiting.remove(&to);
+        }
+        while self.waiting_len > self.waiting_all {
+            let Some(((_, seq), k)) = self.order.pop_first() else {
+                break;
+            };
+            let Some(q) = self.waiting.get_mut(&k) else {
+                continue;
+            };
+            if let Some(i) = q.iter().position(|w| w.seq == seq) {
+                q.remove(i);
+                self.waiting_len -= 1;
+                if q.is_empty() {
+                    self.waiting.remove(&k);
+                }
+            }
+        }
+        if self.order.len() > 2 * self.waiting_len + IM_WAITING {
+            self.recount();
+        }
+    }
+}
+
+/// `w`'s reactor, if it is `old`, as `to` names it now. A rotation names
+/// the successor by its key alone.
+fn rename(w: &mut Waiting, old: &Key, to: &Mailbox) {
+    if Key::of(&w.from) == *old {
+        w.from.fingerprint = to.fingerprint;
+        if !to.login.is_empty() {
+            w.from.login = to.login.clone();
+        }
+    }
 }
 
 /// Does `s` hear `room`'s reactions as they change: a session that
@@ -644,6 +988,15 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Does this messenger session hear instant-message reactions: one that
+/// declared them and is attached, and under an approval one that
+/// understands requests, as a receipt is told.
+fn im_hears(s: &UserSession, approval: bool) -> bool {
+    s.info.transport.reactions
+        && crate::roster::is_live(s)
+        && (!approval || crate::messaging::understands_requests(s))
+}
+
 /// Why a reaction was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReactError {
@@ -662,6 +1015,9 @@ pub enum ReactError {
     BadRequest(&'static str),
     /// A clear on the line of someone this moderator may not moderate.
     Protected,
+    /// An instant message named neither the caller nor the party it
+    /// names as the other.
+    OutOfScope,
     ServerError,
 }
 
@@ -675,6 +1031,8 @@ impl Core {
             let live = self.desk.live.get_mut().unwrap_or_else(|e| e.into_inner());
             live.window = policy.live_window;
             live.batch = policy.batch;
+            live.im_keep = policy.im_keep;
+            live.waiting_all = IM_WAITING_ALL;
         }
         self.reactions = Some(policy);
         self
@@ -811,6 +1169,13 @@ impl Core {
                 }
             }
         });
+    }
+
+    /// An account deleted: no instant-message reaction waits for it or
+    /// from it, so a later holder of the login is handed none.
+    pub(crate) fn forget_waiting_reactions(&self, who: &Mailbox) {
+        let who = who.clone();
+        self.desk(move |_, live| live.forget(&who));
     }
 
     /// Tombstone `ids` with their reactions, the live ones that had any
@@ -989,6 +1354,13 @@ impl Core {
         (self.desk.live().recent.get(&room)).is_some_and(|r| !r.is_empty())
     }
 
+    /// Give up the instant-message reactions that have waited too long:
+    /// the binary's flusher runs this now and then, so that ones never
+    /// handed over do not stay.
+    pub fn reactions_prune(&self) {
+        self.desk(move |c, live| live.prune(c.clock.now()));
+    }
+
     /// Notified when a room first owes a batch.
     pub fn reactions_wake(&self) -> Arc<tokio::sync::Notify> {
         self.desk.wake.clone()
@@ -1120,9 +1492,154 @@ impl Core {
         done.unwrap_or_else(|| Err(StoreError::new("a reaction desk op panicked")))
     }
 
+    /// Relay `change` from `from` to `to`'s sessions that hear reactions,
+    /// those that understand requests alone under an `approval`, or keep
+    /// it for them when there are none. Only an attached session is
+    /// told, and what one is told is kept for nobody: it stands in place
+    /// of anything of the same key that waited.
+    pub(crate) fn im_reaction(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+        approval: bool,
+        (target, key, add): (Reply, ReactionKey, bool),
+    ) {
+        let (from, to) = (from.clone(), to.clone());
+        self.desk(move |c, live| {
+            let now = c.clock.now();
+            let w = Waiting::new(from, target, key, add, now);
+            let mut r = c.roster.lock().unwrap();
+            let told: Vec<Uid> = (r.messengers(&Key::of(&to)).into_iter())
+                .filter(|u| r.users.get(u).is_some_and(|s| im_hears(s, approval)))
+                .collect();
+            if told.is_empty() {
+                drop(r);
+                live.keep(Key::of(&to), w, now);
+                return;
+            }
+            let change = ReactionChange::Changed {
+                target: w.target.clone(),
+                key: w.key.clone(),
+                add: w.add,
+                from: w.from.login.clone(),
+            };
+            for uid in told {
+                r.send_to(uid, Event::ReactionsChanged(vec![change.clone()]));
+            }
+            drop(r);
+            live.told_live(&Key::of(&to), &w);
+        });
+    }
+
+    /// Hand `uid`, at its roster read, the instant-message reactions kept
+    /// for its account: one event a conversation, still fresh, and by
+    /// how the two may message now, which `relation` says of each
+    /// reactor as `im_relation` does, asked with no lock held. A
+    /// conversation they may no longer have is given up; one under an
+    /// approval waits for a session that understands requests; and one
+    /// whose relationship could not be read waits for the next roster
+    /// read. What happened at the desk meanwhile stands: a change told
+    /// live since, the account's deletion or its new key.
+    pub(crate) fn im_reactions_drain(
+        &self,
+        uid: Uid,
+        me: &Mailbox,
+        relation: impl Fn(&Mailbox) -> Result<Option<bool>, ()>,
+    ) {
+        if self.reactions.is_none() {
+            return;
+        }
+        let key = Key::of(me);
+        let taken = self.desk(move |c, live| {
+            let serial = {
+                let r = c.roster.lock().unwrap();
+                let s = r.users.get(&uid)?;
+                if !im_hears(s, false) {
+                    return None;
+                }
+                s.serial
+            };
+            live.take(&key, uid, serial, c.clock.now())
+        });
+        let Some((drain, queue)) = taken else {
+            return;
+        };
+        // A relationship check that panics still ends the drain.
+        let mut ended = DrainEnd {
+            core: self,
+            drain: Some(drain),
+        };
+        let mut conversations: Vec<(Mailbox, Vec<Waiting>)> = Vec::new();
+        for w in queue {
+            match (conversations.iter_mut()).find(|(m, _)| Key::of(m) == Key::of(&w.from)) {
+                Some((_, kept)) => kept.push(w),
+                None => conversations.push((w.from.clone(), vec![w])),
+            }
+        }
+        let judged: Vec<_> = (conversations.into_iter())
+            .map(|(from, kept)| (relation(&from), kept))
+            .collect();
+        ended.drain = None;
+        self.desk(move |c, live| c.hand_over(live, drain, judged));
+    }
+
+    /// At the desk, the second half of a drain: what it took, as what
+    /// happened since leaves it, handed over or kept again. Whether the
+    /// session understands requests is asked now, as it is when it is
+    /// told anything else.
+    fn hand_over(&self, live: &mut Live, drain: u64, judged: Judged) {
+        let Some(d) = live.drains.remove(&drain) else {
+            return;
+        };
+        if d.gone {
+            return;
+        }
+        let now = self.clock.now();
+        let mut back = Vec::new();
+        let mut r = self.roster.lock().unwrap();
+        // The session it was taken for, still there and still hearing;
+        // otherwise all of it waits again.
+        let session = (r.users.get(&d.uid)).filter(|s| s.serial == d.serial && im_hears(s, false));
+        let (there, understands) = (
+            session.is_some(),
+            session.is_some_and(|s| im_hears(s, true)),
+        );
+        let uid = d.uid;
+        for (mut relation, kept) in judged {
+            // Judged under a name the reactor no longer has: not known.
+            if kept.first().is_some_and(|w| d.renamed(&Key::of(&w.from))) && relation == Ok(None) {
+                relation = Err(());
+            }
+            let kept: Vec<Waiting> = kept.into_iter().filter_map(|w| d.replay(w)).collect();
+            if !there {
+                if !matches!(relation, Ok(None)) {
+                    back.extend(kept);
+                }
+                continue;
+            }
+            let deliver = match relation {
+                // Confirmed gone: given up.
+                Ok(None) => continue,
+                // Not known: kept for the next roster read.
+                Err(()) => false,
+                Ok(Some(approval)) => !approval || understands,
+            };
+            if !deliver {
+                back.extend(kept);
+            } else if !kept.is_empty() {
+                let changes = kept.into_iter().map(Waiting::change).collect();
+                r.send_to(uid, Event::ReactionsChanged(changes));
+            }
+        }
+        drop(r);
+        for w in back {
+            live.keep(d.to.clone(), w, now);
+        }
+    }
+
     /// `from`'s reactions are `to`'s now: an account linked an identity.
     /// A live line that lost one, held under both, is told as it now
-    /// stands.
+    /// stands, and what waits for it or from it follows.
     pub(crate) fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) {
         if let Err(e) = self.rekey_all_reactions(from, to) {
             tracing::warn!("chat log would not move {}'s reactions: {e}", from.login);
@@ -1138,6 +1655,7 @@ impl Core {
         let (from, to) = (from.clone(), to.clone());
         self.desk(move |c, live| {
             let now = c.clock.now();
+            live.rekey(&from, &to, now);
             if let Some(log) = c.history.as_ref() {
                 for line in log.rekey_reactions(&from, &to)? {
                     live.owe(line, Owe::Summary, now);
@@ -1147,6 +1665,27 @@ impl Core {
         })
     }
 }
+
+/// Ends a drain whose hand-over never comes, as a panicking
+/// relationship check's does not.
+struct DrainEnd<'a> {
+    core: &'a Core,
+    drain: Option<u64>,
+}
+
+impl Drop for DrainEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(drain) = self.drain.take() {
+            self.core.desk(move |_, live| {
+                live.drains.remove(&drain);
+            });
+        }
+    }
+}
+
+/// A drain's conversations, each with how the two may message, `Err`
+/// where that could not be read.
+type Judged = Vec<(Result<Option<bool>, ()>, Vec<Waiting>)>;
 
 /// A room's batch as the desk took it: what each line owes, the keys of
 /// those owed a summary, and who reacted to them.
@@ -1461,6 +2000,43 @@ mod tests {
             batches(&mut ra),
             [vec![(line, Some((vec![(thumbs(), 1)], vec![])))]]
         );
+    }
+
+    /// However they come, by a merge of two accounts' queues included,
+    /// what waits for one account is held to its bound, each reactor to
+    /// a fair share of it, and counted as it stands.
+    #[test]
+    fn a_merge_of_waiting_queues_keeps_their_bounds() {
+        let mut live = Live {
+            im_keep: Duration::from_secs(3600),
+            waiting_all: IM_WAITING_ALL,
+            ..Live::default()
+        };
+        let now = Instant::now();
+        let waiting = |from: &str, n: u64| {
+            let guid =
+                crate::inbox::MessageGuid::parse(&format!("5f5e1000-1234-4abc-89ab-{n:012x}"))
+                    .unwrap();
+            Waiting::new(
+                Mailbox::login(from),
+                Reply::im("bob".into(), guid).unwrap(),
+                thumbs(),
+                true,
+                now,
+            )
+        };
+        let (bare, linked) = (Mailbox::login("bob"), Mailbox::identified("bob", [7; 32]));
+        let share = IM_WAITING as u64 * 4 / 5;
+        for n in 0..share {
+            live.keep(Key::of(&bare), waiting("alice", n), now);
+            live.keep(Key::of(&linked), waiting("carol", n), now);
+        }
+        live.rekey(&bare, &linked, now);
+        assert_eq!(live.waiting.len(), 1);
+        let queue = &live.waiting[&Key::of(&linked)];
+        assert_eq!((queue.len(), live.waiting_len), (IM_WAITING, IM_WAITING));
+        let alices = queue.iter().filter(|w| w.from.login == "alice").count();
+        assert_eq!(alices, IM_WAITING / 2);
     }
 
     /// Only a room's most recent lines are told as they change; an older
