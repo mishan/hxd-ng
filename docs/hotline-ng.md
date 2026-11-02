@@ -233,6 +233,9 @@ There are three message shapes, told apart by their keys:
   `bad_request`.
 - The server MUST answer every request with exactly one reply, and MUST
   answer requests in the order they were received (rationale §5). A
+  reply MUST NOT be older than an event sent before it: an event for a
+  change the reply does not show is sent after the reply. A client may
+  therefore apply replies and events in the order they arrive. A
   request still outstanding when the connection closes — lost, or closed
   by the server after `kicked` — goes unanswered; a client MUST treat it
   as failed.
