@@ -20,7 +20,7 @@
 //! holding the roster must tell the desk is never waited on: a relayed
 //! line goes to a buffer of each room's newest, at most its live window,
 //! which the next run takes first, and a room archived is posted as an op
-//! for the next leader.
+//! for the next leader, waking the flusher when there is none.
 //!
 //! A panic in an op, or in the log under one, answers that op's caller
 //! as a panic and nobody else's: the run goes on, the lead is handed on.
@@ -105,14 +105,31 @@ struct State {
     leading: bool,
 }
 
-#[derive(Default)]
 pub(crate) struct Desk {
     state: Mutex<State>,
+    /// The flusher's, shared with [`Live`]: also woken by an op posted
+    /// to a desk nobody leads, which the flusher's next run applies.
+    pub(super) wake: Arc<tokio::sync::Notify>,
     /// Held by the leader alone while it applies a run.
     pub(super) live: Mutex<Live>,
     /// Lines relayed since the last run, each room's newest, at most its
     /// live window: what the next run takes first.
     relayed: Mutex<HashMap<u32, VecDeque<LineId>>>,
+}
+
+impl Default for Desk {
+    fn default() -> Self {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        Desk {
+            state: Mutex::default(),
+            live: Mutex::new(Live {
+                wake: wake.clone(),
+                ..Live::default()
+            }),
+            wake,
+            relayed: Mutex::default(),
+        }
+    }
 }
 
 /// An op that panicked, answered to its caller as that.
@@ -199,7 +216,12 @@ impl Core {
             slot: Mutex::new(Slot::Waiting),
             ready: Condvar::new(),
         });
-        self.desk.state.lock().unwrap().queue.push_back(ticket);
+        let mut st = self.desk.state.lock().unwrap();
+        st.queue.push_back(ticket);
+        // Otherwise it would wait for whoever next waits on the desk.
+        if !st.leading {
+            self.desk.wake.notify_one();
+        }
     }
 
     /// One reaction to the log, in a run's one transaction, and the line

@@ -1335,6 +1335,57 @@ fn a_rooms_reactions_are_told_to_its_members_alone() {
     assert_eq!(told(&mut ralice), [there]);
 }
 
+/// An archived room's live lines go as soon as the flusher is woken,
+/// on a server where nothing else waits on the desk: the post wakes it.
+#[test]
+fn an_archived_rooms_live_lines_go_on_an_idle_server() {
+    let core = reacting(Core::new());
+    let (boss, _rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    say(&core, boss, room, "here").unwrap().unwrap();
+    let wake = core.reactions_wake();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let woken = |within: u64| {
+        let within = std::time::Duration::from_millis(within);
+        rt.block_on(async { tokio::time::timeout(within, wake.notified()).await.is_ok() })
+    };
+    core.reactions_flush(core.clock.now());
+    woken(10);
+    assert!(core.reactions_room_live(room));
+    core.room_archive(boss, room, true).unwrap();
+    assert!(woken(1000), "the flusher was not woken");
+    core.reactions_flush(core.clock.now());
+    assert!(!core.reactions_room_live(room));
+}
+
+/// However often the rooms are written, a room's close is posted to the
+/// desk once.
+#[test]
+fn a_room_closed_is_posted_once_however_often_rooms_are_written() {
+    let core = reacting(Core::new());
+    let (boss, _rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    let other = core.room_create(boss, named("den")).unwrap().id;
+    core.room_archive(boss, room, true).unwrap();
+    assert_eq!(core.desk.backlog().0, 1);
+    for n in 0..3 {
+        core.room_edit(boss, other, named(&format!("den-{n}")))
+            .unwrap();
+        core.room_archive(boss, room, true).unwrap();
+    }
+    assert_eq!(
+        core.desk.backlog().0,
+        1,
+        "posted again for a room closed before"
+    );
+    core.room_archive(boss, other, true).unwrap();
+    assert_eq!(core.desk.backlog().0, 2);
+}
+
 /// A member that joined after a line, without history's bit, is told
 /// nothing of that line's reactions.
 #[test]

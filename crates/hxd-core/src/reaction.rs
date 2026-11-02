@@ -876,9 +876,15 @@ impl Core {
         }
     }
 
+    /// Does `room` keep live lines at the desk.
+    #[cfg(test)]
+    pub(crate) fn reactions_room_live(&self, room: u32) -> bool {
+        (self.desk.live().recent.get(&room)).is_some_and(|r| !r.is_empty())
+    }
+
     /// Notified when a room first owes a batch.
     pub fn reactions_wake(&self) -> Arc<tokio::sync::Notify> {
-        self.desk.live().wake.clone()
+        self.desk.wake.clone()
     }
 
     /// One room's batch, to every session that hears the room, of the
