@@ -351,10 +351,13 @@ fn send_until(
             tokio::spawn(async move {
                 let count = ctx.scenario.target.accounts.as_ref().map_or(1, |a| a.count);
                 for seq in 0.. {
-                    let due = start + Duration::from_secs_f64((seq * n + k) as f64 / rate);
-                    if due >= end {
+                    // Compared before it is a `Duration`: a tiny rate puts
+                    // the offset past what one can hold.
+                    let offset = (seq * n + k) as f64 / rate;
+                    if offset >= end.saturating_sub(start).as_secs_f64() {
                         break;
                     }
+                    let due = start + Duration::from_secs_f64(offset);
                     if let Err(e) = drain_until(&mut m, ctx.t0 + due).await {
                         ctx.stats.error("mail.sent", &e.to_string());
                         break;

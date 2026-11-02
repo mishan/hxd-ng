@@ -104,11 +104,12 @@ impl Scenario {
         if self.run.scenario == Kind::LoginStorm
             && (self.login_storm.mail > 0 || self.login_storm.msg_rate > 0.0)
             && !(self.login_storm.accounts
+                && self.target.accounts.as_ref().is_some_and(|a| a.count > 0)
                 && self.target.admin.is_some()
                 && self.login_storm.senders > 0)
         {
             return Err("[login_storm] mail and msg_rate need accounts = true, \
-                 [target] admin and senders"
+                 [target] accounts, admin and senders"
                 .into());
         }
         if self.run.scenario == Kind::Churn
@@ -1014,5 +1015,16 @@ mod tests {
                     [run]\nscenario = \"churn\"\n[churn]\nng = 3\n";
         let err = Scenario::parse(text).unwrap_err();
         assert!(err.contains("accounts"), "{err}");
+    }
+
+    #[test]
+    fn mail_with_no_accounts_to_send_it_to_is_refused() {
+        let text = "[target]\nng = \"127.0.0.1:1\"\nlegacy = \"127.0.0.1:2\"\n\
+                    [target.accounts]\nprefix = \"u\"\ncount = 0\npassword = \"p\"\n\
+                    [target.admin]\nlogin = \"admin\"\npassword = \"p\"\n\
+                    [run]\nscenario = \"login_storm\"\n\
+                    [login_storm]\naccounts = true\nsenders = 1\nmsg_rate = 1\n";
+        let err = Scenario::parse(text).unwrap_err();
+        assert!(err.contains("mail and msg_rate"), "{err}");
     }
 }
