@@ -1,0 +1,26 @@
+# R-1: a reaction storm on the lobby's most recent lines while others
+# read, and one client that stops reading. The accounts come from
+#
+#   hxd-load accounts <server's accounts dir> --prefix react --count 50 \
+#       --password <pw>
+#
+# and the server needs `[history]`, `[reactions] enabled`, a `burst` and
+# `per_second` that let each account react `rate / reactors` times a
+# second, and `batch_seconds` equal to `[reactions] batch` here.
+
+[target]
+ng = "127.0.0.1:5700"
+metrics = true
+accounts = { prefix = "react", count = 50, password = "change-me" }
+
+[run]
+scenario = "reactions"
+duration = 60
+
+[reactions]
+reactors = 50
+readers = 200
+stalled = 2
+rate = 100
+lines = 50
+batch = 1.0

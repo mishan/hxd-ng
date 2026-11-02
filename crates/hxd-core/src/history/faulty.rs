@@ -194,8 +194,16 @@ impl ChatLog for FaultyLog {
         self.inner.forget_reactions(who, since)
     }
 
-    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<Vec<LineId>, StoreError> {
         self.inner.rekey_reactions(from, to)
+    }
+
+    fn reactors_on(
+        &self,
+        ids: &[LineId],
+    ) -> Result<Vec<(LineId, String, ReactionKey)>, StoreError> {
+        self.fails("reactors_on")?;
+        self.inner.reactors_on(ids)
     }
 
     fn tombstone_all(

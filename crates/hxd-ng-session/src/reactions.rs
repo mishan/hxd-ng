@@ -1,8 +1,8 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
-//! line, and a line's reactions on the `history` that shows it, to
-//! sessions that declared it.
+//! line, a line's reactions on the `history` that shows it, and
+//! `reactions_changed`, to sessions that declared it.
 
-use hxd_core::{ReactError, ReactionKey, Reactions, Reply};
+use hxd_core::{ReactError, ReactionChange, ReactionKey, Reactions, Reply};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -56,6 +56,29 @@ pub(crate) fn add(v: &mut Value, shown: Option<&Reactions>) {
         .collect();
     if !shown.mine.is_empty() {
         v["reactions_mine"] = json!(shown.mine);
+    }
+}
+
+/// A change as `reactions_changed` carries it.
+pub(crate) fn change_json(change: &ReactionChange) -> Value {
+    match change {
+        ReactionChange::Summary { target, keys, mine } => {
+            let mut v = json!({
+                "target": crate::replies::json(target),
+                "action": "summary",
+                "keys": keys
+                    .iter()
+                    .map(|(k, n)| json!({ "key": key_json(k), "count": n }))
+                    .collect::<Vec<_>>(),
+            });
+            if !mine.is_empty() {
+                v["mine"] = json!(mine);
+            }
+            v
+        }
+        ReactionChange::Clear { target } => {
+            json!({ "target": crate::replies::json(target), "action": "clear" })
+        }
     }
 }
 

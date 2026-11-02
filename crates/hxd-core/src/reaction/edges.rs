@@ -1,16 +1,18 @@
-//! The paths through the reaction desk that a healthy store and a quiet
-//! server never take: store failures, panics, races, and the order its
-//! locks are taken in.
+//! The paths through the reaction desk and the live announcements that a
+//! healthy store and a quiet server never take: store failures, panics,
+//! races, the order the locks are taken in, the bounds, and the gates a
+//! session can lose between a change and its batch.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use super::tests::{hearing, ng, party, said, thumbs};
+use super::tests::{batches, bits, hearing, ng, party, said, server, thumbs};
 use super::*;
 use crate::history::faulty::FaultyLog;
 use crate::history::HistoryPolicy;
-use crate::{MemoryModeration, ModerationPolicy, ModerationStore};
+use crate::roster::drain;
+use crate::{Events, MemoryModeration, ModerationPolicy, ModerationStore, Transport};
 
 /// A core on the fault-injecting log, moderated in `moderation`.
 fn on_faulty(moderation: Arc<dyn ModerationStore>) -> (Arc<Core>, Arc<FaultyLog>) {
@@ -35,6 +37,178 @@ fn arrived(core: &Core, n: usize) {
         );
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Let a room's owed batch go: the clock moved past it, and flushed.
+fn flush(core: &Core) {
+    core.clock.advance(Duration::from_secs(5));
+    core.reactions_flush(core.clock.now());
+}
+
+/// A batch whose summaries could not be read is owed again, and the
+/// next flush tells it whole.
+#[test]
+fn a_batch_that_could_not_be_read_goes_in_the_next() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let [one, two] = ["one", "two"].map(|t| said(&core, alice, t));
+    core.react(alice, 0, two, &thumbs(), true).unwrap();
+    flush(&core);
+    drain(&mut ra);
+    core.react(alice, 0, one, &party(), true).unwrap();
+    core.react(alice, 0, two, &thumbs(), false).unwrap();
+    log.fail("reactions", true);
+    flush(&core);
+    assert!(batches(&mut ra).is_empty(), "nothing could be told");
+    log.fail("reactions", false);
+    flush(&core);
+    assert_eq!(
+        batches(&mut ra),
+        [vec![
+            (one, Some((vec![(party(), 1)], vec![0]))),
+            (two, Some((vec![], vec![])))
+        ]]
+    );
+}
+
+/// A reaction applied as its line is redacted is never told after the
+/// redaction as anything but cleared: the redaction waits at the desk
+/// behind it, and its clear stands.
+#[test]
+fn a_reaction_racing_a_redaction_is_told_after_it_as_cleared() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "regrettable");
+    drain(&mut ra);
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("react_all", at.clone());
+    let reacting = {
+        let core = core.clone();
+        thread::spawn(move || core.react(alice, 0, line, &thumbs(), true))
+    };
+    at.wait();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    arrived(&core, 1);
+    at.wait();
+    reacting.join().unwrap().unwrap();
+    redacting.join().unwrap().unwrap();
+    flush(&core);
+    assert_nothing_but_clears_after_the_redaction(&drain(&mut ra), line);
+}
+
+/// After `line`'s redaction, `told` holds no summary of it.
+fn assert_nothing_but_clears_after_the_redaction(told: &[Event], line: LineId) {
+    let redacted = (told.iter())
+        .position(|e| matches!(e, Event::ChatRedacted { id } if *id == line))
+        .expect("the redaction is told");
+    for e in &told[redacted..] {
+        if let Event::ReactionsChanged(changes) = e {
+            for c in changes {
+                if let ReactionChange::Summary {
+                    target: Reply::Line { id, .. },
+                    ..
+                } = c
+                {
+                    assert_ne!(*id, line, "a summary after the redaction: {told:?}");
+                }
+            }
+        }
+    }
+}
+
+/// A batch read while its line is redacted goes before the redaction,
+/// under the room's serial, and the redaction's clear after it.
+#[test]
+fn a_batch_taken_as_its_line_is_redacted_goes_before_the_redaction() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "regrettable");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    drain(&mut ra);
+    core.clock.advance(Duration::from_secs(5));
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let flushing = {
+        let core = core.clone();
+        thread::spawn(move || core.reactions_flush(core.clock.now()))
+    };
+    at.wait();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    // The redaction waits on the room's serial, which the desk does not
+    // count; long enough for it to have reached it.
+    thread::sleep(Duration::from_millis(100));
+    at.wait();
+    flushing.join().unwrap();
+    redacting.join().unwrap().unwrap();
+    flush(&core);
+    let told = drain(&mut ra);
+    assert_nothing_but_clears_after_the_redaction(&told, line);
+    assert!(told.iter().any(|e| matches!(e, Event::ReactionsChanged(_))));
+}
+
+/// A redaction that cannot read which of its lines had reactions tells
+/// each as cleared, rather than leaving a reacted line uncleared.
+#[test]
+fn a_redaction_that_cannot_read_reactions_clears_its_lines() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "one");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    flush(&core);
+    drain(&mut ra);
+    log.fail("reactions", true);
+    core.redact_line(crate::Actor::Session(carol), line, "no")
+        .unwrap();
+    log.fail("reactions", false);
+    flush(&core);
+    assert_eq!(batches(&mut ra), [vec![(line, None)]]);
+}
+
+/// A batch owed while the last was being taken and sent is due a whole
+/// batch after that one went, however long it took.
+#[test]
+fn a_batch_owed_while_the_last_went_is_due_a_batch_after_it() {
+    let mut live = Live {
+        window: 10,
+        batch: Duration::from_secs(1),
+        ..Live::default()
+    };
+    live.relayed(0, 1);
+    let t = Instant::now();
+    live.owe(1, Owe::Summary, t);
+    live.sent(0, t + Duration::from_secs(3));
+    assert!(live.owed[&0].due >= t + Duration::from_secs(4));
+}
+
+/// The lines a room owes stay within its live window between batches:
+/// one the window moved past owes nothing.
+#[test]
+fn the_owed_lines_stay_within_the_window() {
+    let (core, _log) = server(ReactionPolicy {
+        live_window: 2,
+        ..ReactionPolicy::default()
+    });
+    let (alice, _rx) = hearing(&core, "alice", ng(), false);
+    let lines = [said(&core, alice, "a"), said(&core, alice, "b")];
+    for line in lines {
+        core.react(alice, 0, line, &thumbs(), true).unwrap();
+    }
+    for t in ["c", "d", "e"] {
+        said(&core, alice, t);
+    }
+    // Whatever was posted is applied by the next op at the desk.
+    core.desk(|_, _| ());
+    let owed = core.desk.live().owed.get(&0).map_or(0, |o| o.lines.len());
+    assert_eq!(owed, 0);
 }
 
 /// What one leader finds queued behind it goes to the log in one
@@ -64,8 +238,10 @@ fn reactions_queued_together_go_to_the_log_together() {
     assert_eq!(*log.runs.lock().unwrap(), [1, 4]);
 }
 
-/// Every caller of the desk at once: redactions, which wait on it
-/// holding a room's serial; reactions and rekeys. All of them finish.
+/// Every caller of the desk at once: lines said, which tell it from
+/// under the roster; redactions, which wait on it holding a room's
+/// serial; batches, taken and sent under the serial; reactions and
+/// rekeys. All of them finish.
 #[test]
 fn reactions_redactions_and_rekeys_together_finish() {
     let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
@@ -89,6 +265,10 @@ fn reactions_redactions_and_rekeys_together_finish() {
             let (a, b) = (Mailbox::login("erin"), Mailbox::identified("erin", [3; 32]));
             c.rekey_reactions(&a, &b);
             c.rekey_reactions(&b, &a);
+        }),
+        Box::new(|c| {
+            c.clock.advance(Duration::from_secs(2));
+            c.reactions_flush(c.clock.now());
         }),
     ];
     let n = work.len();
@@ -135,6 +315,137 @@ fn queued_together(
     for q in queued {
         let _ = q.join();
     }
+}
+
+/// A session that loses its right to read a line between the change
+/// and its batch is not told it.
+#[test]
+fn a_reader_that_lost_the_line_before_its_batch_hears_nothing() {
+    type Lose = fn(&Core, Uid, Uid, u32);
+    let cases: [(&str, Lose); 4] = [
+        ("read_chat taken", |core, _, reader, _| {
+            (core.roster.lock().unwrap().users.get_mut(&reader).unwrap()).access =
+                bits(&[bit::SEND_CHAT]);
+        }),
+        ("left the room", |core, _, reader, room| {
+            core.room_part(reader, room).unwrap();
+        }),
+        ("parted by its gate", |core, boss, _, room| {
+            let edit = crate::rooms::RoomEdit {
+                read: Some(vec!["boss".into()]),
+                ..Default::default()
+            };
+            core.room_edit(boss, room, edit).unwrap();
+        }),
+        ("the room archived", |core, boss, _, room| {
+            core.room_archive(boss, room, true).unwrap();
+        }),
+    ];
+    for (case, lose) in cases {
+        let core = Core::new()
+            .with_history(
+                Arc::new(crate::history::MemoryLog::default()),
+                HistoryPolicy::default(),
+            )
+            .with_reactions(ReactionPolicy::default())
+            .with_rooms(
+                Arc::new(crate::rooms::MemoryRooms::default()),
+                crate::RoomPolicy::default(),
+            )
+            .unwrap();
+        let (boss, _) = hearing(&core, "boss", ng(), false);
+        core.roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&boss)
+            .unwrap()
+            .manage_rooms = true;
+        let (reader, mut rr) = hearing(&core, "reader", ng(), false);
+        // The lobby's case reads the lobby; the rest a room.
+        let room = match case {
+            "read_chat taken" => 0,
+            _ => {
+                let edit = crate::rooms::RoomEdit {
+                    name: Some("den".into()),
+                    ..Default::default()
+                };
+                let room = core.room_create(boss, edit).unwrap().id;
+                core.room_join(boss, room).unwrap();
+                core.room_join(reader, room).unwrap();
+                room
+            }
+        };
+        let line = core
+            .chat_public_all(boss, room, vec![("hi".into(), 0, None)])
+            .pop()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        core.react(boss, room, line, &thumbs(), true).unwrap();
+        lose(&core, boss, reader, room);
+        drain(&mut rr);
+        flush(&core);
+        let told = drain(&mut rr);
+        assert!(
+            !told.iter().any(|e| matches!(e, Event::ReactionsChanged(_))),
+            "{case}: {told:?}"
+        );
+    }
+}
+
+/// An account's deletion tells the live lines it had reacted to as they
+/// now stand.
+#[test]
+fn an_accounts_deletion_tells_its_live_lines() {
+    let (core, _log) = server(ReactionPolicy::default());
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (bob, _) = hearing(&core, "bob", ng(), false);
+    let line = said(&core, alice, "one");
+    core.react(bob, 0, line, &thumbs(), true).unwrap();
+    core.react(alice, 0, line, &party(), true).unwrap();
+    flush(&core);
+    drain(&mut ra);
+    core.inbox_purge(&Mailbox::login("bob"));
+    flush(&core);
+    assert_eq!(
+        batches(&mut ra),
+        [vec![(line, Some((vec![(party(), 1)], vec![0])))]]
+    );
+}
+
+/// A reader that never reads is cut off by what it is owed, each batch
+/// weighed for the summaries it carries, long before the queue's count
+/// of events would: buffered for a while, never without end.
+#[test]
+fn a_reader_that_never_reads_is_cut_off_by_the_weight_of_its_batches() {
+    let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let reactors: Vec<Uid> = (0..4)
+        .map(|i| hearing(&core, &format!("r{i}"), Transport::default(), false).0)
+        .collect();
+    let (stuck, _rx): (Uid, Events) = hearing(&core, "stuck", ng(), false);
+    let keys: Vec<ReactionKey> = (0..20u32)
+        .map(|i| ReactionKey::emoji(&char::from_u32(0x1F600 + i).unwrap().to_string()).unwrap())
+        .collect();
+    let lines: Vec<LineId> = (0..100)
+        .map(|n| said(&core, reactors[0], &format!("l{n}")))
+        .collect();
+    for &line in &lines {
+        for (i, key) in keys.iter().enumerate() {
+            core.react(reactors[i / 5], 0, line, key, true).unwrap();
+        }
+    }
+    let mut batches = 0;
+    while !core.is_lagging(stuck) && batches < crate::roster::LIVE_QUEUE_CAP {
+        for &line in &lines {
+            core.react(reactors[0], 0, line, &keys[0], batches % 2 == 1)
+                .unwrap();
+        }
+        flush(&core);
+        batches += 1;
+    }
+    assert!(core.is_lagging(stuck), "never cut off");
+    assert!(batches < 1000, "cut off by count, after {batches} batches");
 }
 
 /// A run whose one transaction fails is applied again an act at a time,
@@ -271,6 +582,38 @@ fn a_panic_in_the_log_does_not_stop_the_desk() {
         .expect("the desk stopped after a panic");
     let other = said(&core, alice, "two");
     assert_eq!(core.react(alice, 0, other, &thumbs(), true), Ok(1));
+}
+
+/// Lines relayed with nobody reacting wait for the desk no more than a
+/// room's live window of them, however many there are.
+#[test]
+fn relayed_lines_wait_for_the_desk_within_the_window() {
+    let (core, _log) = server(ReactionPolicy {
+        live_window: 50,
+        ..ReactionPolicy::default()
+    });
+    let (alice, _rx) = hearing(&core, "alice", ng(), false);
+    for n in 0..300 {
+        said(&core, alice, &format!("l{n}"));
+    }
+    assert_eq!(core.desk.backlog(), (0, 50));
+}
+
+/// A line reacted to and unreacted within one batch, then redacted, is
+/// told after the redaction as nothing at all, not as a summary of none.
+#[test]
+fn a_redacted_line_whose_reactions_came_and_went_is_told_nothing_after() {
+    let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "regrettable");
+    drain(&mut ra);
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    core.react(alice, 0, line, &thumbs(), false).unwrap();
+    core.redact_line(crate::Actor::Session(carol), line, "no")
+        .unwrap();
+    flush(&core);
+    assert_nothing_but_clears_after_the_redaction(&drain(&mut ra), line);
 }
 
 /// A redaction waits on the desk holding its room's serial and nothing
