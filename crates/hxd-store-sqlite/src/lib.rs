@@ -3451,7 +3451,10 @@ impl ChatLog for SqliteStore {
         to: &hxd_core::inbox::Mailbox,
     ) -> Result<Vec<LineId>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(StoreError::new)?;
+        // Immediate, as `prune` is: the first statement is a read.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
         let (from, to) = (reactor_key(from), reactor_key(to));
         let lost: Vec<i64> = tx
             .prepare(

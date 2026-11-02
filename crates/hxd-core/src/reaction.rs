@@ -484,6 +484,9 @@ pub(crate) struct Live {
     owed: HashMap<u32, Owed>,
     wake: Arc<tokio::sync::Notify>,
     waiting: HashMap<Key, VecDeque<Waiting>>,
+    /// How many `waiting` holds, so the server-wide bound costs nothing
+    /// to ask.
+    waiting_len: usize,
 }
 
 impl Live {
@@ -525,6 +528,30 @@ impl Live {
         }
     }
 
+    /// A batch that could not be read, owed again: behind any change
+    /// since, which is newer, but a redaction stands.
+    fn restore(&mut self, room: u32, lines: BTreeMap<LineId, Owe>, now: Instant) {
+        let lines: Vec<_> = (lines.into_iter())
+            .filter(|(id, _)| self.room_of.contains_key(id))
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let owed = self.owed.entry(room).or_insert_with(|| {
+            self.wake.notify_one();
+            Owed {
+                due: now + self.batch,
+                lines: BTreeMap::new(),
+            }
+        });
+        for (id, what) in lines {
+            let at = owed.lines.entry(id).or_insert(what);
+            if what == Owe::Gone {
+                *at = Owe::Gone;
+            }
+        }
+    }
+
     pub(crate) fn is_live(&self, line: LineId) -> bool {
         self.room_of.contains_key(&line)
     }
@@ -544,6 +571,62 @@ impl Live {
             queue.retain(|w| now.duration_since(w.at) < keep);
             !queue.is_empty()
         });
+        self.recount();
+    }
+
+    fn recount(&mut self) {
+        self.waiting_len = self.waiting.values().map(VecDeque::len).sum();
+    }
+
+    /// What waits for `to`, taken to hand over.
+    fn take(&mut self, to: &Key) -> Option<VecDeque<Waiting>> {
+        let queue = self.waiting.remove(to)?;
+        self.waiting_len -= queue.len();
+        Some(queue)
+    }
+
+    /// `back`, taken and not handed over, ahead of what came meanwhile.
+    fn put_back(&mut self, to: Key, mut back: Vec<Waiting>) {
+        back.sort_by_key(|w| w.at);
+        self.waiting_len += back.len();
+        let queue = self.waiting.entry(to).or_default();
+        for w in back.into_iter().rev() {
+            queue.push_front(w);
+        }
+    }
+
+    /// `from`'s account is `to`'s now: what waits for it, and what it
+    /// reacted, follow.
+    fn rekey(&mut self, from: &Mailbox, to: &Mailbox) {
+        let (old, new) = (Key::of(from), Key::of(to));
+        if old == new {
+            return;
+        }
+        if let Some(moved) = self.waiting.remove(&old) {
+            let queue = self.waiting.entry(new.clone()).or_default();
+            queue.extend(moved);
+            queue.make_contiguous().sort_by_key(|w| w.at);
+        }
+        for w in self.waiting.values_mut().flatten() {
+            if Key::of(&w.from) == old {
+                // A rotation names the successor by its key alone.
+                w.from.fingerprint = to.fingerprint;
+                if !to.login.is_empty() {
+                    w.from.login = to.login.clone();
+                }
+            }
+        }
+    }
+
+    /// An account is gone: nothing waits for it or from it.
+    fn forget(&mut self, who: &Mailbox) {
+        let key = Key::of(who);
+        self.waiting.remove(&key);
+        self.waiting.retain(|_, queue| {
+            queue.retain(|w| Key::of(&w.from) != key);
+            !queue.is_empty()
+        });
+        self.recount();
     }
 
     /// Keep `change` for `to`, from `from`, in place of one it replaces:
@@ -566,11 +649,13 @@ impl Live {
             ) => t1 == t2 && k1 == k2,
             _ => false,
         };
+        let before = queue.len();
         queue.retain(|q| {
             !(Key::of(&q.from) == Key::of(&w.from) && same(&q.change, &w.change))
                 && w.at.duration_since(q.at) < keep
         });
         queue.push_back(w);
+        self.waiting_len = self.waiting_len + queue.len() - before;
         if queue.len() > IM_WAITING {
             // The reactor holding the most gives up its oldest, so one
             // cannot crowd the others out.
@@ -584,15 +669,17 @@ impl Live {
                 .position(|q| held.get(&Key::of(&q.from)).copied() == most)
             {
                 queue.remove(i);
+                self.waiting_len -= 1;
             }
         }
-        while self.waiting.values().map(VecDeque::len).sum::<usize>() > IM_WAITING_ALL {
+        while self.waiting_len > IM_WAITING_ALL {
             let oldest = (self.waiting.iter())
                 .filter_map(|(k, q)| q.front().map(|w| (w.at, k.clone())))
                 .min_by_key(|(at, _)| *at);
             let Some((_, k)) = oldest else { break };
             if let Some(q) = self.waiting.get_mut(&k) {
                 q.pop_front();
+                self.waiting_len -= 1;
                 if q.is_empty() {
                     self.waiting.remove(&k);
                 }
@@ -870,6 +957,18 @@ impl Core {
         }
     }
 
+    /// `from`'s waiting instant-message reactions are `to`'s: an
+    /// identity rotated, which moves the log's itself.
+    pub(crate) fn rekey_waiting_reactions(&self, from: &Mailbox, to: &Mailbox) {
+        self.roster.lock().unwrap().live.rekey(from, to);
+    }
+
+    /// An account deleted: no instant-message reaction waits for it or
+    /// from it, so a later holder of the login is handed none.
+    pub(crate) fn forget_waiting_reactions(&self, who: &Mailbox) {
+        self.roster.lock().unwrap().live.forget(who);
+    }
+
     /// Of `ids`, about to be redacted, the live ones that carry
     /// reactions, to be told as cleared once they are
     /// ([`Core::reactions_gone`]).
@@ -1046,7 +1145,11 @@ impl Core {
         let (mut shown, held) = match read() {
             Ok(read) => read,
             Err(e) => {
+                // Owed again rather than lost: a clear among them needs
+                // no read, but goes in its order with the rest.
                 tracing::warn!("chat log would not read reactions: {e}");
+                let now = self.clock.now();
+                self.roster.lock().unwrap().live.restore(room, lines, now);
                 return;
             }
         };
@@ -1158,7 +1261,7 @@ impl Core {
             if !hears {
                 return;
             }
-            let Some(queue) = r.live.waiting.remove(&Key::of(me)) else {
+            let Some(queue) = r.live.take(&Key::of(me)) else {
                 return;
             };
             (understands, queue)
@@ -1189,11 +1292,7 @@ impl Core {
             }
         }
         if !back.is_empty() {
-            back.sort_by_key(|w| w.at);
-            let queue = r.live.waiting.entry(Key::of(me)).or_default();
-            for w in back.into_iter().rev() {
-                queue.push_front(w);
-            }
+            r.live.put_back(Key::of(me), back);
         }
     }
 
@@ -1201,6 +1300,7 @@ impl Core {
     /// A live line that lost one, held under both, is told as it now
     /// stands.
     pub(crate) fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) {
+        self.roster.lock().unwrap().live.rekey(from, to);
         match self
             .history
             .as_ref()

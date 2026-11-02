@@ -3292,6 +3292,7 @@ impl Core {
     /// `news_rotate`). Returns how much mail went.
     pub fn inbox_purge(&self, of: &Mailbox) -> usize {
         self.forget_reactions(of, Duration::MAX);
+        self.forget_waiting_reactions(of);
         self.news_subs_purge(of);
         self.devices_purge(of);
         self.purge_relationships(of);

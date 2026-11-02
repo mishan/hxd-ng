@@ -1282,7 +1282,8 @@ session that declared `reactions`: once one is told, nothing is kept.
 One reactor filling an account's share gives up its own oldest rather
 than another's, the server holds so many for everyone at once, the
 oldest anywhere going first, and an hourly sweep gives up what has
-waited too long.
+waited too long. They follow an account that links or rotates its
+identity, and go with one that is deleted, to it or from it.
 
 ### `[media]`
 

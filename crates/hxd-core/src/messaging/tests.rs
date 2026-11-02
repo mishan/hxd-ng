@@ -3747,3 +3747,35 @@ fn reactor_reading(core: &Core, login: &str) -> (Uid, Events) {
     core.friends_roster(uid).unwrap();
     (uid, rx)
 }
+
+/// An account's deletion takes what waits for it: a later holder of its
+/// login, made a friend again before the wait is up, is handed nothing
+/// of the one before.
+#[test]
+fn a_deleted_accounts_waiting_im_reactions_go_with_it() {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core.end_session(b);
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core.inbox_purge(&Mailbox::login("bob"));
+
+    // The next bob, quiet until he is alice's friend.
+    let bits = messaging_bits().with(bit::SEND_CHAT);
+    let quiet = crate::Transport::default();
+    let (b, _) = attach_on(&s.core, "bob", bits, "10.0.0.1", quiet, false);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    let (_, mut rb) = reactor_reading(&s.core, "bob");
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+}

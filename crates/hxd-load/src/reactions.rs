@@ -253,13 +253,18 @@ async fn read(
 /// shows it once the storm has passed: no change lost, none told out of
 /// order.
 async fn converged(ctx: &Ctx, creds: (String, String), lines: &[u64], heard: &[Heard]) {
+    // Unchecked is not held: a run that could not look fails.
     let mut observer = match join(ctx, ctx.nick('V', 0), Some(creds)).await {
         Ok(c) => c,
-        Err(e) => return ctx.stats.error("reactions.observer", &e),
+        Err(e) => return ctx.checks.violated("reactions.converged", e),
     };
     let shown = match observer.request("history", json!({ "ids": lines })).await {
         Ok(v) => v,
-        Err(e) => return ctx.stats.error("reactions.history", &e.to_string()),
+        Err(e) => {
+            let _ = observer.logout().await;
+            let why = format!("history could not be read: {e}");
+            return ctx.checks.violated("reactions.converged", why);
+        }
     };
     let _ = observer.logout().await;
     let kept: HashMap<u64, Value> = (shown["lines"].as_array().into_iter().flatten())

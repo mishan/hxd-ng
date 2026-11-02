@@ -191,8 +191,8 @@ The ng wire alone, against a server with `[history]` and `[reactions]`.
 `rate` times a second together, evenly staggered, on the `lines` most
 recent lines the first of them said, each adding a key from a short set
 or taking away one it added. `readers` guests read, and `stalled`
-guests log in and never read again. Every client but the stalled
-declares `reactions` and reads every `reactions_changed` it is sent.
+guests log in and never read again. Every client declares `reactions`;
+all but the stalled read every `reactions_changed` they are sent.
 The server's own rate, `[reactions] burst` and `per_second`, must allow
 `rate / reactors` a second for each account, or its refusals are the
 reactors' errors; `lines` must sit inside its `live_window`, and
