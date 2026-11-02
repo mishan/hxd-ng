@@ -1546,7 +1546,7 @@ impl Core {
         me: &Mailbox,
         relation: impl Fn(&Mailbox) -> Result<Option<bool>, ()>,
     ) {
-        if self.reactions.is_none() {
+        if self.reaction_policy().is_none() {
             return;
         }
         let key = Key::of(me);

@@ -684,7 +684,7 @@ impl Core {
         key: &ReactionKey,
         add: bool,
     ) -> Result<(), ReactError> {
-        let policy = self.reactions.ok_or(ReactError::NotAvailable)?;
+        let policy = self.reaction_policy().ok_or(ReactError::NotAvailable)?;
         // Before `messenger`, which makes the session a messenger.
         {
             let r = self.roster.lock().unwrap();

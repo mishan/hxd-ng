@@ -3495,15 +3495,27 @@ fn a_request_is_reported_by_its_recipient_by_its_cursor() {
 /// A server taking reactions, its accounts allowed to chat as well as
 /// message, the gate a reaction needs.
 fn reacting(logins: &[&str], reactions: crate::ReactionPolicy) -> Server {
+    let history = crate::history::MemoryLog::default();
+    reacting_on(logins, reactions, Some(Arc::new(history)))
+}
+
+fn reacting_on(
+    logins: &[&str],
+    reactions: crate::ReactionPolicy,
+    history: Option<Arc<crate::history::MemoryLog>>,
+) -> Server {
     let bits = messaging_bits().with(bit::SEND_CHAT);
     let dir = Directory(logins.iter().map(|l| (Mailbox::login(*l), bits)).collect());
     let rel = Arc::new(MemoryRelationships::new());
     let inbox = Arc::new(MemoryStore::gated(rel.clone()));
-    let core = Core::new()
+    let mut core = Core::new()
         .with_inbox(inbox.clone(), Arc::new(dir), InboxPolicy::default())
         .with_relationships(rel.clone())
-        .with_messaging(policy())
-        .with_reactions(reactions);
+        .with_messaging(policy());
+    if let Some(log) = history {
+        core = core.with_history(log, crate::history::HistoryPolicy::default());
+    }
+    let core = core.with_reactions(reactions);
     Server {
         core: Arc::new(core),
         rel,
@@ -3808,6 +3820,22 @@ fn identified_reading(core: &Core, login: &str, fp: [u8; 32]) -> (Uid, ImHeard) 
     }
     core.friends_roster(uid).unwrap();
     (uid, im_reactions(&drain(&mut rx)))
+}
+
+/// Reactions need the chat log on every target: a server without one
+/// takes no reaction to an instant message either.
+#[test]
+fn without_history_an_im_reaction_is_not_available() {
+    let s = reacting_on(&["alice", "bob"], crate::ReactionPolicy::default(), None);
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    assert_eq!(
+        s.core.react_im(a, &im_on("bob", 1), "bob", &thumbs, true),
+        Err(crate::ReactError::NotAvailable)
+    );
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
 }
 
 /// A login is matched as the accounts directory matches it, a removal
