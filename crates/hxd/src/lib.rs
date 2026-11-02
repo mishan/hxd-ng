@@ -3088,64 +3088,9 @@ fn loose_mode(meta: &std::fs::Metadata) -> Option<u32> {
 /// Write `text` to `path` whole, owner-only from its first byte, unless
 /// a file is there already: then nothing is written and the answer is
 /// false.
-///
-/// Into a temporary file of its own beside it first, synced, then
-/// hard-linked into place, so a crash leaves a stray temporary file
-/// rather than a truncated secret the next start refuses to read, and a
-/// file that appeared meanwhile is kept rather than replaced. The
-/// temporary name is random, so starts sharing a volume (each pid 1 in
-/// its container) never share one, and a stray one is left alone: it
-/// may be another start's, still being written.
 fn write_private(path: &Path, text: &str) -> Result<bool, String> {
-    use rand_core::RngCore;
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let (tmp, mut f) = loop {
-        let mut nonce = [0u8; 8];
-        rand_core::OsRng
-            .try_fill_bytes(&mut nonce)
-            .map_err(|e| format!("{}: the OS CSPRNG: {e}", path.display()))?;
-        // Not spelled from the target's name, which may already be as
-        // long as a directory entry can be.
-        let tmp = dir.join(format!(".hxd-{:016x}.tmp", u64::from_be_bytes(nonce)));
-        match opts.open(&tmp) {
-            Ok(f) => break (tmp, f),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{}: {e}", tmp.display())),
-        }
-    };
-    let written = writeln!(f, "{text}").and_then(|()| f.sync_all());
-    let linked = written
-        .map(|()| std::fs::hard_link(&tmp, path))
-        .map_err(|e| format!("{}: {e}", tmp.display()));
-    let _ = std::fs::remove_file(&tmp);
-    // Whichever start placed the file, its entry is synced before it is
-    // used.
-    let placed = match linked? {
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => {
-            return Err(format!(
-                "{}: {e} (placing it needs a filesystem with hard links)",
-                path.display()
-            ));
-        }
-        Ok(()) => true,
-    };
-    #[cfg(unix)]
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(placed)
+    hl_private_file::create(path, format!("{text}\n").as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 impl IdentitySection {
@@ -3301,6 +3246,15 @@ pub fn revoke_command(
     let result = revoke_locked(path, &tmp, file, fp, spelled, what, lift);
     if !matches!(result, Ok((_, RevokeOutcome::Changed))) {
         let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    // Until its directory is synced, a crash can take the rename back
+    // after the revocation was reported made.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     result
 }

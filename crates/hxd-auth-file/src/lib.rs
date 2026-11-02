@@ -1486,99 +1486,36 @@ impl FileAuth {
 }
 
 /// Account files hold plaintext-equivalent secrets, so they are written
-/// 0600 like the server key — never at whatever the process umask
-/// happens to be.
-#[cfg(unix)]
-fn private_opts(opts: &mut std::fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    opts.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn private_opts(_opts: &mut std::fs::OpenOptions) {}
-
-/// Write via a temp file and rename, so a crash mid-write can't leave a
-/// half-written account file. The data is fsynced before the rename:
-/// without that, a crash can leave the rename durable and the contents
-/// not, which is a zero-length account file.
+/// owner-only like the server key, never at whatever the process umask
+/// happens to be, and whole, so a crash mid-write can't leave a
+/// half-written one.
 fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    // Keep whatever the operator set on the original.
-    let mode = std::fs::metadata(path).ok().map(file_mode);
-    let tmp = write_tmp(path, text, mode)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    sync_dir(path);
-    Ok(())
+    in_place(path, hl_private_file::replace(path, text.as_bytes()), ())
 }
 
-#[cfg(unix)]
-fn file_mode(m: std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    m.permissions().mode()
-}
-
-#[cfg(not(unix))]
-fn file_mode(_m: std::fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
-fn set_file_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_file_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Write a file that must not exist yet. Written and synced under a
-/// name of its own and then linked into place, which fails if the name
-/// is taken: created in place, it would be an empty account file for a
-/// moment — no password and no access, which `""` logs in to — or for
-/// good after a crash.
+/// Write a file that must not exist yet. Linked into place, which fails
+/// if the name is taken: created in place, it would be an empty account
+/// file for a moment — no password and no access, which `""` logs in
+/// to — or for good after a crash.
 fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
-    let tmp = write_tmp(path, text, None)?;
-    let linked = std::fs::hard_link(&tmp, path);
-    let _ = std::fs::remove_file(&tmp);
-    linked?;
-    sync_dir(path);
-    Ok(())
-}
-
-/// `text` in a temp file beside `path`, synced, with `mode` if given.
-/// One per process: `hxd account` writes beside a running server.
-fn write_tmp(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<PathBuf> {
-    use std::io::Write;
-    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    let written = (|| {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        private_opts(&mut opts);
-        let mut f = opts.open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        if let Some(mode) = mode {
-            set_file_mode(&tmp, mode)?;
-        }
+    if in_place(path, hl_private_file::create(path, text.as_bytes()), true)? {
         Ok(())
-    })();
-    match written {
-        Ok(()) => Ok(tmp),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
+    } else {
+        Err(std::io::ErrorKind::AlreadyExists.into())
     }
 }
 
-/// A rename or a link is only durable once its directory is synced.
-fn sync_dir(path: &Path) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+/// A file in place whose directory could not be synced is written, as
+/// far as anyone reading the directory can tell: answered as an error,
+/// the caller's index would miss it and a retry would find the account
+/// it made and call it taken. So it is a warning, and a success.
+fn in_place<T>(path: &Path, written: std::io::Result<T>, done: T) -> std::io::Result<T> {
+    match written {
+        Err(e) if hl_private_file::placed(&e) => {
+            tracing::warn!("{}: {e}", path.display());
+            Ok(done)
+        }
+        written => written,
     }
 }
 
@@ -2258,6 +2195,13 @@ mod tests {
     fn written_account_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let (td, auth) = backend();
+        // Another writer's, perhaps a process in another container that
+        // is pid 1 too: left alone, and lending its mode to nothing.
+        let stray = td
+            .path()
+            .join(format!("alice.toml.{}.tmp", std::process::id()));
+        std::fs::write(&stray, "half").unwrap();
+        std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o644)).unwrap();
         let a = auth
             .find_or_create_linked("alice", "Alice", &[9u8; 32], AccessBits::empty())
             .unwrap()
@@ -2267,18 +2211,19 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "account files hold secrets");
-        // And a rewrite keeps whatever the operator set.
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), "half");
+        // And a rewrite makes one the operator loosened owner-only again.
         std::fs::set_permissions(
             td.path().join("alice.toml"),
             std::fs::Permissions::from_mode(0o640),
         )
         .unwrap();
-        auth.link_identity("alice", &[10u8; 32]).unwrap();
+        assert!(auth.rotate_link(&[9u8; 32], &[10u8; 32]).unwrap().is_some());
         let mode = std::fs::metadata(td.path().join("alice.toml"))
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o640);
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

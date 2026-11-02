@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hxd_session::LegacyTls;
 use serde::Deserialize;
@@ -127,11 +128,32 @@ fn provision(section: &TlsSection, server_name: &str) -> Result<(), String> {
         }
     }
     let (cert, key) = self_signed(server_name)?;
+    place(section, &cert, &key, Duration::from_secs(5))
+}
+
+/// Write the pair made for `section`.
+fn place(section: &TlsSection, cert: &str, key: &str, wait: Duration) -> Result<(), String> {
     // Each file lands whole or not at all, and the key first: a start
     // that dies between the two leaves the one-without-the-other case
-    // above, never a truncated file beside a complete one.
-    write_whole(&section.key, key.as_bytes(), true)?;
-    write_whole(&section.cert, cert.as_bytes(), false)?;
+    // above, never a truncated file beside a complete one. A start that
+    // finds a key placed meanwhile waits for the certificate of the
+    // start that placed it, which is the one its key pairs with.
+    if !write_new(&section.key, key.as_bytes())? {
+        let deadline = std::time::Instant::now() + wait;
+        while !section.cert.exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "[tls] self_signed: another start placed {} and has not yet written {}; \
+                     start again once it has",
+                    section.key.display(),
+                    section.cert.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return Ok(());
+    }
+    write_new(&section.cert, cert.as_bytes())?;
     tracing::warn!(
         "[tls] made a self-signed certificate at {}: clients will ask their users to \
          trust it on first connect. A certificate from Let's Encrypt avoids that for a \
@@ -141,10 +163,9 @@ fn provision(section: &TlsSection, server_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Write `bytes` to a temporary file beside `path` and rename it into
-/// place, making the directory (owner-only) if it is not there yet.
-fn write_whole(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
-    use std::io::Write;
+/// Write `bytes` to `path` owner-only, unless a file is there already,
+/// making the directory (owner-only) if it is not there yet.
+fn write_new(path: &Path, bytes: &[u8]) -> Result<bool, String> {
     let fail = |e: std::io::Error| format!("[tls] {}: {e}", path.display());
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -160,30 +181,7 @@ fn write_whole(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
         }
         builder.create(dir).map_err(fail)?;
     }
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("[tls] {} names no file", path.display()))?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(".tmp");
-    let tmp = dir.join(tmp_name);
-    // Left by a start that died mid-write; it was never renamed, so
-    // nothing refers to it.
-    let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    #[cfg(not(unix))]
-    let _ = private;
-    let mut file = opts.open(&tmp).map_err(fail)?;
-    file.write_all(bytes).map_err(fail)?;
-    file.sync_all().map_err(fail)?;
-    drop(file);
-    std::fs::rename(&tmp, path).map_err(fail)
+    hl_private_file::create(path, bytes).map_err(fail)
 }
 
 /// A certificate naming the server, for the prompt a client shows. The
@@ -296,17 +294,63 @@ mod tests {
         assert!(err.contains("remove both files"), "{err}");
     }
 
+    /// Under the longest names a directory entry can have, both files
+    /// owner-only and nothing left beside them.
     #[test]
     fn self_signed_makes_the_directory_it_writes_into() {
         let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (
+            format!("{}.pem", "c".repeat(251)),
+            format!("{}.pem", "k".repeat(251)),
+        );
         let config: Config = toml::from_str(&format!(
-            "[tls]\ncert = \"{0}/tls/cert.pem\"\nkey = \"{0}/tls/key.pem\"\nself_signed = true\n",
+            "[tls]\ncert = \"{0}/tls/{cert}\"\nkey = \"{0}/tls/{key}\"\nself_signed = true\n",
             dir.path().display()
         ))
         .unwrap();
         build(&config).unwrap();
-        assert!(dir.path().join("tls/key.pem").exists());
-        assert!(!dir.path().join("tls/.key.pem.tmp").exists());
+        #[cfg(unix)]
+        for name in [&cert, &key] {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(dir.path().join("tls").join(name)).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tls")).unwrap().count(),
+            2
+        );
+    }
+
+    /// A start that finds the key another start has just placed waits
+    /// for that start's certificate, and if it never comes says so,
+    /// rather than offering to remove a pair that is the other start's.
+    #[test]
+    fn a_start_that_loses_the_race_waits_for_the_winners_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = toml::from_str(&format!(
+            "[tls]\ncert = \"{0}/cert.pem\"\nkey = \"{0}/key.pem\"\nself_signed = true\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let section = config.tls.as_ref().unwrap();
+        std::fs::write(&section.key, "theirs").unwrap();
+        let err = place(section, "mine", "mine", Duration::from_millis(200)).unwrap_err();
+        assert!(
+            err.contains("another start") && !err.contains("remove"),
+            "{err}"
+        );
+        assert!(!section.cert.exists());
+
+        let cert = section.cert.clone();
+        let winner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(cert, "theirs").unwrap();
+        });
+        place(section, "mine", "mine", Duration::from_secs(5)).unwrap();
+        winner.join().unwrap();
+        for path in [&section.cert, &section.key] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "theirs");
+        }
     }
 
     #[test]

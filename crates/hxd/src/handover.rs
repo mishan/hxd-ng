@@ -191,11 +191,16 @@ pub fn hand_over(
                 write_durably(out, &hex(key), false)?;
             }
             let lines: Vec<String> = handovers.chain.iter().map(|h| b64(h)).collect();
-            if let Err(e) = write_durably(&section.handovers, &lines.join("\n"), true) {
-                if let Some(out) = next {
-                    let _ = std::fs::remove_file(out);
+            let chain = format!("{}\n", lines.join("\n"));
+            if let Err(e) = hl_private_file::replace(&section.handovers, chain.as_bytes()) {
+                // A chain in place commits to the next successor, whose key
+                // is then the only way on: kept, and the run again finishes.
+                if !hl_private_file::placed(&e) {
+                    if let Some(out) = next {
+                        let _ = std::fs::remove_file(out);
+                    }
                 }
-                return Err(e);
+                return Err(format!("{}: {e}", section.handovers.display()));
             }
             after
         }
@@ -232,9 +237,9 @@ pub fn hand_over(
         &section.key,
         &format!("old-{}", Fingerprint::of(&old.public()).short()),
     );
-    if !retired.exists() {
-        write_durably(&retired, &hex(&old), true)?;
-    } else if read_key(&retired)?.public() != old.public() {
+    let placed = hl_private_file::create(&retired, format!("{}\n", hex(&old)).as_bytes())
+        .map_err(|e| format!("{}: {e}", retired.display()))?;
+    if !placed && read_key(&retired)?.public() != old.public() {
         return Err(format!("{} holds another key", retired.display()));
     }
     write_durably(&section.key, &hex(&new), true)?;
@@ -305,39 +310,20 @@ fn hex(key: &ServerKey) -> String {
     key.seed().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Owner-only and synced before it counts: in place of what is at `path`
-/// with `replace`, through a temporary file renamed over it, or else as a
-/// new file, refusing one already there.
+/// Owner-only and whole: in place of what is at `path` with `replace`,
+/// or else as a new file, refusing one already there.
 fn write_durably(path: &Path, text: &str, replace: bool) -> Result<(), String> {
-    use std::io::Write;
-    let at = if replace {
-        aside_path(path, "tmp")
+    let bytes = format!("{text}\n");
+    let placed = if replace {
+        hl_private_file::replace(path, bytes.as_bytes()).map(|()| true)
     } else {
-        path.to_path_buf()
+        hl_private_file::create(path, bytes.as_bytes())
     };
-    let err = |e: std::io::Error| format!("{}: {e}", at.display());
-    if replace {
-        match std::fs::remove_file(&at) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(err(e)),
-            _ => {}
-        }
+    match placed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("{}: already exists", path.display())),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&at).map_err(err)?;
-    writeln!(f, "{text}")
-        .and_then(|()| f.sync_all())
-        .map_err(err)?;
-    if replace {
-        std::fs::rename(&at, path).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    sync_dir(path);
-    Ok(())
 }
 
 fn sync_dir(path: &Path) {
@@ -370,4 +356,32 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under the longest name a directory entry can have, a new file is
+    /// written owner-only and a file already there is refused, or
+    /// replaced with `replace`.
+    #[test]
+    fn a_file_is_written_whole_under_the_longest_name() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("k".repeat(255));
+            write_durably(&path, "first", replace).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "replace: {replace}");
+            }
+            let again = write_durably(&path, "second", replace);
+            assert_eq!(again.is_ok(), replace, "{again:?}");
+            let want = if replace { "second\n" } else { "first\n" };
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
 }

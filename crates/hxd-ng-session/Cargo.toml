@@ -11,6 +11,7 @@ publish = false
 hxd-core = { workspace = true }
 hxd-files = { workspace = true }
 hl-identity = { workspace = true }
+hl-private-file = { workspace = true }
 hxd-fetch = { workspace = true }
 hl-tunnel = { workspace = true }
 hxd-registrar = { workspace = true }

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 hxd-core = { workspace = true }
+hl-private-file = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = "1"

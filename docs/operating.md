@@ -715,11 +715,13 @@ row says otherwise; each is whatever its key names.
 | The TLS key and certificate | `[tls] key`, `cert` | A CA's pair is issued again. A self-signed one is not: every client that pinned it warns. |
 | The file area | `[files] root` | The files, and in `.hxd-state` their Finder metadata, resource forks and partial uploads. |
 
-The keys are created owner-only; keep their copies the same way. The
-two secrets and the `[identity]`, `[registrar]` and `[link]` keys are
-still used when restored readable by group or others, with a warning
-naming the file and its mode. Back up the directory they are in
-rather than the database alone.
+The keys and account files are created owner-only; keep their copies
+the same way. An edit writes an account file loosened by hand back
+owner-only. The roles file and a self-signed certificate are written
+owner-only too. The two secrets and the `[identity]`, `[registrar]`
+and `[link]` keys are still used when restored readable by group or
+others, with a warning naming the file and its mode. Back up the
+directory they are in rather than the database alone.
 
 ## What SIGHUP reloads
 

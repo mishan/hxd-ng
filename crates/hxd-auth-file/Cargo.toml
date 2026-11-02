@@ -15,6 +15,7 @@ toml = { workspace = true }
 # their comments.
 toml_edit = "0.22"
 hl-identity = { workspace = true }
+hl-private-file = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

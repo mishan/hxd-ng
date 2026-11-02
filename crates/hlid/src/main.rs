@@ -385,18 +385,36 @@ pub(crate) fn read_seed(path: &Path) -> R<[u8; 32]> {
         .map_err(|_| format!("{}: seed must be 32 bytes", path.display()))
 }
 
+/// A key, written whole and owner-only, and never over one already there.
 pub(crate) fn write_private(path: &Path, text: &str) -> R<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    let text = format!("{text}\n");
+    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+    match hl_private_file::create(path, text.as_bytes()) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("{}: already exists", path.display())),
+        // $HLID_HOME may be on a filesystem without hard links (FAT, some
+        // SMB mounts): created in place there, as before, never over a
+        // key but not whole across a crash.
+        Err(e)
+            if !hl_private_file::placed(&e)
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(path)
+                .and_then(|mut f| f.write_all(text.as_bytes()))
+                .map_err(failed)
+        }
+        Err(e) => Err(failed(e)),
     }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    writeln!(f, "{text}").map_err(|e| e.to_string())
 }
 
 fn write_out(a: &Args, bytes: &[u8]) -> R<()> {

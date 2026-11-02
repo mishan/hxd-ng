@@ -1251,6 +1251,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-private-file"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "tempfile",
+]
+
+[[package]]
 name = "hl-tunnel"
 version = "0.1.0"
 dependencies = [
@@ -1266,6 +1274,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "hl-identity",
+ "hl-private-file",
  "qrcodegen",
  "serde_json",
  "tempfile",
@@ -1406,6 +1415,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hl-identity",
+ "hl-private-file",
  "hl-tunnel",
  "hlrelay",
  "hmac",
@@ -1455,6 +1465,7 @@ name = "hxd-auth-file"
 version = "0.1.0"
 dependencies = [
  "hl-identity",
+ "hl-private-file",
  "hxd-core",
  "serde",
  "tempfile",
@@ -1595,6 +1606,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hl-identity",
+ "hl-private-file",
  "hl-tunnel",
  "http-body-util",
  "hxd-core",
@@ -1639,6 +1651,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "hkdf",
+ "hl-private-file",
  "hmac",
  "http-body-util",
  "hxd-core",
