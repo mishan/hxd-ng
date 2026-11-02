@@ -121,6 +121,19 @@ tombstone carries none (e2e-messages.md §4.12). So does a signed
 article's, when someone else's delete of it is an act. `moderation_log`
 shows it as `signed`.
 
+A moderator may also clear every reaction on a line, `react { target,
+clear: true, reason }` (hotline-ng.md §7.3): the `moderate` permission,
+as for a redaction, a line the moderator could have read, and an author
+not protected from them (§2). It is recorded as a `reactions_clear` act
+with the line, its room, its author, the reason, and as evidence the
+keys and counts it took, never who reacted, and is told to the line's
+readers as cleared. As a redaction's, the act is recorded first and
+nothing is taken unless it is; reactions change one at a time beside a
+clear, so its evidence is the rows it takes. An act recorded whose
+clear the log then refuses stands as one attempted, and the moderator
+is told of a server error. A clear of a line with no reactions changes
+and records nothing.
+
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an
 empty string by the sweeper, leaving the row. Moderators can read it
@@ -533,7 +546,7 @@ went by, and the sweeper's two partial indexes:
 ```sql
 CREATE TABLE moderation (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete | ban | unban | room_delete (| vouched_banned, with vouching)
+  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete | ban | unban | room_delete | reactions_clear (| vouched_banned, with vouching)
   actor        TEXT    NOT NULL,        -- login, or 'cli'
   actor_fp     TEXT,
   target_line  INTEGER,

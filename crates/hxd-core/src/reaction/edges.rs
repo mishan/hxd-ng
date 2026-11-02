@@ -10,7 +10,8 @@ use std::thread;
 use super::tests::{batches, bits, hearing, ng, party, said, server, thumbs};
 use super::*;
 use crate::history::faulty::FaultyLog;
-use crate::history::HistoryPolicy;
+use crate::history::{ChatLog, HistoryPolicy};
+use crate::moderation::faulty::FaultyModeration;
 use crate::roster::drain;
 use crate::{Events, MemoryModeration, ModerationPolicy, ModerationStore, Transport};
 
@@ -46,29 +47,80 @@ fn flush(core: &Core) {
 }
 
 /// A batch whose summaries could not be read is owed again, and the
-/// next flush tells it whole.
+/// next flush tells it whole and in order: a removal as the line then
+/// stands, a moderator's clear as cleared.
 #[test]
 fn a_batch_that_could_not_be_read_goes_in_the_next() {
-    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
-    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
-    let [one, two] = ["one", "two"].map(|t| said(&core, alice, t));
-    core.react(alice, 0, two, &thumbs(), true).unwrap();
-    flush(&core);
-    drain(&mut ra);
-    core.react(alice, 0, one, &party(), true).unwrap();
-    core.react(alice, 0, two, &thumbs(), false).unwrap();
-    log.fail("reactions", true);
-    flush(&core);
-    assert!(batches(&mut ra).is_empty(), "nothing could be told");
-    log.fail("reactions", false);
-    flush(&core);
-    assert_eq!(
-        batches(&mut ra),
-        [vec![
-            (one, Some((vec![(party(), 1)], vec![0]))),
-            (two, Some((vec![], vec![])))
-        ]]
-    );
+    type Change = fn(&Core, Uid, Uid, LineId);
+    let cases: [(&str, Change, Option<_>); 2] = [
+        (
+            "removed",
+            |core, alice, _, two| {
+                core.react(alice, 0, two, &thumbs(), false).unwrap();
+            },
+            Some((vec![], vec![])),
+        ),
+        (
+            "cleared",
+            |core, _, carol, two| core.react_clear(carol, 0, two, "spam").unwrap(),
+            None,
+        ),
+    ];
+    for (name, change, told) in cases {
+        let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let (carol, _) = hearing(&core, "carol", ng(), true);
+        let [one, two] = ["one", "two"].map(|t| said(&core, alice, t));
+        core.react(alice, 0, two, &thumbs(), true).unwrap();
+        flush(&core);
+        drain(&mut ra);
+        core.react(alice, 0, one, &party(), true).unwrap();
+        change(&core, alice, carol, two);
+        log.fail("reactions", true);
+        flush(&core);
+        assert!(batches(&mut ra).is_empty(), "{name}: nothing could be told");
+        log.fail("reactions", false);
+        flush(&core);
+        assert_eq!(
+            batches(&mut ra),
+            [vec![
+                (one, Some((vec![(party(), 1)], vec![0]))),
+                (two, told)
+            ]],
+            "{name}"
+        );
+    }
+}
+
+/// A clear whose act cannot be recorded takes nothing; one recorded and
+/// then refused by the log stands in the trail as attempted. Either way
+/// the reactions stay and the moderator is told of a server error.
+#[test]
+fn a_clear_the_stores_refuse_takes_nothing() {
+    for (fails, recorded) in [("record", false), ("clear_reactions", true)] {
+        let moderation = Arc::new(FaultyModeration::default());
+        let (core, log) = on_faulty(moderation.clone());
+        let (alice, _) = hearing(&core, "alice", ng(), false);
+        let (carol, _) = hearing(&core, "carol", ng(), true);
+        let line = said(&core, alice, "one");
+        core.react(alice, 0, line, &thumbs(), true).unwrap();
+        match fails {
+            "record" => moderation.fail("record"),
+            _ => log.fail(fails, true),
+        }
+        assert_eq!(
+            core.react_clear(carol, 0, line, "spam"),
+            Err(ReactError::ServerError),
+            "{fails}"
+        );
+        let kept = core.line_reactions(alice, &[line]).unwrap();
+        assert_eq!(kept[&line].keys, [(thumbs(), 1)], "{fails}");
+        let acts = moderation.acts(None, 10).unwrap();
+        let act = acts
+            .iter()
+            .any(|a| a.kind == crate::ActKind::ReactionsClear);
+        assert_eq!(act, recorded, "{fails}");
+    }
 }
 
 /// A reaction applied as its line is redacted is never told after the
@@ -152,6 +204,69 @@ fn a_batch_taken_as_its_line_is_redacted_goes_before_the_redaction() {
     let told = drain(&mut ra);
     assert_nothing_but_clears_after_the_redaction(&told, line);
     assert!(told.iter().any(|e| matches!(e, Event::ReactionsChanged(_))));
+}
+
+/// A redaction made while a clear is under way waits for it: the clear
+/// takes what it recorded and answers so, and the line is a tombstone
+/// after.
+#[test]
+fn a_redaction_during_a_clear_waits_for_it() {
+    let moderation = Arc::new(MemoryModeration::default());
+    let (core, log) = on_faulty(moderation.clone());
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "vote");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line, "spam"))
+    };
+    at.wait();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    arrived(&core, 1);
+    at.wait();
+    assert_eq!(clearing.join().unwrap(), Ok(()));
+    redacting.join().unwrap().unwrap();
+    let after = log.inner.line(line).unwrap().unwrap();
+    assert!(after.flags.contains(crate::history::LineFlags::DELETED));
+}
+
+/// A reaction made as a clear finishes is told as it stands after both,
+/// never as the line emptied.
+#[test]
+fn a_reaction_just_after_a_clear_is_told_as_it_stands() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "vote");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    flush(&core);
+    drain(&mut ra);
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("clear_reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line, "spam"))
+    };
+    at.wait();
+    let reacting = {
+        let core = core.clone();
+        thread::spawn(move || core.react(alice, 0, line, &party(), true))
+    };
+    arrived(&core, 1);
+    at.wait();
+    clearing.join().unwrap().unwrap();
+    reacting.join().unwrap().unwrap();
+    flush(&core);
+    assert_eq!(
+        batches(&mut ra),
+        [vec![(line, Some((vec![(party(), 1)], vec![0])))]]
+    );
 }
 
 /// A redaction that cannot read which of its lines had reactions tells
@@ -238,10 +353,44 @@ fn reactions_queued_together_go_to_the_log_together() {
     assert_eq!(*log.runs.lock().unwrap(), [1, 4]);
 }
 
+/// What a clear records is exactly what it took, a reaction made while
+/// it worked waiting for it and staying.
+#[test]
+fn a_clears_evidence_is_the_rows_it_took() {
+    let moderation = Arc::new(MemoryModeration::default());
+    let (core, log) = on_faulty(moderation.clone());
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let (bob, _) = hearing(&core, "bob", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "vote");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line, "spam"))
+    };
+    at.wait();
+    let reacting = {
+        let core = core.clone();
+        thread::spawn(move || core.react(bob, 0, line, &party(), true))
+    };
+    arrived(&core, 1);
+    at.wait();
+    clearing.join().unwrap().unwrap();
+    reacting.join().unwrap().unwrap();
+    let act = (moderation.acts(None, 10).unwrap().into_iter())
+        .find(|a| a.kind == crate::ActKind::ReactionsClear)
+        .unwrap();
+    assert_eq!(act.evidence.as_deref(), Some(&*format!("#{line}: 👍 1")));
+    let kept = core.line_reactions(alice, &[line]).unwrap();
+    assert_eq!(kept[&line].keys, [(party(), 1)], "made after the clear");
+}
+
 /// Every caller of the desk at once: lines said, which tell it from
 /// under the roster; redactions, which wait on it holding a room's
-/// serial; batches, taken and sent under the serial; reactions and
-/// rekeys. All of them finish.
+/// serial; batches, taken and sent under the serial; reactions, rekeys
+/// and clears. All of them finish.
 #[test]
 fn reactions_redactions_and_rekeys_together_finish() {
     let (core, _log) = on_faulty(Arc::new(MemoryModeration::default()));
@@ -269,6 +418,9 @@ fn reactions_redactions_and_rekeys_together_finish() {
         Box::new(|c| {
             c.clock.advance(Duration::from_secs(2));
             c.reactions_flush(c.clock.now());
+        }),
+        Box::new(move |c| {
+            let _ = c.react_clear(carol, 0, line, "spam");
         }),
     ];
     let n = work.len();
@@ -448,6 +600,20 @@ fn a_reader_that_never_reads_is_cut_off_by_the_weight_of_its_batches() {
     assert!(batches < 1000, "cut off by count, after {batches} batches");
 }
 
+/// A clear of a line with nothing on it changes nothing and records
+/// nothing.
+#[test]
+fn a_clear_with_nothing_to_take_records_nothing() {
+    let moderation = Arc::new(MemoryModeration::default());
+    let (core, _log) = on_faulty(moderation.clone());
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "quiet");
+    assert_eq!(core.react_clear(carol, 0, line, "spam"), Ok(()));
+    assert!(moderation.acts(None, 10).unwrap().is_empty());
+    assert_eq!(core.reactions_flush(core.clock.now()), None);
+}
+
 /// A run whose one transaction fails is applied again an act at a time,
 /// so each answers for itself: one applied, one of a line no longer
 /// there refused.
@@ -619,18 +785,31 @@ fn a_redacted_line_whose_reactions_came_and_went_is_told_nothing_after() {
 /// A redaction waits on the desk holding its room's serial and nothing
 /// more: an op that takes the roster, ahead of it at the desk, finishes,
 /// as it would not if the redaction held the roster while it waited.
+/// Whatever leads the desk meanwhile, a reaction or a clear.
 #[test]
 fn a_redaction_waits_on_the_desk_without_the_roster() {
+    for leads in ["react_all", "reactions"] {
+        waits_without_the_roster(leads);
+    }
+}
+
+fn waits_without_the_roster(parked_in: &'static str) {
     let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
     let (alice, _) = hearing(&core, "alice", ng(), false);
     let (carol, _) = hearing(&core, "carol", ng(), true);
     let line = said(&core, alice, "one");
     let gone = said(&core, alice, "two");
+    if parked_in == "reactions" {
+        core.react(alice, 0, line, &thumbs(), true).unwrap();
+    }
     let at = Arc::new(Barrier::new(2));
-    log.park_after("react_all", at.clone());
-    let reacting = {
+    log.park_after(parked_in, at.clone());
+    let leading = {
         let core = core.clone();
-        thread::spawn(move || core.react(alice, 0, line, &thumbs(), true))
+        thread::spawn(move || match parked_in {
+            "reactions" => core.react_clear(carol, 0, line, "spam"),
+            _ => core.react(alice, 0, line, &thumbs(), true).map(drop),
+        })
     };
     at.wait();
     let (done, finished) = mpsc::channel();
@@ -652,7 +831,7 @@ fn a_redaction_waits_on_the_desk_without_the_roster() {
     };
     arrived(&core, 2);
     at.wait();
-    reacting.join().unwrap().unwrap();
+    leading.join().unwrap().unwrap();
     for _ in 0..2 {
         finished
             .recv_timeout(Duration::from_secs(10))

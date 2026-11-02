@@ -3454,6 +3454,33 @@ impl ChatLog for SqliteStore {
         Ok(out)
     }
 
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let line = clamp_id(line);
+        let live: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM chat_line WHERE id = ?1 AND channel = ?2 AND flags & ?3 = 0",
+                params![
+                    line,
+                    i64::from(channel),
+                    i64::from(LineFlags::DELETED.bits())
+                ],
+                |r| r.get(0),
+            )
+            .map_err(StoreError::new)?;
+        if live == 0 {
+            return Ok(None);
+        }
+        let gone = tx
+            .execute("DELETE FROM chat_reaction WHERE line = ?1", params![line])
+            .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(Some(gone))
+    }
+
     fn rekey_reactions(
         &self,
         from: &hxd_core::inbox::Mailbox,

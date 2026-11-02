@@ -3745,6 +3745,13 @@ mod tests {
         {
             self.inner.reactors_on(ids)
         }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner.clear_reactions(channel, line)
+        }
         fn attach_media(
             &self,
             id: crate::history::LineId,
@@ -4050,6 +4057,13 @@ mod tests {
         ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
         {
             self.inner.reactors_on(ids)
+        }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner.clear_reactions(channel, line)
         }
         fn attach_media(
             &self,
@@ -4425,6 +4439,13 @@ mod tests {
         ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
         {
             self.0.reactors_on(ids)
+        }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.0.clear_reactions(channel, line)
         }
     }
 

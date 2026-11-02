@@ -1,6 +1,6 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
-//! line, a line's reactions on the `history` that shows it, and
-//! `reactions_changed`, to sessions that declared it.
+//! line, a moderator's clear, a line's reactions on the `history` that
+//! shows it, and `reactions_changed`, to sessions that declared it.
 
 use hxd_core::{ReactError, ReactionChange, ReactionKey, Reactions, Reply};
 use serde::Deserialize;
@@ -85,12 +85,56 @@ pub(crate) fn change_json(change: &ReactionChange) -> Value {
 #[derive(Deserialize)]
 struct ReactParams {
     target: Value,
-    key: Value,
+    key: Option<Value>,
     #[serde(default)]
     remove: bool,
+    #[serde(default)]
+    clear: bool,
+    reason: Option<String>,
 }
 
-/// `react`: one key added to, or with `remove` taken from, one line.
+/// What a well-formed `react` asks.
+enum Act {
+    Line {
+        room: u32,
+        line: u64,
+        key: ReactionKey,
+        add: bool,
+    },
+    Clear {
+        room: u32,
+        line: u64,
+        reason: String,
+    },
+}
+
+/// `react`'s params, or the `bad_request` they earn: a key on every act
+/// but a clear, which takes neither `remove` nor a key, and a reason on
+/// a clear alone.
+fn act(ctx: &NgCtx, p: ReactParams) -> Result<Act, &'static str> {
+    let target = crate::replies::parse(&p.target, &targets(ctx))
+        .ok_or("`target` names no kind this server takes.")?;
+    let emoji = |k: Option<Value>| k.as_ref().and_then(key).ok_or("`key` is not one emoji.");
+    match (target, p.clear) {
+        (Reply::Line { room, id }, true) if p.key.is_none() && !p.remove => Ok(Act::Clear {
+            room,
+            line: id,
+            reason: p.reason.unwrap_or_default(),
+        }),
+        (_, true) => Err("`clear` takes a line, and no key."),
+        (_, false) if p.reason.is_some() => Err("`reason` goes with `clear` alone."),
+        (Reply::Line { room, id }, false) => Ok(Act::Line {
+            room,
+            line: id,
+            key: emoji(p.key)?,
+            add: !p.remove,
+        }),
+        _ => Err("`target` names no kind this server takes."),
+    }
+}
+
+/// `react`: one key added to, or with `remove` taken from, one line, or
+/// with `clear` every key on it.
 pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Value) -> String {
     if !state.reactions {
         return reply_err(id, "not_available", "Reactions are not available.");
@@ -98,26 +142,34 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
     let Ok(p) = serde_json::from_value::<ReactParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed react.");
     };
-    let Some(Reply::Line { room, id: line }) = crate::replies::parse(&p.target, &targets(ctx))
-    else {
-        return reply_err(
-            id,
-            "bad_request",
-            "`target` names no kind this server takes.",
-        );
-    };
-    let Some(key) = key(&p.key) else {
-        return reply_err(id, "bad_request", "`key` is not one emoji.");
+    let act = match act(ctx, p) {
+        Ok(act) => act,
+        Err(why) => return reply_err(id, "bad_request", why),
     };
     let uid = state.uid;
-    let reacted = off_reactor(&ctx.core, move |c| {
-        c.react(uid, room, line, &key, !p.remove)
+    let clearing = matches!(act, Act::Clear { .. });
+    let reacted = off_reactor(&ctx.core, move |c| match act {
+        Act::Line {
+            room,
+            line,
+            key,
+            add,
+        } => c.react(uid, room, line, &key, add).map(Some),
+        Act::Clear { room, line, reason } => c.react_clear(uid, room, line, &reason).map(|()| None),
     })
     .await;
     match reacted {
-        Some(Ok(count)) => reply_ok(id, json!({ "count": count })),
+        Some(Ok(Some(count))) => reply_ok(id, json!({ "count": count })),
+        Some(Ok(None)) => reply_ok(id, json!({})),
+        Some(Err(ReactError::NotAllowed)) if clearing => {
+            reply_err(id, "access_denied", "You may not clear reactions.")
+        }
         Some(Err(ReactError::NotAllowed)) => {
             reply_err(id, "access_denied", "You may not react to that.")
+        }
+        Some(Err(ReactError::BadRequest(why))) => reply_err(id, "bad_request", why),
+        Some(Err(ReactError::Protected)) => {
+            reply_err(id, "protected", "That user cannot be moderated by you.")
         }
         Some(Err(ReactError::NoSuchTarget)) => reply_err(id, "no_such_target", "No such line."),
         Some(Err(ReactError::TooManyReactions)) => reply_err(

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::access::bit;
 use crate::history::LineId;
 use crate::inbox::{Mailbox, StoreError};
+use crate::moderation::{Act, ActKind, Actor, ModError, Subject, MAX_ACT_REASON};
 use crate::reply::Reply;
 use crate::roster::{reads_public_chat, Event, RosterInner, Uid, UserSession};
 use crate::Core;
@@ -390,7 +391,8 @@ pub enum ReactionChange {
         keys: Arc<[(ReactionKey, u32)]>,
         mine: Vec<u8>,
     },
-    /// Every reaction on a line is gone: it was redacted.
+    /// Every reaction on a line is gone: a moderator cleared it, or it
+    /// was redacted.
     Clear { target: Reply },
 }
 
@@ -419,9 +421,26 @@ impl ReactionChange {
 pub(crate) enum Owe {
     /// Its reactions changed: a summary, read when the batch goes.
     Summary,
+    /// A moderator cleared them.
+    Clear,
     /// It was redacted, taking them: told as a clear, to a wire that
     /// shows redactions.
     Gone,
+    /// A moderator cleared them and then it was redacted: told as a
+    /// clear to every reader, the clear being news on any wire.
+    ClearedGone,
+}
+
+impl Owe {
+    /// What is owed when `next` follows `self`: a redaction stands
+    /// whatever comes after it, and keeps a clear before it.
+    fn then(self, next: Owe) -> Owe {
+        match (self, next) {
+            (Owe::Gone | Owe::ClearedGone, _) => self,
+            (Owe::Clear, Owe::Gone) => Owe::ClearedGone,
+            _ => next,
+        }
+    }
 }
 
 struct Owed {
@@ -485,10 +504,8 @@ impl Live {
                 lines: BTreeMap::new(),
             }
         });
-        let was = owed.lines.insert(line, what);
-        if was == Some(Owe::Gone) {
-            owed.lines.insert(line, Owe::Gone);
-        }
+        let at = owed.lines.entry(line).or_insert(what);
+        *at = at.then(what);
     }
 
     /// A batch that could not be read, owed again: behind any change
@@ -509,16 +526,18 @@ impl Live {
         });
         for (id, what) in lines {
             let at = owed.lines.entry(id).or_insert(what);
-            if what == Owe::Gone {
-                *at = Owe::Gone;
-            }
+            *at = what.then(*at);
         }
     }
 
-    /// `line` owes nothing.
+    /// `line`, redacted with no reactions, owes nothing but a clear a
+    /// moderator made before the redaction.
     fn unowe(&mut self, line: LineId) {
         if let Some(owed) = (self.room_of.get(&line)).and_then(|room| self.owed.get_mut(room)) {
-            owed.lines.remove(&line);
+            match owed.lines.get(&line) {
+                Some(Owe::Clear) => owed.lines.insert(line, Owe::ClearedGone),
+                _ => owed.lines.remove(&line),
+            };
         }
     }
 
@@ -639,6 +658,10 @@ pub enum ReactError {
     NoSuchTarget,
     TooManyReactions,
     RateLimited(Duration),
+    /// A clear without a reason, or with one too long.
+    BadRequest(&'static str),
+    /// A clear on the line of someone this moderator may not moderate.
+    Protected,
     ServerError,
 }
 
@@ -845,6 +868,90 @@ impl Core {
             }
         }
         Ok(gone)
+    }
+
+    /// A moderator's clear: every reaction on line `line` of `room` taken,
+    /// recorded in the moderation trail with what was there and `why`,
+    /// and announced as cleared. Who may is who may redact: the moderate
+    /// permission, the line one they could have read, as for a reaction,
+    /// and its author not protected from them (moderation.md §2).
+    ///
+    /// One op at the desk, the act recorded first as a redaction's is: the
+    /// line looked for, its reactions read, the act recorded with them,
+    /// and only then taken and owed as cleared, nothing changing a
+    /// reaction meanwhile, so the evidence is what the clear took.
+    pub fn react_clear(
+        &self,
+        uid: Uid,
+        room: u32,
+        line: LineId,
+        why: &str,
+    ) -> Result<(), ReactError> {
+        self.reaction_policy().ok_or(ReactError::NotAvailable)?;
+        let store = self.moderation.clone().ok_or(ReactError::NotAllowed)?;
+        let acting = self
+            .acting(Actor::Session(uid))
+            .map_err(|_| ReactError::NotAllowed)?;
+        let why = crate::moderation::reason(why, MAX_ACT_REASON).map_err(|e| match e {
+            ModError::BadRequest(what) => ReactError::BadRequest(what),
+            _ => ReactError::ServerError,
+        })?;
+        {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid).ok_or(ReactError::NotAllowed)?;
+            if !could_have_read(&r, sess, room, line) {
+                return Err(ReactError::NoSuchTarget);
+            }
+        }
+        let log = self.history.as_ref().ok_or(ReactError::NotAvailable)?;
+        let author = match log.line(line) {
+            Ok(Some(l)) => Subject::of_line(&l),
+            Ok(None) => return Err(ReactError::NoSuchTarget),
+            Err(e) => {
+                tracing::warn!("chat log would not read a line: {e}");
+                return Err(ReactError::ServerError);
+            }
+        };
+        if self.protected(acting.overrides, author.mailbox().as_ref()) {
+            return Err(ReactError::Protected);
+        }
+        self.desk(move |c, live| {
+            let log = c.history.as_ref().ok_or(ReactError::NotAvailable)?;
+            let failed = |e: StoreError| {
+                tracing::warn!("chat log would not clear reactions: {e}");
+                ReactError::ServerError
+            };
+            let there = log.lines(room, &[line]).map_err(failed)?;
+            if !there
+                .iter()
+                .any(|l| l.id == line && !l.flags.contains(crate::history::LineFlags::DELETED))
+            {
+                return Err(ReactError::NoSuchTarget);
+            }
+            let Some(was) = log.reactions(&[line], None).map_err(failed)?.remove(&line) else {
+                return Ok(());
+            };
+            let mut act = Act::new(ActKind::ReactionsClear, &acting, why).about(&author);
+            act.line = Some(line);
+            act.room = (room != 0).then_some(room);
+            let keys = was.keys.iter().map(|(k, n)| match k {
+                ReactionKey::Emoji(e) => format!("{e} {n}"),
+            });
+            // The keys and their counts, not who reacted: the act is of
+            // the line, and its reactors are nobody's to judge.
+            act.evidence = Some(format!("#{line}: {}", keys.collect::<Vec<_>>().join(", ")));
+            // Recorded first: a clear the store then fails stands in the
+            // trail as one attempted, answered as a server error.
+            store.record(&act).map_err(|e| {
+                tracing::warn!("moderation: a reactions clear would not record: {e}");
+                ReactError::ServerError
+            })?;
+            if log.clear_reactions(room, line).map_err(failed)?.is_none() {
+                return Err(ReactError::NoSuchTarget);
+            }
+            live.owe(line, Owe::Clear, c.clock.now());
+            Ok(())
+        })
     }
 
     /// Send each room whose batch is due what changed on its live lines,
@@ -1064,6 +1171,7 @@ impl Batch {
                         let mine = mine.and_then(|m| m.get(&id)).cloned().unwrap_or_default();
                         Some(ReactionChange::Summary { target, keys, mine })
                     }
+                    Owe::Clear | Owe::ClearedGone => Some(ReactionChange::Clear { target }),
                     Owe::Gone => s
                         .info
                         .transport
@@ -1086,7 +1194,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::history::{ChatLog, HistoryPolicy, MemoryLog};
-    use crate::moderation::Actor;
     use crate::roster::{drain, AttachInfo};
     use crate::{AccessBits, Events, Transport};
 
@@ -1435,6 +1542,97 @@ mod tests {
                 (cleared, Some((vec![], vec![]))),
             ]]
         );
+    }
+
+    /// A moderator's clear, with a reason, of a line by someone it may
+    /// moderate: told as cleared to every reader, and kept in the trail
+    /// with the reason, the author and the counts that were there, even
+    /// when the line is redacted in the same batch. Anything else is
+    /// refused and takes nothing.
+    #[test]
+    fn a_moderators_clear_is_told_and_kept() {
+        use bit::{CANT_BE_DISCONNECTED, READ_CHAT, SEND_CHAT};
+        let core = {
+            let core = Core::new()
+                .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
+                .with_reactions(ReactionPolicy::default())
+                .with_moderation(
+                    Arc::new(crate::MemoryModeration::default()),
+                    crate::ModerationPolicy::default(),
+                );
+            Arc::new(core)
+        };
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let (carol, _) = hearing(&core, "carol", ng(), true);
+        let blind = Transport {
+            redactions: false,
+            ..ng()
+        };
+        let (_, mut rblind) = hearing(&core, "erin", blind, false);
+        let dave = person(
+            &core,
+            "dave",
+            bits(&[READ_CHAT, SEND_CHAT, CANT_BE_DISCONNECTED]),
+            true,
+        );
+        let [kept, gone, gone_after] =
+            ["kept", "gone", "gone after"].map(|t| said(&core, alice, t));
+        let protected = said(&core, dave, "mine");
+        for line in [kept, gone, gone_after, protected] {
+            core.react(alice, 0, line, &party(), true).unwrap();
+        }
+        core.redact_line(Actor::Session(carol), gone, "no").unwrap();
+        let mut now = core.clock.now() + Duration::from_secs(5);
+        core.reactions_flush(now);
+        drain(&mut ra);
+        drain(&mut rblind);
+
+        let refused = [
+            (alice, kept, "spam", ReactError::NotAllowed),
+            (
+                carol,
+                kept,
+                " ",
+                ReactError::BadRequest("A reason is required."),
+            ),
+            (carol, gone, "spam", ReactError::NoSuchTarget),
+            (carol, protected, "spam", ReactError::Protected),
+        ];
+        for (who, line, why, err) in refused {
+            assert_eq!(
+                core.react_clear(who, 0, line, why),
+                Err(err),
+                "{line} {why:?}"
+            );
+        }
+        assert_eq!(core.react_clear(carol, 0, kept, "ballot stuffing"), Ok(()));
+        assert_eq!(core.react_clear(carol, 0, gone_after, "spam"), Ok(()));
+        core.redact_line(Actor::Session(carol), gone_after, "no")
+            .unwrap();
+        now += Duration::from_secs(5);
+        core.reactions_flush(now);
+        for rx in [&mut ra, &mut rblind] {
+            assert_eq!(batches(rx), [vec![(kept, None), (gone_after, None)]]);
+        }
+        let acts = core.moderation.as_ref().unwrap().acts(None, 10).unwrap();
+        let clears: Vec<_> = (acts.iter())
+            .filter(|a| a.kind == crate::ActKind::ReactionsClear)
+            .map(|a| {
+                (
+                    a.line,
+                    a.reason.as_str(),
+                    a.login.as_deref(),
+                    a.evidence.clone(),
+                )
+            })
+            .collect();
+        assert!(clears.contains(&(
+            Some(kept),
+            "ballot stuffing",
+            Some("alice"),
+            Some(format!("#{kept}: 🎉 1"))
+        )));
+        assert_eq!(clears.len(), 2, "nothing refused was recorded");
     }
 
     /// Only a line already relayed, readable, and heard live or read in

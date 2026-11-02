@@ -360,6 +360,10 @@ pub trait ChatLog: Send + Sync + 'static {
     /// announcements, read once for them all.
     fn reactors_on(&self, ids: &[LineId])
         -> Result<Vec<(LineId, String, ReactionKey)>, StoreError>;
+    /// Take every reaction on line `line` of `channel`, answering how
+    /// many went: a moderator's clear. `None` for no such line there, or
+    /// a tombstone.
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError>;
 }
 
 #[derive(Default)]
@@ -736,6 +740,20 @@ impl ChatLog for MemoryLog {
             .collect())
     }
 
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner
+            .lines
+            .iter()
+            .any(|l| l.id == line && l.channel == channel && !l.flags.contains(LineFlags::DELETED))
+        {
+            return Ok(None);
+        }
+        let before = inner.reactions.len();
+        inner.reactions.retain(|r| r.line != line);
+        Ok(Some(before - inner.reactions.len()))
+    }
+
     fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<Vec<LineId>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let (from, to) = (reactor_key(from), reactor_key(to));
@@ -897,6 +915,7 @@ pub mod conformance {
         reactors_are_listed_on_the_lines_asked_alone(new_log());
         reactions_together_are_applied_in_order(new_log());
         tombstones_together_answer_the_lines_they_made(new_log());
+        a_clear_takes_every_reaction_on_one_live_line(new_log());
     }
 
     fn key(e: &str) -> crate::reaction::ReactionKey {
@@ -1135,6 +1154,23 @@ pub mod conformance {
         );
         assert_eq!(ids_in(&*log, 0).len(), 3, "kept as tombstones");
         assert!(shown(&*log, &[3], &alice).is_empty());
+    }
+
+    /// A clear empties one line of its channel, and no other; a line of
+    /// another channel, a tombstone and one never logged are not there.
+    fn a_clear_takes_every_reaction_on_one_live_line(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        react(&*log, &alice, 1, "👍", true, 1);
+        react(&*log, &bob, 1, "🎉", true, 2);
+        react(&*log, &bob, 2, "👍", true, 3);
+        assert!(log.tombstone(3, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        for (channel, line) in [(7, 1), (0, 3), (0, 99)] {
+            assert_eq!(log.clear_reactions(channel, line).unwrap(), None, "{line}");
+        }
+        assert_eq!(log.clear_reactions(0, 1).unwrap(), Some(2));
+        assert_eq!(log.clear_reactions(0, 1).unwrap(), Some(0));
+        assert_eq!(shown(&*log, &[1, 2], &bob), [(2, keys(&[("👍", 1)], &[0]))]);
     }
 
     /// A link or a rotation moves an account's reactions, and one the new
