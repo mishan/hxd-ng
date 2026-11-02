@@ -463,11 +463,14 @@ pub fn log(config: &Config, limit: usize) -> Result<String, String> {
             } else {
                 a.reason.as_str()
             };
+            let kind = match a.kind {
+                ActKind::Unknown(n) => format!("unknown ({n})"),
+                kind => kind.name().to_string(),
+            };
             let mut out = format!(
-                "#{}  {}  {} by {}: {}  — {why}",
+                "#{}  {}  {kind} by {}: {}  — {why}",
                 a.id,
                 hxd_session::session::stamp(a.at),
-                a.kind.name(),
                 a.actor,
                 target.join(", "),
             );

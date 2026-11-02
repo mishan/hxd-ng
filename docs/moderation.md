@@ -437,6 +437,11 @@ Requests, all `access_denied` without `moderate` except `report`:
 | `kick` | `uid`, `ban?` (seconds, at most a year), `purge?` (seconds), `reason?` (required with `purge`) | `{}`; for a user of a linked server `{ "hidden_here": true, "network": bool, "banned": bool }`: hidden here at once, and whether their home server carried out the kick or ban; `ban` of 0 is a kick, and `purge` takes their lines on this server only (server-link.md §6.3) | `no_such_user`, `protected` |
 | `moderation_log` | `before?`, `limit?` | `{ "entries": [ … ], "has_more" }` | |
 
+An act of a kind this server has no name for, one a newer server
+recorded, reads as `unknown` with its number as `kind_number` (in
+`hxd moderation log`, `unknown (N)`), so a log holding one still reads
+after a rollback.
+
 `kick` is new to the ng wire — it has only ever *received* `kicked` —
 and needs the kick bit, not `moderate`; `purge` inside it needs both.
 A `purge` of a guest, who has no identity to purge by, is skipped and

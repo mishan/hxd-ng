@@ -74,8 +74,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     Ok((|| {
         Ok(Act {
             id: id_of(id, "act id")?,
-            kind: ActKind::from_i64(kind)
-                .ok_or_else(|| StoreError::new(format!("stored act kind {kind} is unknown")))?,
+            kind: ActKind::from_i64(kind).unwrap_or(ActKind::Unknown(kind)),
             actor,
             actor_fp: fp(actor_fp)?,
             line: line.map(|n| id_of(n, "line id")).transpose()?,
