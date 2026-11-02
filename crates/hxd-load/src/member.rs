@@ -272,8 +272,8 @@ pub enum Got {
     },
     /// A user left.
     Parted(Option<u64>),
-    /// A private message's text.
-    Msg(String),
+    /// A private message's text, and when it was read off the socket.
+    Msg(String, Instant),
     /// A message from the server itself (classic 0x163), such as the
     /// one telling a user another server kicked it.
     Told(String),
@@ -302,6 +302,7 @@ impl Rx {
                     legacy::push::MSG => Got::Msg(
                         String::from_utf8_lossy(&f.bytes(tag::BODY).unwrap_or_default())
                             .into_owned(),
+                        f.at,
                     ),
                     legacy::push::USER_CHANGE => Got::Joined {
                         nick: String::from_utf8_lossy(&f.bytes(tag::NAME).unwrap_or_default())
@@ -319,7 +320,7 @@ impl Rx {
                 }
                 ng::Incoming::Event(e) if e.ev == "kicked" => Got::Kicked,
                 ng::Incoming::Event(e) if e.ev == "msg" => {
-                    Got::Msg(e.data["text"].as_str().unwrap_or_default().to_owned())
+                    Got::Msg(e.data["text"].as_str().unwrap_or_default().to_owned(), e.at)
                 }
                 ng::Incoming::Event(e) if e.ev == "user_parted" => {
                     Got::Parted(e.data["uid"].as_u64())

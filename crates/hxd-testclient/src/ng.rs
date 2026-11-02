@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -37,6 +37,9 @@ pub struct Event {
     pub seq: u64,
     pub ev: String,
     pub data: Value,
+    /// When it was read off the socket, which a caller that left it in
+    /// the backlog cannot tell from when it looked.
+    pub at: Instant,
 }
 
 /// A seq that was not the one after the last.
@@ -207,6 +210,7 @@ impl Receiver {
                 seq,
                 ev: ev.to_owned(),
                 data: v["data"].clone(),
+                at: Instant::now(),
             }));
         }
     }

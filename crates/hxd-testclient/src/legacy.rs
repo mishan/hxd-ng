@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hxproto::build::pack_header;
 use hxproto::messages::{tag, ClientHdr};
@@ -69,6 +69,9 @@ pub struct Frame {
     pub trans: u32,
     pub flag: u32,
     pub hc: u16,
+    /// When it was read off the socket, which a caller that left it in
+    /// the backlog cannot tell from when it looked.
+    pub at: Instant,
     buf: Vec<u8>,
 }
 
@@ -150,6 +153,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
         trans: h.trans,
         flag: h.flag,
         hc: h.hc,
+        at: Instant::now(),
         buf,
     })
 }
@@ -185,6 +189,7 @@ fn cut_frame(buf: &mut Vec<u8>, pos: &mut usize) -> Result<Option<Frame>> {
         trans: h.trans,
         flag: h.flag,
         hc: h.hc,
+        at: Instant::now(),
         buf: frame,
     }))
 }

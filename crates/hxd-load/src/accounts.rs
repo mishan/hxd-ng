@@ -6,8 +6,8 @@ use std::path::Path;
 /// `<prefix>0` up to `<prefix><count - 1>`, each with `password`, allowed
 /// to chat and to use any nick; an account with a password may detach by
 /// default. With `admin`, one more account by that name, allowed to
-/// disconnect users. If any of the files exists already, none is
-/// written.
+/// disconnect users and to send private messages. If any of the files
+/// exists already, none is written.
 pub fn write(
     dir: &Path,
     prefix: &str,
@@ -36,7 +36,7 @@ pub fn write(
             admin.to_owned(),
             user(
                 admin,
-                "disconnect_users = true\ncant_be_disconnected = true\n",
+                "disconnect_users = true\ncant_be_disconnected = true\nsend_msgs = true\n",
             ),
         ));
     }

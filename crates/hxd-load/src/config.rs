@@ -75,6 +75,7 @@ impl Scenario {
             ("[run] teardown", self.run.teardown),
             ("[login_storm] linger", self.login_storm.linger),
             ("[login_storm] ramp_step", self.login_storm.ramp_step),
+            ("[login_storm] msg_rate", self.login_storm.msg_rate),
             ("[churn] away", self.churn.away),
             ("[churn] chat_rate", self.churn.chat_rate),
             ("[chat] rate", self.chat.rate),
@@ -100,6 +101,16 @@ impl Scenario {
         {
             return Err("[login_storm] accounts = true needs [target] accounts".into());
         }
+        if self.run.scenario == Kind::LoginStorm
+            && (self.login_storm.mail > 0 || self.login_storm.msg_rate > 0.0)
+            && !(self.login_storm.accounts
+                && self.target.admin.is_some()
+                && self.login_storm.senders > 0)
+        {
+            return Err("[login_storm] mail and msg_rate need accounts = true, \
+                 [target] admin and senders"
+                .into());
+        }
         if self.run.scenario == Kind::Churn
             && self.target.admin.is_some()
             && self.target.ng.is_none()
@@ -124,7 +135,11 @@ impl Scenario {
             Kind::Reactions => false,
         };
         let needs_ng = match self.run.scenario {
-            Kind::LoginStorm => self.login_storm.ng > 0,
+            Kind::LoginStorm => {
+                self.login_storm.ng > 0
+                    || self.login_storm.mail > 0
+                    || self.login_storm.msg_rate > 0.0
+            }
             Kind::Chat => self.chat.readers_ng + self.chat.talkers_ng > 0,
             Kind::SlowConsumer => {
                 self.chat.readers_ng + self.chat.talkers_ng + self.slow_consumer.stalled_ng > 0
@@ -787,6 +802,15 @@ pub struct LoginStorm {
     /// arrival, timing when each arrival is heard to join there.
     pub observers_legacy: usize,
     pub observers_ng: usize,
+    /// Private messages waiting for each of `[target] accounts` before
+    /// the first arrival, so that an arrival's login hands them over.
+    pub mail: usize,
+    /// Private messages a second, all `senders` together, to accounts
+    /// picked at random throughout the storm: each is stored and handed
+    /// over under the same lock as a login's.
+    pub msg_rate: f64,
+    /// Ng sessions of `[target] admin` that send `mail` and `msg_rate`.
+    pub senders: usize,
 }
 
 impl Default for LoginStorm {
@@ -803,6 +827,9 @@ impl Default for LoginStorm {
             max_in_flight: 4000,
             observers_legacy: 0,
             observers_ng: 0,
+            mail: 0,
+            msg_rate: 0.0,
+            senders: 4,
         }
     }
 }

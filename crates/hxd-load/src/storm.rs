@@ -10,13 +10,20 @@
 //! (`member::retry_busy`), so the server's login gate shows as latency
 //! and in the report's `busy_logins` rather than as failed logins.
 //!
+//! With `mail`, every account has private messages waiting before the
+//! first arrival, and an arrival logging in to one for the first time
+//! times when the first of them reached its socket (`mail.first`); with
+//! `msg_rate`, senders keep messaging the accounts throughout
+//! (`mail.sent`, due to answered). Both go through the server's one
+//! inbox hand-over lock (`InboxFlush` in `docs/metrics.md`).
+//!
 //! With linked servers, observers on each of them time when each arrival
 //! is heard to join there (`link.join`), from when it was due, and each
 //! must hear every arrival that logged in (`link.joins_heard`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 use serde::Serialize;
@@ -24,7 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::member::{Got, Member, Parts, Rx, Tx, Wire};
+use crate::member::{Conn, Got, Member, Parts, Rx, Tx, Wire};
 use crate::stats::{self, Summary};
 use crate::Ctx;
 
@@ -62,11 +69,13 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let arrivals = Arc::new(Arrivals::default());
     let (done_tx, done_rx) = watch::channel(None);
     let observers = observe(ctx, &arrivals, done_rx).await?;
+    let senders = seed(ctx).await?;
     let in_flight = Arc::new(Semaphore::new(s.max_in_flight));
     let steps: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
     let start = ctx.t0.elapsed() + Duration::from_millis(100);
     let end = start + ctx.duration();
     let every = Duration::from_secs_f64(s.ramp_every);
+    let senders = send_until(ctx, senders, start, end);
     let mut tasks = Vec::new();
     let mut due = start;
     let mut i = 0usize;
@@ -116,6 +125,12 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     }
     for t in tasks {
         let _ = t.await;
+    }
+    for t in senders {
+        let m = t.await.expect("a sender task does not panic");
+        if let Err(e) = m.leave().await {
+            ctx.stats.error("leave", &e.to_string());
+        }
     }
     let logged_in: HashSet<String> = arrivals
         .0
@@ -201,13 +216,204 @@ async fn arrive(
                 a.1 = true;
             }
             ctx.stats.record(&op, took);
-            tokio::time::sleep(Duration::from_secs_f64(s.linger)).await;
+            let linger = tokio::time::sleep(Duration::from_secs_f64(s.linger));
+            let first_login = ctx
+                .scenario
+                .target
+                .accounts
+                .as_ref()
+                .is_some_and(|a| i < a.count);
+            let m = if s.mail > 0 && first_login {
+                let (tx, mut rx, parts) = m.split();
+                tokio::pin!(linger);
+                // A classic client is shown a waiting message under a
+                // stamp, so the tag is looked for anywhere in it.
+                let waiting = waiting(ctx);
+                let heard = tokio::select! {
+                    heard = async {
+                        loop {
+                            match rx.next().await {
+                                Ok(Got::Msg(text, at)) if text.contains(&waiting) => {
+                                    return Ok(at)
+                                }
+                                Ok(_) => {}
+                                Err(e) => return Err(e.to_string()),
+                            }
+                        }
+                    } => heard,
+                    () = &mut linger => Err("no waiting message heard".into()),
+                };
+                match heard {
+                    Ok(at) => ctx.stats.record(
+                        "mail.first",
+                        at.saturating_duration_since(ctx.t0).saturating_sub(due),
+                    ),
+                    Err(e) => ctx.stats.error("mail.first", &e),
+                }
+                linger.await;
+                Member::rejoin(tx, rx, parts)
+            } else {
+                linger.await;
+                m
+            };
             if let Err(e) = m.leave().await {
                 ctx.stats.error("leave", &e.to_string());
             }
         }
         Err(e) => ctx.stats.error(&op, &e.to_string()),
     }
+}
+
+/// The senders, logged in to `[target] admin`, once they have sent
+/// `mail` messages to every one of `[target] accounts`; none, having
+/// left, when there is no `msg_rate` for them to send.
+async fn seed(ctx: &Arc<Ctx>) -> Result<Vec<Member>, String> {
+    let s = &ctx.scenario.login_storm;
+    if s.mail == 0 && s.msg_rate == 0.0 {
+        return Ok(Vec::new());
+    }
+    let admin = ctx
+        .scenario
+        .target
+        .admin
+        .as_ref()
+        .expect("checked by the scenario");
+    let count = ctx.scenario.target.accounts.as_ref().map_or(0, |a| a.count);
+    let began = Instant::now();
+    let mut joined = Vec::new();
+    for k in 0..s.senders {
+        let creds = Some((admin.login.clone(), admin.password.clone()));
+        joined.push(
+            Member::join_as(ctx, Wire::Ng, ctx.nick('P', k), creds)
+                .await
+                .map_err(|e| format!("sender {k} could not join: {e}"))?,
+        );
+    }
+    let mut tasks = joined
+        .into_iter()
+        .enumerate()
+        .map(|(k, mut m)| {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let waiting = waiting(&ctx);
+                for j in (k..count).step_by(ctx.scenario.login_storm.senders) {
+                    for n in 0..ctx.scenario.login_storm.mail {
+                        send(&ctx, &mut m, j, &format!("{waiting} {n}")).await?;
+                    }
+                }
+                Ok::<_, String>(m)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter();
+    let mut senders = Vec::new();
+    while let Some(t) = tasks.next() {
+        match t.await.expect("a seeding task does not panic") {
+            Ok(m) => senders.push(m),
+            Err(e) => {
+                tasks.for_each(|t| t.abort());
+                return Err(format!("seeding: {e}"));
+            }
+        }
+    }
+    eprintln!(
+        "login_storm: {} messages waiting for {count} accounts, sent in {:.1}s",
+        count * s.mail,
+        began.elapsed().as_secs_f64()
+    );
+    if s.msg_rate == 0.0 {
+        for m in senders {
+            if let Err(e) = m.leave().await {
+                ctx.stats.error("leave", &e.to_string());
+            }
+        }
+        return Ok(Vec::new());
+    }
+    Ok(senders)
+}
+
+/// The senders' share of `msg_rate` each, from `start` to `end`, each
+/// timed from when it was due; each task hands its sender back.
+fn send_until(
+    ctx: &Arc<Ctx>,
+    senders: Vec<Member>,
+    start: Duration,
+    end: Duration,
+) -> Vec<JoinHandle<Member>> {
+    let s = &ctx.scenario.login_storm;
+    let n = senders.len();
+    senders
+        .into_iter()
+        .enumerate()
+        .map(|(k, mut m)| {
+            let ctx = ctx.clone();
+            let rate = s.msg_rate;
+            tokio::spawn(async move {
+                let count = ctx.scenario.target.accounts.as_ref().map_or(1, |a| a.count);
+                for seq in 0.. {
+                    let due = start + Duration::from_secs_f64((seq * n + k) as f64 / rate);
+                    if due >= end {
+                        break;
+                    }
+                    if let Err(e) = drain_until(&mut m, ctx.t0 + due).await {
+                        ctx.stats.error("mail.sent", &e.to_string());
+                        break;
+                    }
+                    let to = (ctx.random() * count as f64) as usize;
+                    match send(&ctx, &mut m, to, &format!("live {seq}")).await {
+                        Ok(()) => ctx
+                            .stats
+                            .record("mail.sent", ctx.t0.elapsed().saturating_sub(due)),
+                        Err(e) => ctx.stats.error("mail.sent", &e),
+                    }
+                }
+                m
+            })
+        })
+        .collect()
+}
+
+/// The tag every waiting message carries, unique to the run.
+fn waiting(ctx: &Ctx) -> String {
+    format!("{} waiting", ctx.run)
+}
+
+/// Read and drop what a sender is sent until `at`: the storm's joins and
+/// parts, which a sender that stopped reading would be dropped for.
+async fn drain_until(m: &mut Member, at: Instant) -> Result<(), hxd_testclient::Error> {
+    let Conn::Ng(c) = &mut m.conn else {
+        unreachable!("senders are ng");
+    };
+    drop(c.rx.take_backlog());
+    let at = tokio::time::Instant::from_std(at);
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(at) => return Ok(()),
+            got = c.rx.next_forever() => drop(got?),
+        }
+    }
+}
+
+/// A private message to account `j`, answered.
+async fn send(ctx: &Ctx, m: &mut Member, j: usize, text: &str) -> Result<(), String> {
+    let Conn::Ng(c) = &mut m.conn else {
+        unreachable!("senders are ng");
+    };
+    let to = ctx
+        .scenario
+        .target
+        .accounts
+        .as_ref()
+        .expect("checked by the scenario")
+        .login(j);
+    let sent = c
+        .request("msg", json!({ "to_login": to, "text": text }))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    // The storm's joins and parts, which are not a sender's business.
+    drop(c.rx.take_backlog());
+    sent
 }
 
 /// Each arrival by nick: when it was due, and whether it logged in.

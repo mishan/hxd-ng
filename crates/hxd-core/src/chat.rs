@@ -2778,7 +2778,7 @@ impl Core {
     /// `sender` just sent.
     pub(crate) fn flush_each(
         &self,
-        flushing: &std::sync::MutexGuard<'_, ()>,
+        flushing: &crate::instrument::TimedGuard<'_, crate::roster::InboxFlush>,
         uids: Vec<Uid>,
         mailbox: &Mailbox,
         fresh: Option<MessageId>,
@@ -2912,7 +2912,7 @@ impl Core {
     /// [`Self::flush_to`], for a caller already holding `flushing`.
     fn flush_held(
         &self,
-        _flushing: &std::sync::MutexGuard<'_, ()>,
+        _flushing: &crate::instrument::TimedGuard<'_, crate::roster::InboxFlush>,
         target: Target,
         mailbox: &Mailbox,
         fresh: Option<MessageId>,

@@ -112,6 +112,63 @@ async fn a_login_storm_logs_in_on_both_wires_and_reports_its_steps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_storm_hears_the_mail_waiting_for_it_while_more_is_sent() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let inbox = format!("[inbox]\ndb = \"{d}/messages.db\"\nmax_sent_per_day = 0\n");
+    let server = start(td.path(), &inbox).await;
+    // More accounts than arrivals, so every arrival is its account's
+    // first login and has mail waiting.
+    let accounts = Accounts {
+        prefix: "mail".into(),
+        count: 40,
+        password: "load-test".into(),
+    };
+    hxd_load::accounts::write(
+        &td.path().join("accounts"),
+        &accounts.prefix,
+        accounts.count,
+        &accounts.password,
+        Some("sender"),
+    )
+    .unwrap();
+    let mut s = scenario(&server, Kind::LoginStorm, 2.0);
+    s.target.accounts = Some(accounts);
+    s.target.admin = Some(Account {
+        login: "sender".into(),
+        password: "load-test".into(),
+    });
+    s.login_storm.accounts = true;
+    s.login_storm.rate = 10.0;
+    s.login_storm.ramp_step = 0.0;
+    s.login_storm.linger = 0.5;
+    s.login_storm.mail = 2;
+    s.login_storm.msg_rate = 20.0;
+    s.login_storm.senders = 2;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    let logins: u64 = ["login.legacy", "login.ng"]
+        .iter()
+        .map(|op| report.ops.get(*op).map_or(0, |o| o.count))
+        .sum();
+    let first = report
+        .ops
+        .get("mail.first")
+        .expect("an arrival with mail waiting times it");
+    assert!(
+        logins > 0 && first.count == logins && first.errors.is_empty(),
+        "{}",
+        report.summary()
+    );
+    let sent = &report.ops["mail.sent"];
+    assert!(
+        sent.count > 0 && sent.errors.is_empty(),
+        "{}",
+        report.summary()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn churn_keeps_seqs_gapless_across_drops_resumes_and_kicks() {
     let td = tempfile::tempdir().unwrap();
     // Every churner detaches from one address, and the server must let

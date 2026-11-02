@@ -440,7 +440,7 @@ impl Core {
     /// [`Self::im_deliver`], for a caller already holding `flushing`.
     fn im_deliver_held(
         &self,
-        flushing: &std::sync::MutexGuard<'_, ()>,
+        flushing: &crate::instrument::TimedGuard<'_, crate::roster::InboxFlush>,
         to: &Mailbox,
         fresh: Option<MessageId>,
         sender: Uid,
