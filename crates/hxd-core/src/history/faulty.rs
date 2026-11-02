@@ -77,7 +77,9 @@ impl ChatLog for FaultyLog {
     }
 
     fn append_all(&self, lines: &[NewLine]) -> Result<Vec<Appended>, StoreError> {
-        self.inner.append_all(lines)
+        let out = self.inner.append_all(lines);
+        self.park("append_all");
+        out
     }
 
     fn query(&self, query: &HistoryQuery) -> Result<HistoryPage, StoreError> {
