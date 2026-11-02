@@ -318,6 +318,27 @@ pub trait ChatLog: Send + Sync + 'static {
     /// retired line and a room's deletion take a line's reactions with
     /// it.
     fn react(&self, act: &ReactAct) -> Result<Reacted, StoreError>;
+    /// [`ChatLog::react`] for each of `acts` in order, all applied or, on
+    /// an error, none: a run of reactions committed together, which the
+    /// desk tries again an act at a time when it fails.
+    fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError>;
+    /// [`ChatLog::tombstone`] for each of `ids`, answering those there
+    /// are. A store with transactions makes them in one; this default
+    /// stops at the first error.
+    fn tombstone_all(
+        &self,
+        ids: &[LineId],
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let mut gone = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if self.tombstone(id, by, at)? {
+                gone.push(id);
+            }
+        }
+        Ok(gone)
+    }
     /// The reactions on those of `ids` that have any, `mine` as
     /// `reader`'s account holds them.
     fn reactions(
@@ -352,6 +373,7 @@ struct MemoryInner {
     reactions: Vec<ReactionRow>,
 }
 
+#[derive(Clone)]
 struct ReactionRow {
     line: LineId,
     key: Vec<u8>,
@@ -643,53 +665,17 @@ impl ChatLog for MemoryLog {
     }
 
     fn react(&self, act: &ReactAct) -> Result<Reacted, StoreError> {
+        react_in(&mut self.inner.lock().unwrap(), act)
+    }
+
+    fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.lines.iter().any(|l| {
-            l.id == act.line && l.channel == act.channel && !l.flags.contains(LineFlags::DELETED)
-        }) {
-            return Ok(Reacted::NoSuchLine);
+        let before = inner.reactions.clone();
+        let reacted: Result<Vec<_>, _> = acts.iter().map(|a| react_in(&mut inner, a)).collect();
+        if reacted.is_err() {
+            inner.reactions = before;
         }
-        let (key, reactor) = (act.key.pack(), reactor_key(act.who));
-        let (held, keyed, keys, yours) = {
-            let on: Vec<&ReactionRow> = inner
-                .reactions
-                .iter()
-                .filter(|r| r.line == act.line)
-                .collect();
-            let mut keys: Vec<&[u8]> = on.iter().map(|r| &r.key[..]).collect();
-            keys.sort_unstable();
-            keys.dedup();
-            (
-                on.iter().any(|r| r.key == key && r.reactor == reactor),
-                on.iter().any(|r| r.key == key),
-                keys.len(),
-                on.iter().filter(|r| r.reactor == reactor).count(),
-            )
-        };
-        if act.add && !held {
-            if !keyed && keys >= act.max_keys {
-                return Ok(Reacted::TooManyKeys);
-            }
-            if yours >= act.max_per_user {
-                return Ok(Reacted::TooManyOfYours);
-            }
-            inner.reactions.push(ReactionRow {
-                line: act.line,
-                key: key.clone(),
-                reactor,
-                at: act.at,
-            });
-        } else if !act.add && held {
-            inner
-                .reactions
-                .retain(|r| !(r.line == act.line && r.key == key && r.reactor == reactor));
-        }
-        let count = inner
-            .reactions
-            .iter()
-            .filter(|r| r.line == act.line && r.key == key)
-            .count();
-        Ok(Reacted::Count(count as u32))
+        reacted
     }
 
     fn reactions(
@@ -750,6 +736,56 @@ impl ChatLog for MemoryLog {
     }
 }
 
+/// One reaction to the memory log, under its lock.
+fn react_in(inner: &mut MemoryInner, act: &ReactAct) -> Result<Reacted, StoreError> {
+    if !inner.lines.iter().any(|l| {
+        l.id == act.line && l.channel == act.channel && !l.flags.contains(LineFlags::DELETED)
+    }) {
+        return Ok(Reacted::NoSuchLine);
+    }
+    let (key, reactor) = (act.key.pack(), reactor_key(act.who));
+    let (held, keyed, keys, yours) = {
+        let on: Vec<&ReactionRow> = inner
+            .reactions
+            .iter()
+            .filter(|r| r.line == act.line)
+            .collect();
+        let mut keys: Vec<&[u8]> = on.iter().map(|r| &r.key[..]).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        (
+            on.iter().any(|r| r.key == key && r.reactor == reactor),
+            on.iter().any(|r| r.key == key),
+            keys.len(),
+            on.iter().filter(|r| r.reactor == reactor).count(),
+        )
+    };
+    if act.add && !held {
+        if !keyed && keys >= act.max_keys {
+            return Ok(Reacted::TooManyKeys);
+        }
+        if yours >= act.max_per_user {
+            return Ok(Reacted::TooManyOfYours);
+        }
+        inner.reactions.push(ReactionRow {
+            line: act.line,
+            key: key.clone(),
+            reactor,
+            at: act.at,
+        });
+    } else if !act.add && held {
+        inner
+            .reactions
+            .retain(|r| !(r.line == act.line && r.key == key && r.reactor == reactor));
+    }
+    let count = inner
+        .reactions
+        .iter()
+        .filter(|r| r.line == act.line && r.key == key)
+        .count();
+    Ok(Reacted::Count(count as u32))
+}
+
 /// A line's rows, as `(key, reactor)` in the order they were made, read
 /// into what a reader is shown.
 fn summarize<'a>(
@@ -775,6 +811,9 @@ fn summarize<'a>(
     out.mine.sort_unstable();
     out
 }
+
+#[cfg(test)]
+pub(crate) mod faulty;
 
 pub mod conformance {
     use super::*;
@@ -828,6 +867,8 @@ pub mod conformance {
         a_lines_reactions_go_when_it_does(new_log());
         reactions_are_forgotten_by_reactor_and_time(new_log());
         reactions_follow_their_account_to_its_identity(new_log());
+        reactions_together_are_applied_in_order(new_log());
+        tombstones_together_answer_the_lines_they_made(new_log());
     }
 
     fn key(e: &str) -> crate::reaction::ReactionKey {
@@ -992,6 +1033,46 @@ pub mod conformance {
             [(1, keys(&[("👍", 1)], &[0])), (2, keys(&[("👍", 1)], &[]))]
         );
         assert!(log.forget_reactions(&alice, since).unwrap().is_empty());
+    }
+
+    /// Reactions applied together are applied in order, each seeing
+    /// those before it.
+    fn reactions_together_are_applied_in_order(log: Box<dyn ChatLog>) {
+        fill(&*log, 1);
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        let thumbs = key("👍");
+        let act = |who, add| ReactAct {
+            channel: 0,
+            line: 1,
+            who,
+            nick: "n",
+            key: &thumbs,
+            add,
+            at: SystemTime::UNIX_EPOCH,
+            max_keys: 20,
+            max_per_user: 5,
+        };
+        let acts = [act(&alice, true), act(&bob, true), act(&bob, false)];
+        assert_eq!(
+            log.react_all(&acts).unwrap(),
+            [Reacted::Count(1), Reacted::Count(2), Reacted::Count(1)]
+        );
+    }
+
+    /// Tombstones made together answer, as one at a time do, the lines
+    /// there are, and take their reactions.
+    fn tombstones_together_answer_the_lines_they_made(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        let alice = Mailbox::login("alice");
+        react(&*log, &alice, 3, "👍", true, 1);
+        assert!(log.tombstone(2, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        assert_eq!(
+            log.tombstone_all(&[1, 2, 3, 99], "mod", SystemTime::UNIX_EPOCH)
+                .unwrap(),
+            [1, 2, 3]
+        );
+        assert_eq!(ids_in(&*log, 0).len(), 3, "kept as tombstones");
+        assert!(shown(&*log, &[3], &alice).is_empty());
     }
 
     /// A link or a rotation moves an account's reactions, and one the new

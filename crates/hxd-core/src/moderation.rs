@@ -1266,7 +1266,7 @@ impl Core {
         if lines.is_empty() {
             return Ok(());
         }
-        let log = self.history.as_ref().ok_or(ModError::Disabled)?;
+        self.history.as_ref().ok_or(ModError::Disabled)?;
         let mut by_room: std::collections::BTreeMap<u32, Vec<LineId>> = Default::default();
         for &(id, room) in lines {
             by_room.entry(room).or_default().push(id);
@@ -1278,13 +1278,7 @@ impl Core {
                 .map_or(&self.log_serial, |c| &c.serial)
                 .lock()
                 .unwrap();
-            let now = SystemTime::now();
-            let mut gone = Vec::with_capacity(ids.len());
-            for id in ids {
-                if log.tombstone(id, &acting.name, now)? {
-                    gone.push(id);
-                }
-            }
+            let gone = self.lines_gone(ids, acting.name.clone(), SystemTime::now())?;
             channel
                 .as_ref()
                 .map_or(&self.chat_commit, |c| &c.commit)

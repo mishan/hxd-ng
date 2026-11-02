@@ -949,13 +949,13 @@ impl Core {
         }
         r.room_announce(before, Some(&changed), None);
         drop(r);
-        if let Some(log) = self.history.as_ref() {
+        if self.history.is_some() {
             for id in purge {
                 // Under the room's serial, so no line committed meanwhile
                 // outlives the purge.
                 let channel = self.room_channel(id);
                 let _serial = channel.serial.lock().unwrap();
-                if let Err(e) = log.delete_channel(id) {
+                if let Err(e) = self.delete_channel_lines(id) {
                     warn!("rooms: deleted room {id}'s lines would not go: {e}");
                 }
             }

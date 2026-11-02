@@ -1585,16 +1585,13 @@ impl Core {
             max_age,
             channels: self.room_retention(max_lines, max_age),
         };
-        self.history
-            .as_ref()
-            .and_then(|log| match log.prune(&keep, SystemTime::now()) {
-                Ok(gone) => Some(gone),
-                Err(e) => {
-                    warn!("history retention: {e}");
-                    None
-                }
-            })
-            .unwrap_or(0)
+        match self.prune_log(keep, SystemTime::now()) {
+            Ok(gone) => gone,
+            Err(e) => {
+                warn!("history retention: {e}");
+                0
+            }
+        }
     }
 
     /// Count a chat send's lines against `uid`'s `chat_lines`, as
@@ -3710,6 +3707,12 @@ mod tests {
         ) -> Result<crate::reaction::Reacted, StoreError> {
             self.inner.react(act)
         }
+        fn react_all(
+            &self,
+            acts: &[crate::reaction::ReactAct],
+        ) -> Result<Vec<crate::reaction::Reacted>, StoreError> {
+            self.inner.react_all(acts)
+        }
         fn reactions(
             &self,
             ids: &[crate::history::LineId],
@@ -3998,6 +4001,12 @@ mod tests {
             act: &crate::reaction::ReactAct,
         ) -> Result<crate::reaction::Reacted, StoreError> {
             self.inner.react(act)
+        }
+        fn react_all(
+            &self,
+            acts: &[crate::reaction::ReactAct],
+        ) -> Result<Vec<crate::reaction::Reacted>, StoreError> {
+            self.inner.react_all(acts)
         }
         fn reactions(
             &self,
@@ -4356,6 +4365,12 @@ mod tests {
             act: &crate::reaction::ReactAct,
         ) -> Result<crate::reaction::Reacted, StoreError> {
             self.0.react(act)
+        }
+        fn react_all(
+            &self,
+            acts: &[crate::reaction::ReactAct],
+        ) -> Result<Vec<crate::reaction::Reacted>, StoreError> {
+            self.0.react_all(acts)
         }
         fn reactions(
             &self,
