@@ -3913,6 +3913,43 @@ fn an_im_reaction_is_spelled_relayed_and_gated_as_an_acknowledgement_is() {
     assert!(told(&mut rb).is_empty());
 }
 
+/// An approval left beside a block, as a merge can leave one until it
+/// is settled, carries no reaction, whichever of the two blocked.
+#[test]
+fn an_approval_beside_a_block_carries_no_reaction() {
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    for bob_blocks in [true, false] {
+        let s = reacting(&["bob", "carol"], crate::ReactionPolicy::default());
+        let (c, _) = taker(&s.core, "carol");
+        let (b, mut rb) = taker(&s.core, "bob");
+        send(&s.core, c, "bob", "hello?").unwrap();
+        s.core
+            .request_answer(b, "carol", RequestAction::Approve)
+            .unwrap();
+        {
+            let mut r = s.core.roster.lock().unwrap();
+            r.users.get_mut(&b).unwrap().info.transport.reactions = true;
+            r.users.get_mut(&c).unwrap().access = messaging_bits().with(bit::SEND_CHAT);
+        }
+        let (bob, carol) = (Mailbox::login("bob"), Mailbox::login("carol"));
+        let (owner, other) = if bob_blocks {
+            (&bob, &carol)
+        } else {
+            (&carol, &bob)
+        };
+        s.rel
+            .set_blocked(owner, other, true, std::time::SystemTime::now())
+            .unwrap();
+        drain(&mut rb);
+        assert_eq!(
+            s.core.react_im(c, &im_on("carol", 1), "bob", &thumbs, true),
+            Err(crate::ReactError::NoSuchTarget),
+            "bob blocks: {bob_blocks}"
+        );
+        assert!(im_reactions(&drain(&mut rb)).is_empty());
+    }
+}
+
 /// What waits follows its recipient through a link, and is handed to
 /// the account under its new key.
 #[test]

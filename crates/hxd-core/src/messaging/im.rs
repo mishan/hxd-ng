@@ -147,7 +147,9 @@ impl Core {
             .and_then(|m| m.friendship))
     }
 
-    /// The live approval between `a` and `b`, given by either.
+    /// The live approval between `a` and `b`, given by either, if
+    /// neither has blocked the other. A block ends approvals both ways,
+    /// but one a merge folded beside a block lasts until it is settled.
     pub(crate) fn approval(
         &self,
         a: &Mailbox,
@@ -156,11 +158,16 @@ impl Core {
         let store = self.friends_store()?;
         let now = self.clock.wall();
         for (owner, other) in [(a, b), (b, a)] {
-            if let Some(id) = store
+            let Some(row) = store
                 .relationship(owner, other, now)
                 .map_err(store_failed)?
-                .and_then(|r| r.approval)
-            {
+            else {
+                continue;
+            };
+            if row.blocked_at.is_some() || store.is_blocked(other, owner).map_err(store_failed)? {
+                return Ok(None);
+            }
+            if let Some(id) = row.approval {
                 return Ok(Some(id));
             }
         }
