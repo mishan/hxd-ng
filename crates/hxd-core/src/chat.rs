@@ -1369,7 +1369,13 @@ impl Core {
             let skip = mine.as_ref().map(|_| sender);
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
-                if let Some(policy) = self.reactions {
+                // A room closed since this line was let in has been, or
+                // will be, forgotten at the desk once, and is not brought
+                // back by a line relayed late.
+                let open = room == 0
+                    || (r.rooms.get(&room))
+                        .is_some_and(|e| e.room.archived_at.is_none() && !e.room.deleted);
+                if let (Some(policy), true) = (self.reactions, open) {
                     self.desk.relayed(room, id, policy.live_window);
                 }
             }

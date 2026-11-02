@@ -1362,6 +1362,34 @@ fn an_archived_rooms_live_lines_go_on_an_idle_server() {
     assert!(!core.reactions_room_live(room));
 }
 
+/// A line let into a room before it closed and relayed after the desk
+/// forgot the room does not bring the room back.
+#[test]
+fn a_line_relayed_after_its_room_was_forgotten_keeps_nothing_live() {
+    let log = Arc::new(crate::history::faulty::FaultyLog::default());
+    let core = Arc::new(with_rooms(
+        Core::new()
+            .with_history(log.clone(), HistoryPolicy::default())
+            .with_reactions(crate::ReactionPolicy::default()),
+    ));
+    let (boss, _rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    let at = Arc::new(std::sync::Barrier::new(2));
+    log.park_after("append_all", at.clone());
+    let saying = {
+        let core = core.clone();
+        std::thread::spawn(move || say(&core, boss, room, "late").map(drop))
+    };
+    at.wait();
+    core.room_archive(boss, room, true).unwrap();
+    core.reactions_flush(core.clock.now());
+    at.wait();
+    let _ = saying.join().unwrap();
+    core.reactions_flush(core.clock.now());
+    assert!(!core.reactions_room_live(room));
+}
+
 /// However often the rooms are written, a room's close is posted to the
 /// desk once.
 #[test]
