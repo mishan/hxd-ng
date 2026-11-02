@@ -457,7 +457,7 @@ fn admits(sess: &UserSession, room: &Room) -> bool {
 }
 
 /// May `sess` send in `room` by its gates (§5), given that it is in it?
-fn gates_post(sess: &UserSession, room: &Room) -> bool {
+pub(crate) fn gates_post(sess: &UserSession, room: &Room) -> bool {
     admits(sess, room)
         && (sess.manage_rooms
             || (sess.access.has(bit::SEND_CHAT)
@@ -521,6 +521,9 @@ impl RosterInner {
             return false;
         };
         entry.members.remove(pos);
+        if let Some(sess) = self.users.get_mut(&uid) {
+            sess.heard_from.remove(&room);
+        }
         self.room_send_where(room, Event::ChatUserParted { cid: room, uid }, pred);
         true
     }
@@ -552,6 +555,9 @@ impl RosterInner {
             };
             for &uid in &lost {
                 self.voice_part_room(uid, room);
+                if let Some(sess) = self.users.get_mut(&uid) {
+                    sess.heard_from.remove(&room);
+                }
                 // Why is the parted session's business alone.
                 self.send_to(uid, about(Event::RoomParted { uid, reason }));
                 for &member in &stay {
@@ -1253,6 +1259,10 @@ impl Core {
             }
             r.room_send_where(id, Event::ChatUserJoined { cid: id, user: me }, |_| true);
             r.rooms.get_mut(&id).expect("found above").members.push(uid);
+            let from = r.last_ids.get(&id).copied().unwrap_or(0);
+            if let Some(sess) = r.users.get_mut(&uid) {
+                sess.heard_from.insert(id, from);
+            }
         }
         let members = r.rooms[&id]
             .members

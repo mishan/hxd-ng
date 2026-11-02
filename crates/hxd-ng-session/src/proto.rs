@@ -47,6 +47,9 @@ pub struct LoginParams {
     /// Whether it sends and reads `re` (§7.3).
     #[serde(default)]
     pub replies: bool,
+    /// Whether it reacts and reads reactions (§7.3).
+    #[serde(default)]
+    pub reactions: bool,
 }
 
 #[derive(Debug, Deserialize)]

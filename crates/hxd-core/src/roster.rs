@@ -265,6 +265,9 @@ pub struct Transport {
     /// answers is worth sending it (`docs/hotline-ng.md` §7.3). Kept
     /// here so a resume keeps what the login was granted.
     pub replies: bool,
+    /// It declared the ng wire's `reactions`, so a line's reactions are
+    /// worth sending it (`docs/hotline-ng.md` §7.3). Kept, as `replies`.
+    pub reactions: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -1075,6 +1078,11 @@ pub(crate) struct UserSession {
     /// Has it asked about rooms on a wire that shows them
     /// (`Core::rooms_aware`)? Until then it is told nothing about one.
     pub(crate) rooms_aware: bool,
+    /// The newest line relayed in each channel it hears, the lobby and
+    /// the rooms it has joined, when it began to: lines after it reached
+    /// it live, and any line before it it can only have read in history
+    /// (`crate::reaction`).
+    pub(crate) heard_from: HashMap<u32, crate::history::LineId>,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
     /// And of its voice signaling allowances (`crate::voice`).
@@ -1592,6 +1600,10 @@ pub struct Core {
     pub(crate) post_rates: crate::limits::PostRates,
     /// What each account has left of the folders it may make, likewise.
     pub(crate) folder_rates: crate::limits::PostRates,
+    /// And of its reactions (`crate::reaction`).
+    pub(crate) react_rates: crate::limits::PostRates,
+    /// `[reactions]`, or `None`, which takes none.
+    pub(crate) reactions: Option<crate::reaction::ReactionPolicy>,
     /// What each account and each address have left of the device proofs
     /// they may ask, likewise ([`Core::device_proof_spend`]).
     pub(crate) device_proofs: crate::limits::PostRates,
@@ -2130,6 +2142,12 @@ impl Core {
         log: Arc<dyn crate::history::ChatLog>,
         policy: crate::history::HistoryPolicy,
     ) -> Self {
+        // Each channel's newest line, as relayed: the watermark nothing
+        // about a line may pass (`crate::reaction`).
+        match log.channels() {
+            Ok(channels) => self.roster.lock().unwrap().last_ids.extend(channels),
+            Err(e) => tracing::warn!("chat history: {e}"),
+        }
         self.history = Some(log);
         self.history_policy = policy;
         self
@@ -2203,6 +2221,7 @@ impl Core {
             .account
             .as_ref()
             .map_or_else(Vec::new, |a| a.roles.clone());
+        let lobby_heard_from = r.last_ids.get(&0).copied().unwrap_or(0);
         r.users.insert(
             uid,
             UserSession {
@@ -2237,6 +2256,7 @@ impl Core {
                 can_spam: info.can_spam,
                 manage_rooms: info.manage_rooms,
                 rooms_aware: false,
+                heard_from: HashMap::from([(0, lobby_heard_from)]),
                 set_subject: info.set_subject,
                 flood: Default::default(),
                 voice_flood: Default::default(),

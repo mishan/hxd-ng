@@ -291,6 +291,16 @@ tag and whether its nick was logged tagged, served as the rest of its
 `from.remote` (§7.2). A line logged before has none of them, and a
 tombstone keeps none.
 
+Schema v35 adds `chat_reaction` beside the lines: one row for each key
+an account holds on a line (hotline-ng.md §7.3), the account by the
+mailbox rule in one column so that it holds a key once, the nick it
+reacted under, and when. It is indexed by line, by line and key in
+time order, and by account in time order, for the summaries of a page,
+for who reacted, and for a purge. A line's reactions go with it,
+however it goes: a redaction deletes them with its words, and a
+trigger deletes them with the row on retention and a room's deletion,
+since this database enforces no foreign keys.
+
 `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the spec's one
 guarantee: an id is never reused, so a client's cursor from last week
 still means what it meant. Plain `INTEGER PRIMARY KEY` can hand out a
@@ -504,6 +514,12 @@ reply may hold the highest ids are left out with `has_more`. The log
 keeps a line's `re` (schema 34) until it is redacted, which takes it
 with the words; a reply to a redacted line keeps its own.
 
+**Reactions.** To a session that declared `reactions`, a line of a page
+or of `ids` carries its `reactions` and the reader's `reactions_mine`
+(hotline-ng.md §7.3), read beside the page in two queries over its ids
+whatever its length: the keys and counts every reader shares, and the
+keys the reader's account holds.
+
 The shape is built for a client that loads as the user scrolls, which
 is what hx-ng is expected to do where GtkHx has a button: each page's
 oldest `id` is the next `before`, `has_more: false` is the top of the
@@ -580,6 +596,14 @@ max_lines = 10000      # 0 = unlimited; advertised as DATA_HISTORY_MAX_MSGS
 max_days = 0           # 0 = unlimited; advertised as DATA_HISTORY_MAX_DAYS
 max_page = 200         # the clamp on a client's limit
 replay = 0             # lines pushed as plain 106s to non-capable legacy clients
+
+[reactions]            # emoji on these lines, on the ng wire (hotline-ng.md §7.3)
+enabled = false        # off unless turned on
+max_keys = 20          # distinct keys one line may carry, 1 to 255
+max_per_user = 5       # keys one account may hold on one line
+burst = 10             # one account's reactions at once,
+per_second = 1         # and how many a second it earns back
+read_only_rooms = "allow"  # or "deny": may a reader who may not post react
 ```
 
 The section's presence is what turns history on, and it is a startup

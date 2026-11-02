@@ -43,6 +43,12 @@ impl Core {
             self.after_merge(&successor);
         }
         self.news_rotate(from, to)?;
+        if let Some(log) = self.history.as_ref() {
+            log.rekey_reactions(
+                &crate::inbox::Mailbox::identified(String::new(), *from),
+                &crate::inbox::Mailbox::identified(String::new(), *to),
+            )?;
+        }
         if let Some(store) = self.devices.as_ref() {
             let taken = store.devices_rotate(from, to)?;
             self.devices_changed(false, &taken);

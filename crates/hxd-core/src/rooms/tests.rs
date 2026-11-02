@@ -1183,3 +1183,85 @@ fn a_rooms_signed_mark_is_set_once() {
         Err(RoomError::Invalid("this server carries no signed lines"))
     );
 }
+
+fn reacting(core: Core) -> Core {
+    with_rooms(
+        core.with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
+            .with_reactions(crate::ReactionPolicy::default()),
+    )
+}
+
+fn thumbs() -> crate::ReactionKey {
+    crate::ReactionKey::emoji("\u{1F44D}").unwrap()
+}
+
+/// Without history's bit, a member reacts to the lines it heard there:
+/// none from before it joined, and none said while a narrowed gate had
+/// parted it, once the gate is widened again.
+#[test]
+fn a_member_reacts_to_the_lines_it_heard_in_a_room() {
+    use crate::ReactError::NoSuchTarget;
+    let core = reacting(Core::new());
+    let (boss, _) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    let before = say(&core, boss, room, "before").unwrap().unwrap();
+    let (alice, _) = attach(&core, member("alice"));
+    core.room_join(alice, room).unwrap();
+    let heard = say(&core, boss, room, "heard").unwrap().unwrap();
+    assert_eq!(
+        core.react(alice, room, before, &thumbs(), true),
+        Err(NoSuchTarget)
+    );
+    assert_eq!(core.react(alice, room, heard, &thumbs(), true), Ok(1));
+    let gate = |read: Vec<String>| RoomEdit {
+        read: Some(read),
+        ..RoomEdit::default()
+    };
+    core.room_edit(boss, room, gate(vec!["boss".into()]))
+        .unwrap();
+    let missed = say(&core, boss, room, "missed").unwrap().unwrap();
+    core.room_edit(boss, room, gate(Vec::new())).unwrap();
+    assert_eq!(
+        core.react(alice, room, missed, &thumbs(), true),
+        Err(NoSuchTarget)
+    );
+}
+
+/// A reader a room's post gate leaves out reacts there as the policy
+/// says, and nobody reacts in an archive, which changes no more.
+#[test]
+fn a_reaction_in_a_room_is_held_to_its_post_gate_and_its_archive() {
+    use crate::ReactError::NotAllowed;
+    for (read_only_rooms, want) in [(true, Ok(1)), (false, Err(NotAllowed))] {
+        let core = reacting(Core::new()).with_reactions(crate::ReactionPolicy {
+            read_only_rooms,
+            ..crate::ReactionPolicy::default()
+        });
+        // A manager reads an archive, in history once it has parted it.
+        let boss = Who {
+            access: member("boss").access.with(bit::CHAT_HISTORY),
+            ..manager("boss")
+        };
+        let (boss, _) = attach(&core, boss);
+        let edit = RoomEdit {
+            post: Some(vec!["boss".into()]),
+            ..named("stage")
+        };
+        let room = core.room_create(boss, edit).unwrap().id;
+        let (alice, _) = attach(&core, member("alice"));
+        core.room_join(boss, room).unwrap();
+        core.room_join(alice, room).unwrap();
+        let line = say(&core, boss, room, "on stage").unwrap().unwrap();
+        assert_eq!(
+            core.react(alice, room, line, &thumbs(), true),
+            want,
+            "read_only_rooms {read_only_rooms}"
+        );
+        core.room_archive(boss, room, true).unwrap();
+        assert_eq!(
+            core.react(boss, room, line, &thumbs(), true),
+            Err(NotAllowed)
+        );
+    }
+}

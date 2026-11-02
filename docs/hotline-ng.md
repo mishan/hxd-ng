@@ -184,6 +184,7 @@ over them.
 | `friendships` | Portable friendships: offers, friendships and withdrawals on the `messaging` family's requests and events, `friendships_present` and `friendships_fetch`. Listed only to a login that asked for it (§7.5) | §7.5 here; proposals/portable-friends.md | — |
 | `guest_identities` | Identity guests' message requests: listed apart by `fingerprint` on `requests`, counted in `requests_changed`, and answered by `fingerprint` on `request_answer`. Listed only to a login that asked for it (§7.5) | §7.5 here; instant-messaging.md §4.1 | — |
 | `replies` | `re` on `chat` and `msg`, on the events, listings and pages that carry them, and `ids` on `history`. Listed only to a login that asked for it (§7.3) | §7.3 here | `replies` |
+| `reactions` | `react`, and a line's reactions on the `history` that shows it. Listed only to a login that asked for it (§7.3) | §7.3 here | `reactions` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -286,7 +287,8 @@ Starts a new session.
     "messaging": true,       // optional: it speaks the friend family (§7.5)
     "friendships": true,     // optional: with messaging, its portable part (§7.5)
     "guest_identities": true, // optional: with messaging, identity guests' requests (§7.5)
-    "replies": true          // optional: it sends and reads `re` (§7.3)
+    "replies": true,         // optional: it sends and reads `re` (§7.3)
+    "reactions": true        // optional: it reacts and reads reactions (§7.3)
 } }
 ```
 
@@ -325,6 +327,7 @@ hotline-ng-identity.md §8.1 says.
 | `friendships` | Not echoed: `caps` lists `friendships` when it is granted (§7.5). Without `messaging`, it is ignored. |
 | `guest_identities` | Not echoed: `caps` lists `guest_identities` when it is granted, to a session that takes part (§7.5). Without `messaging`, it is ignored. A resume keeps what the login was granted. |
 | `replies` | Not echoed: `caps` lists `replies` when it is granted, which is whenever the server keeps any kind of target, and the `replies` block says which (§7.3). A resume keeps what the login was granted. |
+| `reactions` | Not echoed: `caps` lists `reactions` when it is granted, which is whenever the server takes reactions on any kind of target, and the `reactions` block says which (§7.3). A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -666,6 +669,7 @@ family document. Each family of §4 adds its own.
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
+| `react` | `target`, `key`, `remove?` (§7.3) | `{ "count" }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `bad_request`, `rate_limited` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message cursor) | `{ "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
@@ -799,6 +803,59 @@ family document. Each family of §4 adds its own.
     is `bad_request`; from any other session it is ignored. When the lines do not fit one reply (*hxd-ng:* 64
     KiB of them) the highest ids are left out and `has_more` is `true`,
     for the client to ask again for those.
+- **`react`**, with the `reactions` capability, adds a reaction, or with
+  `remove: true` takes one away, and answers the key's `count` after.
+  `target` is a `line` as `re` names one (`{ "line", "room"? }`), and
+  `key` one emoji, `{ "emoji": "\u2764\ufe0f" }`: one emoji sequence of at most 64
+  bytes of UTF-8 in its fully-qualified form (UTS #51). The server spells
+  every key that way before it checks, keeps or compares it: it takes
+  out every U+FE0F and puts one back after a keycap's base and after
+  each pictograph not drawn as an emoji by itself that has no skin tone
+  after it, so U+2764 and U+2764 U+FE0F are one key and a client may
+  send either. U+FE0E, which asks for text, is `bad_request`. A
+  sequence that is one grapheme and in no emoji set, a skin tone on a
+  pictograph that takes none, two regional indicators that name no
+  flag, a tag sequence, is kept as sent. Keys come back in that form. The login reply's `reactions` block, `{
+  "targets": [ … ], "max_keys", "max_per_user" }`, lists the kinds of
+  target this server takes, `line` where it keeps history, and its caps.
+  - A reaction is its **account's**, by the mailbox rule (§7.1), shared
+    by every session of the account and kept across a nick change, a
+    reconnect and the account linking an identity. So a session of an
+    account more than one person may use, such as a guest's, may not
+    react, nor one without the send-chat privilege (*hxd-ng:* its
+    interim gate, until the extension's own access bit is allocated):
+    both `access_denied`. Adding a key the account holds, or removing
+    one it does not, changes nothing and succeeds.
+  - The line must be one this session can read, already relayed, and
+    either one it heard live or one it may read in history (the
+    chat-history privilege). A line that does not exist, is redacted,
+    is of another room, cannot be read or has not yet been relayed is
+    `no_such_target`, one answer for all. In a room this session may
+    read and not post in, a reaction is let through or refused
+    `access_denied` as the server says (*hxd-ng:* `[reactions]
+    read_only_rooms`, allow by default; a room's own setting is not
+    offered yet). In an archived room, which changes no more, it is
+    `access_denied` for everyone.
+  - Past `max_keys` distinct keys on the line, or `max_per_user` held by
+    the account on it, a new one is `too_many_reactions`; a reaction to
+    a key already there never is. An account is held to a rate of its
+    own, across its sessions, refused `rate_limited` with `retry_after`
+    and never kicked (*hxd-ng:* `[reactions] burst` and `per_second`).
+    A `key` that is not one emoji, a server's own emoji (`{ "custom" }`,
+    not offered yet), a malformed `target` and a kind the block does not
+    list are `bad_request`. From a session that did not declare
+    `reactions`, `react` is `not_available`.
+  - A `history` line, from a page or `ids`, carries to a session that
+    declared `reactions` its `reactions`, `[ { "key", "count" } ]` in
+    the order the keys were first added, the part every reader shares,
+    and `reactions_mine`, the indexes into it of the keys this reader's
+    account holds; each is left off when empty, and a tombstone has
+    neither. A redaction takes a line's reactions with its words,
+    retention takes them with the line, and a purge of a person takes
+    those they made within its window (moderation.md §3.3). Nothing
+    changes on the classic wire, and nothing crosses a server link.
+    *hxd-ng* does not push changes yet: a client reads them again with
+    `history`.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event
@@ -1376,7 +1433,7 @@ news body is different: it declares its own type (news.md §5).
   `push_unregister`, `files_download`, `files_mkdir`, `files_delete`,
   `files_move`, `files_comment`, `report_close`, `redact`, `revoke`,
   `kick`, `friend_respond`, `friend_remove`, `friend_alias`,
-  `presence`, `typing` and `request_answer`, and `friends` and
+  `presence`, `typing`, `request_answer` and `react`, and `friends` and
   `requests`, which read a row of the store for each one listed. What fans out,
   searches, asks a stranger, or joins, leaves or
   renegotiates media costs 4: `news_post`, `news_delete`,
@@ -1451,7 +1508,8 @@ news body is different: it declares its own type (news.md §5).
   but `msg` spend none: mhxd's table predates the extension and prices
   its transactions only by its catch-all, at which a receipt for every
   message read would be a ban, so they are held to the request limit
-  and instant-messaging.md §4.4's bounds instead. Past the first the session is kicked and its room told;
+  and instant-messaging.md §4.4's bounds instead, as `react` is, which
+  has no classic transaction yet, and its own rate per account. Past the first the session is kicked and its room told;
   past the second it is kicked and banned for `[server] ban_time` —
   its account's login or its identity, and its address unless
   `[limits] exempt` holds that to nothing, so a plain guest on an
@@ -1488,7 +1546,9 @@ news body is different: it declares its own type (news.md §5).
 | `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
-| `not_available` | `history`, `files_*`, family requests | The server does not offer this. |
+| `not_available` | `history`, `files_*`, `react`, family requests | The server does not offer this. |
+| `no_such_target` | `react` | No such line, or one this session may not react to: one answer for all (§7.3). |
+| `too_many_reactions` | `react` | The line carries as many keys as it may, or this account as many of them as it may (§7.3). |
 | `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |
 | `read_only` | `chat` | This session may read that room and not send in it. |

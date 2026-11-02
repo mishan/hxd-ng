@@ -62,6 +62,7 @@ fn req_label(req: &str) -> &'static str {
         "msg_read",
         "nick",
         "ping",
+        "react",
         "resume",
         "rooms",
         "signs",
@@ -121,7 +122,7 @@ fn request_weight(req: &str) -> u32 {
         | "account_update" | "account_delete" | "role_create" | "role_update" | "role_delete"
         | "room_topic" | "room_join" | "room_part" | "friends" | "friend_respond"
         | "friend_remove" | "friend_alias" | "presence" | "typing" | "requests"
-        | "request_answer" => 2,
+        | "request_answer" | "react" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
         | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
@@ -138,6 +139,25 @@ fn request_weight(req: &str) -> u32 {
 /// writes a bounded frame.
 const IDS_MAX: usize = 50;
 const IDS_REPLY_BYTES: usize = 64 * 1024;
+
+/// The reactions on a page's lines, for a session that declared them;
+/// none for any other. A log that will not answer leaves the page
+/// without them rather than unanswered.
+fn reactions_of(
+    core: &hxd_core::Core,
+    uid: Uid,
+    asked: bool,
+    lines: &[hxd_core::LogLine],
+) -> std::collections::HashMap<hxd_core::LineId, hxd_core::Reactions> {
+    if !asked {
+        return Default::default();
+    }
+    let ids: Vec<_> = lines.iter().map(|l| l.id).collect();
+    core.line_reactions(uid, &ids).unwrap_or_else(|e| {
+        warn!("chat log would not read reactions: {e}");
+        Default::default()
+    })
+}
 
 /// `history`'s `ids`: 1 to [`IDS_MAX`] line ids, or `None`.
 fn line_ids(v: &Value) -> Option<Vec<u64>> {
@@ -174,6 +194,8 @@ pub(crate) struct SessState {
     pub(crate) set_subject: bool,
     /// It declared `replies` (§7.3), as the session's transport keeps.
     pub(crate) replies: bool,
+    /// And `reactions`, likewise.
+    pub(crate) reactions: bool,
 }
 
 impl SessState {
@@ -823,6 +845,7 @@ async fn handle_login(
                 }),
             guest_identities: p.guest_identities && p.messaging && ctx.core.messaging_enabled(),
             replies: p.replies && !crate::replies::targets(ctx).is_empty(),
+            reactions: p.reactions && !crate::reactions::targets(ctx).is_empty(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -855,6 +878,7 @@ async fn handle_login(
     let attach_friendships = attach.transport.friendships;
     let attach_guest_identities = attach.transport.guest_identities;
     let replies = attach.transport.replies;
+    let reactions = attach.transport.reactions;
     let attached = if revoked {
         None
     } else {
@@ -1044,6 +1068,9 @@ async fn handle_login(
     if replies {
         caps.push("replies".into());
     }
+    if reactions {
+        caps.push("reactions".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -1163,6 +1190,9 @@ async fn handle_login(
     if replies {
         ok["replies"] = json!({ "targets": crate::replies::targets(ctx) });
     }
+    if reactions {
+        ok["reactions"] = crate::reactions::login_json(ctx);
+    }
     let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
     drop(permit);
@@ -1193,6 +1223,7 @@ async fn handle_login(
             file_getinfo: account.file_getinfo,
             set_subject: account.set_subject,
             replies,
+            reactions,
         },
         events,
     ))
@@ -1305,6 +1336,7 @@ async fn handle_resume(
         file_getinfo: account.as_ref().is_some_and(|account| account.file_getinfo),
         set_subject: account.as_ref().is_some_and(|account| account.set_subject),
         replies: ctx.core.user(uid).is_some_and(|u| u.transport.replies),
+        reactions: ctx.core.user(uid).is_some_and(|u| u.transport.reactions),
     };
 
     // From here the session is attached: any send failure means the new
@@ -1914,9 +1946,16 @@ async fn dispatch(
                     }) if state.replies && line_ids(&ids).is_some() => {
                         let ids = line_ids(&ids).expect("checked by the guard");
                         let uid = state.uid;
-                        match off_reactor(&ctx.core, move |c| c.history_ids(uid, room, &ids)).await
+                        let reactions = state.reactions;
+                        match off_reactor(&ctx.core, move |c| {
+                            c.history_ids(uid, room, &ids).map(|lines| {
+                                let reacted = reactions_of(c, uid, reactions, &lines);
+                                (lines, reacted)
+                            })
+                        })
+                        .await
                         {
-                            Some(Ok(lines)) => {
+                            Some(Ok((lines, reacted))) => {
                                 // The whole reply is held to the bound: its
                                 // envelope, at its longest, and each line
                                 // with the comma before it.
@@ -1927,6 +1966,7 @@ async fn dispatch(
                                     let fetchable = ctx.core.history_media_fetchable(uid, line);
                                     let mut v = history_line_json(line, fetchable);
                                     crate::replies::add(&mut v, line.re.as_ref(), true);
+                                    crate::reactions::add(&mut v, reacted.get(&line.id));
                                     let more = v.to_string().len() + usize::from(!shown.is_empty());
                                     if bytes + more > IDS_REPLY_BYTES && !shown.is_empty() {
                                         break;
@@ -1956,8 +1996,16 @@ async fn dispatch(
                             limit: p.limit.unwrap_or(50).min(policy.max_page),
                         };
                         let uid = state.uid;
-                        match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
-                            Some(Ok(page)) => {
+                        let reactions = state.reactions;
+                        match off_reactor(&ctx.core, move |c| {
+                            c.history(uid, query).map(|page| {
+                                let shown = reactions_of(c, uid, reactions, &page.lines);
+                                (page, shown)
+                            })
+                        })
+                        .await
+                        {
+                            Some(Ok((page, shown))) => {
                                 let lines: Vec<_> = page
                                     .lines
                                     .iter()
@@ -1969,6 +2017,7 @@ async fn dispatch(
                                             line.re.as_ref(),
                                             state.replies,
                                         );
+                                        crate::reactions::add(&mut v, shown.get(&line.id));
                                         v
                                     })
                                     .collect();
@@ -2262,6 +2311,7 @@ async fn dispatch(
         },
 
         "device_cert" => crate::sealed::device_cert(ctx, state, req.id, &req.params).await,
+        "react" => crate::reactions::react(ctx, state, req.id, &req.params).await,
 
         // --- The inbox (docs/private-messages.md §6) -------------------
         //

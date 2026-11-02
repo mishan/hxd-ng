@@ -911,6 +911,7 @@ async fn upgrade(
                     friendships: false,
                     guest_identities: false,
                     replies: false,
+                    reactions: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`

@@ -200,6 +200,11 @@ locking discipline.
   is `claim`'s inverse, so mail follows the account — would hand one
   person's correspondence to whoever links to that account afterwards.
 
+An account's reactions on public lines (hotline-ng.md §7.3) are keyed
+by the same rule and ride the same calls: `inbox_claim` and
+`rotate_identity` move them, and `inbox_purge` and `hxd inbox purge`
+delete them.
+
 On a server with no identity subsystem every mailbox is login-keyed and
 all of this reduces to exactly the naive design — which is the shape a
 seam should have.
