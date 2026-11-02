@@ -360,6 +360,9 @@ impl Core {
                 delivered: true,
             });
         }
+        // Held from the write to this send's own hand-over, so no roster
+        // read hands the row over in between as one that waited.
+        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
         let pushed = store
             .push(
                 &NewMessage {
@@ -404,9 +407,10 @@ impl Core {
             Pushed::Full => return Err(MessagingError::QueueFull),
         };
         let delivered = self
-            .im_deliver(them, fresh.then_some(id), uid, approval)
+            .im_deliver_held(&flushing, them, fresh.then_some(id), uid, approval)
             .contains(&id)
             && !approval;
+        drop(flushing);
         if fresh {
             self.im_notify(them, &me.mailbox, &nick, &text, cursor);
         }
@@ -429,10 +433,22 @@ impl Core {
         sender: Uid,
         under_approval: bool,
     ) -> Vec<MessageId> {
+        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        self.im_deliver_held(&flushing, to, fresh, sender, under_approval)
+    }
+
+    /// [`Self::im_deliver`], for a caller already holding `flushing`.
+    fn im_deliver_held(
+        &self,
+        flushing: &std::sync::MutexGuard<'_, ()>,
+        to: &Mailbox,
+        fresh: Option<MessageId>,
+        sender: Uid,
+        under_approval: bool,
+    ) -> Vec<MessageId> {
         let Some(store) = self.inbox.as_ref() else {
             return Vec::new();
         };
-        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
         let (messengers, plain, understood) = {
             let r = self.roster.lock().unwrap();
             let attached: Vec<Uid> = im_sessions(&r, to)
@@ -448,8 +464,7 @@ impl Core {
             (m, p, understood)
         };
         if messengers.is_empty() {
-            drop(flushing);
-            return self.flush_each(plain, to, fresh, sender);
+            return self.flush_each(flushing, plain, to, fresh, sender);
         }
         let batch = match store.pending_of(
             to,
@@ -503,8 +518,7 @@ impl Core {
         // only to its visible sessions, as all mail goes, so a messenger
         // session's waits for one, as it does at that session's login.
         if under_approval && !understood && self.never_took_requests(to) {
-            drop(flushing);
-            handed.extend(self.flush_each(messengers, to, fresh, sender));
+            handed.extend(self.flush_each(flushing, messengers, to, fresh, sender));
         }
         handed
     }

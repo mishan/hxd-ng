@@ -2584,6 +2584,10 @@ impl Core {
         // second one. Answering it what the first send was answered is
         // what makes a client safe to retry after a socket died mid-ack.
         let (sender_nick, body) = (sender.nick.clone(), text);
+        // Held from the write to this send's own flush, so no other flush
+        // (the recipient's login flush above all) hands the row over in
+        // between as one that waited.
+        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
         let (id, reference, cursor) = match store
             .push(
                 &NewMessage {
@@ -2642,7 +2646,8 @@ impl Core {
                 // waited. Naming it fresh would tell the recipient a
                 // message that sat there arrived just now.
                 let delivered = self
-                    .flush_to(
+                    .flush_held(
+                        &flushing,
                         Target::Named {
                             uid: to.uid,
                             sender: from,
@@ -2675,7 +2680,8 @@ impl Core {
         // Flushing (rather than sending this one row) is what keeps
         // delivery in id order when two senders race.
         let delivered = self
-            .flush_to(
+            .flush_held(
+                &flushing,
                 Target::Named {
                     uid: to.uid,
                     sender: from,
@@ -2684,16 +2690,7 @@ impl Core {
                 Some(id),
             )
             .contains(&id);
-        // A concurrent flush may have been the one that carried it — in
-        // which case ours came back without it, and telling the sender
-        // "queued" for a message the recipient is reading would be wrong.
-        // The same question answers the case where a backlog past
-        // `deliver_at_flush` pushed this row out of the batch.
-        let delivered = delivered
-            || !store
-                .is_pending(&to.mailbox, id)
-                .map_err(store_failed)
-                .unwrap_or(true);
+        drop(flushing);
 
         // The notify decision (docs/push-notifications.md §6), computed
         // here so that both wires reach it — the legacy path skipping it
@@ -2777,16 +2774,17 @@ impl Core {
         );
     }
 
-    /// [`Self::flush_to`] those of `uids` still attached, for a message
+    /// [`Self::flush_held`] those of `uids` still attached, for a message
     /// `sender` just sent.
     pub(crate) fn flush_each(
         &self,
+        flushing: &std::sync::MutexGuard<'_, ()>,
         uids: Vec<Uid>,
         mailbox: &Mailbox,
         fresh: Option<MessageId>,
         sender: Uid,
     ) -> Vec<MessageId> {
-        self.flush_to(Target::Each { uids, sender }, mailbox, fresh)
+        self.flush_held(flushing, Target::Each { uids, sender }, mailbox, fresh)
     }
 
     /// Who a flush to `target` reaches, and what it reads for each: a
@@ -2894,9 +2892,9 @@ impl Core {
         mailbox: &Mailbox,
         fresh: Option<MessageId>,
     ) -> Vec<MessageId> {
-        let Some(store) = self.inbox.as_ref() else {
+        if self.inbox.is_none() {
             return Vec::new();
-        };
+        }
         // One flush per server at a time.
         //
         // `pending` reads rows, the send happens under the roster lock,
@@ -2907,8 +2905,21 @@ impl Core {
         // message twice. Not the roster lock, which would put disk I/O
         // under it; a lock of its own, taken *before* the roster lock and
         // never the other way round.
-        let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        self.flush_held(&flushing, target, mailbox, fresh)
+    }
 
+    /// [`Self::flush_to`], for a caller already holding `flushing`.
+    fn flush_held(
+        &self,
+        _flushing: &std::sync::MutexGuard<'_, ()>,
+        target: Target,
+        mailbox: &Mailbox,
+        fresh: Option<MessageId>,
+    ) -> Vec<MessageId> {
+        let Some(store) = self.inbox.as_ref() else {
+            return Vec::new();
+        };
         let limit = self.inbox_policy.deliver_at_flush;
         let targets = self.flush_reads(&target, mailbox);
         // One read for each kind of session among them: on a server
@@ -5515,7 +5526,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod inbox_tests {
+pub(crate) mod inbox_tests {
     //! The private-message inbox, at the domain level: which messages get
     //! stored, who gets them and when, and what a queued one looks like
     //! when it finally arrives. See docs/private-messages.md §5.
@@ -6913,15 +6924,19 @@ mod inbox_tests {
     /// A store that lets a test run something *during* `push` — inside the
     /// window where the domain has dropped the roster lock to write and
     /// has not taken it back to deliver.
-    struct RacyStore {
+    pub(crate) struct RacyStore {
         inner: MemoryStore,
-        during_push: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        pub(crate) during_push: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl RacyStore {
         fn new() -> Self {
+            Self::over(MemoryStore::new())
+        }
+
+        pub(crate) fn over(inner: MemoryStore) -> Self {
             RacyStore {
-                inner: MemoryStore::new(),
+                inner,
                 during_push: Mutex::new(None),
             }
         }
@@ -7165,6 +7180,43 @@ mod inbox_tests {
         let mut rx = arrived.lock().unwrap().take().expect("attached");
         assert!(
             matches!(&msgs(drain(&mut rx))[..], [Event::Msg { text, .. }] if text == "still up?")
+        );
+    }
+
+    #[test]
+    fn mail_written_as_the_recipients_login_flush_runs_is_not_called_queued() {
+        let store = Arc::new(RacyStore::new());
+        let dir = Arc::new(Directory::of(&["alice", "dave"]));
+        let core = Arc::new(Core::new().with_inbox(store.clone(), dir, InboxPolicy::default()));
+        let (a, _ra) = attach(&core, "alice", true);
+        let (m, mut rm) = attach(&core, "dave", true);
+        drain(&mut rm);
+
+        // Dave's frontend flushes his inbox once his login reply is out,
+        // which is when his client can be sent to. Given the chance, that
+        // flush runs between the write and the sender's own.
+        let weak: Weak<Core> = Arc::downgrade(&core);
+        let login_flush: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let slot = login_flush.clone();
+        *store.during_push.lock().unwrap() = Some(Box::new(move || {
+            let (done, ran) = std::sync::mpsc::channel();
+            let core = weak.upgrade().expect("core outlives the store call");
+            *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                core.flush_inbox(m);
+                let _ = done.send(());
+            }));
+            let _ = ran.recv_timeout(Duration::from_millis(200));
+        }));
+
+        core.msg(a, m, "right here".into(), None, None).unwrap();
+        let flush = login_flush.lock().unwrap().take().expect("pushed");
+        flush.join().unwrap();
+        assert!(
+            matches!(
+                &msgs(drain(&mut rm))[..],
+                [Event::Msg { text, queued: false, .. }] if text == "right here"
+            ),
+            "dave was attached the whole time"
         );
     }
 }
