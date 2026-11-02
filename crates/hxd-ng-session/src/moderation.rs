@@ -192,6 +192,9 @@ fn act_json(a: &Act) -> Value {
     if let Some(signed) = &a.signed {
         v["signed"] = json!(crate::proto::b64url(signed));
     }
+    if let hxd_core::ActKind::Unknown(n) = a.kind {
+        v["kind_number"] = json!(n);
+    }
     v
 }
 
@@ -666,5 +669,40 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
         }
 
         _ => reply_err(id, "unknown_method", "Unknown request."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hxd_core::ActKind;
+
+    #[test]
+    fn an_entry_says_its_kind_and_an_unknown_one_its_number() {
+        for (kind, name, number) in [
+            (ActKind::Redact, "redact", None),
+            (ActKind::Unknown(9999), "unknown", Some(9999)),
+        ] {
+            let v = act_json(&Act {
+                id: 1,
+                kind,
+                actor: "carol".into(),
+                actor_fp: None,
+                line: None,
+                media: None,
+                article: None,
+                report: None,
+                room: None,
+                login: None,
+                fingerprint: None,
+                reason: String::new(),
+                evidence: None,
+                signed: None,
+                media_hash: None,
+                at: std::time::UNIX_EPOCH,
+            });
+            assert_eq!(v["kind"], name);
+            assert_eq!(v.get("kind_number").and_then(Value::as_i64), number);
+        }
     }
 }

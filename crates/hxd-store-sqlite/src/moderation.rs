@@ -74,8 +74,7 @@ fn act_of(r: &Row<'_>) -> rusqlite::Result<Result<Act, StoreError>> {
     Ok((|| {
         Ok(Act {
             id: id_of(id, "act id")?,
-            kind: ActKind::from_i64(kind)
-                .ok_or_else(|| StoreError::new(format!("stored act kind {kind} is unknown")))?,
+            kind: ActKind::from_i64(kind).unwrap_or(ActKind::Unknown(kind)),
             actor,
             actor_fp: fp(actor_fp)?,
             line: line.map(|n| id_of(n, "line id")).transpose()?,
@@ -229,6 +228,11 @@ fn target_where(t: &ReportTarget) -> (i64, &'static str, rusqlite::types::Value)
 
 impl ModerationStore for SqliteStore {
     fn record(&self, act: &Act) -> Result<ActId, StoreError> {
+        if let ActKind::Unknown(n) = act.kind {
+            return Err(StoreError::new(format!(
+                "act kind {n} is not one to record"
+            )));
+        }
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
             "INSERT INTO moderation

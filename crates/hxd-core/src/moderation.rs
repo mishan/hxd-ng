@@ -114,6 +114,10 @@ impl Default for ModerationPolicy {
 /// What kind of act an audit row records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActKind {
+    /// A kind a newer build recorded and this one has no name for, read
+    /// back with its number so a log page that holds one still reads
+    /// after a rollback. Shown, never recorded or acted on.
+    Unknown(i64),
     Redact,
     Revoke,
     Purge,
@@ -137,6 +141,7 @@ pub enum ActKind {
 impl ActKind {
     pub fn as_i64(self) -> i64 {
         match self {
+            ActKind::Unknown(n) => n,
             ActKind::Redact => 1,
             ActKind::Revoke => 2,
             ActKind::Purge => 3,
@@ -168,6 +173,7 @@ impl ActKind {
 
     pub fn name(self) -> &'static str {
         match self {
+            ActKind::Unknown(_) => "unknown",
             ActKind::Redact => "redact",
             ActKind::Revoke => "revoke",
             ActKind::Purge => "purge",

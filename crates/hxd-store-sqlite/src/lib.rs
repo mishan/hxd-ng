@@ -4353,6 +4353,52 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_a_newer_build_recorded_reads_back_beside_the_rest() {
+        use hxd_core::moderation::{Act, ActKind, ModerationStore};
+        let store = SqliteStore::in_memory().unwrap();
+        let act = |kind| Act {
+            id: 0,
+            kind,
+            actor: "carol".into(),
+            actor_fp: None,
+            line: Some(17),
+            media: None,
+            article: None,
+            report: None,
+            room: None,
+            login: Some("bob".into()),
+            fingerprint: None,
+            reason: "spam".into(),
+            evidence: None,
+            signed: None,
+            media_hash: None,
+            at: UNIX_EPOCH + Duration::from_secs(100),
+        };
+        store.record(&act(ActKind::Redact)).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO moderation (kind, actor, target_line, reason, at)
+                 VALUES (9999, 'carol', 18, 'later', 200)",
+                [],
+            )
+            .unwrap();
+        store.record(&act(ActKind::Purge)).unwrap();
+        let kinds: Vec<_> = store
+            .acts(None, 10)
+            .unwrap()
+            .iter()
+            .map(|a| a.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [ActKind::Purge, ActKind::Unknown(9999), ActKind::Redact]
+        );
+    }
+
+    #[test]
     fn chat_log_passes_the_conformance_suite() {
         hxd_core::history::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
