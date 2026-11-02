@@ -123,6 +123,40 @@ fn a_clear_the_stores_refuse_takes_nothing() {
     }
 }
 
+/// Past the server-wide bound, the oldest waiting anywhere goes,
+/// whichever account it waits for.
+#[test]
+fn the_oldest_waiting_anywhere_goes_past_the_server_wide_bound() {
+    let mut live = Live {
+        im_keep: Duration::from_secs(3600),
+        waiting_all: 3,
+        ..Live::default()
+    };
+    let start = Instant::now();
+    let now = start + Duration::from_secs(10);
+    for (n, to) in ["bob", "carol", "dave", "erin"].into_iter().enumerate() {
+        let guid =
+            crate::inbox::MessageGuid::parse(&format!("5f5e1000-1234-4abc-89ab-{n:012x}")).unwrap();
+        let w = Waiting::new(
+            Mailbox::login("alice"),
+            Reply::im(to.into(), guid).unwrap(),
+            thumbs(),
+            true,
+            start + Duration::from_secs(n as u64),
+        );
+        live.keep(Key::of(&Mailbox::login(to)), w, now);
+    }
+    let mut left: Vec<String> = (live.waiting.keys())
+        .map(|k| match k {
+            Key::Login(l) => l.clone(),
+            Key::Identity(_) => unreachable!("logins alone here"),
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, ["carol", "dave", "erin"]);
+    assert_eq!(live.waiting_len, 3);
+}
+
 /// A reaction applied as its line is redacted is never told after the
 /// redaction as anything but cleared: the redaction waits at the desk
 /// behind it, and its clear stands.
@@ -598,6 +632,61 @@ fn a_reader_that_never_reads_is_cut_off_by_the_weight_of_its_batches() {
     }
     assert!(core.is_lagging(stuck), "never cut off");
     assert!(batches < 1000, "cut off by count, after {batches} batches");
+}
+
+/// A rotation moves what waits for the identity and what it reacted,
+/// so either is still the account's under its successor.
+#[test]
+fn waiting_im_reactions_follow_a_rotation_as_recipient_and_reactor() {
+    let (core, _log) = server(ReactionPolicy::default());
+    let now = core.clock.now();
+    let guid = crate::inbox::MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+    {
+        let mut r = core.desk.live();
+        let to = Key::of(&Mailbox::identified("bob", [1; 32]));
+        let from = Mailbox::identified("alice", [3; 32]);
+        let target = Reply::im("bob".into(), guid).unwrap();
+        r.keep(to, Waiting::new(from, target, thumbs(), true, now), now);
+    }
+    core.rotate_identity(&[1; 32], &[2; 32]).unwrap();
+    core.rotate_identity(&[3; 32], &[4; 32]).unwrap();
+    let r = core.desk.live();
+    let queue = r
+        .waiting
+        .get(&Key::Identity([2; 32]))
+        .expect("moved to the successor");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].from, Mailbox::identified("alice", [4; 32]));
+    assert!(!r.waiting.contains_key(&Key::Identity([1; 32])));
+}
+
+/// The hourly sweep gives up what has waited past its age, so a party
+/// that never comes back holds nothing for ever.
+#[test]
+fn the_sweep_gives_up_what_waited_too_long() {
+    let (core, _log) = server(ReactionPolicy {
+        im_keep: Duration::from_secs(60),
+        ..ReactionPolicy::default()
+    });
+    let now = core.clock.now();
+    let guid = crate::inbox::MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+    {
+        let mut r = core.desk.live();
+        let w = Waiting::new(
+            Mailbox::login("alice"),
+            Reply::im("bob".into(), guid).unwrap(),
+            thumbs(),
+            true,
+            now,
+        );
+        r.keep(Key::of(&Mailbox::login("bob")), w, now);
+    }
+    core.reactions_prune();
+    assert_eq!(core.desk.live().waiting_len, 1, "not yet");
+    core.clock.advance(Duration::from_secs(61));
+    core.reactions_prune();
+    let r = core.desk.live();
+    assert!(r.waiting.is_empty() && r.waiting_len == 0);
 }
 
 /// A clear of a line with nothing on it changes nothing and records

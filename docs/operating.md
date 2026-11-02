@@ -1274,7 +1274,17 @@ one a room a batch, so a crowded room costs each reader a few events a
 second at most and one that stops reading falls behind by batches
 rather than by reactions. Older lines, and lines from before a restart,
 are read again when a client shows them. The state behind it is a few
-hundred line ids a room, whatever the traffic.
+hundred line ids a room, whatever the traffic. An instant message's
+reactions wait for a party with no session for as long as `[inbox]
+retain_unread` keeps mail, at most 100 for one account, in memory, so a
+restart forgets them. They wait only while the account has no attached
+messenger session, one that has read `friends`, that declared
+`reactions`: once one is told, nothing is kept, and what waited is
+handed over at a session's next `friends`. One reactor filling an
+account's share gives up its own oldest rather than another's, the
+server holds 50,000 for everyone at once, the oldest anywhere going
+first, and an hourly sweep gives up what has waited too long. They follow an account that links or rotates its
+identity, and go with one that is deleted, to it or from it.
 
 ### `[structured_chat]`
 

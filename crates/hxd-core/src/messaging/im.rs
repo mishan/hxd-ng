@@ -21,12 +21,15 @@ use std::time::SystemTime;
 use tracing::warn;
 
 use super::{is_messenger, store_failed, Key, Me, MessagingError, Presence};
+use crate::access::bit;
 use crate::chat::{sessions_of, SignedMsg};
 use crate::inbox::{
     Cursor, Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef, MessageStore,
     NewMessage, Pending, Pushed, StoredMessage,
 };
+use crate::reaction::{ReactError, ReactionKey};
 use crate::relationships::{RelationId, Requester, SentOn};
+use crate::reply::{ImTarget, Reply};
 use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
@@ -144,8 +147,34 @@ impl Core {
             .and_then(|m| m.friendship))
     }
 
-    /// The live approval between `a` and `b`, given by either.
+    /// The live approval between `a` and `b`, given by either, if
+    /// neither has blocked the other. A block ends approvals both ways,
+    /// but one a merge folded beside a block lasts until it is settled.
     pub(crate) fn approval(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+    ) -> Result<Option<RelationId>, MessagingError> {
+        let store = self.friends_store()?;
+        let now = self.clock.wall();
+        for (owner, other) in [(a, b), (b, a)] {
+            let Some(row) = store
+                .relationship(owner, other, now)
+                .map_err(store_failed)?
+            else {
+                continue;
+            };
+            if row.blocked_at.is_some() || store.is_blocked(other, owner).map_err(store_failed)? {
+                return Ok(None);
+            }
+        }
+        self.approval_on_record(a, b)
+    }
+
+    /// The approval between `a` and `b` as stored, given by either,
+    /// whatever blocks stand: what a message sent under it is, which a
+    /// block does not make it anything else.
+    fn approval_on_record(
         &self,
         a: &Mailbox,
         b: &Mailbox,
@@ -164,7 +193,8 @@ impl Core {
         Ok(None)
     }
 
-    /// The approvals among what `rows` were sent on to `to`.
+    /// The approvals among what `rows` were sent on to `to`, as stored:
+    /// a classification, which is never an authorization.
     pub(crate) fn approval_ids(&self, to: &Mailbox, rows: &[StoredMessage]) -> HashSet<RelationId> {
         let mut senders: Vec<&Mailbox> = Vec::new();
         for m in rows.iter().filter(|m| relation_of(m).is_some()) {
@@ -174,7 +204,7 @@ impl Core {
         }
         senders
             .into_iter()
-            .filter_map(|s| self.approval(to, s).ok().flatten())
+            .filter_map(|s| self.approval_on_record(to, s).ok().flatten())
             .collect()
     }
 
@@ -486,7 +516,7 @@ impl Core {
         let Some(store) = self.inbox.as_ref() else {
             return;
         };
-        let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
         let understands_of = |r: &RosterInner| {
             r.users
                 .get(&uid)
@@ -548,6 +578,10 @@ impl Core {
         if let Err(e) = store.mark_delivered(&ids(&receipts), now, Delivery::Delivered) {
             warn!("inbox: marking receipts delivered: {e}");
         }
+        // The reactions after the messages they are on, and outside the
+        // flush lock: the desk is never waited on holding it.
+        drop(flushing);
+        self.im_reactions_drain(uid, me, |from| self.im_relation(me, from).map_err(|_| ()));
     }
 
     /// IM Acknowledge (812): the caller received, or read, the message
@@ -660,6 +694,63 @@ impl Core {
                 .map_err(store_failed)?;
         }
         Ok(())
+    }
+
+    /// A reaction to an instant message (`docs/hotline-ng.md` §7.3),
+    /// checked as IM Acknowledge is: `with`, the conversation's other
+    /// party, must be the caller's friend or share an approval with it,
+    /// neither blocking the other, or it is no such target. Relayed to
+    /// `with` alone and never kept with the message, which is never
+    /// looked up: its client matches the guid, and one it does not hold
+    /// is noise.
+    pub fn react_im(
+        &self,
+        uid: Uid,
+        target: &ImTarget,
+        with: &str,
+        key: &ReactionKey,
+        add: bool,
+    ) -> Result<(), ReactError> {
+        let policy = self.reaction_policy().ok_or(ReactError::NotAvailable)?;
+        // Before `messenger`, which makes the session a messenger.
+        {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid).ok_or(ReactError::NotAllowed)?;
+            if !sess.is_person || sess.info.system || !sess.access.has(bit::SEND_CHAT) {
+                return Err(ReactError::NotAllowed);
+            }
+        }
+        let me = self
+            .messenger(uid)
+            .map_err(|_| match self.messaging_enabled() {
+                true => ReactError::NotAllowed,
+                false => ReactError::NotAvailable,
+            })?;
+        // As the accounts directory compares a login, whatever its case.
+        let names = |login: &str| target.login().eq_ignore_ascii_case(login);
+        if !names(&me.mailbox.login) && !names(with) {
+            return Err(ReactError::OutOfScope);
+        }
+        self.react_rate(uid, policy)?;
+        let them = self
+            .other(&me, with)
+            .map_err(|_| ReactError::NoSuchTarget)?;
+        let approval = self
+            .im_relation(&me.mailbox, &them)
+            .map_err(|_| ReactError::ServerError)?
+            .ok_or(ReactError::NoSuchTarget)?;
+        let change = (Reply::Im(target.clone()), key.clone(), add);
+        self.im_reaction(&me.mailbox, &them, approval, change);
+        Ok(())
+    }
+
+    /// May `a` and `b` message, as IM Acknowledge asks: as friends,
+    /// `Some(false)`, or under an approval, `Some(true)`.
+    fn im_relation(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<bool>, MessagingError> {
+        if self.friendship(a, b)?.is_some() {
+            return Ok(Some(false));
+        }
+        Ok(self.approval(a, b)?.map(|_| true))
     }
 
     /// IM Typing (813): to the friend's messenger sessions alone, never

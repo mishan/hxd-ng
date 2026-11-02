@@ -421,7 +421,7 @@ impl RosterInner {
     }
 
     /// The messenger sessions of a mailbox.
-    fn messengers(&self, of: &Key) -> Vec<Uid> {
+    pub(crate) fn messengers(&self, of: &Key) -> Vec<Uid> {
         let Some(e) = self.presences.by.get(of) else {
             return Vec::new();
         };
