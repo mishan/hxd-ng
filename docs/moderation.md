@@ -110,7 +110,8 @@ has to be typed.
    hash; the media metadata columns stay, so a history entry can still
    say "[image removed]".
 4. Its reactions (hotline-ng.md §7.3) are deleted with its words: a
-   tombstone has none.
+   tombstone has none, and a live line that had any is told as cleared
+   in its room's next batch, to a wire that shows redactions.
 5. `Event::ChatRedacted { id }` to every session that reads public
    chat.
 
@@ -119,6 +120,13 @@ row's `evidence_signed` (schema v24), and is scrubbed with them; the
 tombstone carries none (e2e-messages.md §4.12). So does a signed
 article's, when someone else's delete of it is an act. `moderation_log`
 shows it as `signed`.
+
+A moderator may also clear every reaction on a line, `react { target,
+clear: true }` (hotline-ng.md §7.3): the `moderate` permission, as for a
+redaction, and a line the moderator could have read. It is recorded as
+a `reactions_clear` act with the line, its room, and as evidence the
+keys and counts it took, and is told to the line's readers as cleared.
+A clear of a line with no reactions changes and records nothing.
 
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an
@@ -171,8 +179,9 @@ rather than purged. The purge also answers every open report on the
 person, and the news arm of news.md §11 deletes their articles in the
 window under the same row. The reactions they made in the window go
 too, wherever they are, by the same identity (hotline-ng.md §7.3); the
-lines they were on are not announced yet, and a client sees the counts
-fall the next time it reads them.
+lines they were on that are still live are told as they now stand in
+their rooms' next batches, and the rest are read again when a client
+shows them.
 
 Every path that bans — `kick { ban }` on the ng wire, a legacy kick
 with ban, an entry added to the ban list, and `kick { purge }` — also
@@ -531,7 +540,7 @@ went by, and the sweeper's two partial indexes:
 ```sql
 CREATE TABLE moderation (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete | ban | unban | room_delete (| vouched_banned, with vouching)
+  kind         INTEGER NOT NULL,        -- redact | revoke | purge | close | news_delete | news_node_delete | ban | unban | room_delete | reactions_clear (| vouched_banned, with vouching)
   actor        TEXT    NOT NULL,        -- login, or 'cli'
   actor_fp     TEXT,
   target_line  INTEGER,

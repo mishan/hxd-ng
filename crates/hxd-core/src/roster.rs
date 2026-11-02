@@ -723,6 +723,11 @@ pub enum Event {
     RequestsChanged {
         count: usize,
     },
+
+    /// Reactions changed (`crate::reaction`): a room's lines in one
+    /// batch, or an instant message's change. Only to sessions whose
+    /// transport declared reactions.
+    ReactionsChanged(Vec<crate::reaction::ReactionChange>),
 }
 
 impl Event {
@@ -828,6 +833,10 @@ impl Event {
                     + im.re.as_ref().map_or(0, |r| r.pack().len())
             }
             Event::Receipt { login, .. } | Event::Typing { login, .. } => login.len(),
+            Event::ReactionsChanged(changes) => changes
+                .iter()
+                .map(crate::reaction::ReactionChange::weight)
+                .sum(),
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -883,6 +892,7 @@ impl Event {
             Event::Receipt { .. } => "receipt",
             Event::Typing { .. } => "typing",
             Event::RequestsChanged { .. } => "requests_changed",
+            Event::ReactionsChanged(..) => "reactions_changed",
         }
     }
 }
@@ -1290,6 +1300,9 @@ pub(crate) struct RosterInner {
     pub(crate) taken_ids: HashSet<u32>,
     /// The newest line in each channel, 0 the lobby's.
     pub(crate) last_ids: HashMap<u32, crate::history::LineId>,
+    /// Which lines' reactions are announced, and what waits to be
+    /// (`crate::reaction`).
+    pub(crate) live: crate::reaction::Live,
     pub(crate) voice: crate::voice::VoiceState,
     /// Who takes part in instant messaging, and what their friends were
     /// last told of them (`crate::messaging`).

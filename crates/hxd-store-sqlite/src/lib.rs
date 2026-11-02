@@ -3279,7 +3279,11 @@ impl ChatLog for SqliteStore {
             params![line, key],
         )?;
         tx.commit().map_err(StoreError::new)?;
-        Ok(Reacted::Count(u32::try_from(count).unwrap_or(u32::MAX)))
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        Ok(match act.add == held {
+            true => Reacted::Held(count),
+            false => Reacted::Count(count),
+        })
     }
 
     /// Two queries for a page, whatever its length: every line's keys
@@ -3381,14 +3385,84 @@ impl ChatLog for SqliteStore {
             .collect())
     }
 
+    fn reactors_on(
+        &self,
+        ids: &[LineId],
+    ) -> Result<Vec<(LineId, String, ReactionKey)>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let marks = vec!["?"; ids.len()].join(", ");
+        let sql = format!("SELECT line, reactor, key FROM chat_reaction WHERE line IN ({marks})");
+        let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(ids.iter().map(|&id| clamp_id(id))),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::new)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (line, reactor, key) = row.map_err(StoreError::new)?;
+            if let (Ok(line), Some(key)) = (LineId::try_from(line), ReactionKey::unpack(&key)) {
+                out.push((line, reactor, key));
+            }
+        }
+        Ok(out)
+    }
+
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let line = clamp_id(line);
+        let live: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM chat_line WHERE id = ?1 AND channel = ?2 AND flags & ?3 = 0",
+                params![
+                    line,
+                    i64::from(channel),
+                    i64::from(LineFlags::DELETED.bits())
+                ],
+                |r| r.get(0),
+            )
+            .map_err(StoreError::new)?;
+        if live == 0 {
+            return Ok(None);
+        }
+        let gone = tx
+            .execute("DELETE FROM chat_reaction WHERE line = ?1", params![line])
+            .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(Some(gone))
+    }
+
     fn rekey_reactions(
         &self,
         from: &hxd_core::inbox::Mailbox,
         to: &hxd_core::inbox::Mailbox,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<LineId>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(StoreError::new)?;
         let (from, to) = (reactor_key(from), reactor_key(to));
+        let lost: Vec<i64> = tx
+            .prepare(
+                "SELECT DISTINCT line FROM chat_reaction WHERE reactor = ?1 AND EXISTS (
+                   SELECT 1 FROM chat_reaction AS held
+                    WHERE held.line = chat_reaction.line AND held.key = chat_reaction.key
+                      AND held.reactor = ?2)
+                  ORDER BY line",
+            )
+            .and_then(|mut stmt| stmt.query_map(params![from, to], |r| r.get(0))?.collect())
+            .map_err(StoreError::new)?;
         tx.execute(
             "DELETE FROM chat_reaction WHERE reactor = ?1 AND EXISTS (
                SELECT 1 FROM chat_reaction AS held
@@ -3402,7 +3476,11 @@ impl ChatLog for SqliteStore {
             params![from, to],
         )
         .map_err(StoreError::new)?;
-        tx.commit().map_err(StoreError::new)
+        tx.commit().map_err(StoreError::new)?;
+        Ok(lost
+            .into_iter()
+            .filter_map(|l| LineId::try_from(l).ok())
+            .collect())
     }
 
     fn find_guid(

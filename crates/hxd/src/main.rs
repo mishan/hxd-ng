@@ -1581,6 +1581,9 @@ async fn main() {
         if ctx.core.messaging_enabled() {
             tokio::spawn(hxd::presence_flusher(ctx.core.clone()));
         }
+        if ctx.core.reaction_policy().is_some() {
+            tokio::spawn(hxd::reactions_flusher(ctx.core.clone()));
+        }
         if ctx.core.push_enabled() {
             tokio::spawn(hxd::device_sweeper(ctx.core.clone()));
         }

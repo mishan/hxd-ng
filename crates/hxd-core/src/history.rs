@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use crate::inbox::{Mailbox, MessageGuid, StoreError};
-use crate::reaction::{reactor_key, ReactAct, Reacted, Reactions};
+use crate::reaction::{reactor_key, ReactAct, Reacted, ReactionKey, Reactions};
 
 pub type LineId = u64;
 
@@ -331,8 +331,18 @@ pub trait ChatLog: Send + Sync + 'static {
     fn forget_reactions(&self, who: &Mailbox, since: SystemTime)
         -> Result<Vec<LineId>, StoreError>;
     /// `from`'s reactions become `to`'s, an identity linked or rotated,
-    /// so the account still holds them; one `to` already holds goes.
-    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError>;
+    /// so the account still holds them; one `to` already holds goes,
+    /// and the lines that lost one are answered.
+    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<Vec<LineId>, StoreError>;
+    /// Every reaction on `ids`, as `(line, reactor, key)`, the reactor
+    /// by [`reactor_key`]: every reader's own part of a batch of
+    /// announcements, read once for them all.
+    fn reactors_on(&self, ids: &[LineId])
+        -> Result<Vec<(LineId, String, ReactionKey)>, StoreError>;
+    /// Take every reaction on line `line` of `channel`, answering how
+    /// many went: a moderator's clear. `None` for no such line there, or
+    /// a tombstone.
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError>;
 }
 
 #[derive(Default)]
@@ -688,8 +698,11 @@ impl ChatLog for MemoryLog {
             .reactions
             .iter()
             .filter(|r| r.line == act.line && r.key == key)
-            .count();
-        Ok(Reacted::Count(count as u32))
+            .count() as u32;
+        Ok(match act.add == held {
+            true => Reacted::Held(count),
+            false => Reacted::Count(count),
+        })
     }
 
     fn reactions(
@@ -731,7 +744,34 @@ impl ChatLog for MemoryLog {
         Ok(lines)
     }
 
-    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+    fn reactors_on(
+        &self,
+        ids: &[LineId],
+    ) -> Result<Vec<(LineId, String, ReactionKey)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .reactions
+            .iter()
+            .filter(|r| ids.contains(&r.line))
+            .filter_map(|r| Some((r.line, r.reactor.clone(), ReactionKey::unpack(&r.key)?)))
+            .collect())
+    }
+
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner
+            .lines
+            .iter()
+            .any(|l| l.id == line && l.channel == channel && !l.flags.contains(LineFlags::DELETED))
+        {
+            return Ok(None);
+        }
+        let before = inner.reactions.len();
+        inner.reactions.retain(|r| r.line != line);
+        Ok(Some(before - inner.reactions.len()))
+    }
+
+    fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<Vec<LineId>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let (from, to) = (reactor_key(from), reactor_key(to));
         let held: std::collections::HashSet<(LineId, Vec<u8>)> = inner
@@ -740,13 +780,18 @@ impl ChatLog for MemoryLog {
             .filter(|r| r.reactor == to)
             .map(|r| (r.line, r.key.clone()))
             .collect();
-        inner
-            .reactions
-            .retain(|r| r.reactor != from || !held.contains(&(r.line, r.key.clone())));
+        let mut lost = Vec::new();
+        inner.reactions.retain(|r| {
+            let twice = r.reactor == from && held.contains(&(r.line, r.key.clone()));
+            if twice && !lost.contains(&r.line) {
+                lost.push(r.line);
+            }
+            !twice
+        });
         for r in inner.reactions.iter_mut().filter(|r| r.reactor == from) {
             r.reactor = to.clone();
         }
-        Ok(())
+        Ok(lost)
     }
 }
 
@@ -828,6 +873,8 @@ pub mod conformance {
         a_lines_reactions_go_when_it_does(new_log());
         reactions_are_forgotten_by_reactor_and_time(new_log());
         reactions_follow_their_account_to_its_identity(new_log());
+        reactors_are_listed_on_the_lines_asked_alone(new_log());
+        a_clear_takes_every_reaction_on_one_live_line(new_log());
     }
 
     fn key(e: &str) -> crate::reaction::ReactionKey {
@@ -888,7 +935,8 @@ pub mod conformance {
     }
 
     /// One account holds a key once however many times it adds it, and
-    /// removing one it does not hold changes nothing; keys are listed in
+    /// removing one it does not hold changes nothing, each answered as
+    /// held so that nothing is announced; keys are listed in
     /// the order they were first added, and each reader is shown its own
     /// account's. An identified account is not its bare login.
     fn reactions_are_counted_per_account_in_the_order_keys_came(log: Box<dyn ChatLog>) {
@@ -897,8 +945,8 @@ pub mod conformance {
         assert_eq!(react(&*log, &alice, 1, "👍", true, 1), Reacted::Count(1));
         assert_eq!(react(&*log, &bob, 1, "🎉", true, 2), Reacted::Count(1));
         assert_eq!(react(&*log, &bob, 1, "👍", true, 3), Reacted::Count(2));
-        assert_eq!(react(&*log, &alice, 1, "👍", true, 4), Reacted::Count(2));
-        assert_eq!(react(&*log, &alice, 1, "🎉", false, 5), Reacted::Count(1));
+        assert_eq!(react(&*log, &alice, 1, "👍", true, 4), Reacted::Held(2));
+        assert_eq!(react(&*log, &alice, 1, "🎉", false, 5), Reacted::Held(1));
         assert_eq!(
             shown(&*log, &[1, 2], &alice),
             [(1, keys(&[("👍", 2), ("🎉", 1)], &[0]))]
@@ -931,7 +979,7 @@ pub mod conformance {
         assert_eq!(go(&alice, "👍"), Reacted::Count(1));
         assert_eq!(go(&alice, "🎉"), Reacted::Count(1));
         assert_eq!(go(&alice, "🔥"), Reacted::TooManyOfYours);
-        assert_eq!(go(&alice, "👍"), Reacted::Count(1));
+        assert_eq!(go(&alice, "👍"), Reacted::Held(1));
         assert_eq!(go(&bob, "🔥"), Reacted::Count(1));
         assert_eq!(go(&carol, "😀"), Reacted::TooManyKeys);
         assert_eq!(go(&carol, "👍"), Reacted::Count(2));
@@ -994,10 +1042,48 @@ pub mod conformance {
         assert!(log.forget_reactions(&alice, since).unwrap().is_empty());
     }
 
+    /// Who holds which key on the lines asked for, by the mailbox rule,
+    /// and nothing of the other lines.
+    fn reactors_are_listed_on_the_lines_asked_alone(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        let (alice, linked) = (Mailbox::login("alice"), Mailbox::identified("bob", [3; 32]));
+        react(&*log, &alice, 1, "👍", true, 1);
+        react(&*log, &linked, 1, "👍", true, 2);
+        react(&*log, &linked, 1, "🎉", true, 3);
+        react(&*log, &alice, 3, "🔥", true, 4);
+        let mut held = log.reactors_on(&[1, 2]).unwrap();
+        held.sort_by_key(|h| (h.0, h.1.clone(), h.2.pack()));
+        let mut want = vec![
+            (1, reactor_key(&alice), key("👍")),
+            (1, reactor_key(&linked), key("👍")),
+            (1, reactor_key(&linked), key("🎉")),
+        ];
+        want.sort_by_key(|h| (h.0, h.1.clone(), h.2.pack()));
+        assert_eq!(held, want);
+        assert!(log.reactors_on(&[2]).unwrap().is_empty());
+    }
+
+    /// A clear empties one line of its channel, and no other; a line of
+    /// another channel, a tombstone and one never logged are not there.
+    fn a_clear_takes_every_reaction_on_one_live_line(log: Box<dyn ChatLog>) {
+        fill(&*log, 3);
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        react(&*log, &alice, 1, "👍", true, 1);
+        react(&*log, &bob, 1, "🎉", true, 2);
+        react(&*log, &bob, 2, "👍", true, 3);
+        assert!(log.tombstone(3, "mod", SystemTime::UNIX_EPOCH).unwrap());
+        for (channel, line) in [(7, 1), (0, 3), (0, 99)] {
+            assert_eq!(log.clear_reactions(channel, line).unwrap(), None, "{line}");
+        }
+        assert_eq!(log.clear_reactions(0, 1).unwrap(), Some(2));
+        assert_eq!(log.clear_reactions(0, 1).unwrap(), Some(0));
+        assert_eq!(shown(&*log, &[1, 2], &bob), [(2, keys(&[("👍", 1)], &[0]))]);
+    }
+
     /// A link or a rotation moves an account's reactions, and one the new
     /// key already holds is not counted twice.
     fn reactions_follow_their_account_to_its_identity(log: Box<dyn ChatLog>) {
-        fill(&*log, 1);
+        fill(&*log, 2);
         let (bare, linked) = (
             Mailbox::login("alice"),
             Mailbox::identified("alice", [4; 32]),
@@ -1005,14 +1091,16 @@ pub mod conformance {
         react(&*log, &bare, 1, "👍", true, 1);
         react(&*log, &bare, 1, "🎉", true, 2);
         react(&*log, &linked, 1, "👍", true, 3);
-        log.rekey_reactions(&bare, &linked).unwrap();
-        // The thumbs-up it already held stays, and the bare login's goes.
+        react(&*log, &bare, 2, "👍", true, 4);
+        // The thumbs-up it already held stays, and the bare login's goes:
+        // that line's count fell, and the other's did not.
+        assert_eq!(log.rekey_reactions(&bare, &linked).unwrap(), [1]);
         assert_eq!(
             shown(&*log, &[1], &linked),
             [(1, keys(&[("🎉", 1), ("👍", 1)], &[0, 1]))]
         );
         let rotated = Mailbox::identified("alice", [5; 32]);
-        log.rekey_reactions(&linked, &rotated).unwrap();
+        assert!(log.rekey_reactions(&linked, &rotated).unwrap().is_empty());
         assert_eq!(
             shown(&*log, &[1], &rotated),
             [(1, keys(&[("🎉", 1), ("👍", 1)], &[0, 1]))]

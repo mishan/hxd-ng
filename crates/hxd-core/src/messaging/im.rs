@@ -21,12 +21,15 @@ use std::time::SystemTime;
 use tracing::warn;
 
 use super::{is_messenger, store_failed, Key, Me, MessagingError, Presence};
+use crate::access::bit;
 use crate::chat::{sessions_of, SignedMsg};
 use crate::inbox::{
     Cursor, Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef, MessageStore,
     NewMessage, Pending, Pushed, StoredMessage,
 };
+use crate::reaction::{ReactError, ReactionChange, ReactionKey};
 use crate::relationships::{RelationId, Requester, SentOn};
+use crate::reply::{ImTarget, Reply};
 use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
@@ -540,6 +543,7 @@ impl Core {
                 );
             }
         }
+        self.im_reactions_drain(uid, me, |from| self.im_relation(me, from).ok().flatten());
         let now = self.clock.wall();
         let ids = |v: &[StoredMessage]| v.iter().map(|m| m.id).collect::<Vec<_>>();
         if let Err(e) = store.mark_handed(&ids(&ims), now) {
@@ -660,6 +664,62 @@ impl Core {
                 .map_err(store_failed)?;
         }
         Ok(())
+    }
+
+    /// A reaction to an instant message (`docs/hotline-ng.md` §7.3),
+    /// checked as IM Acknowledge is: `with`, the conversation's other
+    /// party, must be the caller's friend or share an approval with it,
+    /// neither blocking the other, or it is no such target. Relayed to
+    /// `with` alone and never kept with the message, which is never
+    /// looked up: its client matches the guid, and one it does not hold
+    /// is noise.
+    pub fn react_im(
+        &self,
+        uid: Uid,
+        target: &ImTarget,
+        with: &str,
+        key: &ReactionKey,
+        add: bool,
+    ) -> Result<(), ReactError> {
+        let policy = self.reactions.ok_or(ReactError::NotAvailable)?;
+        let me = self.messenger(uid).map_err(|_| ReactError::NotAvailable)?;
+        {
+            let r = self.roster.lock().unwrap();
+            let sess = r.users.get(&uid).ok_or(ReactError::NotAllowed)?;
+            if !sess.is_person || sess.info.system || !sess.access.has(bit::SEND_CHAT) {
+                return Err(ReactError::NotAllowed);
+            }
+        }
+        // As the accounts directory compares a login, whatever its case.
+        let names = |login: &str| target.login().eq_ignore_ascii_case(login);
+        if !names(&me.mailbox.login) && !names(with) {
+            return Err(ReactError::OutOfScope);
+        }
+        self.react_rate(uid, policy)?;
+        let them = self
+            .other(&me, with)
+            .map_err(|_| ReactError::NoSuchTarget)?;
+        let approval = self
+            .im_relation(&me.mailbox, &them)
+            .map_err(|_| ReactError::ServerError)?
+            .ok_or(ReactError::NoSuchTarget)?;
+        let change = ReactionChange::Changed {
+            target: Reply::Im(target.clone()),
+            key: key.clone(),
+            add,
+            from: me.mailbox.login.clone(),
+        };
+        self.im_reaction(&me.mailbox, &them, approval, change);
+        Ok(())
+    }
+
+    /// May `a` and `b` message, as IM Acknowledge asks: as friends,
+    /// `Some(false)`, or under an approval, `Some(true)`.
+    fn im_relation(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<bool>, MessagingError> {
+        if self.friendship(a, b)?.is_some() {
+            return Ok(Some(false));
+        }
+        Ok(self.approval(a, b)?.map(|_| true))
     }
 
     /// IM Typing (813): to the friend's messenger sessions alone, never

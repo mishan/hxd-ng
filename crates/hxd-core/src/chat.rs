@@ -1336,6 +1336,7 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
+                r.live.relayed(room, id);
             }
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry
@@ -3682,8 +3683,26 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.inner.reactors_on(ids)
+        }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner.clear_reactions(channel, line)
         }
         fn attach_media(
             &self,
@@ -3971,8 +3990,26 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.inner.reactors_on(ids)
+        }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner.clear_reactions(channel, line)
         }
         fn attach_media(
             &self,
@@ -4329,8 +4366,26 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.0.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.0.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.0.reactors_on(ids)
+        }
+        fn clear_reactions(
+            &self,
+            channel: u32,
+            line: crate::history::LineId,
+        ) -> Result<Option<usize>, StoreError> {
+            self.0.clear_reactions(channel, line)
         }
     }
 
