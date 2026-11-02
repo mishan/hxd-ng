@@ -205,8 +205,9 @@ pub struct Login {
     /// The client version. 150 and up is offered the agreement, and this
     /// client agrees to it; 0 sends none, as a 1.2 client does.
     pub version: u16,
-    /// Capability bits to offer, if any.
-    pub caps: Option<u16>,
+    /// Capability bits to offer, if any: in two bytes while they fit,
+    /// as a client that knows no bit past 15 sends them.
+    pub caps: Option<u32>,
 }
 
 impl Login {
@@ -242,7 +243,9 @@ impl Login {
             c.push((tag::VERSION, self.version.to_be_bytes().to_vec()));
         }
         if let Some(caps) = self.caps {
-            c.push((tag::CAPABILITIES, caps.to_be_bytes().to_vec()));
+            let wide = caps.to_be_bytes();
+            let at = if caps > 0xffff { 0 } else { 2 };
+            c.push((tag::CAPABILITIES, wide[at..].to_vec()));
         }
         c
     }

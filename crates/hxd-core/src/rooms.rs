@@ -936,6 +936,17 @@ impl Core {
         r.room_reconcile();
         r.rooms
             .retain(|id, _| file.rooms.iter().any(|room| room.id == *id));
+        // A deleted room takes no more lines, so its count can go.
+        let gone: Vec<u32> = (r.line_counters.keys().copied())
+            .filter(|id| {
+                *id != 0
+                    && !r.chats.contains_key(id)
+                    && r.rooms.get(id).is_none_or(|e| e.room.deleted)
+            })
+            .collect();
+        for id in gone {
+            r.line_counters.remove(&id);
+        }
         r.room_announce(before, Some(&changed), None);
         drop(r);
         if let Some(log) = self.history.as_ref() {

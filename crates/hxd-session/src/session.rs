@@ -51,6 +51,7 @@ use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::friends;
 use crate::media;
 use crate::news::{self, LegacyNews};
+use crate::structured;
 use crate::video;
 use crate::voice;
 
@@ -995,14 +996,22 @@ fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
 /// whose operator tags them, its own then `@tag`. The name is cut to leave
 /// the tag room, never the tag, which is what says where the user is from.
 fn shown_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
-    match u.remote.as_ref().filter(|r| r.tagged) {
-        Some(r) => {
-            let tag = enc.encode_capped(&format!("@{}", r.home_tag), 31);
-            let mut name = enc.encode_capped(&u.nick, 31 - tag.len());
+    let tag = u.remote.as_ref().filter(|r| r.tagged);
+    shown_name(enc, &u.nick, tag.map(|r| r.home_tag.as_str()))
+}
+
+/// [`shown_nick`] of a name and the tag it is shown with, if any: what a
+/// history entry names a line's sender by, live or paged back, so the two
+/// agree with each other and with the user list.
+fn shown_name(enc: TextEncoding, nick: &str, tag: Option<&str>) -> Vec<u8> {
+    match tag {
+        Some(tag) => {
+            let tag = enc.encode_capped(&format!("@{tag}"), 31);
+            let mut name = enc.encode_capped(nick, 31 - tag.len());
             name.extend(tag);
             name
         }
-        None => wire_nick(enc, &u.nick),
+        None => wire_nick(enc, nick),
     }
 }
 
@@ -2539,6 +2548,7 @@ async fn login_phase(
         friendships: caps.has(cap::FRIENDSHIPS),
         // Bit 15 is what lets this wire carry `DATA_FRIEND_IDENTITY`.
         guest_identities: caps.has(cap::FRIENDSHIPS),
+        echoes_own_lines: caps.has(cap::STRUCTURED_CHAT),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -2842,15 +2852,26 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
 
 /// A line from the server to this session alone, in a room or, for 0, the
 /// lobby: mhxd's action form, `\r *** text`, from the system account's
-/// uid where there is one (`docs/chat-rooms.md` §6). Never logged.
+/// uid where there is one (`docs/chat-rooms.md` §6), and else from 0, as
+/// mhxd sends a line no user said. Never logged.
 fn server_line(tx: &Tx, ctx: &ServerCtx, sess: &Session, cid: u32, text: &str) {
-    let from = ctx.core.system_uid().unwrap_or(sess.uid);
-    push_notice(tx, sess, cid, from, text, true);
+    let from = ctx.core.system_uid().unwrap_or(0);
+    push_notice(tx, sess, cid, from, text, true, (None, SystemTime::now()));
 }
 
 /// The legacy rendering of a server notice: `\r<text>`, or mhxd's action
-/// form, `\r *** text`, for the one notice it says that way.
-fn push_notice(tx: &Tx, sess: &Session, cid: u32, from: Uid, text: &str, action: bool) {
+/// form, `\r *** text`, for the one notice it says that way. `stamp` is
+/// its number in the chat's count, `None` for a line to this session
+/// alone, and when it was written.
+fn push_notice(
+    tx: &Tx,
+    sess: &Session,
+    cid: u32,
+    from: Uid,
+    text: &str,
+    action: bool,
+    (ephemeral, at): (Option<u64>, SystemTime),
+) {
     let mut line = Vec::with_capacity(text.len() + 6);
     if action {
         line.extend_from_slice(b"\r *** ");
@@ -2866,6 +2887,23 @@ fn push_notice(tx: &Tx, sess: &Session, cid: u32, from: Uid, text: &str, action:
         chunks.push((tag::CHAT_ID, cid.to_be_bytes().to_vec()));
     }
     chunks.push((tag::UID, from.to_be_bytes().to_vec()));
+    if sess.has_cap(cap::STRUCTURED_CHAT) {
+        // Drawn as a notice, so a server line whatever its uid names.
+        let line = structured::Line {
+            id: ephemeral.unwrap_or(0),
+            at,
+            flags: hxd_core::LineFlags::SERVER_MESSAGE.bits()
+                | ephemeral.map_or(0, |_| structured::EPHEMERAL),
+            icon: 0,
+            nick: b"",
+            text,
+            subfields: &[],
+        };
+        chunks.push((
+            structured::DATA_CHAT_LINE,
+            structured::entry(sess.enc, &line),
+        ));
+    }
     push(tx, hdr::CHAT, chunks);
 }
 
@@ -2969,6 +3007,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             text,
             style,
             media,
+            id,
+            ephemeral,
+            at,
             ..
         } => {
             // Format at the edge, in the connection's encoding, so the
@@ -2990,8 +3031,50 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             // one room, and neither knows about the other. A client that
             // did not negotiate the bit sees the text and nothing else,
             // which is the spec's own fallback.
-            if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
-                chunks.extend(media::companion_chunks(&media));
+            let media_reader = sess.caps.has(cap::INLINE_MEDIA);
+            if let Some(media) = media.as_ref().filter(|_| media_reader) {
+                chunks.extend(media::companion_chunks(media));
+            }
+            // Id 0 names a line to one session, never one a chat shares: a
+            // line with neither number was for a chat gone as it was
+            // relayed, and goes without an entry.
+            let numbered = match (id, ephemeral) {
+                (Some(id), _) => Some((id, 0)),
+                (None, Some(n)) => Some((n, structured::EPHEMERAL)),
+                (None, None) => None,
+            };
+            if let Some((id, flags)) = numbered.filter(|_| sess.has_cap(cap::STRUCTURED_CHAT)) {
+                let subfields = match &media {
+                    // Relayed to this session just now, so its handle is
+                    // one it may fetch.
+                    Some(m) if media_reader => history_media_subfields(&m.to_meta(), true),
+                    _ => Vec::new(),
+                };
+                // As a 700 entry reads to a session that cannot show
+                // the image.
+                let text = if text.is_empty() && media.is_some() && !media_reader {
+                    "[image]"
+                } else {
+                    &text
+                };
+                let line = structured::Line {
+                    id,
+                    at,
+                    flags: flags
+                        | if style == 1 {
+                            hxd_core::LineFlags::ACTION.bits()
+                        } else {
+                            0
+                        },
+                    icon: from.icon,
+                    nick: &shown_nick(sess.enc, &from),
+                    text,
+                    subfields: &subfields,
+                };
+                chunks.push((
+                    structured::DATA_CHAT_LINE,
+                    structured::entry(sess.enc, &line),
+                ));
             }
             push(tx, hdr::CHAT, chunks);
         }
@@ -3000,7 +3083,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             from,
             text,
             action,
-        } => push_notice(tx, sess, cid, from, &text, action),
+            ephemeral,
+            at,
+        } => push_notice(tx, sess, cid, from, &text, action, (ephemeral, at)),
         Event::ChatSubject { cid, subject } => {
             push(
                 tx,
@@ -4701,20 +4786,26 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     let media_reader = sess.has_cap(cap::INLINE_MEDIA);
                     for line in page.lines {
                         let deleted = line.flags.contains(hxd_core::LineFlags::DELETED);
-                        let nick = if deleted {
-                            Vec::new()
-                        } else {
-                            sess.enc.encode(&line.from_nick)
+                        // A tagged ghost is logged under its shown name,
+                        // which is cut here as the user list cuts it.
+                        let tagged = line.home.as_ref().filter(|h| h.tagged).and_then(|h| {
+                            let name = line.from_nick.strip_suffix(&format!("@{}", h.tag))?;
+                            Some((name, h.tag.as_str()))
+                        });
+                        let nick = match tagged {
+                            _ if deleted => Vec::new(),
+                            Some((name, tag)) => shown_name(sess.enc, name, Some(tag)),
+                            None => shown_name(sess.enc, &line.from_nick, None),
                         };
                         // A line that was only an image reads as "[image]"
                         // to a reader that cannot show one, rather than as
                         // a gap where one was (Capabilities-Chat-History).
                         let body = if deleted {
-                            Vec::new()
+                            ""
                         } else if line.text.is_empty() && line.media.is_some() && !media_reader {
-                            b"[image]".to_vec()
+                            "[image]"
                         } else {
-                            sess.enc.encode(&line.text)
+                            &line.text
                         };
                         let media = match &line.media {
                             Some(meta) if media_reader && !deleted => {
@@ -4723,28 +4814,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             }
                             _ => Vec::new(),
                         };
-                        let subfields: Vec<_> = media
-                            .iter()
-                            .map(|(ty, data)| hxproto::build::HistorySubfield { ty: *ty, data })
-                            .collect();
-                        let timestamp = line
-                            .at
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
-                        let Some(entry) = hxproto::build::build_history_entry(
-                            line.id,
-                            timestamp,
-                            line.flags.bits(),
-                            line.icon,
-                            &nick,
-                            &body,
-                            &subfields,
-                        ) else {
-                            warn!(id = line.id, "chat history entry exceeds the wire chunk");
-                            reply_error(tx, f.trans, "Server error.");
-                            return;
-                        };
-                        entries.push(entry);
+                        entries.push(structured::entry(
+                            sess.enc,
+                            &structured::Line {
+                                id: line.id,
+                                at: line.at,
+                                flags: line.flags.bits(),
+                                icon: line.icon,
+                                nick: &nick,
+                                text: body,
+                                subfields: &media,
+                            },
+                        ));
                     }
                     let (entries, trimmed) = fit_history_entries(entries, after.is_some());
                     let mut chunks = Vec::with_capacity(entries.len() + 2);

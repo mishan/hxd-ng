@@ -312,6 +312,11 @@ generate() {
         echo "[reactions]"
         echo "enabled = true"
     fi
+    if on HXD_STRUCTURED_CHAT off; then
+        echo
+        echo "[structured_chat]"
+        echo "enabled = true"
+    fi
     if on HXD_NEWS on; then
         echo
         echo "[news]"

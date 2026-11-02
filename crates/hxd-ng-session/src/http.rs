@@ -912,6 +912,7 @@ async fn upgrade(
                     guest_identities: false,
                     replies: false,
                     reactions: false,
+                    echoes_own_lines: false,
                 };
                 // §8.2: the tunnelled login can self-link, which is a
                 // write of an association — so it needs the same `manage`

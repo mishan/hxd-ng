@@ -17,6 +17,7 @@ pub mod media;
 pub mod news;
 pub mod peer;
 pub mod session;
+pub mod structured;
 pub mod tls;
 pub mod video;
 pub mod voice;

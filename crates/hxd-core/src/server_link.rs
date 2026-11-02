@@ -1448,7 +1448,7 @@ mod tests {
         core.ghost_chat(line);
         let heard = drain(&mut rx);
         assert!(
-            matches!(&heard[..], [Event::Joined(_), Event::Parted(_), Event::Chat { from, text, .. }] if from.uid == g && text == "bye"),
+            matches!(&heard[..], [Event::Joined(_), Event::Parted(_), Event::Chat { from, text, .. }] if from.uid == 0 && from.nick == "bob" && text == "bye"),
             "{heard:?}"
         );
 

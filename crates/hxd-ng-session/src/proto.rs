@@ -793,6 +793,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
         guid,
         signed,
         re,
+        ..
     } = &se.event
     {
         let data = ChatData {

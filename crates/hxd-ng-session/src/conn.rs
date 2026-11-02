@@ -831,8 +831,9 @@ async fn handle_login(
             // Only for a client that said it speaks the friend family,
             // so one that did not is sent nothing new (§7.5).
             messaging: p.messaging && ctx.core.messaging_enabled(),
-            // Capability bit 8 is the classic wire's alone.
+            // Capability bits 8 and 17 are the classic wire's alone.
             messenger_session: false,
+            echoes_own_lines: false,
             // A device of the identity the account links, which may sign
             // messages, asked for by a client that speaks the family
             // (§7.5); whether the account takes part is the domain's.

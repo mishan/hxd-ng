@@ -209,9 +209,10 @@ Event::Chat {
 }
 ```
 
-The legacy encoder ignores `id` and `at` (a 106 has nowhere to put them,
-and formatting a timestamp into the line would break the 13-column
-alignment period clients depend on). The ng encoder emits both (§7).
+The legacy encoder leaves `id` and `at` out of the formatted line, since
+a timestamp there would break the 13-column alignment period clients
+depend on, and sends them only in the structured line of a session that
+negotiated bit 17 (§12). The ng encoder emits both (§7).
 
 ## 4. Storage
 
@@ -393,10 +394,14 @@ crate, and lands beside it in `hxproto` as `build_history_entry`
 so the two cannot disagree about a byte. Nick and body pass through the
 session's text conversion — Mac Roman, or UTF-8 for a client that
 negotiated Text-Encoding — with the lengths taken **after** conversion; the nick was
-truncated to 31 characters on the way in, so it fits, and a body is at
+truncated to 31 characters on the way in, and is cut to the user list's
+31 bytes after conversion, a tagged ghost's tag kept (§12), and a body is at
 most 4096 bytes, so an entry is far under the 65 535 the field can
 carry even with the media sub-fields of §8. Flags map one to one from
-`LineFlags`. Entries go out ascending, then `HAS_MORE`.
+`LineFlags`. Entries go out ascending, then `HAS_MORE`. The encoder is
+the one a structured line on 106 uses (§12): the body in the session's
+line endings, cut at a character boundary should it ever outgrow the
+field.
 
 An entry fits its own u16, but a *page* of them need not fit the
 transaction: 200 lines near the 4096-byte cap is over a quarter of a
@@ -666,3 +671,54 @@ follow-up.
 - **Redaction and reporting** are [moderation.md](moderation.md); its
   §8 asks upstream to define 703 as redact and to allocate a report
   transaction.
+
+## 12. Structured Chat on the classic wire
+
+The Structured Chat draft (this server's, unallocated: capability bit
+17, field `0x0F33` `DATA_CHAT_LINE`, entry flag bit 3) sends a line as
+data as well as text. To a session that negotiated the bit, every 106
+that relays a line also carries the line's Chat History entry, built by
+the encoder 700 uses (`hxd_session::structured`), with `FieldUserID`
+naming the sender and `DATA_CHATID` for a private chat or a room, as
+today. `FieldData` is unchanged, and a session without the bit is sent
+exactly what it was. `[structured_chat] enabled` turns it on; it needs
+nothing else. The ng wire's `chat` event is structured already and is
+unchanged.
+
+**Ids.** A kept line carries its history id. A line nobody keeps — a
+private chat's, the lobby's on a server without `[history]`, a room's
+there too, a notice into a chat — carries a number from that chat's own
+count (`chat::LineCounter`, in `RosterInner::line_counters`, 0 the
+lobby's), from a CSPRNG start below 2^62, with flag bit 3. The number
+is taken under the roster's lock as the line fans out, so every member
+is sent the same one and in the order they hear the lines; it lives in
+memory alone and goes with the chat. A line to one session alone — a
+room's notice to the user it concerns, "n more queued messages" — is
+numbered 0 and takes nothing from the count.
+
+**Server lines.** A line drawn as a notice has the server-message flag,
+no icon and no nick; its `FieldUserID` is the user it is about (the
+kicker on a kick, the spammer on a flood kick), or for a line to one
+session the system account, else 0, as mhxd sends a line nobody said.
+That last is a change for every session: the uid fell back to the
+recipient's own before.
+
+**Who is sent it.** The nick is the one the recipient's user list
+shows, cut to 31 bytes after conversion and a tagged ghost's tag kept,
+in a 700 entry as on 106; the text is the raw text in the
+session's encoding and line endings; an image is its sub-fields to a
+bit-3 session and `[image]` for an empty text to any other, as in 700.
+A sender is sent its echo even where it may not read the lobby, since
+the echo is how it learns its line's id: the domain learns the bit
+for that alone (`Transport::echoes_own_lines`). Legacy replay carries no
+entry, and a bit-4 session is not replayed to.
+
+**What it does not do.** No `DATA_CHANNEL_ID` beside a room's line,
+which the draft allows: this wire's 700 answers channel 0 alone, so it
+would name a history the client cannot fetch. History ids are one
+`AUTOINCREMENT` across channels (`chat-rooms.md` §3), so a room member
+sees the gaps the lobby and other rooms leave; the draft names that as
+a leak a server may accept, and `chat-rooms.md` accepted it for both
+wires. The draft's ephemeral window and byte cap bound what its
+companions remember of unkept lines, and since nothing here remembers
+any, neither is a setting yet.

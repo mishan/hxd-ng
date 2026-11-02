@@ -270,6 +270,36 @@ pub(crate) struct PrivateChat {
     pub(crate) password: String,
 }
 
+/// A chat's count of the lines it does not keep, for the Structured Chat
+/// draft's ephemeral line ids: from a start drawn below 2^62, so it cannot
+/// wrap and a reader learns nothing from it of any other chat's lines.
+/// Never stored, and gone with its chat or the server.
+#[derive(Debug)]
+pub(crate) struct LineCounter(u64);
+
+impl Default for LineCounter {
+    fn default() -> Self {
+        let mut raw = [0u8; 8];
+        getrandom::getrandom(&mut raw).expect("the OS CSPRNG");
+        LineCounter(u64::from_be_bytes(raw) >> 2)
+    }
+}
+
+impl RosterInner {
+    /// The next number in `cid`'s count, 0 the lobby's, or `None` for a
+    /// chat that does not exist or a deleted room, which keep no count
+    /// and whose lines reach nobody.
+    pub(crate) fn ephemeral_line(&mut self, cid: u32) -> Option<u64> {
+        let room = |r: &Self| r.rooms.get(&cid).is_some_and(|e| !e.room.deleted);
+        if cid != 0 && !self.chats.contains_key(&cid) && !room(self) {
+            return None;
+        }
+        let counter = self.line_counters.entry(cid).or_default();
+        counter.0 += 1;
+        Some(counter.0)
+    }
+}
+
 /// The ban a kick places (`Core::kick_by`).
 #[derive(Debug, Clone)]
 pub struct KickBan {
@@ -1140,12 +1170,14 @@ impl Core {
             for (s, result) in batch.iter_mut().zip(results.iter_mut()) {
                 let Some(crate::media::Principal::Session { uid, serial }) = s.principal else {
                     // A ghost hidden since is not shown; one gone since
-                    // still is, as it was, so its last line is not lost.
+                    // still is, as it was, so its last line is not lost,
+                    // but from uid 0: its uid names nobody on the list
+                    // now, and may soon name someone else.
                     if s.principal.is_none() {
                         match r.ghosts.get(&s.info.uid) {
                             Some(g) if !g.visible => *result = Some(Err(ChatError::NoSuchUser)),
                             Some(g) => s.info = g.info.clone(),
-                            None => {}
+                            None => s.info.uid = 0,
                         }
                     }
                     continue;
@@ -1309,12 +1341,17 @@ impl Core {
             // A signed line crosses a link with its signature or not at
             // all (`docs/e2e-messages.md` §4.11).
             let crosses = s.signed.is_none() || s.link.is_some();
+            // The roster a line at a time, so a long batch does not hold
+            // everyone else's roster work for all of it: the log's lock is
+            // what keeps the lines in order.
+            let mut r = self.roster.lock().unwrap();
             let ev = Event::Chat {
                 cid: room,
                 from: s.info,
                 text: s.text,
                 style: s.style,
                 id,
+                ephemeral: id.is_none().then(|| r.ephemeral_line(room)).flatten(),
                 at: s.at,
                 media: s.media.as_ref().map(|(_, r)| r.clone()),
                 guid: None,
@@ -1330,10 +1367,6 @@ impl Core {
                 mine
             });
             let skip = mine.as_ref().map(|_| sender);
-            // The roster a line at a time, so a long batch does not hold
-            // everyone else's roster work for all of it: the log's lock is
-            // what keeps the lines in order.
-            let mut r = self.roster.lock().unwrap();
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
             }
@@ -1343,12 +1376,16 @@ impl Core {
             // under the media store's, which is the one order those two
             // are ever taken in.
             let audience = if room == 0 {
-                r.broadcast_where(&ev, skip, reads_public_chat);
+                // Its echo is how a sender that asks for structured lines
+                // learns its line's id, so it is sent one even where it may
+                // not read the lobby.
+                let hears = |u: &crate::roster::UserSession| {
+                    reads_public_chat(u)
+                        || (u.info.uid == sender && u.info.transport.echoes_own_lines)
+                };
+                r.broadcast_where(&ev, skip, hears);
                 if let Some(mine) = mine {
-                    if r.users
-                        .get(&sender)
-                        .is_some_and(|u| u.visible && reads_public_chat(u))
-                    {
+                    if r.users.get(&sender).is_some_and(|u| u.visible && hears(u)) {
                         r.send_to(sender, mine);
                     }
                 }
@@ -1444,6 +1481,7 @@ impl Core {
             text,
             style,
             id: None,
+            ephemeral: r.ephemeral_line(cid),
             at: SystemTime::now(),
             media: media.as_ref().map(|(_, r)| r.clone()),
             guid: None,
@@ -1783,6 +1821,8 @@ impl Core {
             from,
             text,
             action,
+            ephemeral: r.ephemeral_line(cid),
+            at: SystemTime::now(),
         };
         if cid == 0 {
             r.broadcast_where(&ev, None, reads_public_chat);
@@ -2033,6 +2073,7 @@ impl Core {
         chat.members.remove(pos);
         if chat.members.is_empty() {
             r.chats.remove(&cid);
+            r.line_counters.remove(&cid);
             return;
         }
         let members = chat.members.clone();
@@ -3060,6 +3101,8 @@ impl Core {
                         from: 0,
                         text: format!("{n} more queued messages are waiting."),
                         action: false,
+                        ephemeral: None,
+                        at: SystemTime::now(),
                     },
                 );
             }
@@ -4509,6 +4552,7 @@ mod tests {
                     from,
                     text,
                     action,
+                    ..
                 } if text.contains("spam") => Some((*cid, *from, text.clone(), *action)),
                 _ => None,
             })
@@ -4602,6 +4646,70 @@ mod tests {
             )]
         );
         assert!(spam_notices(&drain(&mut rx_o)).is_empty());
+    }
+
+    /// Lines a chat does not keep are numbered by a count of the chat's
+    /// own: one number a line, the same for everyone it reaches, a notice
+    /// into the chat taking the next, each chat counting apart from a
+    /// random start below 2^62, and the count gone with its chat.
+    #[test]
+    fn unkept_lines_are_numbered_by_their_chats_own_count() {
+        let core = Core::new();
+        let (a, mut rx_a) = test_attach(&core, "a", chatter());
+        let (b, mut rx_b) = test_attach(&core, "b", chatter());
+        let (cid, _) = core.chat_create(a, b).unwrap();
+        core.chat_join(cid, b, "").unwrap();
+        let (other, _) = core.chat_create(a, a).unwrap();
+        drain(&mut rx_a);
+        drain(&mut rx_b);
+
+        core.chat_public(a, "lobby 1".into(), 0, None).unwrap();
+        core.chat_private(cid, b, "chat 1".into(), 0, None).unwrap();
+        core.chat_public(b, "lobby 2".into(), 1, None).unwrap();
+        core.chat_notice(cid, a, "a notice".into());
+        core.chat_private(cid, a, "chat 2".into(), 0, None).unwrap();
+        core.chat_private(other, a, "elsewhere".into(), 0, None)
+            .unwrap();
+        let numbered = |evs: Vec<Event>| -> Vec<(u32, u64)> {
+            evs.into_iter()
+                .filter_map(|e| match e {
+                    Event::Chat {
+                        cid,
+                        id: None,
+                        ephemeral,
+                        ..
+                    }
+                    | Event::Notice { cid, ephemeral, .. } => Some((cid, ephemeral.unwrap())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let heard_a = numbered(drain(&mut rx_a));
+        let (lobby, chat) = (heard_a[0].1, heard_a[1].1);
+        assert_eq!(
+            heard_a,
+            [
+                (0, lobby),
+                (cid, chat),
+                (0, lobby + 1),
+                (cid, chat + 1),
+                (cid, chat + 2),
+                (other, heard_a[5].1),
+            ]
+        );
+        assert_eq!(numbered(drain(&mut rx_b)), heard_a[..5]);
+        for (_, n) in &heard_a {
+            assert!(*n <= 1 << 62, "{n:#x}");
+        }
+        assert_ne!(
+            heard_a[5].1,
+            chat + 3,
+            "each chat counts from its own start"
+        );
+
+        core.chat_part(cid, a);
+        core.chat_part(cid, b);
+        assert!(!core.roster.lock().unwrap().line_counters.contains_key(&cid));
     }
 
     /// mhxd's spam points: a transaction that brings the window to the

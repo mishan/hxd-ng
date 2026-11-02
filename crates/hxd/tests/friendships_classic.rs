@@ -155,7 +155,7 @@ async fn start(dir: &Path) -> Server {
 
 fn login(account: &str, caps: u64) -> Login {
     Login {
-        caps: Some(caps as u16),
+        caps: Some(caps as u32),
         ..Login::account(account, account, "pw")
     }
 }
