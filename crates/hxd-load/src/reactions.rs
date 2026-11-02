@@ -23,6 +23,9 @@ use crate::Ctx;
 /// The reaction keys a storm picks from.
 const KEYS: &[&str] = &["\u{1F44D}", "\u{1F389}", "\u{1F525}", "\u{1F440}"];
 
+/// The most lines one `history` with `ids` takes.
+const HISTORY_IDS: usize = 50;
+
 /// How long the stalled clients are read from afterwards.
 const PROBE_FOR: Duration = Duration::from_secs(5);
 
@@ -258,21 +261,42 @@ async fn converged(ctx: &Ctx, creds: (String, String), lines: &[u64], heard: &[H
         Ok(c) => c,
         Err(e) => return ctx.checks.violated("reactions.converged", e),
     };
-    let shown = match observer.request("history", json!({ "ids": lines })).await {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = observer.logout().await;
-            let why = format!("history could not be read: {e}");
-            return ctx.checks.violated("reactions.converged", why);
+    // `ids` takes so many at once, and a reply that does not fit says
+    // `has_more` for the rest.
+    let mut kept: HashMap<u64, Value> = HashMap::new();
+    for chunk in lines.chunks(HISTORY_IDS) {
+        let mut asked: Vec<u64> = chunk.to_vec();
+        while !asked.is_empty() {
+            let shown = match observer.request("history", json!({ "ids": asked })).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = observer.logout().await;
+                    let why = format!("history could not be read: {e}");
+                    return ctx.checks.violated("reactions.converged", why);
+                }
+            };
+            let got: Vec<(u64, Value)> = (shown["lines"].as_array().into_iter().flatten())
+                .filter_map(|l| Some((l["id"].as_u64()?, l["reactions"].clone())))
+                .collect();
+            let progress = !got.is_empty();
+            asked.retain(|id| !got.iter().any(|(g, _)| g == id));
+            kept.extend(got);
+            if shown["has_more"] != true || !progress {
+                break;
+            }
         }
-    };
+    }
     let _ = observer.logout().await;
-    let kept: HashMap<u64, Value> = (shown["lines"].as_array().into_iter().flatten())
-        .filter_map(|l| Some((l["id"].as_u64()?, l["reactions"].clone())))
-        .collect();
+    for line in lines.iter().filter(|l| !kept.contains_key(l)) {
+        ctx.checks.violated(
+            "reactions.converged",
+            format!("line {line} is not in history to compare with"),
+        );
+    }
     for h in heard {
         for line in lines {
-            let want = kept.get(line).filter(|v| !v.is_null());
+            let Some(want) = kept.get(line) else { continue };
+            let want = Some(want).filter(|v| !v.is_null());
             let got = h
                 .get(line)
                 .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));

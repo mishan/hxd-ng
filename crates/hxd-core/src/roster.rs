@@ -1615,6 +1615,9 @@ pub struct Core {
     pub(crate) folder_rates: crate::limits::PostRates,
     /// And of its reactions (`crate::reaction`).
     pub(crate) react_rates: crate::limits::PostRates,
+    /// Held around every change to the log's reactions, so a moderator's
+    /// clear records exactly the rows it then takes.
+    pub(crate) reaction_writes: Mutex<()>,
     /// `[reactions]`, or `None`, which takes none.
     pub(crate) reactions: Option<crate::reaction::ReactionPolicy>,
     /// What each account and each address have left of the device proofs

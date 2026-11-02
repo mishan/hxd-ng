@@ -487,6 +487,8 @@ pub(crate) struct Live {
     /// How many `waiting` holds, so the server-wide bound costs nothing
     /// to ask.
     waiting_len: usize,
+    /// How long an instant-message reaction may wait.
+    im_keep: Duration,
 }
 
 impl Live {
@@ -585,29 +587,33 @@ impl Live {
         Some(queue)
     }
 
-    /// `back`, taken and not handed over, ahead of what came meanwhile.
-    fn put_back(&mut self, to: Key, mut back: Vec<Waiting>) {
-        back.sort_by_key(|w| w.at);
-        self.waiting_len += back.len();
-        let queue = self.waiting.entry(to).or_default();
-        for w in back.into_iter().rev() {
-            queue.push_front(w);
+    /// `back`, taken and not handed over, kept again as anything new is.
+    fn put_back(&mut self, to: Key, back: Vec<Waiting>, now: Instant) {
+        for w in back {
+            self.keep(to.clone(), w, now);
         }
     }
 
     /// `from`'s account is `to`'s now: what waits for it, and what it
-    /// reacted, follow.
-    fn rekey(&mut self, from: &Mailbox, to: &Mailbox) {
+    /// reacted, follow, each kept again as anything new is, so the
+    /// latest of each and the bounds hold across the merge.
+    fn rekey(&mut self, from: &Mailbox, to: &Mailbox, now: Instant) {
         let (old, new) = (Key::of(from), Key::of(to));
         if old == new {
             return;
         }
-        if let Some(moved) = self.waiting.remove(&old) {
-            let queue = self.waiting.entry(new.clone()).or_default();
-            queue.extend(moved);
-            queue.make_contiguous().sort_by_key(|w| w.at);
+        let touched: Vec<Key> = (self.waiting.iter())
+            .filter(|(k, q)| **k == old || q.iter().any(|w| Key::of(&w.from) == old))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut moved = Vec::new();
+        for k in touched {
+            let queue = self.take(&k).unwrap_or_default();
+            let k = if k == old { new.clone() } else { k };
+            moved.extend(queue.into_iter().map(|w| (k.clone(), w)));
         }
-        for w in self.waiting.values_mut().flatten() {
+        moved.sort_by_key(|(_, w)| w.at);
+        for (k, mut w) in moved {
             if Key::of(&w.from) == old {
                 // A rotation names the successor by its key alone.
                 w.from.fingerprint = to.fingerprint;
@@ -615,6 +621,7 @@ impl Live {
                     w.from.login = to.login.clone();
                 }
             }
+            self.keep(k, w, now);
         }
     }
 
@@ -629,48 +636,57 @@ impl Live {
         self.recount();
     }
 
-    /// Keep `change` for `to`, from `from`, in place of one it replaces:
-    /// the latest of each reactor's key on each message, within
-    /// [`IM_WAITING`] and the policy's age.
-    fn keep(&mut self, to: Key, w: Waiting, keep: Duration) {
-        let queue = self.waiting.entry(to).or_default();
-        let same = |a: &ReactionChange, b: &ReactionChange| match (a, b) {
-            (
-                ReactionChange::Changed {
-                    target: t1,
-                    key: k1,
-                    ..
-                },
-                ReactionChange::Changed {
-                    target: t2,
-                    key: k2,
-                    ..
-                },
-            ) => t1 == t2 && k1 == k2,
-            _ => false,
+    /// Keep `w` for `to`: the one way anything joins the waiting, so its
+    /// rules hold whatever comes in. The latest of each reactor's key on
+    /// each message stands, an older one arriving late giving way;
+    /// nothing older than the policy's age is kept; past [`IM_WAITING`]
+    /// the reactor holding the most gives up its oldest, so one cannot
+    /// crowd the others out; and past [`IM_WAITING_ALL`] the oldest
+    /// anywhere goes.
+    fn keep(&mut self, to: Key, w: Waiting, now: Instant) {
+        let same = |a: &Waiting, b: &Waiting| {
+            Key::of(&a.from) == Key::of(&b.from)
+                && match (&a.change, &b.change) {
+                    (
+                        ReactionChange::Changed {
+                            target: t1,
+                            key: k1,
+                            ..
+                        },
+                        ReactionChange::Changed {
+                            target: t2,
+                            key: k2,
+                            ..
+                        },
+                    ) => t1 == t2 && k1 == k2,
+                    _ => false,
+                }
         };
+        let keep = self.im_keep;
+        let queue = self.waiting.entry(to.clone()).or_default();
         let before = queue.len();
-        queue.retain(|q| {
-            !(Key::of(&q.from) == Key::of(&w.from) && same(&q.change, &w.change))
-                && w.at.duration_since(q.at) < keep
-        });
-        queue.push_back(w);
-        self.waiting_len = self.waiting_len + queue.len() - before;
-        if queue.len() > IM_WAITING {
-            // The reactor holding the most gives up its oldest, so one
-            // cannot crowd the others out.
+        queue.retain(|q| now.duration_since(q.at) < keep);
+        let superseded = queue.iter().any(|q| same(q, &w) && q.at > w.at);
+        if !superseded && now.duration_since(w.at) < keep {
+            queue.retain(|q| !same(q, &w));
+            let at = queue.partition_point(|q| q.at <= w.at);
+            queue.insert(at, w);
+        }
+        while queue.len() > IM_WAITING {
             let mut held: HashMap<Key, usize> = HashMap::new();
             for q in queue.iter() {
                 *held.entry(Key::of(&q.from)).or_default() += 1;
             }
             let most = held.values().max().copied();
-            if let Some(i) = queue
-                .iter()
-                .position(|q| held.get(&Key::of(&q.from)).copied() == most)
-            {
-                queue.remove(i);
-                self.waiting_len -= 1;
-            }
+            let Some(i) = (queue.iter()).position(|q| held.get(&Key::of(&q.from)).copied() == most)
+            else {
+                break;
+            };
+            queue.remove(i);
+        }
+        self.waiting_len = self.waiting_len - before + queue.len();
+        if queue.is_empty() {
+            self.waiting.remove(&to);
         }
         while self.waiting_len > IM_WAITING_ALL {
             let oldest = (self.waiting.iter())
@@ -808,6 +824,7 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             r.live.window = policy.live_window;
             r.live.batch = policy.batch;
+            r.live.im_keep = policy.im_keep;
         }
         self.reactions = Some(policy);
         self
@@ -878,7 +895,11 @@ impl Core {
             max_keys: policy.max_keys,
             max_per_user: policy.max_per_user,
         };
-        match log.react(&act) {
+        let reacted = {
+            let _writing = self.reaction_writes.lock().unwrap();
+            log.react(&act)
+        };
+        match reacted {
             Ok(Reacted::Count(n)) => {
                 let now = self.clock.now();
                 self.roster
@@ -945,7 +966,11 @@ impl Core {
             .wall()
             .checked_sub(within)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        match log.forget_reactions(who, since) {
+        let forgot = {
+            let _writing = self.reaction_writes.lock().unwrap();
+            log.forget_reactions(who, since)
+        };
+        match forgot {
             Ok(lines) => {
                 let now = self.clock.now();
                 let mut r = self.roster.lock().unwrap();
@@ -957,10 +982,20 @@ impl Core {
         }
     }
 
+    /// `lines` changed outside a reaction: those live owe a summary.
+    pub(crate) fn reactions_changed_on(&self, lines: &[LineId]) {
+        let now = self.clock.now();
+        let mut r = self.roster.lock().unwrap();
+        for &line in lines {
+            r.live.owe(line, Owe::Summary, now);
+        }
+    }
+
     /// `from`'s waiting instant-message reactions are `to`'s: an
     /// identity rotated, which moves the log's itself.
     pub(crate) fn rekey_waiting_reactions(&self, from: &Mailbox, to: &Mailbox) {
-        self.roster.lock().unwrap().live.rekey(from, to);
+        let now = self.clock.now();
+        self.roster.lock().unwrap().live.rekey(from, to, now);
     }
 
     /// An account deleted: no instant-message reaction waits for it or
@@ -1030,24 +1065,35 @@ impl Core {
             tracing::warn!("chat log would not clear reactions: {e}");
             ReactError::ServerError
         };
-        let was = log.reactions(&[line], None).map_err(failed)?;
-        match log.clear_reactions(room, line).map_err(failed)? {
-            None => return Err(ReactError::NoSuchTarget),
-            Some(0) => return Ok(()),
-            Some(_) => {}
+        // As a redaction is: the act and its evidence recorded first, and
+        // nothing taken unless they are. Reactions change only under this
+        // lock, so the evidence is the rows the clear then takes.
+        let _writing = self.reaction_writes.lock().unwrap();
+        let there = log.lines(room, &[line]).map_err(failed)?;
+        if !there
+            .iter()
+            .any(|l| l.id == line && !l.flags.contains(crate::history::LineFlags::DELETED))
+        {
+            return Err(ReactError::NoSuchTarget);
         }
+        let Some(was) = log.reactions(&[line], None).map_err(failed)?.remove(&line) else {
+            return Ok(());
+        };
         let mut act = Act::new(ActKind::ClearReactions, &acting, String::new());
         act.line = Some(line);
         act.room = (room != 0).then_some(room);
-        act.evidence = was.get(&line).map(|shown| {
-            let keys = shown.keys.iter().map(|(k, n)| match k {
-                ReactionKey::Emoji(e) => format!("{e} {n}"),
-            });
-            format!("#{line}: {}", keys.collect::<Vec<_>>().join(", "))
+        let keys = was.keys.iter().map(|(k, n)| match k {
+            ReactionKey::Emoji(e) => format!("{e} {n}"),
         });
-        if let Err(e) = store.record(&act) {
+        act.evidence = Some(format!("#{line}: {}", keys.collect::<Vec<_>>().join(", ")));
+        store.record(&act).map_err(|e| {
             tracing::warn!("moderation: a reactions clear would not record: {e}");
+            ReactError::ServerError
+        })?;
+        if log.clear_reactions(room, line).map_err(failed)?.is_none() {
+            return Err(ReactError::NoSuchTarget);
         }
+        drop(_writing);
         let now = self.clock.now();
         self.roster.lock().unwrap().live.owe(line, Owe::Clear, now);
         Ok(())
@@ -1215,7 +1261,6 @@ impl Core {
         approval: bool,
         change: ReactionChange,
     ) {
-        let keep = self.reactions.map_or(Duration::ZERO, |p| p.im_keep);
         let now = self.clock.now();
         let mut r = self.roster.lock().unwrap();
         let told: Vec<Uid> = (r.messengers(&Key::of(to)).into_iter())
@@ -1227,7 +1272,7 @@ impl Core {
                 change,
                 at: now,
             };
-            r.live.keep(Key::of(to), w, keep);
+            r.live.keep(Key::of(to), w, now);
             return;
         }
         for uid in told {
@@ -1292,7 +1337,7 @@ impl Core {
             }
         }
         if !back.is_empty() {
-            r.live.put_back(Key::of(me), back);
+            r.live.put_back(Key::of(me), back, now);
         }
     }
 
@@ -1300,19 +1345,14 @@ impl Core {
     /// A live line that lost one, held under both, is told as it now
     /// stands.
     pub(crate) fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) {
-        self.roster.lock().unwrap().live.rekey(from, to);
+        self.rekey_waiting_reactions(from, to);
+        let _writing = self.reaction_writes.lock().unwrap();
         match self
             .history
             .as_ref()
             .map(|log| log.rekey_reactions(from, to))
         {
-            Some(Ok(lost)) => {
-                let now = self.clock.now();
-                let mut r = self.roster.lock().unwrap();
-                for line in lost {
-                    r.live.owe(line, Owe::Summary, now);
-                }
-            }
+            Some(Ok(lost)) => self.reactions_changed_on(&lost),
             Some(Err(e)) => {
                 tracing::warn!("chat log would not move {}'s reactions: {e}", from.login)
             }
@@ -1551,6 +1591,77 @@ mod tests {
         assert_eq!(lines(&mut ra), [before, after]);
         assert_eq!(lines(&mut rh), [before, after], "it may read history");
         assert_eq!(lines(&mut late), [after]);
+    }
+
+    /// A rotation that folds a key the identity held under both tells the
+    /// line as it now stands.
+    #[test]
+    fn a_rotation_that_folds_a_key_tells_the_line() {
+        let (core, log) = server(ReactionPolicy::default());
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let line = said(&core, alice, "one");
+        for fp in [[4; 32], [5; 32]] {
+            let who = Mailbox::identified("erin", fp);
+            log.react(&ReactAct {
+                channel: 0,
+                line,
+                who: &who,
+                nick: "erin",
+                key: &thumbs(),
+                add: true,
+                at: SystemTime::now(),
+                max_keys: 20,
+                max_per_user: 5,
+            })
+            .unwrap();
+        }
+        drain(&mut ra);
+        core.rotate_identity(&[4; 32], &[5; 32]).unwrap();
+        let due = core.reactions_flush(core.clock.now()).expect("owed");
+        core.reactions_flush(due);
+        assert_eq!(
+            batches(&mut ra),
+            [vec![(line, Some((vec![(thumbs(), 1)], vec![])))]]
+        );
+    }
+
+    /// However they come, by a merge of two accounts' queues included,
+    /// what waits for one account is held to its bound, each reactor to
+    /// a fair share of it, and counted as it stands.
+    #[test]
+    fn a_merge_of_waiting_queues_keeps_their_bounds() {
+        let mut live = Live {
+            im_keep: Duration::from_secs(3600),
+            ..Live::default()
+        };
+        let now = Instant::now();
+        let waiting = |from: &str, n: u64| {
+            let guid =
+                crate::inbox::MessageGuid::parse(&format!("5f5e1000-1234-4abc-89ab-{n:012x}"))
+                    .unwrap();
+            Waiting {
+                from: Mailbox::login(from),
+                change: ReactionChange::Changed {
+                    target: Reply::im("bob".into(), guid).unwrap(),
+                    key: thumbs(),
+                    add: true,
+                    from: from.into(),
+                },
+                at: now,
+            }
+        };
+        let (bare, linked) = (Mailbox::login("bob"), Mailbox::identified("bob", [7; 32]));
+        let share = IM_WAITING as u64 * 4 / 5;
+        for n in 0..share {
+            live.keep(Key::of(&bare), waiting("alice", n), now);
+            live.keep(Key::of(&linked), waiting("carol", n), now);
+        }
+        live.rekey(&bare, &linked, now);
+        assert_eq!(live.waiting.len(), 1);
+        let queue = &live.waiting[&Key::of(&linked)];
+        assert_eq!((queue.len(), live.waiting_len), (IM_WAITING, IM_WAITING));
+        let alices = queue.iter().filter(|w| w.from.login == "alice").count();
+        assert_eq!(alices, IM_WAITING / 2);
     }
 
     /// Only a room's most recent lines are told as they change; an older

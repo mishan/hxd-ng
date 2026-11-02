@@ -126,7 +126,10 @@ clear: true }` (hotline-ng.md §7.3): the `moderate` permission, as for a
 redaction, and a line the moderator could have read. It is recorded as
 a `reactions_clear` act with the line, its room, and as evidence the
 keys and counts it took, and is told to the line's readers as cleared.
-A clear of a line with no reactions changes and records nothing.
+As a redaction's, the act is recorded first and nothing is taken unless
+it is; reactions change one at a time beside a clear, so its evidence
+is the rows it takes. A clear of a line with no reactions changes and
+records nothing.
 
 Evidence — the original text — lives in the audit row for
 `[moderation] evidence_days` (default 30) and is then scrubbed to an
