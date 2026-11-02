@@ -1265,3 +1265,25 @@ fn a_reaction_in_a_room_is_held_to_its_post_gate_and_its_archive() {
         );
     }
 }
+
+#[test]
+fn a_room_taken_out_of_the_file_takes_its_line_count_with_it() {
+    let store = Arc::new(MemoryRooms::new(RoomFile {
+        rooms: vec![Room {
+            id: 5,
+            name: "lounge".into(),
+            ..Room::default()
+        }],
+        ..RoomFile::default()
+    }));
+    let core = Core::new()
+        .with_rooms(store.clone(), RoomPolicy::default())
+        .unwrap();
+    let (alice, _rx) = attach(&core, member("alice"));
+    core.room_join(alice, 5).unwrap();
+    say(&core, alice, 5, "unkept").unwrap();
+    assert!(core.roster.lock().unwrap().line_counters.contains_key(&5));
+    store.0.lock().unwrap().rooms.clear();
+    core.reload_rooms().unwrap();
+    assert!(!core.roster.lock().unwrap().line_counters.contains_key(&5));
+}

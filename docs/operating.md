@@ -1264,6 +1264,20 @@ per_second = 1            # then this many a second
 read_only_rooms = "allow" # or "deny": may a reader who may not post in a room react
 ```
 
+### `[structured_chat]`
+
+Absent, or `enabled` left off, means capability bit 17 is never
+confirmed. Turned on, a classic client that asks for it is sent each
+chat line as a Chat History entry beside the formatted text: its id,
+time, sender and raw text. Clients that do not ask see no change. It
+needs nothing else: without `[history]`, lines carry ids counted in
+memory. See [chat-history.md](chat-history.md) §12.
+
+```toml
+[structured_chat]
+enabled = false           # off unless turned on
+```
+
 ### `[media]`
 
 Absent means no images: the legacy wire never confirms capability bit 3

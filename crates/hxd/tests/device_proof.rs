@@ -234,7 +234,7 @@ impl Port {
 
 fn login(account: &str) -> Login {
     Login {
-        caps: Some(CAP_DEVICE_PROOF as u16),
+        caps: Some(CAP_DEVICE_PROOF as u32),
         ..Login::account(account, account, "pw")
     }
 }
@@ -640,7 +640,7 @@ async fn a_client_that_never_asks_is_answered_as_before() {
         (
             "to a server with no classic host",
             &off,
-            Some(CAP_DEVICE_PROOF as u16),
+            Some(CAP_DEVICE_PROOF as u32),
         ),
     ] {
         let login = Login {

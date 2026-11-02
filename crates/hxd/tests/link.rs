@@ -468,6 +468,45 @@ async fn show_tags_puts_the_home_servers_tag_in_every_ghosts_name() {
     assert_eq!(hi["from"]["remote"]["tagged"], true);
 }
 
+#[tokio::test]
+async fn a_ghosts_structured_line_names_it_as_the_user_list_does() {
+    let (a, b, _dirs) = linked("show_tags = true\n[structured_chat]\nenabled = true").await;
+    let structured = Login {
+        caps: Some(1 << 17 | 1 << 4),
+        ..Login::guest("ann")
+    };
+    let mut ann = legacy::Client::login_at(a.legacy, &structured)
+        .await
+        .unwrap();
+    let long = "roberta-long-name-that-is-long";
+    let mut bob = legacy::Client::login_at(b.legacy, &Login::guest(long))
+        .await
+        .unwrap();
+    // Cut to the user list's 31 bytes, the tag kept.
+    let shown = "roberta-long-name-that-is-lo@bb";
+    let ghost = row(&mut ann, shown).await.uid;
+    row(&mut bob, "ann").await;
+    bob.chat(b"hi").await.unwrap();
+    let f = ann
+        .rx
+        .recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(ghost.into()))
+        .await
+        .unwrap();
+    let data = f.bytes(hxd_session::structured::DATA_CHAT_LINE).unwrap();
+    let e = hxproto::parse::parse_history_entry(&data).unwrap();
+    assert_eq!(
+        (e.nick, e.message, e.flags),
+        (shown.as_bytes(), &b"hi"[..], 0)
+    );
+    assert_ne!(e.message_id, 0, "kept here, under this server's id");
+    // And paged back under the same name.
+    let page = ann
+        .call(700, &[(tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec())])
+        .await
+        .unwrap();
+    assert_eq!(page.all(tag::HISTORY_ENTRY).last(), Some(&data));
+}
+
 /// The next public chat line `c` hears from `uid`.
 async fn heard(c: &mut legacy::Client, uid: u16) -> Vec<u8> {
     c.rx.recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(uid.into()))

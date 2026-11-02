@@ -150,6 +150,7 @@ mod tests {
             messaging: None,
             history: None,
             reactions: None,
+            structured_chat: None,
             media: None,
             news: None,
             files: None,

@@ -81,6 +81,11 @@ pub struct Config {
     /// §7.3). Absent, or `enabled` left off, = none. Lines take them only
     /// where `[history]` keeps lines.
     pub reactions: Option<ReactionsSection>,
+    /// The Structured Chat draft on the classic wire
+    /// (`docs/chat-history.md` §12): capability bit 17. Absent, or
+    /// `enabled` left off, = never confirmed. The ng wire's lines are
+    /// structured already.
+    pub structured_chat: Option<StructuredChatSection>,
     /// Inline media (`docs/inline-media.md` §11). Absent = disabled: no
     /// capability bit 3 on the legacy wire, no `media` cap on the ng
     /// one, and no `/media` routes.
@@ -1462,6 +1467,16 @@ fn default_max_sent_bytes_per_day() -> u64 {
     hxd_core::InboxPolicy::default().max_sent_bytes_per_day
 }
 
+/// `[structured_chat]`: the draft's `StructuredChat.Enabled`. Its window
+/// and byte cap bound what the drafts built on it remember of unkept
+/// lines, and nothing here remembers any.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StructuredChatSection {
+    /// Off unless turned on, as the draft has it.
+    pub enabled: bool,
+}
+
 /// `[reactions]`: the draft's `Reactions.*` settings, its defaults
 /// [`hxd_core::ReactionPolicy`]'s.
 #[derive(Debug, Deserialize)]
@@ -2704,6 +2719,9 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) ->
     }
     if files.is_some() {
         caps = caps.with(cap::LARGE_FILES);
+    }
+    if config.structured_chat.as_ref().is_some_and(|s| s.enabled) {
+        caps = caps.with(cap::STRUCTURED_CHAT);
     }
     caps
 }

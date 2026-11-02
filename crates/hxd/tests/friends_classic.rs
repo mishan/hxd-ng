@@ -189,7 +189,7 @@ async fn start_held(
 /// A classic client offering `caps`, and its login reply.
 async fn classic(s: &Server, who: &str, caps: u16) -> (legacy::Client, Frame) {
     let login = Login {
-        caps: Some(caps),
+        caps: Some(caps.into()),
         ..if who == "guest" {
             Login::guest(who)
         } else {

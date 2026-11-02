@@ -130,6 +130,10 @@ pub mod cap {
     /// **Depends on [`MESSAGING`]**, and only for a client that offered
     /// [`IDENTITY`] with it.
     pub const FRIENDSHIPS: u8 = 15;
+    /// Structured Chat, a draft of this server's and unallocated
+    /// (`docs/chat-history.md` §12): each 106 that relays a line carries
+    /// it as a history entry too.
+    pub const STRUCTURED_CHAT: u8 = 17;
 }
 
 #[cfg(test)]

@@ -549,8 +549,8 @@ server without rooms they are unknown commands, answered with the help.
    read-only`) when the session may not post, as a classic session may
    not in a signed room (§5.2), each followed by `, for
    encrypted connections only` in a secure room. It and every other line
-   of §6 come from the system account's uid, or the session's own on a
-   server without one. A period
+   of §6 come from the system account's uid, or 0 on a server without
+   one, as mhxd sends a line no user said. A period
    client shows the room in a *private chat* window. The window's look
    promises privacy that the room does not have, so the line is
    load-bearing. It goes out on every join.

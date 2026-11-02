@@ -268,6 +268,10 @@ pub struct Transport {
     /// It declared the ng wire's `reactions`, so a line's reactions are
     /// worth sending it (`docs/hotline-ng.md` §7.3). Kept, as `replies`.
     pub reactions: bool,
+    /// It is sent its own public lines even where it may not read the
+    /// lobby: classic capability bit 17, Structured Chat, whose echo is
+    /// how a sender learns its line's id.
+    pub echoes_own_lines: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -396,6 +400,9 @@ pub enum Event {
         /// The durable public-log row. Private chats and servers with no
         /// history configured carry `None`.
         id: Option<crate::history::LineId>,
+        /// The line's number in its chat's own count when it has no `id`
+        /// (`chat::LineCounter`), the same for everyone it reaches.
+        ephemeral: Option<u64>,
         /// Server receive time. Unlike `id`, every chat event has one so
         /// the ng wire can render live timestamps without enabling history.
         at: SystemTime,
@@ -430,6 +437,11 @@ pub enum Event {
         /// classic wire says it byte for byte. The ng wire does not
         /// tell the two apart.
         action: bool,
+        /// Its number in the chat's count, as an unkept line's; `None`
+        /// for a notice to one session, which nobody else could name.
+        ephemeral: Option<u64>,
+        /// When the server wrote it, the same for everyone it reaches.
+        at: SystemTime,
     },
     /// A chat (or, for cid 0, server) subject change.
     ChatSubject {
@@ -1290,6 +1302,9 @@ pub(crate) struct RosterInner {
     pub(crate) taken_ids: HashSet<u32>,
     /// The newest line in each channel, 0 the lobby's.
     pub(crate) last_ids: HashMap<u32, crate::history::LineId>,
+    /// Each chat's count of the lines it does not keep, 0 the lobby's,
+    /// from its first such line.
+    pub(crate) line_counters: HashMap<u32, crate::chat::LineCounter>,
     pub(crate) voice: crate::voice::VoiceState,
     /// Who takes part in instant messaging, and what their friends were
     /// last told of them (`crate::messaging`).
@@ -3242,6 +3257,7 @@ mod tests {
             text: line.clone(),
             style: 0,
             id: None,
+            ephemeral: None,
             at: SystemTime::now(),
             media: None,
             guid: None,
