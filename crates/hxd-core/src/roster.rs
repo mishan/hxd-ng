@@ -1617,6 +1617,9 @@ pub struct Core {
     pub(crate) folder_rates: crate::limits::PostRates,
     /// And of its reactions (`crate::reaction`).
     pub(crate) react_rates: crate::limits::PostRates,
+    /// Where every change to reaction state is made, in order
+    /// (`crate::reaction::desk`).
+    pub(crate) desk: crate::reaction::Desk,
     /// `[reactions]`, or `None`, which takes none.
     pub(crate) reactions: Option<crate::reaction::ReactionPolicy>,
     /// What each account and each address have left of the device proofs

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::access::bit;
 use crate::history::LineId;
 use crate::inbox::{Mailbox, StoreError};
-use crate::roster::{reads_public_chat, Uid};
+use crate::roster::{reads_public_chat, RosterInner, Uid, UserSession};
 use crate::Core;
 
 /// The most bytes one key's text may take: the longest emoji sequences
@@ -24,6 +24,9 @@ pub const MAX_KEY_BYTES: usize = 64;
 /// says: a reader's own keys are indexes into a line's, one byte each on
 /// the classic wire.
 pub const MAX_KEYS_CEILING: usize = 255;
+
+/// Lines one op tombstones at most.
+const GONE_CHUNK: usize = 256;
 
 /// What may be reacted with. Packed as the stores keep it, a kind byte
 /// and the kind's bytes, so that a server's own emoji (kind 2, by id)
@@ -361,6 +364,26 @@ impl Default for ReactionPolicy {
     }
 }
 
+/// What the desk ([`desk`]) keeps beside the log for its ops: nothing
+/// yet, reactions living in the log alone.
+#[derive(Default)]
+pub(crate) struct Live {}
+
+/// Could `sess` have read line `line` of `room`: one it can read, already
+/// relayed, and either heard live or readable in history.
+fn could_have_read(r: &RosterInner, sess: &UserSession, room: u32, line: LineId) -> bool {
+    let readable = match room {
+        0 => reads_public_chat(sess),
+        _ => r
+            .rooms
+            .get(&room)
+            .is_some_and(|e| crate::rooms::sees(sess, &e.room)),
+    };
+    let relayed = r.last_ids.get(&room).is_some_and(|&last| line <= last);
+    let heard = sess.heard_from.get(&room).is_some_and(|&from| line > from);
+    readable && relayed && (heard || sess.access.has(bit::CHAT_HISTORY))
+}
+
 /// A line's reactions as a reader is shown them: its keys with their
 /// counts in the order they were first added, the part every reader
 /// shares, and the indexes into `keys` this reader's account holds.
@@ -457,7 +480,6 @@ impl Core {
         add: bool,
     ) -> Result<u32, ReactError> {
         let policy = self.reaction_policy().ok_or(ReactError::NotAvailable)?;
-        let log = self.history.as_ref().ok_or(ReactError::NotAvailable)?;
         let (who, nick, target) = {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&uid).ok_or(ReactError::NotAllowed)?;
@@ -469,14 +491,7 @@ impl Core {
                 return Err(ReactError::NotAllowed);
             }
             let entry = r.rooms.get(&room);
-            let readable = match room {
-                0 => reads_public_chat(sess),
-                _ => entry.is_some_and(|e| crate::rooms::sees(sess, &e.room)),
-            };
-            let relayed = r.last_ids.get(&room).is_some_and(|&last| line <= last);
-            let heard = sess.heard_from.get(&room).is_some_and(|&from| line > from);
-            let target = if !readable || !relayed || !(heard || sess.access.has(bit::CHAT_HISTORY))
-            {
+            let target = if !could_have_read(&r, sess, room, line) {
                 Err(ReactError::NoSuchTarget)
             } else if entry.is_some_and(|e| {
                 // An archive is read by its managers and moderators alone,
@@ -488,33 +503,22 @@ impl Core {
             } else {
                 Ok(())
             };
-            let who = Mailbox {
-                login: sess.login.clone(),
-                fingerprint: sess.identity,
-            };
-            (who, sess.info.nick.clone(), target)
+            (sess.mailbox(), sess.info.nick.clone(), target)
         };
-        if let Some(rate) = self.post_key(uid) {
-            let per = Duration::from_secs_f64(
-                f64::from(policy.burst) / f64::from(policy.per_second.max(1)),
-            );
-            self.react_rates
-                .reserve(rate, (policy.burst, per), Instant::now())
-                .map_err(ReactError::RateLimited)?;
-        }
+        self.react_rate(uid, policy)?;
         target?;
-        let act = ReactAct {
+        let act = desk::Act {
             channel: room,
             line,
-            who: &who,
-            nick: &nick,
-            key,
+            who,
+            nick,
+            key: key.clone(),
             add,
             at: self.clock.wall(),
             max_keys: policy.max_keys,
             max_per_user: policy.max_per_user,
         };
-        match log.react(&act) {
+        match self.desk_react(act) {
             Ok(Reacted::Count(n)) => Ok(n),
             Ok(Reacted::NoSuchLine) => Err(ReactError::NoSuchTarget),
             Ok(Reacted::TooManyKeys | Reacted::TooManyOfYours) => Err(ReactError::TooManyReactions),
@@ -523,6 +527,19 @@ impl Core {
                 Err(ReactError::ServerError)
             }
         }
+    }
+
+    /// Spend one of `uid`'s account's reactions.
+    pub(crate) fn react_rate(&self, uid: Uid, policy: ReactionPolicy) -> Result<(), ReactError> {
+        if let Some(rate) = self.post_key(uid) {
+            let per = Duration::from_secs_f64(
+                f64::from(policy.burst) / f64::from(policy.per_second.max(1)),
+            );
+            self.react_rates
+                .reserve(rate, (policy.burst, per), Instant::now())
+                .map_err(ReactError::RateLimited)?;
+        }
+        Ok(())
     }
 
     /// The reactions on `ids`, as `uid` is shown them, for a page of
@@ -538,10 +555,10 @@ impl Core {
         };
         let reader = {
             let r = self.roster.lock().unwrap();
-            r.users.get(&uid).filter(|s| s.is_person).map(|s| Mailbox {
-                login: s.login.clone(),
-                fingerprint: s.identity,
-            })
+            r.users
+                .get(&uid)
+                .filter(|s| s.is_person)
+                .map(|s| s.mailbox())
         };
         log.reactions(ids, reader.as_ref())
     }
@@ -550,31 +567,108 @@ impl Core {
     /// account's deletion's, so a later holder of the login inherits
     /// none.
     pub(crate) fn forget_reactions(&self, who: &Mailbox, within: Duration) {
-        let Some(log) = self.history.as_ref() else {
+        if self.history.is_none() {
             return;
-        };
-        let since = self
-            .clock
-            .wall()
+        }
+        let since = (self.clock.wall())
             .checked_sub(within)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Err(e) = log.forget_reactions(who, since) {
-            tracing::warn!("chat log would not forget {}'s reactions: {e}", who.login);
+        let who = who.clone();
+        self.desk(move |c, _| {
+            let log = c.history.as_ref().expect("asked above");
+            if let Err(e) = log.forget_reactions(&who, since) {
+                tracing::warn!("chat log would not forget {}'s reactions: {e}", who.login)
+            }
+        });
+    }
+
+    /// Tombstone `ids` with their reactions: the desk's half of a
+    /// redaction or a purge, which waits on it under the room's serial
+    /// before it tells anyone of the redaction. Answers the lines
+    /// tombstoned.
+    pub(crate) fn lines_gone(
+        &self,
+        ids: Vec<LineId>,
+        by: String,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let mut gone = Vec::with_capacity(ids.len());
+        // An op a chunk, so a purge of a flood keeps the desk, which
+        // other rooms' serials may be waiting on, for a moment at a time.
+        for chunk in ids.chunks(GONE_CHUNK) {
+            let chunk = chunk.to_vec();
+            let by = by.clone();
+            let done = self.desk_caught(move |c, _| c.chunk_gone(chunk, &by, at));
+            gone.extend(
+                done.unwrap_or_else(|| Err(StoreError::new("a reaction desk op panicked")))?,
+            );
         }
+        Ok(gone)
+    }
+
+    fn chunk_gone(
+        &self,
+        ids: Vec<LineId>,
+        by: &str,
+        at: SystemTime,
+    ) -> Result<Vec<LineId>, StoreError> {
+        let log = (self.history.as_ref()).ok_or_else(|| StoreError::new("no chat log"))?;
+        log.tombstone_all(&ids, by, at)
+    }
+
+    /// Retire the log's lines past `keep`, and their reactions with them:
+    /// at the desk, so no reaction is applied to a line between the
+    /// two. One statement for the store, an hour's worth at most.
+    pub(crate) fn prune_log(
+        &self,
+        keep: crate::history::Retention,
+        now: SystemTime,
+    ) -> Result<usize, StoreError> {
+        let done = self.desk_caught(move |c, _| match c.history.as_ref() {
+            Some(log) => log.prune(&keep, now),
+            None => Ok(0),
+        });
+        done.unwrap_or_else(|| Err(StoreError::new("a reaction desk op panicked")))
+    }
+
+    /// Delete a deleted room's lines, and their reactions with them, at
+    /// the desk; its caller holds the room's serial.
+    pub(crate) fn delete_channel_lines(&self, room: u32) -> Result<usize, StoreError> {
+        let done = self.desk_caught(move |c, _| match c.history.as_ref() {
+            Some(log) => log.delete_channel(room),
+            None => Ok(0),
+        });
+        done.unwrap_or_else(|| Err(StoreError::new("a reaction desk op panicked")))
     }
 
     /// `from`'s reactions are `to`'s now: an account linked an identity.
     pub(crate) fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) {
-        if let Some(Err(e)) = self
-            .history
-            .as_ref()
-            .map(|log| log.rekey_reactions(from, to))
-        {
+        if let Err(e) = self.rekey_all_reactions(from, to) {
             tracing::warn!("chat log would not move {}'s reactions: {e}", from.login);
         }
     }
+
+    /// The same, answering a store's error for a caller that retries.
+    pub(crate) fn rekey_all_reactions(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+    ) -> Result<(), StoreError> {
+        let (from, to) = (from.clone(), to.clone());
+        self.desk(move |c, _| {
+            if let Some(log) = c.history.as_ref() {
+                log.rekey_reactions(&from, &to)?;
+            }
+            Ok(())
+        })
+    }
 }
 
+mod desk;
+pub(crate) use desk::Desk;
+
+#[cfg(test)]
+mod edges;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,9 +676,9 @@ mod tests {
 
     use crate::history::{ChatLog, HistoryPolicy, MemoryLog};
     use crate::roster::AttachInfo;
-    use crate::{AccessBits, Transport};
+    use crate::{AccessBits, Events, Transport};
 
-    fn server(policy: ReactionPolicy) -> (Arc<Core>, Arc<MemoryLog>) {
+    pub(super) fn server(policy: ReactionPolicy) -> (Arc<Core>, Arc<MemoryLog>) {
         let log = Arc::new(MemoryLog::default());
         let core = Core::new()
             .with_history(log.clone(), HistoryPolicy::default())
@@ -592,7 +686,7 @@ mod tests {
         (Arc::new(core), log)
     }
 
-    fn bits(of: &[u8]) -> AccessBits {
+    pub(super) fn bits(of: &[u8]) -> AccessBits {
         of.iter().fold(AccessBits::empty(), |a, b| a.with(*b))
     }
 
@@ -626,8 +720,63 @@ mod tests {
         uid
     }
 
-    fn thumbs() -> ReactionKey {
+    pub(super) fn thumbs() -> ReactionKey {
         ReactionKey::emoji("👍").unwrap()
+    }
+
+    pub(super) fn party() -> ReactionKey {
+        ReactionKey::emoji("🎉").unwrap()
+    }
+
+    /// A person's session that reads and may chat, hearing reactions as
+    /// `transport` says, a moderator with `moderate`.
+    pub(super) fn hearing(
+        core: &Core,
+        login: &str,
+        transport: Transport,
+        moderate: bool,
+    ) -> (Uid, Events) {
+        use bit::{READ_CHAT, SEND_CHAT};
+        let (uid, rx) = core
+            .attach(AttachInfo {
+                account: None,
+                nick: login.to_string(),
+                icon: 1,
+                admin: false,
+                access: bits(&[READ_CHAT, SEND_CHAT]),
+                login: login.to_string(),
+                addr: None,
+                can_detach: false,
+                transport,
+                has_inbox: false,
+                attach_news: false,
+                set_avatar: false,
+                moderate,
+                can_spam: false,
+                manage_rooms: false,
+                set_subject: false,
+                is_person: true,
+                reads_on_delivery: false,
+                identity: None,
+                system: false,
+            })
+            .unwrap();
+        core.announce(uid);
+        (uid, rx)
+    }
+
+    pub(super) fn ng() -> Transport {
+        Transport {
+            reactions: true,
+            redactions: true,
+            ..Transport::default()
+        }
+    }
+
+    pub(super) fn said(core: &Core, uid: Uid, text: &str) -> LineId {
+        core.chat_public(uid, text.into(), 0, None)
+            .unwrap()
+            .unwrap()
     }
 
     /// Only a line already relayed, readable, and heard live or read in
