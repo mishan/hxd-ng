@@ -3900,3 +3900,87 @@ fn waiting_im_reactions_follow_a_link() {
     let (_, got) = identified_reading(&s.core, "bob", [1; 32]);
     assert_eq!(heard(got), [guid(1)], "the link");
 }
+
+/// Alice and bob friends, bob's one session a messenger that does not
+/// hear reactions yet, and alice's thumbs-up on bob's message 1 waiting
+/// for him; bob's session and its events.
+fn waiting_for_bob() -> (Server, Uid, Uid, Events) {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", false);
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&b)
+        .unwrap()
+        .info
+        .transport
+        .reactions = true;
+    drain(&mut rb);
+    (s, a, b, rb)
+}
+
+/// A drain whose relationship could not be read keeps what it took for
+/// the next, and hands it over once it can.
+#[test]
+fn a_drain_that_cannot_read_a_relationship_keeps_what_it_took() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    s.core.im_reactions_drain(b, &bob, |_| Err(()));
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+    s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert_eq!(im_reactions(&drain(&mut rb)).concat().len(), 1);
+}
+
+/// A change told live stands in place of what waited of the same key,
+/// whether it waited still or a drain had taken it: an older add is
+/// never handed over after the remove that followed it.
+#[test]
+fn a_live_change_stands_in_place_of_what_waited() {
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let bob = Mailbox::login("bob");
+    for in_flight in [false, true] {
+        let (s, a, b, mut rb) = waiting_for_bob();
+        let remove = || {
+            s.core
+                .react_im(a, &im_on("bob", 1), "bob", &thumbs, false)
+                .unwrap()
+        };
+        if in_flight {
+            s.core.im_reactions_drain(b, &bob, |_| {
+                remove();
+                Ok(Some(false))
+            });
+        } else {
+            remove();
+            s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+        }
+        let told: Vec<bool> = (im_reactions(&drain(&mut rb)).concat().into_iter())
+            .map(|(_, _, add, _)| add)
+            .collect();
+        assert_eq!(told, [false], "in flight: {in_flight}");
+    }
+}
+
+/// An account deleted while a drain of its own checks relationships is
+/// kept nothing of what the drain took.
+#[test]
+fn a_purge_during_a_drain_keeps_nothing_for_the_account() {
+    let (s, _, b, mut rb) = waiting_for_bob();
+    let bob = Mailbox::login("bob");
+    // Under an approval to a session that does not understand requests,
+    // what was taken would be kept again.
+    s.core.im_reactions_drain(b, &bob, |_| {
+        s.core.inbox_purge(&bob);
+        Ok(Some(true))
+    });
+    s.core.im_reactions_drain(b, &bob, |_| Ok(Some(false)));
+    assert!(im_reactions(&drain(&mut rb)).is_empty());
+}

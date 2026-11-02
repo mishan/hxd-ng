@@ -12,6 +12,8 @@ pub(crate) struct FaultyLog {
     pub(crate) inner: MemoryLog,
     failing: Mutex<HashSet<&'static str>>,
     parked: Mutex<Option<(&'static str, Arc<Barrier>)>>,
+    /// How many reactions each `react_all` carried, in order.
+    pub(crate) runs: Mutex<Vec<usize>>,
 }
 
 impl FaultyLog {
@@ -190,6 +192,16 @@ impl ChatLog for FaultyLog {
 
     fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
         self.fails("clear_reactions")?;
-        self.inner.clear_reactions(channel, line)
+        let out = self.inner.clear_reactions(channel, line);
+        self.park("clear_reactions");
+        out
+    }
+
+    fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
+        self.fails("react_all")?;
+        self.runs.lock().unwrap().push(acts.len());
+        let out = self.inner.react_all(acts);
+        self.park("react_all");
+        out
     }
 }

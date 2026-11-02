@@ -318,6 +318,11 @@ pub trait ChatLog: Send + Sync + 'static {
     /// retired line and a room's deletion take a line's reactions with
     /// it.
     fn react(&self, act: &ReactAct) -> Result<Reacted, StoreError>;
+    /// [`ChatLog::react`] for each of `acts` in order, in one transaction
+    /// where the store has them: all applied, or on an error none.
+    fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
+        acts.iter().map(|a| self.react(a)).collect()
+    }
     /// The reactions on those of `ids` that have any, `mine` as
     /// `reader`'s account holds them.
     fn reactions(

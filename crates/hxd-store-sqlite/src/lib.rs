@@ -2873,6 +2873,70 @@ impl SqliteStore {
     }
 }
 
+/// One reaction inside `tx`, which the caller commits.
+fn react_in(tx: &rusqlite::Transaction, act: &ReactAct) -> Result<Reacted, StoreError> {
+    let (line, key, reactor) = (clamp_id(act.line), act.key.pack(), reactor_key(act.who));
+    let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64, StoreError> {
+        tx.query_row(sql, p, |r| r.get(0)).map_err(StoreError::new)
+    };
+    let live = one(
+        "SELECT COUNT(*) FROM chat_line WHERE id = ?1 AND channel = ?2 AND flags & ?3 = 0",
+        params![
+            line,
+            i64::from(act.channel),
+            i64::from(LineFlags::DELETED.bits())
+        ],
+    )?;
+    if live == 0 {
+        return Ok(Reacted::NoSuchLine);
+    }
+    let held = one(
+        "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
+        params![line, key, reactor],
+    )? > 0;
+    if act.add && !held {
+        let keyed = one(
+            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
+            params![line, key],
+        )? > 0;
+        let keys = one(
+            "SELECT COUNT(DISTINCT key) FROM chat_reaction WHERE line = ?1",
+            params![line],
+        )?;
+        if !keyed && keys as usize >= act.max_keys {
+            return Ok(Reacted::TooManyKeys);
+        }
+        let yours = one(
+            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND reactor = ?2",
+            params![line, reactor],
+        )?;
+        if yours as usize >= act.max_per_user {
+            return Ok(Reacted::TooManyOfYours);
+        }
+        tx.execute(
+            "INSERT INTO chat_reaction (line, key, reactor, nick, at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![line, key, reactor, act.nick, unix(act.at)],
+        )
+        .map_err(StoreError::new)?;
+    } else if !act.add && held {
+        tx.execute(
+            "DELETE FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
+            params![line, key, reactor],
+        )
+        .map_err(StoreError::new)?;
+    }
+    let count = one(
+        "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
+        params![line, key],
+    )?;
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    Ok(match act.add == held {
+        true => Reacted::Held(count),
+        false => Reacted::Count(count),
+    })
+}
+
 impl ChatLog for SqliteStore {
     /// One transaction: one commit, and one write of each page the lines
     /// touch, where a commit each wrote the table's and its indexes' last
@@ -3223,67 +3287,23 @@ impl ChatLog for SqliteStore {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::new)?;
-        let (line, key, reactor) = (clamp_id(act.line), act.key.pack(), reactor_key(act.who));
-        let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64, StoreError> {
-            tx.query_row(sql, p, |r| r.get(0)).map_err(StoreError::new)
-        };
-        let live = one(
-            "SELECT COUNT(*) FROM chat_line WHERE id = ?1 AND channel = ?2 AND flags & ?3 = 0",
-            params![
-                line,
-                i64::from(act.channel),
-                i64::from(LineFlags::DELETED.bits())
-            ],
-        )?;
-        if live == 0 {
-            return Ok(Reacted::NoSuchLine);
-        }
-        let held = one(
-            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
-            params![line, key, reactor],
-        )? > 0;
-        if act.add && !held {
-            let keyed = one(
-                "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
-                params![line, key],
-            )? > 0;
-            let keys = one(
-                "SELECT COUNT(DISTINCT key) FROM chat_reaction WHERE line = ?1",
-                params![line],
-            )?;
-            if !keyed && keys as usize >= act.max_keys {
-                return Ok(Reacted::TooManyKeys);
-            }
-            let yours = one(
-                "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND reactor = ?2",
-                params![line, reactor],
-            )?;
-            if yours as usize >= act.max_per_user {
-                return Ok(Reacted::TooManyOfYours);
-            }
-            tx.execute(
-                "INSERT INTO chat_reaction (line, key, reactor, nick, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![line, key, reactor, act.nick, unix(act.at)],
-            )
-            .map_err(StoreError::new)?;
-        } else if !act.add && held {
-            tx.execute(
-                "DELETE FROM chat_reaction WHERE line = ?1 AND key = ?2 AND reactor = ?3",
-                params![line, key, reactor],
-            )
-            .map_err(StoreError::new)?;
-        }
-        let count = one(
-            "SELECT COUNT(*) FROM chat_reaction WHERE line = ?1 AND key = ?2",
-            params![line, key],
-        )?;
+        let reacted = react_in(&tx, act)?;
         tx.commit().map_err(StoreError::new)?;
-        let count = u32::try_from(count).unwrap_or(u32::MAX);
-        Ok(match act.add == held {
-            true => Reacted::Held(count),
-            false => Reacted::Count(count),
-        })
+        Ok(reacted)
+    }
+
+    /// One transaction for them all: the desk's run of reactions
+    /// committed together.
+    fn react_all(&self, acts: &[ReactAct]) -> Result<Vec<Reacted>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let reacted = (acts.iter())
+            .map(|act| react_in(&tx, act))
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(reacted)
     }
 
     /// Two queries for a page, whatever its length: every line's keys

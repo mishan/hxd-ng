@@ -532,12 +532,15 @@ impl RosterInner {
     /// account changed, a room archived or gone (§5). Each parted session
     /// is told once, and the members who stay hear one part for each, so
     /// a room emptied at once costs each of its members one event.
-    pub(crate) fn room_reconcile(&mut self) {
+    /// Answers the rooms archived or deleted, which keep no live lines
+    /// (`crate::reaction`).
+    pub(crate) fn room_reconcile(&mut self) -> Vec<u32> {
         let rooms: Vec<u32> = self.rooms.keys().copied().collect();
+        let mut closed = Vec::new();
         for room in rooms {
             let entry = &self.rooms[&room];
             if entry.room.archived_at.is_some() || entry.room.deleted {
-                self.live.forget_room(room);
+                closed.push(room);
             }
             let entry = &self.rooms[&room];
             let (stay, lost): (Vec<Uid>, Vec<Uid>) = entry
@@ -569,6 +572,7 @@ impl RosterInner {
                 }
             }
         }
+        closed
     }
 
     /// Whether `sess`, as `uid`, may send in `room` now: in it, and let
@@ -937,7 +941,8 @@ impl Core {
             entry.room.deleted = true;
             r.rooms.insert(id, entry);
         }
-        r.room_reconcile();
+        let closed = r.room_reconcile();
+        self.reactions_closed(closed);
         r.rooms
             .retain(|id, _| file.rooms.iter().any(|room| room.id == *id));
         r.room_announce(before, Some(&changed), None);
@@ -1227,7 +1232,8 @@ impl Core {
             room.topic = entry.room.topic.clone();
         }
         entry.room = room.clone();
-        r.room_reconcile();
+        let closed = r.room_reconcile();
+        self.reactions_closed(closed);
         if topic_set {
             let subject = Event::ChatSubject {
                 cid: room.id,

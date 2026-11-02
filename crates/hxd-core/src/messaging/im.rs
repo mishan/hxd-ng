@@ -543,7 +543,7 @@ impl Core {
                 );
             }
         }
-        self.im_reactions_drain(uid, me, |from| self.im_relation(me, from).ok().flatten());
+        self.im_reactions_drain(uid, me, |from| self.im_relation(me, from).map_err(|_| ()));
         let now = self.clock.wall();
         let ids = |v: &[StoredMessage]| v.iter().map(|m| m.id).collect::<Vec<_>>();
         if let Err(e) = store.mark_handed(&ids(&ims), now) {

@@ -1336,7 +1336,9 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
-                r.live.relayed(room, id);
+                if self.reactions.is_some() {
+                    self.desk_post(move |_, live| live.relayed(room, id));
+                }
             }
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry

@@ -1300,9 +1300,6 @@ pub(crate) struct RosterInner {
     pub(crate) taken_ids: HashSet<u32>,
     /// The newest line in each channel, 0 the lobby's.
     pub(crate) last_ids: HashMap<u32, crate::history::LineId>,
-    /// Which lines' reactions are announced, and what waits to be
-    /// (`crate::reaction`).
-    pub(crate) live: crate::reaction::Live,
     pub(crate) voice: crate::voice::VoiceState,
     /// Who takes part in instant messaging, and what their friends were
     /// last told of them (`crate::messaging`).
@@ -1615,11 +1612,9 @@ pub struct Core {
     pub(crate) folder_rates: crate::limits::PostRates,
     /// And of its reactions (`crate::reaction`).
     pub(crate) react_rates: crate::limits::PostRates,
-    /// Held around every change to the log's reactions, so a moderator's
-    /// clear records exactly the rows it then takes. Taken before the
-    /// roster's lock, which a rekey takes under it, and never under the
-    /// roster's or a room's serial.
-    pub(crate) reaction_writes: Mutex<()>,
+    /// Where every change to reaction state is made, in order
+    /// (`crate::reaction::desk`).
+    pub(crate) desk: crate::reaction::Desk,
     /// `[reactions]`, or `None`, which takes none.
     pub(crate) reactions: Option<crate::reaction::ReactionPolicy>,
     /// What each account and each address have left of the device proofs

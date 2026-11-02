@@ -116,7 +116,8 @@ fn the_oldest_waiting_anywhere_goes_past_the_server_wide_bound() {
 }
 
 /// A reaction applied as its line is redacted is never told after the
-/// redaction as anything but cleared.
+/// redaction as anything but cleared: the redaction waits at the desk
+/// behind it, and its clear stands.
 #[test]
 fn a_reaction_racing_a_redaction_is_told_after_it_as_cleared() {
     let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
@@ -125,31 +126,218 @@ fn a_reaction_racing_a_redaction_is_told_after_it_as_cleared() {
     let line = said(&core, alice, "regrettable");
     drain(&mut ra);
     let at = Arc::new(Barrier::new(2));
-    log.park_after("react", at.clone());
+    log.park_after("react_all", at.clone());
     let reacting = {
         let core = core.clone();
         thread::spawn(move || core.react(alice, 0, line, &thumbs(), true))
     };
     at.wait();
-    core.redact_line(crate::Actor::Session(carol), line, "no")
-        .unwrap();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    thread::sleep(Duration::from_millis(100));
     at.wait();
     reacting.join().unwrap().unwrap();
+    redacting.join().unwrap().unwrap();
     flush(&core);
-    let told = drain(&mut ra);
+    assert_nothing_but_clears_after_the_redaction(&drain(&mut ra), line);
+}
+
+/// After `line`'s redaction, `told` holds no summary of it.
+fn assert_nothing_but_clears_after_the_redaction(told: &[Event], line: LineId) {
     let redacted = (told.iter())
         .position(|e| matches!(e, Event::ChatRedacted { id } if *id == line))
         .expect("the redaction is told");
     for e in &told[redacted..] {
         if let Event::ReactionsChanged(changes) = e {
-            assert!(
-                changes
-                    .iter()
-                    .all(|c| matches!(c, ReactionChange::Clear { .. })),
-                "{changes:?}"
-            );
+            for c in changes {
+                if let ReactionChange::Summary {
+                    target: Reply::Line { id, .. },
+                    ..
+                } = c
+                {
+                    assert_ne!(*id, line, "a summary after the redaction: {told:?}");
+                }
+            }
         }
     }
+}
+
+/// A batch read while its line is redacted goes before the redaction,
+/// under the room's serial, and the redaction's clear after it.
+#[test]
+fn a_batch_taken_as_its_line_is_redacted_goes_before_the_redaction() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "regrettable");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    drain(&mut ra);
+    core.clock.advance(Duration::from_secs(5));
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let flushing = {
+        let core = core.clone();
+        thread::spawn(move || core.reactions_flush(core.clock.now()))
+    };
+    at.wait();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    thread::sleep(Duration::from_millis(100));
+    at.wait();
+    flushing.join().unwrap();
+    redacting.join().unwrap().unwrap();
+    flush(&core);
+    let told = drain(&mut ra);
+    assert_nothing_but_clears_after_the_redaction(&told, line);
+    assert!(told.iter().any(|e| matches!(e, Event::ReactionsChanged(_))));
+}
+
+/// A redaction that comes as a clear works waits for it: the clear takes
+/// what it recorded and says so, and the line is a tombstone after.
+#[test]
+fn a_redaction_during_a_clear_waits_for_it() {
+    let moderation = Arc::new(MemoryModeration::default());
+    let (core, log) = on_faulty(moderation.clone());
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "vote");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line))
+    };
+    at.wait();
+    let redacting = {
+        let core = core.clone();
+        thread::spawn(move || core.redact_line(crate::Actor::Session(carol), line, "no"))
+    };
+    thread::sleep(Duration::from_millis(100));
+    at.wait();
+    assert_eq!(clearing.join().unwrap(), Ok(()));
+    redacting.join().unwrap().unwrap();
+}
+
+/// A reaction made as a clear finishes is told as it stands after both,
+/// never as the line emptied.
+#[test]
+fn a_reaction_just_after_a_clear_is_told_as_it_stands() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+    let (carol, _) = hearing(&core, "carol", ng(), true);
+    let line = said(&core, alice, "vote");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    flush(&core);
+    drain(&mut ra);
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("clear_reactions", at.clone());
+    let clearing = {
+        let core = core.clone();
+        thread::spawn(move || core.react_clear(carol, 0, line))
+    };
+    at.wait();
+    let reacting = {
+        let core = core.clone();
+        thread::spawn(move || core.react(alice, 0, line, &party(), true))
+    };
+    thread::sleep(Duration::from_millis(100));
+    at.wait();
+    clearing.join().unwrap().unwrap();
+    reacting.join().unwrap().unwrap();
+    flush(&core);
+    assert_eq!(
+        batches(&mut ra),
+        [vec![(line, Some((vec![(party(), 1)], vec![0])))]]
+    );
+}
+
+/// A reaction made while a batch is slow to read is due a whole batch
+/// after that batch is sent, not after the reaction was made.
+#[test]
+fn a_slow_batch_is_not_followed_by_another_at_once() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, _rx) = hearing(&core, "alice", ng(), false);
+    let line = said(&core, alice, "one");
+    core.react(alice, 0, line, &thumbs(), true).unwrap();
+    core.clock.advance(Duration::from_secs(5));
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("reactions", at.clone());
+    let flushing = {
+        let core = core.clone();
+        thread::spawn(move || core.reactions_flush(core.clock.now()))
+    };
+    at.wait();
+    let reacting = {
+        let core = core.clone();
+        thread::spawn(move || core.react(alice, 0, line, &party(), true))
+    };
+    thread::sleep(Duration::from_millis(100));
+    // The read took long, as a busy store's does.
+    core.clock.advance(Duration::from_secs(3));
+    at.wait();
+    flushing.join().unwrap();
+    reacting.join().unwrap().unwrap();
+    let sent = core.clock.now();
+    let next = core.reactions_flush(sent).expect("the reaction is owed");
+    assert!(
+        next + Duration::from_millis(50) >= sent + Duration::from_secs(1),
+        "due {:?} before a whole batch after the last",
+        sent.duration_since(next)
+    );
+}
+
+/// The lines a room owes stay within its live window between batches:
+/// one the window moved past owes nothing.
+#[test]
+fn the_owed_lines_stay_within_the_window() {
+    let (core, _log) = server(ReactionPolicy {
+        live_window: 2,
+        ..ReactionPolicy::default()
+    });
+    let (alice, _rx) = hearing(&core, "alice", ng(), false);
+    let lines = [said(&core, alice, "a"), said(&core, alice, "b")];
+    for line in lines {
+        core.react(alice, 0, line, &thumbs(), true).unwrap();
+    }
+    for t in ["c", "d", "e"] {
+        said(&core, alice, t);
+    }
+    // Whatever was posted is applied by the next op at the desk.
+    core.desk(|_, _| ());
+    let owed = core.desk.live().owed.get(&0).map_or(0, |o| o.lines.len());
+    assert_eq!(owed, 0);
+}
+
+/// What one leader finds queued behind it goes to the log in one
+/// transaction.
+#[test]
+fn reactions_queued_together_go_to_the_log_together() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let people: Vec<Uid> = (0..5)
+        .map(|i| hearing(&core, &format!("p{i}"), ng(), false).0)
+        .collect();
+    let line = said(&core, people[0], "busy");
+    let at = Arc::new(Barrier::new(2));
+    log.park_after("react_all", at.clone());
+    let react = |who: Uid| {
+        let core = core.clone();
+        thread::spawn(move || core.react(who, 0, line, &thumbs(), true))
+    };
+    let first = react(people[0]);
+    at.wait();
+    let rest: Vec<_> = people[1..].iter().map(|&p| react(p)).collect();
+    thread::sleep(Duration::from_millis(200));
+    at.wait();
+    first.join().unwrap().unwrap();
+    for r in rest {
+        r.join().unwrap().unwrap();
+    }
+    assert_eq!(*log.runs.lock().unwrap(), [1, 4]);
 }
 
 /// What a clear records is exactly what it took, a reaction made while
@@ -377,7 +565,7 @@ fn waiting_im_reactions_follow_a_rotation_as_recipient_and_reactor() {
         from: from.into(),
     };
     {
-        let mut r = core.roster.lock().unwrap();
+        let mut r = core.desk.live();
         let to = Key::of(&Mailbox::identified("bob", [1; 32]));
         let from = Mailbox::identified("alice", [3; 32]);
         let w = Waiting {
@@ -385,19 +573,18 @@ fn waiting_im_reactions_follow_a_rotation_as_recipient_and_reactor() {
             change: change("alice"),
             at: now,
         };
-        r.live.keep(to, w, now);
+        r.keep(to, w, now);
     }
     core.rotate_identity(&[1; 32], &[2; 32]).unwrap();
     core.rotate_identity(&[3; 32], &[4; 32]).unwrap();
-    let r = core.roster.lock().unwrap();
+    let r = core.desk.live();
     let queue = r
-        .live
         .waiting
         .get(&Key::Identity([2; 32]))
         .expect("moved to the successor");
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].from, Mailbox::identified("alice", [4; 32]));
-    assert!(!r.live.waiting.contains_key(&Key::Identity([1; 32])));
+    assert!(!r.waiting.contains_key(&Key::Identity([1; 32])));
 }
 
 /// The hourly sweep gives up what has waited past its age, so a party
@@ -411,7 +598,7 @@ fn the_sweep_gives_up_what_waited_too_long() {
     let now = core.clock.now();
     let guid = crate::inbox::MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
     {
-        let mut r = core.roster.lock().unwrap();
+        let mut r = core.desk.live();
         let w = Waiting {
             from: Mailbox::login("alice"),
             change: ReactionChange::Changed {
@@ -422,14 +609,14 @@ fn the_sweep_gives_up_what_waited_too_long() {
             },
             at: now,
         };
-        r.live.keep(Key::of(&Mailbox::login("bob")), w, now);
+        r.keep(Key::of(&Mailbox::login("bob")), w, now);
     }
     core.reactions_prune();
-    assert_eq!(core.roster.lock().unwrap().live.waiting_len, 1, "not yet");
+    assert_eq!(core.desk.live().waiting_len, 1, "not yet");
     core.clock.advance(Duration::from_secs(61));
     core.reactions_prune();
-    let r = core.roster.lock().unwrap();
-    assert!(r.live.waiting.is_empty() && r.live.waiting_len == 0);
+    let r = core.desk.live();
+    assert!(r.waiting.is_empty() && r.waiting_len == 0);
 }
 
 /// A clear of a line with nothing on it changes nothing and records
@@ -444,4 +631,15 @@ fn a_clear_with_nothing_to_take_records_nothing() {
     assert_eq!(core.react_clear(carol, 0, line), Ok(()));
     assert!(moderation.acts(None, 10).unwrap().is_empty());
     assert_eq!(core.reactions_flush(core.clock.now()), None);
+}
+
+/// A run whose one transaction fails is applied again an act at a time,
+/// so each answers for itself.
+#[test]
+fn a_run_that_fails_together_is_tried_alone() {
+    let (core, log) = on_faulty(Arc::new(MemoryModeration::default()));
+    let (alice, _) = hearing(&core, "alice", ng(), false);
+    let line = said(&core, alice, "one");
+    log.fail("react_all", true);
+    assert_eq!(core.react(alice, 0, line, &thumbs(), true), Ok(1));
 }

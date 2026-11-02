@@ -47,14 +47,7 @@ impl Core {
             crate::inbox::Mailbox::identified(String::new(), *from),
             crate::inbox::Mailbox::identified(String::new(), *to),
         );
-        if let Some(log) = self.history.as_ref() {
-            let lost = {
-                let _writing = self.reaction_writes.lock().unwrap();
-                log.rekey_reactions(&old, &new)?
-            };
-            self.reactions_changed_on(&lost);
-        }
-        self.rekey_waiting_reactions(&old, &new);
+        self.rekey_all_reactions(&old, &new)?;
         if let Some(store) = self.devices.as_ref() {
             let taken = store.devices_rotate(from, to)?;
             self.devices_changed(false, &taken);
