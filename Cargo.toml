@@ -8,6 +8,7 @@
 resolver = "2"
 members = [
     "crates/hl-identity",
+    "crates/hl-private-file",
     "crates/hl-tunnel",
     "crates/hxd-core",
     "crates/hxd-files",
@@ -47,6 +48,7 @@ hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "7ca8e270d2003
 
 # Internal.
 hl-identity = { path = "crates/hl-identity" }
+hl-private-file = { path = "crates/hl-private-file" }
 hl-tunnel = { path = "crates/hl-tunnel" }
 hlrelay = { path = "crates/hlrelay" }
 hxd-core = { path = "crates/hxd-core" }

@@ -74,6 +74,7 @@ hxd-media = { workspace = true, optional = true }
 hxd-markdown = { workspace = true, optional = true }
 hxd-voice = { workspace = true, optional = true }
 hl-identity = { workspace = true }
+hl-private-file = { workspace = true }
 hxd-registrar = { workspace = true }
 base64 = "0.22"
 hxd-store-sqlite = { workspace = true, optional = true }

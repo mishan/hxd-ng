@@ -2324,7 +2324,7 @@ impl Anchors {
                 let moved = if *moved { " moved" } else { "" };
                 text.push_str(&format!("{from} => {to}{moved}\n"));
             }
-            if let Err(e) = write_private(&path, &text) {
+            if let Err(e) = hl_private_file::replace(&path, text.as_bytes()) {
                 tracing::warn!("{}: {e}; successor anchors not compacted", path.display());
             }
         }
@@ -2471,25 +2471,6 @@ fn append_private(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     }
     f.write_all(line.as_bytes())?;
     f.sync_all()
-}
-
-/// Write a file 0600 through a temp-and-rename, fsynced.
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 /// Map a verification error to the spec's refusal codes.
@@ -2711,6 +2692,25 @@ mod tests {
             auth,
             Arc::new(hxd_core::Core::new()),
         )
+    }
+
+    /// Compacting rewrites the file owner-only beside a stray temporary
+    /// file, which is another writer's to finish and is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn anchors_are_compacted_owner_only_beside_a_stray() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("successors");
+        std::fs::write(&path, "junk\n").unwrap();
+        let stray = dir.path().join("successors.tmp");
+        std::fs::write(&stray, "half").unwrap();
+        std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Anchors::load(path.clone());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ANCHORS_HEADER);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), "half");
     }
 
     #[test]

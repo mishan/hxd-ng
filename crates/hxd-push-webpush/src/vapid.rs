@@ -12,7 +12,6 @@
 //! beside it; and [`Vapid::rekey`], the one deliberate replacement.
 
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -201,61 +200,21 @@ pub fn check_contact(contact: &str) -> Result<(), VapidError> {
     }
 }
 
-/// Write a key whole or not at all, with an owner-only mode from the
-/// moment it exists.
-///
-/// Into a file of its own beside `path` first, created `0600` rather
-/// than chmod'ed after — between the two there would be a private key
-/// anyone can read — and synced; then linked into place. A crash
-/// between creating and writing leaves a stray temporary file, never a
-/// half-written key at `path` that the next start refuses to read. A
-/// first key is hard-linked, so a key that appeared meanwhile is kept
-/// rather than overwritten; a rekey renames over the old one.
+/// Write a key whole or not at all, owner-only from the moment it
+/// exists. A first key is never written over one that appeared
+/// meanwhile; a rekey replaces the old one atomically.
 fn write_private(path: &Path, key: &SecretKey, replace: bool) -> Result<(), VapidError> {
     let io = |e: std::io::Error| VapidError::Io(format!("{}: {e}", path.display()));
     let pem = key
         .to_sec1_pem(p256::pkcs8::LineEnding::LF)
         .map_err(|e| VapidError::Unreadable(e.to_string()))?;
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut nonce = [0u8; 8];
-    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}.tmp", B64.encode(nonce)));
-
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    if replace {
+        hl_private_file::replace(path, pem.as_bytes()).map_err(io)
+    } else if hl_private_file::create(path, pem.as_bytes()).map_err(io)? {
+        Ok(())
+    } else {
+        Err(io(std::io::ErrorKind::AlreadyExists.into()))
     }
-    let written = options.open(&tmp).and_then(|mut file| {
-        file.write_all(pem.as_bytes())?;
-        file.sync_all()
-    });
-    let placed = written.and_then(|()| {
-        if replace {
-            fs::rename(&tmp, path)
-        } else {
-            let linked = fs::hard_link(&tmp, path);
-            let _ = fs::remove_file(&tmp);
-            linked
-        }
-    });
-    if placed.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    placed.map_err(io)?;
-    // The directory entry is what makes the file findable after a crash.
-    #[cfg(unix)]
-    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
-    Ok(())
 }
 
 /// An endpoint's origin as RFC 6454 serializes it, which is a token's
@@ -448,6 +407,21 @@ mod tests {
             .expect("no key, and not a first start");
         assert!(matches!(err, VapidError::Missing(_)), "{err}");
         assert!(!path.exists(), "and nothing was minted");
+    }
+
+    /// A key is made, and made again, under the longest name a directory
+    /// entry can have, which leaves no room to spell a temporary name
+    /// from it.
+    #[test]
+    fn a_key_is_made_and_rekeyed_under_the_longest_file_name() {
+        let dir = tempdir();
+        let path = dir.path().join(format!("{}.key", "v".repeat(251)));
+        let contact = "mailto:a@example.org";
+        let old = Vapid::load_or_create(&path, contact, true).unwrap();
+        let new = Vapid::rekey(&path, contact).unwrap();
+        assert_ne!(old.public_key(), new.public_key());
+        let read = Vapid::load_or_create(&path, contact, false).unwrap();
+        assert_eq!(read.public_key(), new.public_key());
     }
 
     #[test]
