@@ -33,6 +33,8 @@ use crate::news::{ArticleId, Author, NewsError};
 use crate::roster::{reads_public_chat, Core, Event, Uid, UserSession};
 
 pub mod conformance;
+#[cfg(test)]
+pub(crate) mod faulty;
 mod memory;
 
 pub use memory::MemoryModeration;

@@ -3520,6 +3520,9 @@ fn im_on(login: &str, n: u64) -> crate::reply::ImTarget {
     }
 }
 
+/// Instant-message reactions as a session was sent them, batch by batch.
+type ImHeard = Vec<Vec<(String, String, bool, String)>>;
+
 /// Each instant-message reaction a session was sent, as (message, key,
 /// added, reactor), batch by batch.
 fn im_reactions(evs: &[Event]) -> Vec<Vec<(String, String, bool, String)>> {
@@ -3778,4 +3781,122 @@ fn a_deleted_accounts_waiting_im_reactions_go_with_it() {
     );
     let (_, mut rb) = reactor_reading(&s.core, "bob");
     assert!(im_reactions(&drain(&mut rb)).is_empty());
+}
+
+/// A session of `login` under the identity `fp` that hears reactions,
+/// its roster read, and the reactions it was handed there.
+fn identified_reading(core: &Core, login: &str, fp: [u8; 32]) -> (Uid, ImHeard) {
+    let (uid, mut rx) = attach_identified(core, login, fp);
+    {
+        let mut r = core.roster.lock().unwrap();
+        let sess = r.users.get_mut(&uid).unwrap();
+        sess.info.transport.reactions = true;
+        sess.access = sess.access.with(bit::SEND_CHAT);
+    }
+    core.friends_roster(uid).unwrap();
+    (uid, im_reactions(&drain(&mut rx)))
+}
+
+/// A login is matched as the accounts directory matches it, a removal
+/// is told as one, a guest may not react, and an approval's reaction
+/// reaches only a session that understands requests.
+#[test]
+fn an_im_reaction_is_spelled_relayed_and_gated_as_an_acknowledgement_is() {
+    let s = reacting(&["alice", "bob", "carol"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    let told = |rb: &mut Events| {
+        im_reactions(&drain(rb))
+            .concat()
+            .into_iter()
+            .map(|(_, _, add, from)| (add, from))
+            .collect::<Vec<_>>()
+    };
+    for (case, target, with, add) in [
+        ("another case", im_on("BOB", 1), "Bob", true),
+        ("a removal", im_on("bob", 1), "bob", false),
+    ] {
+        assert_eq!(
+            s.core.react_im(a, &target, with, &thumbs, add),
+            Ok(()),
+            "{case}"
+        );
+        assert_eq!(told(&mut rb), [(add, "alice".to_string())], "{case}");
+    }
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&a)
+        .unwrap()
+        .is_person = false;
+    assert_eq!(
+        s.core.react_im(a, &im_on("bob", 2), "bob", &thumbs, true),
+        Err(crate::ReactError::NotAllowed),
+        "a guest"
+    );
+
+    // Under an approval, bob's session that understands requests hears it
+    // and his other does not.
+    let (c, _) = taker(&s.core, "carol");
+    let (b2, mut rb2) = taker(&s.core, "bob");
+    send(&s.core, c, "bob", "hello?").unwrap();
+    s.core
+        .request_answer(b2, "carol", RequestAction::Approve)
+        .unwrap();
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&b2)
+        .unwrap()
+        .info
+        .transport
+        .reactions = true;
+    (s.core.roster.lock().unwrap().users.get_mut(&c).unwrap()).access =
+        messaging_bits().with(bit::SEND_CHAT);
+    drain(&mut rb);
+    drain(&mut rb2);
+    s.core
+        .react_im(c, &im_on("carol", 3), "bob", &thumbs, true)
+        .unwrap();
+    assert_eq!(told(&mut rb2), [(true, "carol".to_string())]);
+    assert!(told(&mut rb).is_empty());
+}
+
+/// What waits follows its recipient through a link, and is handed to
+/// the account under its new key.
+#[test]
+fn waiting_im_reactions_follow_a_link() {
+    let s = reacting(&["alice", "bob"], crate::ReactionPolicy::default());
+    let thumbs = crate::ReactionKey::emoji("\u{1F44D}").unwrap();
+    let (a, mut ra) = reactor(&s.core, "alice", true);
+    let (b, mut rb) = reactor(&s.core, "bob", true);
+    friends(&s, a, &mut ra, b, &mut rb);
+    let away = |login: &str| {
+        let gone: Vec<Uid> = (s.core.roster.lock().unwrap().users.iter())
+            .filter(|(_, sess)| sess.login == login)
+            .map(|(uid, _)| *uid)
+            .collect();
+        for uid in gone {
+            s.core.end_session(uid);
+        }
+    };
+    let guid = |n: u64| im_on("bob", n).guid().to_string();
+    let heard = |batches: Vec<Vec<(String, String, bool, String)>>| -> Vec<String> {
+        batches.concat().into_iter().map(|(g, ..)| g).collect()
+    };
+
+    // Waiting for bob as he links an identity.
+    away("bob");
+    s.core
+        .react_im(a, &im_on("bob", 1), "bob", &thumbs, true)
+        .unwrap();
+    s.core.inbox_claim("bob", &[1; 32]);
+    let (_, got) = identified_reading(&s.core, "bob", [1; 32]);
+    assert_eq!(heard(got), [guid(1)], "the link");
 }

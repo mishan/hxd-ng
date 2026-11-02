@@ -1616,7 +1616,9 @@ pub struct Core {
     /// And of its reactions (`crate::reaction`).
     pub(crate) react_rates: crate::limits::PostRates,
     /// Held around every change to the log's reactions, so a moderator's
-    /// clear records exactly the rows it then takes.
+    /// clear records exactly the rows it then takes. Taken before the
+    /// roster's lock, which a rekey takes under it, and never under the
+    /// roster's or a room's serial.
     pub(crate) reaction_writes: Mutex<()>,
     /// `[reactions]`, or `None`, which takes none.
     pub(crate) reactions: Option<crate::reaction::ReactionPolicy>,

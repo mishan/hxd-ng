@@ -374,6 +374,8 @@ pub struct ReactionPolicy {
     /// How long an instant-message reaction waits for a party with no
     /// session: the inbox's unread retention, as the messages it is on.
     pub im_keep: Duration,
+    /// Instant-message reactions kept for everyone at once.
+    pub im_waiting_all: usize,
 }
 
 impl Default for ReactionPolicy {
@@ -387,6 +389,7 @@ impl Default for ReactionPolicy {
             live_window: 200,
             batch: Duration::from_secs(1),
             im_keep: Duration::from_secs(30 * 24 * 3600),
+            im_waiting_all: IM_WAITING_ALL,
         }
     }
 }
@@ -487,8 +490,10 @@ pub(crate) struct Live {
     /// How many `waiting` holds, so the server-wide bound costs nothing
     /// to ask.
     waiting_len: usize,
-    /// How long an instant-message reaction may wait.
+    /// How long an instant-message reaction may wait, and how many may
+    /// for everyone at once.
     im_keep: Duration,
+    waiting_all: usize,
 }
 
 impl Live {
@@ -688,7 +693,7 @@ impl Live {
         if queue.is_empty() {
             self.waiting.remove(&to);
         }
-        while self.waiting_len > IM_WAITING_ALL {
+        while self.waiting_len > self.waiting_all {
             let oldest = (self.waiting.iter())
                 .filter_map(|(k, q)| q.front().map(|w| (w.at, k.clone())))
                 .min_by_key(|(at, _)| *at);
@@ -825,6 +830,7 @@ impl Core {
             r.live.window = policy.live_window;
             r.live.batch = policy.batch;
             r.live.im_keep = policy.im_keep;
+            r.live.waiting_all = policy.im_waiting_all;
         }
         self.reactions = Some(policy);
         self
@@ -1362,6 +1368,8 @@ impl Core {
 }
 
 #[cfg(test)]
+mod edges;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -1370,7 +1378,7 @@ mod tests {
     use crate::roster::{drain, AttachInfo};
     use crate::{AccessBits, Events, Transport};
 
-    fn server(policy: ReactionPolicy) -> (Arc<Core>, Arc<MemoryLog>) {
+    pub(super) fn server(policy: ReactionPolicy) -> (Arc<Core>, Arc<MemoryLog>) {
         let log = Arc::new(MemoryLog::default());
         let core = Core::new()
             .with_history(log.clone(), HistoryPolicy::default())
@@ -1378,7 +1386,7 @@ mod tests {
         (Arc::new(core), log)
     }
 
-    fn bits(of: &[u8]) -> AccessBits {
+    pub(super) fn bits(of: &[u8]) -> AccessBits {
         of.iter().fold(AccessBits::empty(), |a, b| a.with(*b))
     }
 
@@ -1412,17 +1420,22 @@ mod tests {
         uid
     }
 
-    fn thumbs() -> ReactionKey {
+    pub(super) fn thumbs() -> ReactionKey {
         ReactionKey::emoji("👍").unwrap()
     }
 
-    fn party() -> ReactionKey {
+    pub(super) fn party() -> ReactionKey {
         ReactionKey::emoji("🎉").unwrap()
     }
 
     /// A person's session that reads and may chat, hearing reactions as
     /// `transport` says, a moderator with `moderate`.
-    fn hearing(core: &Core, login: &str, transport: Transport, moderate: bool) -> (Uid, Events) {
+    pub(super) fn hearing(
+        core: &Core,
+        login: &str,
+        transport: Transport,
+        moderate: bool,
+    ) -> (Uid, Events) {
         use bit::{READ_CHAT, SEND_CHAT};
         let (uid, rx) = core
             .attach(AttachInfo {
@@ -1452,7 +1465,7 @@ mod tests {
         (uid, rx)
     }
 
-    fn ng() -> Transport {
+    pub(super) fn ng() -> Transport {
         Transport {
             reactions: true,
             redactions: true,
@@ -1463,9 +1476,9 @@ mod tests {
     /// The batches `rx` was sent, each as its groups' lines and what
     /// each says: `Some((keys, mine))` for a summary, `None` for a
     /// clear.
-    type Group = (LineId, Option<(Vec<(ReactionKey, u32)>, Vec<u8>)>);
+    pub(super) type Group = (LineId, Option<(Vec<(ReactionKey, u32)>, Vec<u8>)>);
 
-    fn batches(rx: &mut Events) -> Vec<Vec<Group>> {
+    pub(super) fn batches(rx: &mut Events) -> Vec<Vec<Group>> {
         drain(rx)
             .into_iter()
             .filter_map(|e| match e {
@@ -1490,7 +1503,7 @@ mod tests {
             .collect()
     }
 
-    fn said(core: &Core, uid: Uid, text: &str) -> LineId {
+    pub(super) fn said(core: &Core, uid: Uid, text: &str) -> LineId {
         core.chat_public(uid, text.into(), 0, None)
             .unwrap()
             .unwrap()
@@ -1632,6 +1645,7 @@ mod tests {
     fn a_merge_of_waiting_queues_keeps_their_bounds() {
         let mut live = Live {
             im_keep: Duration::from_secs(3600),
+            waiting_all: IM_WAITING_ALL,
             ..Live::default()
         };
         let now = Instant::now();

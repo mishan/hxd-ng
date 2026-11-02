@@ -637,3 +637,135 @@ async fn a_batch_while_detached_is_replayed_gaplessly() {
     assert_eq!(group["keys"][0]["count"], 1);
     assert!(bob.rx.seq_faults.is_empty(), "{:?}", bob.rx.seq_faults);
 }
+
+/// A clear is a moderator's, of a line there is, in the room named,
+/// with nothing beside it but its target; a room's is heard by the
+/// room's members alone.
+#[tokio::test]
+async fn a_clear_is_a_moderators_on_a_line_it_reads() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut carol, _) = login(addr, "carol", true).await;
+    let (mut boss, _) = login(addr, "boss", true).await;
+    let lobby = say(&mut alice, json!({ "text": "lobby" })).await;
+    let gone = say(&mut alice, json!({ "text": "gone" })).await;
+    react(&mut alice, json!({ "line": lobby }), "👍").await;
+    ok(&mut carol, "redact", json!({ "id": gone, "reason": "no" })).await;
+    let den = ok(&mut boss, "room_create", json!({ "name": "den" })).await["room"]["id"]
+        .as_u64()
+        .unwrap();
+    for c in [&mut alice, &mut carol] {
+        ok(c, "room_join", json!({ "room": den })).await;
+    }
+    let inside = say(&mut alice, json!({ "text": "den", "room": den })).await;
+    let den_line = json!({ "line": inside, "room": den });
+    react(&mut alice, den_line.clone(), "👀").await;
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let key = json!({ "emoji": "👍" });
+    for (case, moderator, params, code) in [
+        (
+            "not a moderator",
+            false,
+            json!({ "target": { "line": lobby }, "clear": true }),
+            "access_denied",
+        ),
+        (
+            "with a key",
+            true,
+            json!({ "target": { "line": lobby }, "clear": true, "key": key }),
+            "bad_request",
+        ),
+        (
+            "with remove",
+            true,
+            json!({ "target": { "line": lobby }, "clear": true, "remove": true }),
+            "bad_request",
+        ),
+        (
+            "an instant message",
+            true,
+            json!({ "target": im, "clear": true }),
+            "bad_request",
+        ),
+        (
+            "with beside a line",
+            true,
+            json!({ "target": { "line": lobby }, "with": "bob", "key": key }),
+            "bad_request",
+        ),
+        (
+            "a tombstone",
+            true,
+            json!({ "target": { "line": gone }, "clear": true }),
+            "no_such_target",
+        ),
+        (
+            "never said",
+            true,
+            json!({ "target": { "line": lobby + 1000 }, "clear": true }),
+            "no_such_target",
+        ),
+        (
+            "named in another room",
+            true,
+            json!({ "target": { "line": lobby, "room": den }, "clear": true }),
+            "no_such_target",
+        ),
+    ] {
+        let who = if moderator { &mut carol } else { &mut alice };
+        assert_eq!(refused(who, "react", params).await, code, "{case}");
+    }
+
+    // The den's members hear its clear; bob, in the lobby alone, hears
+    // the lobby's and nothing of the den's.
+    let clear = |target: &Value| json!({ "target": target, "clear": true });
+    let out = json!({ "line": lobby });
+    changed(&mut bob, &out).await;
+    changed(&mut alice, &den_line).await;
+    ok(&mut carol, "react", clear(&den_line)).await;
+    let (_, group) = changed(&mut alice, &den_line).await;
+    assert_eq!(group["action"], "clear");
+    ok(&mut carol, "react", clear(&out)).await;
+    let (_, group) = changed(&mut bob, &out).await;
+    assert_eq!(group["action"], "clear");
+    for e in bob.rx.take_backlog() {
+        if e.ev == "reactions_changed" {
+            for g in e.data["changes"].as_array().unwrap() {
+                assert_eq!(g["target"], out, "{e:?}");
+            }
+        }
+    }
+}
+
+/// An instant message's reactions are held to the account's rate, told
+/// how long to wait.
+#[tokio::test]
+async fn an_im_reaction_past_the_rate_is_told_to_wait() {
+    let td = tempfile::tempdir().unwrap();
+    let policy = ReactionPolicy {
+        burst: 1,
+        per_second: 1,
+        ..ReactionPolicy::default()
+    };
+    let addr = start(td.path(), policy).await;
+    let mut alice = Client::connect(addr).await.unwrap();
+    alice
+        .login(json!({
+            "login": "alice", "password": "pw", "nick": "alice",
+            "reactions": true, "messaging": true,
+        }))
+        .await
+        .unwrap();
+    let target =
+        json!({ "im": { "login": "alice", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let params = json!({ "target": target, "with": "bob", "key": { "emoji": "👍" } });
+    assert_eq!(
+        refused(&mut alice, "react", params.clone()).await,
+        "no_such_target"
+    );
+    let reply = raw(&mut alice, "react", params).await;
+    assert_eq!(reply["error"]["code"], "rate_limited", "{reply}");
+    assert_eq!(reply["error"]["retry_after"], 1, "{reply}");
+}

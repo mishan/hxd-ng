@@ -5474,6 +5474,18 @@ sync = "full"
                 "[reactions]\nbatch_seconds = 0\n".into(),
                 Some("batch_seconds must be 1 to 60"),
             ),
+            (
+                "[reactions]\nlive_window = 1\nbatch_seconds = 1\n".into(),
+                None,
+            ),
+            (
+                "[reactions]\nlive_window = 0\n".into(),
+                Some("live_window must be 1 to 500"),
+            ),
+            (
+                "[reactions]\nbatch_seconds = 61\n".into(),
+                Some("batch_seconds must be 1 to 60"),
+            ),
         ] {
             let checked = check_config(&parse(&toml).unwrap());
             match refused {

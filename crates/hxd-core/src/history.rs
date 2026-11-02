@@ -821,6 +821,9 @@ fn summarize<'a>(
     out
 }
 
+#[cfg(test)]
+pub(crate) mod faulty;
+
 pub mod conformance {
     use super::*;
 
