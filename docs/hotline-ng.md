@@ -184,7 +184,7 @@ over them.
 | `friendships` | Portable friendships: offers, friendships and withdrawals on the `messaging` family's requests and events, `friendships_present` and `friendships_fetch`. Listed only to a login that asked for it (§7.5) | §7.5 here; proposals/portable-friends.md | — |
 | `guest_identities` | Identity guests' message requests: listed apart by `fingerprint` on `requests`, counted in `requests_changed`, and answered by `fingerprint` on `request_answer`. Listed only to a login that asked for it (§7.5) | §7.5 here; instant-messaging.md §4.1 | — |
 | `replies` | `re` on `chat` and `msg`, on the events, listings and pages that carry them, and `ids` on `history`. Listed only to a login that asked for it (§7.3) | §7.3 here | `replies` |
-| `reactions` | `react`, and a line's reactions on the `history` that shows it. Listed only to a login that asked for it (§7.3) | §7.3 here | `reactions` |
+| `reactions` | `react`, a line's reactions on the `history` that shows it, and `reactions_changed`. Listed only to a login that asked for it (§7.3) | §7.3 here | `reactions` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -854,8 +854,26 @@ family document. Each family of §4 adds its own.
     retention takes them with the line, and a purge of a person takes
     those they made within its window (moderation.md §3.3). Nothing
     changes on the classic wire, and nothing crosses a server link.
-    *hxd-ng* does not push changes yet: a client reads them again with
-    `history`.
+  - **`reactions_changed`**, `{ "changes": [ … ] }`, tells a change as it
+    happens. A line's changes go to every session that declared
+    `reactions` and reads the line's room: the lobby's readers, or a
+    room's members. They are gathered a room at a time over a batch of
+    at least a second, and each session is sent one `reactions_changed`
+    a room a batch at most, a group in it for each line that changed:
+    `{ "target", "action": "summary", "keys", "mine"? }`, the line as it
+    stands when the batch is sent, `keys` as on `history` and `mine` this
+    reader's indexes into them, absent when empty, and `keys` empty once
+    the last reaction is taken away; or `{ "target", "action": "clear" }`
+    for a redaction, and for nothing else. A
+    summary names no reactor. Only a room's most recent lines are told
+    (*hxd-ng:* `[reactions] live_window`, and `batch_seconds` for the
+    batch); a client reads an older line's again with `history` when it
+    shows it, and does after a `resync_required`. A reader is told only
+    of the lines it could have read: heard live, or readable in history.
+    A redaction of a line that had reactions is told as a clear in the
+    room's next batch, to a wire that shows redactions, a purge as the lines it took
+    someone's from now stand, and neither more than once a batch however
+    many lines it took.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event
@@ -903,7 +921,7 @@ blind (identity-registrar.md §7.3).
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
 families — `voice_*`, `video_status`, `news_*`, `room_*` — are specified where §4
-says, and `media_revoked`, `chat_redacted`, `chat_purged`, `report` and `report_closed`
+says, `reactions_changed` in §7.3, and `media_revoked`, `chat_redacted`, `chat_purged`, `report` and `report_closed`
 in moderation.md §5, whose requests — `report`, `redact`, `revoke`,
 `purge`, `kick` and the rest — are specified there too. Every event, of any family,
 counts in §3's sequence.

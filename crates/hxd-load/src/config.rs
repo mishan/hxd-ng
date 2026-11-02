@@ -47,6 +47,7 @@ pub struct Scenario {
     pub slow_peer: SlowPeer,
     pub requests: Requests,
     pub moderation: Moderation,
+    pub reactions: Reactions,
 }
 
 impl Scenario {
@@ -120,6 +121,7 @@ impl Scenario {
             Kind::Requests => self.requests.requesters_legacy > 0,
             // The moderator, and the victims on the linked servers.
             Kind::Moderation => true,
+            Kind::Reactions => false,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => self.login_storm.ng > 0,
@@ -132,6 +134,7 @@ impl Scenario {
             Kind::SlowPeer => self.chat.readers_ng + self.chat.talkers_ng > 0,
             Kind::Requests => self.requests.requesters_ng > 0,
             Kind::Moderation => self.chat.readers_ng + self.chat.talkers_ng > 0,
+            Kind::Reactions => true,
         };
         if !self.target.linked.is_empty() {
             self.check_linked(needs_legacy, needs_ng)?;
@@ -147,6 +150,9 @@ impl Scenario {
         }
         if self.run.scenario == Kind::Moderation {
             self.check_moderation()?;
+        }
+        if self.run.scenario == Kind::Reactions {
+            self.reactions.check(self.target.accounts.as_ref())?;
         }
         if needs_legacy && self.target.legacy.is_none() {
             return Err(
@@ -516,6 +522,64 @@ pub enum Kind {
     Requests,
     /// L-7: kicks and bans of other servers' users while the room talks.
     Moderation,
+    /// R-1: a reaction storm on the room's recent lines, on the ng wire.
+    Reactions,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Reactions {
+    /// Clients reacting, each logged in to one of `[target] accounts`,
+    /// since a guest may not react. The first also says the lines.
+    pub reactors: usize,
+    /// Clients reading, as guests.
+    pub readers: usize,
+    /// Clients that log in and then never read again.
+    pub stalled: usize,
+    /// Reactions a second, every reactor together, on a fixed schedule.
+    pub rate: f64,
+    /// The lines reacted to: the room's most recent, so all of them
+    /// inside the server's `[reactions] live_window`.
+    pub lines: usize,
+    /// The server's `[reactions] batch_seconds`, which the checks hold
+    /// it to.
+    pub batch: f64,
+}
+
+impl Default for Reactions {
+    fn default() -> Self {
+        Reactions {
+            reactors: 20,
+            readers: 20,
+            stalled: 1,
+            rate: 50.0,
+            lines: 20,
+            batch: 1.0,
+        }
+    }
+}
+
+impl Reactions {
+    fn check(&self, accounts: Option<&Accounts>) -> Result<(), String> {
+        let have = accounts.map_or(0, |a| a.count);
+        if self.reactors == 0 || have < self.reactors {
+            return Err(format!(
+                "[reactions] reactors = {} needs that many [target] accounts, \
+                 and at least one; it has {have} (see `hxd-load accounts`)",
+                self.reactors
+            ));
+        }
+        if self.lines == 0 {
+            return Err("[reactions] lines must be at least 1".into());
+        }
+        if !(self.rate.is_finite() && self.rate > 0.0) {
+            return Err("[reactions] rate must be positive".into());
+        }
+        if !(self.batch.is_finite() && self.batch >= 1.0) {
+            return Err("[reactions] batch must be at least 1 second".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -851,7 +915,7 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 12);
+        assert_eq!(seen, 13);
     }
 
     #[test]

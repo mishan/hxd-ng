@@ -1369,6 +1369,9 @@ impl Core {
             let skip = mine.as_ref().map(|_| sender);
             if let Some(id) = id {
                 r.last_ids.insert(room, id);
+                if let Some(policy) = self.reactions {
+                    self.desk.relayed(room, id, policy.live_window);
+                }
             }
             // The authorization set, fixed at relay time: the sender, and
             // every session this line just went to whose wire can carry
@@ -3728,8 +3731,19 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.inner.reactors_on(ids)
         }
         fn attach_media(
             &self,
@@ -4023,8 +4037,19 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.inner.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.inner.reactors_on(ids)
         }
         fn attach_media(
             &self,
@@ -4387,8 +4412,19 @@ mod tests {
         ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.0.forget_reactions(who, since)
         }
-        fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) -> Result<(), StoreError> {
+        fn rekey_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::history::LineId>, StoreError> {
             self.0.rekey_reactions(from, to)
+        }
+        fn reactors_on(
+            &self,
+            ids: &[crate::history::LineId],
+        ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
+        {
+            self.0.reactors_on(ids)
         }
     }
 

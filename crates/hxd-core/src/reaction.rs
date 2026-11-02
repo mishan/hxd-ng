@@ -7,13 +7,15 @@
 //! account's identity. So only an account that is one person reacts —
 //! never a guest, whose login everybody shares.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::access::bit;
 use crate::history::LineId;
 use crate::inbox::{Mailbox, StoreError};
-use crate::roster::{reads_public_chat, RosterInner, Uid, UserSession};
+use crate::reply::Reply;
+use crate::roster::{reads_public_chat, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
 /// The most bytes one key's text may take: the longest emoji sequences
@@ -24,6 +26,10 @@ pub const MAX_KEY_BYTES: usize = 64;
 /// says: a reader's own keys are indexes into a line's, one byte each on
 /// the classic wire.
 pub const MAX_KEYS_CEILING: usize = 255;
+
+/// The most lines a room's live window may hold: one batch reads every
+/// one of them in a statement.
+pub const MAX_LIVE_WINDOW: usize = 500;
 
 /// Lines one op tombstones at most.
 const GONE_CHUNK: usize = 256;
@@ -350,6 +356,13 @@ pub struct ReactionPolicy {
     pub per_second: u32,
     /// May a reader who may not post in a room react there?
     pub read_only_rooms: bool,
+    /// Each room's most recent lines whose changes are announced as they
+    /// happen, at most [`MAX_LIVE_WINDOW`]; older lines' are read when
+    /// they are shown.
+    pub live_window: usize,
+    /// How long a room's changes are gathered into one announcement: no
+    /// session hears more than one a room in it.
+    pub batch: Duration,
 }
 
 impl Default for ReactionPolicy {
@@ -360,14 +373,190 @@ impl Default for ReactionPolicy {
             burst: 10,
             per_second: 1,
             read_only_rooms: true,
+            live_window: 200,
+            batch: Duration::from_secs(1),
         }
     }
 }
 
-/// What the desk ([`desk`]) keeps beside the log for its ops: nothing
-/// yet, reactions living in the log alone.
+/// One change a [`Event::ReactionsChanged`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionChange {
+    /// A line's reactions as they stand when it is sent: its keys, which
+    /// every reader shares, and the indexes into them this reader's
+    /// account holds.
+    Summary {
+        target: Reply,
+        keys: Arc<[(ReactionKey, u32)]>,
+        mine: Vec<u8>,
+    },
+    /// Every reaction on a line is gone: it was redacted.
+    Clear { target: Reply },
+}
+
+impl ReactionChange {
+    /// For [`Event::weight`]: a summary as if its keys were its own,
+    /// though every reader's copy shares them.
+    pub(crate) fn weight(&self) -> usize {
+        let key = |k: &ReactionKey| match k {
+            ReactionKey::Emoji(e) => e.len(),
+        };
+        std::mem::size_of::<Self>()
+            + match self {
+                ReactionChange::Summary { keys, mine, .. } => {
+                    keys.iter()
+                        .map(|(k, _)| std::mem::size_of::<(ReactionKey, u32)>() + key(k))
+                        .sum::<usize>()
+                        + mine.len()
+                }
+                ReactionChange::Clear { .. } => 0,
+            }
+    }
+}
+
+/// What a live line owes its room's next batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owe {
+    /// Its reactions changed: a summary, read when the batch goes.
+    Summary,
+    /// It was redacted, taking them: told as a clear, to a wire that
+    /// shows redactions.
+    Gone,
+}
+
+struct Owed {
+    due: Instant,
+    lines: BTreeMap<LineId, Owe>,
+}
+
+/// What reactions are announced from, at the desk ([`desk`]): which
+/// lines are live, and what has changed on them since their room's last
+/// batch.
+///
+/// Bounded by the rooms rather than by anyone's backlog: a room holds at
+/// most its live window's lines, owed or not, however many react and
+/// however slowly anyone reads, and a session is sent one event a room a
+/// batch, which its own queue and the server's budget weigh as any other.
 #[derive(Default)]
-pub(crate) struct Live {}
+pub(crate) struct Live {
+    /// Lines a room keeps live; 0, a server without reactions, none.
+    window: usize,
+    batch: Duration,
+    /// Each room's live lines, oldest first, and the same by line.
+    recent: HashMap<u32, VecDeque<LineId>>,
+    room_of: HashMap<LineId, u32>,
+    owed: HashMap<u32, Owed>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Live {
+    /// `id` was relayed in `room`: live until the window has moved past
+    /// it, and owing nothing once it has.
+    pub(crate) fn relayed(&mut self, room: u32, id: LineId) {
+        if self.window == 0 {
+            return;
+        }
+        let ring = self.recent.entry(room).or_default();
+        ring.push_back(id);
+        self.room_of.insert(id, room);
+        while ring.len() > self.window {
+            if let Some(old) = ring.pop_front() {
+                self.room_of.remove(&old);
+                if let Some(owed) = self.owed.get_mut(&room) {
+                    owed.lines.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Owe `line`'s room `what` in its next batch, if the line is live.
+    /// A redaction stands whatever comes after it; otherwise the last
+    /// change says what is sent, a summary being the line as it is then.
+    pub(crate) fn owe(&mut self, line: LineId, what: Owe, now: Instant) {
+        let Some(&room) = self.room_of.get(&line) else {
+            return;
+        };
+        // A batch is due a whole batch after its first change, and
+        // [`Live::sent`] keeps it one after the last batch went.
+        let owed = self.owed.entry(room).or_insert_with(|| {
+            self.wake.notify_one();
+            Owed {
+                due: now + self.batch,
+                lines: BTreeMap::new(),
+            }
+        });
+        let was = owed.lines.insert(line, what);
+        if was == Some(Owe::Gone) {
+            owed.lines.insert(line, Owe::Gone);
+        }
+    }
+
+    /// A batch that could not be read, owed again: behind any change
+    /// since, which is newer, but a redaction stands.
+    fn restore(&mut self, room: u32, lines: BTreeMap<LineId, Owe>, now: Instant) {
+        let lines: Vec<_> = (lines.into_iter())
+            .filter(|(id, _)| self.room_of.contains_key(id))
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let owed = self.owed.entry(room).or_insert_with(|| {
+            self.wake.notify_one();
+            Owed {
+                due: now + self.batch,
+                lines: BTreeMap::new(),
+            }
+        });
+        for (id, what) in lines {
+            let at = owed.lines.entry(id).or_insert(what);
+            if what == Owe::Gone {
+                *at = Owe::Gone;
+            }
+        }
+    }
+
+    /// `line` owes nothing.
+    fn unowe(&mut self, line: LineId) {
+        if let Some(owed) = (self.room_of.get(&line)).and_then(|room| self.owed.get_mut(room)) {
+            owed.lines.remove(&line);
+        }
+    }
+
+    /// `room`'s batch went at `at`: the next, owed while it was being
+    /// taken and sent, is due a whole batch after.
+    fn sent(&mut self, room: u32, at: Instant) {
+        if let Some(owed) = self.owed.get_mut(&room) {
+            owed.due = owed.due.max(at + self.batch);
+        }
+    }
+
+    pub(crate) fn is_live(&self, line: LineId) -> bool {
+        self.room_of.contains_key(&line)
+    }
+
+    /// A room deleted or archived keeps no live lines: nothing more is
+    /// told of them.
+    pub(crate) fn forget_room(&mut self, room: u32) {
+        for id in self.recent.remove(&room).into_iter().flatten() {
+            self.room_of.remove(&id);
+        }
+        self.owed.remove(&room);
+    }
+}
+
+/// Does `s` hear `room`'s reactions as they change: a session that
+/// declared them, reading the lobby, or a member of the room able to
+/// see it.
+fn hears(r: &RosterInner, room: u32, uid: Uid, s: &UserSession) -> bool {
+    s.info.transport.reactions
+        && match room {
+            0 => s.visible && reads_public_chat(s),
+            _ => r
+                .rooms
+                .get(&room)
+                .is_some_and(|e| e.members.contains(&uid) && crate::rooms::sees(s, &e.room)),
+        }
+}
 
 /// Could `sess` have read line `line` of `room`: one it can read, already
 /// relayed, and either heard live or readable in history.
@@ -412,8 +601,11 @@ pub struct ReactAct<'a> {
 /// What a store made of a [`ReactAct`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reacted {
-    /// Applied, or nothing to change: the key's count now.
+    /// Applied: the key's count now.
     Count(u32),
+    /// Nothing to change, a key the account held added or one it did
+    /// not removed: the key's count, which nobody need be told.
+    Held(u32),
     /// No such line in that channel, or a tombstone.
     NoSuchLine,
     TooManyKeys,
@@ -454,6 +646,13 @@ impl Core {
     /// Take reactions under `policy`, on the lines of the log.
     pub fn with_reactions(mut self, mut policy: ReactionPolicy) -> Self {
         policy.max_keys = policy.max_keys.min(MAX_KEYS_CEILING);
+        policy.live_window = policy.live_window.min(MAX_LIVE_WINDOW);
+        policy.batch = policy.batch.max(Duration::from_secs(1));
+        {
+            let live = self.desk.live.get_mut().unwrap_or_else(|e| e.into_inner());
+            live.window = policy.live_window;
+            live.batch = policy.batch;
+        }
         self.reactions = Some(policy);
         self
     }
@@ -519,7 +718,7 @@ impl Core {
             max_per_user: policy.max_per_user,
         };
         match self.desk_react(act) {
-            Ok(Reacted::Count(n)) => Ok(n),
+            Ok(Reacted::Count(n) | Reacted::Held(n)) => Ok(n),
             Ok(Reacted::NoSuchLine) => Err(ReactError::NoSuchTarget),
             Ok(Reacted::TooManyKeys | Reacted::TooManyOfYours) => Err(ReactError::TooManyReactions),
             Err(e) => {
@@ -565,7 +764,8 @@ impl Core {
 
     /// Take `who`'s reactions of the last `within`: a purge's, and an
     /// account's deletion's, so a later holder of the login inherits
-    /// none.
+    /// none. The live lines among those they were on are announced in
+    /// their rooms' next batches, one event a room however many lines.
     pub(crate) fn forget_reactions(&self, who: &Mailbox, within: Duration) {
         if self.history.is_none() {
             return;
@@ -574,15 +774,24 @@ impl Core {
             .checked_sub(within)
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let who = who.clone();
-        self.desk(move |c, _| {
+        self.desk(move |c, live| {
             let log = c.history.as_ref().expect("asked above");
-            if let Err(e) = log.forget_reactions(&who, since) {
-                tracing::warn!("chat log would not forget {}'s reactions: {e}", who.login)
+            match log.forget_reactions(&who, since) {
+                Ok(lines) => {
+                    let now = c.clock.now();
+                    for line in lines {
+                        live.owe(line, Owe::Summary, now);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("chat log would not forget {}'s reactions: {e}", who.login)
+                }
             }
         });
     }
 
-    /// Tombstone `ids` with their reactions: the desk's half of a
+    /// Tombstone `ids` with their reactions, the live ones that had any
+    /// told as cleared in their rooms' next batch: the desk's half of a
     /// redaction or a purge, which waits on it under the room's serial
     /// before it tells anyone of the redaction. Answers the lines
     /// tombstoned.
@@ -598,7 +807,7 @@ impl Core {
         for chunk in ids.chunks(GONE_CHUNK) {
             let chunk = chunk.to_vec();
             let by = by.clone();
-            let done = self.desk_caught(move |c, _| c.chunk_gone(chunk, &by, at));
+            let done = self.desk_caught(move |c, live| c.chunk_gone(live, chunk, &by, at));
             gone.extend(
                 done.unwrap_or_else(|| Err(StoreError::new("a reaction desk op panicked")))?,
             );
@@ -608,12 +817,169 @@ impl Core {
 
     fn chunk_gone(
         &self,
+        live: &mut Live,
         ids: Vec<LineId>,
         by: &str,
         at: SystemTime,
     ) -> Result<Vec<LineId>, StoreError> {
         let log = (self.history.as_ref()).ok_or_else(|| StoreError::new("no chat log"))?;
-        log.tombstone_all(&ids, by, at)
+        let live_ids: Vec<LineId> = ids.iter().copied().filter(|id| live.is_live(*id)).collect();
+        // Which had reactions; where that cannot be read, every live one
+        // is told as cleared, which is never wrong of a tombstone.
+        let reacted = match (self.reactions, live_ids.is_empty()) {
+            (Some(_), false) => log.reactions(&live_ids, None).map_err(|e| {
+                tracing::warn!("chat log would not read reactions: {e}");
+            }),
+            _ => Ok(HashMap::new()),
+        };
+        let gone = log.tombstone_all(&ids, by, at)?;
+        let now = self.clock.now();
+        for id in &gone {
+            // A tombstone is told as cleared if it had reactions, and is
+            // owed nothing else: a summary of none after the redaction
+            // would be the line told of after it went.
+            let had = reacted.as_ref().map_or(true, |r| r.contains_key(id));
+            match had {
+                true => live.owe(*id, Owe::Gone, now),
+                false => live.unowe(*id),
+            }
+        }
+        Ok(gone)
+    }
+
+    /// Send each room whose batch is due what changed on its live lines,
+    /// and answer when the next is due. The domain schedules nothing, so
+    /// the binary runs this from a task woken by [`Core::reactions_wake`]
+    /// and by the deadline it returns, as presence's.
+    pub fn reactions_flush(&self, now: Instant) -> Option<Instant> {
+        let due: Vec<u32> = self.desk(move |_, live| {
+            (live.owed.iter())
+                .filter(|(_, o)| o.due <= now)
+                .map(|(room, _)| *room)
+                .collect()
+        });
+        for room in due {
+            self.announce_reactions(room, now);
+        }
+        self.desk(|_, live| live.owed.values().map(|o| o.due).min())
+    }
+
+    /// `rooms` were archived or deleted: posted, since the roster is
+    /// held, for their live lines to go.
+    pub(crate) fn reactions_closed(&self, rooms: Vec<u32>) {
+        if self.reactions.is_some() && !rooms.is_empty() {
+            self.desk_post(move |_, live| {
+                for room in rooms {
+                    live.forget_room(room);
+                }
+            });
+        }
+    }
+
+    /// Notified when a room first owes a batch.
+    pub fn reactions_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.desk.live().wake.clone()
+    }
+
+    /// One room's batch, to every session that hears the room, of the
+    /// lines it could have read: taken at the desk with each summary read
+    /// once, shared, and every reader's own keys from one read of who
+    /// reacted, then sent. All of it under the room's serial, as a
+    /// redaction is, so a summary is never sent after its line's
+    /// redaction, whose clear stands.
+    fn announce_reactions(&self, room: u32, now: Instant) {
+        let channel = (room != 0).then(|| self.room_channel(room));
+        let _serial = channel
+            .as_ref()
+            .map_or(&self.log_serial, |c| &c.serial)
+            .lock()
+            .unwrap();
+        // Under the serial, so a panic here is no batch rather than a
+        // poisoned room.
+        let taken = self.desk_caught(move |c, live| c.take_batch(live, room, now));
+        let Some(batch) = taken.flatten() else {
+            return;
+        };
+        {
+            let mut r = self.roster.lock().unwrap();
+            let readers: Vec<Uid> = (r.users.iter())
+                .filter(|(uid, s)| hears(&r, room, **uid, s))
+                .map(|(uid, _)| *uid)
+                .collect();
+            for uid in readers {
+                let Some(s) = r.users.get(&uid) else {
+                    continue;
+                };
+                let changes = batch.told_to(&r, s, room);
+                if !changes.is_empty() {
+                    r.send_to(uid, Event::ReactionsChanged(changes));
+                }
+            }
+        }
+        let at = self.clock.now();
+        self.desk(move |_, live| live.sent(room, at));
+    }
+
+    /// At the desk: `room`'s owed batch taken, if it is due and anyone
+    /// hears the room, and read. One that could not be read is owed
+    /// again rather than lost, a clear among them going in its order
+    /// with the rest.
+    fn take_batch(&self, live: &mut Live, room: u32, now: Instant) -> Option<Batch> {
+        let log = self.history.as_ref()?;
+        if !live.owed.get(&room).is_some_and(|o| o.due <= now) {
+            return None;
+        }
+        let mut lines = live.owed.remove(&room)?.lines;
+        lines.retain(|id, _| live.is_live(*id));
+        let anyone = {
+            let r = self.roster.lock().unwrap();
+            r.users.iter().any(|(uid, s)| hears(&r, room, *uid, s))
+        };
+        if lines.is_empty() || !anyone {
+            return None;
+        }
+        let asked: Vec<LineId> = (lines.iter())
+            .filter(|(_, w)| **w == Owe::Summary)
+            .map(|(id, _)| *id)
+            .collect();
+        let read = || -> Result<_, StoreError> {
+            if asked.is_empty() {
+                return Ok((HashMap::new(), Vec::new()));
+            }
+            Ok((log.reactions(&asked, None)?, log.reactors_on(&asked)?))
+        };
+        match read() {
+            Ok((mut shown, held)) => {
+                let keys: HashMap<LineId, Arc<[(ReactionKey, u32)]>> = (asked.iter())
+                    .map(|id| {
+                        let keys = shown.remove(id).map(|s| s.keys).unwrap_or_default();
+                        (*id, keys.into())
+                    })
+                    .collect();
+                let mut mine: HashMap<String, HashMap<LineId, Vec<u8>>> = HashMap::new();
+                for (line, reactor, key) in held {
+                    let at = keys
+                        .get(&line)
+                        .and_then(|k| k.iter().position(|(k, _)| *k == key));
+                    if let Some(i) = at.and_then(|i| u8::try_from(i).ok()) {
+                        mine.entry(reactor)
+                            .or_default()
+                            .entry(line)
+                            .or_default()
+                            .push(i);
+                    }
+                }
+                for lines in mine.values_mut() {
+                    lines.values_mut().for_each(|m| m.sort_unstable());
+                }
+                Some(Batch { lines, keys, mine })
+            }
+            Err(e) => {
+                tracing::warn!("chat log would not read reactions: {e}");
+                live.restore(room, lines, self.clock.now());
+                None
+            }
+        }
     }
 
     /// Retire the log's lines past `keep`, and their reactions with them:
@@ -642,6 +1008,8 @@ impl Core {
     }
 
     /// `from`'s reactions are `to`'s now: an account linked an identity.
+    /// A live line that lost one, held under both, is told as it now
+    /// stands.
     pub(crate) fn rekey_reactions(&self, from: &Mailbox, to: &Mailbox) {
         if let Err(e) = self.rekey_all_reactions(from, to) {
             tracing::warn!("chat log would not move {}'s reactions: {e}", from.login);
@@ -655,12 +1023,55 @@ impl Core {
         to: &Mailbox,
     ) -> Result<(), StoreError> {
         let (from, to) = (from.clone(), to.clone());
-        self.desk(move |c, _| {
+        self.desk(move |c, live| {
+            let now = c.clock.now();
             if let Some(log) = c.history.as_ref() {
-                log.rekey_reactions(&from, &to)?;
+                for line in log.rekey_reactions(&from, &to)? {
+                    live.owe(line, Owe::Summary, now);
+                }
             }
             Ok(())
         })
+    }
+}
+
+/// A room's batch as the desk took it: what each line owes, the keys of
+/// those owed a summary, and who reacted to them.
+struct Batch {
+    lines: BTreeMap<LineId, Owe>,
+    keys: HashMap<LineId, Arc<[(ReactionKey, u32)]>>,
+    /// Each reactor's own keys on the batch's lines, as indexes into
+    /// `keys`, found once for the batch so that what each reader costs
+    /// under the roster is its lines and its own keys.
+    mine: HashMap<String, HashMap<LineId, Vec<u8>>>,
+}
+
+impl Batch {
+    /// What `s` is told of it: the lines it could have read, with its own
+    /// account's keys, and a redaction's clear only on a wire that shows
+    /// redactions.
+    fn told_to(&self, r: &RosterInner, s: &UserSession, room: u32) -> Vec<ReactionChange> {
+        let mine = (s.is_person)
+            .then(|| self.mine.get(&reactor_key(&s.mailbox())))
+            .flatten();
+        (self.lines.iter())
+            .filter(|(&id, _)| could_have_read(r, s, room, id))
+            .filter_map(|(&id, what)| {
+                let target = Reply::Line { room, id };
+                match what {
+                    Owe::Summary => {
+                        let keys = self.keys[&id].clone();
+                        let mine = mine.and_then(|m| m.get(&id)).cloned().unwrap_or_default();
+                        Some(ReactionChange::Summary { target, keys, mine })
+                    }
+                    Owe::Gone => s
+                        .info
+                        .transport
+                        .redactions
+                        .then_some(ReactionChange::Clear { target }),
+                }
+            })
+            .collect()
     }
 }
 
@@ -675,7 +1086,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::history::{ChatLog, HistoryPolicy, MemoryLog};
-    use crate::roster::AttachInfo;
+    use crate::moderation::Actor;
+    use crate::roster::{drain, AttachInfo};
     use crate::{AccessBits, Events, Transport};
 
     pub(super) fn server(policy: ReactionPolicy) -> (Arc<Core>, Arc<MemoryLog>) {
@@ -773,10 +1185,256 @@ mod tests {
         }
     }
 
+    /// The batches `rx` was sent, each as its groups' lines and what
+    /// each says: `Some((keys, mine))` for a summary, `None` for a
+    /// clear.
+    pub(super) type Group = (LineId, Option<(Vec<(ReactionKey, u32)>, Vec<u8>)>);
+
+    pub(super) fn batches(rx: &mut Events) -> Vec<Vec<Group>> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::ReactionsChanged(changes) => Some(
+                    changes
+                        .into_iter()
+                        .map(|c| match c {
+                            ReactionChange::Summary {
+                                target: Reply::Line { id, .. },
+                                keys,
+                                mine,
+                            } => (id, Some((keys.to_vec(), mine))),
+                            ReactionChange::Clear {
+                                target: Reply::Line { id, .. },
+                            } => (id, None),
+                            other => panic!("not a line's: {other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn said(core: &Core, uid: Uid, text: &str) -> LineId {
         core.chat_public(uid, text.into(), 0, None)
             .unwrap()
             .unwrap()
+    }
+
+    /// A room's changes over a batch go out together once it is due, as
+    /// one event to each session that declared reactions and reads the
+    /// room, each with its own account's keys, and the next waits a whole
+    /// batch after it. A change that changes nothing is not told.
+    #[test]
+    fn a_batch_goes_once_a_window_to_the_readers_that_declared_reactions() {
+        let (core, _log) = server(ReactionPolicy::default());
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let (bob, mut rb) = hearing(&core, "bob", ng(), false);
+        let (_, mut plain) = hearing(&core, "dave", Transport::default(), false);
+        let (blind, mut rblind) = hearing(&core, "blind", ng(), false);
+        core.roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&blind)
+            .unwrap()
+            .access = bits(&[bit::SEND_CHAT]);
+        let one = said(&core, alice, "one");
+        let two = said(&core, alice, "two");
+        for rx in [&mut ra, &mut rb, &mut plain, &mut rblind] {
+            drain(rx);
+        }
+        let t0 = core.clock.now();
+        core.react(bob, 0, one, &thumbs(), true).unwrap();
+        core.react(alice, 0, one, &party(), true).unwrap();
+        core.react(alice, 0, two, &thumbs(), true).unwrap();
+        let due = core.reactions_flush(t0).expect("a batch is owed");
+        assert!(due >= t0 + Duration::from_secs(1));
+        assert!(batches(&mut ra).is_empty(), "not before its window closes");
+
+        core.clock.advance(due - t0);
+        assert_eq!(core.reactions_flush(core.clock.now()), None);
+        let keys = vec![(thumbs(), 1), (party(), 1)];
+        assert_eq!(
+            batches(&mut ra),
+            [vec![
+                (one, Some((keys.clone(), vec![1]))),
+                (two, Some((vec![(thumbs(), 1)], vec![0])))
+            ]]
+        );
+        assert_eq!(
+            batches(&mut rb),
+            [vec![
+                (one, Some((keys, vec![0]))),
+                (two, Some((vec![(thumbs(), 1)], vec![])))
+            ]]
+        );
+        assert!(batches(&mut plain).is_empty(), "never declared reactions");
+        assert!(batches(&mut rblind).is_empty(), "does not read the lobby");
+
+        assert_eq!(core.react(bob, 0, one, &thumbs(), true), Ok(1));
+        let sent = core.clock.now();
+        assert_eq!(core.reactions_flush(sent), None, "nothing changed");
+        core.react(bob, 0, one, &thumbs(), false).unwrap();
+        let next = core.reactions_flush(sent).expect("owed again");
+        assert!(next >= sent + Duration::from_secs(1), "a whole batch later");
+        assert_eq!(
+            core.reactions_flush(next - Duration::from_millis(1)),
+            Some(next)
+        );
+        assert!(batches(&mut ra).is_empty());
+        core.reactions_flush(next);
+        assert_eq!(
+            batches(&mut ra),
+            [vec![(one, Some((vec![(party(), 1)], vec![0])))]]
+        );
+    }
+
+    /// A line is told only to a reader that could have read it: one that
+    /// heard it live, or may read history. One that came after it hears
+    /// nothing of it, and so learns nothing of a line it never saw.
+    #[test]
+    fn a_reader_is_told_of_the_lines_it_could_have_read_alone() {
+        let (core, _log) = server(ReactionPolicy::default());
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let before = said(&core, alice, "before");
+        let (_, mut late) = hearing(&core, "late", ng(), false);
+        let (reader, mut rh) = hearing(&core, "reader", ng(), false);
+        (core.roster.lock().unwrap().users.get_mut(&reader).unwrap()).access =
+            bits(&[bit::READ_CHAT, bit::CHAT_HISTORY]);
+        let after = said(&core, alice, "after");
+        for rx in [&mut ra, &mut late, &mut rh] {
+            drain(rx);
+        }
+        for line in [before, after] {
+            core.react(alice, 0, line, &thumbs(), true).unwrap();
+        }
+        let due = core.reactions_flush(core.clock.now()).unwrap();
+        core.reactions_flush(due);
+        let lines =
+            |rx: &mut Events| -> Vec<LineId> { batches(rx).concat().iter().map(|g| g.0).collect() };
+        assert_eq!(lines(&mut ra), [before, after]);
+        assert_eq!(lines(&mut rh), [before, after], "it may read history");
+        assert_eq!(lines(&mut late), [after]);
+    }
+
+    /// A rotation that folds a key the identity held under both tells the
+    /// line as it now stands.
+    #[test]
+    fn a_rotation_that_folds_a_key_tells_the_line() {
+        let (core, log) = server(ReactionPolicy::default());
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let line = said(&core, alice, "one");
+        for fp in [[4; 32], [5; 32]] {
+            let who = Mailbox::identified("erin", fp);
+            log.react(&ReactAct {
+                channel: 0,
+                line,
+                who: &who,
+                nick: "erin",
+                key: &thumbs(),
+                add: true,
+                at: SystemTime::now(),
+                max_keys: 20,
+                max_per_user: 5,
+            })
+            .unwrap();
+        }
+        drain(&mut ra);
+        core.rotate_identity(&[4; 32], &[5; 32]).unwrap();
+        let due = core.reactions_flush(core.clock.now()).expect("owed");
+        core.reactions_flush(due);
+        assert_eq!(
+            batches(&mut ra),
+            [vec![(line, Some((vec![(thumbs(), 1)], vec![])))]]
+        );
+    }
+
+    /// Only a room's most recent lines are told as they change; an older
+    /// one's reactions are read when it is shown.
+    #[test]
+    fn only_the_live_window_is_announced() {
+        let (core, _log) = server(ReactionPolicy {
+            live_window: 2,
+            ..ReactionPolicy::default()
+        });
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let old = said(&core, alice, "old");
+        let lines = [said(&core, alice, "a"), said(&core, alice, "b")];
+        drain(&mut ra);
+        assert_eq!(core.react(alice, 0, old, &thumbs(), true), Ok(1));
+        assert_eq!(core.reactions_flush(core.clock.now()), None, "owes nothing");
+        for line in lines {
+            core.react(alice, 0, line, &thumbs(), true).unwrap();
+        }
+        let due = core.reactions_flush(core.clock.now()).unwrap();
+        core.reactions_flush(due);
+        let told: Vec<LineId> = batches(&mut ra).concat().iter().map(|g| g.0).collect();
+        assert_eq!(told, lines);
+    }
+
+    /// What a redaction and a purge take is told in the next batch: a
+    /// redacted line as cleared, to a wire that shows redactions, and a
+    /// line a purge took someone's from as it now stands.
+    #[test]
+    fn a_redaction_and_a_purge_are_told_in_the_next_batch() {
+        let (core, _log) = {
+            let log = Arc::new(MemoryLog::default());
+            let core = Core::new()
+                .with_history(log.clone(), HistoryPolicy::default())
+                .with_reactions(ReactionPolicy::default())
+                .with_moderation(
+                    Arc::new(crate::MemoryModeration::default()),
+                    crate::ModerationPolicy::default(),
+                );
+            (Arc::new(core), log)
+        };
+        let (alice, mut ra) = hearing(&core, "alice", ng(), false);
+        let (bob, _) = hearing(&core, "bob", ng(), false);
+        let (carol, _) = hearing(&core, "carol", ng(), true);
+        let blind = Transport {
+            redactions: false,
+            ..ng()
+        };
+        let (_, mut rblind) = hearing(&core, "erin", blind, false);
+        let [gone, kept, cleared] = ["gone", "kept", "cleared"].map(|t| said(&core, alice, t));
+        for line in [gone, kept, cleared] {
+            core.react(bob, 0, line, &thumbs(), true).unwrap();
+        }
+        core.react(alice, 0, kept, &party(), true).unwrap();
+        let mut now = core.clock.now();
+        let flush = |now: &mut Instant| {
+            *now += Duration::from_secs(5);
+            core.reactions_flush(*now);
+        };
+        flush(&mut now);
+        drain(&mut ra);
+        drain(&mut rblind);
+
+        core.redact_line(Actor::Session(carol), gone, "no").unwrap();
+        core.purge_sender(
+            Actor::Session(carol),
+            &crate::moderation::PersonRef::Login("bob".into()),
+            Duration::from_secs(3600),
+            "ballot stuffing",
+        )
+        .unwrap();
+        flush(&mut now);
+        assert_eq!(
+            batches(&mut ra),
+            [vec![
+                (gone, None),
+                (kept, Some((vec![(party(), 1)], vec![0]))),
+                (cleared, Some((vec![], vec![]))),
+            ]]
+        );
+        assert_eq!(
+            batches(&mut rblind),
+            [vec![
+                (kept, Some((vec![(party(), 1)], vec![]))),
+                (cleared, Some((vec![], vec![]))),
+            ]]
+        );
     }
 
     /// Only a line already relayed, readable, and heard live or read in

@@ -16,7 +16,11 @@
 //! on an op, or leading), then the roster, then a store. Nothing waits on
 //! the desk while it holds the roster; an op never takes a serial nor
 //! waits on the desk itself; and ops are short, because a waiter may hold
-//! a room's serial, so a long piece of work is many ops.
+//! a room's serial, so a long piece of work is many ops. What a caller
+//! holding the roster must tell the desk is never waited on: a relayed
+//! line goes to a buffer of each room's newest, at most its live window,
+//! which the next run takes first, and a room archived is posted as an op
+//! for the next leader.
 //!
 //! A panic in an op, or in the log under one, answers that op's caller
 //! as a panic and nobody else's: the run goes on, the lead is handed on.
@@ -24,11 +28,11 @@
 //! error instead ([`Core::desk_caught`]), so the serial is not poisoned.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::SystemTime;
 
-use super::{Live, ReactAct, Reacted, ReactionKey};
+use super::{Live, Owe, ReactAct, Reacted, ReactionKey};
 use crate::history::LineId;
 use crate::inbox::{Mailbox, StoreError};
 use crate::Core;
@@ -81,6 +85,9 @@ enum Slot {
 
 struct Ticket {
     op: Mutex<Option<Op>>,
+    /// Someone waits on its answer; a posted op is answered to nobody
+    /// and never leads.
+    waited: bool,
     slot: Mutex<Slot>,
     ready: Condvar,
 }
@@ -103,6 +110,9 @@ pub(crate) struct Desk {
     state: Mutex<State>,
     /// Held by the leader alone while it applies a run.
     pub(super) live: Mutex<Live>,
+    /// Lines relayed since the last run, each room's newest, at most its
+    /// live window: what the next run takes first.
+    relayed: Mutex<HashMap<u32, VecDeque<LineId>>>,
 }
 
 /// An op that panicked, answered to its caller as that.
@@ -125,7 +135,27 @@ impl Desk {
     /// has arrived.
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
-        self.state.lock().unwrap().queue.len()
+        let st = self.state.lock().unwrap();
+        st.queue.iter().filter(|t| t.waited).count()
+    }
+
+    /// `id` was relayed in `room`, told from under the roster: kept for
+    /// the next run, no more of a room's than its window holds.
+    pub(crate) fn relayed(&self, room: u32, id: LineId, window: usize) {
+        let mut relayed = self.relayed.lock().unwrap_or_else(|e| e.into_inner());
+        let ring = relayed.entry(room).or_default();
+        ring.push_back(id);
+        while ring.len() > window {
+            ring.pop_front();
+        }
+    }
+
+    /// The tickets queued and the lines relayed and not yet taken.
+    #[cfg(test)]
+    pub(crate) fn backlog(&self) -> (usize, usize) {
+        let queued = self.state.lock().unwrap().queue.len();
+        let relayed = self.relayed.lock().unwrap();
+        (queued, relayed.values().map(VecDeque::len).sum())
     }
 }
 
@@ -156,7 +186,24 @@ impl Core {
             .map(|r| *r)
     }
 
-    /// One reaction to the log, in a run's one transaction.
+    /// Queue `f` for the desk's next leader and go on: for a caller that
+    /// holds the roster, which may not wait on the desk.
+    pub(crate) fn desk_post(&self, f: impl FnOnce(&Core, &mut Live) + Send + 'static) {
+        let work: Work = Box::new(move |c, l| {
+            f(c, l);
+            Box::new(())
+        });
+        let ticket = Arc::new(Ticket {
+            op: Mutex::new(Some(Op::Work(work))),
+            waited: false,
+            slot: Mutex::new(Slot::Waiting),
+            ready: Condvar::new(),
+        });
+        self.desk.state.lock().unwrap().queue.push_back(ticket);
+    }
+
+    /// One reaction to the log, in a run's one transaction, and the line
+    /// owed a summary where it changed.
     pub(crate) fn desk_react(&self, act: Act) -> Result<Reacted, StoreError> {
         match self.desk_submit(Op::React(act)).downcast() {
             Ok(r) => *r,
@@ -167,6 +214,7 @@ impl Core {
     fn desk_submit(&self, op: Op) -> Box<dyn Any + Send> {
         let me = Arc::new(Ticket {
             op: Mutex::new(Some(op)),
+            waited: true,
             slot: Mutex::new(Slot::Waiting),
             ready: Condvar::new(),
         });
@@ -191,8 +239,8 @@ impl Core {
         }
     }
 
-    /// Apply runs until `me`'s op is answered, then hand the lead on:
-    /// `me`'s answer.
+    /// Apply runs until `me`'s op is answered and nobody else is waiting
+    /// behind ops only posted, then hand the lead on: `me`'s answer.
     fn desk_lead(&self, me: &Arc<Ticket>) -> Box<dyn Any + Send> {
         let mut mine = None;
         loop {
@@ -209,19 +257,27 @@ impl Core {
             for (t, answer) in run.iter().zip(answers) {
                 if Arc::ptr_eq(t, me) {
                     mine = Some(answer);
-                } else {
+                } else if t.waited {
                     t.set(Slot::Done(answer));
                 }
             }
-            if mine.is_none() {
-                continue;
-            }
             let mut st = self.desk.state.lock().unwrap();
-            match st.queue.front() {
-                Some(next) => next.set(Slot::Lead),
-                None => st.leading = false,
+            let next = st.queue.iter().find(|t| t.waited).cloned();
+            match (next, &mine, st.queue.is_empty()) {
+                // Another caller waits: it leads, posted ops before it
+                // in its run.
+                (Some(next), Some(_), _) => {
+                    next.set(Slot::Lead);
+                    break;
+                }
+                (None, Some(_), true) => {
+                    st.leading = false;
+                    break;
+                }
+                // Mine is not answered yet, or only posted ops are
+                // left, which nobody else would apply.
+                _ => {}
             }
-            break;
         }
         mine.expect("the leader's op is in a run it applied")
     }
@@ -230,6 +286,13 @@ impl Core {
     /// where they come together, every other op as itself.
     fn desk_apply(&self, run: &[Arc<Ticket>]) -> Vec<Box<dyn Any + Send>> {
         let mut live = self.desk.live();
+        let relayed =
+            std::mem::take(&mut *self.desk.relayed.lock().unwrap_or_else(|e| e.into_inner()));
+        for (room, ids) in relayed {
+            for id in ids {
+                live.relayed(room, id);
+            }
+        }
         let mut answers: Vec<Box<dyn Any + Send>> = Vec::with_capacity(run.len());
         let ops: Vec<Op> = run
             .iter()
@@ -245,7 +308,7 @@ impl Core {
                             acts.push(a);
                         }
                     }
-                    answers.extend(self.desk_react_all(&acts));
+                    answers.extend(self.desk_react_all(&mut live, &acts));
                 }
                 Op::Work(work) => {
                     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -261,7 +324,7 @@ impl Core {
     /// A run's reactions, answered each: together in one transaction, or
     /// where that fails or panics, each again alone, so one act's error or
     /// panic is its own.
-    fn desk_react_all(&self, acts: &[Act]) -> Vec<Box<dyn Any + Send>> {
+    fn desk_react_all(&self, live: &mut Live, acts: &[Act]) -> Vec<Box<dyn Any + Send>> {
         let Some(log) = self.history.as_ref() else {
             return (acts.iter())
                 .map(|_| boxed(Err(StoreError::new("no chat log"))))
@@ -270,8 +333,16 @@ impl Core {
         let borrowed: Vec<ReactAct<'_>> = acts.iter().map(Act::borrowed).collect();
         let together =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.react_all(&borrowed)));
+        let now = self.clock.now();
         match together {
-            Ok(Ok(all)) => return all.into_iter().map(|r| boxed(Ok(r))).collect(),
+            Ok(Ok(all)) => {
+                for (act, r) in acts.iter().zip(&all) {
+                    if matches!(r, Reacted::Count(_)) {
+                        live.owe(act.line, Owe::Summary, now);
+                    }
+                }
+                return all.into_iter().map(|r| boxed(Ok(r))).collect();
+            }
             Ok(Err(e)) => tracing::warn!(
                 "chat log would not take {} reactions together: {e}",
                 acts.len()
@@ -280,8 +351,13 @@ impl Core {
         }
         (borrowed.iter())
             .map(|a| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.react(a)))
-                    .map_or_else(|_| panicked(), boxed)
+                let alone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.react(a)));
+                // Whatever this one answers, its line may have changed in
+                // the run that failed: owed a summary either way.
+                if matches!(alone, Ok(Ok(_))) {
+                    live.owe(a.line, Owe::Summary, now);
+                }
+                alone.map_or_else(|_| panicked(), boxed)
             })
             .collect()
     }

@@ -735,6 +735,10 @@ pub enum Event {
     RequestsChanged {
         count: usize,
     },
+
+    /// Reactions changed (`crate::reaction`): a room's lines in one
+    /// batch. Only to sessions whose transport declared reactions.
+    ReactionsChanged(Vec<crate::reaction::ReactionChange>),
 }
 
 impl Event {
@@ -840,6 +844,10 @@ impl Event {
                     + im.re.as_ref().map_or(0, |r| r.pack().len())
             }
             Event::Receipt { login, .. } | Event::Typing { login, .. } => login.len(),
+            Event::ReactionsChanged(changes) => changes
+                .iter()
+                .map(crate::reaction::ReactionChange::weight)
+                .sum(),
             _ => 0,
         };
         std::mem::size_of::<SeqEvent>() + text
@@ -895,6 +903,7 @@ impl Event {
             Event::Receipt { .. } => "receipt",
             Event::Typing { .. } => "typing",
             Event::RequestsChanged { .. } => "requests_changed",
+            Event::ReactionsChanged(..) => "reactions_changed",
         }
     }
 }

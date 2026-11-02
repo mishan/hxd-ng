@@ -287,11 +287,13 @@ session and of the line that would spend its last spam point, so what
 was sent before a kick is heard before it.
 
 **Reaction state changes at one desk** (`reaction::desk`), as public
-chat commits a room at a time: every write to the log's reactions is
-an op queued there and applied in order by whichever caller finds none
-being applied. Locks go a room's serial, then the desk, then the
-roster, then a store: nothing waits on the desk holding the roster, an
-op never takes a serial nor waits on the desk itself, and ops are short,
+chat commits a room at a time: every write to the log's reactions and
+every change to what is announced from is an op queued there and
+applied in order by whichever caller finds none being applied. Locks
+go a room's serial, then the desk, then the roster, then a store:
+nothing waits on the desk holding the roster (what a caller under it
+must tell the desk is buffered or posted, never waited on), an op
+never takes a serial nor waits on the desk itself, and ops are short,
 because a caller waiting on one may hold a room's serial, so a long
 piece of work, a purge's tombstones, is many ops. A new write to
 reaction state is an op there too.
@@ -402,7 +404,10 @@ Three layers, all `cargo test --workspace`:
   (`react` on a lobby and a room line, counted per account and shown on
   `history` to readers that declared `reactions` alone, the caps, a
   guest and an account that may not chat refused, the per-account rate,
-  and a redaction and a purge taking them), `structured_chat.rs`
+  and a redaction and a purge taking them; `reactions_changed` heard
+  live in one batch by the readers that declared it, a room's by its
+  members alone, and a batch held for a detached session replayed at
+  its resume), `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
   the same bytes as its 700 entry, Mac Roman and UTF-8 entries, an

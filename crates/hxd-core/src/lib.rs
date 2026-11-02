@@ -89,7 +89,7 @@ pub use news::{
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
-pub use reaction::{ReactError, ReactionKey, ReactionPolicy, Reactions};
+pub use reaction::{ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reactions};
 pub use relationships::{MemoryRelationships, RelationId, RelationshipStore, SentOn};
 pub use reply::Reply;
 pub use revoked::{Published, Revocations};
