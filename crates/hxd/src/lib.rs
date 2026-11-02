@@ -2905,7 +2905,9 @@ pub(crate) fn load_key(path: &Path, what: &str) -> Result<ServerKey, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let key = ServerKey::generate();
             let hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
-            write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
+            if !write_private(path, &hex)? {
+                return read_key(path);
+            }
             tracing::info!("generated {what} key at {}", path.display());
             Ok(key)
         }
@@ -2930,7 +2932,9 @@ pub(crate) fn load_secret(path: &Path, what: &str) -> Result<[u8; 32], String> {
                 .try_fill_bytes(&mut secret)
                 .map_err(|e| format!("{what}: the OS CSPRNG: {e}"))?;
             let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
-            write_private(path, &hex).map_err(|e| format!("{}: {e}", path.display()))?;
+            if !write_private(path, &hex)? {
+                return read_seed(path);
+            }
             tracing::info!("generated the {what} at {}", path.display());
             Ok(secret)
         }
@@ -2941,6 +2945,15 @@ pub(crate) fn load_secret(path: &Path, what: &str) -> Result<[u8; 32], String> {
 /// 32 bytes in hex, as [`load_key`] and [`load_secret`] write them.
 fn read_seed(path: &Path) -> Result<[u8; 32], String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Warned of rather than refused: a key restored from a backup with
+    // the wrong mode should not take the server down with it.
+    #[cfg(unix)]
+    if let Some(mode) = std::fs::metadata(path).ok().and_then(|m| loose_mode(&m)) {
+        tracing::warn!(
+            "{} is mode {mode:04o}: readable beyond its owner (chmod 600 it)",
+            path.display()
+        );
+    }
     let hex = text.trim();
     let bytes = (0..hex.len())
         .step_by(2)
@@ -2963,8 +2976,32 @@ pub(crate) fn decode_key(b64: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "key must be 32 bytes".to_string())
 }
 
-fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+/// The mode of a file that grants anyone but its owner anything, if it is one.
+#[cfg(unix)]
+fn loose_mode(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode() & 0o7777;
+    (mode & 0o077 != 0).then_some(mode)
+}
+
+/// Write `text` to `path` whole, owner-only from its first byte, unless
+/// a file is there already: then nothing is written and the answer is
+/// false.
+///
+/// Into a temporary file of its own beside it first, synced, then
+/// hard-linked into place, so a crash leaves a stray temporary file
+/// rather than a truncated secret the next start refuses to read, and a
+/// file that appeared meanwhile is kept rather than replaced. The
+/// temporary name is random, so starts sharing a volume (each pid 1 in
+/// its container) never share one, and a stray one is left alone: it
+/// may be another start's, still being written.
+fn write_private(path: &Path, text: &str) -> Result<bool, String> {
+    use rand_core::RngCore;
     use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -2972,8 +3009,42 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    writeln!(f, "{text}")
+    let (tmp, mut f) = loop {
+        let mut nonce = [0u8; 8];
+        rand_core::OsRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|e| format!("{}: the OS CSPRNG: {e}", path.display()))?;
+        // Not spelled from the target's name, which may already be as
+        // long as a directory entry can be.
+        let tmp = dir.join(format!(".hxd-{:016x}.tmp", u64::from_be_bytes(nonce)));
+        match opts.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", tmp.display())),
+        }
+    };
+    let written = writeln!(f, "{text}").and_then(|()| f.sync_all());
+    let linked = written
+        .map(|()| std::fs::hard_link(&tmp, path))
+        .map_err(|e| format!("{}: {e}", tmp.display()));
+    let _ = std::fs::remove_file(&tmp);
+    // Whichever start placed the file, its entry is synced before it is
+    // used.
+    let placed = match linked? {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            return Err(format!(
+                "{}: {e} (placing it needs a filesystem with hard links)",
+                path.display()
+            ));
+        }
+        Ok(()) => true,
+    };
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(placed)
 }
 
 impl IdentitySection {
@@ -4669,6 +4740,83 @@ mod tests {
         assert_ne!(first, [0; 32]);
         std::fs::write(&path, "not hex\n").unwrap();
         assert!(load_secret(&path, "news guest secret").is_err());
+    }
+
+    /// A start that died writing a secret leaves a temporary file beside
+    /// it, which may as well be another start's live one: it is left
+    /// alone, the secret is written whole and owner-only, and a secret
+    /// already there is kept.
+    #[test]
+    fn a_secret_is_made_beside_a_stray_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("news-guest.key");
+        let stray = dir
+            .path()
+            .join(format!(".news-guest.key.{}.tmp", std::process::id()));
+        std::fs::write(&stray, "half").unwrap();
+        let made = load_secret(&path, "news guest secret").unwrap();
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), "half");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(!write_private(&path, "other").unwrap(), "not replaced");
+        assert_eq!(load_secret(&path, "news guest secret").unwrap(), made);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    /// A secret is made under the longest name a directory entry can
+    /// have, which leaves no room to spell a temporary name from it.
+    #[test]
+    fn a_secret_is_made_under_the_longest_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.key", "k".repeat(251)));
+        let made = load_secret(&path, "news guest secret").unwrap();
+        assert_eq!(load_secret(&path, "news guest secret").unwrap(), made);
+    }
+
+    /// A secret readable beyond its owner is still read, with a warning
+    /// naming it and its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_secret_is_read_with_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Clone, Default)]
+        struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link-server.key");
+        let made = load_secret(&path, "link server").unwrap();
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let read = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            log.0.lock().unwrap().clear();
+            assert_eq!(load_secret(&path, "link server").unwrap(), made);
+            String::from_utf8(log.0.lock().unwrap().clone()).unwrap()
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            let warned = read(0o644);
+            assert!(
+                warned.contains(&path.display().to_string()) && warned.contains("0644"),
+                "{warned}"
+            );
+            assert_eq!(read(0o600), "", "an owner-only file is read quietly");
+        });
     }
 
     /// Unnamed, the secret lives beside the database the news is kept
