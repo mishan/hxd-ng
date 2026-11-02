@@ -1,28 +1,34 @@
 //! Reactions on the ng wire (`docs/hotline-ng.md` §7.3): `react` on a
 //! lobby or a room line, held to its caps, its rate and who may react,
-//! counted on `history` for the sessions that declared `reactions`, and
-//! taken by a redaction and a purge, between scripted clients on a real
-//! server. Emoji in the test data are the reactions themselves.
+//! counted on `history` for the sessions that declared `reactions`, told
+//! live in `reactions_changed` batches to a room's readers, cleared by a
+//! moderator and taken by a redaction and a purge, and on an instant
+//! message relayed to its other party, between scripted clients on a
+//! real server. Emoji in the test data are the reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_core::{Core, HistoryPolicy, InboxPolicy, ModerationPolicy, ReactionPolicy, RoomPolicy};
+use hxd_core::{
+    Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ModerationPolicy, ReactionPolicy, RoomPolicy,
+};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
 use hxd_testclient::ng::{Client, Incoming, Resumed};
 use hxd_testclient::Error;
 use serde_json::{json, Value};
 
-/// History, moderation and rooms on one SQLite file, reactions under
-/// `policy`. `carol` moderates, `boss` makes rooms, `reader` may read
-/// and not chat, and the guest may chat.
+/// History, moderation, rooms and messaging on one SQLite file,
+/// reactions under `policy`, their batches sent as the binary sends them.
+/// `carol` moderates, `boss` makes rooms, `reader` may read and not chat,
+/// and the guest may chat.
 async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-    const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n";
+    const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n\
+                           send_msgs = true\nmessaging = true\n";
     for (login, password, access) in [
         ("alice", true, CHATTER.to_string()),
         ("bob", true, CHATTER.to_string()),
@@ -62,14 +68,21 @@ async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
             },
         )
         .with_reactions(policy)
+        .with_relationships(store.clone())
+        .with_messaging(MessagingPolicy {
+            enabled: true,
+            ..MessagingPolicy::default()
+        })
         .with_moderation(store, ModerationPolicy::default())
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
             RoomPolicy::default(),
         )
         .unwrap();
+    let core = Arc::new(core);
+    tokio::spawn(hxd::reactions_flusher(core.clone()));
     let ng_ctx = NgCtx {
-        core: Arc::new(core),
+        core,
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "reactions".into(),
@@ -169,7 +182,7 @@ async fn reactions_are_counted_per_account_and_shown_to_the_readers_that_asked()
     assert!(caps(&hello).contains(&json!("reactions")));
     assert_eq!(
         hello["reactions"],
-        json!({ "targets": ["line"], "max_keys": 20, "max_per_user": 5 })
+        json!({ "targets": ["line", "im"], "max_keys": 20, "max_per_user": 5 })
     );
     let (mut bob, _) = login(addr, "bob", true).await;
     let (mut dave, hello) = login(addr, "dave", false).await;
@@ -426,4 +439,201 @@ async fn a_resumed_session_still_reacts_and_reads_reactions() {
     assert_eq!(react(&mut alice, json!({ "line": line }), "👋").await, 1);
     let seen = shown(&mut alice, 0, line).await;
     assert_eq!(seen["reactions_mine"], json!([0]), "{seen}");
+}
+
+/// The next `reactions_changed` naming `target`, and what it said of it.
+async fn changed(c: &mut Client, target: &Value) -> (Value, Value) {
+    let t = target.clone();
+    let names = move |d: &Value| {
+        d["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["target"] == t)
+    };
+    let ev = c.event_where("reactions_changed", names).await.unwrap();
+    let group = (ev.data["changes"].as_array().unwrap().iter())
+        .find(|g| g["target"] == *target)
+        .unwrap()
+        .clone();
+    (ev.data, group)
+}
+
+/// A reaction is told as it happens to everyone reading the line who
+/// declared `reactions`: one batch for what changed together, each
+/// reader's own keys its own, and nothing to a reader that did not ask.
+#[tokio::test]
+async fn a_reaction_is_told_live_to_the_readers_in_one_batch() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut erin, _) = login(addr, "erin", true).await;
+    let (mut dave, _) = login(addr, "dave", false).await;
+    let line = say(&mut alice, json!({ "text": "pizza?" })).await;
+    let target = json!({ "line": line });
+    react(&mut erin, target.clone(), "👍").await;
+    react(&mut erin, target.clone(), "🍕").await;
+    let keys = json!([
+        { "key": { "emoji": "👍" }, "count": 1 },
+        { "key": { "emoji": "🍕" }, "count": 1 },
+    ]);
+    for c in [&mut alice, &mut bob] {
+        let (_, group) = changed(c, &target).await;
+        assert_eq!(
+            group,
+            json!({ "target": target, "action": "summary", "keys": keys })
+        );
+    }
+    let (_, group) = changed(&mut erin, &target).await;
+    assert_eq!(group["mine"], json!([0, 1]));
+
+    // The next change is a batch of its own.
+    react(&mut bob, target.clone(), "👍").await;
+    let (_, group) = changed(&mut alice, &target).await;
+    assert_eq!(group["keys"][0]["count"], 2);
+    ok(&mut dave, "ping", json!({})).await;
+    assert!(
+        dave.rx
+            .take_backlog()
+            .iter()
+            .all(|e| e.ev != "reactions_changed"),
+        "a reader that did not declare reactions"
+    );
+}
+
+/// A room's changes reach its members, never the lobby or a reader
+/// outside it; a moderator's clear is told as one, and nobody else may
+/// clear.
+#[tokio::test]
+async fn a_rooms_reactions_stay_in_the_room_and_a_moderator_clears_them() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut boss, _) = login(addr, "boss", true).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut carol, _) = login(addr, "carol", true).await;
+    let room = ok(&mut boss, "room_create", json!({ "name": "den" })).await["room"]["id"]
+        .as_u64()
+        .unwrap();
+    ok(&mut alice, "room_join", json!({ "room": room })).await;
+    ok(&mut carol, "room_join", json!({ "room": room })).await;
+    let inside = say(&mut alice, json!({ "text": "in here", "room": room })).await;
+    let target = json!({ "line": inside, "room": room });
+    react(&mut alice, target.clone(), "👀").await;
+    changed(&mut carol, &target).await;
+    changed(&mut alice, &target).await;
+    // Bob reads the lobby: its next batch is the first he hears.
+    let lobby = say(&mut alice, json!({ "text": "out here" })).await;
+    let out = json!({ "line": lobby });
+    react(&mut alice, out.clone(), "👋").await;
+    let (data, _) = changed(&mut bob, &out).await;
+    assert_eq!(data["changes"].as_array().unwrap().len(), 1, "{data}");
+    for e in bob.rx.take_backlog() {
+        assert_ne!(e.ev, "reactions_changed", "{e:?}");
+    }
+
+    let clear = json!({ "target": target, "clear": true });
+    assert_eq!(
+        refused(&mut alice, "react", clear.clone()).await,
+        "access_denied"
+    );
+    let with_key = json!({ "target": target, "clear": true, "key": { "emoji": "👀" } });
+    assert_eq!(refused(&mut carol, "react", with_key).await, "bad_request");
+    assert_eq!(ok(&mut carol, "react", clear).await, json!({}));
+    let (_, group) = changed(&mut alice, &target).await;
+    assert_eq!(group, json!({ "target": target, "action": "clear" }));
+    assert!(shown(&mut alice, room, inside)
+        .await
+        .get("reactions")
+        .is_none());
+}
+
+/// An instant message's reaction goes to the conversation's other party
+/// as a change, and to nobody else; to a stranger there is no such
+/// target.
+#[tokio::test]
+async fn an_im_reaction_reaches_its_party_and_not_a_stranger() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let messenger = |who: &'static str| async move {
+        let mut c = Client::connect(addr).await.unwrap();
+        c.login(json!({
+            "login": who, "password": "pw", "nick": who,
+            "reactions": true, "messaging": true,
+        }))
+        .await
+        .unwrap();
+        ok(&mut c, "friends", json!({})).await;
+        c
+    };
+    let (mut alice, mut bob, mut erin) = (
+        messenger("alice").await,
+        messenger("bob").await,
+        messenger("erin").await,
+    );
+    ok(&mut alice, "friend_add", json!({ "login": "bob" })).await;
+    bob.event_where("friend_request", |d| d["login"] == "alice")
+        .await
+        .unwrap();
+    ok(
+        &mut bob,
+        "friend_respond",
+        json!({ "login": "alice", "accept": true }),
+    )
+    .await;
+    let target =
+        json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let params = json!({ "target": target, "with": "bob", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(ok(&mut alice, "react", params).await, json!({}));
+    let (_, group) = changed(&mut bob, &target).await;
+    assert_eq!(
+        group,
+        json!({ "target": target, "action": "add", "key": { "emoji": "❤\u{FE0F}" }, "from": { "login": "alice" } })
+    );
+
+    let stranger = json!({ "target": target, "with": "erin", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(refused(&mut alice, "react", stranger).await, "bad_request");
+    let erins =
+        json!({ "im": { "login": "erin", "guid": "5f5e1000-1234-4abc-89ab-000000000002" } });
+    let stranger = json!({ "target": erins, "with": "erin", "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(
+        refused(&mut alice, "react", stranger).await,
+        "no_such_target"
+    );
+    let unnamed = json!({ "target": erins, "key": { "emoji": "❤\u{FE0F}" } });
+    assert_eq!(refused(&mut alice, "react", unnamed).await, "bad_request");
+    ok(&mut erin, "ping", json!({})).await;
+    assert!(erin
+        .rx
+        .take_backlog()
+        .iter()
+        .all(|e| e.ev != "reactions_changed"));
+}
+
+/// A batch sent while a session is detached is held for it like any
+/// other event, and replayed in order at its resume.
+#[tokio::test]
+async fn a_batch_while_detached_is_replayed_gaplessly() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let line = say(&mut alice, json!({ "text": "back soon" })).await;
+    bob.event_where("chat", |d| d["id"] == line).await.unwrap();
+    let (session, last_seq) = (bob.session.clone().unwrap(), bob.rx.last_seq);
+    bob.close().await.unwrap();
+    let target = json!({ "line": line });
+    react(&mut alice, target.clone(), "👍").await;
+    changed(&mut alice, &target).await;
+    let (mut bob, resumed) = Client::resume(addr, session, last_seq, Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(resumed, Resumed::Replayed(n) if n > 0),
+        "{resumed:?}"
+    );
+    let (_, group) = changed(&mut bob, &target).await;
+    assert_eq!(group["keys"][0]["count"], 1);
+    assert!(bob.rx.seq_faults.is_empty(), "{:?}", bob.rx.seq_faults);
 }

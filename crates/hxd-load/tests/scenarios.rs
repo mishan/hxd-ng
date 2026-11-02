@@ -42,6 +42,9 @@ async fn start(dir: &Path, ng: &str) -> Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ngl.local_addr().unwrap(),
     };
+    if ctx.core.reaction_policy().is_some() {
+        tokio::spawn(hxd::reactions_flusher(ctx.core.clone()));
+    }
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_ng_session::serve(ngl, ng_ctx));
     server
@@ -195,6 +198,48 @@ async fn a_slow_consumer_is_measured_and_costs_the_room_nothing() {
         report.checks["slow.disconnected"].held + report.checks["slow.disconnected"].violated,
         2
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reaction_storm_is_told_a_batch_a_window_and_converges() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    // Its reactors react as fast as the run asks, so the server's own
+    // rate does not refuse them.
+    let reactions = format!(
+        "[history]\ndb = \"{d}/history.sqlite\"\n\
+         [reactions]\nenabled = true\nburst = 1000\nper_second = 1000\n"
+    );
+    let server = start(td.path(), &reactions).await;
+    let accounts = Accounts {
+        prefix: "react".into(),
+        count: 4,
+        password: "load-test".into(),
+    };
+    hxd_load::accounts::write(
+        &td.path().join("accounts"),
+        &accounts.prefix,
+        accounts.count,
+        &accounts.password,
+        None,
+    )
+    .unwrap();
+    let mut s = scenario(&server, Kind::Reactions, 3.0);
+    s.target.accounts = Some(accounts);
+    s.reactions.reactors = 4;
+    s.reactions.readers = 3;
+    s.reactions.stalled = 1;
+    s.reactions.rate = 40.0;
+    s.reactions.lines = 5;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    assert!(report.detail["reactions_sent"].as_u64().unwrap() > 40);
+    // Every reader and reactor, of every line.
+    assert_eq!(report.checks["reactions.converged"].held, 7 * 5);
+    assert!(report.checks["reactions.one_per_window"].held > 0);
+    assert_eq!(report.checks["ng.seq_gapless"].held, 7);
+    assert_eq!(report.checks["reactions.backlog_bounded"].held, 1);
+    assert!(report.checks["roster.no_ghosts"].held == 1);
 }
 
 /// A server like `start`'s, with a TLS port and a `[link]` keyed by

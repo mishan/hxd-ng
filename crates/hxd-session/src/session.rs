@@ -3267,6 +3267,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport shows roles, which this one does
         // not.
         Event::RolesChanged(_) | Event::RosterStale => {}
+        // Sent only where the transport declared reactions, which this
+        // one never does.
+        Event::ReactionsChanged(_) => {}
         // Sent only to a session that speaks the friend family, which on
         // this wire is one that negotiated bit 6.
         ev @ (Event::FriendEntry(_)

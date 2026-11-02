@@ -1480,6 +1480,12 @@ pub struct ReactionsSection {
     /// Whether a reader who may not post in a room may react there:
     /// `allow` or `deny`.
     pub read_only_rooms: AllowDeny,
+    /// Each room's most recent lines whose reactions are announced as
+    /// they change, 1 to 500.
+    pub live_window: usize,
+    /// Seconds a room's changes are gathered for, so that a session hears
+    /// at most one announcement a room in them, 1 to 60.
+    pub batch_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1499,6 +1505,8 @@ impl Default for ReactionsSection {
             burst: p.burst,
             per_second: p.per_second,
             read_only_rooms: AllowDeny::Allow,
+            live_window: p.live_window,
+            batch_seconds: p.batch.as_secs(),
         }
     }
 }
@@ -1514,12 +1522,21 @@ impl ReactionsSection {
         if self.burst == 0 || self.per_second == 0 {
             return Err("[reactions] burst and per_second must be above 0".into());
         }
+        if !(1..=hxd_core::reaction::MAX_LIVE_WINDOW).contains(&self.live_window) {
+            return Err("[reactions] live_window must be 1 to 500".into());
+        }
+        if !(1..=60).contains(&self.batch_seconds) {
+            return Err("[reactions] batch_seconds must be 1 to 60".into());
+        }
         Ok(hxd_core::ReactionPolicy {
             max_keys: self.max_keys,
             max_per_user: self.max_per_user,
             burst: self.burst,
             per_second: self.per_second,
             read_only_rooms: self.read_only_rooms == AllowDeny::Allow,
+            live_window: self.live_window,
+            batch: Duration::from_secs(self.batch_seconds),
+            ..hxd_core::ReactionPolicy::default()
         })
     }
 }
@@ -4492,6 +4509,34 @@ pub async fn presence_flusher(core: Arc<Core>) {
     }
 }
 
+/// Sends each room's reactions once its batch is due
+/// (`hxd_core::Core::reactions_flush`), measured on the core's clock, off
+/// the runtime's workers since a batch takes a room's serial and reads the
+/// log; and hourly gives up the instant-message reactions that have
+/// waited too long.
+pub async fn reactions_flusher(core: Arc<Core>) {
+    let wake = core.reactions_wake();
+    let mut prune = tokio::time::interval(Duration::from_secs(3600));
+    prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let c = core.clone();
+        let due = crate::spawn_blocking("reactions", move || c.reactions_flush(c.clock().now()))
+            .await
+            .unwrap_or(None);
+        let wait = due.map(|due| due.saturating_duration_since(core.clock().now()));
+        tokio::select! {
+            _ = async {
+                match wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = wake.notified() => {}
+            _ = prune.tick() => core.reactions_prune(),
+        }
+    }
+}
+
 /// Delete the device rows whose certificates have expired. Skipping it
 /// costs rows and never a wrong push: the gateway compares expiry
 /// itself, so a lapsed device stops being sent to the moment it lapses
@@ -4732,7 +4777,14 @@ pub fn build_ctx(
         _ => return Err("[history] store was not opened".into()),
     };
     let core = match config.reactions.as_ref().filter(|r| r.enabled) {
-        Some(reactions) => core.with_reactions(reactions.policy()?),
+        Some(reactions) => {
+            let mut policy = reactions.policy()?;
+            // An instant message's reactions wait as long as it would.
+            if let Some(inbox) = &config.inbox {
+                policy.im_keep = Duration::from_secs(inbox.retain_unread);
+            }
+            core.with_reactions(policy)
+        }
         None => core,
     };
     // After the log, whose channels no room's id may be.
@@ -5409,6 +5461,18 @@ sync = "full"
             (
                 "[reactions]\nper_second = 0\n".into(),
                 Some("must be above 0"),
+            ),
+            (
+                "[reactions]\nlive_window = 500\nbatch_seconds = 60\n".into(),
+                None,
+            ),
+            (
+                "[reactions]\nlive_window = 501\n".into(),
+                Some("live_window must be 1 to 500"),
+            ),
+            (
+                "[reactions]\nbatch_seconds = 0\n".into(),
+                Some("batch_seconds must be 1 to 60"),
             ),
         ] {
             let checked = check_config(&parse(&toml).unwrap());

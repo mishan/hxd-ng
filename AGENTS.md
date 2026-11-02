@@ -392,7 +392,11 @@ Three layers, all `cargo test --workspace`:
   (`react` on a lobby and a room line, counted per account and shown on
   `history` to readers that declared `reactions` alone, the caps, a
   guest and an account that may not chat refused, the per-account rate,
-  and a redaction and a purge taking them) and
+  and a redaction and a purge taking them; `reactions_changed` heard
+  live in one batch by the readers that declared it, a room's by its
+  members alone, a moderator's clear, an instant message's reaction
+  reaching its party and not a stranger, and a batch held for a
+  detached session replayed at its resume) and
   `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from

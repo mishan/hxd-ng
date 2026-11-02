@@ -1,8 +1,9 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
-//! line, and a line's reactions on the `history` that shows it, to
-//! sessions that declared it.
+//! line or an instant message, a moderator's clear, a line's reactions on
+//! the `history` that shows it, and `reactions_changed`, to sessions that
+//! declared it.
 
-use hxd_core::{ReactError, ReactionKey, Reactions, Reply};
+use hxd_core::{ReactError, ReactionChange, ReactionKey, Reactions, Reply};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -11,12 +12,14 @@ use crate::proto::{reply_err, reply_err_retry, reply_ok};
 use crate::NgCtx;
 
 /// The kinds of target this server takes reactions on: a line where
-/// lines are kept.
+/// lines are kept, and an instant message where they are sent.
 pub(crate) fn targets(ctx: &NgCtx) -> Vec<&'static str> {
-    match ctx.core.reaction_policy() {
-        Some(_) => vec!["line"],
-        None => Vec::new(),
-    }
+    let core = &ctx.core;
+    let on = core.reaction_policy().is_some();
+    [("line", on), ("im", on && core.messaging_enabled())]
+        .into_iter()
+        .filter_map(|(kind, taken)| taken.then_some(kind))
+        .collect()
 }
 
 /// The login reply's `reactions` block.
@@ -59,15 +62,102 @@ pub(crate) fn add(v: &mut Value, shown: Option<&Reactions>) {
     }
 }
 
+/// A change as `reactions_changed` carries it.
+pub(crate) fn change_json(change: &ReactionChange) -> Value {
+    match change {
+        ReactionChange::Summary { target, keys, mine } => {
+            let mut v = json!({
+                "target": crate::replies::json(target),
+                "action": "summary",
+                "keys": keys
+                    .iter()
+                    .map(|(k, n)| json!({ "key": key_json(k), "count": n }))
+                    .collect::<Vec<_>>(),
+            });
+            if !mine.is_empty() {
+                v["mine"] = json!(mine);
+            }
+            v
+        }
+        ReactionChange::Clear { target } => {
+            json!({ "target": crate::replies::json(target), "action": "clear" })
+        }
+        ReactionChange::Changed {
+            target,
+            key,
+            add,
+            from,
+        } => json!({
+            "target": crate::replies::json(target),
+            "action": if *add { "add" } else { "remove" },
+            "key": key_json(key),
+            "from": { "login": from },
+        }),
+    }
+}
+
 #[derive(Deserialize)]
 struct ReactParams {
     target: Value,
-    key: Value,
+    key: Option<Value>,
     #[serde(default)]
     remove: bool,
+    with: Option<String>,
+    #[serde(default)]
+    clear: bool,
 }
 
-/// `react`: one key added to, or with `remove` taken from, one line.
+/// What a well-formed `react` asks.
+enum Act {
+    Line {
+        room: u32,
+        line: u64,
+        key: ReactionKey,
+        add: bool,
+    },
+    Clear {
+        room: u32,
+        line: u64,
+    },
+    Im {
+        target: hxd_core::reply::ImTarget,
+        with: String,
+        key: ReactionKey,
+        add: bool,
+    },
+}
+
+/// `react`'s params, or the `bad_request` they earn: a key on every act
+/// but a clear, which is of a line and takes neither `remove` nor a key,
+/// and `with` on an `im` target alone.
+fn act(ctx: &NgCtx, p: ReactParams) -> Result<Act, &'static str> {
+    let target = crate::replies::parse(&p.target, &targets(ctx))
+        .ok_or("`target` names no kind this server takes.")?;
+    let emoji = |k: Option<Value>| k.as_ref().and_then(key).ok_or("`key` is not one emoji.");
+    match (target, p.clear, p.with) {
+        (Reply::Line { room, id }, true, None) if p.key.is_none() && !p.remove => {
+            Ok(Act::Clear { room, line: id })
+        }
+        (_, true, _) => Err("`clear` takes a line, and no key."),
+        (Reply::Line { room, id }, false, None) => Ok(Act::Line {
+            room,
+            line: id,
+            key: emoji(p.key)?,
+            add: !p.remove,
+        }),
+        (Reply::Im(target), false, Some(with)) => Ok(Act::Im {
+            target,
+            with,
+            key: emoji(p.key)?,
+            add: !p.remove,
+        }),
+        (Reply::Im(_), false, None) => Err("An `im` target needs `with`."),
+        _ => Err("`with` is for an `im` target."),
+    }
+}
+
+/// `react`: one key added to, or with `remove` taken from, one line or
+/// instant message, or with `clear` every key on a line.
 pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Value) -> String {
     if !state.reactions {
         return reply_err(id, "not_available", "Reactions are not available.");
@@ -75,28 +165,41 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
     let Ok(p) = serde_json::from_value::<ReactParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed react.");
     };
-    let Some(Reply::Line { room, id: line }) = crate::replies::parse(&p.target, &targets(ctx))
-    else {
-        return reply_err(
-            id,
-            "bad_request",
-            "`target` names no kind this server takes.",
-        );
-    };
-    let Some(key) = key(&p.key) else {
-        return reply_err(id, "bad_request", "`key` is not one emoji.");
+    let act = match act(ctx, p) {
+        Ok(act) => act,
+        Err(why) => return reply_err(id, "bad_request", why),
     };
     let uid = state.uid;
-    let reacted = off_reactor(&ctx.core, move |c| {
-        c.react(uid, room, line, &key, !p.remove)
+    let reacted = off_reactor(&ctx.core, move |c| match act {
+        Act::Line {
+            room,
+            line,
+            key,
+            add,
+        } => c.react(uid, room, line, &key, add).map(Some),
+        Act::Clear { room, line } => c.react_clear(uid, room, line).map(|()| None),
+        Act::Im {
+            target,
+            with,
+            key,
+            add,
+        } => c.react_im(uid, &target, &with, &key, add).map(|()| None),
     })
     .await;
     match reacted {
-        Some(Ok(count)) => reply_ok(id, json!({ "count": count })),
+        Some(Ok(Some(count))) => reply_ok(id, json!({ "count": count })),
+        Some(Ok(None)) => reply_ok(id, json!({})),
+        Some(Err(ReactError::OutOfScope)) => reply_err(
+            id,
+            "bad_request",
+            "An `im` target names the sender or `with`.",
+        ),
         Some(Err(ReactError::NotAllowed)) => {
             reply_err(id, "access_denied", "You may not react to that.")
         }
-        Some(Err(ReactError::NoSuchTarget)) => reply_err(id, "no_such_target", "No such line."),
+        Some(Err(ReactError::NoSuchTarget)) => {
+            reply_err(id, "no_such_target", "No such line or message.")
+        }
         Some(Err(ReactError::TooManyReactions)) => reply_err(
             id,
             "too_many_reactions",

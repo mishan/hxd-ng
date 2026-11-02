@@ -1079,6 +1079,11 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             ("typing", data)
         }
         Event::RequestsChanged { count } => ("requests_changed", json!({ "count": count })),
+        // Only ever to a session that declared `reactions` (§7.3).
+        Event::ReactionsChanged(changes) => (
+            "reactions_changed",
+            json!({ "changes": changes.iter().map(crate::reactions::change_json).collect::<Vec<_>>() }),
+        ),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.

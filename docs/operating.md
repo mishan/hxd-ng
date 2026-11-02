@@ -1262,7 +1262,28 @@ max_per_user = 5          # emoji one account may hold on one line, 1 to max_key
 burst = 10                # one account's reactions at once,
 per_second = 1            # then this many a second
 read_only_rooms = "allow" # or "deny": may a reader who may not post in a room react
+live_window = 200         # each room's most recent lines told live as they change, 1 to 500
+batch_seconds = 1         # a room's changes gathered for this long, 1 to 60
 ```
+
+A change to one of a room's `live_window` most recent lines is told to
+every session that declared `reactions` and reads the room, its
+members or the lobby's readers, gathered for `batch_seconds` into one
+`reactions_changed` a room: however many react, a session hears at most
+one a room a batch, so a crowded room costs each reader a few events a
+second at most and one that stops reading falls behind by batches
+rather than by reactions. Older lines, and lines from before a restart,
+are read again when a client shows them. The state behind it is a few
+hundred line ids a room, whatever the traffic. An instant message's
+reactions wait for a party with no session for as long as `[inbox]
+retain_unread` keeps mail, at most 100 for one account, in memory, so a
+restart forgets them. They wait only while the account has no attached
+session that declared `reactions`: once one is told, nothing is kept.
+One reactor filling an account's share gives up its own oldest rather
+than another's, the server holds so many for everyone at once, the
+oldest anywhere going first, and an hourly sweep gives up what has
+waited too long. They follow an account that links or rotates its
+identity, and go with one that is deleted, to it or from it.
 
 ### `[media]`
 

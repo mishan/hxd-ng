@@ -128,6 +128,8 @@ pub enum ActKind {
     Unban,
     /// A room deleted, its lines with it (`docs/chat-rooms.md` §2.4).
     RoomDelete,
+    /// Every reaction on a line taken (`crate::reaction`).
+    ClearReactions,
 }
 
 impl ActKind {
@@ -142,6 +144,7 @@ impl ActKind {
             ActKind::Ban => 7,
             ActKind::Unban => 8,
             ActKind::RoomDelete => 9,
+            ActKind::ClearReactions => 10,
         }
     }
 
@@ -156,6 +159,7 @@ impl ActKind {
             7 => ActKind::Ban,
             8 => ActKind::Unban,
             9 => ActKind::RoomDelete,
+            10 => ActKind::ClearReactions,
             _ => return None,
         })
     }
@@ -171,6 +175,7 @@ impl ActKind {
             ActKind::Ban => "ban",
             ActKind::Unban => "unban",
             ActKind::RoomDelete => "room_delete",
+            ActKind::ClearReactions => "reactions_clear",
         }
     }
 }
@@ -1279,12 +1284,14 @@ impl Core {
                 .lock()
                 .unwrap();
             let now = SystemTime::now();
+            let reacted = self.reacted_live(&ids);
             let mut gone = Vec::with_capacity(ids.len());
             for id in ids {
                 if log.tombstone(id, &acting.name, now)? {
                     gone.push(id);
                 }
             }
+            self.reactions_gone(&reacted);
             channel
                 .as_ref()
                 .map_or(&self.chat_commit, |c| &c.commit)

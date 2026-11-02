@@ -80,6 +80,7 @@ fn attach_from(core: &Core, who: Who, addr: Option<std::net::IpAddr>) -> (Uid, E
             transport: Transport {
                 inline_media: true,
                 redactions: true,
+                reactions: true,
                 ..Default::default()
             },
             has_inbox: false,
@@ -1264,4 +1265,87 @@ fn a_reaction_in_a_room_is_held_to_its_post_gate_and_its_archive() {
             Err(NotAllowed)
         );
     }
+}
+
+/// A room's reactions are told to its members, and to nobody in the
+/// lobby or outside it, whatever they could read in its history.
+#[test]
+fn a_rooms_reactions_are_told_to_its_members_alone() {
+    let core = reacting(Core::new());
+    let (boss, mut rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    let (alice, mut ralice) = attach(&core, member("alice"));
+    let (_, mut outside) = attach(&core, manager("ops"));
+    core.room_join(alice, room).unwrap();
+    let line = say(&core, boss, room, "here").unwrap().unwrap();
+    let lobby = say(&core, boss, 0, "there").unwrap().unwrap();
+    for rx in [&mut rboss, &mut ralice, &mut outside] {
+        drain(rx);
+    }
+    core.react(alice, room, line, &thumbs(), true).unwrap();
+    let due = core.reactions_flush(core.clock.now()).unwrap();
+    core.reactions_flush(due);
+    let told = |rx: &mut Events| -> Vec<crate::reply::Reply> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::ReactionsChanged(changes) => Some(changes),
+                _ => None,
+            })
+            .flatten()
+            .map(|c| match c {
+                crate::ReactionChange::Summary { target, .. } => target,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    let here = crate::reply::Reply::Line { room, id: line };
+    assert_eq!(told(&mut rboss), std::slice::from_ref(&here));
+    assert_eq!(told(&mut ralice), [here]);
+    assert!(told(&mut outside).is_empty(), "not a member");
+
+    core.react(alice, 0, lobby, &thumbs(), true).unwrap();
+    let due = core.reactions_flush(core.clock.now()).unwrap();
+    core.reactions_flush(due);
+    let there = crate::reply::Reply::Line { room: 0, id: lobby };
+    assert_eq!(told(&mut outside), std::slice::from_ref(&there));
+    assert_eq!(told(&mut ralice), [there]);
+}
+
+/// A member that joined after a line, without history's bit, is told
+/// nothing of that line's reactions.
+#[test]
+fn a_late_joiner_is_not_told_of_a_line_from_before_it_came() {
+    let core = reacting(Core::new());
+    let (boss, mut rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    let line = say(&core, boss, room, "early").unwrap().unwrap();
+    let (alice, mut ralice) = attach(&core, member("alice"));
+    core.room_join(alice, room).unwrap();
+    drain(&mut rboss);
+    drain(&mut ralice);
+    core.react(boss, room, line, &thumbs(), true).unwrap();
+    let due = core.reactions_flush(core.clock.now()).unwrap();
+    core.reactions_flush(due);
+    let heard = |rx: &mut Events| {
+        drain(rx)
+            .iter()
+            .any(|e| matches!(e, Event::ReactionsChanged(_)))
+    };
+    assert!(heard(&mut rboss));
+    assert!(!heard(&mut ralice), "joined after it");
+
+    // An archive is told nothing more, and owes nothing.
+    core.react(
+        boss,
+        room,
+        line,
+        &crate::ReactionKey::emoji("\u{1F389}").unwrap(),
+        true,
+    )
+    .unwrap();
+    core.room_archive(boss, room, true).unwrap();
+    assert_eq!(core.reactions_flush(core.clock.now()), None);
 }

@@ -25,6 +25,8 @@
 //!   there are more of them.
 //! - **L-7** [`moderation`]: kicks and bans of ghosts while the room
 //!   talks.
+//! - **R-1** [`reactions`]: a reaction storm on the room's recent lines
+//!   while others read, some of them not at all.
 
 pub mod accounts;
 pub mod chat;
@@ -36,6 +38,7 @@ pub mod ledger;
 pub mod member;
 pub mod moderation;
 pub mod proxy;
+pub mod reactions;
 pub mod report;
 pub mod requests;
 pub mod slow;
@@ -163,6 +166,7 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
         }
         Kind::Requests => requests::run(&ctx, proxy.as_ref()).await?,
         Kind::Moderation => moderation::run(&ctx).await?,
+        Kind::Reactions => reactions::run(&ctx).await?,
     };
 
     // Everyone this run brought has left; every roster should say so.

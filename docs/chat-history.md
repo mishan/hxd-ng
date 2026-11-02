@@ -604,6 +604,8 @@ max_per_user = 5       # keys one account may hold on one line
 burst = 10             # one account's reactions at once,
 per_second = 1         # and how many a second it earns back
 read_only_rooms = "allow"  # or "deny": may a reader who may not post react
+live_window = 200      # each room's most recent lines told live as they change
+batch_seconds = 1      # how long a room's changes are gathered for
 ```
 
 The section's presence is what turns history on, and it is a startup

@@ -536,6 +536,10 @@ impl RosterInner {
         let rooms: Vec<u32> = self.rooms.keys().copied().collect();
         for room in rooms {
             let entry = &self.rooms[&room];
+            if entry.room.archived_at.is_some() || entry.room.deleted {
+                self.live.forget_room(room);
+            }
+            let entry = &self.rooms[&room];
             let (stay, lost): (Vec<Uid>, Vec<Uid>) = entry
                 .members
                 .iter()
