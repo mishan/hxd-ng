@@ -954,6 +954,60 @@ fn an_im_is_handed_to_a_friend_and_again_until_it_is_acknowledged() {
 }
 
 #[test]
+fn an_im_written_as_the_recipients_roster_read_runs_is_handed_over_live() {
+    let rel = Arc::new(MemoryRelationships::new());
+    let store = Arc::new(crate::chat::inbox_tests::RacyStore::over(
+        MemoryStore::gated(rel.clone()),
+    ));
+    let dir = Directory(
+        ["alice", "bob"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let core = Arc::new(
+        Core::new()
+            .with_inbox(store.clone(), Arc::new(dir), InboxPolicy::default())
+            .with_relationships(rel)
+            .with_messaging(policy()),
+    );
+    let (a, mut ra) = messenger(&core, "alice");
+    let (b, mut rb) = messenger(&core, "bob");
+    core.friend_add(a, "bob", None).unwrap();
+    core.friend_respond(b, "alice", true).unwrap();
+    drain(&mut ra);
+    drain(&mut rb);
+
+    // Bob's client reads its roster once its login reply is out, which is
+    // when it can be sent to. Given the chance, that read runs between the
+    // write and the sender's own hand-over.
+    let weak = Arc::downgrade(&core);
+    let roster_read: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let slot = roster_read.clone();
+    *store.during_push.lock().unwrap() = Some(Box::new(move || {
+        let (done, ran) = std::sync::mpsc::channel();
+        let core = weak.upgrade().expect("core outlives the store call");
+        *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+            core.friends_roster(b).unwrap();
+            let _ = done.send(());
+        }));
+        let _ = ran.recv_timeout(Duration::from_millis(200));
+    }));
+
+    let sent = core
+        .im_send(a, "bob", "right here".into(), None, None)
+        .unwrap();
+    let read = roster_read.lock().unwrap().take().expect("pushed");
+    read.join().unwrap();
+    assert!(sent.delivered, "bob was attached the whole time");
+    assert_eq!(
+        ims(&drain(&mut rb)).first(),
+        Some(&("right here".into(), false)),
+        "and was handed it as it was sent"
+    );
+}
+
+#[test]
 fn an_im_is_refused_to_anyone_but_a_friend() {
     let p = MessagingPolicy {
         max_message_bytes: 8,
