@@ -1,9 +1,10 @@
 //! Reactions on the ng wire (`docs/hotline-ng.md` §7.3): `react` on a
 //! lobby or a room line, held to its caps, its rate and who may react,
 //! counted on `history` for the sessions that declared `reactions`, told
-//! live in `reactions_changed` batches to a room's readers, and taken by
-//! a redaction and a purge, between scripted clients on a real server.
-//! Emoji in the test data are the reactions themselves.
+//! live in `reactions_changed` batches to a room's readers, cleared by a
+//! moderator and taken by a redaction and a purge, between scripted
+//! clients on a real server. Emoji in the test data are the reactions
+//! themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -564,4 +565,143 @@ async fn a_batch_while_detached_is_replayed_gaplessly() {
     let (_, group) = changed(&mut bob, &target).await;
     assert_eq!(group["keys"][0]["count"], 1);
     assert!(bob.rx.seq_faults.is_empty(), "{:?}", bob.rx.seq_faults);
+}
+
+/// A clear is a moderator's, of a line there is, in the room named,
+/// with a reason and nothing beside it but its target; a room's is
+/// heard by the room's members alone, and each is in the moderation log
+/// with the counts it took.
+#[tokio::test]
+async fn a_clear_is_a_moderators_on_a_line_it_reads() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut carol, _) = login(addr, "carol", true).await;
+    let (mut boss, _) = login(addr, "boss", true).await;
+    let lobby = say(&mut alice, json!({ "text": "lobby" })).await;
+    let gone = say(&mut alice, json!({ "text": "gone" })).await;
+    react(&mut alice, json!({ "line": lobby }), "👍").await;
+    ok(&mut carol, "redact", json!({ "id": gone, "reason": "no" })).await;
+    let den = ok(&mut boss, "room_create", json!({ "name": "den" })).await["room"]["id"]
+        .as_u64()
+        .unwrap();
+    for c in [&mut alice, &mut carol] {
+        ok(c, "room_join", json!({ "room": den })).await;
+    }
+    let inside = say(&mut alice, json!({ "text": "den", "room": den })).await;
+    let den_line = json!({ "line": inside, "room": den });
+    react(&mut alice, den_line.clone(), "👀").await;
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let key = json!({ "emoji": "👍" });
+    for (case, moderator, params, code) in [
+        (
+            "not a moderator",
+            false,
+            json!({ "target": { "line": lobby }, "clear": true, "reason": "spam" }),
+            "access_denied",
+        ),
+        (
+            "with a key",
+            true,
+            json!({ "target": { "line": lobby }, "clear": true, "reason": "spam", "key": key }),
+            "bad_request",
+        ),
+        (
+            "with remove",
+            true,
+            json!({ "target": { "line": lobby }, "clear": true, "reason": "spam", "remove": true }),
+            "bad_request",
+        ),
+        (
+            "an instant message",
+            true,
+            json!({ "target": im, "clear": true, "reason": "spam" }),
+            "bad_request",
+        ),
+        (
+            "a tombstone",
+            true,
+            json!({ "target": { "line": gone }, "clear": true, "reason": "spam" }),
+            "no_such_target",
+        ),
+        (
+            "never said",
+            true,
+            json!({ "target": { "line": lobby + 1000 }, "clear": true, "reason": "spam" }),
+            "no_such_target",
+        ),
+        (
+            "named in another room",
+            true,
+            json!({ "target": { "line": lobby, "room": den }, "clear": true, "reason": "spam" }),
+            "no_such_target",
+        ),
+        (
+            "no reason",
+            true,
+            json!({ "target": { "line": lobby }, "clear": true }),
+            "bad_request",
+        ),
+        (
+            "a reason without a clear",
+            true,
+            json!({ "target": { "line": lobby }, "key": key, "reason": "spam" }),
+            "bad_request",
+        ),
+    ] {
+        let who = if moderator { &mut carol } else { &mut alice };
+        assert_eq!(refused(who, "react", params).await, code, "{case}");
+    }
+
+    // The den's members hear its clear; bob, in the lobby alone, hears
+    // the lobby's and nothing of the den's.
+    let clear = |target: &Value| json!({ "target": target, "clear": true, "reason": "spam" });
+    let out = json!({ "line": lobby });
+    changed(&mut bob, &out).await;
+    changed(&mut alice, &den_line).await;
+    ok(&mut carol, "react", clear(&den_line)).await;
+    let (_, group) = changed(&mut alice, &den_line).await;
+    assert_eq!(group["action"], "clear");
+    ok(&mut carol, "react", clear(&out)).await;
+    let (_, group) = changed(&mut bob, &out).await;
+    assert_eq!(group["action"], "clear");
+    for e in bob.rx.take_backlog() {
+        if e.ev == "reactions_changed" {
+            for g in e.data["changes"].as_array().unwrap() {
+                assert_eq!(g["target"], out, "{e:?}");
+            }
+        }
+    }
+    assert!(shown(&mut alice, den, inside)
+        .await
+        .get("reactions")
+        .is_none());
+    let log = ok(&mut carol, "moderation_log", json!({})).await;
+    let mut clears: Vec<_> = (log["entries"].as_array().unwrap().iter())
+        .filter(|e| e["kind"] == "reactions_clear")
+        .map(|e| {
+            (
+                e["target"]["line"].clone(),
+                e["reason"].clone(),
+                e["evidence"].clone(),
+            )
+        })
+        .collect();
+    clears.sort_by_key(|c| c.0.as_u64());
+    assert_eq!(
+        clears,
+        [
+            (
+                json!(lobby),
+                json!("spam"),
+                json!(format!("#{lobby}: 👍 1"))
+            ),
+            (
+                json!(inside),
+                json!("spam"),
+                json!(format!("#{inside}: 👀 1"))
+            ),
+        ]
+    );
 }

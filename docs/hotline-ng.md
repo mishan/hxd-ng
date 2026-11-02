@@ -669,7 +669,7 @@ family document. Each family of §4 adds its own.
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
-| `react` | `target`, `key`, `remove?` (§7.3) | `{ "count" }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `bad_request`, `rate_limited` |
+| `react` | `target`, `key`, `remove?`; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
 | `msg_read` | `up_to` (message cursor) | `{ "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
@@ -864,7 +864,7 @@ family document. Each family of §4 adds its own.
     stands when the batch is sent, `keys` as on `history` and `mine` this
     reader's indexes into them, absent when empty, and `keys` empty once
     the last reaction is taken away; or `{ "target", "action": "clear" }`
-    for a redaction, and for nothing else. A
+    for a moderator's clear or a redaction, and for nothing else. A
     summary names no reactor. Only a room's most recent lines are told
     (*hxd-ng:* `[reactions] live_window`, and `batch_seconds` for the
     batch); a client reads an older line's again with `history` when it
@@ -874,6 +874,15 @@ family document. Each family of §4 adds its own.
     room's next batch, to a wire that shows redactions, a purge as the lines it took
     someone's from now stand, and neither more than once a batch however
     many lines it took.
+  - **`clear: true`**, with a `line` target, a `reason` and no `key` or
+    `remove`, takes every reaction on the line, for a moderator alone
+    (*hxd-ng:* the `moderate` permission, as `redact` asks, and the line
+    one the moderator could have read), and answers `{}`. It is told as a
+    clear and recorded in the moderation trail (moderation.md §3.1).
+    From anyone else, and on a server that keeps no moderation trail, it
+    is `access_denied`; on the line of someone the moderator may not
+    moderate (moderation.md §2), `protected`; without a reason,
+    `bad_request`. A `reason` on any other act is `bad_request`.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event

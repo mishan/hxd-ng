@@ -406,8 +406,8 @@ Three layers, all `cargo test --workspace`:
   guest and an account that may not chat refused, the per-account rate,
   and a redaction and a purge taking them; `reactions_changed` heard
   live in one batch by the readers that declared it, a room's by its
-  members alone, and a batch held for a detached session replayed at
-  its resume), `structured_chat.rs`
+  members alone, a moderator's clear, and a batch held for a detached
+  session replayed at its resume), `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
   the same bytes as its 700 entry, Mac Roman and UTF-8 entries, an

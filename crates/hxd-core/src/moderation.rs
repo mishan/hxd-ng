@@ -33,6 +33,8 @@ use crate::news::{ArticleId, Author, NewsError};
 use crate::roster::{reads_public_chat, Core, Event, Uid, UserSession};
 
 pub mod conformance;
+#[cfg(test)]
+pub(crate) mod faulty;
 mod memory;
 
 pub use memory::MemoryModeration;
@@ -128,6 +130,8 @@ pub enum ActKind {
     Unban,
     /// A room deleted, its lines with it (`docs/chat-rooms.md` §2.4).
     RoomDelete,
+    /// Every reaction on a line taken (`crate::reaction`).
+    ReactionsClear,
 }
 
 impl ActKind {
@@ -142,6 +146,7 @@ impl ActKind {
             ActKind::Ban => 7,
             ActKind::Unban => 8,
             ActKind::RoomDelete => 9,
+            ActKind::ReactionsClear => 10,
         }
     }
 
@@ -156,6 +161,7 @@ impl ActKind {
             7 => ActKind::Ban,
             8 => ActKind::Unban,
             9 => ActKind::RoomDelete,
+            10 => ActKind::ReactionsClear,
             _ => return None,
         })
     }
@@ -171,6 +177,7 @@ impl ActKind {
             ActKind::Ban => "ban",
             ActKind::Unban => "unban",
             ActKind::RoomDelete => "room_delete",
+            ActKind::ReactionsClear => "reactions_clear",
         }
     }
 }
@@ -225,7 +232,7 @@ impl Act {
         }
     }
 
-    fn about(mut self, who: &Subject) -> Self {
+    pub(crate) fn about(mut self, who: &Subject) -> Self {
         self.login = who.login.clone();
         self.fingerprint = who.fingerprint;
         self
@@ -279,7 +286,7 @@ impl Subject {
         }
     }
 
-    fn of_line(line: &LogLine) -> Self {
+    pub(crate) fn of_line(line: &LogLine) -> Self {
         Subject {
             login: line.from_login.clone(),
             fingerprint: line.from_fingerprint,
@@ -724,7 +731,7 @@ fn days(n: u32) -> Duration {
 
 /// A reason: required, and bounded. "No reason" is a legitimate reason,
 /// but it has to be typed (§3).
-fn reason(text: &str, max: usize) -> Result<String, ModError> {
+pub(crate) fn reason(text: &str, max: usize) -> Result<String, ModError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(ModError::BadRequest("A reason is required."));

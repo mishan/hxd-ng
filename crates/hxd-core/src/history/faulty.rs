@@ -206,6 +206,13 @@ impl ChatLog for FaultyLog {
         self.inner.reactors_on(ids)
     }
 
+    fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
+        self.fails("clear_reactions")?;
+        let out = self.inner.clear_reactions(channel, line);
+        self.park("clear_reactions");
+        out
+    }
+
     fn tombstone_all(
         &self,
         ids: &[LineId],
