@@ -1,14 +1,14 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
 //! line or an instant message, a moderator's clear, a line's reactions on
-//! the `history` that shows it, and `reactions_changed`, to sessions that
-//! declared it.
+//! the `history` that shows it, `reactions` to read them again and who
+//! reacted, and `reactions_changed`, to sessions that declared it.
 
-use hxd_core::{ReactError, ReactionChange, ReactionKey, Reactions, Reply};
+use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, Reactions, Reply};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::conn::{off_reactor, retry_secs, SessState};
-use crate::proto::{reply_err, reply_err_retry, reply_ok};
+use crate::proto::{reply_err, reply_err_retry, reply_ok, ReqEnvelope};
 use crate::NgCtx;
 
 /// The kinds of target this server takes reactions on: a line where
@@ -45,6 +45,12 @@ fn key_json(key: &ReactionKey) -> Value {
     }
 }
 
+fn keys_json(keys: &[(ReactionKey, u32)]) -> Value {
+    keys.iter()
+        .map(|(k, n)| json!({ "key": key_json(k), "count": n }))
+        .collect()
+}
+
 /// Put a line's reactions on its `history` line, for a reader that
 /// declared `reactions`: the keys and counts every reader shares, and the
 /// reader's own as indexes into them, each left off when empty.
@@ -52,11 +58,7 @@ pub(crate) fn add(v: &mut Value, shown: Option<&Reactions>) {
     let Some(shown) = shown.filter(|s| !s.keys.is_empty()) else {
         return;
     };
-    v["reactions"] = shown
-        .keys
-        .iter()
-        .map(|(k, n)| json!({ "key": key_json(k), "count": n }))
-        .collect();
+    v["reactions"] = keys_json(&shown.keys);
     if !shown.mine.is_empty() {
         v["reactions_mine"] = json!(shown.mine);
     }
@@ -69,10 +71,7 @@ pub(crate) fn change_json(change: &ReactionChange) -> Value {
             let mut v = json!({
                 "target": crate::replies::json(target),
                 "action": "summary",
-                "keys": keys
-                    .iter()
-                    .map(|(k, n)| json!({ "key": key_json(k), "count": n }))
-                    .collect::<Vec<_>>(),
+                "keys": keys_json(keys),
             });
             if !mine.is_empty() {
                 v["mine"] = json!(mine);
@@ -229,9 +228,142 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
     }
 }
 
+/// The kinds of target `reactions` answers, of those the login block
+/// lists: an instant message is never kept to be read again.
+const ASKED: &[&str] = &["line"];
+
+/// The most targets one `reactions` names.
+const TARGETS_MAX: usize = 50;
+
+/// What the targets `reactions` names add to its price: one for each
+/// ten, so that one full request costs what a few small ones do.
+pub(crate) fn targets_weight(req: &ReqEnvelope) -> u32 {
+    if req.req != "reactions" {
+        return 0;
+    }
+    let n = req.params.get("targets").and_then(Value::as_array);
+    u32::try_from(n.map_or(0, Vec::len).div_ceil(10)).unwrap_or(u32::MAX)
+}
+
+#[derive(Deserialize)]
+struct AskedParams {
+    targets: Vec<Value>,
+    key: Option<Value>,
+}
+
+/// `reactions`' params, its targets of the kinds of `taken` it answers,
+/// or the `bad_request` they earn.
+fn asked_params(
+    taken: &[&str],
+    p: AskedParams,
+) -> Result<(Vec<Reply>, Option<ReactionKey>), &'static str> {
+    if !(1..=TARGETS_MAX).contains(&p.targets.len()) {
+        return Err("`targets` takes 1 to 50 targets.");
+    }
+    let kinds: Vec<&str> = taken
+        .iter()
+        .copied()
+        .filter(|k| ASKED.contains(k))
+        .collect();
+    let targets = (p.targets.iter())
+        .map(|t| crate::replies::parse(t, &kinds))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("`targets` names a kind `reactions` does not answer.")?;
+    let key = match p.key {
+        None => None,
+        Some(_) if targets.len() != 1 => return Err("`key` goes with one target."),
+        Some(k) => Some(key(&k).ok_or("`key` is not one emoji.")?),
+    };
+    Ok((targets, key))
+}
+
+fn asked_json(a: &Asked) -> Value {
+    let mut v = json!({
+        "target": crate::replies::json(&a.target),
+        "keys": keys_json(&a.shown.keys),
+    });
+    if !a.shown.mine.is_empty() {
+        v["mine"] = json!(a.shown.mine);
+    }
+    if let Some(from) = &a.from {
+        v["from"] = from.iter().map(|nick| json!({ "nick": nick })).collect();
+    }
+    v
+}
+
+/// `reactions`: the reactions on each target this session could have
+/// read, and with `key` and one target who holds that key, by nick.
+pub(crate) async fn asked(ctx: &NgCtx, state: &SessState, id: u64, params: &Value) -> String {
+    if !state.reactions {
+        return reply_err(id, "not_available", "Reactions are not available.");
+    }
+    let Ok(p) = serde_json::from_value::<AskedParams>(params.clone()) else {
+        return reply_err(id, "bad_request", "Malformed reactions.");
+    };
+    let (targets, key) = match asked_params(&targets(ctx), p) {
+        Ok(asked) => asked,
+        Err(why) => return reply_err(id, "bad_request", why),
+    };
+    let uid = state.uid;
+    match off_reactor(&ctx.core, move |c| {
+        c.reactions_asked(uid, &targets, key.as_ref())
+    })
+    .await
+    {
+        Some(Ok(asked)) => {
+            let shown: Vec<_> = asked.iter().map(asked_json).collect();
+            reply_ok(id, json!({ "reactions": shown }))
+        }
+        Some(Err(e)) => {
+            tracing::warn!("chat log would not read reactions: {e}");
+            reply_err(id, "server_error", "Server error.")
+        }
+        None => reply_err(id, "server_error", "Server error."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One to fifty targets of a kind `reactions` answers, and a key
+    /// beside one alone, an emoji; anything else is refused.
+    #[test]
+    fn get_reactions_params_take_one_to_fifty_line_targets() {
+        let taken = ["line", "im"];
+        let line = json!({ "line": 7 });
+        let im =
+            json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+        let thumbs = json!({ "emoji": "👍" });
+        let parse = |targets: Vec<Value>, key: Option<Value>| {
+            asked_params(&taken, AskedParams { targets, key })
+        };
+        let lines = |n: usize| vec![line.clone(); n];
+        let (fifty, none) = parse(lines(50), None).unwrap();
+        assert_eq!((fifty.len(), none), (50, None));
+        let (one, key) = parse(lines(1), Some(thumbs.clone())).unwrap();
+        assert_eq!(one, [Reply::Line { room: 0, id: 7 }]);
+        assert_eq!(key, ReactionKey::emoji("👍"));
+        for (case, targets, key) in [
+            ("none", lines(0), None),
+            ("fifty-one", lines(51), None),
+            ("an instant message", vec![im], None),
+            (
+                "a message",
+                vec![json!({ "pm": "AAAAAAAAAAAAAAAAAAAAAA" })],
+                None,
+            ),
+            ("malformed", vec![json!({ "line": "seven" })], None),
+            ("a key beside two", lines(2), Some(thumbs.clone())),
+            (
+                "a key that is no emoji",
+                lines(1),
+                Some(json!({ "emoji": "ok" })),
+            ),
+        ] {
+            assert!(parse(targets, key).is_err(), "{case}");
+        }
+    }
 
     #[test]
     fn a_key_is_one_emoji_by_name_and_nothing_else() {

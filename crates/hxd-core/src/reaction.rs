@@ -950,6 +950,18 @@ pub struct Reactions {
     pub mine: Vec<u8>,
 }
 
+/// The most reactors Get Reactions names for one key.
+pub const REACTORS_SHOWN: usize = 100;
+
+/// What Get Reactions answers of one target: its reactions as the reader
+/// is shown them, and with a key asked about, the nicks that hold it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    pub target: Reply,
+    pub shown: Reactions,
+    pub from: Option<Vec<String>>,
+}
+
 /// One account adding or removing one key on one line, held to the
 /// policy's caps where it adds.
 #[derive(Debug)]
@@ -1146,6 +1158,66 @@ impl Core {
                 .map(|s| s.mailbox())
         };
         log.reactions(ids, reader.as_ref())
+    }
+
+    /// Get Reactions: those of `targets` `uid` could have read, in the
+    /// order asked, each with its reactions as `uid` is shown them, and
+    /// with `key` the nicks that hold it, newest first and at most
+    /// [`REACTORS_SHOWN`]. A line is held to [`Core::react`]'s read
+    /// rules, and one that fails them is left out, as a tombstone and a
+    /// line that does not exist are. Only lines are answered.
+    pub fn reactions_asked(
+        &self,
+        uid: Uid,
+        targets: &[Reply],
+        key: Option<&ReactionKey>,
+    ) -> Result<Vec<Asked>, StoreError> {
+        let Some(log) = self.history.as_ref().filter(|_| self.reactions.is_some()) else {
+            return Ok(Vec::new());
+        };
+        let mut by_room: BTreeMap<u32, Vec<LineId>> = BTreeMap::new();
+        let reader = {
+            let r = self.roster.lock().unwrap();
+            let Some(sess) = r.users.get(&uid) else {
+                return Ok(Vec::new());
+            };
+            for target in targets {
+                if let &Reply::Line { room, id } = target {
+                    if could_have_read(&r, sess, room, id) {
+                        by_room.entry(room).or_default().push(id);
+                    }
+                }
+            }
+            sess.is_person.then(|| sess.mailbox())
+        };
+        let mut live = std::collections::HashSet::new();
+        for (&room, ids) in &by_room {
+            let lines = log.lines(room, ids)?.into_iter();
+            live.extend(
+                lines
+                    .filter(|l| !l.flags.contains(crate::history::LineFlags::DELETED))
+                    .map(|l| (room, l.id)),
+            );
+        }
+        let ids: Vec<LineId> = live.iter().map(|&(_, id)| id).collect();
+        let shown = log.reactions(&ids, reader.as_ref())?;
+        let mut out = Vec::new();
+        for target in targets {
+            let &Reply::Line { room, id } = target else {
+                continue;
+            };
+            if !live.contains(&(room, id)) {
+                continue;
+            }
+            out.push(Asked {
+                target: target.clone(),
+                shown: shown.get(&id).cloned().unwrap_or_default(),
+                from: key
+                    .map(|k| log.reactors(id, k, REACTORS_SHOWN))
+                    .transpose()?,
+            });
+        }
+        Ok(out)
     }
 
     /// Take `who`'s reactions of the last `within`: a purge's, and an
@@ -2295,6 +2367,82 @@ mod tests {
         assert!(core.line_reactions(guest, &[said]).unwrap()[&said]
             .mine
             .is_empty());
+    }
+
+    /// Get Reactions answers each line asked of that the reader could
+    /// have read, in the order asked and as often as asked, one with
+    /// none answered empty; one it could not, a tombstone, one named in
+    /// another room and one never said are all left out.
+    #[test]
+    fn get_reactions_leaves_out_a_line_the_reader_could_not_have_read() {
+        use bit::{CHAT_HISTORY, READ_CHAT, SEND_CHAT};
+        let (core, log) = server(ReactionPolicy::default());
+        let chatter = bits(&[READ_CHAT, SEND_CHAT]);
+        let alice = person(&core, "alice", chatter, true);
+        let hi = said(&core, alice, "hi");
+        let bare = said(&core, alice, "nobody reacts");
+        let gone = said(&core, alice, "regret");
+        core.react(alice, 0, hi, &thumbs(), true).unwrap();
+        log.tombstone(gone, "mod", SystemTime::now()).unwrap();
+        let logged = log
+            .append(&crate::history::NewLine {
+                channel: 0,
+                ghost: None,
+                from_nick: "x".into(),
+                from_login: None,
+                from_fingerprint: None,
+                icon: 0,
+                text: "not relayed".into(),
+                flags: Default::default(),
+                at: SystemTime::now(),
+                guid: None,
+                signed: None,
+                home_key: None,
+                home: None,
+                re: None,
+            })
+            .unwrap();
+        let late = person(&core, "late", chatter, true);
+        let reader = person(&core, "reader", chatter.with(CHAT_HISTORY), true);
+        let guest = person(&core, "guest", chatter.with(CHAT_HISTORY), false);
+        let blind = person(&core, "blind", bits(&[SEND_CHAT, CHAT_HISTORY]), true);
+        let line = |id| Reply::Line { room: 0, id };
+        let mut asked: Vec<Reply> = [bare, hi, gone, logged, hi + 100, bare]
+            .into_iter()
+            .map(line)
+            .collect();
+        asked.push(Reply::Line { room: 7, id: hi });
+        let held = |mine: &[u8]| Reactions {
+            keys: vec![(thumbs(), 1)],
+            mine: mine.to_vec(),
+        };
+        let none = Reactions::default();
+        let readable =
+            |on_hi: Reactions| vec![(bare, none.clone()), (hi, on_hi), (bare, none.clone())];
+        for (case, uid, want) in [
+            ("heard live", alice, readable(held(&[0]))),
+            ("read in history", reader, readable(held(&[]))),
+            ("a guest, holding none", guest, readable(held(&[]))),
+            ("before it came, no history", late, vec![]),
+            ("cannot read chat", blind, vec![]),
+        ] {
+            let got: Vec<_> = (core.reactions_asked(uid, &asked, None).unwrap().into_iter())
+                .map(|a| {
+                    assert_eq!(a.from, None, "{case}");
+                    (a.target, a.shown)
+                })
+                .collect();
+            let want: Vec<_> = want.into_iter().map(|(id, r)| (line(id), r)).collect();
+            assert_eq!(got, want, "{case}");
+        }
+        let who = |key: &ReactionKey| {
+            let got = core
+                .reactions_asked(reader, &[line(hi)], Some(key))
+                .unwrap();
+            got[0].from.clone()
+        };
+        assert_eq!(who(&thumbs()), Some(vec!["alice".to_string()]));
+        assert_eq!(who(&party()), Some(vec![]));
     }
 
     /// The log's lines are relayed lines after a restart too, on a server

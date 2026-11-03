@@ -208,6 +208,16 @@ impl ChatLog for FaultyLog {
         self.inner.reactors_on(ids)
     }
 
+    fn reactors(
+        &self,
+        line: LineId,
+        key: &ReactionKey,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        self.fails("reactors")?;
+        self.inner.reactors(line, key, limit)
+    }
+
     fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
         self.fails("clear_reactions")?;
         let out = self.inner.clear_reactions(channel, line);

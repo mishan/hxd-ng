@@ -1335,6 +1335,28 @@ fn a_rooms_reactions_are_told_to_its_members_alone() {
     assert_eq!(told(&mut ralice), [there]);
 }
 
+/// Get Reactions finds a line in the room it was said in alone, for a
+/// reader who sees both that room and the one it is named in.
+#[test]
+fn get_reactions_finds_a_line_in_its_own_room_alone() {
+    let core = reacting(Core::new());
+    let (boss, _rboss) = attach(&core, manager("boss"));
+    let room = core.room_create(boss, named("lounge")).unwrap().id;
+    core.room_join(boss, room).unwrap();
+    let inside = say(&core, boss, room, "here").unwrap().unwrap();
+    let lobby = say(&core, boss, 0, "there").unwrap().unwrap();
+    let line = |room, id| crate::reply::Reply::Line { room, id };
+    let asked = [
+        line(room, lobby),
+        line(0, inside),
+        line(room, inside),
+        line(0, lobby),
+    ];
+    let answered = core.reactions_asked(boss, &asked, None).unwrap();
+    let got: Vec<_> = answered.into_iter().map(|a| a.target).collect();
+    assert_eq!(got, [line(room, inside), line(0, lobby)]);
+}
+
 /// An archived room's live lines go as soon as the flusher is woken,
 /// on a server where nothing else waits on the desk: the post wakes it.
 #[test]
