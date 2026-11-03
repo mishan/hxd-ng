@@ -2,9 +2,11 @@
 //! lobby or a room line, held to its caps, its rate and who may react,
 //! counted on `history` for the sessions that declared `reactions`, told
 //! live in `reactions_changed` batches to a room's readers, cleared by a
-//! moderator and taken by a redaction and a purge, and on an instant
-//! message relayed to its other party, between scripted clients on a
-//! real server. Emoji in the test data are the reactions themselves.
+//! moderator and taken by a redaction and a purge, read again with
+//! `reactions` under the reader's checks and with who reacted by nick,
+//! and on an instant message relayed to its other party, between
+//! scripted clients on a real server. Emoji in the test data are the
+//! reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -12,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hxd_core::{
-    Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ModerationPolicy, ReactionPolicy, RoomPolicy,
+    Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ModerationPolicy, ReactionPolicy,
+    RequestLimits, RoomPolicy,
 };
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -25,10 +28,15 @@ use serde_json::{json, Value};
 /// `carol` moderates, `boss` makes rooms, `reader` may read and not chat,
 /// and the guest may chat.
 async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
+    start_limited(dir, policy, RequestLimits::default()).await
+}
+
+/// [`start`], each ng session held to `limits`.
+async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits) -> SocketAddr {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n\
-                           send_msgs = true\nmessaging = true\n";
+                           send_msgs = true\nmessaging = true\nuse_any_name = true\n";
     for (login, password, access) in [
         ("alice", true, CHATTER.to_string()),
         ("bob", true, CHATTER.to_string()),
@@ -78,7 +86,8 @@ async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
             RoomPolicy::default(),
         )
-        .unwrap();
+        .unwrap()
+        .with_request_limits(limits);
     let core = Arc::new(core);
     tokio::spawn(hxd::reactions_flusher(core.clone()));
     let ng_ctx = NgCtx {
@@ -811,4 +820,161 @@ async fn an_im_reaction_past_the_rate_is_told_to_wait() {
     let reply = raw(&mut alice, "react", params).await;
     assert_eq!(reply["error"]["code"], "rate_limited", "{reply}");
     assert_eq!(reply["error"]["retry_after"], 1, "{reply}");
+}
+
+/// `reactions` answers each line asked of that the reader could have
+/// read, in the order asked, one with none as empty, and leaves out a
+/// tombstone, a line never said, one of a room the reader does not see
+/// and one named in a room it was not said in, alike.
+#[tokio::test]
+async fn get_reactions_answers_the_lines_a_reader_could_have_read() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut carol, _) = login(addr, "carol", true).await;
+    let (mut boss, _) = login(addr, "boss", true).await;
+    let (mut dave, _) = login(addr, "dave", false).await;
+    let hi = say(&mut alice, json!({ "text": "hi" })).await;
+    let bare = say(&mut alice, json!({ "text": "quiet" })).await;
+    let gone = say(&mut alice, json!({ "text": "regret" })).await;
+    react(&mut bob, json!({ "line": hi }), "👍").await;
+    react(&mut alice, json!({ "line": hi }), "🎉").await;
+    ok(&mut carol, "redact", json!({ "id": gone, "reason": "no" })).await;
+    let staff = ok(
+        &mut boss,
+        "room_create",
+        json!({ "name": "staff", "read": ["alice"] }),
+    )
+    .await["room"]["id"]
+        .as_u64()
+        .unwrap();
+    ok(&mut alice, "room_join", json!({ "room": staff })).await;
+    let inside = say(&mut alice, json!({ "text": "in here", "room": staff })).await;
+    let in_staff = json!({ "line": inside, "room": staff });
+    react(&mut alice, in_staff.clone(), "👀").await;
+
+    let hi_keys = json!([
+        { "key": { "emoji": "👍" }, "count": 1 },
+        { "key": { "emoji": "🎉" }, "count": 1 },
+    ]);
+    let targets = json!([
+        { "line": bare },
+        { "line": hi },
+        { "line": gone },
+        { "line": hi + 1000 },
+        in_staff,
+        { "line": hi, "room": staff },
+        { "line": bare },
+    ]);
+    assert_eq!(
+        ok(&mut bob, "reactions", json!({ "targets": targets })).await,
+        json!({ "reactions": [
+            { "target": { "line": bare }, "keys": [] },
+            { "target": { "line": hi }, "keys": hi_keys, "mine": [0] },
+            { "target": { "line": bare }, "keys": [] },
+        ] })
+    );
+    let targets = json!([in_staff, { "line": hi, "room": staff }, { "line": hi }]);
+    assert_eq!(
+        ok(&mut alice, "reactions", json!({ "targets": targets })).await,
+        json!({ "reactions": [
+            {
+                "target": in_staff,
+                "keys": [{ "key": { "emoji": "👀" }, "count": 1 }],
+                "mine": [0],
+            },
+            { "target": { "line": hi }, "keys": hi_keys, "mine": [1] },
+        ] })
+    );
+
+    let line = json!([{ "line": hi }]);
+    assert_eq!(
+        refused(&mut dave, "reactions", json!({ "targets": line })).await,
+        "not_available"
+    );
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    for (case, params) in [
+        ("no targets", json!({})),
+        ("an empty list", json!({ "targets": [] })),
+        ("an instant message", json!({ "targets": [im] })),
+        (
+            "a message",
+            json!({ "targets": [{ "pm": "AAAAAAAAAAAAAAAAAAAAAA" }] }),
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut bob, "reactions", params).await,
+            "bad_request",
+            "{case}"
+        );
+    }
+}
+
+/// With a key and one target, `reactions` names who holds it, newest
+/// first, each by the nick it reacted under and never by its login.
+#[tokio::test]
+async fn get_reactions_with_a_key_names_who_reacted_by_nick() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let (mut erin, _) = login(addr, "erin", true).await;
+    let line = say(&mut alice, json!({ "text": "cake?" })).await;
+    let target = json!({ "line": line });
+    ok(&mut bob, "nick", json!({ "nick": "Bobby" })).await;
+    react(&mut bob, target.clone(), "🎂").await;
+    react(&mut alice, target.clone(), "🎂").await;
+    ok(&mut alice, "nick", json!({ "nick": "Alicia" })).await;
+    react(&mut erin, target.clone(), "🎂").await;
+    react(&mut alice, target.clone(), "👍").await;
+
+    let who = |emoji: &str| json!({ "targets": [target], "key": { "emoji": emoji } });
+    let reply = ok(&mut erin, "reactions", who("🎂")).await;
+    assert_eq!(
+        reply["reactions"][0]["from"],
+        json!([{ "nick": "erin" }, { "nick": "alice" }, { "nick": "Bobby" }]),
+        "{reply}"
+    );
+    assert!(!reply.to_string().contains("\"bob\""), "{reply}");
+    let reply = ok(&mut erin, "reactions", who("🔥")).await;
+    assert_eq!(reply["reactions"][0]["from"], json!([]), "{reply}");
+    let two = json!({ "targets": [target, target], "key": { "emoji": "🎂" } });
+    assert_eq!(refused(&mut erin, "reactions", two).await, "bad_request");
+}
+
+/// `reactions` is priced by the targets it names: a session asking of
+/// many at once comes to its request limit in fewer requests than one
+/// asking of one.
+#[tokio::test]
+async fn get_reactions_is_priced_by_its_targets() {
+    let td = tempfile::tempdir().unwrap();
+    let limits = RequestLimits {
+        requests: 12,
+        requests_per: Duration::from_secs(3600),
+        ..RequestLimits::default()
+    };
+    let addr = start_limited(td.path(), ReactionPolicy::default(), limits).await;
+    let (mut erin, _) = login(addr, "erin", true).await;
+    let line = say(&mut erin, json!({ "text": "count me" })).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut bob, _) = login(addr, "bob", true).await;
+    let many = served(&mut alice, line, 50).await;
+    let one = served(&mut bob, line, 1).await;
+    assert!(0 < many && many < one, "{many} of fifty, {one} of one");
+}
+
+/// How many `reactions` naming `line` `n` times `c` is served before it
+/// is told to wait.
+async fn served(c: &mut Client, line: u64, n: usize) -> usize {
+    let params = json!({ "targets": vec![json!({ "line": line }); n] });
+    let mut served = 0;
+    loop {
+        let reply = raw(c, "reactions", params.clone()).await;
+        if reply["error"]["code"] == "rate_limited" {
+            return served;
+        }
+        assert!(reply.get("ok").is_some(), "{reply}");
+        served += 1;
+    }
 }

@@ -3454,6 +3454,25 @@ impl ChatLog for SqliteStore {
         Ok(out)
     }
 
+    fn reactors(
+        &self,
+        line: LineId,
+        key: &ReactionKey,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare(
+            "SELECT nick FROM chat_reaction WHERE line = ?1 AND key = ?2
+              ORDER BY at DESC, id DESC LIMIT ?3",
+        )
+        .and_then(|mut stmt| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            stmt.query_map(params![clamp_id(line), key.pack(), limit], |r| r.get(0))?
+                .collect()
+        })
+        .map_err(StoreError::new)
+    }
+
     fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn

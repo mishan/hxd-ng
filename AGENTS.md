@@ -409,7 +409,10 @@ Three layers, all `cargo test --workspace`:
   live in one batch by the readers that declared it, a room's by its
   members alone, a moderator's clear, an instant message's reaction
   reaching its party and not a stranger, and a batch held for a
-  detached session replayed at its resume), `structured_chat.rs`
+  detached session replayed at its resume; `reactions` answering the
+  lines a reader could have read in the order asked, who reacted by
+  the nick each reacted under, and priced by its targets),
+  `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
   the same bytes as its 700 entry, Mac Roman and UTF-8 entries, an

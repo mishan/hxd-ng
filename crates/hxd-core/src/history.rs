@@ -360,6 +360,14 @@ pub trait ChatLog: Send + Sync + 'static {
     /// announcements, read once for them all.
     fn reactors_on(&self, ids: &[LineId])
         -> Result<Vec<(LineId, String, ReactionKey)>, StoreError>;
+    /// The nicks that hold `key` on `line`, each as it reacted under,
+    /// newest first and at most `limit`: who reacted, by nick alone.
+    fn reactors(
+        &self,
+        line: LineId,
+        key: &ReactionKey,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError>;
     /// Take every reaction on line `line` of `channel`, answering how
     /// many went: a moderator's clear. `None` for no such line there, or
     /// a tombstone.
@@ -388,6 +396,7 @@ struct ReactionRow {
     line: LineId,
     key: Vec<u8>,
     reactor: String,
+    nick: String,
     at: SystemTime,
 }
 
@@ -740,6 +749,23 @@ impl ChatLog for MemoryLog {
             .collect())
     }
 
+    fn reactors(
+        &self,
+        line: LineId,
+        key: &ReactionKey,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let key = key.pack();
+        // Rows are in the order they were made, so reversed before a
+        // stable sort the later of two at one time comes first.
+        let mut on: Vec<&ReactionRow> = (inner.reactions.iter().rev())
+            .filter(|r| r.line == line && r.key == key)
+            .collect();
+        on.sort_by_key(|r| std::cmp::Reverse(r.at));
+        Ok(on.into_iter().take(limit).map(|r| r.nick.clone()).collect())
+    }
+
     fn clear_reactions(&self, channel: u32, line: LineId) -> Result<Option<usize>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         if !inner
@@ -813,6 +839,7 @@ fn react_in(inner: &mut MemoryInner, act: &ReactAct) -> Result<Reacted, StoreErr
             line: act.line,
             key: key.clone(),
             reactor,
+            nick: act.nick.to_string(),
             at: act.at,
         });
     } else if !act.add && held {
@@ -913,6 +940,7 @@ pub mod conformance {
         reactions_are_forgotten_by_reactor_and_time(new_log());
         reactions_follow_their_account_to_its_identity(new_log());
         reactors_are_listed_on_the_lines_asked_alone(new_log());
+        line_reactors_are_newest_first_and_bounded(new_log());
         reactions_together_are_applied_in_order(new_log());
         tombstones_together_answer_the_lines_they_made(new_log());
         a_clear_takes_every_reaction_on_one_live_line(new_log());
@@ -1102,6 +1130,44 @@ pub mod conformance {
         want.sort_by_key(|h| (h.0, h.1.clone(), h.2.pack()));
         assert_eq!(held, want);
         assert!(log.reactors_on(&[2]).unwrap().is_empty());
+    }
+
+    /// Who holds a key on a line, by the nick each reacted under, newest
+    /// first and the later of two at one time first, at most as many as
+    /// asked: a key held already keeps its nick and its time, and another
+    /// key's, another line's and one taken away are not among them.
+    fn line_reactors_are_newest_first_and_bounded(log: Box<dyn ChatLog>) {
+        fill(&*log, 2);
+        let react = |login: &str, nick: &str, line: LineId, e: &str, add: bool, at: u64| {
+            log.react(&ReactAct {
+                channel: 0,
+                line,
+                who: &Mailbox::login(login),
+                nick,
+                key: &key(e),
+                add,
+                at: SystemTime::UNIX_EPOCH + Duration::from_secs(at),
+                max_keys: 20,
+                max_per_user: 5,
+            })
+            .unwrap();
+        };
+        react("alice", "Alice", 1, "👍", true, 10);
+        react("bob", "bobby", 1, "👍", true, 30);
+        react("carol", "carol", 1, "👍", true, 20);
+        react("dave", "dave", 1, "👍", true, 30);
+        react("erin", "erin", 1, "👍", true, 40);
+        react("erin", "erin", 1, "👍", false, 41);
+        react("alice", "alice again", 1, "👍", true, 50);
+        react("bob", "bob", 1, "🎉", true, 60);
+        react("frank", "frank", 2, "👍", true, 70);
+        let thumbs = key("👍");
+        assert_eq!(
+            log.reactors(1, &thumbs, 10).unwrap(),
+            ["dave", "bobby", "carol", "Alice"]
+        );
+        assert_eq!(log.reactors(1, &thumbs, 2).unwrap(), ["dave", "bobby"]);
+        assert!(log.reactors(1, &key("🔥"), 10).unwrap().is_empty());
     }
 
     /// Reactions applied together are applied in order, each seeing

@@ -3763,6 +3763,14 @@ mod tests {
         {
             self.inner.reactors_on(ids)
         }
+        fn reactors(
+            &self,
+            line: crate::history::LineId,
+            key: &crate::reaction::ReactionKey,
+            limit: usize,
+        ) -> Result<Vec<String>, StoreError> {
+            self.inner.reactors(line, key, limit)
+        }
         fn clear_reactions(
             &self,
             channel: u32,
@@ -4075,6 +4083,14 @@ mod tests {
         ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
         {
             self.inner.reactors_on(ids)
+        }
+        fn reactors(
+            &self,
+            line: crate::history::LineId,
+            key: &crate::reaction::ReactionKey,
+            limit: usize,
+        ) -> Result<Vec<String>, StoreError> {
+            self.inner.reactors(line, key, limit)
         }
         fn clear_reactions(
             &self,
@@ -4457,6 +4473,14 @@ mod tests {
         ) -> Result<Vec<(crate::history::LineId, String, crate::reaction::ReactionKey)>, StoreError>
         {
             self.0.reactors_on(ids)
+        }
+        fn reactors(
+            &self,
+            line: crate::history::LineId,
+            key: &crate::reaction::ReactionKey,
+            limit: usize,
+        ) -> Result<Vec<String>, StoreError> {
+            self.0.reactors(line, key, limit)
         }
         fn clear_reactions(
             &self,

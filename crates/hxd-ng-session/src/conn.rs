@@ -63,6 +63,7 @@ fn req_label(req: &str) -> &'static str {
         "nick",
         "ping",
         "react",
+        "reactions",
         "resume",
         "rooms",
         "signs",
@@ -423,7 +424,8 @@ pub(crate) async fn run(
                     // box (§4.3), here as its base64url's length says.
                     let sealed = req.params.get("sealed").and_then(Value::as_str);
                     let sealed = sealed.map_or(0, |b| (b.len() * 3 / 4 / 2048) as u32);
-                    let objects = crate::friends::object_weight(&req);
+                    let objects = crate::friends::object_weight(&req)
+                        .saturating_add(crate::reactions::targets_weight(&req));
                     let cost = request_weight(&req.req)
                         .saturating_add(signed + sealed)
                         .saturating_add(objects);
@@ -2313,6 +2315,7 @@ async fn dispatch(
 
         "device_cert" => crate::sealed::device_cert(ctx, state, req.id, &req.params).await,
         "react" => crate::reactions::react(ctx, state, req.id, &req.params).await,
+        "reactions" => crate::reactions::asked(ctx, state, req.id, &req.params).await,
 
         // --- The inbox (docs/private-messages.md §6) -------------------
         //
