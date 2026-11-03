@@ -871,8 +871,9 @@ family document. Each family of §4 adds its own.
     exactly one target, the line's group also carries `from`, `[ {
     "nick" } ]`, who holds that key, newest first and at most 100, each
     by the nick it had when it reacted and never by its login; it is
-    empty when nobody does, and the key's `count`, the total, less
-    those listed says how many were not. An `im` target, which is kept
+    empty when nobody does. The key's `count` is everyone who holds
+    it, listed or not: those not listed are `count` less the length of
+    `from`. An `im` target, which is kept
     nowhere to be read again, a kind the login block does not list, no
     targets or more than 50, `key` beside more than one, and a `key`
     that is not one emoji are `bad_request`; from a session that did
