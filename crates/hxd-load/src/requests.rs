@@ -370,7 +370,7 @@ fn listen(
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => break,
                 got = rx.next() => match got {
-                    Ok(Got::Msg(text)) => {
+                    Ok(Got::Msg(text, _)) => {
                         if let Some((k, seq, due)) = ledger::parse(&ctx.run, &text) {
                             stats::sample(&mut delivery, ctx.t0.elapsed().saturating_sub(due));
                             *heard.lock().unwrap().entry((k, seq)).or_default() += 1;

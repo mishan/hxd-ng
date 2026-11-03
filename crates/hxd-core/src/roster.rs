@@ -1733,7 +1733,7 @@ pub struct Core {
     /// A lock of its own rather than the roster's, so the no-disk-under-
     /// the-roster-lock rule survives. Order is always this lock first,
     /// then the roster's.
-    pub(crate) flushing: Mutex<()>,
+    pub(crate) flushing: TimedMutex<InboxFlush>,
     /// The image pipeline and its handles, or `None` when no `[media]`
     /// section configured one — in which case neither wire ever offers
     /// the capability. It carries its own mutex; the roster's may be
@@ -1914,6 +1914,10 @@ impl LoginPermit {
 /// own so the lock's metrics carry a name (`TimedMutex`'s default).
 #[derive(Default)]
 pub(crate) struct LogSerial;
+
+/// What `Core::flushing` guards: nothing but mutual exclusion.
+#[derive(Default)]
+pub(crate) struct InboxFlush;
 
 impl Core {
     pub fn new() -> Self {

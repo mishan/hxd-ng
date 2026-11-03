@@ -124,6 +124,23 @@ shows in a step as latency and in `busy_logins`, not as failed logins.
 past it is counted as shed, which is the generator's limit and not the
 server's.
 
+With `accounts = true` and `[target] admin`, `senders` ng sessions of
+that account load the inbox too. Before the first arrival they leave
+`mail` private messages waiting for every one of `[target] accounts`,
+so each account's first login hands them over, and the login times
+from when it was due to when the first of them arrived on its socket
+(`mail.first`). Throughout the storm they send `msg_rate` more a
+second, together, to accounts picked at random, each timed from when
+it was due to its answer (`mail.sent`), and read what they are sent
+in between; with no `msg_rate` they leave once the mail is waiting.
+Every hand-over and every stored message takes the server's one inbox
+lock, `InboxFlush` in `hxd_lock_wait_seconds` and
+`hxd_lock_hold_seconds` (`docs/metrics.md`), labeled by site. The
+server needs an `[inbox]` with `max_sent_per_day` at 0 and
+`max_queued` above `mail` plus what `msg_rate` may leave waiting for
+one account, and `[target] accounts` needs at least as many accounts
+as the storm has arrivals for every one of them to find its mail.
+
 ### Public chat (`chat`)
 
 `readers_*` and `talkers_*` on each wire, joined before the first line
