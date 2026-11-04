@@ -427,8 +427,9 @@ Three layers, all `cargo test --workspace`:
   message answered as delivered, lines and messages answered together
   in the order asked, no `pm` target without an inbox, a change told
   to both parties' sessions but the reactor's, one to a waiting message
-  riding its `msg`, one held for a detached party and replayed, and the
-  recipient's past the sender's window told to the sender not at all),
+  riding its `msg`, one held for a detached party and replayed, the
+  recipient's past the sender's window told to the sender not at all,
+  and a moderator's purge taking a person's and telling both parties),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry

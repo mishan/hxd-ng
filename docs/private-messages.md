@@ -429,9 +429,9 @@ already read keeps its own stamp. A purge takes a stub with
 the mailbox. Only retention makes one, and only of
 a private message: an instant message or a request leaves none.
 
-**The store keeps reactions on a private message**, which the wire
-does not offer yet, in `message_reaction` (schema 36) as `chat_reaction` keeps a line's, one
-row per account and key, but by the message's `ref`: it is never
+**The store keeps reactions on a private message** (hotline-ng.md
+§7.3), in `message_reaction` (schema 36) as `chat_reaction` keeps a
+line's, one row per account and key, but by the message's `ref`: it is never
 reused, so a reaction cannot attach to a later message as it could to
 a rowid. An instant message, a request and a receipt take none; a
 request the recipient turns into mail takes them from then on. Each
@@ -441,8 +441,9 @@ while the sender's window holds the message's `sent_at`, so that to a
 sender a read message and an unread one look alike (§9). Two triggers
 keep a message's reactions going with it on every path that deletes:
 a row's go with the row unless retention left a stub, and then with
-the stub. A purge also takes every reaction the mailbox made, on
-anyone's mail, so a later holder of the login holds none. A claim or a
+the stub. The store's purge, an account's deletion, also takes every
+reaction the mailbox made, on anyone's mail, so a later holder of the
+login holds none; a moderator's purge takes those within its window. A claim or a
 rotation that merges a duplicate, row or stub, moves its reactions onto
 the survivor, but for a key the survivor already holds from the same
 account; that can leave a message with more keys than `max_keys`, which
@@ -539,10 +540,10 @@ reactions, as a stamp that fails does. `flushing` is taken before
 `pm_reacting`, and nothing holding `pm_reacting` takes `flushing`. The
 cost: such a flush, and the send that runs it, can wait behind one
 holder of the mutex, a reaction's write and its fan-out, a scan of
-the roster for the two accounts' sessions, or a claim's move, rekey
-and its bounded announcements, while every other flush waits on
-`flushing`; and a reaction waits for a flush in progress, its stamp's
-fsync included.
+the roster for the two accounts' sessions, or a claim's move and
+rekey or a purge's forget, and their bounded announcements, while
+every other flush waits on `flushing`; and a reaction waits for a
+flush in progress, its stamp's fsync included.
 
 ### 6.3 Flush
 

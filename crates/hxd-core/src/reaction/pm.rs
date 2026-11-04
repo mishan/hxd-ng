@@ -4,7 +4,7 @@
 //! rather than at the desk, which keeps the log's.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::{
     reactor_key, MessageReactAct, MessageReacted, MessageState, ReactError, ReactionChange,
@@ -121,6 +121,23 @@ impl Core {
         }
     }
 
+    /// A purge's half on stored messages: `who`'s reactions on them of
+    /// the last `within`, on rows and stubs alike, go, and the newest of
+    /// the messages that lost one are told ([`Self::pm_announce`]).
+    pub(crate) fn forget_pm_reactions(&self, who: &Mailbox, within: Duration) {
+        let Some(store) = self.inbox.as_ref() else {
+            return;
+        };
+        let since = (self.clock.wall())
+            .checked_sub(within)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let _reacting = self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner());
+        match store.forget_message_reactions(who, since) {
+            Ok(lost) => self.pm_announce(&lost),
+            Err(e) => tracing::warn!("inbox would not forget {}'s reactions: {e}", who.login),
+        }
+    }
+
     /// Each session but `except` that hears any of `states` told them
     /// in one event, with its own account's keys.
     fn pm_tell(&self, states: &[MessageState], open_since: SystemTime, except: Option<Uid>) {
@@ -207,14 +224,15 @@ pub(crate) fn pm_reader(s: &UserSession) -> bool {
 /// `pm_reacting`. A recipient can hold a pending message's ref from
 /// `inbox` and react to it, and its other sessions then learn of that
 /// from the `msg` or from `inbox`, rather than from a summary ahead of
-/// the message it is about. The sender's until its window ends, the
+/// the message it is about. Through a stub, only while it sees one:
+/// inside the sender's window. The sender's until its window ends, the
 /// same for a message read or not, and never asked whether it was
 /// delivered.
 fn pm_hears(s: &UserSession, m: &MessageState, open_since: SystemTime) -> bool {
     let is = |p: &Mailbox| p.matches(&s.login, s.identity.as_ref());
     pm_reader(s)
         && match is(&m.recipient) {
-            true => m.delivered,
+            true => m.delivered && (m.row || m.sent_at >= open_since),
             false => m.sent_at >= open_since && m.sender.as_ref().is_some_and(is),
         }
 }
@@ -232,6 +250,7 @@ mod tests {
     use crate::inbox::{
         Delivery, MemoryStore, MessageId, MessageKind, MessageStore, NewMessage, Pushed,
     };
+    use crate::moderation::{Actor, MemoryModeration, ModerationPolicy, PersonRef};
     use crate::relationships::{MemoryRelationships, RelationshipStore, SentOn};
     use crate::roster::{drain, AttachInfo, InboxPolicy, Resume};
     use crate::{AccessBits, AccountDirectory, Events, Transport};
@@ -277,7 +296,11 @@ mod tests {
             .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
             .with_reactions(policy)
             .with_inbox(inbox.clone(), Arc::new(Nobody), InboxPolicy::default())
-            .with_relationships(rel.clone());
+            .with_relationships(rel.clone())
+            .with_moderation(
+                Arc::new(MemoryModeration::default()),
+                ModerationPolicy::default(),
+            );
         let core = Arc::new(core);
         let ear = |l| attach_rx(&core, l, |i| i.transport.reactions = true);
         let [(alice, a), (dave, d), (carol, c), (_, a2), (_, d2)] =
@@ -470,6 +493,14 @@ mod tests {
 
         fn wait(&self, d: Duration) {
             self.core.clock().advance(d);
+        }
+
+        /// A moderator's purge of `login` over the last `within`.
+        fn purge(&self, login: &str, within: Duration) {
+            let who = PersonRef::Login(login.into());
+            let core = &self.core;
+            core.purge_sender(Actor::Operator, &who, within, "spam")
+                .unwrap();
         }
 
         fn react(&self, uid: Uid, r: MessageRef, emoji: &str) {
@@ -1014,7 +1045,9 @@ mod tests {
 
     /// Past its sender's window, a reaction a rekey or a purge takes is
     /// told to the recipient's session and to none of the sender's,
-    /// each keyed as the change leaves its account.
+    /// each keyed as the change leaves its account; and of a message
+    /// retention left only a stub of, to nobody, since a recipient sees
+    /// a stub only inside the sender's window.
     #[test]
     fn past_the_senders_window_a_purge_or_rekey_tells_the_sender_nothing() {
         let (four, five) = ([4; 32], [5; 32]);
@@ -1024,12 +1057,6 @@ mod tests {
             Mailbox::identified("alice", five),
         );
         let dave5 = Mailbox::identified("dave", five);
-        fn forget(s: &Pm, who: &Mailbox) {
-            let _reacting = s.core.pm_reacting.lock().unwrap();
-            let since = SystemTime::UNIX_EPOCH;
-            s.core
-                .pm_announce(&s.inbox.forget_message_reactions(who, since).unwrap());
-        }
         type Step = Box<dyn Fn(&Pm, MessageRef)>;
         // The sender, and the two as the change leaves them.
         let cases: [(&str, Mailbox, [&Mailbox; 2], Step, Step); 5] = [
@@ -1078,7 +1105,7 @@ mod tests {
                     s.hold(r, &Mailbox::login("alice"), "👍");
                     s.hold(r, &dave(), "🎉");
                 }),
-                Box::new(|s, _| forget(s, &Mailbox::login("alice"))),
+                Box::new(|s, _| s.purge("alice", Duration::MAX)),
             ),
             (
                 "a purge of the recipient's",
@@ -1088,14 +1115,24 @@ mod tests {
                     s.hold(r, &Mailbox::login("alice"), "👍");
                     s.hold(r, &dave(), "🎉");
                 }),
-                Box::new(|s, _| forget(s, &dave())),
+                Box::new(|s, _| s.purge("dave", Duration::MAX)),
             ),
         ];
-        for (case, from, [sender, recipient], before, change) in cases {
+        let policy = InboxPolicy::default();
+        for ((case, from, [sender, recipient], before, change), stubbed) in
+            (cases.iter()).flat_map(|c| [(c, false), (c, true)])
+        {
             let mut s = server(ReactionPolicy::default());
-            let (r, _) = s.mail_as(dave(), from, MessageKind::Message, None);
+            let (r, cursor) = s.mail_as(dave(), from.clone(), MessageKind::Message, None);
+            let mut waited = Duration::ZERO;
+            if stubbed {
+                s.read(cursor);
+                waited = policy.retain_read + TICK;
+                s.wait(waited);
+                assert_eq!(s.core.prune_inbox(), 1, "{case}");
+            }
             before(&s, r);
-            s.wait(InboxPolicy::default().retain_unread + TICK);
+            s.wait(policy.retain_unread + TICK - waited);
             s.ears.clear();
             for (name, m) in [("the sender", sender), ("the recipient", recipient)] {
                 let (_, rx) = attach_rx(&s.core, &m.login, |i| {
@@ -1106,8 +1143,69 @@ mod tests {
             }
             s.told();
             change(&s, r);
-            assert_eq!(s.who(), ["the recipient"], "{case}");
+            let told: &[&str] = if stubbed { &[] } else { &["the recipient"] };
+            assert_eq!(s.who(), told, "{case}, stubbed: {stubbed}");
         }
+    }
+
+    /// A moderator's purge takes the reactions its person made on stored
+    /// messages in its window, on a stub as on a row, which both stay,
+    /// and leaves older ones. It tells the newest live window of the
+    /// messages, newest first and fifty to an event, as they now stand,
+    /// with nothing left on them, to their parties' sessions.
+    #[test]
+    fn a_purge_takes_a_persons_pm_reactions_in_its_window_and_tells_the_newest() {
+        let mut s = server(ReactionPolicy {
+            live_window: 60,
+            ..ReactionPolicy::default()
+        });
+        let alice = Mailbox::login("alice");
+        let (stubbed, cursor) = s.mail();
+        s.read(cursor);
+        s.wait(InboxPolicy::default().retain_read + TICK);
+        assert_eq!(s.core.prune_inbox(), 1);
+        let (old, _) = s.mail();
+        s.hold(old, &alice, "👍");
+        s.wait(DAY);
+        s.hold(stubbed, &alice, "👍");
+        let mut sent: Vec<MessageRef> = (0..70)
+            .map(|_| {
+                s.wait(TICK);
+                let (r, _) = s.mail();
+                s.hold(r, &alice, "👍");
+                r
+            })
+            .collect();
+        s.told();
+        s.purge("alice", Duration::from_secs(3600));
+        assert_eq!(s.kept(old), [(thumbs(), 1)]);
+        for r in sent.iter().chain([&stubbed]) {
+            assert!(s.kept(*r).is_empty());
+        }
+        let stub = s.inbox.message_reaction_states(&[stubbed]).unwrap();
+        assert_eq!(stub.len(), 1, "the stub stays");
+        sent.reverse();
+        let told =
+            |refs: &[MessageRef]| -> Told { refs.iter().map(|r| (*r, vec![], vec![])).collect() };
+        let both = vec![told(&sent[..50]), told(&sent[50..60])];
+        assert_eq!(
+            s.told(),
+            ["alice", "dave", "alice's other", "dave's other"].map(|n| (n, both.clone()))
+        );
+    }
+
+    /// An account's deletion takes its reactions on stored messages with
+    /// the mail, and tells nobody.
+    #[test]
+    fn an_accounts_deletion_takes_its_pm_reactions_and_tells_nobody() {
+        let mut s = server(ReactionPolicy::default());
+        let (r, _) = s.mail();
+        s.react(s.alice, r, "👍");
+        s.react(s.dave, r, "🎉");
+        s.told();
+        s.core.inbox_purge(&Mailbox::login("alice"));
+        assert!(s.kept(r).is_empty());
+        assert!(s.who().is_empty());
     }
 
     /// A rekey that took reactions from more messages than a live window

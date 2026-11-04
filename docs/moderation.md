@@ -184,10 +184,12 @@ identity behind the session; a plain guest has none, and is kicked
 rather than purged. The purge also answers every open report on the
 person, and the news arm of news.md §11 deletes their articles in the
 window under the same row. The reactions they made in the window go
-too, wherever they are, by the same identity (hotline-ng.md §7.3); the
-lines they were on that are still live are told as they now stand in
-their rooms' next batches, and the rest are read again when a client
-shows them.
+too, wherever they are, on a stored private message too, by the same
+identity (hotline-ng.md §7.3); the lines they were on that are still
+live are told as they now stand in their rooms' next batches, the most
+recent of the messages to their parties on each one's terms, with any
+stub retention left of one kept, and the rest are read again when a
+client shows them.
 
 Every path that bans — `kick { ban }` on the ng wire, a legacy kick
 with ban, an entry added to the ban list, and `kick { purge }` — also
@@ -675,10 +677,11 @@ The CLI acts as `cli` in the audit trail and runs against the store
 directly, so it works while the server is down; a running server sees
 the change on its next read (the memory media store is the exception —
 `media revoke` from the CLI needs the server up, and says so, and a
-purge from the CLI takes lines and articles but not images). Bans are
-the one thing a running server does not read again on its own: `hxd
-ban` changes the table, and SIGHUP makes the server reread it and end
-the sessions a new ban refuses.
+purge from the CLI takes lines, articles and the reactions kept in
+the moderation trail's file — a line's with `[history]` there, a
+stored message's with `[inbox]` — but not images). Bans are the one thing a running server does not read again
+on its own: `hxd ban` changes the table, and SIGHUP makes the server
+reread it and end the sessions a new ban refuses.
 
 ```toml
 [moderation]                # optional; moderation is always on, kept in the

@@ -6,9 +6,9 @@
 //! `reactions` under the reader's checks and with who reacted by nick,
 //! on an instant message relayed to its other party, and on a stored
 //! private message kept with it, seen and told to each party on its
-//! own terms and answered `{}` whatever became of it, between scripted
-//! clients on a real server. Emoji in the test data are the reactions
-//! themselves.
+//! own terms, taken by a purge and answered `{}` whatever became of it,
+//! between scripted clients on a real server. Emoji in the test data
+//! are the reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -1353,5 +1353,36 @@ async fn a_recipients_late_reaction_is_not_told_to_the_sender() {
     assert_eq!(
         ok(&mut alice, "reactions", json!({ "targets": [pm] })).await,
         json!({ "reactions": [{ "target": pm, "keys": [] }] })
+    );
+}
+
+/// A moderator's purge takes the reactions its person made on a stored
+/// message and tells both parties what is left, the purged person's
+/// own sessions too.
+#[tokio::test]
+async fn a_purge_takes_a_persons_pm_reactions_and_tells_the_parties() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut carol, _) = login(addr, "carol", true).await;
+    let pm = sent(&mut alice, "dave").await;
+    pm_react(&mut alice, &pm, "👍").await;
+    pm_react(&mut dave, &pm, "🎉").await;
+    ok(
+        &mut carol,
+        "purge",
+        json!({ "login": "alice", "since": 3600, "reason": "spam" }),
+    )
+    .await;
+    let keys = json!([{ "key": { "emoji": "🎉" }, "count": 1 }]);
+    let (_, told) = changed_until(&mut alice, &pm, |g| g["keys"] == keys).await;
+    assert!(told.get("mine").is_none(), "{told}");
+    let (_, told) = changed_until(&mut dave, &pm, |g| g["keys"] == keys).await;
+    assert_eq!(told["mine"], json!([0]), "{told}");
+    hears_no_reactions(&mut carol).await;
+    assert_eq!(
+        ok(&mut alice, "reactions", json!({ "targets": [pm] })).await,
+        json!({ "reactions": [{ "target": pm, "keys": keys }] })
     );
 }

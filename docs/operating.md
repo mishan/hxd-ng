@@ -627,7 +627,7 @@ server sees the change on its next read:
 hxd reports                                  # what is open; --all for everything
 hxd reports close 17 --outcome dismissed     # or duplicate --of 12; --note says why
 hxd history redact 4711 --reason "slur"      # blank a public line, keep its words for moderators
-hxd purge bob --since 1h --reason "spam run" # redact bob's lines and delete his articles
+hxd purge bob --since 1h --reason "spam run" # redact bob's lines, delete his articles, take his reactions
 hxd purge bob --since 1h --reason x --dry-run
 hxd moderation log                           # the audit trail, newest first; --limit N
 hxd ban add 203.0.113.0/24 --reason "botnet" --for 7d

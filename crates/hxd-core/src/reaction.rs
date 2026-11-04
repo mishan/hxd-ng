@@ -1021,6 +1021,9 @@ pub struct MessageState {
     pub sent_at: SystemTime,
     /// Handed to the recipient, or a stub.
     pub delivered: bool,
+    /// Kept by its row rather than a stub, through which the recipient
+    /// sees it only inside the sender's window.
+    pub row: bool,
     /// In the order first added.
     pub keys: Vec<(ReactionKey, u32)>,
     /// Each holder by [`reactor_key`], with the key it holds.
@@ -1035,6 +1038,7 @@ impl MessageState {
         parties: Parties,
         sent_at: SystemTime,
         delivered: bool,
+        row: bool,
         rows: &[(&[u8], &str)],
     ) -> Self {
         MessageState {
@@ -1043,6 +1047,7 @@ impl MessageState {
             sender: parties.sender,
             sent_at,
             delivered,
+            row,
             keys: crate::history::summarize(rows.iter().copied(), None).keys,
             held: (rows.iter())
                 .filter_map(|&(key, reactor)| {
