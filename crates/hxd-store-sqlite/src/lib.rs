@@ -33,8 +33,8 @@ use hxd_core::history::{
     NewLine, Retention, Signature, SignedAt,
 };
 use hxd_core::inbox::{
-    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
-    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
+    Cursor, Delivery, Found, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage, Stub,
 };
 use hxd_core::reaction::{reactor_key, ReactAct, Reacted, ReactionKey, Reactions};
 use hxd_core::relationships::{RelationId, SentOn};
@@ -77,7 +77,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_VERSION: i64 = 36;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -988,6 +988,57 @@ BEGIN
 END;
 ";
 
+/// Reactions on stored private messages, as `chat_reaction` holds them
+/// on lines but by the message's `ref`, which is never reused, so no
+/// reaction can attach to a later message as it could to a rowid.
+///
+/// And `message_stub`: what is left of a private message retention
+/// deleted before its sender's window, `sent_at` plus `retain_unread`,
+/// ended (`docs/private-messages.md` §9). Its parties' mailbox keys, for
+/// its reactions, and its guid and what it signed, for a retry, until
+/// the window ends, so that whether it was read shows nowhere.
+///
+/// A message's reactions go when its row goes, unless retention left a
+/// stub, and then when the stub goes.
+const SCHEMA_V36: &str = "
+CREATE TABLE message_reaction (
+  id      INTEGER PRIMARY KEY,
+  ref     BLOB    NOT NULL,
+  key     BLOB    NOT NULL,
+  reactor TEXT    NOT NULL,
+  nick    TEXT    NOT NULL,
+  at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX message_reaction_one ON message_reaction (ref, key, reactor);
+CREATE INDEX message_reaction_who ON message_reaction (ref, key, at);
+CREATE INDEX message_reaction_by ON message_reaction (reactor, at);
+CREATE TABLE message_stub (
+  ref            BLOB    PRIMARY KEY,
+  recipient      TEXT    NOT NULL,
+  recipient_fp   TEXT,
+  sender         TEXT,
+  sender_fp      TEXT,
+  guid           TEXT,
+  signed_content BLOB,
+  sent_at        INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX message_stub_age ON message_stub (sent_at);
+CREATE INDEX message_stub_recipient ON message_stub (recipient_fp, recipient);
+CREATE INDEX message_stub_sender ON message_stub (sender_fp, sender);
+CREATE INDEX message_stub_guid ON message_stub (guid) WHERE guid IS NOT NULL;
+CREATE INDEX message_guid_age ON message (sent_at)
+  WHERE guid IS NOT NULL AND kind = 0 AND friendship IS NULL;
+CREATE TRIGGER message_reaction_row_gone AFTER DELETE ON message
+WHEN NOT EXISTS (SELECT 1 FROM message_stub WHERE ref = old.ref)
+BEGIN
+  DELETE FROM message_reaction WHERE ref = old.ref;
+END;
+CREATE TRIGGER message_reaction_stub_gone AFTER DELETE ON message_stub
+BEGIN
+  DELETE FROM message_reaction WHERE ref = old.ref;
+END;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1740,6 +1791,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 35 {
         steps.push_str(SCHEMA_V35);
     }
+    if version < 36 {
+        steps.push_str(SCHEMA_V36);
+    }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
     ));
@@ -1792,7 +1846,7 @@ const CLAIM_COLLAPSE: [Collapse; 2] = [
     Collapse {
         destination: "kept.recipient_fp = ?1",
         duplicate: "dup.guid = kept.guid
-                AND dup.id <> kept.id
+                AND dup.ref <> kept.ref
                 AND dup.recipient_fp IS NULL AND dup.recipient = ?2
                 AND CASE WHEN dup.sender_fp IS NULL AND dup.sender = ?2 THEN ?1
                          ELSE IFNULL(dup.sender_fp, IFNULL(dup.sender, '')) END
@@ -1803,7 +1857,7 @@ const CLAIM_COLLAPSE: [Collapse; 2] = [
     Collapse {
         destination: "kept.sender_fp = ?1",
         duplicate: "dup.guid = kept.guid
-                AND dup.id <> kept.id
+                AND dup.ref <> kept.ref
                 AND dup.sender_fp IS NULL AND dup.sender = ?2
                 AND CASE WHEN dup.recipient_fp IS NULL AND dup.recipient = ?2 THEN ?1
                          ELSE IFNULL(dup.recipient_fp, dup.recipient) END
@@ -1818,7 +1872,7 @@ const ROTATE_COLLAPSE: [Collapse; 2] = [
     Collapse {
         destination: "kept.recipient_fp = ?1",
         duplicate: "dup.guid = kept.guid
-                AND dup.id <> kept.id
+                AND dup.ref <> kept.ref
                 AND dup.recipient_fp = ?2
                 AND CASE WHEN dup.sender_fp = ?2 THEN ?1
                          ELSE IFNULL(dup.sender_fp, IFNULL(dup.sender, '')) END
@@ -1828,7 +1882,7 @@ const ROTATE_COLLAPSE: [Collapse; 2] = [
     Collapse {
         destination: "kept.sender_fp = ?1",
         duplicate: "dup.guid = kept.guid
-                AND dup.id <> kept.id
+                AND dup.ref <> kept.ref
                 AND dup.sender_fp = ?2
                 AND CASE WHEN dup.recipient_fp = ?2 THEN ?1
                          ELSE IFNULL(dup.recipient_fp, dup.recipient) END
@@ -1848,27 +1902,47 @@ impl Collapse {
     /// the sender retries, the reader reads the *retry*, the account
     /// relinks — deletes the row that was read and flushes the survivor
     /// again as unread.
+    ///
+    /// A duplicate stub was read, and is stamped as read when it was
+    /// sent: the copy that was read is already pruned, so the survivor
+    /// goes at the next prune, as that copy did, rather than starting a
+    /// fresh `retain_read`.
     fn promote(&self) -> String {
         let (dest, dup) = (self.destination, self.duplicate);
         format!(
             "UPDATE message AS kept
                 SET delivered_at = COALESCE(kept.delivered_at,
-                      (SELECT MIN(dup.delivered_at) FROM message AS dup WHERE {dup})),
+                      (SELECT MIN(dup.delivered_at) FROM message AS dup WHERE {dup}),
+                      (SELECT MIN(dup.sent_at) FROM message_stub AS dup WHERE {dup})),
                     read_at = COALESCE(kept.read_at,
-                      (SELECT MIN(dup.read_at) FROM message AS dup WHERE {dup}))
+                      (SELECT MIN(dup.read_at) FROM message AS dup WHERE {dup}),
+                      (SELECT MIN(dup.sent_at) FROM message_stub AS dup WHERE {dup}))
               WHERE {dest} AND kept.guid IS NOT NULL
-                AND EXISTS (SELECT 1 FROM message AS dup WHERE {dup})"
+                AND (EXISTS (SELECT 1 FROM message AS dup WHERE {dup})
+                     OR EXISTS (SELECT 1 FROM message_stub AS dup WHERE {dup}))"
         )
     }
 
-    /// Then the duplicate goes.
-    fn delete(&self) -> String {
+    /// Then the duplicate goes, row or stub. A stub at the destination
+    /// is the message too, read and pruned, and is kept as a row there
+    /// is: keeping the moving row instead would answer a retry under
+    /// another reference, telling its sender the message was read.
+    fn deletes(&self) -> impl Iterator<Item = String> + '_ {
         let (dest, dup) = (self.destination, self.duplicate);
-        format!(
-            "DELETE FROM message AS dup
-              WHERE dup.guid IS NOT NULL
-                AND EXISTS (SELECT 1 FROM message AS kept WHERE {dest} AND {dup})"
-        )
+        [
+            ("message", "message"),
+            ("message", "message_stub"),
+            ("message_stub", "message"),
+            ("message_stub", "message_stub"),
+        ]
+        .into_iter()
+        .map(move |(moving, at)| {
+            format!(
+                "DELETE FROM {moving} AS dup
+                  WHERE dup.guid IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM {at} AS kept WHERE {dest} AND {dup})"
+            )
+        })
     }
 }
 
@@ -2062,13 +2136,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
             },
             sender_nick: nick,
             body,
-            guid: match guid {
-                Some(g) => Some(
-                    MessageGuid::parse(&g)
-                        .ok_or_else(|| StoreError(format!("stored guid is malformed: {g:?}")))?,
-                ),
-                None => None,
-            },
+            guid: stored_guid(guid)?,
             sent_at: from_unix(sent_at),
             delivered_at: delivered.map(from_unix),
             read_at: read.map(from_unix),
@@ -2090,6 +2158,46 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
                 })
                 .transpose()?,
             re: unpack_reply(re)?,
+        })
+    })())
+}
+
+fn stored_guid(guid: Option<String>) -> Result<Option<MessageGuid>, StoreError> {
+    guid.map(|g| {
+        MessageGuid::parse(&g).ok_or_else(|| StoreError(format!("stored guid is malformed: {g:?}")))
+    })
+    .transpose()
+}
+
+/// Prune's last step, under `message_guid_age`'s predicate word for word,
+/// so that it reads the rows past the window and not every guid held.
+const CLEAR_LATE_GUIDS: &str = "UPDATE message SET guid = NULL
+  WHERE guid IS NOT NULL AND kind = 0 AND friendship IS NULL AND sent_at < ?1";
+
+/// `message_stub`'s columns, which `message` has under the same names.
+const STUB_COLUMNS: &str =
+    "ref, recipient, recipient_fp, sender, sender_fp, guid, signed_content, sent_at";
+
+fn stub(r: &Row<'_>) -> rusqlite::Result<Result<Stub, StoreError>> {
+    let reference: Vec<u8> = r.get(0)?;
+    let (rl, rfp): (String, Option<String>) = (r.get(1)?, r.get(2)?);
+    let (sl, sfp): (Option<String>, Option<String>) = (r.get(3)?, r.get(4)?);
+    let (guid, signed): (Option<String>, Option<Vec<u8>>) = (r.get(5)?, r.get(6)?);
+    let sent_at: i64 = r.get(7)?;
+    Ok((|| {
+        Ok(Stub {
+            reference: MessageRef::try_from(reference)
+                .map_err(|_| StoreError::new("a stub's reference is not 16 bytes"))?,
+            recipient: mailbox(rl, rfp)?,
+            sender: sl.map(|l| mailbox(l, sfp)).transpose()?,
+            guid: stored_guid(guid)?,
+            signed: signed
+                .map(|c| {
+                    <[u8; 32]>::try_from(c)
+                        .map_err(|_| StoreError::new("a stub's signed content is not 32 bytes"))
+                })
+                .transpose()?,
+            sent_at: from_unix(sent_at),
         })
     })())
 }
@@ -2139,8 +2247,15 @@ impl MessageStore for SqliteStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::new)?;
         if let Some(guid) = m.guid.as_ref() {
-            if let Some(existing) = find_guid_in(&tx, &m.recipient, m.sender.as_ref(), guid)? {
-                return Ok(Pushed::Existing(Box::new(existing)));
+            match find_guid_in(&tx, &m.recipient, m.sender.as_ref(), guid)? {
+                Some(Found::Row(existing)) => return Ok(Pushed::Existing(existing)),
+                Some(Found::Stub(stub)) => {
+                    return Ok(Pushed::Pruned {
+                        reference: stub.reference,
+                        signed: stub.signed,
+                    })
+                }
+                None => {}
             }
         }
         if m.kind == MessageKind::Message {
@@ -2225,26 +2340,20 @@ impl MessageStore for SqliteStore {
         to: &Mailbox,
         from: Option<&Mailbox>,
         guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError> {
+    ) -> Result<Option<Found>, StoreError> {
         let conn = self.conn.lock().unwrap();
         find_guid_in(&conn, to, from, guid)
     }
 
-    /// Through `message_guid`, whose key begins with the guid.
-    fn find_sent(
-        &self,
-        from: &Mailbox,
-        guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError> {
+    /// Through `message_guid` and `message_stub_guid`, whose keys begin
+    /// with the guid.
+    fn find_sent(&self, from: &Mailbox, guid: &MessageGuid) -> Result<Option<Found>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT {COLUMNS} FROM message WHERE guid = ?1 AND {} LIMIT 1",
-            mailbox_sql(from, "sender", 2)
-        );
-        conn.query_row(&sql, params![guid.as_str(), bind(from)], row)
-            .optional()
-            .map_err(StoreError::new)?
-            .transpose()
+        find_in(
+            &conn,
+            &format!("guid = ?1 AND {}", mailbox_sql(from, "sender", 2)),
+            &[guid.as_str().to_string(), bind(from)],
+        )
     }
 
     fn pending_of(
@@ -2487,9 +2596,11 @@ impl MessageStore for SqliteStore {
         for half in CLAIM_COLLAPSE {
             tx.execute(&half.promote(), params![fingerprint, login])
                 .map_err(StoreError::new)?;
-            collapsed += tx
-                .execute(&half.delete(), params![fingerprint, login])
-                .map_err(StoreError::new)?;
+            for sql in half.deletes() {
+                collapsed += tx
+                    .execute(&sql, params![fingerprint, login])
+                    .map_err(StoreError::new)?;
+            }
         }
         if collapsed > 0 {
             tracing::info!(
@@ -2516,6 +2627,13 @@ impl MessageStore for SqliteStore {
                 .execute(sql, params![fingerprint, login])
                 .map_err(StoreError::new)?;
         }
+        for sql in [
+            "UPDATE message_stub SET recipient_fp = ?1 WHERE recipient = ?2 AND recipient_fp IS NULL",
+            "UPDATE message_stub SET sender_fp = ?1 WHERE sender = ?2 AND sender_fp IS NULL",
+        ] {
+            tx.execute(sql, params![fingerprint, login])
+                .map_err(StoreError::new)?;
+        }
         tx.commit().map_err(StoreError::new)?;
         Ok(moved)
     }
@@ -2534,9 +2652,11 @@ impl MessageStore for SqliteStore {
         for half in ROTATE_COLLAPSE {
             tx.execute(&half.promote(), params![to, from])
                 .map_err(StoreError::new)?;
-            collapsed += tx
-                .execute(&half.delete(), params![to, from])
-                .map_err(StoreError::new)?;
+            for sql in half.deletes() {
+                collapsed += tx
+                    .execute(&sql, params![to, from])
+                    .map_err(StoreError::new)?;
+            }
         }
         if collapsed > 0 {
             tracing::info!(
@@ -2551,6 +2671,13 @@ impl MessageStore for SqliteStore {
         ] {
             moved += tx
                 .execute(sql, params![to, from])
+                .map_err(StoreError::new)?;
+        }
+        for sql in [
+            "UPDATE message_stub SET recipient_fp = ?1 WHERE recipient_fp = ?2",
+            "UPDATE message_stub SET sender_fp = ?1 WHERE sender_fp = ?2",
+        ] {
+            tx.execute(sql, params![to, from])
                 .map_err(StoreError::new)?;
         }
         tx.commit().map_err(StoreError::new)?;
@@ -2571,6 +2698,16 @@ impl MessageStore for SqliteStore {
             gone += tx
                 .execute(&sql, params![bind(of)])
                 .map_err(StoreError::new)?;
+        }
+        for side in ["recipient", "sender"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM message_stub WHERE {}",
+                    mailbox_sql(of, side, 1)
+                ),
+                params![bind(of)],
+            )
+            .map_err(StoreError::new)?;
         }
         tx.execute(
             "DELETE FROM mailbox_seq WHERE mailbox = ?1",
@@ -2599,14 +2736,41 @@ impl MessageStore for SqliteStore {
         unread: Duration,
         read: Duration,
     ) -> Result<usize, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM message
-              WHERE (read_at IS NOT NULL AND read_at < ?1)
-                 OR (read_at IS NULL AND sent_at < ?2)",
-            params![cutoff(now, read), cutoff(now, unread)],
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let (read, unread) = (cutoff(now, read), cutoff(now, unread));
+        // Before the delete, so the trigger leaves the stub's reactions.
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO message_stub ({STUB_COLUMNS})
+                 SELECT {STUB_COLUMNS} FROM message
+                  WHERE read_at IS NOT NULL AND read_at < ?1 AND sent_at >= ?2
+                    AND kind = 0 AND friendship IS NULL"
+            ),
+            params![read, unread],
         )
-        .map_err(StoreError::new)
+        .map_err(StoreError::new)?;
+        let gone = tx
+            .execute(
+                "DELETE FROM message
+                  WHERE (read_at IS NOT NULL AND read_at < ?1)
+                     OR (read_at IS NULL AND sent_at < ?2)",
+                params![read, unread],
+            )
+            .map_err(StoreError::new)?;
+        tx.execute(
+            "DELETE FROM message_stub WHERE sent_at < ?1",
+            params![unread],
+        )
+        .map_err(StoreError::new)?;
+        // A read row kept past the window answers a retry as the unread
+        // one deleted above does.
+        tx.execute(CLEAR_LATE_GUIDS, params![unread])
+            .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(gone)
     }
 
     fn requests(
@@ -2754,7 +2918,7 @@ fn find_guid_in(
     to: &Mailbox,
     from: Option<&Mailbox>,
     guid: &MessageGuid,
-) -> Result<Option<StoredMessage>, StoreError> {
+) -> Result<Option<Found>, StoreError> {
     // A sender with no mailbox at all is its own scope, and `Mailbox`
     // cannot describe it — a mailbox always has a login. So that case
     // gets its own clause rather than an empty string standing in for
@@ -2765,22 +2929,35 @@ fn find_guid_in(
         // list is a bind shorter in that branch.
         None => "sender IS NULL AND sender_fp IS NULL".to_string(),
     };
-    let sql = format!(
-        "SELECT {COLUMNS} FROM message
-         WHERE guid = ?1 AND {} AND {sender_clause}
-         LIMIT 1",
-        mailbox_sql(to, "recipient", 2)
-    );
-    let found = match from {
-        Some(m) => conn
-            .query_row(&sql, params![guid.as_str(), bind(to), bind(m)], row)
-            .optional(),
-        None => conn
-            .query_row(&sql, params![guid.as_str(), bind(to)], row)
-            .optional(),
+    let mut binds = vec![guid.as_str().to_string(), bind(to)];
+    binds.extend(from.map(bind));
+    find_in(
+        conn,
+        &format!(
+            "guid = ?1 AND {} AND {sender_clause}",
+            mailbox_sql(to, "recipient", 2)
+        ),
+        &binds,
+    )
+}
+
+/// The row `filter` names, or else its stub.
+fn find_in(conn: &Connection, filter: &str, binds: &[String]) -> Result<Option<Found>, StoreError> {
+    let binds = || rusqlite::params_from_iter(binds);
+    let sql = format!("SELECT {COLUMNS} FROM message WHERE {filter} LIMIT 1");
+    if let Some(m) = conn
+        .query_row(&sql, binds(), row)
+        .optional()
+        .map_err(StoreError::new)?
+    {
+        return m.map(|m| Some(Found::Row(Box::new(m))));
     }
-    .map_err(StoreError::new)?;
-    found.transpose()
+    let sql = format!("SELECT {STUB_COLUMNS} FROM message_stub WHERE {filter} LIMIT 1");
+    conn.query_row(&sql, binds(), stub)
+        .optional()
+        .map_err(StoreError::new)?
+        .transpose()
+        .map(|s| s.map(|s| Found::Stub(Box::new(s))))
 }
 
 /// A `MessageId` as SQLite can hold it. Ids are `u64` in the domain and
@@ -4078,6 +4255,179 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Mail of every kind keeps each row as it was, and takes stubs and
+    /// reactions from then on.
+    #[test]
+    fn version_thirty_five_migrates_into_messages_whose_retries_outlive_an_early_prune() {
+        use rusqlite::types::Value;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let snapshot = |conn: &Connection| -> Vec<Vec<Value>> {
+            let mut rows = Vec::new();
+            for table in ["message", "mailbox_seq"] {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                    .unwrap();
+                let n = stmt.column_count();
+                let got = stmt
+                    .query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                    .unwrap();
+                rows.extend(got.map(Result::unwrap));
+            }
+            rows
+        };
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // Read mail, unread mail, a read instant message, a request,
+            // and a receipt for the first.
+            conn.execute_batch(
+                "INSERT INTO message (kind, recipient, sender, sender_nick, body, guid, sent_at,
+                                      delivered_at, read_at, friendship, requested, ref, seq)
+                 VALUES (0, 'dave', 'alice', 'alice', 'read', '00000001-0000-4000-8000-000000000000', 1, 2, 2, NULL, 0,
+                         randomblob(16), 1),
+                        (0, 'dave', 'alice', 'alice', 'unread', '00000002-0000-4000-8000-000000000000', 1, NULL, NULL, NULL, 0,
+                         randomblob(16), 2),
+                        (0, 'dave', 'alice', 'alice', 'instant', '00000003-0000-4000-8000-000000000000', 1, 2, 2, 5, 0,
+                         randomblob(16), 3),
+                        (0, 'dave', 'alice', 'alice', 'request', '00000004-0000-4000-8000-000000000000', 1, NULL, NULL, 0, 1,
+                         randomblob(16), 4),
+                        (1, 'alice', 'dave', 'dave', '00000001-0000-4000-8000-000000000000', NULL, 3, NULL, 3, NULL, 0,
+                         randomblob(16), NULL);
+                 INSERT INTO mailbox_seq (mailbox, last) VALUES ('dave', 4);"
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 35).unwrap();
+            snapshot(&conn)
+        };
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let refs: Vec<Vec<u8>> = {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(snapshot(&conn), before, "every row as it was");
+            let objects: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT type, name FROM sqlite_master
+                      WHERE name LIKE 'message_reaction%' OR name LIKE 'message_stub%'
+                         OR name = 'message_guid_age'
+                      ORDER BY type, name",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let named = |kind: &str, names: &[&str]| -> Vec<(String, String)> {
+                names
+                    .iter()
+                    .map(|n| (kind.to_string(), n.to_string()))
+                    .collect()
+            };
+            let mut want = named(
+                "index",
+                &[
+                    "message_guid_age",
+                    "message_reaction_by",
+                    "message_reaction_one",
+                    "message_reaction_who",
+                    "message_stub_age",
+                    "message_stub_guid",
+                    "message_stub_recipient",
+                    "message_stub_sender",
+                ],
+            );
+            want.extend(named("table", &["message_reaction", "message_stub"]));
+            want.extend(named(
+                "trigger",
+                &["message_reaction_row_gone", "message_reaction_stub_gone"],
+            ));
+            assert_eq!(objects, want);
+            let plan: String = conn
+                .query_row(
+                    &format!("EXPLAIN QUERY PLAN {CLEAR_LATE_GUIDS}"),
+                    [0],
+                    |r| r.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains("message_guid_age"), "{plan}");
+            let refs: Vec<Vec<u8>> = conn
+                .prepare("SELECT ref FROM message WHERE kind = 0 ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let react = |r: &Vec<u8>| {
+                conn.execute(
+                    "INSERT INTO message_reaction (ref, key, reactor, nick, at)
+                     VALUES (?1, x'01', 'l:bob', 'bob', 1)",
+                    params![r],
+                )
+            };
+            for r in &refs {
+                react(r).unwrap();
+            }
+            assert!(react(&refs[0]).is_err(), "one key a reactor, once");
+            refs
+        };
+        let held = || -> Vec<Vec<u8>> {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT ref FROM message_reaction ORDER BY id")
+                .unwrap();
+            let got = stmt.query_map([], |r| r.get(0)).unwrap();
+            got.map(Result::unwrap).collect()
+        };
+        let day = Duration::from_secs(86_400);
+        let prune = |now: Duration| {
+            MessageStore::prune(&store, UNIX_EPOCH + now, day, Duration::from_secs(100)).unwrap()
+        };
+        let retry = NewMessage {
+            recipient: Mailbox::login("dave"),
+            sender: Some(Mailbox::login("alice")),
+            sender_nick: "alice".into(),
+            body: "read".into(),
+            sent_at: UNIX_EPOCH,
+            guid: MessageGuid::parse("00000001-0000-4000-8000-000000000000"),
+            kind: MessageKind::Message,
+            media: None,
+            signed: None,
+            friendship: None,
+            sender_address: None,
+            re: None,
+        };
+        assert_eq!(
+            prune(Duration::from_secs(1000)),
+            3,
+            "read, instant, receipt"
+        );
+        assert_eq!(
+            held(),
+            [refs[0].clone(), refs[1].clone(), refs[3].clone()],
+            "the stub keeps its message's reactions, and the instant message's go"
+        );
+        assert_eq!(
+            store.push(&retry, 100).unwrap(),
+            Pushed::Pruned {
+                reference: MessageRef::try_from(refs[0].clone()).unwrap(),
+                signed: None,
+            }
+        );
+        assert_eq!(prune(day * 2), 2, "unread, request");
+        assert!(held().is_empty(), "the stub's go with it");
+        assert!(matches!(
+            store.push(&retry, 100).unwrap(),
+            Pushed::Stored { .. }
+        ));
     }
 
     #[test]

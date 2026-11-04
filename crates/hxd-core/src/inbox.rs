@@ -308,6 +308,44 @@ pub enum Pushed {
     /// The recipient already has `cap` messages waiting. Nothing was
     /// written.
     Full,
+    /// No row holds the guid, but the stub retention left of one does:
+    /// the message was sent and read, and is answered as its row would
+    /// be. Nothing was written.
+    Pruned {
+        reference: MessageRef,
+        signed: Option<[u8; 32]>,
+    },
+}
+
+/// What is left of a private message retention deleted before its
+/// sender's window, `sent_at` plus `retain_unread`, ended: enough to
+/// answer a retry as the row did, so that whether it was read shows
+/// nowhere (`docs/private-messages.md` §9). Never mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stub {
+    pub reference: MessageRef,
+    pub recipient: Mailbox,
+    pub sender: Option<Mailbox>,
+    pub guid: Option<MessageGuid>,
+    /// What it signed, if it was signed.
+    pub signed: Option<[u8; 32]>,
+    pub sent_at: SystemTime,
+}
+
+/// What [`MessageStore::find_guid`] and [`MessageStore::find_sent`] find.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    Row(Box<StoredMessage>),
+    Stub(Box<Stub>),
+}
+
+impl Found {
+    pub fn recipient(&self) -> &Mailbox {
+        match self {
+            Found::Row(m) => &m.recipient,
+            Found::Stub(s) => &s.recipient,
+        }
+    }
 }
 
 /// What one sender has stored lately, as [`MessageStore::sent_since`]
@@ -403,24 +441,20 @@ pub trait MessageStore: Send + Sync + 'static {
     fn push(&self, m: &NewMessage, cap: usize) -> Result<Pushed, StoreError>;
 
     /// The message this sender already sent this recipient under `guid`,
-    /// if there is one. Scoped to the pair, so two people cannot collide
-    /// on each other's guids and one person may reuse a guid toward two
-    /// recipients.
+    /// if there is one, or its stub. Scoped to the pair, so two people
+    /// cannot collide on each other's guids and one person may reuse a
+    /// guid toward two recipients.
     fn find_guid(
         &self,
         to: &Mailbox,
         from: Option<&Mailbox>,
         guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError>;
+    ) -> Result<Option<Found>, StoreError>;
 
-    /// A message `from` sent under `guid`, to anyone: what a signed id,
-    /// which is its signer's whoever it is sent to, is held to
+    /// A message `from` sent under `guid`, to anyone, or its stub: what a
+    /// signed id, which is its signer's whoever it is sent to, is held to
     /// (`docs/e2e-messages.md` §3.6).
-    fn find_sent(
-        &self,
-        from: &Mailbox,
-        guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError>;
+    fn find_sent(&self, from: &Mailbox, guid: &MessageGuid) -> Result<Option<Found>, StoreError>;
 
     /// Undelivered messages for one mailbox, **oldest first** — the
     /// login/resume flush. `limit` bounds what a single flush hands a
@@ -546,7 +580,7 @@ pub trait MessageStore: Send + Sync + 'static {
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
 
     /// Delete everything belonging to a mailbox — mail to it and mail
-    /// from it. Returns how many rows went.
+    /// from it, and their stubs. Returns how many rows went.
     ///
     /// **Deleting an account must call this.** A login freed by deletion
     /// can be registered by someone else, and [`MessageStore::claim`]
@@ -561,6 +595,11 @@ pub trait MessageStore: Send + Sync + 'static {
     /// sent longer ago than `unread`. Returns how many went. The two
     /// clocks differ on purpose: an unread message ages from when it was
     /// sent, a read one from when the recipient was done with it.
+    ///
+    /// A private message read and dropped less than `unread` after it
+    /// was sent leaves a [`Stub`] until then, and one kept past then
+    /// loses its guid, so that a retry by its sender is answered alike
+    /// whether it was read or not.
     fn prune(&self, now: SystemTime, unread: Duration, read: Duration)
         -> Result<usize, StoreError>;
 

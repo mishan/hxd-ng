@@ -24,8 +24,8 @@ use super::{is_messenger, store_failed, Key, Me, MessagingError, Presence};
 use crate::access::bit;
 use crate::chat::{sessions_of, SignedMsg};
 use crate::inbox::{
-    Cursor, Delivery, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef, MessageStore,
-    NewMessage, Pending, Pushed, StoredMessage,
+    Cursor, Delivery, Found, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, StoredMessage,
 };
 use crate::reaction::{ReactError, ReactionKey};
 use crate::relationships::{RelationId, Requester, SentOn};
@@ -395,6 +395,9 @@ impl Core {
             {
                 return Err(MessagingError::Equivocation)
             }
+            Pushed::Pruned { signed, .. } if content.is_some() && signed != content => {
+                return Err(MessagingError::Equivocation)
+            }
             // A retry is that message, answered as of now, and an
             // approval's as queued whatever became of it.
             Pushed::Existing(m) if m.delivered_at.is_some() => {
@@ -405,6 +408,15 @@ impl Core {
                 })
             }
             Pushed::Existing(m) => (m.id, m.reference, m.cursor, false),
+            // A private message's stub, read and pruned: answered as its
+            // row would be.
+            Pushed::Pruned { reference, .. } => {
+                return Ok(ImSent {
+                    reference: Some(reference),
+                    guid,
+                    delivered: !approval,
+                })
+            }
             Pushed::Full => return Err(MessagingError::QueueFull),
         };
         let delivered = self
@@ -617,7 +629,7 @@ impl Core {
         let Some(sender) = self.any_account(from) else {
             return Ok(());
         };
-        let Some(m) = store
+        let Some(Found::Row(m)) = store
             .find_guid(&me.mailbox, Some(&sender), guid)
             .map_err(store_failed)?
         else {

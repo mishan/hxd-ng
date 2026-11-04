@@ -22,8 +22,8 @@ use std::sync::Arc;
 use crate::relationships::{RelationshipStore, SentOn};
 
 use super::{
-    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
-    MessageStore, NewMessage, Pending, Pushed, Sent,
+    Cursor, Delivery, Found, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent, StoredMessage, Stub,
 };
 
 /// Run every case against a freshly built store. `new_store` is called
@@ -71,6 +71,14 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     a_flush_can_stamp_read_in_the_same_step(&*new_store().inbox);
     a_guid_is_scoped_to_one_sender_and_one_recipient(&*new_store().inbox);
     a_receipt_is_stored_but_never_read_as_mail(&*new_store().inbox);
+    // What retention leaves of a read message for its sender's window.
+    a_stub_answers_a_retry_as_its_row_did(&*new_store().inbox);
+    a_read_message_kept_past_the_window_answers_a_retry_as_an_unread_one_would(&*new_store().inbox);
+    a_stub_is_never_mail(&*new_store().inbox);
+    a_stub_follows_a_claim_and_a_rotation(&*new_store().inbox);
+    a_claim_answers_a_retry_under_one_reference_read_or_not(&*new_store().inbox);
+    only_a_private_message_leaves_a_stub_or_loses_its_guid(&*new_store().inbox);
+    purging_an_account_takes_its_stubs(&*new_store().inbox);
     // The per-sender quota's measure.
     sent_since_counts_a_senders_stored_mail_in_its_window(&*new_store().inbox);
     // The gate (`docs/instant-messaging.md` §5).
@@ -147,6 +155,14 @@ fn place(s: &dyn MessageStore, m: &NewMessage) -> Cursor {
         Pushed::Stored { cursor, .. } => cursor,
         other => panic!("expected a new row, got {other:?}"),
     }
+}
+
+/// What a lookup found, as the row it must be.
+fn row(found: Option<Found>) -> Option<StoredMessage> {
+    found.map(|f| match f {
+        Found::Row(m) => *m,
+        other => panic!("expected a row, got {other:?}"),
+    })
 }
 
 /// Each listed row's cursor, as `list` orders them.
@@ -554,8 +570,7 @@ fn the_friendship_column_round_trips(s: &dyn MessageStore) {
     }
     let got: Vec<_> = (0..sent.len())
         .map(|i| {
-            s.find_guid(&dave, Some(&alice), &guid(i as u8))
-                .unwrap()
+            row(s.find_guid(&dave, Some(&alice), &guid(i as u8)).unwrap())
                 .unwrap()
                 .friendship
         })
@@ -586,8 +601,7 @@ fn a_merge_restamps_what_was_sent_on_the_id_it_ended(s: &dyn MessageStore) {
     s.restamp(&[(3, 5), (5, 9)]).unwrap();
     let got: Vec<_> = (0..sent.len())
         .map(|i| {
-            s.find_guid(&dave, Some(&alice), &guid(i as u8))
-                .unwrap()
+            row(s.find_guid(&dave, Some(&alice), &guid(i as u8)).unwrap())
                 .unwrap()
                 .friendship
         })
@@ -1467,9 +1481,7 @@ fn the_same_guid_twice_is_one_message(s: &dyn MessageStore) {
     m.guid = Some(guid(1));
     let id = push(s, &m);
 
-    let found = s
-        .find_guid(&dave, Some(&alice), &guid(1))
-        .unwrap()
+    let found = row(s.find_guid(&dave, Some(&alice), &guid(1)).unwrap())
         .unwrap_or_else(|| panic!("{case}: the first send is findable"));
     assert_eq!(found.id, id, "{case}: and it is the same row");
     assert_eq!(found.guid.as_ref(), Some(&guid(1)), "{case}: round-trips");
@@ -1628,13 +1640,13 @@ fn a_guid_is_scoped_to_one_sender_and_one_recipient(s: &dyn MessageStore) {
     anon.guid = Some(guid(7));
     push(s, &anon);
     assert_eq!(
-        s.find_guid(&dave, None, &guid(7)).unwrap().map(|m| m.body),
+        row(s.find_guid(&dave, None, &guid(7)).unwrap()).map(|m| m.body),
         Some("from a guest".to_string()),
         "{case}: and a sender with no mailbox is not every sender"
     );
     // Toward anyone, a sender's guid finds what it sent under it.
     assert_eq!(
-        s.find_sent(&alice, &guid(7)).unwrap().map(|m| m.body),
+        row(s.find_sent(&alice, &guid(7)).unwrap()).map(|m| m.body),
         Some("from alice".to_string()),
         "{case}: what a sender sent under a guid, to anyone"
     );
@@ -1746,4 +1758,277 @@ fn sent_since_counts_a_senders_stored_mail_in_its_window(s: &dyn MessageStore) {
         },
         "{case}"
     );
+}
+
+// --- Stubs (`docs/private-messages.md` §9) --------------------------------
+
+/// Retention as the stub cases run it: a read message goes 100s after it
+/// was read, and its sender's window closes 500s after it was sent. Every
+/// age below stays a second or more off either edge, which the two stores
+/// measure in different units.
+fn prune_at(s: &dyn MessageStore, now: u64) -> usize {
+    s.prune(at(now), Duration::from_secs(500), Duration::from_secs(100))
+        .unwrap()
+}
+
+/// Store `m`, sent at 0, read at 10 and pruned at 200: well inside its
+/// sender's window, so it leaves a stub.
+fn stubbed(s: &dyn MessageStore, m: &NewMessage) -> MessageRef {
+    let (reference, cursor) = match s.push(m, usize::MAX).unwrap() {
+        Pushed::Stored {
+            reference, cursor, ..
+        } => (reference, cursor),
+        other => panic!("expected a new row, got {other:?}"),
+    };
+    s.mark_read(&m.recipient, cursor, at(10)).unwrap();
+    assert_eq!(prune_at(s, 200), 1, "read and pruned");
+    reference
+}
+
+fn sent_as(to: &Mailbox, from: &Mailbox, n: u8) -> NewMessage {
+    NewMessage {
+        guid: Some(guid(n)),
+        ..msg(to, from, "read", at(0))
+    }
+}
+
+fn a_stub_answers_a_retry_as_its_row_did(s: &dyn MessageStore) {
+    let case = "a_stub_answers_a_retry_as_its_row_did";
+    let (dave, carol) = (Mailbox::login("dave"), Mailbox::login("carol"));
+    let alice = Mailbox::identified("alice", fp(1));
+    let signature = crate::history::Signature {
+        form: vec![1],
+        content: [7; 32],
+    };
+    for (n, signed) in [(1, None), (2, Some(signature))] {
+        let sent = NewMessage {
+            signed: signed.clone(),
+            ..sent_as(&dave, &alice, n)
+        };
+        let reference = stubbed(s, &sent);
+        let signed = signed.map(|x| x.content);
+        assert_eq!(
+            s.push(&sent, usize::MAX).unwrap(),
+            Pushed::Pruned { reference, signed },
+            "{case}: a retry of {n}"
+        );
+        assert_eq!(s.counts(&dave).unwrap().total, 0, "{case}: writes nothing");
+        let stub = Some(Found::Stub(Box::new(Stub {
+            reference,
+            recipient: dave.clone(),
+            sender: Some(alice.clone()),
+            guid: Some(guid(n)),
+            signed,
+            sent_at: at(0),
+        })));
+        assert_eq!(s.find_guid(&dave, Some(&alice), &guid(n)).unwrap(), stub);
+        assert_eq!(s.find_sent(&alice, &guid(n)).unwrap(), stub);
+        assert_eq!(s.find_guid(&dave, Some(&carol), &guid(n)).unwrap(), None);
+        assert_eq!(s.find_guid(&carol, Some(&alice), &guid(n)).unwrap(), None);
+        assert_eq!(s.find_sent(&carol, &guid(n)).unwrap(), None);
+    }
+    assert_eq!(prune_at(s, 600), 0, "{case}: the window closes");
+    assert_eq!(s.find_sent(&alice, &guid(2)).unwrap(), None, "{case}");
+    assert!(
+        matches!(
+            s.push(&sent_as(&dave, &alice, 1), usize::MAX).unwrap(),
+            Pushed::Stored { .. }
+        ),
+        "{case}: a retry after it is a new message"
+    );
+}
+
+/// Past its sender's window a read message the recipient kept and an
+/// unread one retention deleted look alike to a retry: both store anew.
+fn a_read_message_kept_past_the_window_answers_a_retry_as_an_unread_one_would(
+    s: &dyn MessageStore,
+) {
+    let case = "a_read_message_kept_past_the_window_answers_a_retry_as_an_unread_one_would";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let sent = [sent_as(&dave, &alice, 1), sent_as(&dave, &alice, 2)];
+    let read = place(s, &sent[0]);
+    s.mark_read(&dave, read, at(450)).unwrap();
+    push(s, &sent[1]);
+    for (now, inside) in [(490, true), (540, false)] {
+        prune_at(s, now);
+        for (m, which) in sent.iter().zip(["read late", "unread"]) {
+            let stored = match s.push(m, usize::MAX).unwrap() {
+                Pushed::Existing(_) => false,
+                Pushed::Stored { .. } => true,
+                other => panic!("{case}: {which} at {now}: {other:?}"),
+            };
+            assert_eq!(stored, !inside, "{case}: {which} at {now}");
+        }
+    }
+}
+
+fn a_stub_is_never_mail(s: &dyn MessageStore) {
+    let case = "a_stub_is_never_mail";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    stubbed(s, &sent_as(&dave, &alice, 1));
+    push(s, &msg(&dave, &alice, "waiting", at(150)));
+    assert_eq!(
+        bodies(&s.list(&dave, None, 10).unwrap()),
+        ["waiting"],
+        "{case}"
+    );
+    assert_eq!(
+        bodies(&s.pending_of(&dave, 10, Pending::All).unwrap()),
+        ["waiting"],
+        "{case}"
+    );
+    assert_eq!(
+        s.counts(&dave).unwrap(),
+        InboxCounts {
+            unread: 1,
+            total: 1
+        },
+        "{case}"
+    );
+    assert_eq!(s.sent_since(&alice, at(0)).unwrap().messages, 1, "{case}");
+    assert_eq!(s.purge_count(&dave).unwrap(), 1, "{case}: dave's");
+    assert_eq!(s.purge_count(&alice).unwrap(), 1, "{case}: alice's");
+}
+
+fn a_stub_follows_a_claim_and_a_rotation(s: &dyn MessageStore) {
+    let case = "a_stub_follows_a_claim_and_a_rotation";
+    let found = |to: Mailbox, from: Mailbox| {
+        matches!(
+            s.find_guid(&to, Some(&from), &guid(1)).unwrap(),
+            Some(Found::Stub(_))
+        )
+    };
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    stubbed(s, &sent_as(&dave, &alice, 1));
+    s.claim("dave", &fp(1)).unwrap();
+    s.claim("alice", &fp(2)).unwrap();
+    let id = Mailbox::identified;
+    assert!(
+        found(id("dave", fp(1)), id("alice", fp(2))),
+        "{case}: claimed"
+    );
+    assert!(!found(dave, alice), "{case}: and off the logins");
+    s.rotate(&fp(1), &fp(3)).unwrap();
+    s.rotate(&fp(2), &fp(4)).unwrap();
+    assert!(
+        found(id("dave", fp(3)), id("alice", fp(4))),
+        "{case}: rotated"
+    );
+    assert!(
+        !found(id("dave", fp(1)), id("alice", fp(2))),
+        "{case}: and off the old keys"
+    );
+}
+
+fn purging_an_account_takes_its_stubs(s: &dyn MessageStore) {
+    let case = "purging_an_account_takes_its_stubs";
+    let l = Mailbox::login;
+    // Dave is purged as a recipient, frank as a sender, and bob's to
+    // carol is nobody's business.
+    let pairs = [
+        (l("dave"), l("alice")),
+        (l("erin"), l("frank")),
+        (l("carol"), l("bob")),
+    ];
+    for (n, (to, from)) in pairs.iter().enumerate() {
+        stubbed(s, &sent_as(to, from, n as u8));
+    }
+    s.purge(&l("dave")).unwrap();
+    s.purge(&l("frank")).unwrap();
+    let left: Vec<bool> = pairs
+        .iter()
+        .enumerate()
+        .map(|(n, (to, from))| {
+            s.find_guid(to, Some(from), &guid(n as u8))
+                .unwrap()
+                .is_some()
+        })
+        .collect();
+    assert_eq!(left, [false, false, true], "{case}");
+}
+
+/// Sent to an identity, retried to the bare login after an unlink, and
+/// claimed back: the retry is answered under the identity's reference
+/// whether either copy was read and pruned, before the identity's copy
+/// is read and pruned and after, and a copy that was read leaves the
+/// survivor read.
+fn a_claim_answers_a_retry_under_one_reference_read_or_not(s: &dyn MessageStore) {
+    let case = "a_claim_answers_a_retry_under_one_reference_read_or_not";
+    let alice = Mailbox::login("alice");
+    let send = |m: &NewMessage, read: bool| match read {
+        true => stubbed(s, m),
+        false => match s.push(m, usize::MAX).unwrap() {
+            Pushed::Stored { reference, .. } => reference,
+            other => panic!("{case}: {other:?}"),
+        },
+    };
+    // Where the retry was read, a store that kept its stub beside the
+    // survivor answers with it about half the time once both are
+    // pruned, so those cases are asked often.
+    let often = |c| std::iter::repeat_n(c, 16);
+    for (n, (linked, bare)) in [(false, false), (true, false)]
+        .into_iter()
+        .chain(often((false, true)))
+        .chain(often((true, true)))
+        .enumerate()
+    {
+        let login = format!("dave{n}");
+        let id = Mailbox::identified(&login, fp(n as u8));
+        let first = send(&sent_as(&id, &alice, 1), linked);
+        send(&sent_as(&Mailbox::login(&login), &alice, 1), bare);
+        s.claim(&login, &fp(n as u8)).unwrap();
+        let unread = usize::from(!linked && !bare);
+        assert_eq!(s.pending_count(&id).unwrap(), unread, "{case}: {n} pending");
+        assert_eq!(s.counts(&id).unwrap().unread, unread, "{case}: {n} unread");
+        for when in ["claimed", "pruned"] {
+            let answered = match s.push(&sent_as(&id, &alice, 1), usize::MAX).unwrap() {
+                Pushed::Existing(m) => m.reference,
+                Pushed::Pruned { reference, .. } => reference,
+                other => panic!("{case}: {other:?}"),
+            };
+            assert_eq!(
+                answered, first,
+                "{case}: read {linked}, retry read {bare}, {when}"
+            );
+            s.mark_read(&id, Cursor::MAX, at(10)).unwrap();
+            prune_at(s, 200);
+        }
+    }
+}
+
+/// An instant message, a request and a receipt, read and pruned inside
+/// the window and read and kept past it: none is a private message, so
+/// none leaves a stub or loses its guid.
+fn only_a_private_message_leaves_a_stub_or_loses_its_guid(s: &dyn MessageStore) {
+    let case = "only_a_private_message_leaves_a_stub_or_loses_its_guid";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let kinds = [
+        ("instant", MessageKind::Message, Some(SentOn::Relation(1))),
+        ("request", MessageKind::Message, Some(SentOn::Request)),
+        ("receipt", MessageKind::ReadReceipt, None),
+    ];
+    for (phase, read, now, first) in [("pruned", 100, 200, 10u8), ("kept", 1000, 540, 20)] {
+        let sent: Vec<NewMessage> = kinds
+            .iter()
+            .zip(first..)
+            .map(|((_, kind, friendship), n)| NewMessage {
+                kind: *kind,
+                friendship: *friendship,
+                ..sent_as(&dave, &alice, n)
+            })
+            .collect();
+        let ids: Vec<MessageId> = sent.iter().map(|m| push(s, m)).collect();
+        s.mark_delivered(&ids, at(10), Delivery::Read).unwrap();
+        s.prune(at(now), Duration::from_secs(500), Duration::from_secs(read))
+            .unwrap();
+        for (m, (which, ..)) in sent.iter().zip(&kinds) {
+            let retry = s.push(m, usize::MAX).unwrap();
+            let held = match &retry {
+                Pushed::Stored { .. } => false,
+                Pushed::Existing(_) => true,
+                other => panic!("{case}: {which} {phase}: {other:?}"),
+            };
+            assert_eq!(held, phase == "kept", "{case}: {which} {phase}");
+        }
+    }
 }

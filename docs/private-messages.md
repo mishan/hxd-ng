@@ -219,7 +219,7 @@ pub trait MessageStore: Send + Sync + 'static {
     // client retrying a send, and a sender sending in parallel.
     fn push(&self, m: &NewMessage, cap: usize) -> Result<Pushed, StoreError>;
     fn find_guid(&self, to: &Mailbox, from: Option<&Mailbox>, guid: &MessageGuid)
-        -> Result<Option<StoredMessage>, StoreError>;
+        -> Result<Option<Found>, StoreError>;   // the row, or its stub (below)
     fn pending(&self, to: &Mailbox, limit: usize) -> Result<Vec<StoredMessage>, StoreError>;
     fn pending_count(&self, to: &Mailbox) -> Result<usize, StoreError>;
     fn is_pending(&self, to: &Mailbox, id: MessageId) -> Result<bool, StoreError>;
@@ -377,10 +377,11 @@ on the read clock without prune needing to know what kinds exist, and
 neither it nor its siblings count toward the queue cap — a chatty reader
 must not be able to fill the mailbox it is acking into.
 
-**Nothing writes a receipt yet**, and every read path this store exposes
-filters to messages, so a kind the wire cannot carry can never occupy a
-flush slot or be rendered as mail. The column exists now because adding
-it later is a migration; the wire that fills it is `IM Acknowledge (812)`.
+**`IM Acknowledge (812)` writes receipts**, for a sender that was not
+there to hear a read. Only the read that hands receipts to their sender
+returns them; every other read path this store exposes returns messages
+alone, so a receipt can never occupy a flush slot or be rendered as
+mail.
 
 **And the shape that survives per-device envelopes.** When amendment C's
 envelopes land, a message is N ciphertexts rather than one, `pending`
@@ -397,6 +398,29 @@ event and the `inbox` row so it verifies when it is read days later, and
 `signed_content`, the hash of what it says. A retry under the same guid
 that is signed and says something else is refused as an equivocation
 rather than answered as the stored message.
+
+**A read message pruned early leaves a stub** (schema 36), so that a
+retry cannot tell its sender it was read (§9). When `prune` deletes a
+private message that was read before its sender's window, `sent_at`
+plus `retain_unread`, ended, it keeps in `message_stub` the message's
+`ref`, both parties' mailbox keys, its `guid`, its `signed_content` and
+`sent_at`, until the window ends. A retry under the guid is answered
+from the stub as delivered, under its `ref`, and refused as an
+equivocation where it is signed and says something else, as against the
+row; `find_guid` and `find_sent` find the stub when no row matches.
+The first prune past the window clears the guid of a read message the
+recipient keeps (through `message_guid_age`, which holds only the rows
+that can lose one), so from then on a retry is a new message whatever
+became of the first. A stub is never mail: nothing lists, counts or
+flushes one. A claim and a rotation move it as they move rows, and
+where they merge duplicates a stub already in the destination mailbox
+is kept as a row there would be, so the retry is answered under one
+`ref` whether the message was read or not. A moving stub that meets a
+row there carries its read state over, as a duplicate row does: the row
+is stamped delivered and read as of the stub's `sent_at`, so it is not
+handed over again and goes at the next prune. A purge takes a stub with
+the mailbox. Only retention makes one, and only of
+a private message: an instant message or a request leaves none.
 
 `Mailbox`'s matching rule appears in SQL as **one shape per kind of
 mailbox** — `<col>_fp = ?` for an identified one, `<col>_fp IS NULL AND
@@ -785,6 +809,23 @@ address beside the plain guests' (`instant-messaging.md` §4.1). Once
 approved, its messages reach a session of the recipient that is there,
 or nobody, as a plain guest's do, unless `[messaging]
 queue_identity_guests` lets them wait as an account's mail does.
+
+**The sender's window.** Retention keeps a read message `retain_read`
+from its reading and an unread one `retain_unread` from its sending, so
+a sender that retried under a guid would learn which of its messages
+were read from which are still there. Until `sent_at` plus
+`retain_unread`, the window the sender can work out, a read message
+retention deleted answers through its stub (§5) as an unread one still
+held does; at the first prune after it ends the stub and the unread one
+go, a read one the recipient still keeps loses its guid, and from then
+on a retry stores a new message in every case. A stub lasts at most `retain_unread -
+retain_read` past its message. The window is measured with
+`retain_unread` as it is set now, not as it was when the message was
+sent: **raising it** can show a sender which of its messages already
+past the old window were read, and lowering it shows nothing. And one
+known limit: the daily quota counts rows, not stubs, so with
+`retain_read` under a day a sender near its quota can still see a
+message stop counting once it was read and pruned.
 
 Pruning runs hourly in the binary, next to the existing detached sweeper.
 

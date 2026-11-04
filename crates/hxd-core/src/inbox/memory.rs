@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime};
 use crate::relationships::{MemoryRelationships, RelationId, SentOn};
 
 use super::{
-    Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
-    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage,
+    Cursor, Delivery, Found, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
+    MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage, Stub,
 };
 
 #[derive(Default)]
@@ -36,6 +36,9 @@ struct Inner {
     requested: HashSet<MessageId>,
     /// The address keys guests' requests were sent from.
     addresses: HashMap<MessageId, String>,
+    /// What retention left of read private messages, until their
+    /// senders' windows end.
+    stubs: HashMap<MessageRef, Stub>,
 }
 
 impl Inner {
@@ -157,17 +160,19 @@ fn index_key(m: &Mailbox) -> String {
     }
 }
 
-/// The key the guid index will hold for this row once the merge has
+/// The key the guid index will hold for a row or stub once the merge has
 /// moved everything it moves — `after` is the merge, applied to one
 /// mailbox.
 fn merged_key(
-    m: &StoredMessage,
+    recipient: &Mailbox,
+    sender: Option<&Mailbox>,
+    guid: &Option<MessageGuid>,
     after: &impl Fn(&Mailbox) -> String,
 ) -> (String, String, Option<MessageGuid>) {
     (
-        after(&m.recipient),
-        m.sender.as_ref().map(after).unwrap_or_default(),
-        m.guid.clone(),
+        after(recipient),
+        sender.map(after).unwrap_or_default(),
+        guid.clone(),
     )
 }
 
@@ -227,31 +232,46 @@ fn renumber(inner: &mut Inner, moves: impl Fn(&Mailbox) -> bool, from: &str, int
 /// while linked, the account unlinks, the sender retries, the reader
 /// reads the retry, the account relinks — deletes the row that was read
 /// and hands the survivor over again as unread.
+///
+/// A stub at the destination is the message too, read and pruned, and is
+/// kept as a row there is, so a retry is answered under one reference
+/// whether the message was read or not; a moving stub goes as a moving
+/// row does.
 fn collapse(
-    msgs: &mut Vec<StoredMessage>,
+    inner: &mut Inner,
     at_destination: impl Fn(&Mailbox) -> bool,
     moves: impl Fn(&Mailbox) -> bool,
     after: impl Fn(&Mailbox) -> String,
 ) {
     for sender_side in [false, true] {
-        let side = |m: &StoredMessage, f: &dyn Fn(&Mailbox) -> bool| {
+        let side = |recipient: &Mailbox, sender: Option<&Mailbox>, f: &dyn Fn(&Mailbox) -> bool| {
             if sender_side {
-                m.sender.as_ref().is_some_and(f)
+                sender.is_some_and(f)
             } else {
-                f(&m.recipient)
+                f(recipient)
             }
         };
+        let row = |m: &StoredMessage, f: &dyn Fn(&Mailbox) -> bool| {
+            m.guid.is_some() && side(&m.recipient, m.sender.as_ref(), f)
+        };
+        let stub = |s: &Stub, f: &dyn Fn(&Mailbox) -> bool| {
+            s.guid.is_some() && side(&s.recipient, s.sender.as_ref(), f)
+        };
+        let row_key =
+            |m: &StoredMessage| merged_key(&m.recipient, m.sender.as_ref(), &m.guid, &after);
+        let stub_key = |s: &Stub| merged_key(&s.recipient, s.sender.as_ref(), &s.guid, &after);
+        let msgs = &mut inner.msgs;
         // Each moving row against the row it will collide with, by
         // index, so the survivor can be updated before the other goes.
         let doomed: Vec<(usize, usize)> = msgs
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.guid.is_some() && side(m, &moves))
+            .filter(|(_, m)| row(m, &moves))
             .filter_map(|(i, m)| {
-                let key = merged_key(m, &after);
-                let kept = msgs.iter().position(|k| {
-                    k.guid.is_some() && side(k, &at_destination) && merged_key(k, &after) == key
-                })?;
+                let key = row_key(m);
+                let kept = msgs
+                    .iter()
+                    .position(|k| row(k, &at_destination) && row_key(k) == key)?;
                 Some((i, kept))
             })
             .collect();
@@ -267,6 +287,35 @@ fn collapse(
             i += 1;
             keep
         });
+        // A moving stub was read, as when it was sent (`Collapse::promote`
+        // in the SQLite store says why).
+        let mut read: HashMap<_, SystemTime> = HashMap::new();
+        for s in inner.stubs.values().filter(|s| stub(s, &moves)) {
+            let at = read.entry(stub_key(s)).or_insert(s.sent_at);
+            *at = (*at).min(s.sent_at);
+        }
+        for m in msgs.iter_mut().filter(|m| row(m, &at_destination)) {
+            if let Some(&at) = read.get(&row_key(m)) {
+                m.delivered_at.get_or_insert(at);
+                m.read_at.get_or_insert(at);
+            }
+        }
+        let stubbed: HashSet<_> = inner
+            .stubs
+            .values()
+            .filter(|s| stub(s, &at_destination))
+            .map(stub_key)
+            .collect();
+        let mut kept: HashSet<_> = msgs
+            .iter()
+            .filter(|m| row(m, &at_destination))
+            .map(row_key)
+            .collect();
+        msgs.retain(|m| !(row(m, &moves) && stubbed.contains(&row_key(m))));
+        kept.extend(stubbed);
+        inner
+            .stubs
+            .retain(|_, s| !(stub(s, &moves) && kept.contains(&stub_key(s))));
     }
 }
 
@@ -283,6 +332,44 @@ fn is(m: &Mailbox, key: &Mailbox) -> bool {
     key.matches(&m.login, m.fingerprint.as_ref())
 }
 
+/// Is a row or stub from `sender` to `recipient` one of the pair's, as
+/// `message_guid` keys it?
+fn of_pair(
+    recipient: &Mailbox,
+    sender: Option<&Mailbox>,
+    to: &Mailbox,
+    from: Option<&Mailbox>,
+) -> bool {
+    is(recipient, to)
+        && match (sender, from) {
+            (Some(a), Some(b)) => is(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// What `find_guid` finds, the row before its stub.
+fn find_guid_in(
+    inner: &Inner,
+    to: &Mailbox,
+    from: Option<&Mailbox>,
+    guid: &MessageGuid,
+) -> Option<Found> {
+    let row = inner.msgs.iter().find(|m| {
+        m.guid.as_ref() == Some(guid) && of_pair(&m.recipient, m.sender.as_ref(), to, from)
+    });
+    match row {
+        Some(m) => Some(Found::Row(Box::new(m.clone()))),
+        None => inner
+            .stubs
+            .values()
+            .find(|s| {
+                s.guid.as_ref() == Some(guid) && of_pair(&s.recipient, s.sender.as_ref(), to, from)
+            })
+            .map(|s| Found::Stub(Box::new(s.clone()))),
+    }
+}
+
 impl MessageStore for MemoryStore {
     fn push(&self, m: &NewMessage, cap: usize) -> Result<Pushed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
@@ -290,17 +377,15 @@ impl MessageStore for MemoryStore {
         // under too — see the trait docs for why neither can be the
         // caller's job.
         if let Some(guid) = m.guid.as_ref() {
-            let existing = inner.msgs.iter().find(|x| {
-                x.guid.as_ref() == Some(guid)
-                    && is(&x.recipient, &m.recipient)
-                    && match (&x.sender, &m.sender) {
-                        (Some(a), Some(b)) => is(a, b),
-                        (None, None) => true,
-                        _ => false,
-                    }
-            });
-            if let Some(existing) = existing {
-                return Ok(Pushed::Existing(Box::new(existing.clone())));
+            match find_guid_in(&inner, &m.recipient, m.sender.as_ref(), guid) {
+                Some(Found::Row(existing)) => return Ok(Pushed::Existing(existing)),
+                Some(Found::Stub(stub)) => {
+                    return Ok(Pushed::Pruned {
+                        reference: stub.reference,
+                        signed: stub.signed,
+                    })
+                }
+                None => {}
             }
         }
         // The cap is about mail. A receipt is not something the recipient
@@ -366,36 +451,27 @@ impl MessageStore for MemoryStore {
         to: &Mailbox,
         from: Option<&Mailbox>,
         guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .msgs
-            .iter()
-            .find(|m| {
-                m.guid.as_ref() == Some(guid)
-                    && is(&m.recipient, to)
-                    && match (&m.sender, from) {
-                        (Some(s), Some(f)) => is(s, f),
-                        (None, None) => true,
-                        _ => false,
-                    }
-            })
-            .cloned())
+    ) -> Result<Option<Found>, StoreError> {
+        Ok(find_guid_in(&self.inner.lock().unwrap(), to, from, guid))
     }
 
-    fn find_sent(
-        &self,
-        from: &Mailbox,
-        guid: &MessageGuid,
-    ) -> Result<Option<StoredMessage>, StoreError> {
+    fn find_sent(&self, from: &Mailbox, guid: &MessageGuid) -> Result<Option<Found>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
+        let sent = |g: Option<&MessageGuid>, s: Option<&Mailbox>| {
+            g == Some(guid) && s.is_some_and(|s| is(s, from))
+        };
+        let row = inner
             .msgs
             .iter()
-            .find(|m| {
-                m.guid.as_ref() == Some(guid) && m.sender.as_ref().is_some_and(|s| is(s, from))
-            })
-            .cloned())
+            .find(|m| sent(m.guid.as_ref(), m.sender.as_ref()));
+        Ok(match row {
+            Some(m) => Some(Found::Row(Box::new(m.clone()))),
+            None => inner
+                .stubs
+                .values()
+                .find(|s| sent(s.guid.as_ref(), s.sender.as_ref()))
+                .map(|s| Found::Stub(Box::new(s.clone()))),
+        })
     }
 
     fn pending_of(
@@ -553,7 +629,7 @@ impl MessageStore for MemoryStore {
         let hex: String = fingerprint.iter().map(|b| format!("{b:02x}")).collect();
         let moves = |m: &Mailbox| m.fingerprint.is_none() && m.login == login;
         collapse(
-            &mut inner.msgs,
+            &mut inner,
             |m: &Mailbox| m.fingerprint.as_ref() == Some(fingerprint),
             moves,
             |m: &Mailbox| {
@@ -569,6 +645,12 @@ impl MessageStore for MemoryStore {
         // Its count went with its mail: a later holder of the login
         // must not count on from it. An unlink raises it again.
         inner.cursors.remove(login);
+        for stub in inner.stubs.values_mut() {
+            claim_one(&mut stub.recipient, login, fingerprint);
+            if let Some(s) = stub.sender.as_mut() {
+                claim_one(s, login, fingerprint);
+            }
+        }
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if claim_one(&mut m.recipient, login, fingerprint) {
@@ -588,7 +670,7 @@ impl MessageStore for MemoryStore {
         let hex: String = to.iter().map(|b| format!("{b:02x}")).collect();
         let moves = |m: &Mailbox| m.fingerprint.as_ref() == Some(from);
         collapse(
-            &mut inner.msgs,
+            &mut inner,
             |m: &Mailbox| m.fingerprint.as_ref() == Some(to),
             moves,
             |m: &Mailbox| {
@@ -606,6 +688,12 @@ impl MessageStore for MemoryStore {
             &index_key(&Mailbox::identified("", *from)),
             &hex,
         );
+        for stub in inner.stubs.values_mut() {
+            rotate_one(&mut stub.recipient, from, to);
+            if let Some(s) = stub.sender.as_mut() {
+                rotate_one(s, from, to);
+            }
+        }
         let mut n = 0;
         for m in inner.msgs.iter_mut() {
             if rotate_one(&mut m.recipient, from, to) {
@@ -626,6 +714,9 @@ impl MessageStore for MemoryStore {
         inner
             .msgs
             .retain(|m| !is(&m.recipient, of) && !m.sender.as_ref().is_some_and(|s| is(s, of)));
+        inner
+            .stubs
+            .retain(|_, s| !is(&s.recipient, of) && !s.sender.as_ref().is_some_and(|s| is(s, of)));
         inner.cursors.remove(&index_key(of));
         inner.forget_removed();
         Ok(before - inner.msgs.len())
@@ -646,12 +737,36 @@ impl MessageStore for MemoryStore {
         unread: Duration,
         read: Duration,
     ) -> Result<usize, StoreError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
         let before = inner.msgs.len();
-        inner.msgs.retain(|m| match m.read_at {
-            Some(read_at) => elapsed(now, read_at) < read,
-            None => elapsed(now, m.sent_at) < unread,
+        let open = |m: &StoredMessage| elapsed(now, m.sent_at) < unread;
+        let private = |m: &StoredMessage| is_mail(m) && m.friendship.is_none();
+        let stubs = &mut inner.stubs;
+        inner.msgs.retain(|m| {
+            let keep = match m.read_at {
+                Some(read_at) => elapsed(now, read_at) < read,
+                None => open(m),
+            };
+            if !keep && private(m) && open(m) {
+                stubs.insert(
+                    m.reference,
+                    Stub {
+                        reference: m.reference,
+                        recipient: m.recipient.clone(),
+                        sender: m.sender.clone(),
+                        guid: m.guid.clone(),
+                        signed: m.signed.as_ref().map(|s| s.content),
+                        sent_at: m.sent_at,
+                    },
+                );
+            }
+            keep
         });
+        stubs.retain(|_, s| elapsed(now, s.sent_at) < unread);
+        for m in inner.msgs.iter_mut().filter(|m| private(m) && !open(m)) {
+            m.guid = None;
+        }
         inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
