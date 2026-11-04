@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::access::bit;
 use crate::history::LineId;
-use crate::inbox::{Mailbox, StoreError};
+use crate::inbox::{Mailbox, MessageRef, StoreError};
 use crate::messaging::Key;
 use crate::moderation::{Act, ActKind, Actor, ModError, Subject, MAX_ACT_REASON};
 use crate::reply::Reply;
@@ -990,6 +990,105 @@ pub enum Reacted {
     NoSuchLine,
     TooManyKeys,
     TooManyOfYours,
+}
+
+/// One account adding or removing one key on a stored private message,
+/// named by its reference: [`ReactAct`] for the inbox.
+#[derive(Debug)]
+pub struct MessageReactAct<'a> {
+    pub reference: MessageRef,
+    pub who: &'a Mailbox,
+    pub nick: &'a str,
+    pub key: &'a ReactionKey,
+    pub add: bool,
+    pub at: SystemTime,
+    /// The earliest `sent_at` still inside the sender's window.
+    pub open_since: SystemTime,
+    pub max_keys: usize,
+    pub max_per_user: usize,
+}
+
+/// A stored private message's reactions and its parties, read in the
+/// transaction that changed them, for telling whoever may hear it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageState {
+    pub reference: MessageRef,
+    pub recipient: Mailbox,
+    pub sender: Option<Mailbox>,
+    /// What shuts the sender out once its window ends.
+    pub sent_at: SystemTime,
+    /// Handed to the recipient, or a stub.
+    pub delivered: bool,
+    /// In the order first added.
+    pub keys: Vec<(ReactionKey, u32)>,
+    /// Each holder by [`reactor_key`], with the key it holds.
+    pub held: Vec<(String, ReactionKey)>,
+}
+
+impl MessageState {
+    /// A message's state from its reactions as `(key, reactor)`, in the
+    /// order they were made, as both stores build it.
+    pub fn of(
+        reference: MessageRef,
+        parties: Parties,
+        sent_at: SystemTime,
+        delivered: bool,
+        rows: &[(&[u8], &str)],
+    ) -> Self {
+        MessageState {
+            reference,
+            recipient: parties.recipient,
+            sender: parties.sender,
+            sent_at,
+            delivered,
+            keys: crate::history::summarize(rows.iter().copied(), None).keys,
+            held: (rows.iter())
+                .filter_map(|&(key, reactor)| {
+                    Some((reactor.to_string(), ReactionKey::unpack(key)?))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What a store made of a [`MessageReactAct`]. Nobody is told of the
+/// two that change nothing, so neither says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageReacted {
+    /// Boxed: it dwarfs the others.
+    Applied(Box<MessageState>),
+    /// Nothing to change.
+    Held,
+    /// Not a party on its side's terms, or past a cap.
+    Dropped,
+}
+
+/// Who a stored private message is between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parties {
+    pub recipient: Mailbox,
+    pub sender: Option<Mailbox>,
+}
+
+impl Parties {
+    /// These parties, if `who` is one of them on its side's terms
+    /// (`docs/private-messages.md` §5): the recipient through its row
+    /// while it lives, and either through the row or its stub while the
+    /// sender's window, from `open_since`, holds `sent_at`. The one rule
+    /// both stores ask.
+    pub fn seen_by(
+        self,
+        who: &Mailbox,
+        row: bool,
+        sent_at: SystemTime,
+        open_since: SystemTime,
+    ) -> Option<Self> {
+        let open = sent_at >= open_since;
+        let is = |m: &Mailbox| who.matches(&m.login, m.fingerprint.as_ref());
+        let recipient = is(&self.recipient) && (row || open);
+        let sender = open && self.sender.as_ref().is_some_and(is);
+        (recipient || sender).then_some(self)
+    }
 }
 
 /// The mailbox rule as one value, which a store can index and compare:

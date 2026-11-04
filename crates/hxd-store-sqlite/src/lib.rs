@@ -29,14 +29,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hxd_core::history::{
-    Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineHome, LineId, LogLine, MediaMeta,
-    NewLine, Retention, Signature, SignedAt,
+    summarize, Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineHome, LineId, LogLine,
+    MediaMeta, NewLine, Retention, Signature, SignedAt,
 };
 use hxd_core::inbox::{
     Cursor, Delivery, Found, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
     MessageStore, NewMessage, Pending, Pushed, Sent, StoreError, StoredMessage, Stub,
 };
-use hxd_core::reaction::{reactor_key, ReactAct, Reacted, ReactionKey, Reactions};
+use hxd_core::reaction::{
+    reactor_key, MessageReactAct, MessageReacted, MessageState, Parties, ReactAct, Reacted,
+    ReactionKey, Reactions, REACTORS_SHOWN,
+};
 use hxd_core::relationships::{RelationId, SentOn};
 use hxd_core::reply::Reply;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -1925,11 +1928,13 @@ impl Collapse {
         )
     }
 
-    /// Then the duplicate goes, row or stub. A stub at the destination
-    /// is the message too, read and pruned, and is kept as a row there
-    /// is: keeping the moving row instead would answer a retry under
-    /// another reference, telling its sender the message was read.
-    fn deletes(&self) -> impl Iterator<Item = String> + '_ {
+    /// Then the duplicate goes, row or stub, its reactions carried first
+    /// onto the survivor but for a key it already holds from the same
+    /// account: each pair is `(carry, delete)`. A stub at the
+    /// destination is the message too, read and pruned, and is kept as a
+    /// row there is: keeping the moving row instead would answer a retry
+    /// under another reference, telling its sender the message was read.
+    fn deletes(&self) -> impl Iterator<Item = (String, String)> + '_ {
         let (dest, dup) = (self.destination, self.duplicate);
         [
             ("message", "message"),
@@ -1939,10 +1944,21 @@ impl Collapse {
         ]
         .into_iter()
         .map(move |(moving, at)| {
-            format!(
-                "DELETE FROM {moving} AS dup
-                  WHERE dup.guid IS NOT NULL
-                    AND EXISTS (SELECT 1 FROM {at} AS kept WHERE {dest} AND {dup})"
+            (
+                format!(
+                    "INSERT OR IGNORE INTO message_reaction (ref, key, reactor, nick, at)
+                     SELECT kept.ref, r.key, r.reactor, r.nick, r.at
+                       FROM {moving} AS dup
+                       JOIN {at} AS kept ON {dest} AND {dup}
+                       JOIN message_reaction AS r ON r.ref = dup.ref
+                      WHERE dup.guid IS NOT NULL
+                      ORDER BY r.id"
+                ),
+                format!(
+                    "DELETE FROM {moving} AS dup
+                      WHERE dup.guid IS NOT NULL
+                        AND EXISTS (SELECT 1 FROM {at} AS kept WHERE {dest} AND {dup})"
+                ),
             )
         })
     }
@@ -2202,6 +2218,113 @@ fn stub(r: &Row<'_>) -> rusqlite::Result<Result<Stub, StoreError>> {
             sent_at: from_unix(sent_at),
         })
     })())
+}
+
+/// `?1, ?2, …` for `n` binds, numbered so one list can be named twice.
+fn numbered(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn refs_from(rows: Vec<Vec<u8>>) -> Vec<MessageRef> {
+    rows.into_iter()
+        .filter_map(|r| MessageRef::try_from(r).ok())
+        .collect()
+}
+
+/// A private message by its reference: its parties, `sent_at`, whether
+/// a row holds it rather than a stub, and whether it was delivered.
+type Held = (MessageRef, Parties, SystemTime, bool, bool);
+
+/// [`Held`] for each of `refs` a private message row or a stub holds,
+/// through `message_ref` and the stub's key.
+fn held_in(conn: &Connection, refs: &[MessageRef]) -> Result<Vec<Held>, StoreError> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks = numbered(refs.len());
+    let sql = format!(
+        "SELECT ref, recipient, recipient_fp, sender, sender_fp, sent_at,
+                delivered_at IS NOT NULL, 1
+           FROM message WHERE ref IN ({marks}) AND kind = 0 AND friendship IS NULL
+         UNION ALL
+         SELECT ref, recipient, recipient_fp, sender, sender_fp, sent_at, 1, 0
+           FROM message_stub WHERE ref IN ({marks})"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(refs.iter().map(|r| &r[..])),
+            |r| {
+                let reference: Vec<u8> = r.get(0)?;
+                let (rl, rfp): (String, Option<String>) = (r.get(1)?, r.get(2)?);
+                let (sl, sfp): (Option<String>, Option<String>) = (r.get(3)?, r.get(4)?);
+                let (sent_at, delivered, row): (i64, bool, bool) =
+                    (r.get(5)?, r.get(6)?, r.get(7)?);
+                Ok((|| {
+                    let parties = Parties {
+                        recipient: mailbox(rl, rfp)?,
+                        sender: sl.map(|l| mailbox(l, sfp)).transpose()?,
+                    };
+                    let reference = MessageRef::try_from(reference)
+                        .map_err(|_| StoreError::new("a reference is not 16 bytes"))?;
+                    Ok((reference, parties, from_unix(sent_at), row, delivered))
+                })())
+            },
+        )
+        .map_err(StoreError::new)?;
+    rows.map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
+        .collect()
+}
+
+/// Every reaction on `refs` as `(ref, key, reactor)`, in the order made.
+fn reactions_on(
+    conn: &Connection,
+    refs: &[MessageRef],
+) -> Result<Vec<(MessageRef, Vec<u8>, String)>, StoreError> {
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT ref, key, reactor FROM message_reaction WHERE ref IN ({}) ORDER BY id",
+        numbered(refs.len())
+    );
+    let mut stmt = conn.prepare(&sql).map_err(StoreError::new)?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(refs.iter().map(|r| &r[..])),
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(StoreError::new)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (reference, key, reactor) = row.map_err(StoreError::new)?;
+        if let Ok(reference) = MessageRef::try_from(reference) {
+            out.push((reference, key, reactor));
+        }
+    }
+    Ok(out)
+}
+
+fn rows_of(on: &[(MessageRef, Vec<u8>, String)], r: MessageRef) -> Vec<(&[u8], &str)> {
+    (on.iter())
+        .filter(|x| x.0 == r)
+        .map(|x| (&x.1[..], &x.2[..]))
+        .collect()
+}
+
+/// The state of each of `refs` a row or stub holds, in the order asked.
+fn states_in(conn: &Connection, refs: &[MessageRef]) -> Result<Vec<MessageState>, StoreError> {
+    let on = reactions_on(conn, refs)?;
+    let mut states: Vec<MessageState> = (held_in(conn, refs)?.into_iter())
+        .map(|(r, parties, sent_at, _, delivered)| {
+            MessageState::of(r, parties, sent_at, delivered, &rows_of(&on, r))
+        })
+        .collect();
+    states.sort_by_key(|s| refs.iter().position(|r| *r == s.reference));
+    Ok(states)
 }
 
 /// Collect a query's rows, surfacing the first unreadable one.
@@ -2598,9 +2721,11 @@ impl MessageStore for SqliteStore {
         for half in CLAIM_COLLAPSE {
             tx.execute(&half.promote(), params![fingerprint, login])
                 .map_err(StoreError::new)?;
-            for sql in half.deletes() {
+            for (carry, delete) in half.deletes() {
+                tx.execute(&carry, params![fingerprint, login])
+                    .map_err(StoreError::new)?;
                 collapsed += tx
-                    .execute(&sql, params![fingerprint, login])
+                    .execute(&delete, params![fingerprint, login])
                     .map_err(StoreError::new)?;
             }
         }
@@ -2654,9 +2779,11 @@ impl MessageStore for SqliteStore {
         for half in ROTATE_COLLAPSE {
             tx.execute(&half.promote(), params![to, from])
                 .map_err(StoreError::new)?;
-            for sql in half.deletes() {
+            for (carry, delete) in half.deletes() {
+                tx.execute(&carry, params![to, from])
+                    .map_err(StoreError::new)?;
                 collapsed += tx
-                    .execute(&sql, params![to, from])
+                    .execute(&delete, params![to, from])
                     .map_err(StoreError::new)?;
             }
         }
@@ -2714,6 +2841,12 @@ impl MessageStore for SqliteStore {
         tx.execute(
             "DELETE FROM mailbox_seq WHERE mailbox = ?1",
             params![bind(of)],
+        )
+        .map_err(StoreError::new)?;
+        // So a later holder of the login holds none, wherever they are.
+        tx.execute(
+            "DELETE FROM message_reaction WHERE reactor = ?1",
+            params![reactor_key(of)],
         )
         .map_err(StoreError::new)?;
         tx.commit().map_err(StoreError::new)?;
@@ -2865,6 +2998,179 @@ impl MessageStore for SqliteStore {
         );
         conn.execute(&sql, params![bind(to), bind(from)])
             .map_err(StoreError::new)
+    }
+
+    fn message_party(
+        &self,
+        r: &MessageRef,
+        who: &Mailbox,
+        open_since: SystemTime,
+    ) -> Result<Option<Parties>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok((held_in(&conn, &[*r])?.into_iter())
+            .find_map(|(_, p, sent_at, row, _)| p.seen_by(who, row, sent_at, open_since)))
+    }
+
+    fn react_message(&self, act: &MessageReactAct) -> Result<MessageReacted, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        // Immediate, as `react` is: the first statement is a read.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let seen = (held_in(&tx, &[act.reference])?.into_iter())
+            .find_map(|(_, p, sent_at, row, _)| p.seen_by(act.who, row, sent_at, act.open_since));
+        if seen.is_none() {
+            return Ok(MessageReacted::Dropped);
+        }
+        let (r, key, reactor) = (&act.reference[..], act.key.pack(), reactor_key(act.who));
+        let (keys, keyed, yours, held): (i64, i64, i64, i64) = tx
+            .query_row(
+                "SELECT COUNT(DISTINCT key), COUNT(*) FILTER (WHERE key = ?2),
+                        COUNT(*) FILTER (WHERE reactor = ?3),
+                        COUNT(*) FILTER (WHERE key = ?2 AND reactor = ?3)
+                   FROM message_reaction WHERE ref = ?1",
+                params![r, key, reactor],
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)),
+            )
+            .map_err(StoreError::new)?;
+        if act.add == (held > 0) {
+            return Ok(MessageReacted::Held);
+        }
+        let full =
+            (keyed == 0 && keys as usize >= act.max_keys) || yours as usize >= act.max_per_user;
+        if act.add && full {
+            return Ok(MessageReacted::Dropped);
+        }
+        let write = match act.add {
+            true => tx.execute(
+                "INSERT INTO message_reaction (ref, key, reactor, nick, at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![r, key, reactor, act.nick, unix(act.at)],
+            ),
+            false => tx.execute(
+                "DELETE FROM message_reaction WHERE ref = ?1 AND key = ?2 AND reactor = ?3",
+                params![r, key, reactor],
+            ),
+        };
+        write.map_err(StoreError::new)?;
+        let state = (states_in(&tx, &[act.reference])?.pop())
+            .ok_or_else(|| StoreError::new("a party's message went in its own reaction"))?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(MessageReacted::Applied(Box::new(state)))
+    }
+
+    fn message_reactions(
+        &self,
+        refs: &[MessageRef],
+        reader: &Mailbox,
+        open_since: SystemTime,
+        key: Option<&ReactionKey>,
+    ) -> Result<HashMap<MessageRef, (Reactions, Vec<String>)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let seen: Vec<MessageRef> = (held_in(&conn, refs)?.into_iter())
+            .filter_map(|(r, p, sent_at, row, _)| {
+                p.seen_by(reader, row, sent_at, open_since).map(|_| r)
+            })
+            .collect();
+        let on = reactions_on(&conn, &seen)?;
+        let mine = reactor_key(reader);
+        let mut out = HashMap::new();
+        for r in seen {
+            let shown = summarize(rows_of(&on, r), Some(&mine));
+            if shown.keys.is_empty() {
+                continue;
+            }
+            let holders = match key {
+                None => Vec::new(),
+                Some(key) => conn
+                    .prepare_cached(
+                        "SELECT nick FROM message_reaction WHERE ref = ?1 AND key = ?2
+                          ORDER BY at DESC, id DESC LIMIT ?3",
+                    )
+                    .and_then(|mut stmt| {
+                        let limit = REACTORS_SHOWN as i64;
+                        stmt.query_map(params![&r[..], key.pack(), limit], |x| x.get(0))?
+                            .collect()
+                    })
+                    .map_err(StoreError::new)?,
+            };
+            out.insert(r, (shown, holders));
+        }
+        Ok(out)
+    }
+
+    fn message_reaction_states(
+        &self,
+        refs: &[MessageRef],
+    ) -> Result<Vec<MessageState>, StoreError> {
+        states_in(&self.conn.lock().unwrap(), refs)
+    }
+
+    fn forget_message_reactions(
+        &self,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<MessageRef>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        let (reactor, since) = (reactor_key(who), unix(since));
+        let lost: Vec<Vec<u8>> = tx
+            .prepare(
+                "SELECT DISTINCT ref FROM message_reaction WHERE reactor = ?1 AND at >= ?2
+                  ORDER BY ref",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(params![reactor, since], |r| r.get(0))?
+                    .collect()
+            })
+            .map_err(StoreError::new)?;
+        tx.execute(
+            "DELETE FROM message_reaction WHERE reactor = ?1 AND at >= ?2",
+            params![reactor, since],
+        )
+        .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(refs_from(lost))
+    }
+
+    fn rekey_message_reactions(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+    ) -> Result<Vec<MessageRef>, StoreError> {
+        let (from, to) = (reactor_key(from), reactor_key(to));
+        if from == to {
+            // Nothing moves, and the collision rule would take them all.
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(StoreError::new)?;
+        const TWICE: &str = "reactor = ?1 AND EXISTS (
+           SELECT 1 FROM message_reaction AS held
+            WHERE held.ref = message_reaction.ref AND held.key = message_reaction.key
+              AND held.reactor = ?2)";
+        let lost: Vec<Vec<u8>> = tx
+            .prepare(&format!(
+                "SELECT DISTINCT ref FROM message_reaction WHERE {TWICE} ORDER BY ref"
+            ))
+            .and_then(|mut stmt| stmt.query_map(params![from, to], |r| r.get(0))?.collect())
+            .map_err(StoreError::new)?;
+        tx.execute(
+            &format!("DELETE FROM message_reaction WHERE {TWICE}"),
+            params![from, to],
+        )
+        .map_err(StoreError::new)?;
+        tx.execute(
+            "UPDATE message_reaction SET reactor = ?2 WHERE reactor = ?1",
+            params![from, to],
+        )
+        .map_err(StoreError::new)?;
+        tx.commit().map_err(StoreError::new)?;
+        Ok(refs_from(lost))
     }
 
     fn restamp(&self, merged: &[(RelationId, RelationId)]) -> Result<usize, StoreError> {
@@ -3045,6 +3351,28 @@ impl SqliteStore {
         conn.query_row(
             "SELECT COUNT(*) FROM chat_reaction WHERE reactor = ?1",
             params![reactor_key(who)],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .map_err(StoreError::new)
+    }
+
+    /// How many stored messages' reactions `who`'s purge would take:
+    /// those on its mail and its stubs, and those it made anywhere.
+    pub fn message_reactions_held(&self, who: &Mailbox) -> Result<usize, StoreError> {
+        let theirs = format!(
+            "({}) OR ({})",
+            mailbox_sql(who, "recipient", 1),
+            mailbox_sql(who, "sender", 1)
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM message_reaction WHERE reactor = ?2
+                    OR ref IN (SELECT ref FROM message WHERE {theirs})
+                    OR ref IN (SELECT ref FROM message_stub WHERE {theirs})"
+            ),
+            params![bind(who), reactor_key(who)],
             |r| r.get::<_, i64>(0),
         )
         .map(|n| n as usize)

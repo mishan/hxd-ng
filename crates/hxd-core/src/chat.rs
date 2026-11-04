@@ -7220,6 +7220,50 @@ pub(crate) mod inbox_tests {
         fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError> {
             self.inner.delete_requests(to, from)
         }
+        fn message_party(
+            &self,
+            r: &crate::inbox::MessageRef,
+            who: &Mailbox,
+            open_since: SystemTime,
+        ) -> Result<Option<crate::reaction::Parties>, StoreError> {
+            self.inner.message_party(r, who, open_since)
+        }
+        fn react_message(
+            &self,
+            act: &crate::reaction::MessageReactAct,
+        ) -> Result<crate::reaction::MessageReacted, StoreError> {
+            self.inner.react_message(act)
+        }
+        fn message_reactions(
+            &self,
+            refs: &[crate::inbox::MessageRef],
+            reader: &Mailbox,
+            open_since: SystemTime,
+            key: Option<&crate::ReactionKey>,
+        ) -> Result<HashMap<crate::inbox::MessageRef, (crate::Reactions, Vec<String>)>, StoreError>
+        {
+            self.inner.message_reactions(refs, reader, open_since, key)
+        }
+        fn message_reaction_states(
+            &self,
+            refs: &[crate::inbox::MessageRef],
+        ) -> Result<Vec<crate::reaction::MessageState>, StoreError> {
+            self.inner.message_reaction_states(refs)
+        }
+        fn forget_message_reactions(
+            &self,
+            who: &Mailbox,
+            since: SystemTime,
+        ) -> Result<Vec<crate::inbox::MessageRef>, StoreError> {
+            self.inner.forget_message_reactions(who, since)
+        }
+        fn rekey_message_reactions(
+            &self,
+            from: &Mailbox,
+            to: &Mailbox,
+        ) -> Result<Vec<crate::inbox::MessageRef>, StoreError> {
+            self.inner.rekey_message_reactions(from, to)
+        }
     }
 
     #[test]

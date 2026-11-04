@@ -19,6 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::sync::Arc;
 
+use crate::reaction::{
+    MessageReactAct, MessageReacted, MessageState, Parties, ReactionKey, Reactions,
+};
 use crate::relationships::{RelationshipStore, SentOn};
 
 use super::{
@@ -79,6 +82,24 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     a_claim_answers_a_retry_under_one_reference_read_or_not(&*new_store().inbox);
     only_a_private_message_leaves_a_stub_or_loses_its_guid(&*new_store().inbox);
     purging_an_account_takes_its_stubs(&*new_store().inbox);
+    an_early_pruned_message_leaves_a_stub_its_parties_still_find(&*new_store().inbox);
+    a_message_kept_past_the_window_answers_its_recipient_and_not_its_sender(&*new_store().inbox);
+    mail_to_ones_own_account_kept_past_the_window_is_still_its_recipients(&*new_store().inbox);
+    // Reactions on stored private messages.
+    a_message_reaction_adds_removes_and_holds(&*new_store().inbox);
+    message_reactions_keep_first_added_order_and_name_holders_newest_first(&*new_store().inbox);
+    a_message_holds_its_caps_in_the_write(&*new_store().inbox);
+    either_party_and_no_one_else_reacts_and_reads(&*new_store().inbox);
+    only_a_private_message_takes_reactions(&*new_store().inbox);
+    a_messages_reactions_go_with_it_however_it_goes(&*new_store().inbox);
+    a_stubs_reactions_last_until_the_window_ends(&*new_store().inbox);
+    a_kept_rows_reactions_are_the_recipients_after_the_window(&*new_store().inbox);
+    a_merged_duplicate_gives_the_survivor_its_reactions(new_store);
+    message_reactions_follow_a_reactors_claim_and_rotation(&*new_store().inbox);
+    purging_an_account_takes_every_reaction_it_made(&*new_store().inbox);
+    forgetting_a_persons_message_reactions_keeps_those_before_the_window_and_the_stubs(
+        &*new_store().inbox,
+    );
     // The per-sender quota's measure.
     sent_since_counts_a_senders_stored_mail_in_its_window(&*new_store().inbox);
     // The gate (`docs/instant-messaging.md` §5).
@@ -2031,4 +2052,515 @@ fn only_a_private_message_leaves_a_stub_or_loses_its_guid(s: &dyn MessageStore) 
             assert_eq!(held, phase == "kept", "{case}: {which} {phase}");
         }
     }
+}
+
+/// The parties' side of a stub: each finds it while the sender's window
+/// holds its `sent_at`, whether or not retention has taken it yet, and
+/// neither after.
+fn an_early_pruned_message_leaves_a_stub_its_parties_still_find(s: &dyn MessageStore) {
+    let case = "an_early_pruned_message_leaves_a_stub_its_parties_still_find";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = stubbed(s, &sent_as(&dave, &alice, 1));
+    for (now, prune, inside) in [(490, false, true), (510, false, false), (600, true, false)] {
+        if prune {
+            prune_at(s, now);
+        }
+        for who in [&dave, &alice] {
+            let found = s.message_party(&r, who, window(now)).unwrap();
+            assert_eq!(found.is_some(), inside, "{case}: {} at {now}", who.login);
+        }
+    }
+}
+
+fn a_message_kept_past_the_window_answers_its_recipient_and_not_its_sender(s: &dyn MessageStore) {
+    let case = "a_message_kept_past_the_window_answers_its_recipient_and_not_its_sender";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(s, &msg(&dave, &alice, "kept", at(0)), false, &[]);
+    s.mark_read(&dave, Cursor::MAX, at(450)).unwrap();
+    let parties = Parties {
+        recipient: dave.clone(),
+        sender: Some(alice.clone()),
+    };
+    for (now, sender) in [(490, true), (540, false)] {
+        prune_at(s, now);
+        let party = |who| s.message_party(&r, who, window(now)).unwrap();
+        assert_eq!(party(&dave), Some(parties.clone()), "{case}: dave at {now}");
+        let seen = party(&alice).is_some();
+        assert_eq!(seen, sender, "{case}: alice at {now}");
+    }
+}
+
+/// A message to one's own account is held to the recipient's rule, so
+/// it is not shut out with the sender's window.
+fn mail_to_ones_own_account_kept_past_the_window_is_still_its_recipients(s: &dyn MessageStore) {
+    let case = "mail_to_ones_own_account_kept_past_the_window_is_still_its_recipients";
+    let dave = Mailbox::login("dave");
+    let r = put(s, &msg(&dave, &dave, "note", at(0)), false, &[]);
+    s.mark_read(&dave, Cursor::MAX, at(450)).unwrap();
+    prune_at(s, 540);
+    assert!(
+        s.message_party(&r, &dave, window(540)).unwrap().is_some(),
+        "{case}"
+    );
+    applied(react(s, r, &dave, "👍", true, 540));
+    assert_eq!(shown(s, r, &dave, 540), shows(&[("👍", 1)], &[0]), "{case}");
+}
+
+// --- Reactions on stored messages (`docs/private-messages.md` §5) ------
+
+/// Where the sender's window opens at `now`, as `prune_at` closes it.
+fn window(now: u64) -> SystemTime {
+    at(now.saturating_sub(500))
+}
+
+fn key(s: &str) -> ReactionKey {
+    ReactionKey::emoji(s).unwrap()
+}
+
+/// `who`, under its login as its nick, adding or removing `k` on `r` at
+/// `now`, held to `caps` (keys, and keys an account holds).
+fn react_capped(
+    s: &dyn MessageStore,
+    r: MessageRef,
+    who: &Mailbox,
+    k: &str,
+    add: bool,
+    now: u64,
+    caps: (usize, usize),
+) -> MessageReacted {
+    s.react_message(&MessageReactAct {
+        reference: r,
+        who,
+        nick: &who.login,
+        key: &key(k),
+        add,
+        at: at(now),
+        open_since: window(now),
+        max_keys: caps.0,
+        max_per_user: caps.1,
+    })
+    .unwrap()
+}
+
+fn react(
+    s: &dyn MessageStore,
+    r: MessageRef,
+    who: &Mailbox,
+    k: &str,
+    add: bool,
+    now: u64,
+) -> MessageReacted {
+    react_capped(s, r, who, k, add, now, (8, 8))
+}
+
+fn applied(reacted: MessageReacted) -> MessageState {
+    match reacted {
+        MessageReacted::Applied(state) => *state,
+        other => panic!("expected it applied, got {other:?}"),
+    }
+}
+
+/// What `reader` is shown of `r` at `now`, `None` for nothing.
+fn shown(s: &dyn MessageStore, r: MessageRef, reader: &Mailbox, now: u64) -> Option<Reactions> {
+    let mut shown = s
+        .message_reactions(&[r], reader, window(now), None)
+        .unwrap();
+    shown.remove(&r).map(|(reactions, _)| reactions)
+}
+
+fn shows(keys: &[(&str, u32)], mine: &[u8]) -> Option<Reactions> {
+    Some(Reactions {
+        keys: keys.iter().map(|&(k, n)| (key(k), n)).collect(),
+        mine: mine.to_vec(),
+    })
+}
+
+/// Store `m` with `reactions` made at 1, 2, …, and as a stub with
+/// `stub`: read at 10 and pruned at 200.
+fn put(
+    s: &dyn MessageStore,
+    m: &NewMessage,
+    stub: bool,
+    reactions: &[(&Mailbox, &str)],
+) -> MessageRef {
+    let (id, reference) = match s.push(m, usize::MAX).unwrap() {
+        Pushed::Stored { id, reference, .. } => (id, reference),
+        other => panic!("expected a new row, got {other:?}"),
+    };
+    for (n, (who, k)) in (1..).zip(reactions) {
+        applied(react(s, reference, who, k, true, n));
+    }
+    if stub {
+        s.mark_delivered(&[id], at(10), Delivery::Read).unwrap();
+        prune_at(s, 200);
+    }
+    reference
+}
+
+/// Each add or removal that changes nothing is answered as held, and
+/// each that does with the state it leaves.
+fn a_message_reaction_adds_removes_and_holds(s: &dyn MessageStore) {
+    let case = "a_message_reaction_adds_removes_and_holds";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(s, &msg(&dave, &alice, "hi", at(0)), false, &[]);
+    assert_eq!(
+        applied(react(s, r, &alice, "👍", true, 1)),
+        MessageState {
+            reference: r,
+            recipient: dave.clone(),
+            sender: Some(alice.clone()),
+            sent_at: at(0),
+            delivered: false,
+            keys: vec![(key("👍"), 1)],
+            held: vec![("l:alice".into(), key("👍"))],
+        },
+        "{case}"
+    );
+    assert_eq!(react(s, r, &alice, "👍", true, 2), MessageReacted::Held);
+    assert_eq!(react(s, r, &dave, "🎉", false, 3), MessageReacted::Held);
+    let state = applied(react(s, r, &dave, "👍", true, 4));
+    assert_eq!(state.keys, [(key("👍"), 2)], "{case}");
+    assert_eq!(shown(s, r, &dave, 5), shows(&[("👍", 2)], &[0]), "{case}");
+    applied(react(s, r, &alice, "👍", false, 6));
+    let state = applied(react(s, r, &dave, "👍", false, 7));
+    assert_eq!((state.keys, state.held), (vec![], vec![]), "{case}");
+    assert_eq!(shown(s, r, &dave, 8), None, "{case}: nothing left to show");
+}
+
+/// Keys in the order first added; who holds one newest first, the later
+/// of two made in one second first.
+fn message_reactions_keep_first_added_order_and_name_holders_newest_first(s: &dyn MessageStore) {
+    let case = "message_reactions_keep_first_added_order_and_name_holders_newest_first";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(s, &msg(&dave, &alice, "hi", at(0)), false, &[]);
+    for (who, k, now) in [
+        (&alice, "🎉", 5),
+        (&dave, "👍", 5),
+        (&alice, "👍", 5),
+        (&dave, "🎉", 9),
+    ] {
+        applied(react(s, r, who, k, true, now));
+    }
+    for (asked, holders) in [
+        (None, vec![]),
+        (Some("🎉"), vec!["dave", "alice"]),
+        (Some("👍"), vec!["alice", "dave"]),
+        (Some("😀"), vec![]),
+    ] {
+        let asked = asked.map(key);
+        let got = s
+            .message_reactions(&[r], &alice, window(10), asked.as_ref())
+            .unwrap();
+        let holders = holders.into_iter().map(String::from).collect();
+        let expected = (shows(&[("🎉", 2), ("👍", 2)], &[0, 1]).unwrap(), holders);
+        assert_eq!(got.get(&r), Some(&expected), "{case}: {asked:?}");
+    }
+}
+
+/// A new key past the message's keys, or past what one account may
+/// hold on it, is dropped; adding to a key already there never is.
+fn a_message_holds_its_caps_in_the_write(s: &dyn MessageStore) {
+    let case = "a_message_holds_its_caps_in_the_write";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(s, &msg(&dave, &alice, "hi", at(0)), false, &[]);
+    for (n, (who, k, ok)) in (1..).zip([
+        (&alice, "👍", true),
+        (&alice, "🎉", true),
+        (&alice, "😀", false),
+        (&dave, "😀", true),
+        (&dave, "🔥", false),
+        (&dave, "👍", true),
+        (&dave, "🎉", false),
+    ]) {
+        let reacted = react_capped(s, r, who, k, true, n, (3, 2));
+        let dropped = reacted == MessageReacted::Dropped;
+        assert_eq!(!dropped, ok, "{case}: {} {k}", who.login);
+    }
+    assert_eq!(
+        shown(s, r, &dave, 10),
+        shows(&[("👍", 2), ("🎉", 1), ("😀", 1)], &[0, 2]),
+        "{case}"
+    );
+}
+
+/// Neither a stranger nor the other kind of mailbox key reacts to, reads
+/// or is a party to a message.
+fn either_party_and_no_one_else_reacts_and_reads(s: &dyn MessageStore) {
+    let case = "either_party_and_no_one_else_reacts_and_reads";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::identified("alice", fp(1)));
+    let r = put(s, &msg(&dave, &alice, "hi", at(0)), false, &[]);
+    let others = [
+        Mailbox::login("carol"),
+        Mailbox::login("alice"),
+        Mailbox::identified("dave", fp(2)),
+    ];
+    for (n, who) in (1..).zip(&others) {
+        let reacted = react(s, r, who, "👍", true, n);
+        assert_eq!(reacted, MessageReacted::Dropped, "{case}: {who:?}");
+    }
+    for (n, who) in (10..).zip([&dave, &alice]) {
+        applied(react(s, r, who, "👍", true, n));
+        let parties = s.message_party(&r, who, window(n)).unwrap();
+        let expected = Parties {
+            recipient: dave.clone(),
+            sender: Some(alice.clone()),
+        };
+        assert_eq!(parties, Some(expected), "{case}: {who:?}");
+    }
+    for who in &others {
+        assert_eq!(
+            s.message_party(&r, who, window(20)).unwrap(),
+            None,
+            "{case}"
+        );
+        assert_eq!(shown(s, r, who, 20), None, "{case}: {who:?} reads");
+    }
+}
+
+/// Instant messages, requests and receipts take none, and a request the
+/// recipient turns into mail does from then on.
+fn only_a_private_message_takes_reactions(s: &dyn MessageStore) {
+    let case = "only_a_private_message_takes_reactions";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    for (which, kind, friendship) in [
+        ("instant", MessageKind::Message, Some(SentOn::Relation(1))),
+        ("request", MessageKind::Message, Some(SentOn::Request)),
+        ("receipt", MessageKind::ReadReceipt, None),
+    ] {
+        let sent = NewMessage {
+            kind,
+            friendship,
+            ..msg(&dave, &alice, "not mail", at(0))
+        };
+        let r = put(s, &sent, false, &[]);
+        let reacted = react(s, r, &alice, "👍", true, 1);
+        assert_eq!(reacted, MessageReacted::Dropped, "{case}: {which}");
+        let party = s.message_party(&r, &alice, window(1)).unwrap();
+        assert_eq!(party, None, "{case}: {which}");
+        if which == "request" {
+            s.requests_to_mail(&dave, &alice, None, at(0)).unwrap();
+            applied(react(s, r, &alice, "👍", true, 2));
+        }
+    }
+}
+
+/// A purge of either party, and retention of an unread message past its
+/// window, leave none of its reactions anywhere.
+fn a_messages_reactions_go_with_it_however_it_goes(s: &dyn MessageStore) {
+    let case = "a_messages_reactions_go_with_it_however_it_goes";
+    let l = |name: String| Mailbox::login(name);
+    for (n, how) in [
+        "recipient purged",
+        "sender purged",
+        "unread past its window",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (to, from) = (l(format!("to{n}")), l(format!("from{n}")));
+        put(
+            s,
+            &msg(&to, &from, "hi", at(0)),
+            false,
+            &[(&to, "👍"), (&from, "🎉")],
+        );
+        match n {
+            0 => s.purge(&to).map(drop).unwrap(),
+            1 => s.purge(&from).map(drop).unwrap(),
+            _ => assert_eq!(prune_at(s, 600), 1, "{case}"),
+        }
+        for who in [&to, &from] {
+            let left = s.forget_message_reactions(who, at(0)).unwrap();
+            assert!(left.is_empty(), "{case}: {how}, {}'s", who.login);
+        }
+    }
+}
+
+/// A read message pruned inside its window keeps its reactions on its
+/// stub, and both parties go on reading and making them there, until
+/// the stub goes and takes them.
+fn a_stubs_reactions_last_until_the_window_ends(s: &dyn MessageStore) {
+    let case = "a_stubs_reactions_last_until_the_window_ends";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(s, &msg(&dave, &alice, "hi", at(0)), true, &[(&alice, "👍")]);
+    applied(react(s, r, &dave, "🎉", true, 300));
+    applied(react(s, r, &alice, "😀", true, 300));
+    let all = [("👍", 1), ("🎉", 1), ("😀", 1)];
+    assert_eq!(shown(s, r, &alice, 300), shows(&all, &[0, 2]), "{case}");
+    assert_eq!(shown(s, r, &dave, 300), shows(&all, &[1]), "{case}");
+    let states = s.message_reaction_states(&[r]).unwrap();
+    assert!(states[0].delivered, "{case}: a stub answers as delivered");
+    prune_at(s, 600);
+    assert!(
+        s.message_reaction_states(&[r]).unwrap().is_empty(),
+        "{case}"
+    );
+    let left = s.forget_message_reactions(&alice, at(0)).unwrap();
+    assert!(left.is_empty(), "{case}: gone with the stub");
+}
+
+/// A read row the recipient keeps past its sender's window keeps its
+/// reactions for the recipient, who still makes them, and shows the
+/// sender nothing.
+fn a_kept_rows_reactions_are_the_recipients_after_the_window(s: &dyn MessageStore) {
+    let case = "a_kept_rows_reactions_are_the_recipients_after_the_window";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(
+        s,
+        &msg(&dave, &alice, "hi", at(0)),
+        false,
+        &[(&alice, "👍")],
+    );
+    s.mark_read(&dave, Cursor::MAX, at(450)).unwrap();
+    prune_at(s, 540);
+    let reacted = react(s, r, &alice, "🎉", true, 540);
+    assert_eq!(reacted, MessageReacted::Dropped, "{case}: the sender");
+    let state = applied(react(s, r, &dave, "😀", true, 540));
+    assert_eq!(state.sent_at, at(0), "{case}: which shuts the sender out");
+    let both = [("👍", 1), ("😀", 1)];
+    assert_eq!(shown(s, r, &dave, 540), shows(&both, &[1]), "{case}");
+    assert_eq!(shown(s, r, &alice, 540), None, "{case}");
+}
+
+/// A claim or rotation that merges a duplicate, a row or a stub, into a
+/// row or stub already at the destination, on either half of the guid
+/// key, moves the duplicate's reactions onto the survivor, one both
+/// held kept once.
+fn a_merged_duplicate_gives_the_survivor_its_reactions(new_store: &dyn Fn() -> Gated) {
+    let case = "a_merged_duplicate_gives_the_survivor_its_reactions";
+    let (alice, bare) = (Mailbox::login("alice"), Mailbox::login("dave"));
+    let (dave1, dave2) = (
+        Mailbox::identified("dave", fp(1)),
+        Mailbox::identified("dave", fp(2)),
+    );
+    for rotate in [false, true] {
+        let (from, to) = match rotate {
+            false => (&bare, &dave1),
+            true => (&dave1, &dave2),
+        };
+        for sender_half in [false, true] {
+            for (kept_stub, moving_stub) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let s = &*new_store().inbox;
+                let sent = |dave: &Mailbox| match sender_half {
+                    false => sent_as(dave, &alice, 1),
+                    true => sent_as(&alice, dave, 1),
+                };
+                let kept = put(s, &sent(to), kept_stub, &[(&alice, "👍")]);
+                let carried = [(&alice, "👍"), (from, "🎉"), (from, "😀")];
+                let moving = put(s, &sent(from), moving_stub, &carried);
+                match rotate {
+                    false => s.claim("dave", &fp(1)).map(drop).unwrap(),
+                    true => s.rotate(&fp(1), &fp(2)).map(drop).unwrap(),
+                }
+                let what = format!(
+                    "{case}: rotate {rotate}, sender {sender_half}, stubs {kept_stub} {moving_stub}"
+                );
+                let states = s.message_reaction_states(&[kept, moving]).unwrap();
+                let keys: Vec<_> = states
+                    .iter()
+                    .map(|x| (x.reference, x.keys.clone()))
+                    .collect();
+                assert_eq!(
+                    keys,
+                    [(kept, vec![(key("👍"), 1), (key("🎉"), 1), (key("😀"), 1)])],
+                    "{what}"
+                );
+                let carried = s.forget_message_reactions(from, at(0)).unwrap();
+                assert_eq!(carried, [kept], "{what}: and nothing left on the duplicate");
+            }
+        }
+    }
+}
+
+/// A reactor's claim and rotation move its reactions to its new key, a
+/// key it held under both going once and its message answered.
+fn message_reactions_follow_a_reactors_claim_and_rotation(s: &dyn MessageStore) {
+    let case = "message_reactions_follow_a_reactors_claim_and_rotation";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let (alice1, alice2) = (
+        Mailbox::identified("alice", fp(1)),
+        Mailbox::identified("alice", fp(2)),
+    );
+    let r = put(
+        s,
+        &msg(&dave, &alice, "hi", at(0)),
+        false,
+        &[(&alice, "👍"), (&alice, "🎉")],
+    );
+    s.claim("alice", &fp(1)).unwrap();
+    applied(react(s, r, &alice1, "👍", true, 5));
+    let both = [("👍", 2), ("🎉", 1)];
+    assert_eq!(shown(s, r, &dave, 5), shows(&both, &[]), "{case}");
+    assert_eq!(
+        s.rekey_message_reactions(&alice, &alice1).unwrap(),
+        [r],
+        "{case}"
+    );
+    // The 👍 that went was the first made, so 🎉 is first now.
+    let after = [("🎉", 1), ("👍", 1)];
+    assert_eq!(
+        shown(s, r, &alice1, 6),
+        shows(&after, &[0, 1]),
+        "{case}: claimed"
+    );
+    s.rotate(&fp(1), &fp(2)).unwrap();
+    for (from, why) in [(&alice1, "nothing to fold"), (&alice2, "onto itself")] {
+        let lost = s.rekey_message_reactions(from, &alice2).unwrap();
+        assert!(lost.is_empty(), "{case}: {why}");
+    }
+    assert_eq!(
+        shown(s, r, &alice2, 7),
+        shows(&after, &[0, 1]),
+        "{case}: rotated"
+    );
+}
+
+/// A purge takes every reaction made under the mailbox's key, on mail
+/// that is no longer its own too, so a later holder of the login holds
+/// none: here mail claimed by an identity before its reactions moved.
+fn purging_an_account_takes_every_reaction_it_made(s: &dyn MessageStore) {
+    let case = "purging_an_account_takes_every_reaction_it_made";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let r = put(
+        s,
+        &msg(&dave, &alice, "hi", at(0)),
+        false,
+        &[(&alice, "👍")],
+    );
+    s.claim("alice", &fp(1)).unwrap();
+    s.purge(&alice).unwrap();
+    assert_eq!(shown(s, r, &dave, 5), None, "{case}");
+}
+
+/// A moderator's purge of what a person did lately takes its reactions
+/// made since then, on rows and stubs alike, and leaves the older ones
+/// and the stubs.
+fn forgetting_a_persons_message_reactions_keeps_those_before_the_window_and_the_stubs(
+    s: &dyn MessageStore,
+) {
+    let case = "forgetting_a_persons_message_reactions_keeps_those_before_the_window_and_the_stubs";
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let reactions = [(&alice, "👍"), (&alice, "🎉"), (&dave, "😀")];
+    let stub = put(s, &sent_as(&dave, &alice, 0), true, &reactions);
+    // Enough random refs that answers out of order are never in order by
+    // chance.
+    let mut all: Vec<MessageRef> = (1..8)
+        .map(|n| put(s, &sent_as(&dave, &alice, n), false, &reactions))
+        .chain([stub])
+        .collect();
+    let lost = s.forget_message_reactions(&alice, at(2)).unwrap();
+    all.sort_unstable();
+    assert_eq!(lost, all, "{case}: in ref order");
+    for &r in &all {
+        let left = [("👍", 1), ("😀", 1)];
+        assert_eq!(shown(s, r, &dave, 300), shows(&left, &[1]), "{case}");
+    }
+    assert!(
+        s.message_party(&stub, &dave, window(300))
+            .unwrap()
+            .is_some(),
+        "{case}"
+    );
 }

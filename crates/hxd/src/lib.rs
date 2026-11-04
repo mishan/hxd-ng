@@ -4120,13 +4120,20 @@ pub fn inbox_purge(
         // first.
         (true, InboxKind::At(path)) => {
             let store = open_read_only(&path)?;
-            hxd_core::MessageStore::purge_count(&*store, &mailbox).map_err(|e| e.to_string())?
+            store
+                .message_reactions_held(&mailbox)
+                .map_err(|e| e.to_string())?
+                + hxd_core::MessageStore::purge_count(&*store, &mailbox)
+                    .map_err(|e| e.to_string())?
                 + hxd_core::RelationshipStore::purge_count(&*store, &mailbox)
                     .map_err(|e| e.to_string())?
         }
         (false, InboxKind::At(_)) => match open_inbox(config)? {
             Some(store) => {
-                hxd_core::MessageStore::purge(&*store, &mailbox).map_err(|e| e.to_string())?
+                store
+                    .message_reactions_held(&mailbox)
+                    .map_err(|e| e.to_string())?
+                    + hxd_core::MessageStore::purge(&*store, &mailbox).map_err(|e| e.to_string())?
                     + hxd_core::RelationshipStore::purge(&*store, &mailbox)
                         .map_err(|e| e.to_string())?
             }
@@ -6400,6 +6407,96 @@ sync = "full"
 
         assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 8);
         assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 8);
+    }
+
+    /// The reactions on a mailbox's mail and its stubs, each once though
+    /// it is also the mailbox's own, and those it made elsewhere, and
+    /// none of anyone else's on anyone else's mail.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn inbox_purge_dry_run_counts_the_message_reactions_it_would_take() {
+        use hxd_core::inbox::{Delivery, Mailbox, MessageStore, NewMessage, Pushed};
+        use hxd_core::reaction::{MessageReactAct, ReactionKey};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("messages.db");
+        let mut cfg = parse("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = db.clone();
+        let store = hxd_store_sqlite::SqliteStore::open(&db, hxd_store_sqlite::Synchronous::Normal)
+            .unwrap();
+        let (alice, bob, carol) = (
+            Mailbox::login("alice"),
+            Mailbox::login("bob"),
+            Mailbox::login("carol"),
+        );
+        let (thumbs, party) = (
+            ReactionKey::emoji("\u{1F44D}").unwrap(),
+            ReactionKey::emoji("\u{1F389}").unwrap(),
+        );
+        let send = |to: &Mailbox, reactions: &[(&Mailbox, &ReactionKey)]| {
+            let sent = NewMessage {
+                recipient: to.clone(),
+                sender: Some(bob.clone()),
+                sender_nick: "bob".into(),
+                body: "hi".into(),
+                sent_at: UNIX_EPOCH,
+                guid: None,
+                kind: hxd_core::inbox::MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship: None,
+                sender_address: None,
+                re: None,
+            };
+            let Pushed::Stored { id, reference, .. } = store.push(&sent, usize::MAX).unwrap()
+            else {
+                panic!("stored");
+            };
+            for (who, key) in reactions {
+                store
+                    .react_message(&MessageReactAct {
+                        reference,
+                        who,
+                        nick: &who.login,
+                        key,
+                        add: true,
+                        at: UNIX_EPOCH,
+                        open_since: UNIX_EPOCH,
+                        max_keys: 8,
+                        max_per_user: 8,
+                    })
+                    .unwrap();
+            }
+            id
+        };
+        // Mail claimed by an identity before its reactions moved: alice's
+        // own is reached by her key alone.
+        send(&alice, &[(&alice, &party)]);
+        store.claim("alice", &[1; 32]).unwrap();
+        send(&alice, &[(&bob, &thumbs), (&alice, &party)]);
+        let read = send(&alice, &[(&bob, &thumbs)]);
+        send(&carol, &[(&carol, &thumbs)]);
+        let secs = Duration::from_secs;
+        store
+            .mark_delivered(&[read], UNIX_EPOCH, Delivery::Read)
+            .unwrap();
+        assert_eq!(
+            store.prune(UNIX_EPOCH + secs(200), secs(500), secs(100)),
+            Ok(1),
+            "the read one is left as a stub"
+        );
+        drop(store);
+
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 5);
+        assert_eq!(inbox_purge(&cfg, "alice", None, false).unwrap(), 5);
+        assert_eq!(inbox_purge(&cfg, "alice", None, true).unwrap(), 0);
+        let store = open_read_only(&db).unwrap();
+        assert_eq!(
+            store.message_reactions_held(&carol).unwrap(),
+            1,
+            "carol's own are hers"
+        );
     }
 
     #[cfg(all(feature = "inbox", unix))]
