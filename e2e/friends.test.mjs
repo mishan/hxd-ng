@@ -414,7 +414,7 @@ describe('instant messaging', () => {
     const resumed = await hal.waitForHook('onResumed', () => true, { since: mark, timeout: 20_000 });
     const asked = hal.seen('req', 'resume').at(-1);
     const answered = hal.log.find((r) => r.kind === 'reply' && r.id === asked.id);
-    const replayed = hal.log.filter((r) => r.kind === 'ev' && r.n > answered.n).slice(0, resumed.data.replay);
+    const replayed = await hal.replayed(answered, resumed.data.replay);
     const at = (name, login) => replayed.findIndex((r) => r.name === name && r.data.login === login);
     assert.ok(at('friend_request', 'ivy') >= 0, hal.diagnose('no friend_request in the replay', mark));
     assert.ok(at('friend_request', 'ivy') < at('presence', 'gus'), hal.diagnose('replayed out of order', mark));

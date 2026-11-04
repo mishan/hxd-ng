@@ -189,6 +189,28 @@ export class TestClient {
     return this.await_('hook', name, match, opts);
   }
 
+  /**
+   * The events a resume replayed, once all `count` of them have arrived.
+   * `onResumed` fires on the reply, and the replay follows it, so the
+   * log can hold fewer of them the moment the hook is seen.
+   */
+  replayed(answered, count, { timeout = 5000 } = {}) {
+    const replay = () => this.log.filter((r) => r.kind === 'ev' && r.n > answered.n).slice(0, count);
+    if (replay().length >= count) return Promise.resolve(replay());
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        settle: () => replay().length >= count && (resolve(replay()), true),
+      };
+      this.waiters.push(waiter);
+      setTimeout(() => {
+        const i = this.waiters.indexOf(waiter);
+        if (i < 0) return;
+        this.waiters.splice(i, 1);
+        reject(new TimeoutError(this.diagnose(`not all ${count} replayed events within ${timeout}ms`, answered.n)));
+      }, timeout).unref();
+    });
+  }
+
   /** Wait for a connection state: `'reconnecting'`, `'online'`. */
   waitForState(name, opts = {}) {
     return this.await_('state', name, () => true, opts);
