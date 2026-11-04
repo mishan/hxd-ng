@@ -4,9 +4,10 @@
 //! live in `reactions_changed` batches to a room's readers, cleared by a
 //! moderator and taken by a redaction and a purge, read again with
 //! `reactions` under the reader's checks and with who reacted by nick,
-//! and on an instant message relayed to its other party, between
-//! scripted clients on a real server. Emoji in the test data are the
-//! reactions themselves.
+//! on an instant message relayed to its other party, and on a stored
+//! private message kept with it, seen by each party on its own terms
+//! and answered `{}` whatever became of it, between scripted clients on
+//! a real server. Emoji in the test data are the reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 /// History, moderation, rooms and messaging on one SQLite file,
 /// reactions under `policy`, their batches sent as the binary sends them.
 /// `carol` moderates, `boss` makes rooms, `reader` may read and not chat,
+/// `dave` takes no part in messaging, so what is sent him is private mail,
 /// and the guest may chat.
 async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
     start_limited(dir, policy, RequestLimits::default()).await
@@ -33,6 +35,17 @@ async fn start(dir: &Path, policy: ReactionPolicy) -> SocketAddr {
 
 /// [`start`], each ng session held to `limits`.
 async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits) -> SocketAddr {
+    start_core(dir, policy, limits, true).await.0
+}
+
+/// [`start_limited`], with an inbox or none, and its core, for a test
+/// that moves the clock.
+async fn start_core(
+    dir: &Path,
+    policy: ReactionPolicy,
+    limits: RequestLimits,
+    inbox: bool,
+) -> (SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     const CHATTER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n\
@@ -40,7 +53,7 @@ async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits
     for (login, password, access) in [
         ("alice", true, CHATTER.to_string()),
         ("bob", true, CHATTER.to_string()),
-        ("dave", true, CHATTER.to_string()),
+        ("dave", true, CHATTER.replace("messaging = true\n", "")),
         ("erin", true, CHATTER.to_string()),
         ("carol", true, format!("{CHATTER}disconnect_users = true\n")),
         (
@@ -64,8 +77,11 @@ async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits
     }
     let auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
-    let core = Core::new()
-        .with_inbox(store.clone(), auth.clone(), InboxPolicy::default())
+    let core = match inbox {
+        true => Core::new().with_inbox(store.clone(), auth.clone(), InboxPolicy::default()),
+        false => Core::new(),
+    };
+    let core = core
         .with_history(
             store.clone(),
             HistoryPolicy {
@@ -91,7 +107,7 @@ async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits
     let core = Arc::new(core);
     tokio::spawn(hxd::reactions_flusher(core.clone()));
     let ng_ctx = NgCtx {
-        core,
+        core: core.clone(),
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "reactions".into(),
@@ -114,7 +130,7 @@ async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
-    addr
+    (addr, core)
 }
 
 /// A client, declaring `reactions` (and `replies`, for `history`'s
@@ -179,6 +195,9 @@ async fn shown(c: &mut Client, room: u64, id: u64) -> Value {
     page["lines"][0].clone()
 }
 
+/// A message reference nobody was sent.
+const PM: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
 fn caps(hello: &Value) -> Vec<Value> {
     hello["caps"].as_array().unwrap().clone()
 }
@@ -191,7 +210,7 @@ async fn reactions_are_counted_per_account_and_shown_to_the_readers_that_asked()
     assert!(caps(&hello).contains(&json!("reactions")));
     assert_eq!(
         hello["reactions"],
-        json!({ "targets": ["line", "im"], "max_keys": 20, "max_per_user": 5 })
+        json!({ "targets": ["line", "im", "pm"], "max_keys": 20, "max_per_user": 5 })
     );
     let (mut bob, _) = login(addr, "bob", true).await;
     let (mut dave, hello) = login(addr, "dave", false).await;
@@ -314,8 +333,18 @@ async fn a_reaction_past_what_a_line_or_an_account_may_hold_is_refused() {
         ),
         ("no key", json!({ "target": target }), "bad_request"),
         (
-            "a message",
-            json!({ "target": { "pm": "AAAAAAAAAAAAAAAAAAAAAA" }, "key": { "emoji": "👍" } }),
+            "a message with `with`",
+            json!({ "target": { "pm": PM }, "with": "bob", "key": { "emoji": "👍" } }),
+            "bad_request",
+        ),
+        (
+            "a message cleared",
+            json!({ "target": { "pm": PM }, "clear": true, "reason": "no" }),
+            "bad_request",
+        ),
+        (
+            "a message with a reason",
+            json!({ "target": { "pm": PM }, "key": { "emoji": "👍" }, "reason": "no" }),
             "bad_request",
         ),
         (
@@ -557,6 +586,32 @@ async fn a_rooms_reactions_stay_in_the_room() {
     }
 }
 
+/// `who`'s session that declared `reactions` and `messaging`, with its
+/// friends read.
+async fn messenger(addr: SocketAddr, who: &str) -> Client {
+    let mut c = Client::connect(addr).await.unwrap();
+    c.login(json!({
+        "login": who, "password": "pw", "nick": who,
+        "reactions": true, "messaging": true,
+    }))
+    .await
+    .unwrap();
+    ok(&mut c, "friends", json!({})).await;
+    c
+}
+
+/// alice and bob, made friends.
+async fn friends(addr: SocketAddr) -> (Client, Client) {
+    let (mut alice, mut bob) = (messenger(addr, "alice").await, messenger(addr, "bob").await);
+    ok(&mut alice, "friend_add", json!({ "login": "bob" })).await;
+    bob.event_where("friend_request", |d| d["login"] == "alice")
+        .await
+        .unwrap();
+    let accept = json!({ "login": "alice", "accept": true });
+    ok(&mut bob, "friend_respond", accept).await;
+    (alice, bob)
+}
+
 /// An instant message's reaction goes to the conversation's other party
 /// as a change, and to nobody else; to a stranger there is no such
 /// target.
@@ -564,32 +619,8 @@ async fn a_rooms_reactions_stay_in_the_room() {
 async fn an_im_reaction_reaches_its_party_and_not_a_stranger() {
     let td = tempfile::tempdir().unwrap();
     let addr = start(td.path(), ReactionPolicy::default()).await;
-    let messenger = |who: &'static str| async move {
-        let mut c = Client::connect(addr).await.unwrap();
-        c.login(json!({
-            "login": who, "password": "pw", "nick": who,
-            "reactions": true, "messaging": true,
-        }))
-        .await
-        .unwrap();
-        ok(&mut c, "friends", json!({})).await;
-        c
-    };
-    let (mut alice, mut bob, mut erin) = (
-        messenger("alice").await,
-        messenger("bob").await,
-        messenger("erin").await,
-    );
-    ok(&mut alice, "friend_add", json!({ "login": "bob" })).await;
-    bob.event_where("friend_request", |d| d["login"] == "alice")
-        .await
-        .unwrap();
-    ok(
-        &mut bob,
-        "friend_respond",
-        json!({ "login": "alice", "accept": true }),
-    )
-    .await;
+    let (mut alice, mut bob) = friends(addr).await;
+    let mut erin = messenger(addr, "erin").await;
     let target =
         json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
     let params = json!({ "target": target, "with": "bob", "key": { "emoji": "❤\u{FE0F}" } });
@@ -898,10 +929,6 @@ async fn get_reactions_answers_the_lines_a_reader_could_have_read() {
         ("no targets", json!({})),
         ("an empty list", json!({ "targets": [] })),
         ("an instant message", json!({ "targets": [im] })),
-        (
-            "a message",
-            json!({ "targets": [{ "pm": "AAAAAAAAAAAAAAAAAAAAAA" }] }),
-        ),
     ] {
         assert_eq!(
             refused(&mut bob, "reactions", params).await,
@@ -977,4 +1004,244 @@ async fn served(c: &mut Client, line: u64, n: usize) -> usize {
         assert!(reply.get("ok").is_some(), "{reply}");
         served += 1;
     }
+}
+
+/// `c` reacts with `emoji` to the stored message `pm` names, answered
+/// `{}` whatever became of it.
+async fn pm_react(c: &mut Client, pm: &Value, emoji: &str) {
+    let params = json!({ "target": pm, "key": { "emoji": emoji } });
+    assert_eq!(ok(c, "react", params).await, json!({}), "{pm}");
+}
+
+/// `c`'s message to `to`, as a `pm` target.
+async fn sent(c: &mut Client, to: &str) -> Value {
+    let sent = ok(c, "msg", json!({ "to_login": to, "text": "hi" })).await;
+    json!({ "pm": sent["ref"] })
+}
+
+/// `c` reads its mail up to the message `pm` names.
+async fn read(c: &mut Client, pm: &Value) {
+    let id = inbox_row(c, &pm["pm"]).await["id"].clone();
+    ok(c, "msg_read", json!({ "up_to": id })).await;
+}
+
+/// `c`'s `inbox` row of the message `r` names.
+async fn inbox_row(c: &mut Client, r: &Value) -> Value {
+    let rows = ok(c, "inbox", json!({})).await;
+    let row = (rows["messages"].as_array().unwrap().iter()).find(|m| m["ref"] == *r);
+    row.cloned().unwrap_or_else(|| panic!("no {r} in {rows}"))
+}
+
+/// A reaction to a stored private message is kept with it: on the
+/// recipient's `inbox` row for a session that declared `reactions` and
+/// not for one that did not, and read back by the sender with
+/// `reactions`, with who reacted.
+#[tokio::test]
+async fn a_pm_reaction_is_kept_with_the_message_and_shown_to_its_parties() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut plain, _) = login(addr, "dave", false).await;
+    let sent = ok(
+        &mut alice,
+        "msg",
+        json!({ "to_login": "dave", "text": "lunch?" }),
+    )
+    .await;
+    let pm = json!({ "pm": sent["ref"] });
+    pm_react(&mut alice, &pm, "👍").await;
+    pm_react(&mut dave, &pm, "🎉").await;
+    let keys = json!([
+        { "key": { "emoji": "👍" }, "count": 1 },
+        { "key": { "emoji": "🎉" }, "count": 1 },
+    ]);
+    let row = inbox_row(&mut dave, &sent["ref"]).await;
+    assert_eq!(
+        (&row["reactions"], &row["reactions_mine"]),
+        (&keys, &json!([1]))
+    );
+    let row = inbox_row(&mut plain, &sent["ref"]).await;
+    assert!(row.get("reactions").is_none() && row.get("reactions_mine").is_none());
+    let asked = json!({ "targets": [pm], "key": { "emoji": "🎉" } });
+    assert_eq!(
+        ok(&mut alice, "reactions", asked).await,
+        json!({ "reactions": [
+            { "target": pm, "keys": keys, "mine": [0], "from": [{ "nick": "dave" }] },
+        ] })
+    );
+}
+
+/// A reaction to another pair's message, to one nobody was sent, to a
+/// message between parties one of whom blocks the other, or to an
+/// instant message's reference is dropped and answered as one applied,
+/// and shows nowhere.
+#[tokio::test]
+async fn a_dropped_pm_reaction_is_answered_as_an_applied_one() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, bob) = friends(addr).await;
+    bob.logout().await.unwrap();
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut erin, _) = login(addr, "erin", true).await;
+    let (to_dave, im) = (
+        sent(&mut alice, "dave").await,
+        sent(&mut alice, "bob").await,
+    );
+    ok(&mut dave, "block", json!({ "login": "alice" })).await;
+    let nobodys = json!({ "pm": PM });
+    pm_react(&mut erin, &to_dave, "👍").await;
+    pm_react(&mut erin, &nobodys, "👍").await;
+    pm_react(&mut alice, &to_dave, "👍").await;
+    pm_react(&mut alice, &im, "👍").await;
+
+    let asked = json!({ "targets": [to_dave, nobodys] });
+    assert_eq!(
+        ok(&mut erin, "reactions", asked).await,
+        json!({ "reactions": [
+            { "target": to_dave, "keys": [] },
+            { "target": nobodys, "keys": [] },
+        ] })
+    );
+    let row = inbox_row(&mut dave, &to_dave["pm"]).await;
+    assert!(row.get("reactions").is_none(), "{row}");
+    let asked = json!({ "targets": [to_dave, im] });
+    let shown = ok(&mut alice, "reactions", asked).await;
+    for (n, target) in [to_dave, im].iter().enumerate() {
+        assert_eq!(
+            shown["reactions"][n],
+            json!({ "target": target, "keys": [] })
+        );
+    }
+}
+
+/// A sender's view of its messages, read and pruned, read late and
+/// kept, or never read, is one view until its window ends and nothing
+/// after; the recipient's kept row takes reactions past it.
+#[tokio::test]
+async fn a_senders_view_of_a_pm_ends_with_its_window_and_the_recipients_does_not() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let policy = InboxPolicy::default();
+    let day = Duration::from_secs(24 * 3600);
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let mut pms = Vec::new();
+    for _ in 0..3 {
+        pms.push(sent(&mut alice, "dave").await);
+    }
+    read(&mut dave, &pms[0]).await;
+    core.clock().advance(policy.retain_read + day);
+    assert_eq!(core.prune_inbox(), 1);
+    let asked = json!({ "targets": pms });
+    for (emoji, keys) in [
+        ("👍", json!([{ "key": { "emoji": "👍" }, "count": 1 }])),
+        ("🎉", json!([])),
+    ] {
+        for pm in &pms {
+            pm_react(&mut alice, pm, emoji).await;
+        }
+        let shown = ok(&mut alice, "reactions", asked.clone()).await;
+        for n in 0..pms.len() {
+            assert_eq!(shown["reactions"][n]["keys"], keys, "{emoji}: {shown}");
+        }
+        if emoji == "👍" {
+            core.clock()
+                .advance(policy.retain_unread - policy.retain_read - 3 * day);
+            read(&mut dave, &pms[1]).await;
+            core.clock().advance(3 * day);
+            core.prune_inbox();
+        }
+    }
+    pm_react(&mut dave, &pms[1], "🔥").await;
+    let row = inbox_row(&mut dave, &pms[1]["pm"]).await;
+    assert_eq!(
+        (&row["reactions"], &row["reactions_mine"]),
+        (
+            &json!([
+                { "key": { "emoji": "👍" }, "count": 1 },
+                { "key": { "emoji": "🔥" }, "count": 1 },
+            ]),
+            &json!([1])
+        )
+    );
+}
+
+/// A retry of a message read and pruned inside its sender's window is
+/// answered as the delivered message it was, and stores nothing again.
+#[tokio::test]
+async fn a_retry_of_a_read_and_pruned_message_is_answered_as_delivered() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let params = json!({
+        "to_login": "dave", "text": "once", "guid": "5f5e1000-1234-4abc-89ab-000000000001",
+    });
+    let sent = ok(&mut alice, "msg", params.clone()).await;
+    let id = inbox_row(&mut dave, &sent["ref"]).await["id"].clone();
+    ok(&mut dave, "msg_read", json!({ "up_to": id })).await;
+    core.clock()
+        .advance(InboxPolicy::default().retain_read + Duration::from_secs(2));
+    assert_eq!(core.prune_inbox(), 1);
+    dave.rx.take_backlog();
+    assert_eq!(ok(&mut alice, "msg", params).await, sent);
+    let rows = ok(&mut dave, "inbox", json!({})).await;
+    assert_eq!(rows["messages"], json!([]), "{rows}");
+    assert!(dave.rx.take_backlog().iter().all(|e| e.ev != "msg"));
+}
+
+/// `reactions` answers lines and stored messages together, in the order
+/// asked, as often as each is named.
+#[tokio::test]
+async fn get_reactions_answers_lines_and_messages_in_the_order_asked() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let line = json!({ "line": say(&mut alice, json!({ "text": "hi" })).await });
+    react(&mut alice, line.clone(), "👍").await;
+    let sent = ok(
+        &mut alice,
+        "msg",
+        json!({ "to_login": "dave", "text": "psst" }),
+    )
+    .await;
+    let pm = json!({ "pm": sent["ref"] });
+    pm_react(&mut dave, &pm, "🎉").await;
+    let nobodys = json!({ "pm": PM });
+    let asked = json!({ "targets": [pm, line, nobodys, pm] });
+    let mine =
+        json!({ "target": pm, "keys": [{ "key": { "emoji": "🎉" }, "count": 1 }], "mine": [0] });
+    assert_eq!(
+        ok(&mut dave, "reactions", asked).await,
+        json!({ "reactions": [
+            mine,
+            { "target": line, "keys": [{ "key": { "emoji": "👍" }, "count": 1 }] },
+            { "target": nobodys, "keys": [] },
+            mine,
+        ] })
+    );
+}
+
+/// A server that keeps no mail takes no `pm` target.
+#[tokio::test]
+async fn a_server_without_an_inbox_takes_no_pm_target() {
+    let td = tempfile::tempdir().unwrap();
+    let limits = RequestLimits::default();
+    let (addr, _) = start_core(td.path(), ReactionPolicy::default(), limits, false).await;
+    let (_, hello) = login(addr, "alice", true).await;
+    assert_eq!(hello["reactions"]["targets"], json!(["line"]));
 }

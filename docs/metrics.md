@@ -75,7 +75,9 @@ roster, `LogSerial` for the order public chat is persisted in (held
 once per commit, which may carry many lines, and by each redaction and
 purge), `InboxFlush` for the one inbox hand-over at a time (every
 flush, and every private or instant message from its write to its
-delivery), `sqlite`
+delivery), `PmReactions` for stored private messages' reactions (each
+one's write, and a claim or rotation from its move through its rekey),
+`sqlite`
 and `sqlite_registrar` for the two databases' connections. `site` is
 the file and line that took it (`hxd-core/src/chat.rs:256`), so the
 worst holder is named without anyone instrumenting it by hand. For the

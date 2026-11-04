@@ -52,7 +52,7 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, what a line or message answers (`reply`), the emoji an account reacts to a line with (`reaction`, every change to them made in order at one desk, `reaction::desk`), the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, what a line or message answers (`reply`), the emoji an account reacts to a line or a stored message with (`reaction`, every change to a line's made in order at one desk, `reaction::desk`, and to a message's under a mutex of its own, `reaction::pm`), the news tree, avatars, access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`), the friend family of fogWraith's instant messaging extension and the message requests draft (`friends.rs`), device proof, with the checks behind a `DeviceProver` the binary wires in (`device.rs`), and a chat line as its history entry, for 700 and for Structured Chat's 106 alike (`structured.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunnelled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs and the classic wire's device proofs (`proof.rs`), and the registrar's requests, records and signed lists (with the one record verifier they all share), and the signed messages of `docs/e2e-messages.md` §3 (`message.rs`) and their sealing with HPKE (`sealed.rs`), and the server key handover of `docs/server-key-handover.md` with a client's check of a served chain (`handover.rs`), and the friendship objects of `docs/proposals/friendship-objects.md` (`friendship.rs`) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
@@ -297,7 +297,10 @@ must tell the desk is buffered or posted, never waited on), an op
 never takes a serial nor waits on the desk itself, and ops are short,
 because a caller waiting on one may hold a room's serial, so a long
 piece of work, a purge's tombstones, is many ops. A new write to
-reaction state is an op there too.
+reaction state is an op there too, except a stored private message's,
+which the inbox store keeps and which changes under `Core`'s
+`pm_reacting` instead: `flushing`, then it, then the roster or a store,
+one at a time, and never the desk.
 
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
@@ -411,7 +414,16 @@ Three layers, all `cargo test --workspace`:
   reaching its party and not a stranger, and a batch held for a
   detached session replayed at its resume; `reactions` answering the
   lines a reader could have read in the order asked, who reacted by
-  the nick each reacted under, and priced by its targets),
+  the nick each reacted under, and priced by its targets; and a stored
+  private message's: answered `{}` whatever became of the reaction,
+  kept with the message and shown on the recipient's `inbox` row to a
+  session that declared `reactions`, read back by the sender with who
+  reacted, dropped for a stranger, a block either way and an instant
+  message's reference, the sender's view the same for a read and an
+  unread message until its window ends and gone after while the
+  recipient's kept row takes reactions, a retry of a read and pruned
+  message answered as delivered, lines and messages answered together
+  in the order asked, and no `pm` target without an inbox),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
