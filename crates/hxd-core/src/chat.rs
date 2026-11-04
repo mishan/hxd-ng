@@ -2248,7 +2248,7 @@ impl Core {
         if let Some(store) = self.inbox.as_ref() {
             if store
                 .find_sent(from, guid)?
-                .is_some_and(|m| other(&m.recipient))
+                .is_some_and(|m| other(m.recipient()))
             {
                 return Ok(true);
             }
@@ -2667,6 +2667,18 @@ impl Core {
                 } else {
                     MsgOutcome::Queued(m.reference)
                 });
+            }
+            // Read and pruned inside its sender's window: answered as
+            // its row was, delivered, so a retry cannot tell it from an
+            // unread one.
+            crate::inbox::Pushed::Pruned {
+                reference,
+                signed: was,
+            } => {
+                if signed.as_ref().is_some_and(|s| was != Some(s.content)) {
+                    return Err(ChatError::Equivocation);
+                }
+                return Ok(MsgOutcome::Delivered(Some(reference)));
             }
             crate::inbox::Pushed::Full => return Err(ChatError::MailboxFull),
         };
@@ -6556,6 +6568,57 @@ pub(crate) mod inbox_tests {
         assert_eq!(left, ["unread"]);
     }
 
+    /// A signed message read and pruned inside its sender's window: a
+    /// retry is answered from its stub as the row would answer it, and
+    /// its id is still its signer's toward anyone else.
+    #[test]
+    fn a_retry_of_a_read_and_pruned_message_is_answered_by_its_stub() {
+        let store = Arc::new(MemoryStore::new());
+        let dir = Arc::new(Directory(
+            [("alice", 1), ("dave", 2), ("carol", 3)]
+                .map(|(l, n)| Mailbox::identified(l, fp(n)))
+                .to_vec(),
+        ));
+        let core = Arc::new(Core::new().with_inbox(store.clone(), dir, InboxPolicy::default()));
+        let (a, _ra) = attach_identified(&core, "alice", fp(1));
+        let (m, mut rm) = attach_identified(&core, "dave", fp(2));
+        let (c, _rc) = attach_identified(&core, "carol", fp(3));
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        let send = |to: Uid, key: u8, says: u8| {
+            let signed = SignedMsg {
+                signature: crate::history::Signature {
+                    form: vec![says],
+                    content: [says; 32],
+                },
+                to: fp(key),
+            };
+            core.msg_signed(
+                a,
+                to,
+                "hi".into(),
+                Some(guid.clone()),
+                None,
+                Some(signed),
+                None,
+            )
+        };
+        let first = send(m, 2, 1);
+        assert!(
+            matches!(first, Ok(MsgOutcome::Delivered(Some(_)))),
+            "{first:?}"
+        );
+        drain(&mut rm);
+        core.inbox_mark_read(m, store.all()[0].cursor).unwrap();
+        core.clock()
+            .advance(core.inbox_policy().retain_read + Duration::from_secs(1));
+        assert_eq!(core.prune_inbox(), 1);
+        assert_eq!(send(m, 2, 1), first);
+        assert_eq!(send(m, 2, 2), Err(ChatError::Equivocation));
+        assert_eq!(send(c, 3, 1), Err(ChatError::Equivocation), "to carol");
+        assert!(store.all().is_empty(), "nothing stored again");
+        assert!(msgs(drain(&mut rm)).is_empty(), "nor handed to dave");
+    }
+
     #[test]
     fn counts_and_marking_read_are_scoped_to_the_callers_own_account() {
         let (core, store) = server(&["alice", "dave"]);
@@ -7010,7 +7073,7 @@ pub(crate) mod inbox_tests {
             &self,
             from: &Mailbox,
             guid: &MessageGuid,
-        ) -> Result<Option<StoredMessage>, StoreError> {
+        ) -> Result<Option<crate::inbox::Found>, StoreError> {
             self.inner.find_sent(from, guid)
         }
         fn pending_of(
@@ -7083,7 +7146,7 @@ pub(crate) mod inbox_tests {
             to: &Mailbox,
             from: Option<&Mailbox>,
             guid: &MessageGuid,
-        ) -> Result<Option<StoredMessage>, StoreError> {
+        ) -> Result<Option<crate::inbox::Found>, StoreError> {
             self.inner.find_guid(to, from, guid)
         }
         fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError> {

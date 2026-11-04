@@ -1178,6 +1178,13 @@ grow the database. Past it, a message to someone connected still
 arrives, live and unstored, as a period server delivers it; one that
 would have to wait is refused, as a full mailbox refuses.
 
+A read message retention deletes before `retain_unread` has passed since
+it was sent leaves a small stub until then, so that its sender cannot
+tell from a retry that it was read (private-messages.md §9). That
+window is measured with `retain_unread` as it is set now: raising it can
+show a sender which of its messages already past the old window were
+read, and lowering it shows nothing.
+
 `full` costs a disk sync per commit. Public chat lines arriving together
 share a commit, so a busy room pays one sync for many lines, but a line
 still waits for the sync of the commit before its own: on a disk that
