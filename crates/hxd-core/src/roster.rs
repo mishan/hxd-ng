@@ -510,6 +510,10 @@ pub enum Event {
 
         /// What the message answers, as its sender named it.
         re: Option<Box<crate::reply::Reply>>,
+        /// An instant message's guid, when it is handed over as mail:
+        /// what a client needs to react to it as the instant message it
+        /// is.
+        im: Option<crate::inbox::MessageGuid>,
     },
     /// A sealed private message (`docs/e2e-messages.md` §4.4), only ever
     /// to the session of the device it was sealed to, and never stored.
@@ -769,6 +773,7 @@ impl Event {
                 from_login,
                 signed,
                 re,
+                im,
                 ..
             } => {
                 from_nick.len()
@@ -776,6 +781,7 @@ impl Event {
                     + from_login.as_ref().map_or(0, String::len)
                     + signed.as_ref().map_or(0, Vec::len)
                     + re.as_ref().map_or(0, |r| r.pack().len())
+                    + im.as_ref().map_or(0, |g| g.as_str().len())
             }
             Event::Sealed {
                 from_nick,

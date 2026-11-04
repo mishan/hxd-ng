@@ -467,7 +467,9 @@ belong to the `inbox` capability (§4).
   the recipient's `msg` event and `inbox` row carry it (rationale §5).
   It is the one name sender and recipient share for the message.
 - **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
-  `at`, `queued` and, when the message was stored, `id` and `ref`.
+  `at`, `queued` and, when the message was stored, `id` and `ref`; for
+  an instant message handed over as mail, also `im: true` and its
+  `guid`, stored or not.
   `from.uid` is 0 when a queued message's sender no longer has a
   session. `from.login` is absent when there is nobody to reply to — a
   guest, or an account since deleted. `id` is the message's place in
@@ -930,8 +932,12 @@ family document. Each family of §4 adds its own.
     carries no presence.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
-  at, read, media?, signed?, re? }`, `id` and `ref` as on the `msg` event
-  (§7.1); there is no uid, which may have been reused since.
+  at, read, media?, signed?, re?, im?, guid? }`, `id` and `ref` as on the
+  `msg` event (§7.1); there is no uid, which may have been reused since.
+  An instant message's row carries `im: true` and its `guid`, which with
+  `from.login` make the `im` target that reacts to it; one sent under an
+  identity guest's approval has no `from.login`, and cannot be reacted
+  to.
 - **`msg_read`** marks every message of this account's with an `id` at or
   below `up_to` read, and returns the counts after it.
 - **A cursor this account's mailbox never issued** — past the last `id`

@@ -8,7 +8,7 @@ use hxd_core::video::{
     VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
 };
 use hxd_core::voice::{IceCandidate, VoiceError, VoiceParticipant};
-use hxd_core::{Event, LineFlags, LogLine, SeqEvent, SessionStatus, UserInfo};
+use hxd_core::{Event, LineFlags, LogLine, SentOn, SeqEvent, SessionStatus, UserInfo};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -841,6 +841,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             media,
             signed,
             re,
+            im,
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -872,6 +873,10 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             }
             if let Some(signed) = signed {
                 data["signed"] = json!(b64url(signed));
+            }
+            if let Some(guid) = im {
+                data["im"] = json!(true);
+                data["guid"] = json!(guid.as_str());
             }
             crate::replies::add(&mut data, re.as_deref(), replies);
             ("msg", data)
@@ -1263,6 +1268,10 @@ pub fn stored_msg_json(m: &hxd_core::StoredMessage, media: Option<&MediaRef>) ->
     if let Some(signed) = &m.signed {
         value["signed"] = json!(b64url(&signed.form));
     }
+    if let (Some(SentOn::Relation(_)), Some(guid)) = (m.friendship, &m.guid) {
+        value["im"] = json!(true);
+        value["guid"] = json!(guid.as_str());
+    }
     value
 }
 
@@ -1360,6 +1369,75 @@ mod tests {
             parted,
             json!({ "seq": 10, "ev": "user_parted", "data": { "uid": 7 } })
         );
+    }
+
+    /// On its `inbox` row and on the `msg` that hands it over as mail,
+    /// an instant message says what it is and names the guid an `im`
+    /// target takes; a private message does neither.
+    #[test]
+    fn an_instant_message_says_so_and_names_its_guid() {
+        let guid = hxd_core::inbox::MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001");
+        for (case, friendship, want) in [
+            ("a private message", None, None),
+            (
+                "an instant message",
+                Some(SentOn::Relation(3)),
+                guid.clone(),
+            ),
+        ] {
+            let row = hxd_core::StoredMessage {
+                id: 1,
+                reference: [4; 16],
+                cursor: 1,
+                recipient: hxd_core::inbox::Mailbox::login("bob"),
+                sender: Some(hxd_core::inbox::Mailbox::login("alice")),
+                sender_nick: "alice".into(),
+                body: "hi".into(),
+                sent_at: std::time::UNIX_EPOCH,
+                guid: guid.clone(),
+                kind: hxd_core::inbox::MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship,
+                re: None,
+                delivered_at: None,
+                read_at: None,
+            };
+            let msg: Value = serde_json::from_str(&event_json(
+                &SeqEvent {
+                    seq: 1,
+                    event: Event::Msg {
+                        from: 0,
+                        from_nick: "alice".into(),
+                        from_login: Some("alice".into()),
+                        text: "hi".into(),
+                        cursor: Some(1),
+                        reference: Some([4; 16]),
+                        sent_at: std::time::UNIX_EPOCH,
+                        queued: true,
+                        media: None,
+                        signed: None,
+                        re: None,
+                        im: want.clone(),
+                    },
+                },
+                false,
+            ))
+            .unwrap();
+            for (shape, v) in [
+                ("row", stored_msg_json(&row, None)),
+                ("msg", msg["data"].clone()),
+            ] {
+                assert_eq!(
+                    (v.get("im"), v.get("guid").and_then(Value::as_str)),
+                    (
+                        want.as_ref().map(|_| &json!(true)),
+                        want.as_ref().map(|g| g.as_str())
+                    ),
+                    "{case}'s {shape}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -691,13 +691,19 @@ impl Core {
 
     /// The caller, marked a messenger session, if it takes part.
     fn messenger(&self, uid: Uid) -> Result<Me, MessagingError> {
+        self.caller(uid, true)
+    }
+
+    /// The caller, if it takes part, marked a messenger session only when
+    /// `messenger`.
+    fn caller(&self, uid: Uid, messenger: bool) -> Result<Me, MessagingError> {
         if !self.messaging_enabled() {
             return Err(MessagingError::NotEnabled);
         }
         let mut r = self.roster.lock().unwrap();
         let sess = r.users.get_mut(&uid).ok_or(MessagingError::NotEnabled)?;
         let state = sess.messaging.as_mut().ok_or(MessagingError::NotEnabled)?;
-        state.messenger = true;
+        state.messenger |= messenger;
         Ok(Me {
             understands: state.understands_requests,
             mailbox: sess.mailbox(),

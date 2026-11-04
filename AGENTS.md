@@ -462,7 +462,9 @@ Three layers, all `cargo test --workspace`:
   `friends.rs` (the friend family on the ng wire: two clients made
   friends, presence through the binary's flusher, instant messages
   with receipts and typing, one sent while away handed over at the
-  roster read, a block reading as a missing account on every request
+  roster read, one read as mail by a session not handed them naming its
+  guid on its `msg` and its `inbox` row and reacted to as an instant
+  message, a block reading as a missing account on every request
   naming one, a request listed, approved and answered, a span no clock
   holds refused, crossing requests, a guest's message by login refused
   by an account taking no requests, Invisible hiding presence alone, an account without the bit
