@@ -2961,7 +2961,7 @@ impl TunnelSink for LegacyTunnel {
             )
             .await;
             if let Err(error) = served {
-                tracing::debug!(%peer, %error, "tunnelled HTXF transfer refused");
+                tracing::info!(%peer, %error, "tunnelled HTXF transfer refused");
             }
         }))
     }

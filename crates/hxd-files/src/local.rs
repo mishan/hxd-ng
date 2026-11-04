@@ -219,11 +219,11 @@ impl LocalFileSource {
         if data_offset == 0 && resource_offset == 0 {
             return Ok(None);
         }
-        if large && resource_offset != 0 {
-            return Err(FileError::InvalidPath);
-        }
         let generation = self.read_upload_generation(base)?;
-        let digest = if large {
+        // A partial with a resource fork came from a classic FILP, which
+        // resumes from its RFLT. Without a digest a large-file RESUME is
+        // refused, and a raw upload declines the quote and replaces it.
+        let digest = if large && resource_offset == 0 {
             Some(self.resume_digest(base, data_offset)?)
         } else {
             None
@@ -2133,6 +2133,12 @@ mod tests {
         assert_eq!(quote.data_offset, 3);
         assert_eq!(quote.resource_offset, 4);
         assert!(quote.digest.is_none());
+        let large = source
+            .prepare_upload(&key("alice", &path), &path, Some(128), true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((large.data_offset, large.resource_offset), (3, 4));
+        assert!(large.digest.is_none());
         assert!(source
             .prepare_upload(&key("mallory", &path), &path, Some(128), false, true)
             .unwrap()
