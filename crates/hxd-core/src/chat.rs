@@ -6532,11 +6532,15 @@ pub(crate) mod inbox_tests {
     fn retention_is_measured_on_the_cores_clock() {
         let (core, store) = server(&["alice", "dave"]);
         let (a, _ra) = attach(&core, "alice", true);
+        let policy = core.inbox_policy();
+        // Far enough on that mail stamped on real time would age out too.
+        core.clock()
+            .advance(policy.retain_unread - policy.retain_read + Duration::from_secs(1));
         for text in ["read", "unread"] {
             core.msg_login(a, "dave", text.into(), None, None).unwrap();
         }
         let (m, _rm) = attach(&core, "dave", true);
-        let keep = core.inbox_policy().retain_read;
+        let keep = policy.retain_read;
 
         core.clock().advance(keep * 2);
         core.inbox_mark_read(m, store.all()[0].cursor).unwrap();
