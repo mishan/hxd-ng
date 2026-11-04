@@ -326,6 +326,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 |---|---|---|
 | `HXD_SYSTEM` | `off` | The server account on the user list, and its commands ([system-account.md](system-account.md)). |
 | `HXD_SYSTEM_NICK` | `Server` | Its nick. |
+| `HXD_SYSTEM_ICON` | `0` | Its icon, by a classic icon's ID. |
 | `HXD_ROOMS_ANNOUNCE` | `on` | One line in the lobby, at most once a day, telling a classic user that rooms exist and how to join one ([chat-rooms.md](chat-rooms.md) §6.5). It points at the server account's commands, so it is sent only with `HXD_SYSTEM` on. |
 | `HXD_FILES_ROOT` | | A directory in the container to serve as the file area (`/srv/files` in the examples); mount one there. Uploads go into folders named `Uploads` or `Drop Box`. It must be writable by uid 10001 for uploads. |
 | `HXD_FILES_MAX_FILE_SIZE` | 64 GiB | Bytes per file. |
