@@ -866,12 +866,17 @@ impl TransferRegistry {
                 (false, None)
             }
             PreparedTransfer::Upload(transfer) => {
-                // Large-file mode is fixed when FILE_PUT is quoted, and the
-                // handshake must agree with it. SIZE64 only frames the length:
-                // a client may leave it off whenever 32 bits carry it (Large
-                // File extension, "Handshake Flags and Length"). htxf::parse
-                // has already checked how the flags relate to one another.
-                if (preamble.flags & htxf::FLAG_LARGE_FILE != 0) != transfer.large {
+                // LARGE_FILE says the object is raw data, and it needs large
+                // files negotiated before FILE_PUT. Without it the object is a
+                // classic FILP, which is unambiguous in either mode: a client
+                // that negotiated large files may still send one, as GtkHx
+                // does below 4 GiB to keep type, creator and comment. SIZE64
+                // only frames the length: a client may leave it off whenever
+                // 32 bits carry it (Large File extension, "Handshake Flags and
+                // Length"). htxf::parse has already checked how the flags
+                // relate to one another.
+                let large = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
+                if large && !transfer.large {
                     return Err(FileError::InvalidPath);
                 }
                 let resumes = match (&transfer.quote, &preamble.resume_digest) {
@@ -886,7 +891,20 @@ impl TransferRegistry {
                         true
                     }
                     // A classic resume carries no flag; its length says it.
-                    (Some(_), None) if !transfer.large => true,
+                    // It starts where the RFLT says, which cannot say an
+                    // offset past 32 bits. A large-file session may send the
+                    // whole file as a classic FILP instead, so without
+                    // FILE_PUT's length to tell the two apart it is refused
+                    // rather than appended to the partial.
+                    (Some(quote), None) if !large => {
+                        if quote.data_offset > u64::from(u32::MAX)
+                            || quote.resource_offset > u64::from(u32::MAX)
+                            || (transfer.large && transfer.transfer_len.is_none())
+                        {
+                            return Err(FileError::InvalidPath);
+                        }
+                        true
+                    }
                     // A large-file client may turn a quote down and send the
                     // whole file, which then replaces the partial rather than
                     // extending it ("Resume Flow (Upload)").
@@ -935,6 +953,7 @@ impl TransferRegistry {
                 upload.quote = None;
             }
             upload.transfer_len = resolved_len;
+            upload.large = preamble.flags & htxf::FLAG_LARGE_FILE != 0;
         }
         Ok((transfer, running))
     }
@@ -1712,6 +1731,67 @@ mod tests {
         match registry.claim(&core, &preamble(reference, 6, resume, quote.digest), HERE) {
             Ok(PreparedTransfer::Upload(upload)) => assert_eq!(upload.transfer_len, Some(10)),
             other => panic!("undeclared claim: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_classic_filp_resumes_a_large_file_quote_only_where_it_is_unambiguous() {
+        let core = Core::new();
+        let principal = attach(&core, "first");
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(LocalFileSource::open(temp.path(), crate::LocalLimits::default()).unwrap());
+        let registry = TransferRegistry::new(Duration::from_secs(30), limits(8, 8, 8));
+        let wide = u64::from(u32::MAX) + 1;
+        // (case, FILE_PUT's length, data offset, resource offset, resumes)
+        let cases = [
+            ("a declared length", Some(14), 4, 0, true),
+            ("no declared length", None, 4, 0, false),
+            (
+                "a data offset past 32 bits",
+                Some(wide + 10),
+                wide,
+                0,
+                false,
+            ),
+            (
+                "a resource offset past 32 bits",
+                Some(wide + 14),
+                4,
+                wide,
+                false,
+            ),
+        ];
+        for (case, transfer_len, data_offset, resource_offset, resumes) in cases {
+            let quote = UploadQuote {
+                data_offset,
+                resource_offset,
+                generation: [7; 16],
+                digest: Some([9; htxf::RESUME_DIGEST_LEN]),
+            };
+            let reference = registry
+                .issue(large_upload(
+                    principal,
+                    source.clone(),
+                    transfer_len,
+                    Some(quote.clone()),
+                ))
+                .unwrap();
+            let preamble = htxf::Preamble {
+                reference,
+                transfer_len: 10,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            };
+            match registry.claim(&core, &preamble, HERE) {
+                Ok(PreparedTransfer::Upload(upload)) if resumes => {
+                    assert_eq!(upload.quote, Some(quote), "{case}");
+                    assert!(!upload.large, "{case}");
+                }
+                Err(FileError::InvalidPath) if !resumes => {}
+                other => panic!("{case}: {other:?}"),
+            }
         }
     }
 

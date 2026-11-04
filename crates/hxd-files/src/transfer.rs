@@ -8,7 +8,7 @@ use hxfiles_xfer::{ffo, folder, htxf, rflt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::local::PartialKey;
 use crate::{
@@ -344,7 +344,7 @@ where
                 }
             };
             if let Err(error) = serve_one(stream, peer, &registry, core, timeouts, None).await {
-                debug!(%peer, %error, "HTXF transfer refused");
+                info!(%peer, %error, "HTXF transfer refused");
             }
         });
     }
@@ -949,7 +949,14 @@ async fn receive_upload<S: HtxfStream>(
     on_disk(&transfer.source, move |source| match result {
         Ok(hfs) => source
             .publish_upload(&tree, &path, &files, &hfs)
-            .map(|_| ()),
+            .map(|_| ())
+            .inspect_err(|error| match error {
+                // A name taken meanwhile, as two uploads of one name race.
+                FileError::AlreadyExists | FileError::Busy => {
+                    info!(%path, %error, "upload received but not published")
+                }
+                _ => warn!(%path, %error, "upload received but not published"),
+            }),
         // Dropped here, off the runtime: a partial left empty is removed as
         // it goes.
         Err(error) => {

@@ -351,6 +351,150 @@ async fn classic_uploads_follow_mhxd_for_access_shape_and_session() {
     assert!(!root.path().join("Uploads/orphan.bin").exists());
 }
 
+/// GtkHx negotiates large files and still sends an upload below 4 GiB as a
+/// classic FILP, with LARGE_FILE off, to keep its type, creator and comment.
+#[tokio::test]
+async fn a_large_file_session_uploads_and_resumes_a_classic_filp() {
+    let (server, root, _source) = start_local().await;
+    let mut capable = Legacy::login(server.legacy, true).await;
+    let sizes = |len: usize| {
+        [
+            (tag::HTXF_SIZE, (len as u32).to_be_bytes().to_vec()),
+            (tag::XFERSIZE64, (len as u64).to_be_bytes().to_vec()),
+        ]
+    };
+
+    let data = vec![0x5a; 3 << 20];
+    let object = two_fork_object(&data);
+    let mut chunks = vec![(tag::FILE_NAME, b"movie.mov".to_vec())];
+    chunks.extend(sizes(object.len()));
+    let put = capable.request(FILE_PUT, &chunks).await;
+    assert_eq!(put.flag & 1, 0);
+    upload(server.htxf, reference_of(&put), object.len(), &object).await;
+    assert_eq!(std::fs::read(root.path().join("movie.mov")).unwrap(), data);
+
+    // A raw large-file upload interrupted after "hello" leaves a partial,
+    // and its resume quote, made in large-file mode, is taken up by a
+    // classic FILP of what is left.
+    let mut chunks = vec![(tag::FILE_NAME, b"resumed.bin".to_vec())];
+    chunks.extend(sizes(11));
+    let first = capable.request(FILE_PUT, &chunks).await;
+    let mut interrupted = TcpStream::connect(server.htxf).await.unwrap();
+    interrupted
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&first),
+                transfer_len: 11,
+                type_code: 0,
+                flags: htxf::FLAG_LARGE_FILE,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    interrupted.write_all(b"hello").await.unwrap();
+    interrupted.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    interrupted.read_to_end(&mut ignored).await.unwrap();
+
+    let full = two_fork_object(b"hello world").len();
+    let mut chunks = vec![
+        (tag::FILE_NAME, b"resumed.bin".to_vec()),
+        (tag::FILE_PREVIEW, vec![0, 1]),
+    ];
+    chunks.extend(sizes(full));
+    let resume = capable.request(FILE_PUT, &chunks).await;
+    assert_eq!(resume.flag & 1, 0);
+    assert!(
+        field(&resume, tag::PARTIAL_DIGEST).is_some(),
+        "a large-file quote"
+    );
+    let rest = two_fork_object(b" world");
+    assert_eq!(rest.len(), full - 5);
+    upload(server.htxf, reference_of(&resume), rest.len(), &rest).await;
+    assert_eq!(
+        std::fs::read(root.path().join("resumed.bin")).unwrap(),
+        b"hello world"
+    );
+}
+
+#[tokio::test]
+async fn an_ng_upload_starts_over_a_classic_partial_with_a_resource_fork() {
+    let (server, root, _source) = start_local().await;
+    let mut classic = Legacy::login(server.legacy, false).await;
+    let encoded = ffo::encode(
+        &ffo::Metadata {
+            name: b"ignored",
+            type_code: *b"BINA",
+            creator: *b"TEST",
+            comment: b"",
+            create_time: 0,
+            modify_time: 0,
+        },
+        ffo::Forks {
+            data_len: 3,
+            data_offset: 0,
+            resource_len: 4,
+            resource_offset: 0,
+        },
+        false,
+    )
+    .unwrap();
+    let put = classic
+        .request(FILE_PUT, &[(tag::FILE_NAME, b"forked.bin".to_vec())])
+        .await;
+    let mut interrupted = encoded.prefix;
+    interrupted.extend_from_slice(b"abc");
+    interrupted.extend_from_slice(&encoded.resource_header);
+    interrupted.extend_from_slice(b"rs");
+    let mut transfer = TcpStream::connect(server.htxf).await.unwrap();
+    transfer
+        .write_all(
+            &htxf::Preamble {
+                reference: reference_of(&put),
+                transfer_len: encoded.transfer_len,
+                type_code: 0,
+                flags: 0,
+                resume_digest: None,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    transfer.write_all(&interrupted).await.unwrap();
+    transfer.shutdown().await.unwrap();
+    let mut ignored = Vec::new();
+    transfer.read_to_end(&mut ignored).await.unwrap();
+
+    // The partial has no digest for this wire to resume it by.
+    let mut ws = ng_login(server.ng, json!({"nick": "up"})).await;
+    let begun = ng_request(
+        &mut ws,
+        2,
+        "files_upload",
+        json!({"path": "forked.bin", "size": "10"}),
+    )
+    .await;
+    assert_eq!(begun["ok"]["offset"], "0", "{begun}");
+    let url = begun["ok"]["url"].as_str().unwrap();
+    let sent = put_piece(
+        server.ng,
+        url,
+        Some("bytes 0-9/10".into()),
+        None,
+        b"0123456789",
+    )
+    .await;
+    assert!(sent.starts_with("http/1.1 201"), "{sent}");
+    assert_eq!(
+        std::fs::read(root.path().join("forked.bin")).unwrap(),
+        b"0123456789"
+    );
+}
+
 #[tokio::test]
 async fn a_drop_box_takes_uploads_without_telling_what_it_holds() {
     let (server, root, _source) =

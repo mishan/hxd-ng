@@ -173,8 +173,9 @@ impl FileService {
             source.prepare_upload(&quote_key, &path, Some(size), true, resume)
         })
         .await?
-        // A partial longer than the file is another file's.
-        .filter(|quote| quote.data_offset < size);
+        // A partial longer than the file is another file's, and one with no
+        // digest is a classic FILP's, which this wire cannot resume.
+        .filter(|quote| quote.data_offset < size && quote.digest.is_some());
         let now = Instant::now();
         let mut grants = self.ng_uploads.grants.lock().unwrap();
         grants.retain(|_, grant| grant.expires > now || grant.busy);
