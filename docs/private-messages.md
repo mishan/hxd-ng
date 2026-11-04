@@ -203,7 +203,12 @@ locking discipline.
 An account's reactions on public lines (hotline-ng.md §7.3) are keyed
 by the same rule and ride the same calls: `inbox_claim` and
 `rotate_identity` move them, and `inbox_purge` and `hxd inbox purge`
-delete them.
+delete them. Its reactions on stored private messages (§5) are kept by
+the same rule in the store, whose `purge` takes them with the mailbox,
+those it made on anyone's mail too, and `hxd inbox purge --dry-run`
+counts them. The store can move them to a claimed or rotated key
+(`rekey_message_reactions`); the claim and rotation calls follow, with
+the wire.
 
 On a server with no identity subsystem every mailbox is login-keyed and
 all of this reduces to exactly the naive design — which is the shape a
@@ -422,6 +427,26 @@ so it is not handed over again and goes at the next prune, and one
 already read keeps its own stamp. A purge takes a stub with
 the mailbox. Only retention makes one, and only of
 a private message: an instant message or a request leaves none.
+
+**The store keeps reactions on a private message**, which the wire
+does not offer yet, in `message_reaction` (schema 36) as `chat_reaction` keeps a line's, one
+row per account and key, but by the message's `ref`: it is never
+reused, so a reaction cannot attach to a later message as it could to
+a rowid. An instant message, a request and a receipt take none; a
+request the recipient turns into mail takes them from then on. Each
+party reacts and reads on its own side's terms: the recipient for as
+long as its row lives, and either party through the row or its stub
+while the sender's window holds the message's `sent_at`, so that to a
+sender a read message and an unread one look alike (§9). Two triggers
+keep a message's reactions going with it on every path that deletes:
+a row's go with the row unless retention left a stub, and then with
+the stub. A purge also takes every reaction the mailbox made, on
+anyone's mail, so a later holder of the login holds none. A claim or a
+rotation that merges a duplicate, row or stub, moves its reactions onto
+the survivor, but for a key the survivor already holds from the same
+account; that can leave a message with more keys than `max_keys`, which
+is accepted, since the cap refuses new keys and nothing reads the count
+as a bound.
 
 `Mailbox`'s matching rule appears in SQL as **one shape per kind of
 mailbox** — `<col>_fp = ?` for an identified one, `<col>_fp IS NULL AND

@@ -27,8 +27,12 @@
 //! because it only ever asks "how long since"; a stored message needs a
 //! time it can show a human next week. The two are not interchangeable.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use crate::reaction::{
+    MessageReactAct, MessageReacted, MessageState, Parties, ReactionKey, Reactions,
+};
 use crate::relationships::RelationId;
 
 pub mod conformance;
@@ -580,7 +584,8 @@ pub trait MessageStore: Send + Sync + 'static {
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<usize, StoreError>;
 
     /// Delete everything belonging to a mailbox — mail to it and mail
-    /// from it, and their stubs. Returns how many rows went.
+    /// from it, their stubs and reactions, and every reaction it made.
+    /// Returns how many rows went.
     ///
     /// **Deleting an account must call this.** A login freed by deletion
     /// can be registered by someone else, and [`MessageStore::claim`]
@@ -661,6 +666,56 @@ pub trait MessageStore: Send + Sync + 'static {
 
     /// Delete `from`'s requests to `to`. Returns how many went.
     fn delete_requests(&self, to: &Mailbox, from: &Mailbox) -> Result<usize, StoreError>;
+
+    // Reactions on stored private messages (`docs/private-messages.md`
+    // §5), keyed by reference and kept with the row or its stub. None
+    // has a default: one that dropped a write would do so silently.
+
+    /// The parties of the private message `r` names, if `who` is one of
+    /// them on its side's terms ([`Parties::seen_by`]).
+    fn message_party(
+        &self,
+        r: &MessageRef,
+        who: &Mailbox,
+        open_since: SystemTime,
+    ) -> Result<Option<Parties>, StoreError>;
+
+    /// Apply one reaction: the party and the caps checked in the same
+    /// step as the write, and the state it leaves read there too.
+    fn react_message(&self, act: &MessageReactAct) -> Result<MessageReacted, StoreError>;
+
+    /// The reactions on those of `refs` that have any and that `reader`
+    /// is party to, `mine` as its account holds them; with `key`, the
+    /// nicks holding it beside them, newest first and at most
+    /// [`crate::reaction::REACTORS_SHOWN`].
+    fn message_reactions(
+        &self,
+        refs: &[MessageRef],
+        reader: &Mailbox,
+        open_since: SystemTime,
+        key: Option<&ReactionKey>,
+    ) -> Result<HashMap<MessageRef, (Reactions, Vec<String>)>, StoreError>;
+
+    /// The state of each of `refs` a row or stub still holds, for
+    /// telling its parties.
+    fn message_reaction_states(&self, refs: &[MessageRef])
+        -> Result<Vec<MessageState>, StoreError>;
+
+    /// Take every reaction `who` made at or after `since`, on rows and
+    /// stubs alike, which stay; answers the messages that lost one.
+    fn forget_message_reactions(
+        &self,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<MessageRef>, StoreError>;
+
+    /// `from`'s reactions become `to`'s; one `to` already holds goes,
+    /// and the messages that lost one are answered.
+    fn rekey_message_reactions(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+    ) -> Result<Vec<MessageRef>, StoreError>;
 }
 
 #[cfg(test)]

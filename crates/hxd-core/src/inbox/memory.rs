@@ -13,6 +13,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use crate::history::summarize;
+use crate::reaction::{
+    reactor_key, MessageReactAct, MessageReacted, MessageState, Parties, ReactionKey, Reactions,
+    REACTORS_SHOWN,
+};
 use crate::relationships::{MemoryRelationships, RelationId, SentOn};
 
 use super::{
@@ -39,6 +44,18 @@ struct Inner {
     /// What retention left of read private messages, until their
     /// senders' windows end.
     stubs: HashMap<MessageRef, Stub>,
+    /// Reactions on private messages, in the order they were made, which
+    /// stands in for the SQLite store's `id`.
+    reactions: Vec<Reaction>,
+}
+
+#[derive(Clone)]
+struct Reaction {
+    reference: MessageRef,
+    key: Vec<u8>,
+    reactor: String,
+    nick: String,
+    at: SystemTime,
 }
 
 impl Inner {
@@ -50,6 +67,75 @@ impl Inner {
             marks.retain(|id| held.contains(id));
         }
         self.addresses.retain(|id, _| held.contains(id));
+        let refs: HashSet<MessageRef> = (self.msgs.iter().map(|m| m.reference))
+            .chain(self.stubs.keys().copied())
+            .collect();
+        self.reactions.retain(|r| refs.contains(&r.reference));
+    }
+
+    /// The parties of the private message `r` names, its `sent_at`,
+    /// whether a row holds it rather than a stub, and whether it was
+    /// delivered.
+    fn parties(&self, r: &MessageRef) -> Option<(Parties, SystemTime, bool, bool)> {
+        let parties = |recipient: &Mailbox, sender: &Option<Mailbox>| Parties {
+            recipient: recipient.clone(),
+            sender: sender.clone(),
+        };
+        match self.msgs.iter().find(|m| m.reference == *r) {
+            Some(m) => (is_mail(m) && m.friendship.is_none()).then(|| {
+                let p = parties(&m.recipient, &m.sender);
+                (p, m.sent_at, true, m.delivered_at.is_some())
+            }),
+            None => (self.stubs.get(r))
+                .map(|s| (parties(&s.recipient, &s.sender), s.sent_at, false, true)),
+        }
+    }
+
+    fn seen(&self, r: &MessageRef, who: &Mailbox, open_since: SystemTime) -> Option<Parties> {
+        let (parties, sent_at, row, _) = self.parties(r)?;
+        parties.seen_by(who, row, sent_at, open_since)
+    }
+
+    /// A message's reactions as `(key, reactor)`, in the order made.
+    fn rows(&self, r: &MessageRef) -> Vec<(&[u8], &str)> {
+        (self.reactions.iter())
+            .filter(|x| x.reference == *r)
+            .map(|x| (&x.key[..], &x.reactor[..]))
+            .collect()
+    }
+
+    fn state(&self, r: &MessageRef) -> Option<MessageState> {
+        let (parties, sent_at, _, delivered) = self.parties(r)?;
+        Some(MessageState::of(
+            *r,
+            parties,
+            sent_at,
+            delivered,
+            &self.rows(r),
+        ))
+    }
+}
+
+/// Copy each reaction on the first of a pair onto the second, unless the
+/// second already holds that key from that account: what a duplicate a
+/// merge deletes owes the message that survives it, in the order the
+/// reactions were made, as the SQLite store's `Collapse::deletes` carries them.
+fn carry(reactions: &mut Vec<Reaction>, pairs: &[(MessageRef, MessageRef)]) {
+    let carried: Vec<Reaction> = (reactions.iter())
+        .flat_map(|r| {
+            (pairs.iter().filter(|(dup, _)| *dup == r.reference)).map(|(_, kept)| Reaction {
+                reference: *kept,
+                ..r.clone()
+            })
+        })
+        .collect();
+    for r in carried {
+        if !reactions
+            .iter()
+            .any(|h| h.reference == r.reference && h.key == r.key && h.reactor == r.reactor)
+        {
+            reactions.push(r);
+        }
     }
 }
 
@@ -231,7 +317,8 @@ fn renumber(inner: &mut Inner, moves: impl Fn(&Mailbox) -> bool, from: &str, int
 /// delivered or read. Otherwise the obvious sequence — mail arrives
 /// while linked, the account unlinks, the sender retries, the reader
 /// reads the retry, the account relinks — deletes the row that was read
-/// and hands the survivor over again as unread.
+/// and hands the survivor over again as unread. Its reactions come too,
+/// but for a key the survivor already holds from the same account.
 ///
 /// A stub at the destination is the message too, read and pruned, and is
 /// kept as a row there is, so a retry is answered under one reference
@@ -281,6 +368,10 @@ fn collapse(
             kept.delivered_at = kept.delivered_at.or(delivered);
             kept.read_at = kept.read_at.or(read);
         }
+        let pairs: Vec<_> = (doomed.iter())
+            .map(|&(dup, kept)| (msgs[dup].reference, msgs[kept].reference))
+            .collect();
+        carry(&mut inner.reactions, &pairs);
         let mut i = 0;
         msgs.retain(|_| {
             let keep = !doomed.iter().any(|(dup, _)| *dup == i);
@@ -300,23 +391,44 @@ fn collapse(
                 m.read_at.get_or_insert(at);
             }
         }
-        let stubbed: HashSet<_> = inner
-            .stubs
-            .values()
+        let stubbed: Vec<_> = (inner.stubs.values())
             .filter(|s| stub(s, &at_destination))
-            .map(stub_key)
+            .map(|s| (stub_key(s), s.reference))
             .collect();
-        let mut kept: HashSet<_> = msgs
-            .iter()
+        let rowed: Vec<_> = (msgs.iter())
             .filter(|m| row(m, &at_destination))
-            .map(row_key)
+            .map(|m| (row_key(m), m.reference))
             .collect();
-        msgs.retain(|m| !(row(m, &moves) && stubbed.contains(&row_key(m))));
-        kept.extend(stubbed);
-        inner
-            .stubs
-            .retain(|_, s| !(stub(s, &moves) && kept.contains(&stub_key(s))));
+        let moving = (msgs.iter())
+            .filter(|m| row(m, &moves))
+            .map(|m| (row_key(m), m.reference));
+        let pairs = meeting(moving, &stubbed);
+        carry(&mut inner.reactions, &pairs);
+        msgs.retain(|m| !pairs.iter().any(|(dup, _)| *dup == m.reference));
+        for kept in [&rowed, &stubbed] {
+            let moving = (inner.stubs.values())
+                .filter(|s| stub(s, &moves))
+                .map(|s| (stub_key(s), s.reference));
+            let pairs = meeting(moving, kept);
+            carry(&mut inner.reactions, &pairs);
+            inner
+                .stubs
+                .retain(|r, _| !pairs.iter().any(|(dup, _)| dup == r));
+        }
     }
+}
+
+/// Each of `moving` against what it meets in `kept` by key, as
+/// `(moving, kept)` references.
+fn meeting<K: PartialEq>(
+    moving: impl Iterator<Item = (K, MessageRef)>,
+    kept: &[(K, MessageRef)],
+) -> Vec<(MessageRef, MessageRef)> {
+    moving
+        .flat_map(|(key, dup)| {
+            (kept.iter().filter(move |(k, _)| *k == key)).map(move |(_, r)| (dup, *r))
+        })
+        .collect()
 }
 
 fn is_request(m: &StoredMessage) -> bool {
@@ -718,6 +830,8 @@ impl MessageStore for MemoryStore {
             .stubs
             .retain(|_, s| !is(&s.recipient, of) && !s.sender.as_ref().is_some_and(|s| is(s, of)));
         inner.cursors.remove(&index_key(of));
+        let reactor = reactor_key(of);
+        inner.reactions.retain(|r| r.reactor != reactor);
         inner.forget_removed();
         Ok(before - inner.msgs.len())
     }
@@ -895,6 +1009,141 @@ impl MessageStore for MemoryStore {
                 messages: sent.messages + 1,
                 bytes: sent.bytes + x.body.len() as u64,
             }))
+    }
+
+    fn message_party(
+        &self,
+        r: &MessageRef,
+        who: &Mailbox,
+        open_since: SystemTime,
+    ) -> Result<Option<Parties>, StoreError> {
+        Ok(self.inner.lock().unwrap().seen(r, who, open_since))
+    }
+
+    fn react_message(&self, act: &MessageReactAct) -> Result<MessageReacted, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let r = act.reference;
+        if inner.seen(&r, act.who, act.open_since).is_none() {
+            return Ok(MessageReacted::Dropped);
+        }
+        let (key, reactor) = (act.key.pack(), reactor_key(act.who));
+        let on: Vec<&Reaction> = inner
+            .reactions
+            .iter()
+            .filter(|x| x.reference == r)
+            .collect();
+        let held = on.iter().any(|x| x.key == key && x.reactor == reactor);
+        if act.add == held {
+            return Ok(MessageReacted::Held);
+        }
+        if act.add {
+            let mut keys: Vec<&[u8]> = on.iter().map(|x| &x.key[..]).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let keyed = keys.contains(&&key[..]);
+            let yours = on.iter().filter(|x| x.reactor == reactor).count();
+            if (!keyed && keys.len() >= act.max_keys) || yours >= act.max_per_user {
+                return Ok(MessageReacted::Dropped);
+            }
+            inner.reactions.push(Reaction {
+                reference: r,
+                key,
+                reactor,
+                nick: act.nick.to_string(),
+                at: act.at,
+            });
+        } else {
+            (inner.reactions)
+                .retain(|x| !(x.reference == r && x.key == key && x.reactor == reactor));
+        }
+        let state = inner.state(&r).expect("a party's message");
+        Ok(MessageReacted::Applied(Box::new(state)))
+    }
+
+    fn message_reactions(
+        &self,
+        refs: &[MessageRef],
+        reader: &Mailbox,
+        open_since: SystemTime,
+        key: Option<&ReactionKey>,
+    ) -> Result<HashMap<MessageRef, (Reactions, Vec<String>)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mine = reactor_key(reader);
+        let key = key.map(ReactionKey::pack);
+        Ok((refs.iter())
+            .filter(|r| inner.seen(r, reader, open_since).is_some())
+            .filter_map(|r| {
+                let shown = summarize(inner.rows(r), Some(&mine));
+                // Reversed before a stable sort, so the later of two at
+                // one time comes first.
+                let mut holders: Vec<&Reaction> = (inner.reactions.iter().rev())
+                    .filter(|x| x.reference == *r && key.as_ref() == Some(&x.key))
+                    .collect();
+                holders.sort_by_key(|x| std::cmp::Reverse(x.at));
+                let holders = (holders.into_iter().take(REACTORS_SHOWN))
+                    .map(|x| x.nick.clone())
+                    .collect();
+                (!shown.keys.is_empty()).then_some((*r, (shown, holders)))
+            })
+            .collect())
+    }
+
+    fn message_reaction_states(
+        &self,
+        refs: &[MessageRef],
+    ) -> Result<Vec<MessageState>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(refs.iter().filter_map(|r| inner.state(r)).collect())
+    }
+
+    fn forget_message_reactions(
+        &self,
+        who: &Mailbox,
+        since: SystemTime,
+    ) -> Result<Vec<MessageRef>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let reactor = reactor_key(who);
+        let mut lost = Vec::new();
+        inner.reactions.retain(|r| {
+            let gone = r.reactor == reactor && r.at >= since;
+            if gone && !lost.contains(&r.reference) {
+                lost.push(r.reference);
+            }
+            !gone
+        });
+        // In the SQLite store's order, so either is announced alike.
+        lost.sort_unstable();
+        Ok(lost)
+    }
+
+    fn rekey_message_reactions(
+        &self,
+        from: &Mailbox,
+        to: &Mailbox,
+    ) -> Result<Vec<MessageRef>, StoreError> {
+        let (from, to) = (reactor_key(from), reactor_key(to));
+        if from == to {
+            // Nothing moves, and the collision rule would take them all.
+            return Ok(Vec::new());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let held: HashSet<(MessageRef, Vec<u8>)> = (inner.reactions.iter())
+            .filter(|r| r.reactor == to)
+            .map(|r| (r.reference, r.key.clone()))
+            .collect();
+        let mut lost = Vec::new();
+        inner.reactions.retain(|r| {
+            let twice = r.reactor == from && held.contains(&(r.reference, r.key.clone()));
+            if twice && !lost.contains(&r.reference) {
+                lost.push(r.reference);
+            }
+            !twice
+        });
+        for r in inner.reactions.iter_mut().filter(|r| r.reactor == from) {
+            r.reactor = to.clone();
+        }
+        lost.sort_unstable();
+        Ok(lost)
     }
 }
 

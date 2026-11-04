@@ -858,9 +858,9 @@ fn react_in(inner: &mut MemoryInner, act: &ReactAct) -> Result<Reacted, StoreErr
     })
 }
 
-/// A line's rows, as `(key, reactor)` in the order they were made, read
-/// into what a reader is shown.
-fn summarize<'a>(
+/// A line's rows, or a stored message's, as `(key, reactor)` in the
+/// order they were made, read into what a reader is shown.
+pub fn summarize<'a>(
     rows: impl IntoIterator<Item = (&'a [u8], &'a str)>,
     reader: Option<&str>,
 ) -> Reactions {
