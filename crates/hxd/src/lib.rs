@@ -1456,6 +1456,8 @@ impl InboxSection {
             deliver_at_flush: self.deliver_at_flush,
             max_sent_per_day: self.max_sent_per_day,
             max_sent_bytes_per_day: self.max_sent_bytes_per_day,
+            retain_unread: Duration::from_secs(self.retain_unread),
+            retain_read: Duration::from_secs(self.retain_read),
         }
     }
 }
@@ -2319,10 +2321,10 @@ fn default_deliver_at_flush() -> usize {
     25
 }
 fn default_retain_unread() -> u64 {
-    30 * 24 * 3600
+    hxd_core::InboxPolicy::default().retain_unread.as_secs()
 }
 fn default_retain_read() -> u64 {
-    7 * 24 * 3600
+    hxd_core::InboxPolicy::default().retain_read.as_secs()
 }
 fn default_history_max_lines() -> u32 {
     10_000
@@ -4375,7 +4377,7 @@ pub(crate) fn parse_fingerprint(text: &str) -> Result<[u8; 32], String> {
 /// Retention: drop unread messages older than their window, and read ones
 /// read longer ago than theirs. Runs beside the ng frontend's detached
 /// sweeper, but is not its business — a legacy-only server has inboxes too.
-pub async fn inbox_pruner(core: Arc<Core>, unread: Duration, read: Duration) {
+pub async fn inbox_pruner(core: Arc<Core>) {
     // Hourly: retention is measured in days, so anything finer is work
     // for its own sake.
     let mut tick = tokio::time::interval(Duration::from_secs(3600));
@@ -4387,7 +4389,7 @@ pub async fn inbox_pruner(core: Arc<Core>, unread: Duration, read: Duration) {
         // `sqlite3` holding a write lock would otherwise stall every
         // session the reactor thread is carrying.
         let core = core.clone();
-        let gone = crate::spawn_blocking("prune", move || core.prune_inbox(unread, read))
+        let gone = crate::spawn_blocking("prune", move || core.prune_inbox())
             .await
             .unwrap_or(0);
         if gone > 0 {

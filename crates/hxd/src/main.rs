@@ -1528,11 +1528,7 @@ async fn main() {
                 "private-message inbox at {} — it holds message bodies in the clear",
                 inbox.db.display()
             );
-            tokio::spawn(hxd::inbox_pruner(
-                ctx.core.clone(),
-                std::time::Duration::from_secs(inbox.retain_unread),
-                std::time::Duration::from_secs(inbox.retain_read),
-            ));
+            tokio::spawn(hxd::inbox_pruner(ctx.core.clone()));
         }
 
         if let Some(history) = &config.history {

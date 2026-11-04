@@ -2354,7 +2354,7 @@ impl Core {
         signed: Option<SignedMsg>,
         re: Option<Reply>,
     ) -> Result<MsgOutcome, ChatError> {
-        let now = SystemTime::now();
+        let now = self.clock.wall();
         let from = sender.uid;
         let sender_login = sender.reply_login.clone().unwrap_or_default();
         let sender_login = sender_login.as_str();
@@ -3071,7 +3071,7 @@ impl Core {
             if ids.is_empty() {
                 continue;
             }
-            if let Err(e) = store.mark_delivered(&ids, SystemTime::now(), what) {
+            if let Err(e) = store.mark_delivered(&ids, self.clock.wall(), what) {
                 warn!("inbox: marking {} messages delivered: {e}", ids.len());
             }
         }
@@ -3188,7 +3188,7 @@ impl Core {
         let (store, mailbox) = self.inbox_of(uid)?;
         issued(store.as_ref(), &mailbox, Some(up_to))?;
         store
-            .mark_read(&mailbox, up_to, SystemTime::now())
+            .mark_read(&mailbox, up_to, self.clock.wall())
             .map_err(store_failed)?;
         store.counts(&mailbox).map_err(store_failed)
     }
@@ -3374,11 +3374,12 @@ impl Core {
 
     /// Retention. The binary runs this on an interval, next to the
     /// detached-session sweeper. Returns how many messages went.
-    pub fn prune_inbox(&self, unread: Duration, read: Duration) -> usize {
+    pub fn prune_inbox(&self) -> usize {
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };
-        match store.prune(SystemTime::now(), unread, read) {
+        let p = &self.inbox_policy;
+        match store.prune(self.clock.wall(), p.retain_unread, p.retain_read) {
             Ok(n) => n,
             Err(e) => {
                 warn!("inbox: pruning: {e}");
@@ -6530,6 +6531,29 @@ pub(crate) mod inbox_tests {
         );
         assert_eq!(core.inbox_mark_read(a, 3).unwrap().unread, 0, "the last is");
         assert_eq!(core.inbox_list(a, Some(3), 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retention_is_measured_on_the_cores_clock() {
+        let (core, store) = server(&["alice", "dave"]);
+        let (a, _ra) = attach(&core, "alice", true);
+        let policy = core.inbox_policy();
+        // Far enough on that mail stamped on real time would age out too.
+        core.clock()
+            .advance(policy.retain_unread - policy.retain_read + Duration::from_secs(1));
+        for text in ["read", "unread"] {
+            core.msg_login(a, "dave", text.into(), None, None).unwrap();
+        }
+        let (m, _rm) = attach(&core, "dave", true);
+        let keep = policy.retain_read;
+
+        core.clock().advance(keep * 2);
+        core.inbox_mark_read(m, store.all()[0].cursor).unwrap();
+        assert_eq!(core.prune_inbox(), 0, "read just now");
+        core.clock().advance(keep + Duration::from_secs(1));
+        assert_eq!(core.prune_inbox(), 1);
+        let left: Vec<_> = store.all().into_iter().map(|m| m.body).collect();
+        assert_eq!(left, ["unread"]);
     }
 
     #[test]
