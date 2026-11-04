@@ -727,7 +727,6 @@ impl Core {
         add: bool,
     ) -> Result<(), ReactError> {
         let policy = self.reaction_policy().ok_or(ReactError::NotAvailable)?;
-        // Before `messenger`, which makes the session a messenger.
         {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&uid).ok_or(ReactError::NotAllowed)?;
@@ -735,8 +734,10 @@ impl Core {
                 return Err(ReactError::NotAllowed);
             }
         }
+        // A reaction is no family request: a client handed instant
+        // messages as mail goes on being handed them so.
         let me = self
-            .messenger(uid)
+            .caller(uid, false)
             .map_err(|_| match self.messaging_enabled() {
                 true => ReactError::NotAllowed,
                 false => ReactError::NotAvailable,

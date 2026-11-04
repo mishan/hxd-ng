@@ -405,6 +405,11 @@ async fn an_instant_message_in_the_inbox_and_on_a_msg_names_its_guid_and_takes_a
     })
     .await;
     assert_eq!(told["changes"][0]["from"]["login"], "bob");
+
+    // Reacting left bob handed instant messages as mail.
+    let after = json!({ "to_login": "bob", "text": "after the reaction", "guid": guid(4) });
+    ok(&mut alice, "msg", after).await;
+    event(&mut bob, "msg", |d| d["text"] == "after the reaction").await;
 }
 
 #[tokio::test]

@@ -936,8 +936,8 @@ family document. Each family of §4 adds its own.
   `msg` event (§7.1); there is no uid, which may have been reused since.
   An instant message's row carries `im: true` and its `guid`, which with
   `from.login` make the `im` target that reacts to it; one sent under an
-  identity guest's approval has `from.login` `guest`, the shared guest
-  account rather than its sender, and cannot be reacted to.
+  identity guest's approval has no `from.login`, and cannot be reacted
+  to.
 - **`msg_read`** marks every message of this account's with an `id` at or
   below `up_to` read, and returns the counts after it.
 - **A cursor this account's mailbox never issued** — past the last `id`
