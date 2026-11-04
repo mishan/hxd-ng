@@ -333,6 +333,7 @@ impl Core {
                 media: None,
                 signed: form.clone(),
                 re: re.clone().map(Box::new),
+                im: Some(guid.clone()),
             };
             let im = Event::Im(Box::new(Im {
                 from_login: me.mailbox.login.clone(),

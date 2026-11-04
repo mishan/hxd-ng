@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_core::{Core, InboxPolicy, MessagingPolicy};
+use hxd_core::{Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ReactionPolicy};
 use hxd_ng_session::{NgConfig, NgCtx, Registry};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -89,6 +89,8 @@ async fn start(dir: &Path, messaging: bool) -> Server {
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
     let core = Core::new()
         .with_inbox(store.clone(), auth.clone(), InboxPolicy::default())
+        .with_history(store.clone(), HistoryPolicy::default())
+        .with_reactions(ReactionPolicy::default())
         .with_relationships(store)
         .with_messaging(MessagingPolicy {
             enabled: messaging,
@@ -349,6 +351,60 @@ async fn an_instant_message_sent_while_away_arrives_at_the_roster_read() {
     assert_eq!(im["ref"], sent["ref"]);
     // Handed over as an instant message alone, never as mail too.
     assert!(!bob.rx.take_backlog().iter().any(|e| e.ev == "msg"));
+}
+
+/// A session not handed instant messages reads one as mail, which says
+/// what it is and names its guid, on the `msg` and on its `inbox` row
+/// alike, so it can react to it as an instant message.
+#[tokio::test]
+async fn an_instant_message_in_the_inbox_and_on_a_msg_names_its_guid_and_takes_an_im_reaction() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), true).await;
+    let reacting = |who: &'static str, messaging: bool| {
+        let addr = s.ng;
+        async move {
+            let mut c = Client::connect(addr).await.unwrap();
+            c.login(json!({
+                "login": who, "password": "pw", "nick": who,
+                "messaging": messaging, "reactions": true,
+            }))
+            .await
+            .unwrap();
+            c
+        }
+    };
+    let mut alice = reacting("alice", true).await;
+    let (mut bob, _) = messenger(&s, "bob").await;
+    befriend(&mut alice, &mut bob, "bob", "alice").await;
+    ok(&mut alice, "friends", json!({})).await;
+    bob.logout().await.unwrap();
+    let sent = ok(
+        &mut alice,
+        "msg",
+        json!({ "to_login": "bob", "text": "while you were out", "guid": guid(3) }),
+    )
+    .await;
+
+    let mut bob = reacting("bob", false).await;
+    let msg = event(&mut bob, "msg", |d| d["text"] == "while you were out").await;
+    let rows = ok(&mut bob, "inbox", json!({})).await;
+    for (shape, v) in [("msg", &msg), ("row", &rows["messages"][0])] {
+        assert_eq!(v["ref"], sent["ref"], "{shape}");
+        assert_eq!(
+            (&v["im"], &v["guid"]),
+            (&json!(true), &json!(guid(3))),
+            "{shape}"
+        );
+    }
+
+    let target = json!({ "im": { "login": "alice", "guid": msg["guid"] } });
+    let react = json!({ "target": target, "with": "alice", "key": { "emoji": "👍" } });
+    assert_eq!(ok(&mut bob, "react", react).await, json!({}));
+    let told = event(&mut alice, "reactions_changed", |d| {
+        d["changes"][0]["target"] == target
+    })
+    .await;
+    assert_eq!(told["changes"][0]["from"]["login"], "bob");
 }
 
 #[tokio::test]

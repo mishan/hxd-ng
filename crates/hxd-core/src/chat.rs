@@ -31,7 +31,7 @@ use crate::inbox::{
     Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
     MessageStore, NewMessage, StoreError, StoredMessage,
 };
-use crate::relationships::RelationshipStore;
+use crate::relationships::{RelationshipStore, SentOn};
 use crate::reply::Reply;
 use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
 use crate::Core;
@@ -2479,6 +2479,7 @@ impl Core {
                 media,
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
+                im: None,
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -2566,6 +2567,7 @@ impl Core {
                 media,
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
+                im: None,
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -3040,6 +3042,9 @@ impl Core {
                             media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
                             signed: m.signed.as_ref().map(|s| s.form.clone()),
                             re: m.re.clone().map(Box::new),
+                            im: matches!(m.friendship, Some(SentOn::Relation(_)))
+                                .then(|| m.guid.clone())
+                                .flatten(),
                         },
                     );
                     if !delivered.contains(&m.id) {

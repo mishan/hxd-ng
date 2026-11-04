@@ -975,6 +975,7 @@ impl Core {
                 media: None,
                 signed,
                 re: None,
+                im: None,
             },
         );
         Ok(())

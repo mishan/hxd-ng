@@ -1080,6 +1080,43 @@ fn a_family_session_waits_for_its_roster_read_and_any_other_is_handed_a_message(
     assert_eq!(msgs(&drain(&mut rb2)), ["live"], "and every other one");
 }
 
+/// Handed over as mail, out of the inbox or live past the sender's
+/// quota, an instant message names its guid, so a client that is not
+/// handed instant messages can still react to it as one.
+#[test]
+fn an_instant_message_handed_over_as_mail_names_its_guid() {
+    let quota = InboxPolicy {
+        max_sent_per_day: 1,
+        ..InboxPolicy::default()
+    };
+    let dir = Directory(
+        ["alice", "bob"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let s = server_of(dir, policy(), quota, None);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    s.core.end_session(b);
+    let (_plain, mut rp) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.2");
+    for (case, n, stored) in [("stored", 1, true), ("past the quota", 2, false)] {
+        let guid = MessageGuid::parse(&format!("5f5e1000-1234-4abc-89ab-00000000002{n}")).unwrap();
+        s.core
+            .im_send(a, "bob", case.into(), Some(guid.clone()), None)
+            .unwrap();
+        let mail: Vec<_> = drain(&mut rp)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Msg { im, reference, .. } => Some((im, reference.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mail, [(Some(guid), stored)], "{case}");
+    }
+}
+
 #[test]
 fn what_was_queued_on_a_friendship_is_held_once_it_ends() {
     let s = server(&["alice", "bob"]);
