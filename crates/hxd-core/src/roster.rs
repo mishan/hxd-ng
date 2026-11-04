@@ -1564,6 +1564,10 @@ pub struct InboxPolicy {
     pub max_sent_per_day: usize,
     /// Body bytes, likewise; 0 for no quota.
     pub max_sent_bytes_per_day: u64,
+    /// How long an unread message is kept, from when it was sent.
+    pub retain_unread: Duration,
+    /// How long a read message is kept, from when it was read.
+    pub retain_read: Duration,
 }
 
 impl Default for InboxPolicy {
@@ -1573,6 +1577,8 @@ impl Default for InboxPolicy {
             deliver_at_flush: 25,
             max_sent_per_day: 1_000,
             max_sent_bytes_per_day: 8 << 20,
+            retain_unread: Duration::from_secs(30 * 24 * 3600),
+            retain_read: Duration::from_secs(7 * 24 * 3600),
         }
     }
 }
