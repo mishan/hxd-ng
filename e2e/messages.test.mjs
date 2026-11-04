@@ -310,7 +310,7 @@ describe('private messages', () => {
     // Handed over in the resume: one of the events it replayed, which
     // follow its reply.
     const answered = reader.log.find((r) => r.kind === 'reply' && r.id === asked.id);
-    const replayed = reader.log.filter((r) => r.kind === 'ev' && r.n > answered.n).slice(0, resumed.data.replay);
+    const replayed = await reader.replayed(answered, resumed.data.replay);
     assert.ok(
       replayed.some((r) => r.name === 'msg' && r.data.sealed === held.sealed),
       `expected the box among the ${resumed.data.replay} events the resume replayed`,
