@@ -514,6 +514,10 @@ pub enum Event {
         /// what a client needs to react to it as the instant message it
         /// is.
         im: Option<crate::inbox::MessageGuid>,
+        /// A stored private message's reactions as its recipient's
+        /// account is shown them, when a flush hands it to a session
+        /// that hears them; never on a message that was not stored.
+        reactions: Option<Box<crate::reaction::Reactions>>,
     },
     /// A sealed private message (`docs/e2e-messages.md` §4.4), only ever
     /// to the session of the device it was sealed to, and never stored.
@@ -774,6 +778,7 @@ impl Event {
                 signed,
                 re,
                 im,
+                reactions,
                 ..
             } => {
                 from_nick.len()
@@ -782,6 +787,9 @@ impl Event {
                     + signed.as_ref().map_or(0, Vec::len)
                     + re.as_ref().map_or(0, |r| r.pack().len())
                     + im.as_ref().map_or(0, |g| g.as_str().len())
+                    + reactions
+                        .as_ref()
+                        .map_or(0, |r| crate::reaction::keys_weight(&r.keys) + r.mine.len())
             }
             Event::Sealed {
                 from_nick,
@@ -1749,7 +1757,9 @@ pub struct Core {
     /// Serializes changes to stored private messages' reactions, which
     /// the inbox store keeps and the desk never sees: a reaction, and a
     /// claim or rotation with the rekey that follows its move, so a
-    /// reaction falls before both or after both. Order is `flushing`,
+    /// reaction falls before both or after both; and a flush, from its
+    /// read of the reactions its `msg`s carry through their stamp, so a
+    /// reaction rides the `msg` or is told after it. Order is `flushing`,
     /// then this, then the roster or a store, never two of those at once
     /// and never the desk.
     pub(crate) pm_reacting: TimedMutex<PmReactions>,

@@ -422,26 +422,28 @@ impl ReactionChange {
     /// For [`Event::weight`]: a summary as if its keys were its own,
     /// though every reader's copy shares them.
     pub(crate) fn weight(&self) -> usize {
-        let key = |k: &ReactionKey| match k {
-            ReactionKey::Emoji(e) => e.len(),
-        };
         std::mem::size_of::<Self>()
             + match self {
-                ReactionChange::Summary { keys, mine, .. } => {
-                    keys.iter()
-                        .map(|(k, _)| std::mem::size_of::<(ReactionKey, u32)>() + key(k))
-                        .sum::<usize>()
-                        + mine.len()
-                }
+                ReactionChange::Summary { keys, mine, .. } => keys_weight(keys) + mine.len(),
                 ReactionChange::Clear { .. } => 0,
                 ReactionChange::Changed {
-                    target,
-                    key: k,
-                    from,
-                    ..
-                } => target.pack().len() + key(k) + from.len(),
+                    target, key, from, ..
+                } => target.pack().len() + key_weight(key) + from.len(),
             }
     }
+}
+
+fn key_weight(k: &ReactionKey) -> usize {
+    match k {
+        ReactionKey::Emoji(e) => e.len(),
+    }
+}
+
+/// For [`Event::weight`]: what a summary's keys hold.
+pub(crate) fn keys_weight(keys: &[(ReactionKey, u32)]) -> usize {
+    (keys.iter())
+        .map(|(k, _)| std::mem::size_of::<(ReactionKey, u32)>() + key_weight(k))
+        .sum()
 }
 
 /// What a live line owes its room's next batch.
@@ -1927,6 +1929,7 @@ impl Batch {
 mod desk;
 pub(crate) use desk::Desk;
 mod pm;
+pub(crate) use pm::pm_reader;
 
 #[cfg(test)]
 mod edges;

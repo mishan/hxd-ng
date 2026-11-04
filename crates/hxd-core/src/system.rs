@@ -741,6 +741,7 @@ impl Core {
                 signed: None,
                 re: None,
                 im: None,
+                reactions: None,
             },
         );
     }

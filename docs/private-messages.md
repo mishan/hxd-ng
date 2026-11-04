@@ -525,6 +525,23 @@ the recipient is now attached, flush its pending messages immediately.
 Same shape as the registry's copy-out/release/consult/reacquire
 discipline in AGENTS.md.
 
+A flush hands a private message over before it stamps it delivered, so
+that a stamp that fails delivers twice rather than never. A reaction
+between the two would find the message undelivered, and tell none of
+the recipient's sessions, after the `msg` had gone without it. So a
+flush that hands one to a session hearing reactions takes
+`pm_reacting`, the mutex stored messages' reactions change under, from
+its read of their reactions through its stamp, and no earlier: the
+reply addresses, image handles and pending reads come first. A reaction
+then rides the `msg` or is told after it. `flushing` is taken before
+`pm_reacting`, and nothing holding `pm_reacting` takes `flushing`. The
+cost: such a flush, and the send that runs it, can wait behind one
+holder of the mutex, a reaction's write and its fan-out, a scan of
+the roster for the two accounts' sessions, or a claim's move, rekey
+and its bounded announcements, while every other flush waits on
+`flushing`; and a reaction waits for a flush in progress, its stamp's
+fsync included.
+
 ### 6.3 Flush
 
 `Core::flush_inbox(uid)` pushes a session's pending messages through its

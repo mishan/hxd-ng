@@ -976,6 +976,7 @@ impl Core {
                 signed,
                 re: None,
                 im: None,
+                reactions: None,
             },
         );
         Ok(())

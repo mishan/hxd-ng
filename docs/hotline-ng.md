@@ -469,7 +469,9 @@ belong to the `inbox` capability (§4).
 - **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
   `at`, `queued` and, when the message was stored, `id` and `ref`; for
   an instant message handed over as mail, also `im: true` and its
-  `guid`, stored or not.
+  `guid`, stored or not; and to a session that declared `reactions`, a
+  stored private message's `reactions` and `reactions_mine` as they
+  stand when it is handed over, as its `inbox` row carries them (§7.3).
   `from.uid` is 0 when a queued message's sender no longer has a
   session. `from.login` is absent when there is nobody to reply to — a
   guest, or an account since deleted. `id` is the message's place in
@@ -957,6 +959,22 @@ family document. Each family of §4 adds its own.
     is turned off still reacts to the mail it has. A server takes `pm`
     targets only where it keeps history as well, as every kind of
     target goes through the one reactions gate.
+    A change is told at once, in a `reactions_changed` of its own whose
+    one group is the message's summary, `{ "target": { "pm" }, "action":
+    "summary", "keys", "mine"? }`, to every session of either party's
+    account that declared `reactions` but the one that reacted, attached
+    or detached; never to a guest's. The sender's are told only within
+    its view. The recipient's are told only once the message has been
+    handed over: until then its reactions ride the `msg` that hands it
+    over. A recipient can react to a waiting message it read in `inbox`,
+    and its other sessions then learn of it from that `msg` or from
+    `inbox` rather than from a summary ahead of the message it is
+    about; and once one session is handed the message the account's
+    others are told, which a client holding no message by that `ref`
+    ignores. A link or a rotation that folds one key's reactions into
+    another's tells the messages that lost one the same way, the most
+    recent alone (*hxd-ng:* `[reactions] live_window` of them, fifty to
+    an event); a client reads the rest with `reactions` or `inbox`.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re?, im?, guid?, reactions?,
