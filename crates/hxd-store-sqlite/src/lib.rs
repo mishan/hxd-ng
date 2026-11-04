@@ -1903,10 +1903,12 @@ impl Collapse {
     /// relinks — deletes the row that was read and flushes the survivor
     /// again as unread.
     ///
-    /// A duplicate stub was read, and is stamped as read when it was
-    /// sent: the copy that was read is already pruned, so the survivor
-    /// goes at the next prune, as that copy did, rather than starting a
-    /// fresh `retain_read`.
+    /// A duplicate stub was read, and stamps a survivor that was not as
+    /// read when it was sent: the copy that was read is already pruned,
+    /// so the survivor goes at the next prune, as that copy did, rather
+    /// than starting a fresh `retain_read`. A survivor already read keeps
+    /// its own stamp, as it does against a duplicate row: its reader read
+    /// that copy then, and nothing a sender sees turns on when it goes.
     fn promote(&self) -> String {
         let (dest, dup) = (self.destination, self.duplicate);
         format!(

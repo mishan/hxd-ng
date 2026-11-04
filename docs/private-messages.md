@@ -416,9 +416,10 @@ flushes one. A claim and a rotation move it as they move rows, and
 where they merge duplicates a stub already in the destination mailbox
 is kept as a row there would be, so the retry is answered under one
 `ref` whether the message was read or not. A moving stub that meets a
-row there carries its read state over, as a duplicate row does: the row
-is stamped delivered and read as of the stub's `sent_at`, so it is not
-handed over again and goes at the next prune. A purge takes a stub with
+row there carries its read state over, as a duplicate row does: a row
+not yet read is stamped delivered and read as of the stub's `sent_at`,
+so it is not handed over again and goes at the next prune, and one
+already read keeps its own stamp. A purge takes a stub with
 the mailbox. Only retention makes one, and only of
 a private message: an instant message or a request leaves none.
 
