@@ -1746,6 +1746,13 @@ pub struct Core {
     /// the-roster-lock rule survives. Order is always this lock first,
     /// then the roster's.
     pub(crate) flushing: TimedMutex<InboxFlush>,
+    /// Serializes changes to stored private messages' reactions, which
+    /// the inbox store keeps and the desk never sees: a reaction, and a
+    /// claim or rotation with the rekey that follows its move, so a
+    /// reaction falls before both or after both. Order is `flushing`,
+    /// then this, then the roster or a store, never two of those at once
+    /// and never the desk.
+    pub(crate) pm_reacting: TimedMutex<PmReactions>,
     /// The image pipeline and its handles, or `None` when no `[media]`
     /// section configured one — in which case neither wire ever offers
     /// the capability. It carries its own mutex; the roster's may be
@@ -1930,6 +1937,10 @@ pub(crate) struct LogSerial;
 /// What `Core::flushing` guards: nothing but mutual exclusion.
 #[derive(Default)]
 pub(crate) struct InboxFlush;
+
+/// What `Core::pm_reacting` guards: nothing but mutual exclusion.
+#[derive(Default)]
+pub(crate) struct PmReactions;
 
 impl Core {
     pub fn new() -> Self {

@@ -3326,18 +3326,29 @@ impl Core {
             }
             None => crate::relationships::Rekeyed::default(),
         };
-        let moved = match self.inbox.as_ref().map(|s| s.claim(login, fingerprint)) {
-            Some(Ok(n)) => n,
-            Some(Err(e)) => {
-                warn!("inbox: claiming {login}'s mail: {e}");
-                0
+        let claimed = Mailbox::identified(login, *fingerprint);
+        let moved = match self.inbox.as_ref() {
+            Some(store) => {
+                // A reaction falls before the move and its rekey, or after
+                // both. Between them a session of the new key would be
+                // checked against the new key's reactions alone: a remove
+                // of a key still under the old one would be Held and come
+                // back with the rekey, and `max_per_user` undercounted.
+                let _reacting = self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner());
+                let moved = store.claim(login, fingerprint).unwrap_or_else(|e| {
+                    warn!("inbox: claiming {login}'s mail: {e}");
+                    0
+                });
+                if let Err(e) = store.rekey_message_reactions(&Mailbox::login(login), &claimed) {
+                    warn!("inbox: moving {login}'s reactions: {e}");
+                }
+                moved
             }
             None => 0,
         };
         if let Err(e) = self.restamp(&rekeyed.merged) {
             warn!("inbox: re-stamping {login}'s merged friendships: {e}");
         }
-        let claimed = Mailbox::identified(login, *fingerprint);
         self.rekey_reactions(&Mailbox::login(login), &claimed);
         self.rekey_friends(&Mailbox::login(login), &claimed);
         // A claim runs at every login of a linked account; only one
@@ -7043,6 +7054,9 @@ pub(crate) mod inbox_tests {
     pub(crate) struct RacyStore {
         inner: MemoryStore,
         pub(crate) during_push: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Run as a rekey of reactions starts: after a claim or a
+        /// rotation has moved the mail, before its reactions follow.
+        pub(crate) during_move: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl RacyStore {
@@ -7054,6 +7068,7 @@ pub(crate) mod inbox_tests {
             RacyStore {
                 inner,
                 during_push: Mutex::new(None),
+                during_move: Mutex::new(None),
             }
         }
     }
@@ -7262,6 +7277,9 @@ pub(crate) mod inbox_tests {
             from: &Mailbox,
             to: &Mailbox,
         ) -> Result<Vec<crate::inbox::MessageRef>, StoreError> {
+            if let Some(f) = self.during_move.lock().unwrap().take() {
+                f();
+            }
             self.inner.rekey_message_reactions(from, to)
         }
     }

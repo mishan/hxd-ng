@@ -18,8 +18,15 @@ impl Core {
     /// Called once the account link has moved, it ends every session
     /// still keyed by `from`, so nothing is written there afterwards.
     pub fn rotate_identity(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<(), StoreError> {
+        let (old, new) = (
+            crate::inbox::Mailbox::identified(String::new(), *from),
+            crate::inbox::Mailbox::identified(String::new(), *to),
+        );
         if let Some(store) = self.inbox.as_ref() {
+            // As a claim holds it, for the same reason.
+            let _reacting = self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner());
             store.rotate(from, to)?;
+            store.rekey_message_reactions(&old, &new)?;
         }
         if let Some(store) = self.relationships.as_ref() {
             let rekeyed = store.rotate(from, to)?;
@@ -43,10 +50,6 @@ impl Core {
             self.after_merge(&successor);
         }
         self.news_rotate(from, to)?;
-        let (old, new) = (
-            crate::inbox::Mailbox::identified(String::new(), *from),
-            crate::inbox::Mailbox::identified(String::new(), *to),
-        );
         self.rekey_all_reactions(&old, &new)?;
         if let Some(store) = self.devices.as_ref() {
             let taken = store.devices_rotate(from, to)?;

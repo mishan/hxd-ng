@@ -1264,7 +1264,10 @@ impl Core {
     /// with `key` the nicks that hold it, newest first and at most
     /// [`REACTORS_SHOWN`]. A line is held to [`Core::react`]'s read
     /// rules, and one that fails them is left out, as a tombstone and a
-    /// line that does not exist are. Only lines are answered.
+    /// line that does not exist are. A stored private message is always
+    /// answered, as [`Core::react_pm`] lets `uid` see it: anything it is
+    /// not party to on its side's terms is answered as one with none.
+    /// Only lines and stored messages are answered.
     pub fn reactions_asked(
         &self,
         uid: Uid,
@@ -1300,20 +1303,36 @@ impl Core {
         }
         let ids: Vec<LineId> = live.iter().map(|&(_, id)| id).collect();
         let shown = log.reactions(&ids, reader.as_ref())?;
+        let refs: Vec<MessageRef> = (targets.iter())
+            .filter_map(|t| match t {
+                Reply::Pm(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let pms = match (self.inbox.as_ref(), &reader) {
+            (Some(store), Some(reader)) if !refs.is_empty() => {
+                store.message_reactions(&refs, reader, self.pm_open_since(), key)?
+            }
+            _ => HashMap::new(),
+        };
         let mut out = Vec::new();
         for target in targets {
-            let &Reply::Line { room, id } = target else {
-                continue;
+            let (shown, from) = match *target {
+                Reply::Line { room, id } if live.contains(&(room, id)) => (
+                    shown.get(&id).cloned().unwrap_or_default(),
+                    key.map(|k| log.reactors(id, k, REACTORS_SHOWN))
+                        .transpose()?,
+                ),
+                Reply::Pm(r) => {
+                    let (shown, from) = pms.get(&r).cloned().unwrap_or_default();
+                    (shown, key.map(|_| from))
+                }
+                _ => continue,
             };
-            if !live.contains(&(room, id)) {
-                continue;
-            }
             out.push(Asked {
                 target: target.clone(),
-                shown: shown.get(&id).cloned().unwrap_or_default(),
-                from: key
-                    .map(|k| log.reactors(id, k, REACTORS_SHOWN))
-                    .transpose()?,
+                shown,
+                from,
             });
         }
         Ok(out)
@@ -1907,6 +1926,7 @@ impl Batch {
 
 mod desk;
 pub(crate) use desk::Desk;
+mod pm;
 
 #[cfg(test)]
 mod edges;

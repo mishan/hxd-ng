@@ -1,6 +1,7 @@
 //! The `reactions` capability (`docs/hotline-ng.md` §7.3): `react` on a
-//! line or an instant message, a moderator's clear, a line's reactions on
-//! the `history` that shows it, `reactions` to read them again and who
+//! line, an instant message or a stored private message, a moderator's
+//! clear, a line's reactions on the `history` that shows it and a
+//! message's on its `inbox` row, `reactions` to read them again and who
 //! reacted, and `reactions_changed`, to sessions that declared it.
 
 use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, Reactions, Reply};
@@ -12,14 +13,19 @@ use crate::proto::{reply_err, reply_err_retry, reply_ok, ReqEnvelope};
 use crate::NgCtx;
 
 /// The kinds of target this server takes reactions on: a line where
-/// lines are kept, and an instant message where they are sent.
+/// lines are kept, an instant message where they are sent, and a stored
+/// private message where there is an inbox as well.
 pub(crate) fn targets(ctx: &NgCtx) -> Vec<&'static str> {
     let core = &ctx.core;
     let on = core.reaction_policy().is_some();
-    [("line", on), ("im", on && core.messaging_enabled())]
-        .into_iter()
-        .filter_map(|(kind, taken)| taken.then_some(kind))
-        .collect()
+    [
+        ("line", on),
+        ("im", on && core.messaging_enabled()),
+        ("pm", on && core.inbox_enabled()),
+    ]
+    .into_iter()
+    .filter_map(|(kind, taken)| taken.then_some(kind))
+    .collect()
 }
 
 /// The login reply's `reactions` block.
@@ -126,6 +132,11 @@ enum Act {
         key: ReactionKey,
         add: bool,
     },
+    Pm {
+        reference: hxd_core::inbox::MessageRef,
+        key: ReactionKey,
+        add: bool,
+    },
 }
 
 /// `react`'s params, or the `bad_request` they earn: a key on every act
@@ -156,12 +167,18 @@ fn act(ctx: &NgCtx, p: ReactParams) -> Result<Act, &'static str> {
             add: !p.remove,
         }),
         (Reply::Im(_), false, None) => Err("An `im` target needs `with`."),
+        (Reply::Pm(reference), false, None) => Ok(Act::Pm {
+            reference,
+            key: emoji(p.key)?,
+            add: !p.remove,
+        }),
         _ => Err("`with` is for an `im` target."),
     }
 }
 
-/// `react`: one key added to, or with `remove` taken from, one line or
-/// instant message, or with `clear` every key on a line.
+/// `react`: one key added to, or with `remove` taken from, one line,
+/// instant message or stored message, or with `clear` every key on a
+/// line.
 pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Value) -> String {
     if !state.reactions {
         return reply_err(id, "not_available", "Reactions are not available.");
@@ -189,6 +206,11 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
             key,
             add,
         } => c.react_im(uid, &target, &with, &key, add).map(|()| None),
+        Act::Pm {
+            reference,
+            key,
+            add,
+        } => c.react_pm(uid, reference, &key, add).map(|()| None),
     })
     .await;
     match reacted {
@@ -230,7 +252,7 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
 
 /// The kinds of target `reactions` answers, of those the login block
 /// lists: an instant message is never kept to be read again.
-const ASKED: &[&str] = &["line"];
+const ASKED: &[&str] = &["line", "pm"];
 
 /// The most targets one `reactions` names.
 const TARGETS_MAX: usize = 50;
@@ -329,8 +351,8 @@ mod tests {
     /// One to fifty targets of a kind `reactions` answers, and a key
     /// beside one alone, an emoji; anything else is refused.
     #[test]
-    fn get_reactions_params_take_one_to_fifty_line_targets() {
-        let taken = ["line", "im"];
+    fn get_reactions_params_take_one_to_fifty_line_and_pm_targets() {
+        let taken = ["line", "im", "pm"];
         let line = json!({ "line": 7 });
         let im =
             json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
@@ -344,15 +366,13 @@ mod tests {
         let (one, key) = parse(lines(1), Some(thumbs.clone())).unwrap();
         assert_eq!(one, [Reply::Line { room: 0, id: 7 }]);
         assert_eq!(key, ReactionKey::emoji("👍"));
+        let pm = json!({ "pm": "AAAAAAAAAAAAAAAAAAAAAA" });
+        let (both, _) = parse(vec![pm, line.clone()], None).unwrap();
+        assert_eq!(both, [Reply::Pm([0; 16]), Reply::Line { room: 0, id: 7 }]);
         for (case, targets, key) in [
             ("none", lines(0), None),
             ("fifty-one", lines(51), None),
             ("an instant message", vec![im], None),
-            (
-                "a message",
-                vec![json!({ "pm": "AAAAAAAAAAAAAAAAAAAAAA" })],
-                None,
-            ),
             ("malformed", vec![json!({ "line": "seven" })], None),
             ("a key beside two", lines(2), Some(thumbs.clone())),
             (

@@ -2327,14 +2327,22 @@ async fn dispatch(
         "inbox" => match params_or_default::<InboxParams>(&req.params) {
             Ok(p) => {
                 let limit = p.limit.unwrap_or(50).clamp(1, 200);
-                let (uid, before) = (state.uid, p.before);
+                let (uid, before, reactions) = (state.uid, p.before, state.reactions);
                 let listed = off_reactor(&ctx.core, move |c| {
                     c.inbox_list(uid, before, limit).map(|m| {
                         let counts = c.inbox_counts(uid).unwrap_or_else(|e| {
                             warn!(uid, "inbox counts unavailable: {e:?}; reporting zeros");
                             Default::default()
                         });
-                        (m, counts)
+                        let refs: Vec<_> = m.iter().map(|m| m.reference).collect();
+                        let reacted = match reactions {
+                            true => c.message_reactions(uid, &refs).unwrap_or_else(|e| {
+                                warn!("inbox would not read reactions: {e}");
+                                Default::default()
+                            }),
+                            false => Default::default(),
+                        };
+                        (m, counts, reacted)
                     })
                 })
                 .await;
@@ -2342,7 +2350,7 @@ async fn dispatch(
                     return finish(ws_tx, reply_err(req.id, "server_error", "Server error.")).await;
                 };
                 match listed {
-                    Ok((messages, counts)) => reply_ok(
+                    Ok((messages, counts, reacted)) => reply_ok(
                         req.id,
                         json!({
                             "messages": messages
@@ -2354,6 +2362,7 @@ async fn dispatch(
                                         .and_then(|meta| media_now(&ctx.core, meta));
                                     let mut v = stored_msg_json(m, media.as_ref());
                                     crate::replies::add(&mut v, m.re.as_ref(), state.replies);
+                                    crate::reactions::add(&mut v, reacted.get(&m.reference));
                                     v
                                 })
                                 .collect::<Vec<_>>(),

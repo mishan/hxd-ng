@@ -206,9 +206,10 @@ by the same rule and ride the same calls: `inbox_claim` and
 delete them. Its reactions on stored private messages (§5) are kept by
 the same rule in the store, whose `purge` takes them with the mailbox,
 those it made on anyone's mail too, and `hxd inbox purge --dry-run`
-counts them. The store can move them to a claimed or rotated key
-(`rekey_message_reactions`); the claim and rotation calls follow, with
-the wire.
+counts them. `inbox_claim` and `rotate_identity` move them with the
+mail (`rekey_message_reactions`), under the lock a reaction to one is
+made under, so a reaction falls before the move and its rekey or after
+both.
 
 On a server with no identity subsystem every mailbox is login-keyed and
 all of this reduces to exactly the naive design — which is the shape a
