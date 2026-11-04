@@ -371,8 +371,10 @@ generate() {
         echo
         echo "[system]"
         str HXD_SYSTEM_NICK nick
+        num HXD_SYSTEM_ICON icon
     else
         unused HXD_SYSTEM_NICK "HXD_SYSTEM is off"
+        unused HXD_SYSTEM_ICON "HXD_SYSTEM is off"
         # The lobby notice points at the account's commands.
         unused HXD_ROOMS_ANNOUNCE "HXD_SYSTEM is off"
     fi
