@@ -7,6 +7,100 @@ as AGENTS.md's "Releasing" describes it.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
+### Upgrading
+
+- The main SQLite store migrates from schema 29 to 36 on first start:
+  portable friendships, a private message's reference and per-mailbox
+  cursor, replies, reactions on chat lines and on stored private
+  messages, and stubs of read messages. Forward-only, as before: take a
+  backup first (docs/operating.md, "Backups"). The registrar's database
+  is unchanged.
+- A new secret, `messaging-requests.key` beside `[inbox] db`
+  (`[messaging] request_secret`), is made owner-only on first start
+  wherever `[messaging]` and `[inbox]` are configured, and one that
+  cannot be read refuses the start. Back it up with the other keys.
+  Each address's count of requests sent today starts over once.
+- `[messaging] max_message_bytes` is now at most 65505, and twice
+  `request_messages` messages of that size must fit a page of the
+  classic wire's Get Message Requests; a config past either is refused
+  at start. The defaults are well inside both.
+- Get User Info shows a user's login and address only to that user and
+  to a session holding `disconnect_users`; everyone else, the bootstrap
+  guest included, reads `-` in their place.
+- A private message to a login now reaches every attached session of
+  the account but the sender's, rather than one of them.
+- To an account taking part in messaging, a guest's message by login is
+  now a message request, or refused where the account takes none.
+- On the ng wire, a stored private message is named by `ref`, and `id`
+  is now its place in the reader's own mailbox; the `msg` reply carries
+  `ref` in place of `id`. An id a client kept from 0.1.0 is not a cursor,
+  so a client should read `inbox` afresh; a cursor its mailbox never
+  issued is refused `bad_request` by `inbox`, `msg_read` and `report`.
+- Get Chat History sends a line in the session's own line endings, its
+  nick cut to the user list's length.
+- Account and roles files and a self-signed TLS certificate are written
+  owner-only, and an account file loosened by hand is made owner-only
+  again by its next edit. A key or secret readable by group or others
+  is still used, with a warning naming it.
+- A read message pruned inside its sender's `[inbox] retain_unread`
+  window leaves a stub until the window ends; raising `retain_unread`
+  can show a sender which of its messages already past the old window
+  were read (docs/operating.md, `[inbox]`).
+- The Docker image's `latest` tag follows main alone; a release tag
+  publishes `X.Y.Z` and `X.Y`.
+
+### Known limitations
+
+Built since 0.1.0: instant messaging on the classic wire, and portable friendships on both wires.
+
+- Signed and sealed messages on the classic wire (capability bit 13 is never confirmed).
+- Replies on signed lines and messages.
+- hx-ng reacts to public lines only: no client reacts to instant or stored private messages yet.
+
+### Legacy Hotline wire
+
+- Structured Chat, capability bit 17: each chat line also sent as its Chat History entry, to a client that asks (`[structured_chat]`, `HXD_STRUCTURED_CHAT`, docs/chat-history.md section 12).
+- Classic FILP uploads, and their resumes, from a session that negotiated Large Files, as GtkHx sends them; a refused HTXF transfer is logged at INFO with its peer and reason.
+
+### Hotline-ng wire
+
+- Replies: `re` on `chat` and `msg`, naming a line, a stored private message, an instant message or a signed line, relayed as sent to sessions that declare `replies`; `history` by `ids` (docs/hotline-ng.md section 7.3).
+- Reactions: an account's emoji on lobby and room lines, instant messages and stored private messages (`react`), counted on `history` and `inbox`, told live as `reactions_changed` batched per room, and read again with `reactions`, naming who reacted by nick; off by default (`[reactions]`, needs `[history]`; `HXD_REACTIONS`).
+- An instant message read as mail carries `im: true` and its `guid`.
+
+### Identity and registrar
+
+- Device proof on the classic wire: Get Device Challenge and Prove Device, capability bit 14, for a classic client holding its own device key (`[identity] classic_hosts`, `classic_proof`; `HXD_IDENTITY_CLASSIC_HOSTS`, `HXD_IDENTITY_CLASSIC_PROOF`; docs/proposals/portable-friends.md section 3).
+
+### Instant messaging
+
+- fogWraith's Instant Messaging extension and the message requests draft on the classic wire, capability bits 6 and 8, for accounts taking part, sharing friends, presence, IMs and requests with ng (docs/instant-messaging.md section 7).
+- Portable friendships: a friendship signed by both parties' devices, presented on another server and in place there with no new request, and ended everywhere by a signed withdrawal; on ng (`friendships`) and on the classic wire (capability bit 15), from a proved device (docs/proposals/portable-friends.md, docs/hotline-ng.md section 7.5).
+- Requests from guests: the plain guests as one group, an identity guest by its fingerprint to sessions that can name it; an approved identity guest's messages wait for an absent recipient only with `[messaging] queue_identity_guests`.
+- Listing message requests renews an account's opt-in, and Set Presence without a state leaves presence, and Invisible, as it was.
+
+### Moderation and bans
+
+- A moderator's clear of a line's reactions, recorded with its reason.
+- A purge (`purge`, a kick with purge, `hxd purge`) takes the person's reactions in its window, on lines and stored private messages; `hxd inbox purge` takes and counts an account's.
+- The moderation log shows an act kind it does not know as `unknown (N)` rather than failing.
+
+### Operations
+
+- Keys, secrets, account files and the self-signed certificate are written whole through a temporary file beside them, so a crash never leaves a partial key that refuses the next start; `hlid`'s keys too.
+- `HXD_SYSTEM_ICON` for the system account's icon in the Docker image.
+
+### Fixed
+
+- Chat history's hourly retention failing with "database is locked" beside the inbox, and pruning nothing.
+- A session left on the roster, and online to friends, after its connection task panicked; a link or dialer that panics is unregistered and dialed again.
+- Status text set while Invisible reaching friends once the account's last session left.
+- A released message request counted twice toward the sender's daily quota.
+- A message to a session that had just logged in arriving marked queued.
+- A retry of a read and pruned private message storing a second copy, which told its sender it had been read.
+
 ## [0.1.0] - 2026-10-29
 
 The first release.
@@ -149,5 +243,6 @@ Designed but not built yet:
 - `HXD_DEBUG=proto` wire trace, in GtkHx's format.
 - `tools/ng-client.mjs`, a terminal ng client, and `tools/ng-voice.html`, a one-file voice and video client.
 
-[Unreleased]: https://github.com/mishan/hxd-ng/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mishan/hxd-ng/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mishan/hxd-ng/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mishan/hxd-ng/releases/tag/v0.1.0
