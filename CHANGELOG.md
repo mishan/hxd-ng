@@ -7,6 +7,24 @@ as AGENTS.md's "Releasing" describes it.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Upgrading
+
+- No schema migration and no config change.
+- On the ng wire, the `msg` reply to a message that went as an instant
+  message carries `im: true` and the message's `guid`, the one it was
+  sent with or the server's own, so a client names it by guid for
+  replies and reactions rather than as a stored message. A client that
+  ignores unknown fields sees no other change.
+
+### Fixed
+
+- A private message waiting for its recipient, retried by login under
+  its guid once they were back, never reaching their attached session.
+- A retry by login of a private message read and pruned since answered
+  as an instant message.
+
 ## [0.2.0] - 2026-11-04
 
 ### Upgrading
@@ -243,6 +261,7 @@ Designed but not built yet:
 - `HXD_DEBUG=proto` wire trace, in GtkHx's format.
 - `tools/ng-client.mjs`, a terminal ng client, and `tools/ng-voice.html`, a one-file voice and video client.
 
-[Unreleased]: https://github.com/mishan/hxd-ng/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mishan/hxd-ng/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mishan/hxd-ng/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mishan/hxd-ng/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mishan/hxd-ng/releases/tag/v0.1.0
