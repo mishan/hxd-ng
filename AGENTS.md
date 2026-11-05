@@ -300,7 +300,9 @@ piece of work, a purge's tombstones, is many ops. A new write to
 reaction state is an op there too, except a stored private message's,
 which the inbox store keeps and which changes under `Core`'s
 `pm_reacting` instead: `flushing`, then it, then the roster or a store,
-one at a time, and never the desk.
+one at a time, and never the desk. A flush holds it from its read of
+the reactions its `msg`s carry through their delivered stamp, so a
+reaction rides the `msg` or is told after it.
 
 **`assert!` over `debug_assert!`** for wire invariants — release builds
 must not skip them.
@@ -423,7 +425,10 @@ Three layers, all `cargo test --workspace`:
   unread message until its window ends and gone after while the
   recipient's kept row takes reactions, a retry of a read and pruned
   message answered as delivered, lines and messages answered together
-  in the order asked, and no `pm` target without an inbox),
+  in the order asked, no `pm` target without an inbox, a change told
+  to both parties' sessions but the reactor's, one to a waiting message
+  riding its `msg`, one held for a detached party and replayed, and the
+  recipient's past the sender's window told to the sender not at all),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry

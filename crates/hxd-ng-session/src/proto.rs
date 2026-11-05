@@ -842,6 +842,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             signed,
             re,
             im,
+            reactions,
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -878,6 +879,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
                 data["im"] = json!(true);
                 data["guid"] = json!(guid.as_str());
             }
+            crate::reactions::add(&mut data, reactions.as_deref());
             crate::replies::add(&mut data, re.as_deref(), replies);
             ("msg", data)
         }
@@ -1419,6 +1421,7 @@ mod tests {
                         signed: None,
                         re: None,
                         im: want.clone(),
+                        reactions: None,
                     },
                 },
                 false,

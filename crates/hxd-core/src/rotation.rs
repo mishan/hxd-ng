@@ -26,7 +26,8 @@ impl Core {
             // As a claim holds it, for the same reason.
             let _reacting = self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner());
             store.rotate(from, to)?;
-            store.rekey_message_reactions(&old, &new)?;
+            let lost = store.rekey_message_reactions(&old, &new)?;
+            self.pm_announce(&lost);
         }
         if let Some(store) = self.relationships.as_ref() {
             let rekeyed = store.rotate(from, to)?;

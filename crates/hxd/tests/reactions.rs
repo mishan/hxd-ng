@@ -5,9 +5,10 @@
 //! moderator and taken by a redaction and a purge, read again with
 //! `reactions` under the reader's checks and with who reacted by nick,
 //! on an instant message relayed to its other party, and on a stored
-//! private message kept with it, seen by each party on its own terms
-//! and answered `{}` whatever became of it, between scripted clients on
-//! a real server. Emoji in the test data are the reactions themselves.
+//! private message kept with it, seen and told to each party on its
+//! own terms and answered `{}` whatever became of it, between scripted
+//! clients on a real server. Emoji in the test data are the reactions
+//! themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -1244,4 +1245,113 @@ async fn a_server_without_an_inbox_takes_no_pm_target() {
     let (addr, _) = start_core(td.path(), ReactionPolicy::default(), limits, false).await;
     let (_, hello) = login(addr, "alice", true).await;
     assert_eq!(hello["reactions"]["targets"], json!(["line"]));
+}
+
+/// `c` has been told nothing of reactions by the time a round trip has
+/// passed.
+async fn hears_no_reactions(c: &mut Client) {
+    ok(c, "ping", json!({})).await;
+    let told = c.rx.take_backlog();
+    assert!(told.iter().all(|e| e.ev != "reactions_changed"), "{told:?}");
+}
+
+/// A reaction to a stored message is told as a summary to the sessions
+/// of both parties that declared `reactions`, each with its own
+/// account's keys, and not to the session that reacted.
+#[tokio::test]
+async fn a_pm_reaction_is_told_to_both_parties_but_the_reactors_own_session() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut other, _) = login(addr, "dave", true).await;
+    let (mut plain, _) = login(addr, "dave", false).await;
+    let pm = sent(&mut alice, "dave").await;
+    pm_react(&mut dave, &pm, "🎉").await;
+    let keys = json!([{ "key": { "emoji": "🎉" }, "count": 1 }]);
+    let summary = json!({ "target": pm, "action": "summary", "keys": keys });
+    assert_eq!(changed(&mut alice, &pm).await.1, summary);
+    let mut mine = summary;
+    mine["mine"] = json!([0]);
+    assert_eq!(changed(&mut other, &pm).await.1, mine);
+    for c in [&mut dave, &mut plain] {
+        hears_no_reactions(c).await;
+    }
+}
+
+/// A reaction to a message still waiting for its recipient rides the
+/// `msg` that hands it over.
+#[tokio::test]
+async fn a_reaction_to_a_queued_message_arrives_on_its_msg() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let pm = sent(&mut alice, "dave").await;
+    pm_react(&mut alice, &pm, "👍").await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let msg = dave.event_where("msg", |d| d["ref"] == pm["pm"]).await;
+    let msg = msg.unwrap().data;
+    assert_eq!(
+        msg["reactions"],
+        json!([{ "key": { "emoji": "👍" }, "count": 1 }]),
+        "{msg}"
+    );
+    assert!(msg.get("reactions_mine").is_none(), "{msg}");
+}
+
+/// A summary told while a party is away is held for its session and
+/// replayed in order at its resume.
+#[tokio::test]
+async fn a_pm_reaction_waits_in_the_outbox_of_a_detached_party() {
+    let td = tempfile::tempdir().unwrap();
+    let addr = start(td.path(), ReactionPolicy::default()).await;
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let pm = sent(&mut alice, "dave").await;
+    dave.event_where("msg", |d| d["ref"] == pm["pm"])
+        .await
+        .unwrap();
+    let (session, last_seq) = (dave.session.clone().unwrap(), dave.rx.last_seq);
+    dave.close().await.unwrap();
+    pm_react(&mut alice, &pm, "👍").await;
+    let (mut dave, resumed) = Client::resume(addr, session, last_seq, Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        matches!(resumed, Resumed::Replayed(n) if n > 0),
+        "{resumed:?}"
+    );
+    let (_, group) = changed(&mut dave, &pm).await;
+    assert_eq!(
+        group["keys"],
+        json!([{ "key": { "emoji": "👍" }, "count": 1 }])
+    );
+    assert!(dave.rx.seq_faults.is_empty(), "{:?}", dave.rx.seq_faults);
+}
+
+/// Past its sender's window, a reaction the recipient makes on the row
+/// it kept is told to its own other session and to none of the
+/// sender's, whose `reactions` shows none of it.
+#[tokio::test]
+async fn a_recipients_late_reaction_is_not_told_to_the_sender() {
+    let td = tempfile::tempdir().unwrap();
+    let limits = RequestLimits::default();
+    let (addr, core) = start_core(td.path(), ReactionPolicy::default(), limits, true).await;
+    let policy = InboxPolicy::default();
+    let day = Duration::from_secs(24 * 3600);
+    let (mut alice, _) = login(addr, "alice", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut other, _) = login(addr, "dave", true).await;
+    let pm = sent(&mut alice, "dave").await;
+    core.clock().advance(policy.retain_unread - day);
+    read(&mut dave, &pm).await;
+    core.clock().advance(day + Duration::from_secs(2));
+    core.prune_inbox();
+    pm_react(&mut dave, &pm, "🔥").await;
+    assert_eq!(changed(&mut other, &pm).await.1["mine"], json!([0]));
+    hears_no_reactions(&mut alice).await;
+    assert_eq!(
+        ok(&mut alice, "reactions", json!({ "targets": [pm] })).await,
+        json!({ "reactions": [{ "target": pm, "keys": [] }] })
+    );
 }

@@ -2480,6 +2480,7 @@ impl Core {
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
                 im: None,
+                reactions: None,
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -2568,6 +2569,7 @@ impl Core {
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
                 im: None,
+                reactions: None,
             };
             for uid in uids {
                 r.send_to(uid, ev.clone());
@@ -2805,9 +2807,14 @@ impl Core {
     /// session that speaks the friend family is handed a friend's
     /// instant messages at its roster read instead, and what an approval
     /// carries waits for a session that understands requests where the
-    /// account ever took them (`docs/instant-messaging.md` §5, §4.6).
-    fn flush_reads(&self, target: &Target, mailbox: &Mailbox) -> Vec<(Uid, crate::inbox::Pending)> {
-        let sessions: Vec<(Uid, bool, bool)> = {
+    /// account ever took them (`docs/instant-messaging.md` §5, §4.6),
+    /// and whether it hears stored messages' reactions.
+    fn flush_reads(
+        &self,
+        target: &Target,
+        mailbox: &Mailbox,
+    ) -> Vec<(Uid, crate::inbox::Pending, bool)> {
+        let sessions: Vec<(Uid, bool, bool, bool)> = {
             let r = self.roster.lock().unwrap();
             let uids = match target {
                 Target::Only(uid) => Some(*uid)
@@ -2827,6 +2834,7 @@ impl Core {
                         u,
                         crate::messaging::is_messenger(s),
                         crate::messaging::understands_requests(s),
+                        crate::reaction::pm_reader(s),
                     ))
                 })
                 .collect()
@@ -2836,7 +2844,7 @@ impl Core {
         let never_took = || *never_took.get_or_init(|| self.never_took_requests(mailbox));
         sessions
             .into_iter()
-            .map(|(uid, messenger, understands)| {
+            .map(|(uid, messenger, understands, reactions)| {
                 let which = if messenger && !understands && never_took() {
                     crate::inbox::Pending::MailApproved
                 } else if messenger {
@@ -2846,7 +2854,7 @@ impl Core {
                 } else {
                     crate::inbox::Pending::All
                 };
-                (uid, which)
+                (uid, which, reactions)
             })
             .collect()
     }
@@ -2939,7 +2947,7 @@ impl Core {
         // One read for each kind of session among them: on a server
         // without messaging, one read.
         let mut batches: Vec<(crate::inbox::Pending, Vec<StoredMessage>)> = Vec::new();
-        for (_, which) in &targets {
+        for (_, which, _) in &targets {
             if batches.iter().any(|(w, _)| w == which) {
                 continue;
             }
@@ -2971,6 +2979,38 @@ impl Core {
             handles.extend(self.media_states(batch));
         }
 
+        // Held from the read of the batch's reactions through its stamp,
+        // and taken no earlier: a reaction lands before the read and
+        // rides its `msg`, or after the stamp, where it finds the message
+        // delivered and is told after it (`docs/private-messages.md`
+        // §6.2).
+        let mut pms: Vec<MessageRef> = (batches.iter().flat_map(|(_, b)| b))
+            .filter(|m| m.kind == MessageKind::Message && m.friendship.is_none())
+            .map(|m| m.reference)
+            .collect();
+        pms.sort_unstable();
+        pms.dedup();
+        let hearing =
+            self.reaction_policy().is_some() && !pms.is_empty() && targets.iter().any(|t| t.2);
+        let reacting = hearing.then(|| self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner()));
+        // A read that fails leaves every private message of the batch
+        // unstamped, as a failed stamp does: any of them may have
+        // reactions its `msg` went without, and the next flush hands it
+        // over again with them, delivered twice rather than without.
+        let (reactions, unstamped) = match hearing {
+            true => match store.message_reactions(&pms, mailbox, self.pm_open_since(), None) {
+                Ok(reactions) => (reactions, HashSet::new()),
+                Err(e) => {
+                    warn!("inbox: reading reactions for {}: {e}", mailbox.login);
+                    let ids = (batches.iter().flat_map(|(_, b)| b))
+                        .filter(|m| pms.contains(&m.reference))
+                        .map(|m| m.id);
+                    (HashMap::new(), ids.collect())
+                }
+            },
+            false => (HashMap::new(), HashSet::new()),
+        };
+
         let mut delivered = Vec::new();
         // Handed to a session that can say it has read them, so it is
         // left to say so: a row is read on delivery only when every
@@ -2983,7 +3023,7 @@ impl Core {
         };
         {
             let mut r = self.roster.lock().unwrap();
-            for (uid, which) in targets {
+            for (uid, which, _) in targets {
                 // Only an attached session receives, and the lock was let
                 // go for the read. A detached one leaves its mail pending
                 // rather than filling an outbox buffer that is bounded and
@@ -3012,6 +3052,7 @@ impl Core {
                 // be handed them as IMs, so it is handed them as mail.
                 let approvals = which == crate::inbox::Pending::MailApproved
                     && !crate::messaging::understands_requests(s);
+                let hears = crate::reaction::pm_reader(s);
                 for m in batch {
                     if messenger && m.friendship.is_some() && !approvals {
                         continue;
@@ -3057,6 +3098,9 @@ impl Core {
                             im: matches!(m.friendship, Some(SentOn::Relation(_)))
                                 .then(|| m.guid.clone())
                                 .flatten(),
+                            reactions: (reactions.get(&m.reference))
+                                .filter(|_| hears)
+                                .map(|(shown, _)| Box::new(shown.clone())),
                         },
                     );
                     if !delivered.contains(&m.id) {
@@ -3077,8 +3121,9 @@ impl Core {
         // task", and a socket that dies before the bytes go out loses
         // them for good — there is no resume on that wire. See
         // `docs/private-messages.md` §11.)
-        let (left_unread, read): (Vec<MessageId>, Vec<MessageId>) =
-            delivered.iter().partition(|id| unread.contains(id));
+        let (left_unread, read): (Vec<MessageId>, Vec<MessageId>) = (delivered.iter())
+            .filter(|id| !unstamped.contains(id))
+            .partition(|id| unread.contains(id));
         for (ids, what) in [(read, Delivery::Read), (left_unread, Delivery::Delivered)] {
             if ids.is_empty() {
                 continue;
@@ -3087,6 +3132,7 @@ impl Core {
                 warn!("inbox: marking {} messages delivered: {e}", ids.len());
             }
         }
+        drop(reacting);
 
         // The cap is for the legacy wire, where each private message opens
         // a window. What it leaves behind is still there — say so, in the
@@ -3339,8 +3385,9 @@ impl Core {
                     warn!("inbox: claiming {login}'s mail: {e}");
                     0
                 });
-                if let Err(e) = store.rekey_message_reactions(&Mailbox::login(login), &claimed) {
-                    warn!("inbox: moving {login}'s reactions: {e}");
+                match store.rekey_message_reactions(&Mailbox::login(login), &claimed) {
+                    Ok(lost) => self.pm_announce(&lost),
+                    Err(e) => warn!("inbox: moving {login}'s reactions: {e}"),
                 }
                 moved
             }
@@ -7057,6 +7104,10 @@ pub(crate) mod inbox_tests {
         /// Run as a rekey of reactions starts: after a claim or a
         /// rotation has moved the mail, before its reactions follow.
         pub(crate) during_move: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Run as a flush stamps what it handed over, before the stamp.
+        pub(crate) during_stamp: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// The next read of stored messages' reactions fails.
+        pub(crate) fail_reactions: Mutex<bool>,
     }
 
     impl RacyStore {
@@ -7069,6 +7120,8 @@ pub(crate) mod inbox_tests {
                 inner,
                 during_push: Mutex::new(None),
                 during_move: Mutex::new(None),
+                during_stamp: Mutex::new(None),
+                fail_reactions: Mutex::new(false),
             }
         }
     }
@@ -7129,6 +7182,9 @@ pub(crate) mod inbox_tests {
             at: std::time::SystemTime,
             what: Delivery,
         ) -> Result<(), StoreError> {
+            if let Some(f) = self.during_stamp.lock().unwrap().take() {
+                f();
+            }
             self.inner.mark_delivered(ids, at, what)
         }
         fn mark_read(
@@ -7257,6 +7313,9 @@ pub(crate) mod inbox_tests {
             key: Option<&crate::ReactionKey>,
         ) -> Result<HashMap<crate::inbox::MessageRef, (crate::Reactions, Vec<String>)>, StoreError>
         {
+            if std::mem::take(&mut *self.fail_reactions.lock().unwrap()) {
+                return Err(StoreError("no reactions".into()));
+            }
             self.inner.message_reactions(refs, reader, open_since, key)
         }
         fn message_reaction_states(
