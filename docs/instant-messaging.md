@@ -833,8 +833,9 @@ it. In brief:
   804, 809, 811, 812 and 813;
 - an instant message is sent as a `msg` by `to_login`, which §4.1
   routes, answered for a request `{ "queued": true, "requested": true }`
-  (§4.2), with its new refusals `not_friends`, `request_full` and
-  `roster_full`, and `quota_exceeded` and `no_such_user` as they are;
+  (§4.2) and for an instant message with `im: true` and its `guid`,
+  with its new refusals `not_friends`, `request_full` and `roster_full`,
+  and `quota_exceeded` and `no_such_user` as they are;
 - `requests` `{ cursor? }`, `request_answer` `{ login, action }` and
   `requests_clear` `{ since?, before? }` (§4.3), with the event
   `requests_changed` `{ count }` to sessions that understand requests.

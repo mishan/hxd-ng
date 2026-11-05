@@ -62,6 +62,8 @@ impl Server {
     }
 }
 
+const MAX_IM: usize = 64;
+
 /// Both frontends on one core keeping mail and relationships in SQLite,
 /// with messaging on unless `messaging` is false. `zed` has no
 /// `AccessMessaging`; everyone else has it.
@@ -95,6 +97,8 @@ async fn start(dir: &Path, messaging: bool) -> Server {
         .with_messaging(MessagingPolicy {
             enabled: messaging,
             presence_debounce: Duration::from_millis(50),
+            // Under the wire's own cap, so a text can be too long for one.
+            max_message_bytes: MAX_IM,
             ..MessagingPolicy::default()
         });
     let core = Arc::new(core);
@@ -340,7 +344,8 @@ async fn an_instant_message_sent_while_away_arrives_at_the_roster_read() {
         json!({ "to_login": "bob", "text": "while you were out", "guid": guid(2) }),
     )
     .await;
-    assert_eq!(sent["queued"], true);
+    assert_eq!((&sent["queued"], &sent["im"]), (&json!(true), &json!(true)));
+    assert_eq!(sent["guid"], guid(2));
     assert!(sent["ref"].is_string());
 
     let (mut bob, _) = messenger(&s, "bob").await;
@@ -351,6 +356,29 @@ async fn an_instant_message_sent_while_away_arrives_at_the_roster_read() {
     assert_eq!(im["ref"], sent["ref"]);
     // Handed over as an instant message alone, never as mail too.
     assert!(!bob.rx.take_backlog().iter().any(|e| e.ev == "msg"));
+
+    // `im` is what tells the sender to react to its own line as an
+    // instant message rather than as a `pm`.
+    let long = "x".repeat(MAX_IM + 1);
+    for (to, text, queued, im) in [
+        ("bob", "welcome back", false, Some(true)),
+        ("bob", long.as_str(), false, None),
+        ("zed", "not a messenger", true, None),
+    ] {
+        let sent = ok(&mut alice, "msg", json!({ "to_login": to, "text": text })).await;
+        assert_eq!(sent["queued"], queued, "{to}: {text:.12}");
+        assert_eq!(
+            sent.get("im"),
+            im.map(Value::from).as_ref(),
+            "{to}: {text:.12}"
+        );
+        // Sent without one, so the server's is what names it.
+        if im.is_some() {
+            let heard = event(&mut bob, "im", |d| d["text"] == text).await;
+            assert!(heard["guid"].is_string());
+            assert_eq!(sent["guid"], heard["guid"]);
+        }
+    }
 }
 
 /// A session not handed instant messages reads one as mail, which says

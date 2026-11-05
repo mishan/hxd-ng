@@ -542,12 +542,16 @@ impl Core {
             return "error: that is me".into();
         }
         match self.msg_login(from, who, body, None, None) {
-            Ok(crate::MsgOutcome::Delivered(_)) => "ok: sent".into(),
+            Ok(crate::MsgOutcome::Delivered(_) | crate::MsgOutcome::Im { queued: false, .. }) => {
+                "ok: sent".into()
+            }
             // A request is answered as a queued message is, so nothing
             // here tells it apart (`docs/instant-messaging.md` §4.2).
-            Ok(crate::MsgOutcome::Queued { .. } | crate::MsgOutcome::Requested) => {
-                "ok: queued".into()
-            }
+            Ok(
+                crate::MsgOutcome::Queued { .. }
+                | crate::MsgOutcome::Im { queued: true, .. }
+                | crate::MsgOutcome::Requested,
+            ) => "ok: queued".into(),
             Err(crate::ChatError::NoSuchUser) => "error: no such account".into(),
             Err(crate::ChatError::Blocked) => "ok: sent".into(),
             Err(crate::ChatError::MailboxFull) => "error: that mailbox is full".into(),

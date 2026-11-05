@@ -1402,7 +1402,7 @@ fn a_message_by_login_to_a_friend_is_an_instant_message() {
     assert!(matches!(
         s.core
             .msg_login(plain, "bob", "by login".into(), None, None),
-        Ok(crate::MsgOutcome::Delivered(_))
+        Ok(crate::MsgOutcome::Im { queued: false, .. })
     ));
     assert_eq!(ims(&drain(&mut rb)), [("by login".into(), false)]);
     s.core
@@ -1412,6 +1412,19 @@ fn a_message_by_login_to_a_friend_is_an_instant_message() {
         msgs(&drain(&mut rc)),
         ["outside messaging"],
         "an account outside messaging is sent a private message as before"
+    );
+
+    // A guid that already named a private message names that message.
+    let g = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000031").unwrap();
+    let (bob_plain, _rbp) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.4");
+    let pm = s
+        .core
+        .msg(plain, bob_plain, "as mail".into(), Some(g.clone()), None);
+    assert!(matches!(pm, Ok(crate::MsgOutcome::Delivered(Some(_)))));
+    assert_eq!(
+        s.core
+            .msg_login(plain, "bob", "as mail".into(), Some(g), None),
+        pm
     );
 }
 
@@ -1774,12 +1787,12 @@ fn an_approved_conversation_shows_less_than_a_friendship() {
     // Every send is answered as queued, both ways.
     assert!(matches!(
         send(&s.core, a, "bob", "thanks"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     assert_eq!(ims(&drain(&mut rb)), [("thanks".into(), false)]);
     assert!(matches!(
         send(&s.core, b, "alice", "sure"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     let sure = drain(&mut ra)
         .into_iter()
@@ -1817,7 +1830,7 @@ fn writing_back_approves_and_a_friendship_takes_what_waited() {
     drain(&mut rb);
     assert!(matches!(
         send(&s.core, b, "alice", "hi alice"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     assert_eq!(ims(&drain(&mut rb)), [("hi bob".into(), true)]);
     assert_eq!(ims(&drain(&mut ra)), [("hi alice".into(), false)]);
@@ -1916,7 +1929,7 @@ fn a_classic_party_is_sent_an_approval_as_private_messages() {
         let mut second_rx = (case == "attached family").then(|| family(&s.core, "plain").1);
         assert!(matches!(
             send(&s.core, b, "plain", "welcome"),
-            Ok(crate::MsgOutcome::Queued(_))
+            Ok(crate::MsgOutcome::Im { queued: true, .. })
         ));
         let mut heard = drain(&mut rp);
         if let Some(rx) = family_rx.as_mut() {
@@ -2000,10 +2013,13 @@ fn a_retry_under_an_approval_is_answered_queued() {
         s.core
             .msg_login(a, "bob", "again".into(), Some(g.clone()), None)
     };
-    assert!(matches!(send_g(), Ok(crate::MsgOutcome::Queued(_))));
+    assert!(matches!(
+        send_g(),
+        Ok(crate::MsgOutcome::Im { queued: true, .. })
+    ));
     s.core.im_ack(b, "alice", &g, true).unwrap();
     assert!(
-        matches!(send_g(), Ok(crate::MsgOutcome::Queued(_))),
+        matches!(send_g(), Ok(crate::MsgOutcome::Im { queued: true, .. })),
         "a retry of one read is answered as queued too"
     );
 }
@@ -2475,7 +2491,7 @@ fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
     );
     assert!(matches!(
         send(&s.core, d, "bob", "thanks"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     assert_eq!(
         ims(&drain(&mut rb)),
@@ -2484,7 +2500,7 @@ fn an_opt_out_switches_the_account_off_and_the_session_still_understands() {
     );
     assert!(matches!(
         send(&s.core, b, "dave", "welcome"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     let welcome = drain(&mut rd)
         .into_iter()
@@ -2768,7 +2784,7 @@ fn a_released_request_counts_once_toward_the_daily_quota() {
         .unwrap();
     assert!(matches!(
         send(&s.core, a, "bob", "thanks"),
-        Ok(MsgOutcome::Queued(_))
+        Ok(MsgOutcome::Im { queued: true, .. })
     ));
     assert_eq!(
         send(&s.core, a, "bob", "and another"),

@@ -465,7 +465,8 @@ belong to the `inbox` capability (§4).
   to a live session. `ref` is present whenever the message was stored,
   queued or not: the stored message's reference, an opaque string, as
   the recipient's `msg` event and `inbox` row carry it (rationale §5).
-  It is the one name sender and recipient share for the message.
+  It is the one name sender and recipient share for the message. By
+  `to_login` it may also carry `requested`, or `im` and `guid` (§7.5).
 - **The `msg` event** carries `from` (`{ uid, nick, login? }`), `text`,
   `at`, `queued` and, when the message was stored, `id` and `ref`; for
   an instant message handed over as mail, also `im: true` and its
@@ -673,7 +674,7 @@ family document. Each family of §4 adds its own.
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?`, `re?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
@@ -1134,10 +1135,13 @@ bound of instant-messaging.md §4.4 and `no_such_user` for an account
 that has blocked the sender. A request carries text alone: one with
 `media` is `not_friends`. A message to a friend whose text is longer
 than `max_message_bytes`, or that carries `media`, is a private
-message, as before. A sender SHOULD send a `guid`: receipts name the
-message by it. A `msg` to an attached friend is answered `queued:
-false` whatever the friend's state, `invisible` included, as the
-extension has it.
+message, as before. The reply to one that went as an instant message,
+handed over or `queued`, carries `im: true` and the message's `guid`,
+the one it was sent with or the server's own, which is what names it
+as an `im` target for `re` and `react` (§7.3) rather than a `pm`. A
+sender SHOULD send a `guid`: receipts name the message by it. A `msg`
+to an attached friend is answered `queued: false` whatever the
+friend's state, `invisible` included, as the extension has it.
 
 **Receiving.** A friend's instant message reaches every attached
 session of the recipient's that speaks the family as an `im` event,
