@@ -2315,15 +2315,24 @@ fn rows_of(on: &[(MessageRef, Vec<u8>, String)], r: MessageRef) -> Vec<(&[u8], &
         .collect()
 }
 
+/// The most refs [`states_in`] binds to one statement: far inside
+/// SQLite's limit on binds, however many a purge hands it, and few
+/// enough that matching a chunk's reactions to its messages stays cheap.
+const STATES_AT_ONCE: usize = 100;
+
 /// The state of each of `refs` a row or stub holds, in the order asked.
 fn states_in(conn: &Connection, refs: &[MessageRef]) -> Result<Vec<MessageState>, StoreError> {
-    let on = reactions_on(conn, refs)?;
-    let mut states: Vec<MessageState> = (held_in(conn, refs)?.into_iter())
-        .map(|(r, parties, sent_at, _, delivered)| {
-            MessageState::of(r, parties, sent_at, delivered, &rows_of(&on, r))
-        })
-        .collect();
-    states.sort_by_key(|s| refs.iter().position(|r| *r == s.reference));
+    let mut states = Vec::new();
+    for refs in refs.chunks(STATES_AT_ONCE) {
+        let on = reactions_on(conn, refs)?;
+        let mut chunk: Vec<MessageState> = (held_in(conn, refs)?.into_iter())
+            .map(|(r, parties, sent_at, row, delivered)| {
+                MessageState::of(r, parties, sent_at, delivered, row, &rows_of(&on, r))
+            })
+            .collect();
+        chunk.sort_by_key(|s| refs.iter().position(|r| *r == s.reference));
+        states.extend(chunk);
+    }
     Ok(states)
 }
 
@@ -4503,6 +4512,64 @@ mod tests {
                 relationships: store,
             }
         });
+    }
+
+    /// A purge can hand `message_reaction_states` every message one
+    /// account ever reacted to: more refs than SQLite binds to one
+    /// statement are read all the same, in the order asked.
+    #[test]
+    fn message_reaction_states_reads_more_refs_than_one_statement_binds() {
+        let s = SqliteStore::in_memory().unwrap();
+        let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+        let push = || {
+            let m = NewMessage {
+                recipient: dave.clone(),
+                sender: Some(alice.clone()),
+                sender_nick: "alice".into(),
+                body: "hi".into(),
+                sent_at: UNIX_EPOCH,
+                guid: None,
+                kind: MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship: None,
+                sender_address: None,
+                re: None,
+            };
+            match s.push(&m, usize::MAX).unwrap() {
+                Pushed::Stored { reference, .. } => reference,
+                other => panic!("not stored: {other:?}"),
+            }
+        };
+        let (first, last) = (push(), push());
+        let thumbs = ReactionKey::emoji("👍").unwrap();
+        s.react_message(&MessageReactAct {
+            reference: last,
+            who: &alice,
+            nick: "alice",
+            key: &thumbs,
+            add: true,
+            at: UNIX_EPOCH,
+            open_since: UNIX_EPOCH,
+            max_keys: 8,
+            max_per_user: 8,
+        })
+        .unwrap();
+        // Past SQLite's default limit of 32766 binds a statement.
+        let mut refs: Vec<MessageRef> = (0..40_000u32)
+            .map(|n| {
+                let mut r = [0xff; 16];
+                r[..4].copy_from_slice(&n.to_be_bytes());
+                r
+            })
+            .collect();
+        refs.insert(0, last);
+        refs.push(first);
+        let states = s.message_reaction_states(&refs).unwrap();
+        let read: Vec<_> = (states.iter())
+            .map(|m| (m.reference, m.keys.clone()))
+            .collect();
+        assert_eq!(read, [(last, vec![(thumbs, 1)]), (first, vec![])]);
     }
 
     #[test]

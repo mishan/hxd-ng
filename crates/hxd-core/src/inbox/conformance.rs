@@ -2211,6 +2211,7 @@ fn a_message_reaction_adds_removes_and_holds(s: &dyn MessageStore) {
             sender: Some(alice.clone()),
             sent_at: at(0),
             delivered: false,
+            row: true,
             keys: vec![(key("👍"), 1)],
             held: vec![("l:alice".into(), key("👍"))],
         },
@@ -2390,6 +2391,7 @@ fn a_stubs_reactions_last_until_the_window_ends(s: &dyn MessageStore) {
     assert_eq!(shown(s, r, &dave, 300), shows(&all, &[1]), "{case}");
     let states = s.message_reaction_states(&[r]).unwrap();
     assert!(states[0].delivered, "{case}: a stub answers as delivered");
+    assert!(!states[0].row, "{case}");
     prune_at(s, 600);
     assert!(
         s.message_reaction_states(&[r]).unwrap().is_empty(),

@@ -972,9 +972,12 @@ family document. Each family of §4 adds its own.
     about; and once one session is handed the message the account's
     others are told, which a client holding no message by that `ref`
     ignores. A link or a rotation that folds one key's reactions into
-    another's tells the messages that lost one the same way, the most
-    recent alone (*hxd-ng:* `[reactions] live_window` of them, fifty to
-    an event); a client reads the rest with `reactions` or `inbox`.
+    another's, and a moderator's purge of a person's, tell the messages
+    that lost one the same way, the most recent alone (*hxd-ng:*
+    `[reactions] live_window` of them, fifty to an event); a client
+    reads the rest with `reactions` or `inbox`. An account's deletion
+    tells nobody: it deletes every message the account was party to,
+    and their reactions with them.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
   at, read, media?, signed?, re?, im?, guid?, reactions?,

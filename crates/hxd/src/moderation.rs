@@ -240,9 +240,10 @@ fn operator_core(config: &Config, read_only: bool) -> Result<Core, String> {
     } else {
         crate::open_sqlite(&path, Synchronous::Normal)?
     };
-    let core = Core::new().with_accounts(Arc::new(
+    let accounts = Arc::new(
         hxd_auth_file::FileAuth::new(&config.paths.accounts).with_roles(&config.roles.file)?,
-    ));
+    );
+    let core = Core::new().with_accounts(accounts.clone());
     // Only what shares the trail's file is reachable here: a `[news]`
     // with a database of its own keeps its articles where this cannot
     // see them, and a purge says what it took rather than guessing.
@@ -266,6 +267,11 @@ fn operator_core(config: &Config, read_only: bool) -> Result<Core, String> {
     let core = match config.news.as_ref() {
         Some(n) if here(&n.db) => core.with_news(store.clone(), n.to_policy()),
         _ => core,
+    };
+    // The trail's file is `[inbox]`'s wherever there is one (`db`).
+    let core = match config.inbox.as_ref() {
+        Some(i) => core.with_inbox(store.clone(), accounts, i.policy()),
+        None => core,
     };
     Ok(core.with_moderation(store, policy(config)))
 }
@@ -652,5 +658,64 @@ mod tests {
         }
         assert!(parse_since("soon").unwrap_err().starts_with("--since "));
         assert!(parse_since("all").is_ok());
+    }
+
+    /// `hxd purge` from a process of its own takes the reactions the
+    /// person made on stored messages in `[inbox]`'s file, the trail's.
+    #[cfg(feature = "inbox")]
+    #[test]
+    fn an_operators_purge_reaches_the_inbox_on_its_file() {
+        use hxd_core::inbox::{Mailbox, MessageKind, MessageStore, NewMessage, Pushed};
+        use hxd_core::reaction::{MessageReactAct, ReactionKey};
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = toml::from_str("[inbox]\ndb = \"placeholder\"\n").unwrap();
+        cfg.inbox.as_mut().unwrap().db = dir.path().join("hx.db");
+        cfg.paths.accounts = dir.path().join("accounts");
+        let store = hxd_store_sqlite::SqliteStore::open(
+            &cfg.inbox.as_ref().unwrap().db,
+            hxd_store_sqlite::Synchronous::Normal,
+        )
+        .unwrap();
+        let (alice, dave) = (Mailbox::login("alice"), Mailbox::login("dave"));
+        let now = SystemTime::now();
+        let sent = NewMessage {
+            recipient: dave.clone(),
+            sender: Some(alice.clone()),
+            sender_nick: "alice".into(),
+            body: "hi".into(),
+            sent_at: now,
+            guid: None,
+            kind: MessageKind::Message,
+            media: None,
+            signed: None,
+            friendship: None,
+            sender_address: None,
+            re: None,
+        };
+        let Pushed::Stored { reference, .. } = store.push(&sent, usize::MAX).unwrap() else {
+            panic!("stored");
+        };
+        for (who, emoji) in [(&alice, "👍"), (&dave, "🎉")] {
+            store
+                .react_message(&MessageReactAct {
+                    reference,
+                    who,
+                    nick: &who.login,
+                    key: &ReactionKey::emoji(emoji).unwrap(),
+                    add: true,
+                    at: now,
+                    open_since: SystemTime::UNIX_EPOCH,
+                    max_keys: 8,
+                    max_per_user: 8,
+                })
+                .unwrap();
+        }
+        let hour = Duration::from_secs(3600);
+        purge(&cfg, "alice", None, hour, "spam", false).unwrap();
+        let states = store.message_reaction_states(&[reference]).unwrap();
+        let left: Vec<_> = states[0].held.iter().map(|(who, _)| who.as_str()).collect();
+        assert_eq!(left, ["l:dave"]);
     }
 }

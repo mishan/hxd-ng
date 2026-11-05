@@ -105,12 +105,13 @@ impl Inner {
     }
 
     fn state(&self, r: &MessageRef) -> Option<MessageState> {
-        let (parties, sent_at, _, delivered) = self.parties(r)?;
+        let (parties, sent_at, row, delivered) = self.parties(r)?;
         Some(MessageState::of(
             *r,
             parties,
             sent_at,
             delivered,
+            row,
             &self.rows(r),
         ))
     }
