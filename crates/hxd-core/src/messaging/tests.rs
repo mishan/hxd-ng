@@ -1426,6 +1426,24 @@ fn a_message_by_login_to_a_friend_is_an_instant_message() {
             .msg_login(plain, "bob", "as mail".into(), Some(g), None),
         pm
     );
+
+    // And one that waited is handed over by its retry.
+    s.core.end_session(b);
+    s.core.end_session(bob_plain);
+    let g = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000032").unwrap();
+    let long = "x".repeat(policy().max_message_bytes + 1);
+    let Ok(crate::MsgOutcome::Queued(r)) =
+        s.core.msg_login(plain, "bob", long, Some(g.clone()), None)
+    else {
+        panic!("too long for an instant message, it waits as mail");
+    };
+    let (_, mut rbp) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.4");
+    assert_eq!(
+        s.core
+            .msg_login(plain, "bob", "again".into(), Some(g), None),
+        Ok(crate::MsgOutcome::Delivered(Some(r)))
+    );
+    assert_eq!(msgs(&drain(&mut rbp)).len(), 1);
 }
 
 #[derive(Default)]

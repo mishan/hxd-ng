@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use super::im::understands_requests;
 use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
-use crate::inbox::{Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
+use crate::inbox::{Found, Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
 use crate::relationships::{AccountUpdate, LedgerEntry, Recorded, RequestKind, Requester, SentOn};
 use crate::reply::Reply;
 use crate::roster::{Event, Uid};
@@ -261,6 +261,15 @@ impl Core {
         if let_in {
             return None;
         }
+        // A retry of a private message stays one, which that path
+        // answers and hands over.
+        if let (Some(g), Ok(store)) = (guid, self.inbox_store()) {
+            match store.find_guid(&them, Some(&sending.mailbox), g) {
+                Ok(Some(Found::Row(m))) if m.friendship.is_none() => return None,
+                Ok(_) => {}
+                Err(e) => return Some(Err(chat_error(store_failed(e)))),
+            }
+        }
         // An image, or text too long for an instant message, goes to a
         // friend as a private message, as it always has, and is no
         // stranger's first contact.
@@ -376,14 +385,10 @@ impl Core {
                 signed.clone(),
                 re.clone(),
             )
-            .map(|sent| match (sent.im, sent.delivered, sent.reference) {
-                (true, delivered, reference) => MsgOutcome::Im {
-                    queued: !delivered && reference.is_some(),
-                    reference,
-                    guid: sent.guid,
-                },
-                (false, false, Some(r)) => MsgOutcome::Queued(r),
-                (false, _, r) => MsgOutcome::Delivered(r),
+            .map(|sent| MsgOutcome::Im {
+                queued: !sent.delivered && sent.reference.is_some(),
+                reference: sent.reference,
+                guid: sent.guid,
             })
         };
         if let Some(id) = friend {

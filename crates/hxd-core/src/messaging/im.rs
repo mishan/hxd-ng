@@ -67,8 +67,6 @@ pub struct ImSent {
     pub reference: Option<MessageRef>,
     pub guid: MessageGuid,
     pub delivered: bool,
-    /// `false` for a private message already sent under the guid.
-    pub im: bool,
 }
 
 /// A fresh guid for a message sent without one, since 811 requires
@@ -362,7 +360,6 @@ impl Core {
                 reference: None,
                 guid,
                 delivered: true,
-                im: true,
             });
         }
         // Held from the write to this send's own hand-over, so no roster
@@ -402,16 +399,6 @@ impl Core {
             Pushed::Pruned { signed, .. } if content.is_some() && signed != content => {
                 return Err(MessagingError::Equivocation)
             }
-            // The guid already named a private message, which this is a
-            // retry of, not an instant message.
-            Pushed::Existing(m) if m.friendship.is_none() => {
-                return Ok(ImSent {
-                    reference: Some(m.reference),
-                    guid,
-                    delivered: m.delivered_at.is_some(),
-                    im: false,
-                })
-            }
             // A retry is that message, answered as of now, and an
             // approval's as queued whatever became of it.
             Pushed::Existing(m) if m.delivered_at.is_some() => {
@@ -419,7 +406,6 @@ impl Core {
                     reference: Some(m.reference),
                     guid,
                     delivered: !approval,
-                    im: true,
                 })
             }
             Pushed::Existing(m) => (m.id, m.reference, m.cursor, false),
@@ -430,7 +416,6 @@ impl Core {
                     reference: Some(reference),
                     guid,
                     delivered: !approval,
-                    im: true,
                 })
             }
             Pushed::Full => return Err(MessagingError::QueueFull),
@@ -447,7 +432,6 @@ impl Core {
             reference: Some(reference),
             guid,
             delivered,
-            im: true,
         })
     }
 
