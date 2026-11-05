@@ -1437,13 +1437,30 @@ fn a_message_by_login_to_a_friend_is_an_instant_message() {
     else {
         panic!("too long for an instant message, it waits as mail");
     };
-    let (_, mut rbp) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.4");
+    let (bp, mut rbp) = attach_as(&s.core, "bob", messaging_bits(), "10.0.0.4");
+    assert_eq!(
+        s.core
+            .msg_login(plain, "bob", "again".into(), Some(g.clone()), None),
+        Ok(crate::MsgOutcome::Delivered(Some(r)))
+    );
+    let handed = drain(&mut rbp);
+    assert_eq!(msgs(&handed).len(), 1);
+
+    // Read and pruned to its stub, it is still a private message.
+    let cursor = handed.iter().find_map(|e| match e {
+        Event::Msg { cursor, .. } => *cursor,
+        _ => None,
+    });
+    s.core.inbox_mark_read(bp, cursor.unwrap()).unwrap();
+    s.core
+        .clock
+        .advance(InboxPolicy::default().retain_read + Duration::from_secs(1));
+    assert!(s.core.prune_inbox() > 0);
     assert_eq!(
         s.core
             .msg_login(plain, "bob", "again".into(), Some(g), None),
         Ok(crate::MsgOutcome::Delivered(Some(r)))
     );
-    assert_eq!(msgs(&drain(&mut rbp)).len(), 1);
 }
 
 #[derive(Default)]
