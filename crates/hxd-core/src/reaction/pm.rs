@@ -962,6 +962,29 @@ mod tests {
         assert!(!early);
     }
 
+    /// A flush that could not read its messages' reactions hands them
+    /// over without them and leaves them waiting, so the next flush
+    /// hands them over again carrying them.
+    #[test]
+    fn a_message_whose_reactions_could_not_be_read_is_handed_over_again() {
+        let racy = Arc::new(RacyStore::over(MemoryStore::new()));
+        let mut s = server_on(racy.clone(), ReactionPolicy::default());
+        let r = s.queued();
+        s.react(s.alice, r, "👍");
+        *racy.fail_reactions.lock().unwrap() = true;
+        s.core.flush_mailbox(&dave());
+        assert_eq!(s.inbox.pending_count(&dave()).unwrap(), 1);
+        s.heard("dave");
+        s.core.flush_mailbox(&dave());
+        let msgs: Vec<_> = (s.heard("dave").into_iter())
+            .filter_map(|e| match e {
+                Event::Msg { reactions, .. } => Some(reactions.map(|r| r.keys)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs, [Some(vec![(thumbs(), 1)])]);
+    }
+
     /// Who hears a message's reactions is who may read them: never a
     /// guest on the shared guest mailbox, nor an identity guest on the
     /// mail it sent, though the store counts both as parties.

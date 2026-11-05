@@ -2993,14 +2993,22 @@ impl Core {
         let hearing =
             self.reaction_policy().is_some() && !pms.is_empty() && targets.iter().any(|t| t.2);
         let reacting = hearing.then(|| self.pm_reacting.lock().unwrap_or_else(|e| e.into_inner()));
-        let reactions = match hearing {
-            true => store
-                .message_reactions(&pms, mailbox, self.pm_open_since(), None)
-                .unwrap_or_else(|e| {
+        // A read that fails leaves every private message of the batch
+        // unstamped, as a failed stamp does: any of them may have
+        // reactions its `msg` went without, and the next flush hands it
+        // over again with them, delivered twice rather than without.
+        let (reactions, unstamped) = match hearing {
+            true => match store.message_reactions(&pms, mailbox, self.pm_open_since(), None) {
+                Ok(reactions) => (reactions, HashSet::new()),
+                Err(e) => {
                     warn!("inbox: reading reactions for {}: {e}", mailbox.login);
-                    HashMap::new()
-                }),
-            false => HashMap::new(),
+                    let ids = (batches.iter().flat_map(|(_, b)| b))
+                        .filter(|m| pms.contains(&m.reference))
+                        .map(|m| m.id);
+                    (HashMap::new(), ids.collect())
+                }
+            },
+            false => (HashMap::new(), HashSet::new()),
         };
 
         let mut delivered = Vec::new();
@@ -3113,8 +3121,9 @@ impl Core {
         // task", and a socket that dies before the bytes go out loses
         // them for good — there is no resume on that wire. See
         // `docs/private-messages.md` §11.)
-        let (left_unread, read): (Vec<MessageId>, Vec<MessageId>) =
-            delivered.iter().partition(|id| unread.contains(id));
+        let (left_unread, read): (Vec<MessageId>, Vec<MessageId>) = (delivered.iter())
+            .filter(|id| !unstamped.contains(id))
+            .partition(|id| unread.contains(id));
         for (ids, what) in [(read, Delivery::Read), (left_unread, Delivery::Delivered)] {
             if ids.is_empty() {
                 continue;
@@ -7097,6 +7106,8 @@ pub(crate) mod inbox_tests {
         pub(crate) during_move: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// Run as a flush stamps what it handed over, before the stamp.
         pub(crate) during_stamp: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// The next read of stored messages' reactions fails.
+        pub(crate) fail_reactions: Mutex<bool>,
     }
 
     impl RacyStore {
@@ -7110,6 +7121,7 @@ pub(crate) mod inbox_tests {
                 during_push: Mutex::new(None),
                 during_move: Mutex::new(None),
                 during_stamp: Mutex::new(None),
+                fail_reactions: Mutex::new(false),
             }
         }
     }
@@ -7301,6 +7313,9 @@ pub(crate) mod inbox_tests {
             key: Option<&crate::ReactionKey>,
         ) -> Result<HashMap<crate::inbox::MessageRef, (crate::Reactions, Vec<String>)>, StoreError>
         {
+            if std::mem::take(&mut *self.fail_reactions.lock().unwrap()) {
+                return Err(StoreError("no reactions".into()));
+            }
             self.inner.message_reactions(refs, reader, open_since, key)
         }
         fn message_reaction_states(

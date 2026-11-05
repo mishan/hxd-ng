@@ -533,7 +533,9 @@ flush that hands one to a session hearing reactions takes
 `pm_reacting`, the mutex stored messages' reactions change under, from
 its read of their reactions through its stamp, and no earlier: the
 reply addresses, image handles and pending reads come first. A reaction
-then rides the `msg` or is told after it. `flushing` is taken before
+then rides the `msg` or is told after it; a read that fails leaves the
+batch's private messages pending, to be handed over again with their
+reactions, as a stamp that fails does. `flushing` is taken before
 `pm_reacting`, and nothing holding `pm_reacting` takes `flushing`. The
 cost: such a flush, and the send that runs it, can wait behind one
 holder of the mutex, a reaction's write and its fan-out, a scan of
