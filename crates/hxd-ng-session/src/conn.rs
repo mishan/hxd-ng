@@ -2242,6 +2242,19 @@ async fn dispatch(
                     Ok(MsgOutcome::Queued(r)) => {
                         reply_ok(req.id, json!({ "queued": true, "ref": b64url(&r) }))
                     }
+                    // What names it as an `im` target for `re` and `react`
+                    // rather than a `pm` (§7.3).
+                    Ok(MsgOutcome::Im {
+                        queued,
+                        reference,
+                        guid,
+                    }) => {
+                        let mut ok = json!({ "queued": queued, "im": true, "guid": guid.as_str() });
+                        if let Some(r) = reference {
+                            ok["ref"] = json!(b64url(&r));
+                        }
+                        reply_ok(req.id, ok)
+                    }
                     // The one answer a request has (`docs/instant-messaging.md`
                     // §4.2).
                     Ok(MsgOutcome::Requested) => {

@@ -534,8 +534,12 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
         Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid)) {
             Ok(outcome) => {
                 let reason = match outcome {
-                    MsgOutcome::Delivered(_) => ReasonCode::Ok,
-                    MsgOutcome::Queued(_) => ReasonCode::OfflineQueued,
+                    MsgOutcome::Delivered(_) | MsgOutcome::Im { queued: false, .. } => {
+                        ReasonCode::Ok
+                    }
+                    MsgOutcome::Queued(_) | MsgOutcome::Im { queued: true, .. } => {
+                        ReasonCode::OfflineQueued
+                    }
                     MsgOutcome::Requested => ReasonCode::Requested,
                 };
                 Answer::ok(vec![reason_chunk(reason)])

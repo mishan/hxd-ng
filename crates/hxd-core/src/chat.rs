@@ -795,12 +795,20 @@ pub struct SignedMsg {
 
 /// What became of a private message, and the reference a stored one is
 /// named by, which the sender holds as the recipient does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MsgOutcome {
     /// Handed to a live connection; `None` when nothing was stored.
     Delivered(Option<MessageRef>),
     /// Stored for a recipient who wasn't there to take it.
     Queued(MessageRef),
+    /// An instant message (`docs/hotline-ng.md` §7.5): `queued` and
+    /// `reference` as `Queued` and `Delivered` carry them, and the guid
+    /// it went under.
+    Im {
+        queued: bool,
+        reference: Option<MessageRef>,
+        guid: MessageGuid,
+    },
     /// A message request (`docs/instant-messaging.md` §4.2), however it
     /// was stored, held or dropped.
     Requested,
