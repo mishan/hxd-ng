@@ -262,10 +262,13 @@ impl Core {
             return None;
         }
         // A retry of a private message stays one, which that path
-        // answers and hands over.
-        if let (Some(g), Ok(store)) = (guid, self.inbox_store()) {
+        // answers and hands over. Only a private message leaves a stub.
+        // Not a guest's, let in above or a request: that path would
+        // deliver its words live, unasked and without looking for them.
+        if let (false, Some(g), Ok(store)) = (sending.guest, guid, self.inbox_store()) {
             match store.find_guid(&them, Some(&sending.mailbox), g) {
                 Ok(Some(Found::Row(m))) if m.friendship.is_none() => return None,
+                Ok(Some(Found::Stub(_))) => return None,
                 Ok(_) => {}
                 Err(e) => return Some(Err(chat_error(store_failed(e)))),
             }
