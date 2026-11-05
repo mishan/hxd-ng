@@ -36,6 +36,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Full debug info more than doubles the target directory, past what a
+  # runner's disk holds; line tables keep a panic's backtrace readable.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   rust:
