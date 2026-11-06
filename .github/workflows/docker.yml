@@ -4,7 +4,8 @@
 # and that the image in relay mode carries /trtp to the server.
 # A push to main does the same and then publishes the image to GHCR as
 # `latest` and `sha-<commit>`; a pushed `v*` tag publishes it as the
-# version, `X.Y.Z` and `X.Y`, and `sha-<commit>`.
+# version, `X.Y.Z` and `X.Y`, and `sha-<commit>`, and once it is
+# published makes the tag's GitHub release from its CHANGELOG.md entry.
 #
 # Every pull request, not only those touching docker/: the image builds
 # the whole workspace, so a change anywhere can break it.
@@ -92,3 +93,30 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
+
+  # Its own job, so only this one may write to the repository, and only
+  # after the image it names is published.
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v h="## [$v]" '
+            /^## \[/ { p = index($0, h) == 1; next }
+            /^\[[^]]+\]: / { p = 0 }
+            p' CHANGELOG.md | sed '/./,$!d' > notes.md
+          if ! grep -q . notes.md; then
+            echo "CHANGELOG.md has no entry for $v" >&2
+            exit 1
+          fi
+          printf '\nImage: `ghcr.io/%s:%s`\n' "${GITHUB_REPOSITORY,,}" "$v" >> notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "hxd-ng $v" --notes-file notes.md

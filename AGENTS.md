@@ -751,7 +751,8 @@ added or renamed, a protocol change — and a patch release for fixes.
 The release PR bumps `crates/hxd/Cargo.toml` and adds the
 `CHANGELOG.md` entry, written for operators from the merge commits
 since the last tag. Once it merges, tag `vX.Y.Z` on main; the tag
-publishes the image as `X.Y.Z` and `X.Y`.
+publishes the image as `X.Y.Z` and `X.Y`, then makes the GitHub release
+from that `CHANGELOG.md` entry.
 
 ## Where things stand, and what's next
 
