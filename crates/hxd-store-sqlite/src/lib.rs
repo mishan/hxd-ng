@@ -5267,6 +5267,65 @@ mod tests {
         hxd_core::news::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    /// A timeline page reads each followed category's nearest threads,
+    /// so it costs the same however much older news those categories
+    /// hold. Counted in SQLite's own steps rather than timed.
+    #[test]
+    fn a_timeline_page_costs_the_same_however_deep_the_archive() {
+        use hxd_core::news::{NewNode, NewsStore, NodeKind, SubScope, TimelineQuery};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let steps = |old: usize| {
+            let store = SqliteStore::in_memory().unwrap();
+            let bob = Mailbox::login("bob");
+            let busy: Vec<_> = (0..2u8)
+                .map(|n| {
+                    let node = NewNode {
+                        parent: None,
+                        kind: NodeKind::Category,
+                        name: format!("busy {n}"),
+                        guid: [n; 16],
+                        at: UNIX_EPOCH,
+                    };
+                    store.create_node(&node, 16).unwrap().id
+                })
+                .collect();
+            for &c in &busy {
+                store
+                    .subscribe(&bob, SubScope::Category(c), 10, UNIX_EPOCH)
+                    .unwrap();
+            }
+            for n in 0..old + 20 {
+                news_post(&store, busy[n % 2], "s", "b", "Alice", Some("alice"));
+            }
+            let count = Arc::new(AtomicU64::new(0));
+            let counter = count.clone();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                )
+                .unwrap();
+            let q = TimelineQuery {
+                before: None,
+                after: None,
+                limit: 10,
+            };
+            assert_eq!(store.timeline(&bob, &q).unwrap().threads.len(), 10);
+            count.load(Ordering::Relaxed)
+        };
+        let (shallow, deep) = (steps(200), steps(2000));
+        assert!(
+            deep < shallow * 2,
+            "{shallow} steps over a shallow archive, {deep} over one ten times as deep"
+        );
+    }
+
     #[test]
     fn push_devices_pass_the_conformance_suite() {
         hxd_core::push::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));

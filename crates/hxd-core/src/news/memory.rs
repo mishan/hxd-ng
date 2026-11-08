@@ -15,7 +15,8 @@ use super::{
     Article, ArticleId, ArticlePage, Author, BodyType, FeedId, FeedListing, FeedPoll, FeedState,
     GuestKey, Hit, Listed, NewNode, NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId,
     NodeKind, Posted, Reference, SearchPage, SearchQuery, SeenItem, SubScope, Subscriber,
-    Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
+    Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, TimelineItem, TimelinePage,
+    TimelineQuery, Writer,
 };
 use crate::inbox::{Mailbox, StoreError};
 
@@ -1123,6 +1124,81 @@ impl NewsStore for MemoryNews {
                 }
             })
             .collect())
+    }
+
+    fn timeline(&self, owner: &Mailbox, q: &TimelineQuery) -> Result<TimelinePage, NewsError> {
+        if q.limit == 0 {
+            return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
+        }
+        let inner = self.inner.lock().unwrap();
+        let followed: HashMap<NodeId, ArticleId> = inner
+            .subs
+            .iter()
+            .filter(|r| !r.muted && owns(owner, &r.owner))
+            .filter_map(|r| match r.scope {
+                SubScope::Category(c) => Some((c, r.last_seen)),
+                SubScope::Thread(_) => None,
+            })
+            .collect();
+        let mut roots: Vec<&ArticleRow> = inner
+            .articles
+            .iter()
+            .filter(|a| a.parent.is_none() && followed.contains_key(&a.category))
+            .filter(|a| q.before.is_none_or(|b| a.id < b))
+            .filter(|a| q.after.is_none_or(|b| a.id > b))
+            .filter(|r| inner.articles.iter().any(|a| a.root == r.id && !a.deleted))
+            .collect();
+        if q.after.is_some() {
+            roots.sort_by_key(|a| a.id);
+        } else {
+            roots.sort_by_key(|a| std::cmp::Reverse(a.id));
+        }
+        let has_more = roots.len() > q.limit;
+        roots.truncate(q.limit);
+        if q.after.is_some() {
+            roots.reverse();
+        }
+        Ok(TimelinePage {
+            threads: roots
+                .into_iter()
+                .map(|r| TimelineItem {
+                    head: inner.head(r),
+                    unread: !r.deleted && r.id > followed[&r.category] && !r.author.is(owner),
+                })
+                .collect(),
+            has_more,
+        })
+    }
+
+    fn seen_timeline(
+        &self,
+        owner: &Mailbox,
+        from: ArticleId,
+        up_to: ArticleId,
+    ) -> Result<usize, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut moves = Vec::new();
+        for (i, r) in inner.subs.iter().enumerate() {
+            if r.muted || !owns(owner, &r.owner) || !matches!(r.scope, SubScope::Category(_)) {
+                continue;
+            }
+            let unshown = inner
+                .in_scope(r.scope)
+                .filter(|a| a.id > r.last_seen && a.id < from)
+                .filter(|a| !a.deleted && !a.author.is(owner))
+                .map(|a| a.id - 1)
+                .min();
+            let to = up_to
+                .min(inner.newest(r.scope))
+                .min(unshown.unwrap_or(ArticleId::MAX));
+            moves.push((i, r.last_seen.max(to)));
+        }
+        let mut left = 0;
+        for (i, last_seen) in moves {
+            inner.subs[i].last_seen = last_seen;
+            left += inner.unread(owner, inner.subs[i].scope, last_seen);
+        }
+        Ok(left)
     }
 
     fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {

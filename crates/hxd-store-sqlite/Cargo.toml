@@ -20,4 +20,6 @@ sha2 = "0.10"
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `progress_handler`, which the timeline's work bound counts with.
+rusqlite = { version = "0.40", features = ["hooks"] }
 tempfile = "3"

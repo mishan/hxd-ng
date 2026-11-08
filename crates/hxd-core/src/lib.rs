@@ -86,7 +86,8 @@ pub use news::{
     AutoFollow, AutoSubscribe, BlobId, BlobStore, BodyRenderer, BodyType, Listed, MarkdownMode,
     MemoryNews, NewsError, NewsPolicy, NewsStore, NewsUsage, Node, NodeId, NodeKind, NodeTree,
     Notified, NotifyPolicy, NotifyReason, PostRequest, Reference, Rendered, StagedAttachment,
-    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery,
+    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, TimelineItem,
+    TimelinePage, TimelineQuery,
 };
 pub use notify::{MessageNotice, NewsNotice, Notification, NotificationGateway};
 pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};

@@ -639,6 +639,31 @@ pub struct ThreadPage {
     pub has_more: bool,
 }
 
+/// A page of the timeline: the threads started in every category an
+/// account follows and has not muted, merged, and paged as
+/// [`ThreadQuery`] pages one category's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineQuery {
+    pub before: Option<ArticleId>,
+    pub after: Option<ArticleId>,
+    /// Clamped by the caller; zero is refused.
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelinePage {
+    pub threads: Vec<TimelineItem>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineItem {
+    pub head: ThreadHead,
+    /// Counted by its category's badge (§10.4): live, past that row's
+    /// cursor, and not the reader's own.
+    pub unread: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticlePage {
     /// Preorder: every reply directly under the article it answers,
@@ -1202,6 +1227,22 @@ pub trait NewsStore: Send + Sync + 'static {
         category: Option<NodeId>,
         article: ArticleId,
     ) -> Result<Vec<Subscriber>, StoreError>;
+
+    /// `owner`'s timeline ([`TimelineQuery`]).
+    fn timeline(&self, owner: &Mailbox, q: &TimelineQuery) -> Result<TimelinePage, NewsError>;
+
+    /// `owner` has been shown the timeline's threads from `from` to
+    /// `up_to`, both starters. Each followed, unmuted category's cursor
+    /// moves to `up_to` as [`Self::seen`] moves it, but stops short of an
+    /// unread starter older than `from`, which was never on screen: a
+    /// busy category filling the page must not mark a quiet one's older
+    /// threads seen. Answers the unread left across those rows.
+    fn seen_timeline(
+        &self,
+        owner: &Mailbox,
+        from: ArticleId,
+        up_to: ArticleId,
+    ) -> Result<usize, StoreError>;
 
     /// Unread across every unmuted row `owner` holds: the badge.
     fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError>;

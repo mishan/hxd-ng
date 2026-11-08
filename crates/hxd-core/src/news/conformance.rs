@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::{
     ArticleId, ArticleSignature, Author, AutoFollow, BodyType, CompiledQuery, FeedId, FeedPoll,
     FeedPost, GuestKey, GuestKeyer, NewNode, NewPost, NewsError, NewsStore, NewsUsage, NodeId,
-    NodeKind, Posted, SearchOrder, SearchQuery, SeenItem, SubScope, TextLen, ThreadQuery, Writer,
+    NodeKind, Posted, SearchOrder, SearchQuery, SeenItem, SubScope, TextLen, ThreadQuery,
+    TimelineQuery, Writer,
 };
 use crate::inbox::Mailbox;
 
@@ -68,6 +69,11 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn NewsStore>) {
     a_rotated_identity_keeps_what_it_wrote(&*new_store());
     rows_go_with_what_they_follow(&*new_store());
     a_listing_is_newest_first_and_says_what_it_follows(&*new_store());
+    // The timeline: every followed category's threads as one stream.
+    a_timeline_merges_what_is_followed_newest_first(&*new_store());
+    a_timelines_marks_are_what_its_badges_count(&*new_store());
+    the_timeline_pages_without_gap_or_overlap_while_news_arrives(&*new_store());
+    seeing_the_timeline_stops_short_of_what_was_not_shown(&*new_store());
     // The legacy wire: a category as one 1.5 listing, and as 1.2 news.
     a_legacy_listing_is_whole_threads_newest_first(&*new_store());
     a_legacy_listing_measures_rather_than_carries(&*new_store());
@@ -863,6 +869,353 @@ fn a_listing_is_newest_first_and_says_what_it_follows(s: &dyn NewsStore) {
         s.subscriptions(&bob()).unwrap()[1].label,
         "",
         "a tombstone keeps its place and loses its words"
+    );
+}
+
+fn timeline_query(
+    before: Option<ArticleId>,
+    after: Option<ArticleId>,
+    limit: usize,
+) -> TimelineQuery {
+    TimelineQuery {
+        before,
+        after,
+        limit,
+    }
+}
+
+/// The starters on a page of `owner`'s timeline, and whether there is more.
+fn timeline(
+    s: &dyn NewsStore,
+    owner: &Mailbox,
+    before: Option<ArticleId>,
+    after: Option<ArticleId>,
+    limit: usize,
+) -> (Vec<ArticleId>, bool) {
+    let page = s
+        .timeline(owner, &timeline_query(before, after, limit))
+        .unwrap();
+    let ids = page.threads.iter().map(|i| i.head.article.id).collect();
+    (ids, page.has_more)
+}
+
+fn a_timeline_merges_what_is_followed_newest_first(s: &dyn NewsStore) {
+    let a = category(s, "A");
+    let b = category(s, "B");
+    let muted = category(s, "Muted");
+    let other = category(s, "Other");
+    let releases = category(s, "Releases");
+    let feed = s
+        .feed_open("mobius", "https://example.com/a.atom")
+        .unwrap()
+        .id;
+    for c in [a, b, muted, releases] {
+        s.subscribe(&bob(), SubScope::Category(c), 10, t(1))
+            .unwrap();
+    }
+    s.mute(&bob(), SubScope::Category(muted), true, 10, t(1))
+        .unwrap();
+    s.subscribe(
+        &Mailbox::login("carol"),
+        SubScope::Category(other),
+        10,
+        t(1),
+    )
+    .unwrap();
+
+    let a1 = post(s, a, None, "a1", 2);
+    let b1 = post(s, b, None, "b1", 3);
+    post(s, muted, None, "muted", 4);
+    let followed_thread = post(s, other, None, "a thread bob follows", 5);
+    s.subscribe(&bob(), SubScope::Thread(followed_thread), 10, t(5))
+        .unwrap();
+    let f1 = feed_post(s, releases, feed, 1, 6);
+    let a2 = post(s, a, None, "a2", 7);
+    post(s, a, Some(a1), "a reply is no new thread", 8);
+    let b2 = post(s, b, None, "b2", 9);
+
+    assert_eq!(
+        timeline(s, &bob(), None, None, 10),
+        (vec![b2, a2, f1, b1, a1], false),
+        "followed categories alone, muted ones, threads and someone else's follows left out"
+    );
+    assert_eq!(timeline(s, &bob(), None, None, 2), (vec![b2, a2], true));
+    assert_eq!(timeline(s, &bob(), Some(a2), None, 2), (vec![f1, b1], true));
+    assert_eq!(timeline(s, &bob(), Some(b1), None, 2), (vec![a1], false));
+    assert_eq!(
+        timeline(s, &bob(), None, Some(a1), 2),
+        (vec![f1, b1], true),
+        "the threads nearest the cursor, newest first"
+    );
+    assert_eq!(
+        timeline(s, &bob(), None, Some(f1), 5),
+        (vec![b2, a2], false)
+    );
+    assert_eq!(
+        timeline(s, &Mailbox::login("dave"), None, None, 10),
+        (vec![], false)
+    );
+
+    let a1_page = s
+        .timeline(&bob(), &timeline_query(Some(b1), None, 1))
+        .unwrap();
+    assert_eq!(a1_page.threads[0].head.replies, 1);
+    assert_eq!(
+        s.timeline(&bob(), &timeline_query(None, None, 0)),
+        Err(NewsError::BadRequest("A page needs a limit of at least 1."))
+    );
+}
+
+fn a_timelines_marks_are_what_its_badges_count(s: &dyn NewsStore) {
+    let cat = category(s, "General");
+    let other = category(s, "Other");
+    let fp = [3u8; 32];
+    let by_login = Mailbox::login("carol");
+    for c in [cat, other] {
+        s.subscribe(&by_login, SubScope::Category(c), 10, t(1))
+            .unwrap();
+    }
+    let carol = |fingerprint| Author {
+        nick: "Carol".into(),
+        login: Some("carol".into()),
+        fingerprint,
+    };
+    let before_the_link = post_by(s, carol(None), cat, None, "before the link", 2);
+    let theirs = post(s, cat, None, "theirs", 3);
+    let deleted = post(s, other, None, "deleted", 4);
+    post(s, other, Some(deleted), "a live reply keeps it listed", 5);
+    s.tombstone(deleted, "m", t(6)).unwrap();
+    let dead = post(s, other, None, "dead", 7);
+    s.tombstone(dead, "m", t(8)).unwrap();
+    s.subs_claim("carol", &fp).unwrap();
+    let linked = Mailbox::identified("carol", fp);
+    let own = post_by(s, carol(Some(fp)), cat, None, "after the link", 9);
+
+    assert_eq!(timeline(s, &by_login, None, None, 10), (vec![], false));
+    let page = s
+        .timeline(&linked, &timeline_query(None, None, 10))
+        .unwrap();
+    let marks: Vec<(ArticleId, bool)> = page
+        .threads
+        .iter()
+        .map(|i| (i.head.article.id, i.unread))
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (own, false),
+            (deleted, false),
+            (theirs, true),
+            // A link does not re-stamp authorship (§10.2), so the badge
+            // counts it too.
+            (before_the_link, true),
+        ]
+    );
+    let badges: usize = s
+        .subscriptions(&linked)
+        .unwrap()
+        .iter()
+        .map(|r| r.unread)
+        .sum();
+    assert_eq!(marks.iter().filter(|(_, unread)| *unread).count(), badges);
+}
+
+fn the_timeline_pages_without_gap_or_overlap_while_news_arrives(s: &dyn NewsStore) {
+    let cats: Vec<NodeId> = (0..4).map(|n| category(s, &format!("c{n}"))).collect();
+    let followed = [cats[0], cats[1], cats[3]];
+    for c in followed {
+        s.subscribe(&bob(), SubScope::Category(c), 10, t(1))
+            .unwrap();
+    }
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut roll = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    // Every starter made, with its category, and whether a live article
+    // keeps its thread listed.
+    let mut starters: Vec<(ArticleId, NodeId, bool)> = Vec::new();
+    let mut at = 1;
+    let mut post_some =
+        |s: &dyn NewsStore, count: usize, starters: &mut Vec<(ArticleId, NodeId, bool)>| {
+            for _ in 0..count {
+                at += 1;
+                let c = cats[roll(4) as usize];
+                let live: Vec<ArticleId> = starters
+                    .iter()
+                    .filter(|(_, sc, listed)| *sc == c && *listed)
+                    .map(|(id, ..)| *id)
+                    .collect();
+                match roll(5) {
+                    0 if !live.is_empty() => {
+                        let parent = live[roll(live.len() as u64) as usize];
+                        post(s, c, Some(parent), "reply", at);
+                    }
+                    1 => {
+                        let id = post(s, c, None, "gone", at);
+                        s.tombstone(id, "m", t(at)).unwrap();
+                        starters.push((id, c, false));
+                    }
+                    _ => starters.push((post(s, c, None, "starter", at), c, true)),
+                }
+            }
+        };
+    let oracle = |starters: &[(ArticleId, NodeId, bool)], top: ArticleId| -> Vec<ArticleId> {
+        let mut ids: Vec<ArticleId> = starters
+            .iter()
+            .filter(|(id, c, listed)| *listed && *id <= top && followed.contains(c))
+            .map(|(id, ..)| *id)
+            .collect();
+        ids.sort_by_key(|id| std::cmp::Reverse(*id));
+        ids
+    };
+
+    post_some(s, 60, &mut starters);
+    let (mut walked, mut more) = timeline(s, &bob(), None, None, 7);
+    let top = walked[0];
+    while more {
+        post_some(s, 5, &mut starters);
+        let (page, has_more) = timeline(s, &bob(), walked.last().copied(), None, 7);
+        walked.extend(page);
+        more = has_more;
+    }
+    assert_eq!(
+        walked,
+        oracle(&starters, top),
+        "older pages, while newer news lands"
+    );
+
+    let mut upward = Vec::new();
+    let mut after = Some(0);
+    loop {
+        let (page, has_more) = timeline(s, &bob(), None, after, 7);
+        after = page.first().copied().or(after);
+        upward.splice(0..0, page);
+        if !has_more {
+            break;
+        }
+        post_some(s, 5, &mut starters);
+    }
+    assert_eq!(
+        upward,
+        oracle(&starters, ArticleId::MAX),
+        "newer pages reach what landed meanwhile"
+    );
+}
+
+fn seeing_the_timeline_stops_short_of_what_was_not_shown(s: &dyn NewsStore) {
+    let busy = category(s, "Busy");
+    let quiet = category(s, "Quiet");
+    let muted = category(s, "Muted");
+    let threads = category(s, "Threads");
+    for c in [busy, quiet, muted] {
+        s.subscribe(&bob(), SubScope::Category(c), 10, t(1))
+            .unwrap();
+    }
+    s.mute(&bob(), SubScope::Category(muted), true, 10, t(1))
+        .unwrap();
+    let followed = post(s, threads, None, "followed", 2);
+    s.subscribe(&bob(), SubScope::Thread(followed), 10, t(2))
+        .unwrap();
+    let own = post_by(s, bob_writing(), quiet, None, "bob's own", 3);
+    let gone = post(s, quiet, None, "gone", 4);
+    s.tombstone(gone, "m", t(4)).unwrap();
+    let q: Vec<ArticleId> = (0..3)
+        .map(|n| post(s, quiet, None, &format!("quiet {n}"), 5 + n))
+        .collect();
+    post(s, muted, None, "muted", 8);
+    post(s, threads, Some(followed), "a reply", 9);
+    let b: Vec<ArticleId> = (0..5)
+        .map(|n| post(s, busy, None, &format!("busy {n}"), 10 + n))
+        .collect();
+    let cursor = |scope| {
+        s.subscriptions(&bob())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.scope == scope)
+            .unwrap()
+            .last_seen
+    };
+    let untouched = [SubScope::Category(muted), SubScope::Thread(followed)].map(&cursor);
+    // Busy's unread, then quiet's.
+    let unread = || {
+        (
+            unread_of(s, &bob(), SubScope::Category(busy)),
+            unread_of(s, &bob(), SubScope::Category(quiet)),
+        )
+    };
+
+    let (page, _) = timeline(s, &bob(), None, None, 5);
+    assert_eq!(page, [b[4], b[3], b[2], b[1], b[0]]);
+    assert_eq!(
+        s.seen_timeline(&bob(), b[0], b[3]).unwrap(),
+        4,
+        "a busy category filling the page does not mark the quiet one's threads seen"
+    );
+    assert_eq!(unread(), (1, 3), "nor anything newer than was shown");
+    assert_eq!(
+        cursor(SubScope::Category(quiet)),
+        q[0] - 1,
+        "stopped by the oldest unshown thread it counts, not by a tombstone or the reader's own"
+    );
+    let marks: Vec<(ArticleId, bool)> = s
+        .timeline(&bob(), &timeline_query(None, None, 10))
+        .unwrap()
+        .threads
+        .iter()
+        .map(|i| (i.head.article.id, i.unread))
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (b[4], true),
+            (b[3], false),
+            (b[2], false),
+            (b[1], false),
+            (b[0], false),
+            (q[2], true),
+            (q[1], true),
+            (q[0], true),
+            (own, false),
+        ]
+    );
+    s.seen_timeline(&bob(), b[0], b[0]).unwrap();
+    assert_eq!(unread(), (1, 3), "a cursor never moves back");
+
+    assert_eq!(s.seen_timeline(&bob(), 0, b[4]).unwrap(), 0);
+    assert_eq!(
+        [SubScope::Category(muted), SubScope::Thread(followed)].map(&cursor),
+        untouched,
+        "a muted category and a thread are not the timeline's to mark"
+    );
+
+    let b5 = post(s, busy, None, "busy 5", 20);
+    post(s, quiet, None, "quiet 3", 21);
+    for n in 6..9 {
+        post(s, busy, None, &format!("busy {n}"), 16 + n);
+    }
+    let (page, _) = timeline(s, &bob(), None, None, 5);
+    assert_eq!(*page.last().unwrap(), b5);
+    s.seen_timeline(&bob(), b5, page[0]).unwrap();
+    assert_eq!(
+        unread(),
+        (0, 0),
+        "what was seen before does not stop a cursor"
+    );
+
+    assert_eq!(s.seen_timeline(&bob(), 0, ArticleId::MAX).unwrap(), 0);
+    post(s, quiet, None, "later", 30);
+    assert_eq!(
+        unread_of(s, &bob(), SubScope::Category(quiet)),
+        1,
+        "a cursor goes no further than the news"
+    );
+    assert_eq!(
+        s.seen_timeline(&Mailbox::login("dave"), 0, ArticleId::MAX)
+            .unwrap(),
+        0
     );
 }
 

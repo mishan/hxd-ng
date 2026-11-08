@@ -20,7 +20,8 @@ use hxd_core::news::{
     Article, ArticleId, ArticlePage, ArticleSignature, Attachment, AttachmentFetch, Author, BlobId,
     BodyType, FeedId, FeedListing, FeedPoll, FeedState, Listed, NewNode, NewPost, NewsError,
     NewsStore, NewsUsage, Node, NodeId, NodeKind, Posted, Reference, SeenItem, StagedAttachment,
-    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, Writer,
+    SubScope, Subscriber, Subscription, TextLen, ThreadHead, ThreadPage, ThreadQuery, TimelineItem,
+    TimelinePage, TimelineQuery, Writer,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
@@ -625,6 +626,24 @@ fn check_target(conn: &Connection, scope: SubScope) -> Result<(), NewsError> {
     }
 }
 
+/// A thread starter as a listing shows it, with what is under it.
+fn head(conn: &Connection, raw: RawArticle) -> Result<ThreadHead, StoreError> {
+    let article = raw.into_article(conn)?;
+    let (count, last_at, last_id): (i64, i64, i64) = sql(conn
+        .prepare_cached("SELECT COUNT(*), MAX(at), MAX(id) FROM news_article WHERE root = ?1")
+        .and_then(|mut s| {
+            s.query_row(params![i64::from(article.id)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+        }))?;
+    Ok(ThreadHead {
+        replies: u32::try_from(count - 1).unwrap_or(0),
+        last_at: from_unix(last_at),
+        last_id: article_id(last_id)?,
+        article,
+    })
+}
+
 /// `owner`'s row for `scope`: its id and cursor.
 fn sub_row(
     conn: &Connection,
@@ -1221,22 +1240,7 @@ impl NewsStore for SqliteStore {
         let has_more = raws.len() > q.limit;
         let mut threads = Vec::with_capacity(raws.len().min(q.limit));
         for raw in raws.into_iter().take(q.limit) {
-            let article = raw.into_article(&conn)?;
-            let (count, last_at, last_id): (i64, i64, i64) = sql(conn
-                .prepare_cached(
-                    "SELECT COUNT(*), MAX(at), MAX(id) FROM news_article WHERE root = ?1",
-                )
-                .and_then(|mut s| {
-                    s.query_row(params![i64::from(article.id)], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                    })
-                }))?;
-            threads.push(ThreadHead {
-                replies: u32::try_from(count - 1).unwrap_or(0),
-                last_at: from_unix(last_at),
-                last_id: article_id(last_id)?,
-                article,
-            });
+            threads.push(head(&conn, raw)?);
         }
         if q.after.is_some() {
             threads.reverse();
@@ -2110,6 +2114,107 @@ impl NewsStore for SqliteStore {
                 },
             )
             .collect()
+    }
+
+    fn timeline(&self, owner: &Mailbox, q: &TimelineQuery) -> Result<TimelinePage, NewsError> {
+        if q.limit == 0 {
+            return Err(NewsError::BadRequest("A page needs a limit of at least 1."));
+        }
+        let conn = self.conn.lock().unwrap();
+        let order = if q.after.is_some() { "ASC" } else { "DESC" };
+        // A page's worth from each followed category, then the nearest of
+        // those. Asked of them all at once, the live-thread test leaves
+        // SQLite no early stop, and a page reads every followed thread in
+        // range.
+        let sql_text = format!(
+            "WITH f(cat, seen) AS (
+               SELECT target, last_seen FROM news_sub
+                WHERE {} AND scope = 1 AND muted = 0)
+             SELECT {ARTICLE_COLUMNS}, deleted_at IS NULL AND id > f.seen AND {}
+               FROM f JOIN news_article a ON a.id IN (
+                    SELECT r.id FROM news_article r
+                     WHERE r.category = f.cat AND r.parent IS NULL
+                       AND r.id < ?1 AND r.id > ?2
+                       AND EXISTS (SELECT 1 FROM news_article d
+                                    WHERE d.root = r.id AND d.deleted_at IS NULL)
+                     ORDER BY r.id {order} LIMIT ?3)
+              ORDER BY a.id {order} LIMIT ?3",
+            mailbox_sql(owner, "owner", 4),
+            not_by(owner, 4)
+        );
+        let take = q.limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let rows: Vec<(RawArticle, bool)> = {
+            let mut stmt = sql(conn.prepare_cached(&sql_text))?;
+            let rows = sql(stmt.query_map(
+                params![
+                    q.before.map_or(i64::MAX, i64::from),
+                    q.after.map_or(0, i64::from),
+                    take,
+                    bind(owner)
+                ],
+                |r| Ok((raw_article(r)?, r.get(19)?)),
+            ))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        let has_more = rows.len() > q.limit;
+        let mut threads = Vec::with_capacity(rows.len().min(q.limit));
+        for (raw, unread) in rows.into_iter().take(q.limit) {
+            threads.push(TimelineItem {
+                head: head(&conn, raw)?,
+                unread,
+            });
+        }
+        if q.after.is_some() {
+            threads.reverse();
+        }
+        Ok(TimelinePage { threads, has_more })
+    }
+
+    fn seen_timeline(
+        &self,
+        owner: &Mailbox,
+        from: ArticleId,
+        up_to: ArticleId,
+    ) -> Result<usize, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+        let rows: Vec<(i64, i64, i64)> = {
+            let mut stmt = sql(tx.prepare(&format!(
+                "SELECT id, target, last_seen FROM news_sub
+                  WHERE {} AND scope = 1 AND muted = 0",
+                mailbox_sql(owner, "owner", 1)
+            )))?;
+            let rows = sql(stmt.query_map(params![bind(owner)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            }))?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(StoreError::new)?
+        };
+        let mut left = 0;
+        for (id, target, last_seen) in rows {
+            let scope = scope_of(1, target)?;
+            let last_seen = article_id(last_seen)?;
+            let unshown: Option<i64> = sql(tx.query_row(
+                &format!(
+                    "SELECT MIN(id) FROM news_article
+                      WHERE category = ?1 AND parent IS NULL AND id > ?2 AND id < ?3
+                        AND deleted_at IS NULL AND {}",
+                    not_by(owner, 4)
+                ),
+                params![target, i64::from(last_seen), i64::from(from), bind(owner)],
+                |r| r.get(0),
+            ))?;
+            let short_of = unshown.map_or(Ok(ArticleId::MAX), |u| article_id(u - 1))?;
+            let to = last_seen.max(up_to.min(newest(&tx, scope)?).min(short_of));
+            sql(tx.execute(
+                "UPDATE news_sub SET last_seen = ?2 WHERE id = ?1",
+                params![id, i64::from(to)],
+            ))?;
+            left += unread(&tx, owner, scope, to)?;
+        }
+        sql(tx.commit())?;
+        Ok(left)
     }
 
     fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {

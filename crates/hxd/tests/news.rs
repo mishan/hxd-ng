@@ -13,7 +13,8 @@ use hxd_core::inbox::{Mailbox, StoreError};
 use hxd_core::news::{
     Article, ArticleId, ArticlePage, FeedId, FeedListing, FeedPoll, FeedState, Listed, NewNode,
     NewPost, NewsError, NewsStore, NewsUsage, Node, NodeId, Posted, Reference, SearchPage,
-    SearchQuery, SeenItem, SubScope, Subscriber, Subscription, ThreadPage, ThreadQuery, Writer,
+    SearchQuery, SeenItem, SubScope, Subscriber, Subscription, ThreadPage, ThreadQuery,
+    TimelinePage, TimelineQuery, Writer,
 };
 use hxd_core::{AttachmentPolicy, Core, MarkdownMode, NewsPolicy, NotifyPolicy, RequestLimits};
 use hxd_ng_session::{NgConfig, NgCtx, Registry, TrustedProxies};
@@ -3113,6 +3114,19 @@ impl NewsStore for CountingNews {
         article: ArticleId,
     ) -> Result<Vec<Subscriber>, StoreError> {
         self.inner.subscribers(root, category, article)
+    }
+
+    fn timeline(&self, owner: &Mailbox, q: &TimelineQuery) -> Result<TimelinePage, NewsError> {
+        self.inner.timeline(owner, q)
+    }
+
+    fn seen_timeline(
+        &self,
+        owner: &Mailbox,
+        from: ArticleId,
+        up_to: ArticleId,
+    ) -> Result<usize, StoreError> {
+        self.inner.seen_timeline(owner, from, up_to)
     }
 
     fn unread_total(&self, owner: &Mailbox) -> Result<usize, StoreError> {
