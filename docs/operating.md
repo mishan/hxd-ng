@@ -1309,6 +1309,23 @@ memory. See [chat-history.md](chat-history.md) §12.
 enabled = false           # off unless turned on
 ```
 
+### `[emoji]`
+
+The Server Emoji draft's catalog of images an operator curates. Its
+settings are checked at startup, and a server of this version keeps
+no catalog yet and offers nothing on either wire. It needs a database:
+the catalog is kept in the one `[inbox]`, `[history]` or `[news]`
+names.
+
+```toml
+[emoji]
+enabled = false           # off unless turned on
+max_count = 200           # live emoji, 1 to 1000; as many removed ones are kept
+max_bytes = 16384         # the largest stored image, 64 to 65535
+max_dimension = 128       # images fitted within this square, 64 to 256
+max_frames = 50           # frames in an animated emoji, 16 to 150
+```
+
 ### `[media]`
 
 Absent means no images: the legacy wire never confirms capability bit 3

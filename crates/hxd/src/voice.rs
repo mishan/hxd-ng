@@ -151,6 +151,7 @@ mod tests {
             history: None,
             reactions: None,
             structured_chat: None,
+            emoji: None,
             media: None,
             news: None,
             files: None,
