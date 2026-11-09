@@ -235,6 +235,9 @@ struct Slot {
     /// The group as the peer last sent it, to show the ghost again when
     /// its home server changes and, later, to relay it whole.
     group: UserGroup,
+    /// The name it is shown by here, which a nameless group leaves as it
+    /// was.
+    nick: String,
 }
 
 /// A request for the peer (905, 906), and where its reply's fields go.
@@ -935,7 +938,10 @@ impl Hub {
             .ghosts
             .values()
             .filter(|slot| slot.group.home == id)
-            .filter_map(|slot| Some((slot.uid, self.ghost_info(live, &slot.group, show_tags)?)))
+            .filter_map(|slot| {
+                let info = self.ghost_info(live, &slot.group, &slot.nick, show_tags)?;
+                Some((slot.uid, info))
+            })
             .collect();
         if let Some(group) = passed {
             relay(&mut state, peer, Relay::Server(group));
@@ -1155,8 +1161,8 @@ impl Hub {
             })
     }
 
-    /// Where ghost `uid` is from: its home server's ID and tag, and its
-    /// own name.
+    /// Where ghost `uid` is from: its home server's ID and tag, and the
+    /// name it is shown by here.
     fn ghost_home(&self, uid: Uid) -> Option<(ServerId, String, String)> {
         let state = self.0.state.lock().unwrap();
         state.links.values().find_map(|live| {
@@ -1166,7 +1172,7 @@ impl Hub {
                 .iter()
                 .chain(live.servers.values())
                 .find(|s| s.id == slot.group.home)?;
-            Some((home.id, home.tag.clone(), slot.group.name.clone()))
+            Some((home.id, home.tag.clone(), slot.nick.clone()))
         })
     }
 
@@ -1366,8 +1372,11 @@ impl Hub {
             .get_mut(peer)
             .filter(|l| l.generation == generation)
             .ok_or("link replaced")?;
+        let nick = shown_name(&g.name)
+            .or_else(|| live.ghosts.get(&g.id).map(|slot| slot.nick.clone()))
+            .unwrap_or_else(|| UNNAMED.into());
         let info = self
-            .ghost_info(live, &g, show_tags)
+            .ghost_info(live, &g, &nick, show_tags)
             .ok_or("not homed behind this link")?;
         // Attached and counted under the hub's lock, so two links cannot
         // both take the last place under the caps.
@@ -1376,6 +1385,7 @@ impl Hub {
             // A snapshot resends everyone: only a change goes on.
             let changed = slot.group != g;
             slot.group = g;
+            slot.nick = nick;
             self.0.core.ghost_update(slot.uid, info);
             let passed = relayed_group(slot.uid, &slot.group, live.features);
             if transit && changed {
@@ -1392,7 +1402,14 @@ impl Hub {
             return Err("no uid to give a ghost");
         };
         let passed = relayed_group(uid, &g, live.features);
-        live.ghosts.insert(g.id, Slot { uid, group: g });
+        live.ghosts.insert(
+            g.id,
+            Slot {
+                uid,
+                group: g,
+                nick,
+            },
+        );
         if transit {
             relay(&mut state, peer, Relay::User(passed));
         }
@@ -1401,16 +1418,20 @@ impl Hub {
 
     /// How a user of the peer's is shown here, or `None` if it is homed
     /// anywhere but behind this link.
-    fn ghost_info(&self, live: &Live, g: &UserGroup, show_tags: bool) -> Option<GhostInfo> {
+    fn ghost_info(
+        &self,
+        live: &Live,
+        g: &UserGroup,
+        nick: &str,
+        show_tags: bool,
+    ) -> Option<GhostInfo> {
         let home = live
             .peer
             .iter()
             .chain(live.servers.values())
             .find(|s| s.id == g.home)?;
         Some(GhostInfo {
-            // Cut to a local name's length for display only; the group
-            // keeps the name whole for relaying.
-            nick: g.name.chars().take(31).collect(),
+            nick: nick.to_string(),
             icon: g.icon,
             away: g.flags & flag::AWAY != 0,
             color: home.color.unwrap_or_else(|| derived_color(&home.tag)),
@@ -1775,6 +1796,7 @@ impl Hub {
                             s.group.home == g.home
                                 && s.group.name == g.name
                                 && s.group.icon == g.icon
+                                && !hxd_core::nameless(&g.name)
                         });
                         if let Some(at) = same {
                             live.ghosts.insert(g.id, stale.swap_remove(at));
@@ -1834,6 +1856,19 @@ fn sendable(cert: &[u8], now: u64) -> bool {
     cert.len() <= hl_identity::message::CERT_MAX_BYTES
         && hl_identity::DeviceCert::parse(cert)
             .is_ok_and(|c| c.allows(hl_identity::caps::MESSAGE) && c.expires > now)
+}
+
+/// What a user whose group carries no name is shown by until it sends
+/// one: nobody is shown here without a name, a policy of this server's
+/// rather than the extension's (`docs/server-link.md`).
+const UNNAMED: &str = "unnamed";
+
+/// A group's name as shown here, cut to a local name's length for
+/// display only; the group keeps the name whole for relaying. `None`
+/// when what is left shows as nothing.
+fn shown_name(name: &str) -> Option<String> {
+    let cut: String = name.chars().take(31).collect();
+    (!hxd_core::nameless(&cut)).then_some(cut)
 }
 
 /// The color a server's users are shown in when it suggests none: one of
@@ -2513,6 +2548,32 @@ mod tests {
             h.requester("a", link + 1, ServerId([2; 8])).is_none(),
             "a replaced link"
         );
+    }
+
+    #[test]
+    fn a_user_with_no_name_is_shown_by_a_stand_in_or_the_name_it_had() {
+        let h = hub_with_peer("a");
+        let (link, _) = h.register("a");
+        h.accept_server("a", link, group(2, "two", 0), true)
+            .unwrap();
+        let shown = |id| {
+            let uid = h.ghost_uid("a", link, id).unwrap();
+            let row = h.0.core.roster_rows().into_iter().find(|u| u.uid == uid);
+            row.map(|u| (u.nick, u.icon))
+        };
+        h.apply_user("a", link, named(9, "")).unwrap();
+        assert_eq!(shown(9), Some((UNNAMED.into(), 1)), "a new user");
+        let controls = format!("{}a", "\u{1}".repeat(31));
+        h.apply_user("a", link, named(11, &controls)).unwrap();
+        assert_eq!(shown(11), Some((UNNAMED.into(), 1)), "nothing in the cut");
+        h.apply_user("a", link, named(10, "bob")).unwrap();
+        let mut nameless = named(10, "\0");
+        nameless.icon = 7;
+        h.apply_user("a", link, nameless).unwrap();
+        assert_eq!(shown(10), Some(("bob".into(), 7)), "an update");
+        h.accept_server("a", link, group(2, "zwei", 0), true)
+            .unwrap();
+        assert_eq!(shown(10), Some(("bob".into(), 7)), "its server changing");
     }
 
     /// A link up to its snapshot, with the peer at `epoch` showing `users`.

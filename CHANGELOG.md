@@ -7,6 +7,17 @@ as AGENTS.md's "Releasing" describes it.
 
 ## [Unreleased]
 
+### Fixed
+
+- A client that may use any name logging in, agreeing or changing its
+  info with an empty name, or one a classic client reads as empty (a
+  leading NUL, or nothing but control characters), and shown with none:
+  such a name at login falls back to the account's, and one sent later
+  leaves the nick as it was. An account file's `name` like that is read
+  as the login, and `[system] nick` like that is refused. A linked
+  user with no name is shown as `unnamed`, and an update without one
+  keeps the name it was shown by.
+
 ## [0.3.0] - 2026-11-05
 
 ### Upgrading

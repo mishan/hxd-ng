@@ -285,6 +285,62 @@ async fn account_login_wrong_password_and_name_policy() {
 }
 
 #[tokio::test]
+async fn an_empty_name_never_becomes_the_nick() {
+    // Each case: the name a guest logs in with, then a request carrying
+    // `then`'s name and icon 9, and the row a watcher then lists for it.
+    // A classic client reads a name only up to a NUL.
+    let (agree, change) = (HDR_AGREEMENTAGREE, HDR_USERCHANGE_REQ);
+    let cases = [
+        ("login", "", None, "guest", 5),
+        ("login nul", "\0bob", None, "guest", 5),
+        ("agreement", "carol", Some((agree, "")), "carol", 9),
+        ("agreement nul", "carol", Some((agree, "\0bob")), "carol", 9),
+        ("change", "carol", Some((change, "")), "carol", 9),
+        ("change nul", "carol", Some((change, "\0")), "carol", 9),
+    ];
+    for (case, name, then, want_nick, want_icon) in cases {
+        let td = tempfile::tempdir().unwrap();
+        let addr = start_server(td.path(), None).await;
+        let mut w = Client::connect(addr).await;
+        w.login_guest("watcher", 1, 150).await;
+        w.recv_type(HDR_SELFINFO).await;
+
+        let mut c = Client::connect(addr).await;
+        let login = c.login_guest(name, 5, 150).await;
+        let uid = chunk_u16(&login, tag::UID).unwrap();
+        if let Some((ty, name)) = then {
+            c.send(
+                ty,
+                &[
+                    (tag::NAME, name.as_bytes().to_vec()),
+                    (tag::ICON, 9u16.to_be_bytes().to_vec()),
+                ],
+            )
+            .await;
+        }
+        loop {
+            let f = w.recv_type(HDR_USER_CHANGE).await;
+            if chunk_u16(&f, tag::UID) == Some(uid) && chunk_u16(&f, tag::ICON) == Some(want_icon) {
+                break;
+            }
+        }
+        w.send(HDR_GETLIST, &[]).await;
+        let list = w.recv_type(HDR_TASK).await;
+        let row = list
+            .chunks()
+            .filter(|c| c.tag == tag::USER_LIST)
+            .map(|c| parse_userlist(c.data))
+            .find(|r| r.0 == uid)
+            .unwrap();
+        assert_eq!(
+            (row.1, row.3.as_slice()),
+            (want_icon, want_nick.as_bytes()),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn agreement_flow_parks_login_until_agree() {
     let td = tempfile::tempdir().unwrap();
     let addr = start_server(td.path(), Some("Be nice\nOr else\n")).await;

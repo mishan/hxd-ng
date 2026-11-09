@@ -176,7 +176,12 @@ impl AccountFile {
             allow_self_link: self.identity.allow_self_link.unwrap_or(true),
             reserve_name: self.identity.reserve_name.unwrap_or(false),
         };
-        let name = self.name.unwrap_or_else(|| login.clone());
+        // A name that shows as nothing is no name: every nick that falls
+        // back to it must have one to show.
+        let name = self
+            .name
+            .filter(|n| !hxd_core::nameless(n))
+            .unwrap_or_else(|| login.clone());
         let mut account = Account::new(login, name, has_password, identity, config);
         account.roles = self.roles;
         account
@@ -1614,6 +1619,18 @@ mod tests {
         assert!(acct.access.has(bit::USE_ANY_NAME));
         assert!(acct.access.has(bit::DISCONNECT_USERS));
         assert!(!acct.access.has(bit::DELETE_FILES));
+    }
+
+    #[test]
+    fn an_empty_name_is_the_login() {
+        let (td, auth) = backend();
+        let controls = "\\u0001".repeat(30);
+        for name in ["", "\\u0000bob", &format!("{controls}\\u20ac")] {
+            let file = format!("name = \"{name}\"\npassword = \"x\"\n");
+            write(td.path(), "alice.toml", &file);
+            let acct = auth.authenticate("alice", Proof::Plain(b"x")).unwrap();
+            assert_eq!(acct.name, "alice", "{name:?}");
+        }
     }
 
     #[test]
