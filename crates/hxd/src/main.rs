@@ -67,7 +67,9 @@ fn init_tracing() {
 /// account files of everyone logged in, the rooms file, and the emoji
 /// catalog.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn reload_on_hangup(
+    hangup: std::io::Result<tokio::signal::unix::Signal>,
     core: std::sync::Arc<hxd_core::Core>,
     registrar: Option<std::sync::Arc<hxd_registrar::Registrar>>,
     tls: Option<std::sync::Arc<hxd_session::LegacyTls>>,
@@ -76,7 +78,7 @@ async fn reload_on_hangup(
     identity: Option<std::sync::Arc<hxd_ng_session::IdentityState>>,
     path: PathBuf,
 ) {
-    let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+    let mut hangup = match hangup {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("install SIGHUP handler: {e}; revocations need a restart");
@@ -1319,6 +1321,11 @@ async fn main() {
         // binds, because every subscription is bound to that key.
         let push = hxd::push::build(&config)?;
         let classic = config.server.classic;
+        // Before anything listens: a SIGHUP that arrived before the
+        // handler would end the server, and a listening server is one an
+        // operator may already be reloading.
+        #[cfg(unix)]
+        let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
         // Bind HTXF before either frontend advertises Files. A configured
         // but unavailable transfer port is a startup failure, never a
         // capability promise that downloads cannot fulfill.
@@ -1641,6 +1648,7 @@ async fn main() {
         };
         #[cfg(unix)]
         tokio::spawn(reload_on_hangup(
+            hangup,
             ctx.core.clone(),
             ng_ctx.as_ref().and_then(|n| n.registrar.clone()),
             tls.as_ref().map(|t| t.tls.clone()),
