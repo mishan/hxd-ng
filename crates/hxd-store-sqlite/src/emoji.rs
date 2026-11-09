@@ -210,7 +210,7 @@ impl EmojiStore for SqliteStore {
             [],
             |r| r.get(0),
         ))?;
-        let past = removed - keep_removed as i64;
+        let past = removed - i64::try_from(keep_removed).unwrap_or(i64::MAX);
         if past > 0 {
             sql(tx.execute(
                 "UPDATE emoji_meta SET floor = MAX(floor, (

@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::{EmojiEntry, EmojiId, EmojiImage, EmojiName, EmojiStore, EmojiStoreError};
 use crate::media::MediaType;
 
-/// The count the cases add under, where the count is not the subject.
-const ROOM: usize = 100;
+/// The count the cases add and remove under, where the count is not the
+/// subject: as large as it can be, so a store that narrows it is caught.
+const ROOM: usize = usize::MAX;
 
 /// Run every case against a freshly built store.
 pub fn run(new_store: &dyn Fn() -> Box<dyn EmojiStore>) {
