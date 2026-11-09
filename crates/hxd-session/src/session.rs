@@ -2480,12 +2480,16 @@ async fn login_phase(
     }
 
     // Resolve the visible name: the account must grant use_any_name for
-    // the client's own nick to stick; otherwise the account name rules.
+    // the client's own nick to stick; otherwise the account name rules,
+    // as it does for one that shows as nothing, as on mhxd.
     let got_name = req.nick.is_some();
-    let nick = match (&req.nick, account.access.has(bit::USE_ANY_NAME)) {
-        (Some(n), true) => enc.decode_chars(n, 31),
-        _ => account.name.clone(),
-    };
+    let nick = req
+        .nick
+        .as_ref()
+        .filter(|_| account.access.has(bit::USE_ANY_NAME))
+        .map(|n| enc.decode_chars(n, 31))
+        .filter(|n| !hxd_core::nameless(n))
+        .unwrap_or_else(|| account.name.clone());
 
     // The capability negotiation happens *before* the attach, because
     // one of its bits is something the domain needs: the authorization

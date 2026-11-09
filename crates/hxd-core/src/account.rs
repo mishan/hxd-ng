@@ -495,6 +495,28 @@ pub trait AuthBackend: Send + Sync + 'static {
 /// never be typed on it.
 pub const FIELD_MAX_CHARS: usize = 31;
 
+/// The classic wire's cut of a nick, in bytes after conversion, at a
+/// character boundary.
+const NICK_WIRE_BYTES: usize = 31;
+
+/// Whether a nick or name shows as no name at all: a classic client
+/// reads it only up to a NUL, as mhxd does, and draws a control
+/// character as nothing, and it is sent only what the wire's cut leaves.
+/// That is judged in UTF-8, the widest encoding a classic client may
+/// use; Mac Roman, a byte a character, keeps at least as much.
+pub fn nameless(name: &str) -> bool {
+    let mut end = name.len().min(NICK_WIRE_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    !name[..end]
+        .split('\0')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .any(|c| !c.is_control())
+}
+
 /// An administrator's change to one account. `None` keeps what the
 /// account has; a new account takes its login as its name, no password
 /// and what its roles grant.
@@ -758,6 +780,22 @@ pub trait AccountDirectory: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_is_nameless_when_the_wire_would_show_nothing_of_it() {
+        let controls = |n: usize| "\u{1}".repeat(n);
+        for (name, nameless_) in [
+            (String::new(), true),
+            ("\0bob".into(), true),
+            (" ".into(), false),
+            ("bob\0".into(), false),
+            (format!("{}a", controls(30)), false),
+            (format!("{}a", controls(31)), true),
+            (format!("{}\u{20ac}", controls(30)), true),
+        ] {
+            assert_eq!(nameless(&name), nameless_, "{name:?}");
+        }
+    }
 
     fn slot<'a, T>(x: &'a mut Extras<T>, key: &str) -> &'a mut T {
         match key {

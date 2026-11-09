@@ -406,6 +406,13 @@ alternative is losing it.
   not exported; hxd-ng's nick cap is far below that.
 - **Receiving:** the hub drops, never truncates, a transaction or group
   over the extension's maximums or the Relaying Fields bounds.
+- **A nameless user.** A user group whose name is empty, or reads as
+  empty to a classic client (nothing before a NUL but control
+  characters), is never refused. A new user is shown as `unnamed`,
+  tagged like any ghost under `show_tags`, and an update keeps the name
+  the user is shown by and applies the rest. That is this server's
+  policy, not the extension's, and only for display: the group is
+  relayed as it came.
 
 ## 5. The ng wire
 

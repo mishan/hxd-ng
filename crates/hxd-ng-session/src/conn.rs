@@ -772,7 +772,7 @@ async fn handle_login(
     }
 
     let mut nick = match (&p.nick, account.access.has(bit::USE_ANY_NAME)) {
-        (Some(n), true) if !n.is_empty() => n.clone(),
+        (Some(n), true) if !hxd_core::nameless(n) => n.clone(),
         _ => account.name.clone(),
     };
     // The legacy wire truncates a nick to 31 Mac Roman bytes after

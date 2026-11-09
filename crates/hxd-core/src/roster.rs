@@ -2405,7 +2405,11 @@ impl Core {
             return false;
         };
         let mut changed = false;
-        if let Some(n) = nick {
+        // A nick that shows as nothing is no change, on either wire: a
+        // user is always shown by a name, and a Structured Chat line
+        // relies on one. mhxd takes an empty name from 304; this
+        // deliberately does not.
+        if let Some(n) = nick.filter(|n| !crate::nameless(n)) {
             if sess.info.nick != n {
                 sess.info.nick = n;
                 changed = true;

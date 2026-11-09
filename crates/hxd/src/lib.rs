@@ -450,7 +450,7 @@ impl SystemSection {
         if self.login.trim().is_empty() {
             return Err("[system] login must be a login".into());
         }
-        if self.nick.trim().is_empty() {
+        if self.nick.trim().is_empty() || hxd_core::nameless(&self.nick) {
             return Err("[system] nick must be a name".into());
         }
         Ok(())
@@ -5381,6 +5381,15 @@ hmac_secret = "new secret"
         ] {
             let err = check_config(&parse(&toml).unwrap()).unwrap_err();
             assert!(err.contains(says), "{toml:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_system_nick_that_shows_as_nothing_is_refused() {
+        for nick in ["", "\\u0000", "\\u0000bob"] {
+            let toml = format!("[system]\nnick = \"{nick}\"\n");
+            let err = check_config(&parse(&toml).unwrap()).unwrap_err();
+            assert!(err.contains("nick must be a name"), "{toml:?}: {err}");
         }
     }
 
