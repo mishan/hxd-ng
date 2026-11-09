@@ -68,6 +68,7 @@ impl Synchronous {
 
 mod avatar;
 mod blobs;
+mod emoji;
 mod identity_records;
 mod moderation;
 mod news;
@@ -80,7 +81,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 36;
+const SCHEMA_VERSION: i64 = 37;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1042,6 +1043,34 @@ BEGIN
 END;
 ";
 
+/// The server's emoji catalog (`hxd_core::emoji`). `AUTOINCREMENT`, so
+/// no id is given twice even once the highest is forgotten. A removed
+/// row keeps its id and last name and nothing else of its image; live
+/// names are unique, removed ones are not. `emoji_meta` is the
+/// catalog's revision and the highest revision forgotten. And the refs
+/// a line or a message binds, beside it as `re` is.
+const SCHEMA_V37: &str = "
+CREATE TABLE emoji (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL,
+  revision   INTEGER NOT NULL,
+  hash       BLOB,
+  mime       TEXT,
+  width      INTEGER,
+  height     INTEGER,
+  animated   INTEGER NOT NULL DEFAULT 0,
+  bytes      BLOB,
+  added_at   INTEGER NOT NULL,
+  removed_at INTEGER
+);
+CREATE UNIQUE INDEX emoji_live_name ON emoji (name) WHERE removed_at IS NULL;
+CREATE INDEX emoji_removed ON emoji (revision) WHERE removed_at IS NOT NULL;
+CREATE TABLE emoji_meta (revision INTEGER NOT NULL, floor INTEGER NOT NULL);
+INSERT INTO emoji_meta (revision, floor) VALUES (0, 0);
+ALTER TABLE chat_line ADD COLUMN emoji BLOB;
+ALTER TABLE message ADD COLUMN emoji BLOB;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1796,6 +1825,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 36 {
         steps.push_str(SCHEMA_V36);
+    }
+    if version < 37 {
+        steps.push_str(SCHEMA_V37);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -4710,7 +4742,15 @@ mod tests {
         let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
         let refs: Vec<Vec<u8>> = {
             let conn = store.conn.lock().unwrap();
-            assert_eq!(snapshot(&conn), before, "every row as it was");
+            let after = snapshot(&conn);
+            assert_eq!(after.len(), before.len());
+            for (row, was) in after.iter().zip(&before) {
+                assert_eq!(row[..was.len()], was[..], "every row as it was");
+                assert!(
+                    row[was.len()..].iter().all(|v| *v == Value::Null),
+                    "and nothing in a column added since"
+                );
+            }
             let objects: Vec<(String, String)> = conn
                 .prepare(
                     "SELECT type, name FROM sqlite_master
@@ -4825,6 +4865,59 @@ mod tests {
             store.push(&retry, 100).unwrap(),
             Pushed::Stored { .. }
         ));
+    }
+
+    /// An empty catalog at revision 0, whose ids, kept in the file,
+    /// outlive a forget and a reopen; and the refs' columns beside the
+    /// lines and the mail already there.
+    #[test]
+    fn version_thirty_six_migrates_into_a_catalog_that_never_gives_an_id_twice() {
+        use hxd_core::emoji::{conformance::image, EmojiName, EmojiStore};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch("INSERT INTO chat_line (nick, body, at) VALUES ('alice', 'hi', 1);")
+                .unwrap();
+            conn.pragma_update(None, "user_version", 36).unwrap();
+        }
+        let party = EmojiName::parse("party").unwrap();
+        let last = {
+            let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+            let catalog = store.load().unwrap();
+            assert_eq!((catalog.revision, catalog.floor), (0, 0));
+            assert!(catalog.entries.is_empty());
+            {
+                let conn = store.conn.lock().unwrap();
+                let line: (String, Option<Vec<u8>>) = conn
+                    .query_row("SELECT body, emoji FROM chat_line", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap();
+                assert_eq!(line, ("hi".into(), None));
+                conn.prepare("SELECT emoji FROM message").unwrap();
+            }
+            store.add(&party, &image(1), UNIX_EPOCH, 10).unwrap();
+            let id = store.load().unwrap().entries[0].id;
+            store.remove(id, UNIX_EPOCH, 0).unwrap();
+            assert!(store.load().unwrap().entries.is_empty());
+            id
+        };
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        store.add(&party, &image(1), UNIX_EPOCH, 10).unwrap();
+        let catalog = store.load().unwrap();
+        assert!(catalog.entries[0].id > last, "{:?}", catalog.entries[0].id);
+        assert_eq!((catalog.revision, catalog.floor), (3, 2));
     }
 
     #[test]

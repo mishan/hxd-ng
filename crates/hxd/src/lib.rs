@@ -86,6 +86,9 @@ pub struct Config {
     /// `enabled` left off, = never confirmed. The ng wire's lines are
     /// structured already.
     pub structured_chat: Option<StructuredChatSection>,
+    /// The Server Emoji draft's catalog. Absent, or `enabled` left off,
+    /// = none. Kept in the shared database.
+    pub emoji: Option<EmojiSection>,
     /// Inline media (`docs/inline-media.md` §11). Absent = disabled: no
     /// capability bit 3 on the legacy wire, no `media` cap on the ng
     /// one, and no `/media` routes.
@@ -1477,6 +1480,77 @@ fn default_max_sent_bytes_per_day() -> u64 {
 pub struct StructuredChatSection {
     /// Off unless turned on, as the draft has it.
     pub enabled: bool,
+}
+
+/// `[emoji]`: the draft's `Emoji.*` settings, its defaults
+/// [`hxd_core::emoji::EmojiPolicy`]'s.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmojiSection {
+    /// Off unless turned on, as the draft has it.
+    pub enabled: bool,
+    /// Live emoji, up to `MAX_COUNT_CEILING`; as many removed ones are
+    /// kept.
+    pub max_count: usize,
+    /// The largest stored image, `MIN_BYTES` to `MAX_BYTES_CEILING`.
+    pub max_bytes: usize,
+    /// Images are fitted within this square, `MIN_DIMENSION` to
+    /// `MAX_DIMENSION_CEILING`.
+    pub max_dimension: u32,
+    /// Frames in an animated emoji, `MIN_FRAMES` to `MAX_FRAMES_CEILING`.
+    pub max_frames: u32,
+}
+
+impl Default for EmojiSection {
+    fn default() -> Self {
+        let p = hxd_core::emoji::EmojiPolicy::default();
+        EmojiSection {
+            enabled: false,
+            max_count: p.max_count,
+            max_bytes: p.max_bytes,
+            max_dimension: p.max_dimension,
+            max_frames: p.max_frames,
+        }
+    }
+}
+
+impl EmojiSection {
+    pub fn policy(&self) -> Result<hxd_core::emoji::EmojiPolicy, String> {
+        use hxd_core::emoji as e;
+        if !(1..=e::MAX_COUNT_CEILING).contains(&self.max_count) {
+            return Err(format!(
+                "[emoji] max_count must be 1 to {}",
+                e::MAX_COUNT_CEILING
+            ));
+        }
+        if !(e::MIN_BYTES..=e::MAX_BYTES_CEILING).contains(&self.max_bytes) {
+            return Err(format!(
+                "[emoji] max_bytes must be {} to {}",
+                e::MIN_BYTES,
+                e::MAX_BYTES_CEILING
+            ));
+        }
+        if !(e::MIN_DIMENSION..=e::MAX_DIMENSION_CEILING).contains(&self.max_dimension) {
+            return Err(format!(
+                "[emoji] max_dimension must be {} to {}",
+                e::MIN_DIMENSION,
+                e::MAX_DIMENSION_CEILING
+            ));
+        }
+        if !(e::MIN_FRAMES..=e::MAX_FRAMES_CEILING).contains(&self.max_frames) {
+            return Err(format!(
+                "[emoji] max_frames must be {} to {}",
+                e::MIN_FRAMES,
+                e::MAX_FRAMES_CEILING
+            ));
+        }
+        Ok(e::EmojiPolicy {
+            max_count: self.max_count,
+            max_bytes: self.max_bytes,
+            max_dimension: self.max_dimension,
+            max_frames: self.max_frames,
+        })
+    }
 }
 
 /// `[reactions]`: the draft's `Reactions.*` settings, its defaults
@@ -3588,6 +3662,19 @@ pub fn check_config(config: &Config) -> Result<(), String> {
             return Err("[reactions] needs [history]: reactions are kept beside the lines".into());
         }
     }
+    if let Some(emoji) = &config.emoji {
+        emoji.policy()?;
+        let shared = config.inbox.is_some()
+            || config.history.as_ref().is_some_and(|h| h.db.is_some())
+            || config.news.as_ref().is_some_and(|n| n.db.is_some());
+        if emoji.enabled && !shared {
+            return Err(
+                "[emoji] needs a database: the catalog is kept in the one [inbox], [history] \
+                 or [news] names"
+                    .into(),
+            );
+        }
+    }
     if let Some(messaging) = &config.messaging {
         messaging.policy(&config.limits)?;
         if messaging.enabled && config.inbox.is_none() {
@@ -5479,6 +5566,39 @@ sync = "full"
             }
         }
         assert!(parse("[reactions]\nread_only_rooms = \"maybe\"\n").is_err());
+    }
+
+    #[test]
+    fn emoji_needs_a_database_and_counts_a_catalog_can_hold() {
+        for (toml, refused) in [
+            ("[inbox]\ndb = \"s.sqlite\"\n[emoji]\nenabled = true\n", None),
+            ("[history]\ndb = \"h.sqlite\"\n[emoji]\nenabled = true\n", None),
+            ("[news]\ndb = \"n.sqlite\"\n[emoji]\nenabled = true\n", None),
+            ("[emoji]\nenabled = true\n", Some("needs a database")),
+            ("[emoji]\n", None),
+            (
+                "[emoji]\nmax_count = 1000\nmax_bytes = 65535\nmax_dimension = 256\nmax_frames = 150\n",
+                None,
+            ),
+            (
+                "[emoji]\nmax_count = 1\nmax_bytes = 64\nmax_dimension = 64\nmax_frames = 16\n",
+                None,
+            ),
+            ("[emoji]\nmax_count = 0\n", Some("max_count must be 1 to 1000")),
+            ("[emoji]\nmax_count = 1001\n", Some("max_count must be 1 to 1000")),
+            ("[emoji]\nmax_bytes = 63\n", Some("max_bytes must be 64 to 65535")),
+            ("[emoji]\nmax_bytes = 65536\n", Some("max_bytes must be 64 to 65535")),
+            ("[emoji]\nmax_dimension = 63\n", Some("max_dimension must be 64 to 256")),
+            ("[emoji]\nmax_dimension = 257\n", Some("max_dimension must be 64 to 256")),
+            ("[emoji]\nmax_frames = 15\n", Some("max_frames must be 16 to 150")),
+            ("[emoji]\nmax_frames = 151\n", Some("max_frames must be 16 to 150")),
+        ] {
+            let checked = check_config(&parse(toml).unwrap());
+            match refused {
+                None => checked.unwrap_or_else(|e| panic!("{toml:?}: {e}")),
+                Some(why) => assert!(checked.unwrap_err().contains(why), "{toml:?}"),
+            }
+        }
     }
 
     #[test]
