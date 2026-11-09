@@ -7,6 +7,16 @@ as AGENTS.md's "Releasing" describes it.
 
 ## [Unreleased]
 
+### Upgrading
+
+- No schema migration and no config change.
+- The ng wire gains `news_timeline`: one stream, newest first, of the
+  threads started in every news category an account follows and has
+  not muted, each marked `unread` as its category's badge counts it,
+  and `news_seen { timeline: true, from, up_to }` to say a run of it
+  was shown (docs/news.md §10.8, §10.9). Each costs 4 of an ng
+  session's request limit. A client that never asks sees no change.
+
 ### Fixed
 
 - A client that may use any name logging in, agreeing or changing its

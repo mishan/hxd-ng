@@ -1834,6 +1834,25 @@ scope has a cost for a thread read a page at a time: `up_to` is the
 highest id shown, and a thread reads in reply order rather than id order,
 so an older reply on a page not yet loaded is counted as seen.
 
+The timeline (§10.9) is marked seen by a form of its own:
+
+```
+news_seen { timeline: true, from, up_to }  ->  { unread }
+```
+
+It applies to the rows the timeline reads, every unmuted category row,
+so the client names nothing and needs no list of what it follows.
+`from` and `up_to` are the oldest and newest starters of the run the
+client has shown, unbroken; a run that reached the end of the timeline
+sends `from: 0`. A single high-water mark is not enough here, since a
+page filled by a busy category would mark a quiet category's older
+threads seen without their ever being on screen. So each row's cursor
+moves to `up_to`, clamped to the category's newest article as above,
+but no further than just below its oldest unread starter older than
+`from`, where it has one. `unread` is what is left across those rows,
+the timeline's own badge rather than the login reply's, which counts
+thread rows too. One store transaction.
+
 ### 10.9 Requests
 
 | `req` | params | ok |
@@ -1842,7 +1861,8 @@ so an older reply on a page not yet loaded is counted as seen.
 | `news_unsubscribe` | exactly one of `thread` / `category` | `{}` |
 | `news_mute` | exactly one of `thread` / `category`, plus `muted` | `{}` |
 | `news_subs` | — | `{ "subs": [ … ] }`, newest first |
-| `news_seen` | exactly one of `thread` / `category`, plus `up_to` | `{ "unread": 0 }` |
+| `news_seen` | exactly one of `thread` / `category`, plus `up_to`; or `timeline: true`, `from` and `up_to` (§10.8) | `{ "unread": 0 }` |
+| `news_timeline` | `before?` / `after?` (thread root id), `limit?` (default 50, at most `max_page`) | `{ "threads": [ … ], "has_more": bool }` |
 
 A sub is `{ "scope": "thread" | "category", "target", "category",
 "subject" | "name", "auto", "muted", "unread", "last_seen" }`: `category`
@@ -1858,7 +1878,34 @@ nothing: a `thread` that is a reply rather than a starter, or no article at all,
 is `no_such_article`, and a `category` that is not one is
 `no_such_node` or `not_a_category`. Not following something that is
 there is no error: `news_unsubscribe` and unmuting answer `{}`, and
-`news_seen` answers 0. Naming both scopes or neither is `bad_request`.
+`news_seen` answers 0. Naming both scopes or neither is `bad_request`,
+and so is naming `timeline` beside either or on any request but
+`news_seen`, leaving out its `from` or `up_to`, or a `from` past
+`up_to`.
+
+**The timeline** is one stream of the threads started in every category
+the account follows and has not muted, newest first. A muted row is
+left out because muting a category nobody followed makes one (§10.3),
+and a category someone asked never to hear about does not belong in
+their stream. A followed thread in a category that is not followed is
+not in it, and a thread does not rise on a reply. Order and paging are
+`news_threads`' (§9.2) exactly, by starter id across every category at
+once, so a `before` page is unchanged by posts made while paging and new
+threads are reached with `after` from the top. A feed's item is where
+the poller stored it (news-feeds.md §5), as in its category's own list.
+A thread is `news_threads`' object, its `article.category` saying where
+it is, plus `unread`: whether its category's badge counts it, by
+§10.4's rule (live, past that row's cursor, not the reader's own), so
+the marks of a whole walk sum to the category rows' `unread`. The
+reader's own threads are listed, marked as the badge counts them, and a
+tombstoned starter kept for a live reply is never unread. A thread by
+someone the reader blocked is listed, as in the category: a block silences notifications,
+not public news (§10.5). Nothing followed answers `{ "threads": [],
+"has_more": false }`. `news_timeline` and `news_seen`'s timeline form
+each cost 4 of the request limit (hotline-ng.md §9), as `news_search`
+does, since each reads every followed category. There is no login flag:
+a server with news and without the timeline answers `unknown_method`,
+which is all a client needs to leave the view out.
 
 The login reply's `news` block (§9.1) gains `unread` — the total across
 subscribed scopes — so a client can draw a badge on the first frame,
@@ -2582,7 +2629,7 @@ schema version 4: the index over the columns version 3 put there for it,
 `hxd news-reindex`, and a conformance suite that asserts which articles
 each row of the grammar finds. Subscriptions are schema version 5:
 `news_sub`, the audience and the catch-up rule in `hxd-core::news::subs`,
-`news_notify`, the five requests of §10.9, `[news.notify]`, and
+`news_notify`, the subscription requests of §10.9, `[news.notify]`, and
 `Notification` as a sum with `NewsNotice` in it — tested with a
 recording gateway, since no gateway exists yet. The `stale_after` floor
 under the catch-up rule is built with it: the audience scan dates the
@@ -2602,7 +2649,8 @@ it, `article` as a report target, the purge's news arm, §8's ladder,
 the moderation sweeper, and `hxd purge` reaching articles. The ng e2e is
 `crates/hxd/tests/news.rs`, the out-of-process one `e2e/news.test.mjs`,
 and the first client is hx-ng's News view, which follows, mutes, badges
-and says "seen".
+and says "seen". §10.9's timeline came after, in the store, the core
+and the ng wire.
 
 W9 is the legacy binding of §12: the hx-libs opcodes and the pin bump,
 path resolution in `hxd-session`, the eight 1.5 transactions with

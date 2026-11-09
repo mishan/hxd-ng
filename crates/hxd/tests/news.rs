@@ -1105,6 +1105,27 @@ async fn subscribing_says_why_not() {
         ("news_mute", json!({ "thread": root }), "bad_request"),
         ("news_seen", json!({ "thread": root }), "bad_request"),
         ("news_subscribe", json!({ "thread": "one" }), "bad_request"),
+        (
+            "news_seen",
+            json!({ "timeline": true, "category": cat, "from": 0, "up_to": root }),
+            "bad_request",
+        ),
+        (
+            "news_seen",
+            json!({ "timeline": true, "from": root + 1, "up_to": root }),
+            "bad_request",
+        ),
+        (
+            "news_seen",
+            json!({ "timeline": true, "up_to": root }),
+            "bad_request",
+        ),
+        (
+            "news_subscribe",
+            json!({ "timeline": true, "category": cat }),
+            "bad_request",
+        ),
+        ("news_timeline", json!({ "limit": 0 }), "bad_request"),
     ] {
         assert_eq!(
             alice.refused(method, params.clone()).await,
@@ -1112,18 +1133,27 @@ async fn subscribing_says_why_not() {
             "{method} {params}"
         );
     }
-    assert_eq!(
-        outsider
-            .refused("news_subscribe", json!({ "category": cat }))
-            .await,
-        "access_denied"
-    );
+    for (method, params) in [
+        ("news_subscribe", json!({ "category": cat })),
+        ("news_timeline", json!({})),
+    ] {
+        assert_eq!(
+            outsider.refused(method, params).await,
+            "access_denied",
+            "{method}"
+        );
+    }
     assert_eq!(
         alice
             .ok("news_seen", json!({ "category": cat, "up_to": root }))
             .await["unread"],
         0,
         "seeing what you do not follow is nothing to refuse"
+    );
+    assert_eq!(
+        alice.ok("news_timeline", json!({})).await,
+        json!({ "threads": [], "has_more": false }),
+        "a followed thread is not a followed category"
     );
     // Nor is leaving what you never followed, so long as it is there.
     alice
@@ -1147,6 +1177,155 @@ async fn subscribing_says_why_not() {
     assert_eq!(hello["news"]["subscribe"], false);
     assert!(hello["news"].get("auto_subscribe").is_none());
     assert_eq!(alice.refused("news_subs", json!({})).await, "not_available");
+    assert_eq!(
+        alice.refused("news_timeline", json!({})).await,
+        "not_available"
+    );
+}
+
+/// The `unread` marks of a timeline page, by starter id.
+fn marks(page: &Value) -> Vec<(u64, bool)> {
+    page["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["article"]["id"].as_u64().unwrap(),
+                t["unread"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A reader following two categories reads one stream of the threads
+/// started in both, by an ng client and a period one alike, and saying
+/// it saw a page does not mark seen an older thread the page never
+/// showed.
+#[tokio::test]
+async fn the_timeline_merges_what_a_reader_follows_and_sees_what_was_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy, ng) = start_server(dir.path(), Some(news_server())).await;
+    let (mut admin, _) = Ng::login(ng, "admin").await;
+    let (mut alice, _) = Ng::login(ng, "alice").await;
+    let (mut lurker, _) = Ng::login(ng, "lurker").await;
+    let quiet = category(&mut admin, None, "Quiet").await;
+    let busy = category(&mut admin, None, "Busy").await;
+    let elsewhere = category(&mut admin, None, "Elsewhere").await;
+    for cat in [quiet, busy] {
+        lurker
+            .ok("news_subscribe", json!({ "category": cat }))
+            .await;
+    }
+
+    let q1 = post(&mut alice, quiet, None, "Quiet news", "Rarely.").await;
+    post(&mut alice, elsewhere, None, "Not followed", "Unseen.").await;
+    let mut bob = Period::login(legacy, "bob").await;
+    let mut busy_threads = Vec::new();
+    for subject in ["One", "Two"] {
+        bob.ok(
+            POST_THREAD,
+            vec![
+                news_path(&[b"Busy"]),
+                (tag::NEWSSUBJECT, subject.as_bytes().to_vec()),
+                (tag::NEWSDATA, b"from 1996".to_vec()),
+                id_field(tag::THREADID, 0),
+            ],
+        )
+        .await;
+        let posted = lurker
+            .event("news_posted", |d| d["subject"] == subject)
+            .await;
+        busy_threads.push(posted["data"]["id"].as_u64().unwrap());
+    }
+    let [b1, b2] = busy_threads[..] else {
+        unreachable!()
+    };
+    let replied = post(&mut alice, busy, Some(b1), "Re: One", "A reply.").await;
+
+    let page = lurker.ok("news_timeline", json!({ "limit": 2 })).await;
+    assert_eq!(marks(&page), [(b2, true), (b1, true)]);
+    assert_eq!(page["has_more"], true);
+    let one = &page["threads"][1];
+    assert_eq!(one["article"]["category"], busy);
+    assert_eq!(one["article"]["subject"], "One");
+    assert_eq!(one["replies"], 1);
+    assert_eq!(one["last_id"], replied);
+
+    // Quiet's thread is older than anything on the page, so it stays
+    // unread however far the page reached.
+    let seen = lurker
+        .ok(
+            "news_seen",
+            json!({ "timeline": true, "from": b1, "up_to": b2 }),
+        )
+        .await;
+    assert_eq!(seen["unread"], 1);
+    let page = lurker.ok("news_timeline", json!({ "limit": 2 })).await;
+    assert_eq!(marks(&page), [(b2, false), (b1, false)]);
+    let older = lurker
+        .ok("news_timeline", json!({ "before": b1, "limit": 2 }))
+        .await;
+    assert_eq!(marks(&older), [(q1, true)]);
+    assert_eq!(older["has_more"], false);
+
+    // The run shown reached the end of the timeline.
+    let seen = lurker
+        .ok(
+            "news_seen",
+            json!({ "timeline": true, "from": 0, "up_to": b2 }),
+        )
+        .await;
+    assert_eq!(seen["unread"], 0);
+    let subs = lurker.ok("news_subs", json!({})).await;
+    assert!(
+        subs["subs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["unread"] == 0),
+        "{subs}"
+    );
+
+    let fresh = post(&mut alice, quiet, None, "Quiet again", "Twice.").await;
+    lurker.event("news_posted", |d| d["id"] == fresh).await;
+    let newer = lurker.ok("news_timeline", json!({ "after": b2 })).await;
+    assert_eq!(marks(&newer), [(fresh, true)]);
+}
+
+/// The timeline and its seen form each cost 4, a search's price, since
+/// each reads every followed category: either one spends a bucket of 4.
+#[tokio::test]
+async fn the_timeline_is_priced_by_what_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = RequestLimits {
+        requests: 4,
+        requests_per: Duration::from_secs(3600),
+        ..RequestLimits::default()
+    };
+    let (_, ng, _) = start_server_limited(
+        dir.path(),
+        Some(news_server()),
+        LegacyNews::default(),
+        |store| store as Arc<dyn NewsStore>,
+        limits,
+    )
+    .await;
+    for (method, params) in [
+        ("news_timeline", json!({})),
+        (
+            "news_seen",
+            json!({ "timeline": true, "from": 0, "up_to": 0 }),
+        ),
+    ] {
+        let (mut lurker, _) = Ng::login(ng, "lurker").await;
+        lurker.ok(method, params).await;
+        assert_eq!(
+            lurker.refused("ping", json!({})).await,
+            "rate_limited",
+            "{method}"
+        );
+    }
 }
 
 #[tokio::test]

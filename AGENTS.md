@@ -374,7 +374,9 @@ Three layers, all `cargo test --workspace`:
   the ng wire: the tree and its containment rules, threads in reading
   order and paged both ways, references and backlinks, tombstones, who
   hears that the news changed and who hears that it is theirs, following
-  and muting — and on the legacy wire: a scripted 1.5 client walking
+  and muting, a timeline merging the categories a reader follows, marked
+  seen without reaching a thread it never showed and priced as a search
+  — and on the legacy wire: a scripted 1.5 client walking
   the tree an ng client built, reading both parts of a markdown article,
   posting and keeping house, and a 1.2 client reading the flat category,
   posting into it and hearing its push, read from the store once

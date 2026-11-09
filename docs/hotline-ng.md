@@ -1562,16 +1562,18 @@ news body is different: it declares its own type (news.md §5).
   handshake spends its weight from. A write, or a request others hear
   of, costs 2: `chat`, `msg`, `nick`, `signs`, `block`, `unblock`,
   `msg_read`, `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
-  `news_seen`, `news_subscribe`, `news_unsubscribe`, `news_mute`,
-  `push_unregister`, `files_download`, `files_mkdir`, `files_delete`,
-  `files_move`, `files_comment`, `report_close`, `redact`, `revoke`,
+  `news_seen` (not its timeline form, below), `news_subscribe`,
+  `news_unsubscribe`, `news_mute`, `push_unregister`, `files_download`,
+  `files_mkdir`, `files_delete`, `files_move`, `files_comment`,
+  `report_close`, `redact`, `revoke`,
   `kick`, `friend_respond`, `friend_remove`, `friend_alias`,
   `presence`, `typing`, `request_answer` and `react`, and `friends` and
-  `requests`, which read a row of the store for each one listed. What fans out,
-  searches, asks a stranger, or joins, leaves or
-  renegotiates media costs 4: `news_post`, `news_delete`,
-  `news_node_create`, `news_node_rename`, `news_node_delete`,
-  `news_search`, `voice_join`, `voice_leave`, `video_start`,
+  `requests`, which read a row of the store for each one listed. What
+  fans out, searches, reads every followed category, asks a stranger,
+  or joins, leaves or renegotiates media costs 4: `news_post`,
+  `news_delete`, `news_node_create`, `news_node_rename`,
+  `news_node_delete`, `news_search`, `news_timeline`, `news_seen`'s
+  timeline form, `voice_join`, `voice_leave`, `video_start`,
   `video_stop`, `video_subscribe`, `push_register`, `report`,
   `purge`, `device_cert`, `friend_add`, `requests_clear`, `find_user`
   and `user_profile`. Every other request, the reads, a

@@ -1148,7 +1148,8 @@ without `subject` and `body` (`news.md` §9.2):
   rewrites, is never signed.
 
 An `article` object gains `signed` wherever it is served, in
-`news_article`, `news_thread` and `news_threads`; a search hit does not.
+`news_article`, `news_thread`, `news_threads` and `news_timeline`; a
+search hit does not.
 A deleted article loses `signed` with its body. A feed's article
 (`news-feeds.md`) is never signed. A classic reader is served the
 article as now: the plain downgrade and the subject cut at the legacy
