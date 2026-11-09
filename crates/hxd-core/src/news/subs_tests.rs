@@ -219,6 +219,14 @@ fn notices(rx: &mut Events) -> Vec<Notified> {
         .collect()
 }
 
+fn everything() -> TimelineQuery {
+    TimelineQuery {
+        before: None,
+        after: None,
+        limit: 50,
+    }
+}
+
 fn thread(id: ArticleId) -> String {
     SubScope::Thread(id).key()
 }
@@ -501,6 +509,14 @@ fn a_guest_neither_follows_nor_hears() {
         s.core.news_subscribe(guest, SubScope::Category(s.cat)),
         Err(NewsError::NoMailbox)
     );
+    assert_eq!(
+        s.core.news_timeline(guest, everything()),
+        Err(NewsError::NoMailbox)
+    );
+    assert_eq!(
+        s.core.news_seen_timeline(guest, 0, 1),
+        Err(NewsError::NoMailbox)
+    );
     let root = s.post(guest, None, "from nobody in particular");
     s.post_as("alice", Some(root), "a reply");
     assert!(notices(&mut rx).is_empty());
@@ -588,6 +604,14 @@ fn a_server_without_subscriptions_says_so() {
     assert_eq!(s.core.news_unread(alice), None);
     assert_eq!(
         s.core.news_subscribe(alice, SubScope::Category(s.cat)),
+        Err(NewsError::NotifyOff)
+    );
+    assert_eq!(
+        s.core.news_timeline(alice, everything()),
+        Err(NewsError::NotifyOff)
+    );
+    assert_eq!(
+        s.core.news_seen_timeline(alice, 0, 1),
         Err(NewsError::NotifyOff)
     );
     let root = s.post(alice, None, "a question");
@@ -777,4 +801,31 @@ fn a_feed_rings_its_followers_from_its_second_poll() {
         .news_feed_import(&feed, vec![item(1), item(2), item(3)])
         .unwrap();
     assert_eq!(s.gw.to("alice"), 1);
+}
+
+#[test]
+fn the_timeline_is_what_an_account_follows_until_it_is_seen() {
+    let s = Server::new(NotifyPolicy::default());
+    s.as_absent("alice", |alice| {
+        s.core
+            .news_subscribe(alice, SubScope::Category(s.cat))
+            .unwrap()
+    });
+    let root = s.post_as("bob", None, "news");
+    let (alice, _rx) = s.login("alice");
+    let page = s.core.news_timeline(alice, everything()).unwrap();
+    let marks: Vec<_> = page
+        .threads
+        .iter()
+        .map(|i| (i.head.article.id, i.unread))
+        .collect();
+    assert_eq!(marks, [(root, true)]);
+    assert_eq!(
+        s.core.news_seen_timeline(alice, root + 1, root),
+        Err(NewsError::BadRequest(
+            "What was shown starts after it ends."
+        ))
+    );
+    assert_eq!(s.core.news_seen_timeline(alice, root, root), Ok(0));
+    assert_eq!(s.core.news_unread(alice), Some(0));
 }

@@ -37,6 +37,7 @@ use tracing::warn;
 use super::{
     store_failed, ArticleId, Asker, AutoFollow, AutoSubscribe, NewPost, NewsError, NewsStore,
     NodeKind, Notified, NotifyPolicy, NotifyReason, Posted, SubScope, Subscriber, Subscription,
+    TimelinePage, TimelineQuery,
 };
 use crate::access::bit;
 use crate::inbox::Mailbox;
@@ -298,6 +299,33 @@ impl Core {
                 .map(|()| 0)
                 .map_err(store_failed),
         }
+    }
+
+    /// The threads started in every category this session's account
+    /// follows and has not muted, newest first.
+    pub fn news_timeline(&self, uid: Uid, q: TimelineQuery) -> Result<TimelinePage, NewsError> {
+        let (store, mailbox, _) = self.news_subscriber(uid)?;
+        store.timeline(&mailbox, &q).map_err(store_failed)
+    }
+
+    /// The client has shown its user the timeline from `from` up to
+    /// `up_to` ([`NewsStore::seen_timeline`]). Explicit, as
+    /// [`Self::news_seen`] is.
+    pub fn news_seen_timeline(
+        &self,
+        uid: Uid,
+        from: ArticleId,
+        up_to: ArticleId,
+    ) -> Result<usize, NewsError> {
+        let (store, mailbox, _) = self.news_subscriber(uid)?;
+        if from > up_to {
+            return Err(NewsError::BadRequest(
+                "What was shown starts after it ends.",
+            ));
+        }
+        store
+            .seen_timeline(&mailbox, from, up_to)
+            .map_err(|e| store_failed(e.into()))
     }
 
     /// The news half of `inbox_claim`: subscriptions are keyed the way a
