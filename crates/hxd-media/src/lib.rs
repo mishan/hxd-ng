@@ -44,6 +44,7 @@ use std::io::Cursor;
 use std::sync::{Condvar, Mutex};
 
 use hxd_core::avatar::{AvatarImages, AvatarLimits};
+use hxd_core::emoji::{EmojiImage, EmojiPolicy};
 use hxd_core::media::{Canonical, CodecLimits, MediaCodec, MediaReject, MediaType};
 use image::codecs::gif::{GifDecoder, GifEncoder};
 use image::codecs::jpeg::JpegEncoder;
@@ -66,6 +67,17 @@ const JPEG_QUALITY: u8 = 85;
 /// server that fits its avatars larger still sends legacy clients one
 /// within this.
 const LEGACY_MAX_DIMENSION: u32 = 256;
+
+/// The largest side of an emoji's source. An animation is fitted frame
+/// by frame, so its source's canvas is what its CPU scales with.
+pub const EMOJI_MAX_SOURCE: u32 = 1024;
+
+/// An emoji animation's whole length, the draft's.
+pub const EMOJI_MAX_DURATION_MS: u32 = 10_000;
+
+/// An emoji too large in bytes is shrunk by quarters until it fits, and
+/// refused once its longest side is down to this.
+const EMOJI_MIN_SIDE: u32 = 32;
 
 /// The pipeline. One per server, shared: it carries the limits and the
 /// decode permits.
@@ -90,6 +102,19 @@ impl Codec {
         Codec {
             limits: CodecLimits {
                 max_bytes,
+                ..self.limits
+            },
+            permits: self.permits.clone(),
+        }
+    }
+
+    /// This pipeline with other animation bounds, sharing its decode
+    /// permits: `inspect` and `fit_animation` read the codec's own.
+    pub fn with_animation(&self, max_frames: u32, max_duration_ms: u32) -> Self {
+        Codec {
+            limits: CodecLimits {
+                max_frames,
+                max_duration_ms,
                 ..self.limits
             },
             permits: self.permits.clone(),
@@ -231,6 +256,10 @@ impl Codec {
 }
 
 impl MediaCodec for Codec {
+    fn emoji(&self, input: &[u8], policy: &EmojiPolicy) -> Result<EmojiImage, MediaReject> {
+        self.make_emoji(input, policy)
+    }
+
     fn avatar(&self, input: &[u8], limits: &AvatarLimits) -> Result<AvatarImages, MediaReject> {
         self.make_avatar(input, limits)
     }
@@ -423,6 +452,36 @@ impl Codec {
         })
     }
 
+    /// `MediaCodec::emoji` for this pipeline: an animation that fits is
+    /// kept, and anything else is a PNG of the still or the first frame,
+    /// shrunk until it fits.
+    fn make_emoji(&self, input: &[u8], policy: &EmojiPolicy) -> Result<EmojiImage, MediaReject> {
+        let mut codec = self.with_animation(
+            policy.max_frames.min(self.limits.max_frames),
+            EMOJI_MAX_DURATION_MS.min(self.limits.max_duration_ms),
+        );
+        codec.limits.max_dimension = codec.limits.max_dimension.min(EMOJI_MAX_SOURCE);
+        let walked = codec.inspect(input, false)?;
+        let _permit = self.permits.acquire(self.limits.permit_wait)?;
+        let size = |w: u32, h: u32| -> Result<(u16, u16), MediaReject> {
+            let side = |n: u32| u16::try_from(n).map_err(|_| MediaReject::TooLarge);
+            Ok((side(w)?, side(h)?))
+        };
+        let still = if walked.format == Format::Gif && walked.frames > 1 {
+            let (animation, first) = codec.fit_animation(input, policy.max_dimension)?;
+            if animation.bytes.len() <= policy.max_bytes {
+                let (w, h) = size(animation.width, animation.height)?;
+                return Ok(EmojiImage::new(MediaType::Gif, w, h, true, animation.bytes));
+            }
+            DynamicImage::ImageRgba8(first)
+        } else {
+            fit(codec.decode_still(input, &walked)?, policy.max_dimension)
+        };
+        let (img, bytes) = png_within(still, policy.max_bytes)?.ok_or(MediaReject::TooLarge)?;
+        let (w, h) = size(img.width(), img.height())?;
+        Ok(EmojiImage::new(MediaType::Png, w, h, false, bytes))
+    }
+
     /// Every frame of an animation fitted to `max_dimension`, re-encoded
     /// as `reencode_gif` does, and the first frame for a still fallback.
     fn fit_animation(
@@ -558,6 +617,29 @@ fn still_gif(mut img: DynamicImage, max_bytes: usize) -> Result<Option<Vec<u8>>,
             return Ok(Some(out));
         }
         if img.width().max(img.height()) <= 16 {
+            return Ok(None);
+        }
+        img = img.resize(
+            (img.width() * 3 / 4).max(1),
+            (img.height() * 3 / 4).max(1),
+            FilterType::Triangle,
+        );
+    }
+}
+
+/// A PNG of `img` within `max_bytes`, shrinking it by quarters until it
+/// fits, as [`still_gif`] does. `None` once it is down to
+/// [`EMOJI_MIN_SIDE`].
+fn png_within(
+    mut img: DynamicImage,
+    max_bytes: usize,
+) -> Result<Option<(DynamicImage, Vec<u8>)>, MediaReject> {
+    loop {
+        let bytes = encode_png(&img)?;
+        if bytes.len() <= max_bytes {
+            return Ok(Some((img, bytes)));
+        }
+        if img.width().max(img.height()) <= EMOJI_MIN_SIDE {
             return Ok(None);
         }
         img = img.resize(

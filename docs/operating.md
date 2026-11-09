@@ -32,7 +32,8 @@ cmake; the TLS stack's `ring` still wants the C compiler.
 `voice`, `inbox`, `media`, `markdown`, `push`, `uniqush` and `feeds` are
 all on by default, so CI covers them. The `inbox` feature supplies the
 shared SQLite store for the inbox, history, news, moderation, avatars,
-the registrar and push devices; `media` supplies the image pipeline;
+the registrar, push devices and the emoji catalog; `media` supplies
+the image pipeline, which `hxd emoji` needs as well as `inbox`;
 `markdown` supplies the parser behind `[news] markdown = "render"`;
 `push` supplies the Web Push sender, and needs `inbox` for the store its
 devices live in; `uniqush` supplies the uniqush-push gateway beside it,
@@ -616,6 +617,35 @@ alone. A tombstone clears the key, and the database zeroes what it
 leaves behind. Make room by deleting threads, by raising a ceiling, or
 with `retain_days`. See [news.md](news.md) §7.4.
 
+## Emoji
+
+The server's emoji are a catalog in its database, and `hxd emoji` is
+what edits it, beside a running server or without one:
+
+```sh
+hxd emoji add party party.gif      # fitted, re-encoded, and given the next id
+hxd emoji rename party tada        # or by id, quoted for the shell: '#1'
+hxd emoji remove tada              # keeps its id and last name; the image goes
+hxd emoji list --removed
+```
+
+`add` makes the image here, through the media pipeline: a PNG for a
+still and a GIF for an animation, fitted within `max_dimension` and
+shrunk to fit `max_bytes`, or an animation's first frame where it
+cannot fit. A running server applies an edit on SIGHUP, so a batch of
+edits takes one SIGHUP. See
+[server-emoji.md](server-emoji.md).
+
+**A restored database restores the catalog, and invalidates what
+clients have cached of it.** A client caches an image under its id for
+good, because an id is never given to another picture. A restore puts
+back the database's record of the ids it gave as of the backup, so an
+id given since may be given again, to a different picture, and a client
+that cached the first draws it in its place. A client holding a
+revision past the restored one is sent the whole catalog only until the
+revision climbs back to it, and nothing tells it an id it cached
+changed hands. Restore the newest copy there is.
+
 ## Moderation and bans
 
 Moderators act from an ng client. The same acts, the reports and the
@@ -699,7 +729,7 @@ row says otherwise; each is whatever its key names.
 | `accounts/` | `[paths] accounts` | Every account, its password and its identity link. |
 | `roles.toml` | `[roles] file` | Every grant the roles gave; accounts keep listing roles that no longer grant anything. |
 | `rooms.toml` | `[rooms] file` | Every room, its gates and topic; their lines stay in the database with no room to read them in. |
-| The SQLite database, with its `-wal` | `[inbox] db`, `[history] db`, `[news] db`, `[avatars] db`, `[push] db` | Private messages, chat history, news, avatars, push devices, the moderation trail, reports and bans, and the registrars' records the server has fetched. Copy it with the server stopped or with `sqlite3 .backup`, never mid-write. |
+| The SQLite database, with its `-wal` | `[inbox] db`, `[history] db`, `[news] db`, `[avatars] db`, `[push] db` | Private messages, chat history, news, avatars, push devices, the moderation trail, reports and bans, the emoji catalog, and the registrars' records the server has fetched. Copy it with the server stopped or with `sqlite3 .backup`, never mid-write. |
 | `news-guest.key`, beside the news database | `[news] guest_secret` | The guests' articles already kept are counted against no address. |
 | `messaging-requests.key`, beside the inbox database | `[messaging] request_secret` | Every address's count of requests sent today starts again, no guest is held by its address any more, and approving a guest no longer releases what it had waiting. |
 | `news-blobs/` | `[news] blobs` | Every image attached to an article. |
@@ -739,6 +769,7 @@ other key takes a restart.
 | `[tls] cert` and `key` | The next handshake uses the new pair; nobody is dropped | Certificate in use unchanged |
 | `[[link.peer]]`, and `hxd link suspend` and `resume` | A removed or suspended peer is unlinked, a new one dialed; `hxd ban lift n…` requests are sent | Peers unchanged; `[link]` taken out of the file stays on until a restart |
 | `[banner] file`, when one is in use | The next client to agree is shown the new one | Banner unchanged |
+| The emoji catalog, when `[emoji]` is enabled, from the database `hxd emoji` writes | What `hxd emoji` added, renamed or removed is what the server holds | Catalog unchanged |
 
 ## Configuration reference
 
@@ -1311,11 +1342,11 @@ enabled = false           # off unless turned on
 
 ### `[emoji]`
 
-The Server Emoji draft's catalog of images an operator curates. Its
-settings are checked at startup, and a server of this version keeps
-no catalog yet and offers nothing on either wire. It needs a database:
-the catalog is kept in the one `[inbox]`, `[history]` or `[news]`
-names.
+The Server Emoji draft's catalog of images an operator curates with
+`hxd emoji` ([Emoji](#emoji)). A server of this version keeps the
+catalog and rereads it on SIGHUP, and offers it on neither wire yet. It
+needs a database: the catalog is kept in the one `[inbox]`, `[history]`
+or `[news]` names.
 
 ```toml
 [emoji]

@@ -64,7 +64,8 @@ fn init_tracing() {
 /// `[tls]`'s certificate and key from the paths the server started with,
 /// so a renewal reaches the next handshake without dropping a session,
 /// `[banner]`'s file, which the next client to agree is shown, the
-/// account files of everyone logged in, and the rooms file.
+/// account files of everyone logged in, the rooms file, and the emoji
+/// catalog.
 #[cfg(unix)]
 async fn reload_on_hangup(
     core: std::sync::Arc<hxd_core::Core>,
@@ -132,6 +133,19 @@ async fn reload_on_hangup(
                 ),
                 Ok(Err(e)) => tracing::error!("SIGHUP: rooms: {e}; the rooms are unchanged"),
                 Err(e) => tracing::error!("SIGHUP: room reload failed: {e}"),
+            }
+        }
+        // What `hxd emoji` changed meanwhile.
+        if core.emoji_policy().is_some() {
+            let emoji = core.clone();
+            match tokio::task::spawn_blocking(move || emoji.emoji_reload()).await {
+                Ok(Ok(moved)) => tracing::info!(
+                    "SIGHUP: emoji catalog {} revision {}",
+                    if moved { "now at" } else { "unchanged at" },
+                    core.emoji_revision().unwrap_or_default()
+                ),
+                Ok(Err(e)) => tracing::error!("SIGHUP: emoji: {e}; the catalog is unchanged"),
+                Err(e) => tracing::error!("SIGHUP: emoji reload failed: {e}"),
             }
         }
         if let Some(reg) = registrar.as_deref() {
@@ -355,6 +369,8 @@ enum Command {
     LinkResetId,
     /// `room …`: the words after `room`.
     Room(Vec<String>),
+    /// `emoji …`: the words after `emoji`.
+    Emoji(Vec<String>),
 }
 
 const USAGE: &str = "usage:\n  \
@@ -397,7 +413,9 @@ hxd [--config …] role rm <name>\n  \
 hxd [--config …] link status\n  \
 hxd [--config …] link suspend|resume <peer>\n  \
 hxd [--config …] link reset-id\n  \
-hxd [--config …] room list|create|edit|archive|unarchive|delete …\n\n\
+hxd [--config …] room list|create|edit|archive|unarchive|delete …\n  \
+hxd [--config …] emoji list [--removed] | add <name> <file> | rename <name|'#id'> <new-name>\n    \
+| remove <name|'#id'>\n\n\
 `news-reindex` rebuilds the news search index from the articles: the\n\
 repair for an index that has drifted.\n\n\
 `news feeds` lists the feeds the news database remembers: their\n\
@@ -476,6 +494,10 @@ an empty list leaves it to the access bits), --position, --max-lines and\n\
 `delete <name> --purge` leaves only its id, taken for good, and the\n\
 server deletes its lines. `room` alone lists every flag. A running\n\
 server applies an edit on SIGHUP, and gives a new room its id then.\n\n\
+`emoji` edits the server's emoji catalog in its database ([emoji]):\n\
+`add` makes <file>, a PNG, GIF or JPEG, into the emoji <name> under a\n\
+new id; `rename` gives one another name, and `remove` keeps only its id\n\
+and last name. A running server applies an edit on SIGHUP.\n\n\
 `link status` says how each [[link.peer]] stands, as the running server\n\
 last wrote it. `link suspend` pauses a peer's link: on SIGHUP it is\n\
 closed, what it showed goes, and every attempt to link is refused until\n\
@@ -647,9 +669,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 std::process::exit(0);
             }
             other if other.starts_with('-') => return Err(format!("unknown argument {other:?}")),
-            // Its flags are its own (`hxd::rooms::command`).
-            "room" if rest.is_empty() => {
-                rest.push("room".into());
+            // Their flags are their own (`hxd::rooms::command`,
+            // `hxd::emoji::command`).
+            verb @ ("room" | "emoji") if rest.is_empty() => {
+                rest.push(verb.into());
                 rest.extend(args.by_ref());
             }
             other => rest.push(other.to_string()),
@@ -720,6 +743,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                     | &"role"
                     | &"link"
                     | &"room"
+                    | &"emoji"
             )
         )
     {
@@ -760,8 +784,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if (fingerprint.is_some() || dry_run) && words.first() == Some(&"registrar") {
         return Err("--fingerprint and --dry-run belong to `inbox purge`".to_string());
     }
-    if let Some(("room", words)) = rest.split_first().map(|(w, r)| (w.as_str(), r)) {
-        return Ok((config, Command::Room(words.to_vec())));
+    match rest.split_first().map(|(w, r)| (w.as_str(), r)) {
+        Some(("room", words)) => return Ok((config, Command::Room(words.to_vec()))),
+        Some(("emoji", words)) => return Ok((config, Command::Emoji(words.to_vec()))),
+        _ => {}
     }
     // `purge` shares `--fingerprint` and `--dry-run` with `inbox purge`,
     // and is the only other command that does. After every other flag's
@@ -1256,6 +1282,10 @@ async fn main() {
             }
             Command::RoleRm { name } => {
                 println!("{}", hxd::roles::remove(&config, name)?);
+                return Ok(());
+            }
+            Command::Emoji(args) => {
+                println!("{}", hxd::emoji::command(&config, args)?);
                 return Ok(());
             }
             Command::Room(args) => {

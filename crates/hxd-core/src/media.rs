@@ -252,6 +252,17 @@ pub trait MediaCodec: Send + Sync + 'static {
         Err(MediaReject::Unsupported)
     }
 
+    /// Make a server emoji: fitted to `policy.max_dimension`, a PNG for
+    /// a still and a GIF for an animation, within `policy.max_bytes`.
+    /// Implementations without emoji refuse.
+    fn emoji(
+        &self,
+        _input: &[u8],
+        _policy: &crate::emoji::EmojiPolicy,
+    ) -> Result<crate::emoji::EmojiImage, MediaReject> {
+        Err(MediaReject::Unsupported)
+    }
+
     /// Make a file's preview (`docs/hotline-ng.md` §7.2): a still, its
     /// first frame for an animation, fitted to `max_dimension`.
     /// Implementations without previews refuse.
