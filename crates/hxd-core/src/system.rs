@@ -744,6 +744,7 @@ impl Core {
                 media: None,
                 signed: None,
                 re: None,
+                emoji: None,
                 im: None,
                 reactions: None,
             },

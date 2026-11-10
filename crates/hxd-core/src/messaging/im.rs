@@ -56,6 +56,8 @@ pub struct Im {
     pub approval: bool,
     /// What it answers, as its sender named it.
     pub re: Option<crate::reply::Reply>,
+    /// The emoji refs its sender sent, as kept.
+    pub emoji: Option<crate::emoji::EmojiRefs>,
 }
 
 /// What became of an instant message: `OK` where a messenger session
@@ -95,6 +97,7 @@ fn im_of(m: StoredMessage, queued: bool, approval: bool) -> Option<Event> {
         signed: m.signed.map(|s| s.form),
         approval,
         re: m.re,
+        emoji: m.emoji,
     })))
 }
 
@@ -233,7 +236,7 @@ impl Core {
         let id = self
             .friendship(&me.mailbox, &them)?
             .ok_or(MessagingError::NotFriends)?;
-        self.im_store(uid, &me, &them, (id, false), text, guid, signed, None)
+        self.im_store(uid, &me, &them, (id, false), text, guid, signed, None, None)
     }
 
     /// Store a message on the friendship or approval `on` (`true` for an
@@ -250,6 +253,7 @@ impl Core {
         guid: Option<MessageGuid>,
         signed: Option<SignedMsg>,
         re: Option<crate::reply::Reply>,
+        emoji: Option<crate::emoji::EmojiRefs>,
     ) -> Result<ImSent, MessagingError> {
         let (on, approval) = on;
         if text.len() > self.messaging_policy.max_message_bytes {
@@ -333,6 +337,7 @@ impl Core {
                 media: None,
                 signed: form.clone(),
                 re: re.clone().map(Box::new),
+                emoji: emoji.clone(),
                 im: Some(guid.clone()),
                 reactions: None,
             };
@@ -349,6 +354,7 @@ impl Core {
                 signed: form,
                 approval: false,
                 re,
+                emoji,
             }));
             for u in messengers {
                 r.send_to(u, im.clone());
@@ -380,6 +386,7 @@ impl Core {
                     friendship: Some(SentOn::Relation(on)),
                     sender_address: None,
                     re,
+                    emoji,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -716,6 +723,7 @@ impl Core {
                         friendship: Some(SentOn::Relation(id)),
                         sender_address: None,
                         re: None,
+                        emoji: None,
                     },
                     self.inbox_policy.max_queued,
                 )

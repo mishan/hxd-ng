@@ -1,8 +1,9 @@
 # Server emoji
 
 Status: the catalog, its images, `hxd emoji`, the server's copy of
-the catalog and server emoji as reaction keys on the ng wire are built
-(§9); neither wire offers the catalog itself yet. This binds
+the catalog, server emoji as reaction keys on the ng wire and
+references in the domain are built (§10); neither wire offers the
+catalog or carries references yet. This binds
 nobody but this server: the protocol is the Server Emoji draft
 (`Capabilities-Server-Emoji.md`, a draft written for this server, in
 fogWraith's protocol documents and not yet allocated), which hxd-ng is
@@ -175,7 +176,29 @@ too, which draws a placeholder for it.
 - **A moderator's clear** records each server emoji by the name the
   catalog gives it, removed or not, and by its id once it is forgotten.
 
-## 6. Restoring a backup
+## 6. References
+
+What makes `:party:` in a line or a message an emoji is a **reference**
+its sender's client sends beside the text, binding the name to an id
+for that one message; the text is sent, kept and relayed as typed, and
+the server never reads it for names. A chat line, a private chat's line,
+a private message and an instant message take them.
+
+- **Kept** are those of the first 32 sent that name a live entry, in the
+  copy the server serves (§4), by exactly its current name, then each id
+  once, the first kept, in the order sent. Every other is dropped
+  silently: a message is never refused over its references. A
+  reference the text never uses is kept, and readers ignore it.
+- **Stored** beside the line or the message, as what it answers is,
+  and gone with its words when a redaction or a purge takes them.
+- **Relayed** to a reader whose wire negotiated server emoji, and to
+  nobody else, who reads `:party:`. A reference names an id, so a later
+  rename leaves the image the sender saw.
+- **Never across a link**: a lobby line crosses with its text alone, a
+  linked user's line has none, and a message to one is sent without
+  them.
+
+## 7. Restoring a backup
 
 Restoring the database restores the catalog with it, and with it a
 revision a client may already have passed. A client holding a revision
@@ -186,7 +209,7 @@ names a different picture: the database's record of the ids it gave is
 restored with it, so an id given after the backup may be given again.
 A restore invalidates every client's cache.
 
-## 7. Limits
+## 8. Limits
 
 | What | Bound |
 |---|---|
@@ -196,11 +219,12 @@ A restore invalidates every client's cache.
 | `max_frames` | 50, from 16 to 150 |
 | An animation | 10 seconds |
 | A source | 1024 pixels a side; 2 MiB as `hxd emoji` reads it |
+| References | the first 32 sent, each id once |
 
 A lowered `max_bytes` or `max_dimension` holds new images to it; an
 image already stored stays as it was made.
 
-## 8. Failure modes
+## 9. Failure modes
 
 - **A store error at startup**: the server does not start. On SIGHUP:
   the copy in use stays, logged.
@@ -208,15 +232,18 @@ image already stored stays as it was made.
   last SIGHUP.
 - **An image the pipeline refuses**: `hxd emoji` says why, the catalog
   unchanged.
+- **A removal racing a reference or a reaction**: one may land. It names
+  an id, and is drawn as `:name:` once the catalog says the entry is
+  removed.
 
-## 9. Stages
+## 10. Stages
 
 | Stage | Content | Built |
 |---|---|---|
 | E1 | The catalog's types, names and stores, schema V37, `[emoji]` | yes |
 | E2 | The emoji pipeline, `hxd emoji`, the server's copy and its reload on SIGHUP | yes |
 | E3 | Server emoji as reaction keys (§5) | yes |
-| E4 | References in the domain, and the classic wire: bit 20, the catalog, image and notification transactions, references in and out | no |
+| E4 | References in the domain (§6), and the classic wire: bit 20, the catalog, image and notification transactions, references in and out | references |
 | E5 | The ng wire: `emoji` listed in `caps` with its block, `emoji_list`, `emoji_changed`, references, `GET /emoji/{hash}` | no |
 | E6, E7 | hx-ng, and the out-of-process suite | no |
 

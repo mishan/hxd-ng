@@ -47,6 +47,7 @@ pub fn run(new_store: &dyn Fn() -> Gated) {
     each_mailbox_numbers_its_own_mail(&*new_store().inbox);
     references_are_random_and_follow_the_row(&*new_store().inbox);
     a_message_keeps_what_it_answers(&*new_store().inbox);
+    a_message_keeps_the_emoji_it_names(&*new_store().inbox);
     a_cursor_is_not_handed_out_again(&*new_store().inbox);
     a_merge_numbers_what_it_moves_after_both_mailboxes(&*new_store().inbox);
     an_unlinked_login_counts_on_past_its_identity(&*new_store().inbox);
@@ -158,6 +159,7 @@ fn msg(to: &Mailbox, from: &Mailbox, body: &str, sent_at: SystemTime) -> NewMess
         friendship: None,
         sender_address: None,
         re: None,
+        emoji: None,
     }
 }
 
@@ -241,6 +243,19 @@ fn a_message_keeps_what_it_answers(s: &dyn MessageStore) {
     m.re = Some(re.clone());
     push(s, &m);
     assert_eq!(s.list(&dave, None, 1).unwrap()[0].re, Some(re));
+}
+
+fn a_message_keeps_the_emoji_it_names(s: &dyn MessageStore) {
+    let (dave, alice) = (Mailbox::login("dave"), Mailbox::login("alice"));
+    let refs = crate::emoji::conformance::refs();
+    let mut m = msg(&dave, &alice, ":party: :polly:", at(1));
+    m.emoji = Some(refs.clone());
+    push(s, &m);
+    push(s, &msg(&dave, &alice, "plain", at(2)));
+    let listed = s.list(&dave, None, 2).unwrap();
+    let kept: Vec<_> = listed.iter().map(|m| m.emoji.as_ref()).collect();
+    assert_eq!(kept, [None, Some(&refs)]);
+    assert_eq!(s.pending(&dave, 1).unwrap()[0].emoji, Some(refs));
 }
 
 fn references_are_random_and_follow_the_row(s: &dyn MessageStore) {
@@ -543,6 +558,7 @@ fn a_message_round_trips_whole(s: &dyn MessageStore) {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         },
     );
     let got = &s.pending(&Mailbox::identified("dave", fp(1)), 10).unwrap()[0];
@@ -698,6 +714,7 @@ fn requests_turned_to_mail_are_gated_as_mail_and_still_not_counted_as_sent(s: &d
                 friendship: Some(SentOn::Request),
                 sender_address: address.map(str::to_owned),
                 re: None,
+                emoji: None,
                 ..msg(&dave, from, body, at(t))
             },
         );
@@ -749,6 +766,7 @@ fn a_guests_requests_are_deleted_by_address(s: &dyn MessageStore) {
                 friendship: Some(SentOn::Request),
                 sender_address: address.map(str::to_owned),
                 re: None,
+                emoji: None,
                 ..msg(&dave, from, body, at(1))
             },
         );

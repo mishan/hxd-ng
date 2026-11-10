@@ -531,7 +531,8 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
             }
         }
         Op::Presence(update) => done(core.set_presence(uid, update)),
-        Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid)) {
+        Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid), &[])
+        {
             Ok(outcome) => {
                 let reason = match outcome {
                     MsgOutcome::Delivered(_) | MsgOutcome::Im { queued: false, .. } => {
@@ -1243,6 +1244,7 @@ mod tests {
             signed: None,
             friendship: None,
             re: None,
+            emoji: None,
             delivered_at: None,
             read_at: None,
         }

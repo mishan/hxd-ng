@@ -850,6 +850,7 @@ fn a_claim_restamps_what_was_sent_on_a_friendship_it_merged() {
                 friendship: Some(SentOn::Relation(lost)),
                 sender_address: None,
                 re: None,
+                emoji: None,
             },
             10,
         )
@@ -919,7 +920,7 @@ fn a_send_by_login_from_a_session_without_an_inbox_is_refused() {
         .unwrap()
         .has_inbox = false;
     assert_eq!(
-        s.core.im_send_login(a, "bob", "hi".into(), None),
+        s.core.im_send_login(a, "bob", "hi".into(), None, &[]),
         Err(MessagingError::NotEnabled)
     );
     assert!(s.inbox.all().is_empty());
@@ -1255,7 +1256,8 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
             Some(g4.clone()),
             None,
             signed(4, 4),
-            None
+            None,
+            &[]
         ),
         Ok(crate::MsgOutcome::Requested)
     );
@@ -2091,6 +2093,7 @@ fn a_backlog_the_flush_must_skip_never_starves_private_mail() {
             friendship,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         let backlog = InboxPolicy::default().deliver_at_flush + 5;
         for i in 0..backlog {
@@ -2307,6 +2310,7 @@ fn a_request_to_a_full_mailbox_is_dropped_and_counted() {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 usize::MAX,
             )
@@ -2407,6 +2411,7 @@ fn an_approvals_backlog_never_starves_a_friends_im() {
                     friendship: Some(SentOn::Relation(on)),
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 1000,
             )

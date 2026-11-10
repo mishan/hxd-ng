@@ -2215,13 +2215,13 @@ async fn dispatch(
                             return finish(ws_tx, out).await;
                         }
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_signed(from, uid, text, guid, media, signed, re)
+                            c.msg_signed(from, uid, text, guid, media, signed, re, &[])
                         })
                         .await
                     }
                     (None, Some(login)) => {
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_login_signed(from, &login, text, guid, media, signed, re)
+                            c.msg_login_signed(from, &login, text, guid, media, signed, re, &[])
                         })
                         .await
                     }

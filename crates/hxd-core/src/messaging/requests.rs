@@ -14,6 +14,7 @@ use std::time::SystemTime;
 use super::im::understands_requests;
 use super::{store_failed, Key, Me, MessagingError};
 use crate::chat::{ChatError, MsgOutcome, SignedMsg};
+use crate::emoji::{EmojiRef, EmojiRefs};
 use crate::inbox::{Found, Mailbox, MessageGuid, MessageKind, NewMessage, Pushed, StoredMessage};
 use crate::relationships::{AccountUpdate, LedgerEntry, Recorded, RequestKind, Requester, SentOn};
 use crate::reply::Reply;
@@ -177,6 +178,7 @@ impl Core {
         media: bool,
         signed: &Option<SignedMsg>,
         re: &Option<Reply>,
+        emoji: &Option<EmojiRefs>,
     ) -> Option<Result<MsgOutcome, ChatError>> {
         // The guests are answered by `request_answer`, never by writing
         // back: an approval of `guest` would let every guest in.
@@ -300,7 +302,7 @@ impl Core {
             }
         }
         Some(
-            self.route(uid, sending, them, friend, text, guid, signed, re)
+            self.route(uid, sending, them, friend, text, guid, signed, re, emoji)
                 .map_err(chat_error),
         )
     }
@@ -317,6 +319,7 @@ impl Core {
         to: &str,
         text: String,
         guid: Option<MessageGuid>,
+        emoji: &[EmojiRef],
     ) -> Result<MsgOutcome, MessagingError> {
         let me = self.messenger(uid)?;
         // As an ng `msg` from it would never be routed as one.
@@ -336,7 +339,10 @@ impl Core {
             understands: me.understands,
             classic: false,
         };
-        self.route(uid, sending, them, friend, &text, &guid, &None, &None)
+        let emoji = self.emoji_keep(emoji);
+        self.route(
+            uid, sending, them, friend, &text, &guid, &None, &None, &emoji,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -350,6 +356,7 @@ impl Core {
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
         re: &Option<Reply>,
+        emoji: &Option<EmojiRefs>,
     ) -> Result<MsgOutcome, MessagingError> {
         let rel = self.friends_store()?;
         let me = Me {
@@ -387,6 +394,7 @@ impl Core {
                 guid.clone(),
                 signed.clone(),
                 re.clone(),
+                emoji.clone(),
             )
             .map(|sent| MsgOutcome::Im {
                 queued: !sent.delivered && sent.reference.is_some(),
@@ -433,6 +441,7 @@ impl Core {
             guid,
             signed,
             re,
+            emoji,
             account.requests_opted_at,
         )?;
         Ok(MsgOutcome::Requested)
@@ -450,6 +459,7 @@ impl Core {
         guid: &Option<MessageGuid>,
         signed: &Option<SignedMsg>,
         re: &Option<Reply>,
+        emoji: &Option<EmojiRefs>,
         opted_at: Option<SystemTime>,
     ) -> Result<(), MessagingError> {
         let rel = self.friends_store()?;
@@ -589,6 +599,7 @@ impl Core {
                         _ => None,
                     },
                     re: re.clone(),
+                    emoji: emoji.clone(),
                 },
                 self.inbox_policy.max_queued,
             )

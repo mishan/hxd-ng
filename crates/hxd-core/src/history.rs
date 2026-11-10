@@ -98,6 +98,8 @@ pub struct NewLine {
     pub home: Option<LineHome>,
     /// What the line answers, as its sender named it.
     pub re: Option<crate::reply::Reply>,
+    /// The emoji refs its sender sent, as kept (`crate::emoji`).
+    pub emoji: Option<crate::emoji::EmojiRefs>,
 }
 
 /// A linked server's user's home server, as its line was logged
@@ -173,6 +175,8 @@ pub struct LogLine {
     pub home: Option<LineHome>,
     /// [`NewLine::re`], until the line is redacted.
     pub re: Option<crate::reply::Reply>,
+    /// [`NewLine::emoji`], until the line is redacted.
+    pub emoji: Option<crate::emoji::EmojiRefs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +433,7 @@ impl MemoryInner {
             home_key: line.home_key,
             home: line.home.clone(),
             re: line.re.clone(),
+            emoji: line.emoji.clone(),
         });
         if let Some(key) = line.ghost {
             self.ghosts.insert(id, key);
@@ -544,6 +549,7 @@ impl ChatLog for MemoryLog {
         line.signed = None;
         line.home = None;
         line.re = None;
+        line.emoji = None;
         line.flags = line.flags.with(LineFlags::DELETED);
         inner.signed.retain(|_, at| at.id != id);
         inner.reactions.retain(|r| r.line != id);
@@ -910,6 +916,7 @@ pub mod conformance {
             guid: None,
             signed: None,
             re: None,
+            emoji: None,
         }
     }
 
@@ -932,6 +939,7 @@ pub mod conformance {
         a_rooms_mark_is_kept_and_its_unsigned_lines_are_found(new_log());
         a_linked_lines_signature_is_restored_beside_its_home_key(new_log());
         a_reply_is_kept_until_its_own_line_is_redacted(new_log());
+        a_lines_emoji_go_with_its_words(new_log());
         lines_are_fetched_by_id_in_their_channel_alone(new_log());
         reactions_are_counted_per_account_in_the_order_keys_came(new_log());
         reactions_are_held_to_their_caps_when_they_add(new_log());
@@ -1301,6 +1309,38 @@ pub mod conformance {
         assert!(log.tombstone(3, "carol", SystemTime::now()).unwrap());
         assert_eq!(kept(2).as_ref(), Some(&replies[0]));
         assert_eq!(kept(3), None);
+    }
+
+    /// Read back by every path a line is, until a redaction or a purge
+    /// takes them with the text.
+    fn a_lines_emoji_go_with_its_words(log: Box<dyn ChatLog>) {
+        let refs = crate::emoji::conformance::refs();
+        for n in 1..=3 {
+            log.append(&NewLine {
+                emoji: (n != 2).then(|| refs.clone()),
+                ..line(n)
+            })
+            .unwrap();
+        }
+        let kept = |id| log.line(id).unwrap().unwrap().emoji;
+        assert_eq!((kept(1), kept(2)), (Some(refs.clone()), None));
+        let page = log
+            .query(&HistoryQuery {
+                channel: 0,
+                before: None,
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        let paged: Vec<_> = page.lines.iter().map(|l| l.emoji.is_some()).collect();
+        assert_eq!(paged, [true, false, true]);
+        assert_eq!(log.lines(0, &[3]).unwrap()[0].emoji, Some(refs));
+        assert!(log.tombstone(1, "carol", SystemTime::now()).unwrap());
+        assert_eq!(
+            log.tombstone_all(&[3], "carol", SystemTime::now()).unwrap(),
+            [3]
+        );
+        assert_eq!((kept(1), kept(3)), (None, None));
     }
 
     fn lines_are_fetched_by_id_in_their_channel_alone(log: Box<dyn ChatLog>) {
@@ -1929,7 +1969,8 @@ mod core_tests {
         let (b, _) = test_attach(&core, "bob", access);
         let (cid, _) = core.chat_create(a, b).unwrap();
         core.chat_join(cid, b, "").unwrap();
-        core.chat_private(cid, a, "secret".into(), 0, None).unwrap();
+        core.chat_private(cid, a, "secret".into(), 0, None, &[])
+            .unwrap();
         assert!(log
             .query(&HistoryQuery {
                 channel: 0,

@@ -427,6 +427,7 @@ mod tests {
                 friendship,
                 sender_address: None,
                 re: None,
+                emoji: None,
             };
             match self.inbox.push(&m, 100).unwrap() {
                 Pushed::Stored {
