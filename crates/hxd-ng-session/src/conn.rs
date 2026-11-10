@@ -197,6 +197,8 @@ pub(crate) struct SessState {
     pub(crate) replies: bool,
     /// And `reactions`, likewise.
     pub(crate) reactions: bool,
+    /// And `emoji`, likewise.
+    pub(crate) emoji: bool,
 }
 
 impl SessState {
@@ -856,6 +858,7 @@ async fn handle_login(
             guest_identities: p.guest_identities && p.messaging && ctx.core.messaging_enabled(),
             replies: p.replies && !crate::replies::targets(ctx).is_empty(),
             reactions: p.reactions && !crate::reactions::targets(ctx).is_empty(),
+            emoji: p.emoji && ctx.core.emoji_policy().is_some(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -889,6 +892,7 @@ async fn handle_login(
     let attach_guest_identities = attach.transport.guest_identities;
     let replies = attach.transport.replies;
     let reactions = attach.transport.reactions;
+    let emoji = attach.transport.emoji;
     let attached = if revoked {
         None
     } else {
@@ -1234,6 +1238,7 @@ async fn handle_login(
             set_subject: account.set_subject,
             replies,
             reactions,
+            emoji,
         },
         events,
     ))
@@ -1347,6 +1352,7 @@ async fn handle_resume(
         set_subject: account.as_ref().is_some_and(|account| account.set_subject),
         replies: ctx.core.user(uid).is_some_and(|u| u.transport.replies),
         reactions: ctx.core.user(uid).is_some_and(|u| u.transport.reactions),
+        emoji: ctx.core.user(uid).is_some_and(|u| u.transport.emoji),
     };
 
     // From here the session is attached: any send failure means the new

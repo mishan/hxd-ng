@@ -378,7 +378,7 @@ impl Core {
         Ok(self)
     }
 
-    fn emoji_catalog(&self) -> Option<Arc<Catalog>> {
+    pub(crate) fn emoji_catalog(&self) -> Option<Arc<Catalog>> {
         let state = self.emoji.as_ref()?;
         Some(state.snapshot.lock().unwrap().clone())
     }

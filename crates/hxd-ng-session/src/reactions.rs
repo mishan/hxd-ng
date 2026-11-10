@@ -38,16 +38,25 @@ pub(crate) fn login_json(ctx: &NgCtx) -> Value {
     })
 }
 
-/// A key as a client sent it: `{ "emoji" }` and nothing else. A server's
-/// own emoji, `{ "custom" }`, is not offered here.
-fn key(v: &Value) -> Option<ReactionKey> {
+/// A key as a client sent it: `{ "emoji" }`, or from a session that
+/// declared `emoji` one of the server's by id, `{ "custom" }`, and
+/// nothing else.
+fn key(v: &Value, emoji: bool) -> Option<ReactionKey> {
     let o = v.as_object().filter(|o| o.len() == 1)?;
-    ReactionKey::emoji(o.get("emoji")?.as_str()?)
+    match (o.get("emoji"), o.get("custom")) {
+        (Some(e), _) => ReactionKey::emoji(e.as_str()?),
+        (_, Some(id)) if emoji => {
+            let id = u32::try_from(id.as_u64()?).ok()?;
+            Some(ReactionKey::Custom(hxd_core::emoji::EmojiId(id)))
+        }
+        _ => None,
+    }
 }
 
 fn key_json(key: &ReactionKey) -> Value {
     match key {
         ReactionKey::Emoji(e) => json!({ "emoji": e }),
+        ReactionKey::Custom(id) => json!({ "custom": id.0 }),
     }
 }
 
@@ -139,13 +148,16 @@ enum Act {
     },
 }
 
+const KEY_REFUSED: &str =
+    "`key` is not one emoji, nor one of this server's from a session that declared `emoji`.";
+
 /// `react`'s params, or the `bad_request` they earn: a key on every act
 /// but a clear, which is of a line and takes neither `remove` nor a key,
 /// a reason on a clear alone, and `with` on an `im` target alone.
-fn act(ctx: &NgCtx, p: ReactParams) -> Result<Act, &'static str> {
+fn act(ctx: &NgCtx, p: ReactParams, custom: bool) -> Result<Act, &'static str> {
     let target = crate::replies::parse(&p.target, &targets(ctx))
         .ok_or("`target` names no kind this server takes.")?;
-    let emoji = |k: Option<Value>| k.as_ref().and_then(key).ok_or("`key` is not one emoji.");
+    let emoji = |k: Option<Value>| k.as_ref().and_then(|k| key(k, custom)).ok_or(KEY_REFUSED);
     match (target, p.clear, p.with) {
         (Reply::Line { room, id }, true, None) if p.key.is_none() && !p.remove => Ok(Act::Clear {
             room,
@@ -186,7 +198,7 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
     let Ok(p) = serde_json::from_value::<ReactParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed react.");
     };
-    let act = match act(ctx, p) {
+    let act = match act(ctx, p, state.emoji) {
         Ok(act) => act,
         Err(why) => return reply_err(id, "bad_request", why),
     };
@@ -234,6 +246,7 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
         Some(Err(ReactError::NoSuchTarget)) => {
             reply_err(id, "no_such_target", "No such line or message.")
         }
+        Some(Err(ReactError::NoSuchEmoji)) => reply_err(id, "no_such_emoji", "No such emoji."),
         Some(Err(ReactError::TooManyReactions)) => reply_err(
             id,
             "too_many_reactions",
@@ -278,6 +291,7 @@ struct AskedParams {
 fn asked_params(
     taken: &[&str],
     p: AskedParams,
+    custom: bool,
 ) -> Result<(Vec<Reply>, Option<ReactionKey>), &'static str> {
     if !(1..=TARGETS_MAX).contains(&p.targets.len()) {
         return Err("`targets` takes 1 to 50 targets.");
@@ -294,7 +308,7 @@ fn asked_params(
     let key = match p.key {
         None => None,
         Some(_) if targets.len() != 1 => return Err("`key` goes with one target."),
-        Some(k) => Some(key(&k).ok_or("`key` is not one emoji.")?),
+        Some(k) => Some(key(&k, custom).ok_or(KEY_REFUSED)?),
     };
     Ok((targets, key))
 }
@@ -322,7 +336,7 @@ pub(crate) async fn asked(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
     let Ok(p) = serde_json::from_value::<AskedParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed reactions.");
     };
-    let (targets, key) = match asked_params(&targets(ctx), p) {
+    let (targets, key) = match asked_params(&targets(ctx), p, state.emoji) {
         Ok(asked) => asked,
         Err(why) => return reply_err(id, "bad_request", why),
     };
@@ -358,7 +372,7 @@ mod tests {
             json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
         let thumbs = json!({ "emoji": "👍" });
         let parse = |targets: Vec<Value>, key: Option<Value>| {
-            asked_params(&taken, AskedParams { targets, key })
+            asked_params(&taken, AskedParams { targets, key }, false)
         };
         let lines = |n: usize| vec![line.clone(); n];
         let (fifty, none) = parse(lines(50), None).unwrap();
@@ -385,17 +399,31 @@ mod tests {
         }
     }
 
+    /// One emoji by name, or for a session that declared `emoji` one of
+    /// the server's by an id that fits its four bytes.
     #[test]
-    fn a_key_is_one_emoji_by_name_and_nothing_else() {
-        assert_eq!(key(&json!({ "emoji": "👍" })), ReactionKey::emoji("👍"));
-        for bad in [
-            json!("👍"),
-            json!({ "emoji": "ok" }),
-            json!({ "custom": 1234 }),
-            json!({ "emoji": "👍", "custom": 1 }),
-            json!({}),
+    fn a_key_is_one_emoji_by_name_or_a_server_emoji_by_id() {
+        use hxd_core::emoji::EmojiId;
+        let custom = |id| Some(ReactionKey::Custom(EmojiId(id)));
+        for (sent, plain, with_emoji) in [
+            (
+                json!({ "emoji": "👍" }),
+                ReactionKey::emoji("👍"),
+                ReactionKey::emoji("👍"),
+            ),
+            (json!({ "custom": 1234 }), None, custom(1234)),
+            (json!({ "custom": u32::MAX }), None, custom(u32::MAX)),
+            (json!({ "custom": u64::from(u32::MAX) + 1 }), None, None),
+            (json!({ "custom": -1 }), None, None),
+            (json!({ "custom": 1.5 }), None, None),
+            (json!({ "custom": "1" }), None, None),
+            (json!({ "emoji": "👍", "custom": 1 }), None, None),
+            (json!("👍"), None, None),
+            (json!({ "emoji": "ok" }), None, None),
+            (json!({}), None, None),
         ] {
-            assert_eq!(key(&bad), None, "{bad}");
+            assert_eq!(key(&sent, false), plain, "{sent}");
+            assert_eq!(key(&sent, true), with_emoji, "{sent}, with emoji");
         }
     }
 }

@@ -1348,9 +1348,10 @@ enabled = false           # off unless turned on
 
 The Server Emoji draft's catalog of images an operator curates with
 `hxd emoji` ([Emoji](#emoji)). A server of this version keeps the
-catalog and rereads it on SIGHUP, and offers it on neither wire yet. It
-needs a database: the catalog is kept in the one `[inbox]`, `[history]`
-or `[news]` names.
+catalog and rereads it on SIGHUP, and offers the catalog on neither
+wire yet; its ids are reaction keys on the ng wire
+([server-emoji.md](server-emoji.md) §5). It needs a database: the
+catalog is kept in the one `[inbox]`, `[history]` or `[news]` names.
 
 ```toml
 [emoji]

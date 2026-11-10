@@ -7,14 +7,17 @@
 //! on an instant message relayed to its other party, and on a stored
 //! private message kept with it, seen and told to each party on its
 //! own terms, taken by a purge and answered `{}` whatever became of it,
-//! between scripted clients on a real server. Emoji in the test data
-//! are the reactions themselves.
+//! between scripted clients on a real server; and with a server's own
+//! emoji as the key on each target, live, removed or never added, and
+//! on a server serving no catalog. Emoji in the test data are the
+//! reactions themselves.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hxd_core::emoji::{EmojiId, EmojiPolicy, EmojiStore, NewEmojiName};
 use hxd_core::{
     Core, HistoryPolicy, InboxPolicy, MessagingPolicy, ModerationPolicy, ReactionPolicy,
     RequestLimits, RoomPolicy,
@@ -40,12 +43,24 @@ async fn start_limited(dir: &Path, policy: ReactionPolicy, limits: RequestLimits
 }
 
 /// [`start_limited`], with an inbox or none, and its core, for a test
-/// that moves the clock.
+/// that moves the clock or edits the emoji catalog.
 async fn start_core(
     dir: &Path,
     policy: ReactionPolicy,
     limits: RequestLimits,
     inbox: bool,
+) -> (SocketAddr, Arc<Core>) {
+    start_server(dir, policy, limits, inbox, true).await
+}
+
+/// [`start_core`], with the database's emoji catalog served or, as
+/// with `[emoji] enabled = false`, none.
+async fn start_server(
+    dir: &Path,
+    policy: ReactionPolicy,
+    limits: RequestLimits,
+    inbox: bool,
+    emoji: bool,
 ) -> (SocketAddr, Arc<Core>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -97,7 +112,14 @@ async fn start_core(
         .with_messaging(MessagingPolicy {
             enabled: true,
             ..MessagingPolicy::default()
-        })
+        });
+    let core = match emoji {
+        true => core
+            .with_emoji(store.clone(), EmojiPolicy::default())
+            .unwrap(),
+        false => core,
+    };
+    let core = core
         .with_moderation(store, ModerationPolicy::default())
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
@@ -147,6 +169,41 @@ async fn login(addr: SocketAddr, who: &str, reactions: bool) -> (Client, Value) 
         .await
         .unwrap();
     (c, hello)
+}
+
+/// [`login`], declaring `emoji` as well.
+async fn login_emoji(addr: SocketAddr, who: &str) -> Client {
+    let mut c = Client::connect(addr).await.unwrap();
+    let password = if who == "guest" { "" } else { "pw" };
+    c.login(json!({
+        "login": who, "password": password, "nick": who,
+        "reactions": true, "replies": true, "emoji": true,
+    }))
+    .await
+    .unwrap();
+    c
+}
+
+/// The catalog in `dir`'s database, written beside the running server
+/// as `hxd emoji` writes it, and the server's copy reloaded after, as a
+/// SIGHUP does.
+fn edit_catalog(dir: &Path, core: &Core, edit: impl FnOnce(&SqliteStore)) {
+    edit(&SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
+    core.emoji_reload().unwrap();
+}
+
+/// `name` added to the catalog, and its id.
+fn add_emoji(dir: &Path, core: &Core, name: &str) -> u32 {
+    let mut id = 0;
+    edit_catalog(dir, core, |store| {
+        let image = hxd_core::emoji::conformance::image(1);
+        let name = NewEmojiName::parse(name).unwrap();
+        store
+            .add(&name, &image, std::time::SystemTime::now(), 100)
+            .unwrap();
+        id = store.load().unwrap().entries.last().unwrap().id.0;
+    });
+    id
 }
 
 async fn ok(c: &mut Client, req: &str, params: Value) -> Value {
@@ -462,8 +519,15 @@ async fn a_redaction_takes_a_lines_reactions_and_a_purge_a_persons() {
 #[tokio::test]
 async fn a_resumed_session_still_reacts_and_reads_reactions() {
     let td = tempfile::tempdir().unwrap();
-    let addr = start(td.path(), ReactionPolicy::default()).await;
-    let (mut alice, _) = login(addr, "alice", true).await;
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let cat = add_emoji(td.path(), &core, "party_cat");
+    let mut alice = login_emoji(addr, "alice").await;
     let line = say(&mut alice, json!({ "text": "still here?" })).await;
     alice
         .event_where("chat", |d| d["id"] == line)
@@ -476,8 +540,10 @@ async fn a_resumed_session_still_reacts_and_reads_reactions() {
         .unwrap();
     assert!(matches!(resumed, Resumed::Replayed(_)), "{resumed:?}");
     assert_eq!(react(&mut alice, json!({ "line": line }), "👋").await, 1);
+    let custom = json!({ "target": { "line": line }, "key": { "custom": cat } });
+    assert_eq!(ok(&mut alice, "react", custom).await["count"], 1);
     let seen = shown(&mut alice, 0, line).await;
-    assert_eq!(seen["reactions_mine"], json!([0]), "{seen}");
+    assert_eq!(seen["reactions_mine"], json!([0, 1]), "{seen}");
 }
 
 /// The next `reactions_changed` naming `target`, and what it said of it.
@@ -587,13 +653,13 @@ async fn a_rooms_reactions_stay_in_the_room() {
     }
 }
 
-/// `who`'s session that declared `reactions` and `messaging`, with its
-/// friends read.
+/// `who`'s session that declared `reactions`, `messaging` and `emoji`,
+/// with its friends read.
 async fn messenger(addr: SocketAddr, who: &str) -> Client {
     let mut c = Client::connect(addr).await.unwrap();
     c.login(json!({
         "login": who, "password": "pw", "nick": who,
-        "reactions": true, "messaging": true,
+        "reactions": true, "messaging": true, "emoji": true,
     }))
     .await
     .unwrap();
@@ -1385,4 +1451,362 @@ async fn a_purge_takes_a_persons_pm_reactions_and_tells_the_parties() {
         ok(&mut alice, "reactions", json!({ "targets": [pm] })).await,
         json!({ "reactions": [{ "target": pm, "keys": keys }] })
     );
+}
+
+/// The catalog's entry `id` renamed `name`.
+fn rename_emoji(dir: &Path, core: &Core, id: u32, name: &str) {
+    let name = NewEmojiName::parse(name).unwrap();
+    edit_catalog(dir, core, |s| {
+        s.rename(EmojiId(id), &name).unwrap();
+    });
+}
+
+/// The catalog's entry `id` removed.
+fn remove_emoji(dir: &Path, core: &Core, id: u32) {
+    edit_catalog(dir, core, |s| {
+        s.remove(EmojiId(id), std::time::SystemTime::now(), 100)
+            .unwrap();
+    });
+}
+
+/// A server emoji is a key on a line, a stored message and an instant
+/// message alike, `{ "custom": id }`, from a session that declared
+/// `emoji`, and carried to every reader of reactions, one that did not
+/// declare `emoji` included; a reader that did not declare `reactions`
+/// sees nothing of it.
+#[tokio::test]
+async fn a_server_emoji_is_a_key_on_every_target_and_shown_to_every_reader_of_reactions() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let cat = add_emoji(td.path(), &core, "party_cat");
+    let (mut alice, mut bob) = friends(addr).await;
+    let (mut erin, _) = login(addr, "erin", true).await;
+    let (mut dave, _) = login(addr, "dave", true).await;
+    let (mut plain, _) = login(addr, "dave", false).await;
+    let key = json!({ "custom": cat });
+
+    let line = say(&mut alice, json!({ "text": "party?" })).await;
+    let target = json!({ "line": line });
+    let to = |key: &Value| json!({ "target": target, "key": key });
+    assert_eq!(ok(&mut alice, "react", to(&key)).await["count"], 1);
+    assert_eq!(ok(&mut bob, "react", to(&key)).await["count"], 2);
+    assert_eq!(react(&mut erin, target.clone(), "👍").await, 1);
+    let keys = json!([
+        { "key": key, "count": 2 },
+        { "key": { "emoji": "👍" }, "count": 1 },
+    ]);
+    let (_, group) = changed_until(&mut erin, &target, |g| g["keys"] == keys).await;
+    assert_eq!(group["mine"], json!([1]), "{group}");
+    let seen = shown(&mut erin, 0, line).await;
+    assert_eq!(seen["reactions"], keys, "{seen}");
+    let seen = shown(&mut bob, 0, line).await;
+    assert_eq!(seen["reactions_mine"], json!([0]), "{seen}");
+    let who = json!({ "targets": [target], "key": key });
+    let asked = ok(&mut bob, "reactions", who.clone()).await;
+    assert_eq!(
+        asked["reactions"][0]["from"],
+        json!([{ "nick": "bob" }, { "nick": "alice" }])
+    );
+    assert_eq!(refused(&mut erin, "react", to(&key)).await, "bad_request");
+    assert_eq!(refused(&mut erin, "reactions", who).await, "bad_request");
+    let unseen = shown(&mut plain, 0, line).await;
+    assert!(unseen.get("reactions").is_none(), "{unseen}");
+
+    let pm = sent(&mut alice, "dave").await;
+    let on_pm = json!({ "target": pm, "key": key });
+    assert_eq!(ok(&mut alice, "react", on_pm).await, json!({}));
+    let row = inbox_row(&mut dave, &pm["pm"]).await;
+    assert_eq!(
+        row["reactions"],
+        json!([{ "key": key, "count": 1 }]),
+        "{row}"
+    );
+
+    let mut bob_plain = Client::connect(addr).await.unwrap();
+    let login = json!({ "login": "bob", "password": "pw", "reactions": true, "messaging": true });
+    bob_plain.login(login).await.unwrap();
+    ok(&mut bob_plain, "friends", json!({})).await;
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let on_im = json!({ "target": im, "with": "bob", "key": key });
+    assert_eq!(ok(&mut alice, "react", on_im).await, json!({}));
+    for c in [&mut bob, &mut bob_plain] {
+        let (_, group) = changed(c, &im).await;
+        assert_eq!(
+            (&group["action"], &group["key"]),
+            (&json!("add"), &key),
+            "{group}"
+        );
+    }
+}
+
+/// A server emoji is named by its id: a rename changes nothing about
+/// it, and once it is removed a new reaction with it on a line, a
+/// message or an instant message is `no_such_emoji`, while one made
+/// already stays, shown as it was, and may be taken away. A new emoji
+/// under its old name is another key.
+#[tokio::test]
+async fn a_removed_server_emoji_takes_no_new_reaction_and_lets_one_go() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let cat = add_emoji(td.path(), &core, "party_cat");
+    let (mut alice, mut bob) = friends(addr).await;
+    let mut erin = login_emoji(addr, "erin").await;
+    let mut dave = login_emoji(addr, "dave").await;
+    let key = json!({ "custom": cat });
+    let line = say(&mut alice, json!({ "text": "party?" })).await;
+    let target = json!({ "line": line });
+    let pm = sent(&mut alice, "dave").await;
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let on = |key: &Value, remove: bool| {
+        [
+            json!({ "target": target, "key": key, "remove": remove }),
+            json!({ "target": pm, "key": key, "remove": remove }),
+            json!({ "target": im, "with": "bob", "key": key, "remove": remove }),
+        ]
+    };
+    let [on_line, on_pm, on_im] = on(&key, false);
+    assert_eq!(ok(&mut alice, "react", on_line.clone()).await["count"], 1);
+    assert_eq!(ok(&mut erin, "react", on_line).await["count"], 2);
+    assert_eq!(ok(&mut alice, "react", on_pm).await, json!({}));
+    assert_eq!(ok(&mut alice, "react", on_im).await, json!({}));
+
+    rename_emoji(td.path(), &core, cat, "party_kitty");
+    let [on_line, ..] = on(&key, false);
+    assert_eq!(
+        ok(&mut bob, "react", on_line).await["count"],
+        3,
+        "renamed, the same key"
+    );
+
+    remove_emoji(td.path(), &core, cat);
+    let row = inbox_row(&mut dave, &pm["pm"]).await;
+    assert_eq!(
+        row["reactions"],
+        json!([{ "key": key, "count": 1 }]),
+        "{row}"
+    );
+    let unknown = json!({ "custom": cat + 100 });
+    let [on_line, on_pm, on_im] = on(&key, false);
+    for (target, params) in [("a line", on_line), ("a message", on_pm)] {
+        let code = refused(&mut dave, "react", params).await;
+        assert_eq!(code, "no_such_emoji", "on {target}");
+    }
+    let code = refused(&mut alice, "react", on_im).await;
+    assert_eq!(code, "no_such_emoji", "on an instant message");
+
+    let [on_line, on_pm, on_im] = on(&key, true);
+    assert_eq!(ok(&mut alice, "react", on_line).await["count"], 2);
+    assert_eq!(ok(&mut alice, "react", on_pm).await, json!({}));
+    let row = inbox_row(&mut dave, &pm["pm"]).await;
+    assert!(row.get("reactions").is_none(), "{row}");
+    assert_eq!(ok(&mut alice, "react", on_im).await, json!({}));
+    let (_, group) = changed_until(&mut bob, &im, |g| g["action"] == "remove").await;
+    assert_eq!(group["key"], key, "{group}");
+    let [on_line, ..] = on(&unknown, true);
+    assert_eq!(ok(&mut dave, "react", on_line).await["count"], 0);
+
+    let kitty = add_emoji(td.path(), &core, "party_kitty");
+    let fresh = json!({ "target": target, "key": { "custom": kitty } });
+    assert_eq!(ok(&mut dave, "react", fresh).await["count"], 1);
+    let seen = shown(&mut dave, 0, line).await;
+    assert_eq!(
+        seen["reactions"],
+        json!([
+            { "key": key, "count": 2 },
+            { "key": { "custom": kitty }, "count": 1 },
+        ]),
+        "{seen}"
+    );
+}
+
+/// A server emoji counts against a line's keys and an account's as any
+/// key does.
+#[tokio::test]
+async fn a_server_emoji_counts_against_the_caps_as_any_key() {
+    let td = tempfile::tempdir().unwrap();
+    let policy = ReactionPolicy {
+        max_keys: 3,
+        max_per_user: 2,
+        ..ReactionPolicy::default()
+    };
+    let (addr, core) = start_core(td.path(), policy, RequestLimits::default(), true).await;
+    let [a, b, c] =
+        ["party_cat", "blob_wave", "meow_heart"].map(|n| add_emoji(td.path(), &core, n));
+    let mut alice = login_emoji(addr, "alice").await;
+    let mut bob = login_emoji(addr, "bob").await;
+    let mut erin = login_emoji(addr, "erin").await;
+    let line = say(&mut alice, json!({ "text": "vote" })).await;
+    let custom = |id: u32| json!({ "custom": id });
+    let emoji = |e: &str| json!({ "emoji": e });
+    for (case, who, key, want) in [
+        ("a first", "alice", emoji("👍"), Ok(1)),
+        ("a second, a server's", "alice", custom(a), Ok(1)),
+        (
+            "a third of one account's, a server's",
+            "alice",
+            custom(b),
+            Err("too_many_reactions"),
+        ),
+        (
+            "a third of one account's",
+            "alice",
+            emoji("🔥"),
+            Err("too_many_reactions"),
+        ),
+        ("the line's third", "bob", custom(b), Ok(1)),
+        (
+            "past the line's, a server's",
+            "erin",
+            custom(c),
+            Err("too_many_reactions"),
+        ),
+        (
+            "past the line's",
+            "erin",
+            emoji("😀"),
+            Err("too_many_reactions"),
+        ),
+        ("a server's already there", "erin", custom(a), Ok(2)),
+    ] {
+        let c = match who {
+            "alice" => &mut alice,
+            "bob" => &mut bob,
+            _ => &mut erin,
+        };
+        let params = json!({ "target": { "line": line }, "key": key });
+        let got = match c.request("react", params).await {
+            Ok(v) => Ok(v["count"].as_u64().unwrap()),
+            Err(Error::Refused { code, .. }) => Err(code),
+            Err(e) => panic!("{case}: {e:?}"),
+        };
+        assert_eq!(got, want.map_err(String::from), "{case}");
+    }
+}
+
+/// A core serving no catalog, as one built from `[emoji] enabled =
+/// false` is, grants no session `emoji`, so a server emoji is no key,
+/// added or taken away; one a core serving the catalog kept in the
+/// same database is still shown, by its id. The second core runs beside
+/// the first, which nobody uses after, on one database.
+#[tokio::test]
+async fn a_server_without_a_catalog_takes_no_server_emoji_and_shows_those_it_kept() {
+    let td = tempfile::tempdir().unwrap();
+    let (addr, core) = start_core(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+    )
+    .await;
+    let cat = add_emoji(td.path(), &core, "party_cat");
+    let mut alice = login_emoji(addr, "alice").await;
+    let line = say(&mut alice, json!({ "text": "party?" })).await;
+    let key = json!({ "custom": cat });
+    let on_line = json!({ "target": { "line": line }, "key": key });
+    assert_eq!(ok(&mut alice, "react", on_line).await["count"], 1);
+    alice.close().await.unwrap();
+
+    let (addr, _) = start_server(
+        td.path(),
+        ReactionPolicy::default(),
+        RequestLimits::default(),
+        true,
+        false,
+    )
+    .await;
+    let mut alice = login_emoji(addr, "alice").await;
+    let seen = shown(&mut alice, 0, line).await;
+    assert_eq!(
+        seen["reactions"],
+        json!([{ "key": key, "count": 1 }]),
+        "{seen}"
+    );
+    assert_eq!(seen["reactions_mine"], json!([0]), "{seen}");
+    let pm = sent(&mut alice, "dave").await;
+    let im = json!({ "im": { "login": "bob", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    assert_eq!(react(&mut alice, json!({ "line": line }), "👍").await, 1);
+    pm_react(&mut alice, &pm, "👍").await;
+    let plain_im = json!({ "target": im, "with": "bob", "key": { "emoji": "👍" } });
+    assert_eq!(
+        refused(&mut alice, "react", plain_im).await,
+        "no_such_target"
+    );
+    for (req, params) in [
+        ("react", json!({ "target": { "line": line }, "key": key })),
+        (
+            "react",
+            json!({ "target": { "line": line }, "key": key, "remove": true }),
+        ),
+        ("react", json!({ "target": pm, "key": key })),
+        ("react", json!({ "target": im, "with": "bob", "key": key })),
+        (
+            "reactions",
+            json!({ "targets": [{ "line": line }], "key": key }),
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut alice, req, params.clone()).await,
+            "bad_request",
+            "{req} {params}"
+        );
+    }
+}
+
+/// On every kind of target a server emoji no live entry has is asked
+/// about after who may react and before the rate: a guest is refused
+/// as a guest, and a refusal spends none of an account's reactions.
+#[tokio::test]
+async fn a_server_emoji_is_refused_after_who_may_react_and_before_the_rate() {
+    let td = tempfile::tempdir().unwrap();
+    let policy = ReactionPolicy {
+        burst: 1,
+        ..ReactionPolicy::default()
+    };
+    let (addr, core) = start_core(td.path(), policy, RequestLimits::default(), true).await;
+    let cat = add_emoji(td.path(), &core, "party_cat");
+    let (mut alice, mut bob) = friends(addr).await;
+    let mut erin = login_emoji(addr, "erin").await;
+    let mut dave = login_emoji(addr, "dave").await;
+    let mut guest = login_emoji(addr, "guest").await;
+    let line = say(&mut alice, json!({ "text": "party?" })).await;
+    let pm = sent(&mut alice, "dave").await;
+    let im = json!({ "im": { "login": "alice", "guid": "5f5e1000-1234-4abc-89ab-000000000001" } });
+    let on = |key: Value| {
+        [
+            json!({ "target": { "line": line }, "key": key }),
+            json!({ "target": pm, "key": key }),
+            json!({ "target": im, "with": "alice", "key": key }),
+        ]
+    };
+    let unknown = json!({ "custom": cat + 100 });
+    for (n, params) in on(unknown.clone()).into_iter().enumerate() {
+        let code = refused(&mut guest, "react", params).await;
+        assert_eq!(code, "access_denied", "a guest, target {n}");
+    }
+    let [unknown_line, unknown_pm, unknown_im] = on(unknown);
+    let [live_line, live_pm, live_im] = on(json!({ "custom": cat }));
+    for (target, c, unknown, live) in [
+        ("a line", &mut erin, unknown_line, live_line),
+        ("a message", &mut dave, unknown_pm, live_pm),
+        ("an instant message", &mut bob, unknown_im, live_im),
+    ] {
+        assert_eq!(
+            refused(c, "react", unknown).await,
+            "no_such_emoji",
+            "{target}"
+        );
+        ok(c, "react", live).await;
+    }
 }

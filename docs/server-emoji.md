@@ -1,7 +1,8 @@
 # Server emoji
 
-Status: the catalog, its images, `hxd emoji` and the server's copy of
-the catalog are built (§8); neither wire offers them yet. This binds
+Status: the catalog, its images, `hxd emoji`, the server's copy of
+the catalog and server emoji as reaction keys on the ng wire are built
+(§9); neither wire offers the catalog itself yet. This binds
 nobody but this server: the protocol is the Server Emoji draft
 (`Capabilities-Server-Emoji.md`, a draft written for this server, in
 fogWraith's protocol documents and not yet allocated), which hxd-ng is
@@ -141,7 +142,40 @@ while it paged. A client that can tell a later page of a delta was
 answered whole (the ng wire's `delta`) knows entries were forgotten, or
 the catalog restored, meanwhile, and starts again from no revision.
 
-## 5. Restoring a backup
+## 5. Reactions
+
+A catalog id is a reaction key (`docs/hotline-ng.md` §7.3), `{
+"custom": id }` on the ng wire and kind 2 packed as the id's four bytes
+big-endian where it is kept, so it needs no migration. It names
+the id and never the name: a rename changes nothing about the reactions
+made with it, and a new emoji under a name an old one freed is another
+key. Past the kind, a server emoji is a key like any other: it counts
+toward a line's keys and an account's as an emoji does, and every
+reader of reactions is shown it, one that does not know the catalog
+too, which draws a placeholder for it.
+
+- **Added**, it must be live in the copy the server serves (§4), on a
+  line, a stored message and an instant message alike, or the reaction
+  is refused `no_such_emoji`: one removed, one never added, or one
+  added since the last SIGHUP. The check is after the session's own
+  privileges and before the account's rate, since it looks up the
+  catalog and not the target. A removal not yet applied by SIGHUP
+  leaves the emoji live, and one applied between that check and the
+  reaction being kept lets that one reaction through; nothing scans the
+  reactions made.
+- **Taken away**, it is never refused for what became of the emoji, so
+  a reaction made with one since removed can be taken back. What stays
+  goes on naming the id.
+- **Who may send one**, to `react` or as the key `reactions` asks
+  about: a session that declared `emoji` at login, to a server serving
+  a catalog. From any other the key is malformed, added or taken away,
+  so on a server with `[emoji] enabled = false` a reaction kept from
+  before is shown and stays until retention, a redaction, a clear or a
+  purge takes it.
+- **A moderator's clear** records each server emoji by the name the
+  catalog gives it, removed or not, and by its id once it is forgotten.
+
+## 6. Restoring a backup
 
 Restoring the database restores the catalog with it, and with it a
 revision a client may already have passed. A client holding a revision
@@ -152,7 +186,7 @@ names a different picture: the database's record of the ids it gave is
 restored with it, so an id given after the backup may be given again.
 A restore invalidates every client's cache.
 
-## 6. Limits
+## 7. Limits
 
 | What | Bound |
 |---|---|
@@ -166,7 +200,7 @@ A restore invalidates every client's cache.
 A lowered `max_bytes` or `max_dimension` holds new images to it; an
 image already stored stays as it was made.
 
-## 7. Failure modes
+## 8. Failure modes
 
 - **A store error at startup**: the server does not start. On SIGHUP:
   the copy in use stays, logged.
@@ -175,15 +209,15 @@ image already stored stays as it was made.
 - **An image the pipeline refuses**: `hxd emoji` says why, the catalog
   unchanged.
 
-## 8. Stages
+## 9. Stages
 
 | Stage | Content | Built |
 |---|---|---|
 | E1 | The catalog's types, names and stores, schema V37, `[emoji]` | yes |
 | E2 | The emoji pipeline, `hxd emoji`, the server's copy and its reload on SIGHUP | yes |
-| E3 | Server emoji as reaction keys | no |
+| E3 | Server emoji as reaction keys (§5) | yes |
 | E4 | References in the domain, and the classic wire: bit 20, the catalog, image and notification transactions, references in and out | no |
-| E5 | The ng wire: the `emoji` capability, `emoji_list`, `emoji_changed`, references, `GET /emoji/{hash}` | no |
+| E5 | The ng wire: `emoji` listed in `caps` with its block, `emoji_list`, `emoji_changed`, references, `GET /emoji/{hash}` | no |
 | E6, E7 | hx-ng, and the out-of-process suite | no |
 
 Managing the catalog from either wire, rather than from `hxd emoji`

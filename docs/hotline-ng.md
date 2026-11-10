@@ -291,7 +291,8 @@ Starts a new session.
     "friendships": true,     // optional: with messaging, its portable part (§7.5)
     "guest_identities": true, // optional: with messaging, identity guests' requests (§7.5)
     "replies": true,         // optional: it sends and reads `re` (§7.3)
-    "reactions": true        // optional: it reacts and reads reactions (§7.3)
+    "reactions": true,       // optional: it reacts and reads reactions (§7.3)
+    "emoji": true            // optional: it knows the server's own emoji (§7.3)
 } }
 ```
 
@@ -331,6 +332,7 @@ hotline-ng-identity.md §8.1 says.
 | `guest_identities` | Not echoed: `caps` lists `guest_identities` when it is granted, to a session that takes part (§7.5). Without `messaging`, it is ignored. A resume keeps what the login was granted. |
 | `replies` | Not echoed: `caps` lists `replies` when it is granted, which is whenever the server keeps any kind of target, and the `replies` block says which (§7.3). A resume keeps what the login was granted. |
 | `reactions` | Not echoed: `caps` lists `reactions` when it is granted, which is whenever the server takes reactions on any kind of target, and the `reactions` block says which (§7.3). A resume keeps what the login was granted. |
+| `emoji` | Not echoed: where the server keeps an emoji catalog (*hxd-ng:* `[emoji]`, server-emoji.md), it lets `react` and `reactions` take one of the server's own emoji as a key (§7.3); elsewhere it is ignored. *hxd-ng* does not yet list it in `caps` or send a block for it (server-emoji.md §9), so a client cannot yet tell whether it was granted. A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -677,7 +679,7 @@ family document. Each family of §4 adds its own.
 | `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
-| `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
+| `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `no_such_emoji`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
 | `reactions` | `targets` (1–50 `line` and `pm` targets), and `key` with exactly one (§7.3) | `{ "reactions": [ { "target", "keys", "mine"?, "from"? } ] }` | `not_available`, `bad_request`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
 | `inbox` | `before?` (message cursor), `limit?` (1–200, default 50) | `{ "messages": […], "unread", "total" }` | `bad_request`, `no_inbox`, `server_error` |
@@ -824,10 +826,14 @@ family document. Each family of §4 adds its own.
   send either. U+FE0E, which asks for text, is `bad_request`. A
   sequence that is one grapheme and in no emoji set, a skin tone on a
   pictograph that takes none, two regional indicators that name no
-  flag, a tag sequence, is kept as sent. Keys come back in that form. The login reply's `reactions` block, `{
-  "targets": [ … ], "max_keys", "max_per_user" }`, lists the kinds of
-  target this server takes, `line` where it keeps history and `im` with
-  `messaging` as well and `pm` where it also has an inbox, and its caps.
+  flag, a tag sequence, is kept as sent. Keys come back in that form.
+  From a session that declared `emoji` and was granted it (§6.1), `key`
+  may instead be one of the server's own emoji by its catalog id, `{
+  "custom": 1234 }`, an unsigned integer below 2^32 (server-emoji.md
+  §5). The login reply's `reactions` block, `{ "targets": [ … ],
+  "max_keys", "max_per_user" }`, lists the kinds of target this server
+  takes, `line` where it keeps history and `im` with `messaging` as
+  well and `pm` where it also has an inbox, and its caps.
   - A reaction is its **account's**, by the mailbox rule (§7.1), shared
     by every session of the account and kept across a nick change, a
     reconnect and the account linking an identity. So a session of an
@@ -851,10 +857,22 @@ family document. Each family of §4 adds its own.
     a key already there never is. An account is held to a rate of its
     own, across its sessions, refused `rate_limited` with `retry_after`
     and never kicked (*hxd-ng:* `[reactions] burst` and `per_second`).
-    A `key` that is not one emoji, a server's own emoji (`{ "custom" }`,
-    not offered yet), a malformed `target` and a kind the block does not
-    list are `bad_request`. From a session that did not declare
-    `reactions`, `react` is `not_available`.
+    A `key` that is not one emoji, a server's own emoji from a session
+    that did not declare `emoji` or was not granted it, a malformed
+    `target` and a kind the block does not list are `bad_request`. From
+    a session that did not declare `reactions`, `react` is
+    `not_available`.
+  - **A server's own emoji** is a key named by its id, never its name:
+    a rename changes nothing about the reactions made with it, and an
+    emoji added later under a freed name is another key. Added, it must
+    be live in the catalog, or the reaction is `no_such_emoji`, on every
+    kind of target: one removed, one never added, alike. That is asked
+    after the session's own privileges and before the rate. Taking one
+    away is never refused for what became of the emoji, and a reaction
+    made with one since removed stays, by its id, as any reaction does.
+    Past that it is a key like any other, held to the same caps, and
+    every session that declared `reactions` is sent it, one that did not
+    declare `emoji` included, which draws a placeholder for it.
   - A `history` line, from a page or `ids`, carries to a session that
     declared `reactions` its `reactions`, `[ { "key", "count" } ]` in
     the order the keys were first added, the part every reader shares,
@@ -885,8 +903,8 @@ family document. Each family of §4 adds its own.
     `from`. An `im` target, which is kept
     nowhere to be read again, a kind the login block does not list, no
     targets or more than 50, `key` beside more than one, and a `key`
-    that is not one emoji are `bad_request`; from a session that did
-    not declare `reactions`, `not_available`.
+    that `react` would refuse as malformed are `bad_request`; from a
+    session that did not declare `reactions`, `not_available`.
   - **`reactions_changed`**, `{ "changes": [ … ] }`, tells a change as it
     happens. A line's changes go to every session that declared
     `reactions` and reads the line's room: the lobby's readers, or a
@@ -942,7 +960,9 @@ family document. Each family of §4 adds its own.
     stored beside them is reacted to as an `im`, never as a `pm`. `with`,
     `clear` and `reason` beside it are `bad_request`, and a session of
     no one account or without the send-chat privilege is
-    `access_denied`, as for a line; a messenger session may react. Past
+    `access_denied`, as for a line; a messenger session may react. A
+    server emoji added that is not live is `no_such_emoji` here too: it
+    looks up the catalog and says nothing of the message. Past
     those and the rate it is answered `{}`, once the reaction has been
     applied, and never `no_such_target` or `too_many_reactions`: a
     reaction to a message that is not the caller's on its side's terms,
@@ -1684,6 +1704,7 @@ news body is different: it declares its own type (news.md §5).
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, `react`, `reactions`, family requests | The server does not offer this. |
 | `no_such_target` | `react` | No such line, or one this session may not react to, or an instant message's party it may not message: one answer for all (§7.3). Never for a `pm` target, which is answered `{}`. |
+| `no_such_emoji` | `react` | A server emoji added as a key that no live catalog entry has: removed, or never added (§7.3). Never for taking one away. |
 | `too_many_reactions` | `react` | The line carries as many keys as it may, or this account as many of them as it may (§7.3). Never for a `pm` target. |
 | `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |

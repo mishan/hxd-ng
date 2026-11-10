@@ -268,6 +268,11 @@ pub struct Transport {
     /// It declared the ng wire's `reactions`, so a line's reactions are
     /// worth sending it (`docs/hotline-ng.md` §7.3). Kept, as `replies`.
     pub reactions: bool,
+    /// It declared the ng wire's `emoji`, to a server that keeps a
+    /// catalog (`docs/server-emoji.md`): what lets the ng frontend take
+    /// one of the server's own emoji as a reaction key. Kept, as
+    /// `replies`.
+    pub emoji: bool,
     /// It is sent its own public lines even where it may not read the
     /// lobby: classic capability bit 17, Structured Chat, whose echo is
     /// how a sender learns its line's id.
