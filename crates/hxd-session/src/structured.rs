@@ -13,6 +13,10 @@ use crate::encoding::TextEncoding;
 /// `DATA_CHAT_LINE`: the draft's, and not allocated.
 pub const DATA_CHAT_LINE: u16 = 0x0f33;
 
+/// `DATA_CHAT_REASON`, the family's reason code in a refusal: the
+/// draft's, and not allocated.
+pub const DATA_CHAT_REASON: u16 = 0x0f2a;
+
 /// The draft's entry flag for an id from the chat's own count rather than
 /// the log's. Never set in a 700 entry.
 pub const EPHEMERAL: u16 = 1 << 3;

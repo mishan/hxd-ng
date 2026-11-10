@@ -1083,3 +1083,73 @@ async fn requests_per_address_outlasts_a_restart() {
     let refused = ask_friend(second.ng, "bob", "erin").await;
     assert_eq!(refused["error"]["code"], "quota_exceeded", "{refused}");
 }
+
+/// Get Emoji (714) is rationed per session: a burst a client opening a
+/// busy chat fetches at once, then two a second, refused `RateLimited`
+/// past it and never charged spam points, which at mhxd's price would
+/// ban the client a tenth of the way through its burst.
+#[tokio::test]
+async fn get_emoji_is_held_to_its_burst_and_then_its_rate() {
+    use hxd_core::emoji::{EmojiStore, NewEmojiName};
+    use hxd_session::emoji::{DATA_EMOJI_ID, DATA_EMOJI_IMAGE, GET_CATALOG, GET_EMOJI};
+    use hxd_session::structured::DATA_CHAT_REASON;
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let server = start(
+        td.path(),
+        &format!(
+            "connections_per_addr = 0\nreconnect_seconds = 0\n\
+             spam_points = 100\nspam_seconds = 60\n\
+             [inbox]\ndb = \"{d}/hx.db\"\n[emoji]\nenabled = true"
+        ),
+    )
+    .await;
+    let store = hxd_store_sqlite::SqliteStore::open(
+        td.path().join("hx.db"),
+        hxd_store_sqlite::Synchronous::Normal,
+    )
+    .unwrap();
+    let party = NewEmojiName::parse("party").unwrap();
+    let image = hxd_core::emoji::conformance::image(2);
+    store
+        .add(&party, &image, std::time::SystemTime::now(), 10)
+        .unwrap();
+    server.core.emoji_reload().unwrap();
+    let login = legacy::Login {
+        caps: Some(1 << 20 | 1 << 1),
+        ..legacy::Login::guest("fetcher")
+    };
+    let mut c = legacy::Client::login_at(server.legacy, &login)
+        .await
+        .unwrap();
+    let fetch = [(DATA_EMOJI_ID, 1u32.to_be_bytes().to_vec())];
+    let mut sent = Vec::new();
+    // Past the burst by more than the rate could refill while they are
+    // answered.
+    for _ in 0..110 {
+        sent.push(c.send(GET_EMOJI, &fetch).await.unwrap());
+    }
+    for _ in 0..30 {
+        sent.push(c.send(GET_CATALOG, &[]).await.unwrap());
+    }
+    let mut answered = Vec::new();
+    for trans in sent {
+        answered.push(c.reply(trans).await.expect("never kicked for it"));
+    }
+    let fetched = |f: &legacy::Frame| !f.is_error() && f.chunk(DATA_EMOJI_IMAGE).is_some();
+    assert!(answered[..100].iter().all(fetched), "the burst");
+    let past = &answered[100..110];
+    let refused: Vec<_> = past.iter().filter(|f| f.is_error()).collect();
+    assert!(refused.len() > past.len() / 2, "then refused");
+    assert!(
+        refused.iter().all(|f| f.uint(DATA_CHAT_REASON) == Some(6)),
+        "RateLimited"
+    );
+    assert!(
+        answered[110..].iter().all(|f| !f.is_error()),
+        "713 unrationed"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let again = c.call(GET_EMOJI, &fetch).await;
+    assert!(again.as_ref().is_ok_and(fetched), "and then the rate");
+}

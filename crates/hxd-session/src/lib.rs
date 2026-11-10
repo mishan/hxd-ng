@@ -7,6 +7,7 @@ mod accounts;
 pub mod banner;
 pub mod caps;
 pub mod device;
+pub mod emoji;
 pub mod encoding;
 mod file_manage;
 mod files;

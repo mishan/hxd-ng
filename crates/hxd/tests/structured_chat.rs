@@ -16,6 +16,8 @@ use hxproto::messages::{tag, ClientHdr};
 use serde_json::Value;
 
 const STRUCTURED: u32 = 1 << 17;
+const EMOJI: u32 = 1 << 20;
+const EMOJI_REFS_FIELD: u16 = hxd_session::emoji::DATA_EMOJI_REFS;
 const UTF8: u32 = 1 << 1;
 const HISTORY: u32 = 1 << 4;
 const ACTION: u16 = 1;
@@ -54,6 +56,8 @@ async fn start(dir: &Path, extra: &str) -> Server {
         ("bob", MEMBER),
         ("dave", MEMBER),
         ("erin", MEMBER),
+        ("frank", MEMBER),
+        ("gina", MEMBER),
         (
             "admin",
             "read_chat = true\nsend_chat = true\ndisconnect_users = true\n",
@@ -183,12 +187,55 @@ fn seen(f: &Frame) -> Vec<u8> {
     [&f.wire()[..4], &f.wire()[8..]].concat()
 }
 
-/// What a period client and an ng client are sent of one script, with the
-/// server offering bit 17 or not.
-async fn period_and_ng(structured: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Value>) {
+/// A 106 to a bit-17 session as [`seen`], its entry's timestamp zeroed,
+/// and its id where it is ephemeral, which is random: what two runs of
+/// one script can agree on.
+fn seen_structured(f: &Frame) -> Vec<u8> {
+    let entry = f.bytes(DATA_CHAT_LINE).expect("an entry");
+    let mut out = seen(f);
+    let at = out
+        .windows(entry.len())
+        .position(|w| w == entry)
+        .expect("the entry in the frame");
+    out[at + 8..at + 16].fill(0);
+    if parse(&entry).flags & EPHEMERAL != 0 {
+        out[at..at + 8].fill(0);
+    }
+    out
+}
+
+/// What each client is sent of one script, with the server offering bit
+/// 17 or not and serving a catalog or not: a period client's 106s, a
+/// period sender's that may not read the lobby, a bit-17 client's and an
+/// ng client's chat events. A sender that offers bit 20 sends refs
+/// throughout.
+type Seen = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Value>);
+
+async fn period_and_ng(structured: bool, emoji: bool) -> Seen {
     let td = tempfile::tempdir().unwrap();
-    let extra = history(td.path()) + if structured { ON } else { "" };
+    let mut extra = history(td.path()) + if structured { ON } else { "" };
+    if emoji {
+        extra += "[emoji]\nenabled = true\n";
+    }
     let s = start(td.path(), &extra).await;
+    if emoji {
+        use hxd_core::emoji::{EmojiStore, NewEmojiName};
+        let store = hxd_store_sqlite::SqliteStore::open(
+            td.path().join("hx.db"),
+            hxd_store_sqlite::Synchronous::Normal,
+        )
+        .unwrap();
+        let image = hxd_core::emoji::conformance::image(2);
+        let party = NewEmojiName::parse("party").unwrap();
+        store
+            .add(&party, &image, std::time::SystemTime::now(), 10)
+            .unwrap();
+        s.core.emoji_reload().unwrap();
+    }
+    let party = (
+        EMOJI_REFS_FIELD,
+        [&[0, 1, 0, 0, 0, 1, 5][..], b"party"].concat(),
+    );
     let (mut carol, _) = ng::Client::account(s.ng, "erin", "pw", "carol")
         .await
         .unwrap();
@@ -197,6 +244,8 @@ async fn period_and_ng(structured: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Val
     let mut admin = classic(&s, "admin", None).await;
     let dave = classic(&s, "dave", Some(STRUCTURED)).await;
     let mut writer = classic(&s, "writer", None).await;
+    let mut frank = classic(&s, "frank", Some(EMOJI | UTF8 | STRUCTURED)).await;
+    let mut gina = classic(&s, "gina", Some(STRUCTURED | UTF8)).await;
 
     alice.chat(b"hi").await.unwrap();
     assert_eq!(entry(&line(&mut alice, "hi").await).is_some(), structured);
@@ -206,12 +255,46 @@ async fn period_and_ng(structured: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Val
     line(&mut alice, "two").await;
     carol.chat("from ng").await.unwrap();
     line(&mut alice, "from ng").await;
+    for c in [&mut frank, &mut alice] {
+        c.send(
+            ClientHdr::Chat.as_u32(),
+            &[(tag::BODY, b"a :party:".to_vec()), party.clone()],
+        )
+        .await
+        .unwrap();
+        line(c, "a :party:").await;
+    }
+    frank
+        .send(
+            ClientHdr::Chat.as_u32(),
+            &[
+                (tag::STYLE, 1u16.to_be_bytes().to_vec()),
+                (tag::BODY, b"dances :party:".to_vec()),
+                party.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    line(&mut alice, "dances :party:").await;
     kick(&mut admin, dave.uid.unwrap()).await;
     line(&mut alice, "by admin>").await;
     writer.chat(b"blind").await.unwrap();
     line(&mut alice, "blind").await;
     alice.chat(b"end").await.unwrap();
 
+    let normal = |f: &Frame| {
+        if structured {
+            seen_structured(f)
+        } else {
+            seen(f)
+        }
+    };
+    let last = line(&mut gina, "end").await;
+    let mut structured_frames: Vec<Vec<u8>> = (gina.rx.take_backlog().iter())
+        .filter(|f| f.ty == push::CHAT)
+        .map(normal)
+        .collect();
+    structured_frames.push(normal(&last));
     let last = line(&mut bob, "end").await;
     let mut frames: Vec<Vec<u8>> = bob
         .rx
@@ -242,14 +325,28 @@ async fn period_and_ng(structured: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Val
             break;
         }
     }
-    (frames, blind, events)
+    (frames, blind, structured_frames, events)
 }
 
 #[tokio::test]
 async fn a_period_client_and_an_ng_client_are_sent_the_same_whether_bit_17_is_offered_or_not() {
-    let (frames, blind, events) = period_and_ng(false).await;
+    let (frames, blind, _, events) = period_and_ng(false, false).await;
     assert!(frames.len() >= 6, "{frames:?}");
-    assert_eq!(period_and_ng(true).await, (frames, blind, events));
+    let (on, on_blind, _, on_events) = period_and_ng(true, false).await;
+    assert_eq!((on, on_blind, on_events), (frames, blind, events));
+}
+
+#[tokio::test]
+async fn every_client_without_bit_20_is_sent_the_same_whether_emoji_are_served_or_not() {
+    for structured in [false, true] {
+        let off = period_and_ng(structured, false).await;
+        assert!(off.2.len() >= 9, "{:?}", off.2);
+        assert_eq!(
+            period_and_ng(structured, true).await,
+            off,
+            "bit 17 {structured}"
+        );
+    }
 }
 
 #[tokio::test]

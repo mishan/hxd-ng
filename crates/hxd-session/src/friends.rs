@@ -166,7 +166,7 @@ pub(crate) enum Op {
     Respond(String, bool, Option<Vec<u8>>),
     Block(String, bool, Option<Vec<u8>>),
     Presence(PresenceUpdate),
-    Send(String, MessageGuid, String),
+    Send(String, MessageGuid, String, Vec<hxd_core::emoji::EmojiRef>),
     Ack(String, MessageGuid, bool),
     Typing(String, bool),
     Find(Named, bool),
@@ -212,8 +212,15 @@ const MALFORMED: &str = "Malformed request.";
 
 /// Read `f`, a transaction [`handles`] says is the family's, with what
 /// only bit 15 adds read where `friendships` says the session negotiated
-/// it, and ignored, as any field unknown to the extension is, where not.
-pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<Op, &'static str> {
+/// it, and ignored, as any field unknown to the extension is, where not;
+/// and an instant message's emoji refs where `emoji` says it negotiated
+/// bit 20.
+pub(crate) fn parse(
+    f: &Frame,
+    enc: TextEncoding,
+    friendships: bool,
+    emoji: bool,
+) -> Result<Op, &'static str> {
     let field = |t: u16| f.chunks().find(|c| c.tag == t).map(|c| c.data.to_vec());
     // A friendship object, within its field's bound.
     let object = |t: u16, max: usize| {
@@ -329,7 +336,12 @@ pub(crate) fn parse(f: &Frame, enc: TextEncoding, friendships: bool) -> Result<O
             let body = field(tag::MESSAGE_BODY)
                 .filter(|b| !b.is_empty())
                 .ok_or(MALFORMED)?;
-            Op::Send(login()?, guid()?, enc.decode(&body))
+            Op::Send(
+                login()?,
+                guid()?,
+                enc.decode(&body),
+                crate::emoji::refs_in(f, emoji),
+            )
         }
         ClientHdr::ImAck => {
             let read = match uint(tag::ACK_TYPE)
@@ -531,22 +543,23 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
             }
         }
         Op::Presence(update) => done(core.set_presence(uid, update)),
-        Op::Send(login, guid, text) => match core.im_send_login(uid, &login, text, Some(guid), &[])
-        {
-            Ok(outcome) => {
-                let reason = match outcome {
-                    MsgOutcome::Delivered(_) | MsgOutcome::Im { queued: false, .. } => {
-                        ReasonCode::Ok
-                    }
-                    MsgOutcome::Queued(_) | MsgOutcome::Im { queued: true, .. } => {
-                        ReasonCode::OfflineQueued
-                    }
-                    MsgOutcome::Requested => ReasonCode::Requested,
-                };
-                Answer::ok(vec![reason_chunk(reason)])
+        Op::Send(login, guid, text, refs) => {
+            match core.im_send_login(uid, &login, text, Some(guid), &refs) {
+                Ok(outcome) => {
+                    let reason = match outcome {
+                        MsgOutcome::Delivered(_) | MsgOutcome::Im { queued: false, .. } => {
+                            ReasonCode::Ok
+                        }
+                        MsgOutcome::Queued(_) | MsgOutcome::Im { queued: true, .. } => {
+                            ReasonCode::OfflineQueued
+                        }
+                        MsgOutcome::Requested => ReasonCode::Requested,
+                    };
+                    Answer::ok(vec![reason_chunk(reason)])
+                }
+                Err(e) => refusal(e),
             }
-            Err(e) => refusal(e),
-        },
+        }
         Op::Ack(login, guid, read) => done(core.im_ack(uid, &login, &guid, read)),
         Op::Typing(login, typing) => {
             // A notification: what the domain refuses is dropped unsaid.
@@ -734,7 +747,12 @@ fn refusal(e: MessagingError) -> Answer {
 
 /// The notification a domain event is on this wire, for one of the
 /// family's.
-pub(crate) fn event(ev: &Event, enc: TextEncoding, friendships: bool) -> Option<(u32, Chunks)> {
+pub(crate) fn event(
+    ev: &Event,
+    enc: TextEncoding,
+    friendships: bool,
+    emoji: bool,
+) -> Option<(u32, Chunks)> {
     Some(match ev {
         Event::FriendEntry(e) => (
             ServerHdr::RosterEntry.as_u32(),
@@ -770,9 +788,8 @@ pub(crate) fn event(ev: &Event, enc: TextEncoding, friendships: bool) -> Option<
             }
             (ServerHdr::PresenceChanged.as_u32(), c)
         }
-        Event::Im(im) => (
-            ServerHdr::ImDeliver.as_u32(),
-            vec![
+        Event::Im(im) => {
+            let mut c = vec![
                 (tag::MESSAGE_GUID, guid_bytes(&im.guid).to_vec()),
                 (tag::FRIEND_LOGIN, enc.encode(&im.from_login)),
                 (tag::MESSAGE_BODY, enc.body(&im.text)),
@@ -780,8 +797,15 @@ pub(crate) fn event(ev: &Event, enc: TextEncoding, friendships: bool) -> Option<
                     tag::MESSAGE_TIMESTAMP,
                     unix(im.sent_at).to_be_bytes().to_vec(),
                 ),
-            ],
-        ),
+            ];
+            if let Some(refs) = im.emoji.as_ref().filter(|_| emoji) {
+                c.push((
+                    crate::emoji::DATA_EMOJI_REFS,
+                    crate::emoji::refs_field(refs),
+                ));
+            }
+            (ServerHdr::ImDeliver.as_u32(), c)
+        }
         Event::Receipt {
             login, guid, read, ..
         } => {
