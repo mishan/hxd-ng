@@ -255,14 +255,16 @@ async fn period_and_ng(structured: bool, emoji: bool) -> Seen {
     line(&mut alice, "two").await;
     carol.chat("from ng").await.unwrap();
     line(&mut alice, "from ng").await;
-    for c in [&mut frank, &mut alice] {
+    // Each waits for its own line by nick: frank's is still unread at alice
+    // when she sends hers.
+    for (c, nick) in [(&mut frank, "frank"), (&mut alice, "alice")] {
         c.send(
             ClientHdr::Chat.as_u32(),
             &[(tag::BODY, b"a :party:".to_vec()), party.clone()],
         )
         .await
         .unwrap();
-        line(c, "a :party:").await;
+        line(c, format!("{nick}:  a :party:")).await;
     }
     frank
         .send(
