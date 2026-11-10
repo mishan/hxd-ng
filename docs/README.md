@@ -49,6 +49,7 @@ to another project.
 | [chat-history.md](chat-history.md) — server-held scrollback, fogWraith's Get Chat History | yes | extended, ng | design, implements a fogWraith spec |
 | [chat-rooms.md](chat-rooms.md) — curated, persistent rooms gated by `read` and `post` lists, logged where history is; public chat as the lobby; period clients join through the system account | R1–R3; not `700` per room, secure rooms or rooms across links | all (period joins by invite) | design; §7 is the ng spec |
 | [avatars.md](avatars.md) — a user's picture on both wires: fogWraith's GIF Icons and the ng `avatars` capability | yes | extended, ng | design, implements a fogWraith spec |
+| [server-emoji.md](server-emoji.md) — the operator's catalog of custom emoji, the Server Emoji draft | the catalog, its images and `hxd emoji`; not either wire | extended, ng (period sees `:name:`) | design, implements this server's draft |
 | [banner.md](banner.md) — the server banner, held or by URL, on both wires | yes | all | design |
 | [inline-media.md](inline-media.md) — images in chat, fogWraith's Inline Media | yes | extended, ng (period sees the caption) | design, implements a fogWraith spec |
 | [moderation.md](moderation.md) — reports, redaction, revocation, purge | yes, less vouching | all (period reports and is moderated) | design; §5 is the ng spec |

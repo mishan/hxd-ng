@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use hxd_core::emoji::{
-    Catalog, EmojiEntry, EmojiId, EmojiImage, EmojiName, EmojiStore, EmojiStoreError,
+    Catalog, EmojiEntry, EmojiId, EmojiImage, EmojiName, EmojiStore, EmojiStoreError, NewEmojiName,
 };
 use hxd_core::inbox::StoreError;
 use hxd_core::media::MediaType;
@@ -128,11 +128,12 @@ impl EmojiStore for SqliteStore {
 
     fn add(
         &self,
-        name: &EmojiName,
+        name: &NewEmojiName,
         image: &EmojiImage,
         at: SystemTime,
         max_count: usize,
     ) -> Result<u32, EmojiStoreError> {
+        let name = name.name();
         let mut conn = self.conn.lock().unwrap();
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         if name_live(&tx, name)? {
@@ -167,7 +168,8 @@ impl EmojiStore for SqliteStore {
         Ok(revision)
     }
 
-    fn rename(&self, id: EmojiId, name: &EmojiName) -> Result<u32, EmojiStoreError> {
+    fn rename(&self, id: EmojiId, name: &NewEmojiName) -> Result<u32, EmojiStoreError> {
+        let name = name.name();
         let mut conn = self.conn.lock().unwrap();
         let tx = sql(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
         match live_name(&tx, id)? {

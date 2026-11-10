@@ -4872,7 +4872,7 @@ mod tests {
     /// lines and the mail already there.
     #[test]
     fn version_thirty_six_migrates_into_a_catalog_that_never_gives_an_id_twice() {
-        use hxd_core::emoji::{conformance::image, EmojiName, EmojiStore};
+        use hxd_core::emoji::{conformance::image, EmojiStore, NewEmojiName};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("messages.db");
         {
@@ -4891,7 +4891,7 @@ mod tests {
                 .unwrap();
             conn.pragma_update(None, "user_version", 36).unwrap();
         }
-        let party = EmojiName::parse("party").unwrap();
+        let party = NewEmojiName::parse("party").unwrap();
         let last = {
             let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
             let catalog = store.load().unwrap();

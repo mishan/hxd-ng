@@ -24,6 +24,7 @@ use serde::Deserialize;
 pub mod accounts;
 pub mod banner;
 pub mod device;
+pub mod emoji;
 #[cfg(feature = "feeds")]
 pub mod feeds;
 pub mod files;
@@ -3832,6 +3833,8 @@ struct RuntimeStores {
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
     records: Option<Arc<dyn hxd_core::identity_records::RecordCache>>,
     avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
+    /// In the file the trail is in, which `hxd emoji` writes.
+    emoji: Option<Arc<dyn hxd_core::emoji::EmojiStore>>,
     /// The chat log's store as itself, for the tests to ask how it was
     /// opened.
     #[cfg(test)]
@@ -3924,7 +3927,10 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         .map(|s| s as Arc<dyn hxd_core::ModerationStore>);
     // Beside the bans: what the registrars publish refuses keys as a ban
     // does.
-    let records = moderation_store.map(|s| s as Arc<dyn hxd_core::identity_records::RecordCache>);
+    let records = moderation_store
+        .clone()
+        .map(|s| s as Arc<dyn hxd_core::identity_records::RecordCache>);
+    let emoji = moderation_store.map(|s| s as Arc<dyn hxd_core::emoji::EmojiStore>);
     // Avatars share whatever file there is, like devices.
     let avatars_path = config.avatars.as_ref().and_then(|a| {
         a.db.clone()
@@ -3978,6 +3984,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         moderation,
         records,
         avatars,
+        emoji,
     })
 }
 
@@ -4016,6 +4023,7 @@ struct RuntimeStores {
     moderation: Option<Arc<dyn hxd_core::ModerationStore>>,
     records: Option<Arc<dyn hxd_core::identity_records::RecordCache>>,
     avatars: Option<Arc<dyn hxd_core::AvatarStore>>,
+    emoji: Option<Arc<dyn hxd_core::emoji::EmojiStore>>,
 }
 
 #[cfg(not(feature = "inbox"))]
@@ -4047,6 +4055,7 @@ fn open_runtime_stores(config: &Config) -> Result<RuntimeStores, String> {
         moderation: None,
         records: None,
         avatars: None,
+        emoji: None,
     })
 }
 
@@ -4893,6 +4902,13 @@ pub fn build_ctx(
     let core = match stores.records {
         Some(records) => core.with_record_cache(records),
         None => core,
+    };
+    let core = match (stores.emoji, config.emoji.as_ref().filter(|e| e.enabled)) {
+        (Some(store), Some(emoji)) => core
+            .with_emoji(store, emoji.policy()?)
+            .map_err(|e| format!("[emoji] catalog: {e}"))?,
+        (None, Some(_)) => return Err("[emoji] needs a database".into()),
+        (_, None) => core,
     };
     // The registry and the gateway together or not at all: a registry
     // with nothing to send from would take registrations and drop every

@@ -1821,6 +1821,8 @@ pub struct Core {
     /// When each owner last changed its avatar (`AvatarPolicy`'s
     /// interval). Its own lock, taken with nothing else held.
     pub(crate) avatar_turns: Mutex<HashMap<crate::avatar::Turn, Instant>>,
+    /// The server's emoji catalog, or `None` without `[emoji]`.
+    pub(crate) emoji: Option<crate::emoji::EmojiState>,
 }
 
 /// [`Core::census`]: the roster in numbers. `system` is the reserved
