@@ -267,11 +267,13 @@ serves any session, as below.
   and a sandbox CSP. Any session may fetch any live emoji, and one
   picture two entries share is served while either lives. A hash no
   live emoji has is 404 `no_such_emoji`, to a conditional request too:
-  the lookup comes before `If-None-Match`, so a removed image leaves
-  the caches that held it. Without a session it is 401, and past
-  `[limits] avatar_fetches_per_minute` from one address 429, counted
-  apart from the avatars'. A server serving no catalog answers every
-  hash 404, as one with no avatars answers `GET /avatars/{id}`.
+  the lookup comes before `If-None-Match`, so a cache that revalidates
+  drops it. One that does not keeps it, so a client stops showing an
+  entry when `emoji_list` says it was removed. Without a session it is
+  401, and past `[limits] avatar_fetches_per_minute` from one address
+  429, counted apart from the avatars'. A server serving no catalog
+  answers every hash 404, as one with no avatars answers `GET
+  /avatars/{id}`.
 - **References** are `emoji`, `[ { "name", "id" } ]`, on `chat` and
   `msg`, of which the first 32 are read and kept as §6 says. Anything
   but a list, or among the first 32 read anything but an object with a
