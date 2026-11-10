@@ -760,6 +760,7 @@ impl Core {
         if !names(&me.mailbox.login) && !names(with) {
             return Err(ReactError::OutOfScope);
         }
+        self.emoji_live(key, add)?;
         self.react_rate(uid, policy)?;
         let them = self
             .other(&me, with)

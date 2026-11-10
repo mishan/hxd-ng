@@ -434,7 +434,14 @@ Three layers, all `cargo test --workspace`:
   to both parties' sessions but the reactor's, one to a waiting message
   riding its `msg`, one held for a detached party and replayed, the
   recipient's past the sender's window told to the sender not at all,
-  and a moderator's purge taking a person's and telling both parties),
+  and a moderator's purge taking a person's and telling both parties;
+  and a server emoji as a key on all three, by its id through a rename,
+  shown to a reader that did not declare `emoji` and refused from it,
+  held to the caps as any key, `no_such_emoji` once removed or never
+  added, asked after who may react and before the rate, while one made
+  already is kept and may be taken away, kept
+  across a resume, and refused on a server serving no catalog, which
+  still shows those it kept),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry

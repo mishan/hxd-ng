@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::access::bit;
+use crate::emoji::EmojiId;
 use crate::history::LineId;
 use crate::inbox::{Mailbox, MessageRef, StoreError};
 use crate::messaging::Key;
@@ -46,16 +47,19 @@ pub const IM_WAITING: usize = 100;
 pub const IM_WAITING_ALL: usize = 50_000;
 
 /// What may be reacted with. Packed as the stores keep it, a kind byte
-/// and the kind's bytes, so that a server's own emoji (kind 2, by id)
-/// can join without a migration.
+/// and the kind's bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReactionKey {
     /// One emoji, as UTF-8 in its fully-qualified form
     /// ([`ReactionKey::emoji`]), compared byte for byte.
     Emoji(String),
+    /// One of the server's own emoji, by its id and never its name, so
+    /// a rename changes nothing about the reactions made with it.
+    Custom(EmojiId),
 }
 
 const EMOJI: u8 = 1;
+const CUSTOM: u8 = 2;
 
 impl ReactionKey {
     /// An emoji key, or `None` for anything that is not exactly one
@@ -69,6 +73,7 @@ impl ReactionKey {
     pub fn pack(&self) -> Vec<u8> {
         match self {
             ReactionKey::Emoji(s) => [&[EMOJI][..], s.as_bytes()].concat(),
+            ReactionKey::Custom(id) => [&[CUSTOM][..], &id.0.to_be_bytes()].concat(),
         }
     }
 
@@ -79,6 +84,9 @@ impl ReactionKey {
     pub fn unpack(b: &[u8]) -> Option<Self> {
         match b.split_first()? {
             (&EMOJI, rest) => Some(ReactionKey::Emoji(String::from_utf8(rest.to_vec()).ok()?)),
+            (&CUSTOM, rest) => Some(ReactionKey::Custom(EmojiId(u32::from_be_bytes(
+                rest.try_into().ok()?,
+            )))),
             _ => None,
         }
     }
@@ -436,6 +444,7 @@ impl ReactionChange {
 fn key_weight(k: &ReactionKey) -> usize {
     match k {
         ReactionKey::Emoji(e) => e.len(),
+        ReactionKey::Custom(_) => 0,
     }
 }
 
@@ -1133,6 +1142,9 @@ pub enum ReactError {
     /// cannot be read, or has not been relayed yet: all one answer.
     NoSuchTarget,
     TooManyReactions,
+    /// A server emoji added that no live entry has: one never added,
+    /// one removed, or any on a server without a catalog.
+    NoSuchEmoji,
     RateLimited(Duration),
     /// A clear without a reason, or with one too long.
     BadRequest(&'static str),
@@ -1208,6 +1220,7 @@ impl Core {
             };
             (sess.mailbox(), sess.info.nick.clone(), target)
         };
+        self.emoji_live(key, add)?;
         self.react_rate(uid, policy)?;
         target?;
         let act = desk::Act {
@@ -1229,6 +1242,20 @@ impl Core {
                 tracing::warn!("chat log would not take a reaction: {e}");
                 Err(ReactError::ServerError)
             }
+        }
+    }
+
+    /// A server emoji added must be live in the catalog served. Taking
+    /// one away is never refused, so a reaction made with an emoji
+    /// since removed can still be taken back. A catalog lookup, saying
+    /// nothing about the target, so asked before it; and before the
+    /// rate, so a refusal spends none.
+    pub(crate) fn emoji_live(&self, key: &ReactionKey, add: bool) -> Result<(), ReactError> {
+        match key {
+            ReactionKey::Custom(id) if add && self.emoji_image(*id).is_none() => {
+                Err(ReactError::NoSuchEmoji)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1482,6 +1509,7 @@ impl Core {
         if self.protected(acting.overrides, author.mailbox().as_ref()) {
             return Err(ReactError::Protected);
         }
+        let catalog = self.emoji_catalog();
         self.desk(move |c, live| {
             let log = c.history.as_ref().ok_or(ReactError::NotAvailable)?;
             let failed = |e: StoreError| {
@@ -1503,6 +1531,16 @@ impl Core {
             act.room = (room != 0).then_some(room);
             let keys = was.keys.iter().map(|(k, n)| match k {
                 ReactionKey::Emoji(e) => format!("{e} {n}"),
+                ReactionKey::Custom(id) => {
+                    let entry = catalog
+                        .iter()
+                        .flat_map(|c| &c.entries)
+                        .find(|e| e.id == *id);
+                    match entry {
+                        Some(e) => format!(":{}: {n}", e.name),
+                        None => format!("#{} {n}", id.0),
+                    }
+                }
             });
             // The keys and their counts, not who reacted: the act is of
             // the line, and its reactors are nobody's to judge.
@@ -2681,9 +2719,138 @@ mod tests {
             ReactionKey::unpack(b"\x01ok"),
             Some(ReactionKey::Emoji("ok".into()))
         );
-        for bad in [&[][..], &[2, 0, 0, 0, 1], &[1, 0xff]] {
+        let custom = ReactionKey::Custom(EmojiId(0x0102_0304));
+        assert_eq!(custom.pack(), [2, 1, 2, 3, 4], "kind 2, the id big-endian");
+        assert_eq!(ReactionKey::unpack(&[2, 1, 2, 3, 4]), Some(custom));
+        for bad in [
+            &[][..],
+            &[1, 0xff],
+            &[2, 0, 0, 1],
+            &[2, 0, 0, 0, 1, 0],
+            &[3, 1],
+        ] {
             assert_eq!(ReactionKey::unpack(bad), None, "{bad:?}");
         }
+    }
+
+    /// A catalog holding `names`, each added in turn, served by a core
+    /// with a log and reactions under `policy`, and its ids.
+    fn with_catalog(
+        policy: ReactionPolicy,
+        names: &[&str],
+    ) -> (Arc<Core>, Arc<crate::emoji::MemoryEmoji>, Vec<EmojiId>) {
+        use crate::emoji::{EmojiPolicy, EmojiStore, MemoryEmoji, NewEmojiName};
+        let store = Arc::new(MemoryEmoji::default());
+        let ids = (names.iter().enumerate())
+            .map(|(n, name)| {
+                let name = NewEmojiName::parse(name).unwrap();
+                let image = crate::emoji::conformance::image(n as u8);
+                store.add(&name, &image, SystemTime::now(), 100).unwrap();
+                store.load().unwrap().entries.last().unwrap().id
+            })
+            .collect();
+        let core = Core::new()
+            .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
+            .with_reactions(policy)
+            .with_moderation(
+                Arc::new(crate::MemoryModeration::default()),
+                crate::ModerationPolicy::default(),
+            )
+            .with_emoji(store.clone(), EmojiPolicy::default())
+            .unwrap();
+        (Arc::new(core), store, ids)
+    }
+
+    /// A server emoji is a key while the copy of the catalog the server
+    /// serves has it live: one removed from the store or added to it is
+    /// not taken as such until a reload. The catalog is asked before the
+    /// target, as it says nothing about the line; and a core with no
+    /// catalog takes none.
+    #[test]
+    fn a_server_emoji_is_a_new_reaction_only_while_the_catalog_served_has_it() {
+        use crate::emoji::{EmojiStore, NewEmojiName};
+        use bit::{READ_CHAT, SEND_CHAT};
+        let (core, store, ids) =
+            with_catalog(ReactionPolicy::default(), &["party_cat", "blob_wave"]);
+        let [cat, wave] = [ids[0], ids[1]].map(ReactionKey::Custom);
+        let chatter = bits(&[READ_CHAT, SEND_CHAT]);
+        let [alice, bob] = ["alice", "bob"].map(|n| person(&core, n, chatter, true));
+        let line = said(&core, alice, "hi");
+        let add = |name: &str| {
+            let name = NewEmojiName::parse(name).unwrap();
+            let image = crate::emoji::conformance::image(9);
+            store.add(&name, &image, SystemTime::now(), 100).unwrap();
+            ReactionKey::Custom(store.load().unwrap().entries.last().unwrap().id)
+        };
+
+        store.remove(ids[1], SystemTime::now(), 100).unwrap();
+        let served = add("new_one");
+        let not_reloaded = core.react(alice, 0, line, &wave, true);
+        assert_eq!(not_reloaded, Ok(1), "removed, not reloaded");
+        core.emoji_reload().unwrap();
+        let unserved = add("newer_one");
+        let no_emoji = Err(ReactError::NoSuchEmoji);
+        for (case, target, key, want) in [
+            ("removed and reloaded", line, &wave, no_emoji),
+            ("added, not reloaded", line, &unserved, no_emoji),
+            ("removed, on no line", line + 100, &wave, no_emoji),
+            ("added and reloaded", line, &served, Ok(1)),
+            ("live", line, &cat, Ok(1)),
+        ] {
+            assert_eq!(core.react(bob, 0, target, key, true), want, "{case}");
+        }
+
+        let (bare, _log) = server(ReactionPolicy::default());
+        let alice = person(&bare, "alice", chatter, true);
+        let line = said(&bare, alice, "hi");
+        assert_eq!(
+            bare.react(alice, 0, line, &ReactionKey::Custom(EmojiId(1)), true),
+            Err(ReactError::NoSuchEmoji),
+            "no catalog"
+        );
+    }
+
+    /// A clear records a server emoji by the name the catalog served
+    /// gives it, live or removed, and by its id once it is forgotten.
+    #[test]
+    fn a_clear_names_a_server_emoji_by_its_name_until_it_is_forgotten() {
+        use crate::emoji::EmojiStore;
+        use bit::{READ_CHAT, SEND_CHAT};
+        let (core, store, ids) = with_catalog(
+            ReactionPolicy::default(),
+            &["party_cat", "blob_wave", "old_one"],
+        );
+        let (alice, _) = hearing(&core, "alice", ng(), false);
+        let (carol, _) = hearing(&core, "carol", ng(), true);
+        let bob = person(&core, "bob", bits(&[READ_CHAT, SEND_CHAT]), true);
+        let line = said(&core, alice, "vote");
+        for (uid, key) in [
+            (alice, ReactionKey::Custom(ids[0])),
+            (bob, ReactionKey::Custom(ids[0])),
+            (alice, ReactionKey::Custom(ids[1])),
+            (alice, ReactionKey::Custom(ids[2])),
+            (alice, thumbs()),
+        ] {
+            core.react(uid, 0, line, &key, true).unwrap();
+        }
+        store.remove(ids[2], SystemTime::now(), 100).unwrap();
+        store.remove(ids[1], SystemTime::now(), 1).unwrap();
+        core.emoji_reload().unwrap();
+        core.react_clear(carol, 0, line, "spam").unwrap();
+        let acts = core.moderation.as_ref().unwrap().acts(None, 10).unwrap();
+        let clear = (acts.iter())
+            .find(|a| a.kind == crate::ActKind::ReactionsClear)
+            .unwrap();
+        assert_eq!(
+            clear.evidence.as_deref(),
+            Some(
+                format!(
+                    "#{line}: :party_cat: 2, :blob_wave: 1, #{} 1, 👍 1",
+                    ids[2].0
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]

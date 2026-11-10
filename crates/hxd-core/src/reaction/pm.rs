@@ -47,6 +47,7 @@ impl Core {
             }
             (sess.mailbox(), sess.info.nick.clone())
         };
+        self.emoji_live(key, add)?;
         self.react_rate(uid, policy)?;
         let failed = |e: StoreError| {
             tracing::warn!("inbox would not take a reaction: {e}");

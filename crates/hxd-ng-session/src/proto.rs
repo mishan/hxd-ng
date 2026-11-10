@@ -50,6 +50,9 @@ pub struct LoginParams {
     /// Whether it reacts and reads reactions (§7.3).
     #[serde(default)]
     pub reactions: bool,
+    /// Whether it knows the server's own emoji (`docs/server-emoji.md`).
+    #[serde(default)]
+    pub emoji: bool,
 }
 
 #[derive(Debug, Deserialize)]
