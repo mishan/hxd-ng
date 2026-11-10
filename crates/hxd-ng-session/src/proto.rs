@@ -846,6 +846,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             re,
             im,
             reactions,
+            ..
         } => {
             // `uid` is 0 when a queued message's sender has no session
             // now; `login` is the account that survives either way, and
@@ -1405,6 +1406,7 @@ mod tests {
                 signed: None,
                 friendship,
                 re: None,
+                emoji: None,
                 delivered_at: None,
                 read_at: None,
             };
@@ -1423,6 +1425,7 @@ mod tests {
                         media: None,
                         signed: None,
                         re: None,
+                        emoji: None,
                         im: want.clone(),
                         reactions: None,
                     },

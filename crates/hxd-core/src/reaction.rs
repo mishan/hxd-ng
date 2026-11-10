@@ -2488,6 +2488,7 @@ mod tests {
             home_key: None,
             home: None,
             re: None,
+            emoji: None,
         });
         let late = person(&core, "late", chatter, true);
         let reader = person(&core, "reader", chatter.with(CHAT_HISTORY), true);
@@ -2565,6 +2566,7 @@ mod tests {
                 home_key: None,
                 home: None,
                 re: None,
+                emoji: None,
             })
             .unwrap();
         let late = person(&core, "late", chatter, true);

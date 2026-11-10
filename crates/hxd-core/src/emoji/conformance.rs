@@ -11,6 +11,14 @@ use crate::media::MediaType;
 /// subject: as large as it can be, so a store that narrows it is caught.
 const ROOM: usize = usize::MAX;
 
+/// Refs as a line or message keeps them, for the other stores' suites.
+pub fn refs() -> super::EmojiRefs {
+    super::EmojiRefs::unpack(&[
+        2, 0, 0, 0, 1, 5, b'p', b'a', b'r', b't', b'y', 0, 0, 0, 7, 2, b'o', b'k',
+    ])
+    .expect("refs as they are packed")
+}
+
 /// Run every case against a freshly built store.
 pub fn run(new_store: &dyn Fn() -> Box<dyn EmojiStore>) {
     ids_ascend_and_are_never_given_again(&*new_store());

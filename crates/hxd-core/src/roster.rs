@@ -268,10 +268,10 @@ pub struct Transport {
     /// It declared the ng wire's `reactions`, so a line's reactions are
     /// worth sending it (`docs/hotline-ng.md` §7.3). Kept, as `replies`.
     pub reactions: bool,
-    /// It declared the ng wire's `emoji`, to a server that keeps a
-    /// catalog (`docs/server-emoji.md`): what lets the ng frontend take
-    /// one of the server's own emoji as a reaction key. Kept, as
-    /// `replies`.
+    /// It reads the server's emoji catalog (`docs/server-emoji.md`):
+    /// the ng wire's `emoji` declared, to a server that keeps one. Such
+    /// a session is told of a change to it, and may react with one of
+    /// its emoji. Kept, as `replies`.
     pub emoji: bool,
     /// It is sent its own public lines even where it may not read the
     /// lobby: classic capability bit 17, Structured Chat, whose echo is
@@ -430,6 +430,10 @@ pub enum Event {
         /// nowhere to put it carries the text alone. Boxed, so that
         /// every event does not grow by a target's size.
         re: Option<Box<crate::reply::Reply>>,
+        /// The emoji refs its sender sent, as kept
+        /// (`crate::emoji`). A wire with nowhere to put them carries the
+        /// text alone, which reads `:name:`.
+        emoji: Option<crate::emoji::EmojiRefs>,
     },
     /// A server notice into a chat (kick announcements and the like).
     /// Semantic text; each frontend formats it (legacy: `\r<text>`).
@@ -515,6 +519,8 @@ pub enum Event {
 
         /// What the message answers, as its sender named it.
         re: Option<Box<crate::reply::Reply>>,
+        /// The emoji refs its sender sent, as kept.
+        emoji: Option<crate::emoji::EmojiRefs>,
         /// An instant message's guid, when it is handed over as mail:
         /// what a client needs to react to it as the instant message it
         /// is.
@@ -753,6 +759,11 @@ pub enum Event {
     /// batch, or an instant message's change. Only to sessions whose
     /// transport declared reactions.
     ReactionsChanged(Vec<crate::reaction::ReactionChange>),
+    /// The emoji catalog moved to `revision` (`crate::emoji`), told only
+    /// to a session that reads it.
+    EmojiChanged {
+        revision: u32,
+    },
 }
 
 impl Event {
@@ -767,12 +778,14 @@ impl Event {
                 from,
                 signed,
                 re,
+                emoji,
                 ..
             } => {
                 text.len()
                     + from.nick.len()
                     + signed.as_ref().map_or(0, Vec::len)
                     + re.as_ref().map_or(0, |r| r.pack().len())
+                    + emoji.as_ref().map_or(0, |e| e.packed_len())
             }
             Event::Notice { text, .. } => text.len(),
             Event::ChatSubject { subject, .. } => subject.len(),
@@ -782,6 +795,7 @@ impl Event {
                 from_login,
                 signed,
                 re,
+                emoji,
                 im,
                 reactions,
                 ..
@@ -791,6 +805,7 @@ impl Event {
                     + from_login.as_ref().map_or(0, String::len)
                     + signed.as_ref().map_or(0, Vec::len)
                     + re.as_ref().map_or(0, |r| r.pack().len())
+                    + emoji.as_ref().map_or(0, |e| e.packed_len())
                     + im.as_ref().map_or(0, |g| g.as_str().len())
                     + reactions
                         .as_ref()
@@ -862,6 +877,7 @@ impl Event {
                     + im.text.len()
                     + im.signed.as_ref().map_or(0, Vec::len)
                     + im.re.as_ref().map_or(0, |r| r.pack().len())
+                    + im.emoji.as_ref().map_or(0, |e| e.packed_len())
             }
             Event::Receipt { login, .. } | Event::Typing { login, .. } => login.len(),
             Event::ReactionsChanged(changes) => changes
@@ -924,6 +940,7 @@ impl Event {
             Event::Typing { .. } => "typing",
             Event::RequestsChanged { .. } => "requests_changed",
             Event::ReactionsChanged(..) => "reactions_changed",
+            Event::EmojiChanged { .. } => "emoji_changed",
         }
     }
 }
@@ -3324,6 +3341,7 @@ mod tests {
             guid: None,
             signed: None,
             re: None,
+            emoji: None,
         }
         .weight();
         assert_eq!(

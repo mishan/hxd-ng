@@ -94,6 +94,75 @@ impl std::fmt::Display for EmojiName {
     }
 }
 
+/// A name bound to an id for one line or message, as its sender's client
+/// sent it beside the text: what makes `:name:` there an emoji. The text
+/// itself is never read for names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmojiRef {
+    pub id: EmojiId,
+    pub name: EmojiName,
+}
+
+/// The most refs one line or message keeps: the first this many sent,
+/// the rest unread.
+pub const MAX_REFS: usize = 32;
+
+/// The refs a line or message kept ([`Core::emoji_keep`]): one to
+/// [`MAX_REFS`] of them, each id once, each naming a live entry by its
+/// name when it was sent. Made only there and by [`EmojiRefs::unpack`],
+/// so a store holds none other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmojiRefs(Arc<[EmojiRef]>);
+
+impl EmojiRefs {
+    pub fn refs(&self) -> &[EmojiRef] {
+        &self.0
+    }
+
+    /// How the stores keep them: a count, then each id and its name.
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.packed_len());
+        out.push(self.0.len() as u8);
+        for r in self.0.iter() {
+            out.extend_from_slice(&r.id.0.to_be_bytes());
+            out.push(r.name.as_str().len() as u8);
+            out.extend_from_slice(r.name.as_str().as_bytes());
+        }
+        out
+    }
+
+    pub(crate) fn packed_len(&self) -> usize {
+        1 + self
+            .0
+            .iter()
+            .map(|r| 5 + r.name.as_str().len())
+            .sum::<usize>()
+    }
+
+    /// [`EmojiRefs::pack`]'s bytes back, or `None` for bytes it never
+    /// wrote.
+    pub fn unpack(b: &[u8]) -> Option<Self> {
+        let (&n, mut rest) = b.split_first()?;
+        let mut refs: Vec<EmojiRef> = Vec::with_capacity(usize::from(n));
+        for _ in 0..n {
+            let id = EmojiId(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?));
+            let len = usize::from(*rest.get(4)?);
+            let name = std::str::from_utf8(rest.get(5..5 + len)?).ok()?;
+            refs.push(EmojiRef {
+                id,
+                name: EmojiName::parse(name)?,
+            });
+            rest = &rest[5 + len..];
+        }
+        let unique = refs
+            .iter()
+            .enumerate()
+            .all(|(i, r)| refs[..i].iter().all(|k| k.id != r.id));
+        (rest.is_empty() && (1..=MAX_REFS).contains(&refs.len()) && unique)
+            .then(|| EmojiRefs(refs.into()))
+    }
+}
+
 /// A stored image, as the codec made it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmojiImage {
@@ -441,16 +510,60 @@ impl Core {
             .find(|i| i.hash == *hash)
     }
 
+    /// What a line or message keeps of the refs its sender sent: of the
+    /// first [`MAX_REFS`], each whose id names a live entry under exactly
+    /// its name, then each id once, the first kept, in the order sent.
+    /// Never an error: a message is never refused over its refs. Read
+    /// from the snapshot, so a ref to an emoji added since the last
+    /// reload is dropped and one removed since is kept.
+    pub fn emoji_keep(&self, sent: &[EmojiRef]) -> Option<EmojiRefs> {
+        if sent.is_empty() {
+            return None;
+        }
+        let catalog = self.emoji_catalog()?;
+        let mut kept: Vec<EmojiRef> = Vec::new();
+        for r in sent.iter().take(MAX_REFS) {
+            let named = catalog
+                .entries
+                .binary_search_by_key(&r.id, |e| e.id)
+                .ok()
+                .map(|at| &catalog.entries[at])
+                .is_some_and(|e| e.image.is_some() && e.name == r.name);
+            if named && kept.iter().all(|k| k.id != r.id) {
+                kept.push(r.clone());
+            }
+        }
+        (!kept.is_empty()).then(|| EmojiRefs(kept.into()))
+    }
+
     /// Read the catalog again and serve it from now on, answering
     /// whether its revision moved. On an error the catalog served stays
     /// as it was. Store I/O: call it off the reactor.
+    ///
+    /// A move is told to every session that reads the catalog, once
+    /// however many edits it covers, and after the swap: a session that
+    /// read the revision before it hears of the new one.
     pub fn emoji_reload(&self) -> Result<bool, StoreError> {
         let Some(state) = self.emoji.as_ref() else {
             return Ok(false);
         };
         let catalog = Arc::new(state.store.load()?);
         let old = std::mem::replace(&mut *state.snapshot.lock().unwrap(), catalog.clone());
-        Ok(old.revision != catalog.revision)
+        let moved = old.revision != catalog.revision;
+        if moved {
+            let ev = crate::roster::Event::EmojiChanged {
+                revision: catalog.revision,
+            };
+            let mut r = self.roster.lock().unwrap();
+            let readers: Vec<crate::roster::Uid> = (r.users.iter())
+                .filter(|(_, s)| s.info.transport.emoji)
+                .map(|(uid, _)| *uid)
+                .collect();
+            for uid in readers {
+                r.send_to(uid, ev.clone());
+            }
+        }
+        Ok(moved)
     }
 }
 
@@ -652,6 +765,180 @@ mod tests {
         assert_eq!(core.emoji_image(party), None, "live only");
         assert_eq!(core.emoji_by_hash(&image.hash), None, "live only");
         assert!(core.emoji_image(kept).is_some());
+    }
+
+    fn named(id: EmojiId, name: &str) -> EmojiRef {
+        EmojiRef {
+            id,
+            name: EmojiName::parse(name).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_ref_is_kept_only_naming_a_live_emoji_by_its_name_once_as_sent() {
+        let store = Arc::new(MemoryEmoji::default());
+        let [party, polly, gone] = ["party", "old_name", "gone"].map(|n| add(&*store, n, 1));
+        store
+            .rename(polly, &NewEmojiName::parse("polly").unwrap())
+            .unwrap();
+        store
+            .remove(gone, SystemTime::UNIX_EPOCH, usize::MAX)
+            .unwrap();
+        let core = served(store.clone());
+        let fresh = add(&*store, "fresh", 2);
+        let going = add(&*store, "going", 3);
+        core.emoji_reload().unwrap();
+        store
+            .remove(going, SystemTime::UNIX_EPOCH, usize::MAX)
+            .unwrap();
+        add(&*store, "unread", 4);
+        let filler = |n: usize| vec![named(EmojiId(999), "nobody"); n];
+        for (case, sent, kept) in [
+            (
+                "live",
+                vec![named(party, "party")],
+                vec![named(party, "party")],
+            ),
+            (
+                "renamed, by its old name",
+                vec![named(polly, "old_name")],
+                vec![],
+            ),
+            (
+                "renamed, by its new one",
+                vec![named(polly, "polly")],
+                vec![named(polly, "polly")],
+            ),
+            ("removed", vec![named(gone, "gone")], vec![]),
+            ("never given", vec![named(EmojiId(999), "party")], vec![]),
+            ("another's name", vec![named(party, "polly")], vec![]),
+            (
+                "added since the reload",
+                vec![named(EmojiId(6), "unread")],
+                vec![],
+            ),
+            (
+                "removed since it",
+                vec![named(going, "going")],
+                vec![named(going, "going")],
+            ),
+            (
+                "the first that names it right",
+                vec![
+                    named(party, "bad"),
+                    named(party, "party"),
+                    named(party, "party"),
+                ],
+                vec![named(party, "party")],
+            ),
+            (
+                "in the order sent",
+                vec![
+                    named(fresh, "fresh"),
+                    named(gone, "gone"),
+                    named(party, "party"),
+                ],
+                vec![named(fresh, "fresh"), named(party, "party")],
+            ),
+            (
+                "within the first 32",
+                [filler(MAX_REFS - 1), vec![named(party, "party")]].concat(),
+                vec![named(party, "party")],
+            ),
+            (
+                "past them",
+                [filler(MAX_REFS), vec![named(party, "party")]].concat(),
+                vec![],
+            ),
+            ("none sent", vec![], vec![]),
+        ] {
+            let got = core.emoji_keep(&sent);
+            assert_eq!(
+                got.as_ref().map_or(&[][..], |k| k.refs()),
+                &kept[..],
+                "{case}"
+            );
+        }
+        assert_eq!(
+            Core::new().emoji_keep(&[named(party, "party")]),
+            None,
+            "no catalog"
+        );
+    }
+
+    #[test]
+    fn kept_refs_pack_and_back_and_nothing_else_unpacks() {
+        let store = Arc::new(MemoryEmoji::default());
+        let ids: Vec<EmojiId> = (0..MAX_REFS)
+            .map(|n| add(&*store, &format!("e{n}{}", "x".repeat(29)), 1))
+            .collect();
+        let core = served(store);
+        let longest: Vec<EmojiRef> = (ids.iter().enumerate())
+            .map(|(n, &id)| named(id, &format!("e{n}{}", "x".repeat(29))))
+            .collect();
+        for sent in [vec![longest[0].clone()], longest] {
+            let kept = core.emoji_keep(&sent).unwrap();
+            assert_eq!(kept.packed_len(), kept.pack().len());
+            assert_eq!(EmojiRefs::unpack(&kept.pack()), Some(kept));
+        }
+        let one =
+            |id: u32, name: &[u8]| [&id.to_be_bytes()[..], &[name.len() as u8], name].concat();
+        let many = |n: u8| {
+            [
+                &[n][..],
+                &(1..=u32::from(n))
+                    .map(|i| one(i, b"ab"))
+                    .collect::<Vec<_>>()
+                    .concat(),
+            ]
+            .concat()
+        };
+        assert!(EmojiRefs::unpack(&many(MAX_REFS as u8)).is_some());
+        for (case, bytes) in [
+            ("nothing", vec![]),
+            ("none", vec![0]),
+            ("past the bound", many(MAX_REFS as u8 + 1)),
+            ("cut short", many(2)[..12].to_vec()),
+            ("more after", [many(1), vec![0]].concat()),
+            ("no name", [vec![1], one(1, b"Party")].concat()),
+            (
+                "one id twice",
+                [vec![2], one(1, b"ab"), one(1, b"cd")].concat(),
+            ),
+        ] {
+            assert_eq!(EmojiRefs::unpack(&bytes), None, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_reload_that_moves_the_catalog_tells_each_session_that_reads_it_once() {
+        let store = Arc::new(MemoryEmoji::default());
+        let core = served(store.clone());
+        let attach = |login: &str, emoji: bool| {
+            let transport = crate::roster::Transport {
+                emoji,
+                ..Default::default()
+            };
+            crate::roster::test_attach_on(&core, login, Default::default(), transport)
+        };
+        let (_reader, mut reader) = attach("reader", true);
+        let (_other, mut other) = attach("other", false);
+        let changes = |rx: &mut crate::roster::Events| {
+            (crate::roster::drain(rx).into_iter())
+                .filter_map(|ev| match ev {
+                    crate::roster::Event::EmojiChanged { revision } => Some(revision),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        changes(&mut reader);
+        changes(&mut other);
+        add(&*store, "aa", 1);
+        add(&*store, "bb", 1);
+        assert_eq!(core.emoji_reload(), Ok(true));
+        assert_eq!(core.emoji_reload(), Ok(false));
+        assert_eq!(changes(&mut reader), [2]);
+        assert_eq!(changes(&mut other), Vec::<u32>::new());
     }
 
     #[test]

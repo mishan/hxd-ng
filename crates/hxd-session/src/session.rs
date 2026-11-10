@@ -3359,6 +3359,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport declared reactions, which this
         // one never does.
         Event::ReactionsChanged(_) => {}
+        // Sent only where the transport reads the emoji catalog, which
+        // this one does not yet.
+        Event::EmojiChanged { .. } => {}
         // Sent only to a session that speaks the friend family, which on
         // this wire is one that negotiated bit 6.
         ev @ (Event::FriendEntry(_)
@@ -3642,6 +3645,9 @@ async fn public_chat(
         return;
     }
     let from = sess.uid;
+    let lines = (lines.into_iter())
+        .map(|(text, style, media)| (text, style, media, Vec::new()))
+        .collect();
     let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, room, lines)).await
     else {
         return;
@@ -4718,7 +4724,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 cid,
                 line: (body, style, media),
             }) => {
-                if let Err(e) = ctx.core.chat_private(cid, sess.uid, body, style, media) {
+                if let Err(e) = ctx
+                    .core
+                    .chat_private(cid, sess.uid, body, style, media, &[])
+                {
                     debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
                 }
             }

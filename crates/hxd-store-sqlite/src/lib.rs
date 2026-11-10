@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hxd_core::emoji::EmojiRefs;
 use hxd_core::history::{
     summarize, Appended, ChatLog, HistoryPage, HistoryQuery, LineFlags, LineHome, LineId, LogLine,
     MediaMeta, NewLine, Retention, Signature, SignedAt,
@@ -1118,9 +1119,9 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
         .prepare_cached(
             "INSERT INTO chat_line
            (channel, nick, login, login_fp, icon, flags, body, at, ghost, guid, guid_from,
-            signed, signed_content, home_key, home_name, home_tag, home_tagged, re)
+            signed, signed_content, home_key, home_name, home_tag, home_tagged, re, emoji)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18)
+                 ?18, ?19)
          ON CONFLICT (channel, guid_from, guid) WHERE guid IS NOT NULL DO NOTHING",
         )
         .and_then(|mut stmt| {
@@ -1143,6 +1144,7 @@ fn insert_line(conn: &Connection, line: &NewLine) -> Result<Appended, StoreError
                 line.home.as_ref().map(|h| &h.tag),
                 line.home.as_ref().map(|h| h.tagged),
                 line.re.as_ref().map(Reply::pack),
+                line.emoji.as_ref().map(EmojiRefs::pack),
             ])
         })
         .map_err(StoreError::new)?;
@@ -2081,7 +2083,7 @@ fn fp_from_hex(s: &str) -> Result<[u8; 32], StoreError> {
 const COLUMNS: &str = "id, kind, recipient, recipient_fp, sender, sender_fp, \
                        sender_nick, body, guid, sent_at, delivered_at, read_at, \
                        media_id, media_type, media_w, media_h, media_bytes, \
-                       signed, signed_content, friendship, ref, seq, re";
+                       signed, signed_content, friendship, ref, seq, re, emoji";
 
 /// Every read path the inbox exposes is mail only — a kind the wire
 /// cannot carry must not be listed, counted, or handed to a flush.
@@ -2160,6 +2162,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
     let friendship: Option<i64> = r.get(19)?;
     let (reference, seq): (Option<Vec<u8>>, Option<i64>) = (r.get(20)?, r.get(21)?);
     let re: Option<Vec<u8>> = r.get(22)?;
+    let emoji: Option<Vec<u8>> = r.get(23)?;
     Ok((|| {
         Ok(StoredMessage {
             reference: reference
@@ -2208,6 +2211,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<StoredMessage, StoreError>> {
                 })
                 .transpose()?,
             re: unpack_reply(re)?,
+            emoji: unpack_emoji(emoji)?,
         })
     })())
 }
@@ -2457,9 +2461,9 @@ impl MessageStore for SqliteStore {
                (kind, recipient, recipient_fp, sender, sender_fp, sender_nick,
                 body, guid, sent_at, read_at,
                 media_id, media_type, media_w, media_h, media_bytes, signed, signed_content,
-                friendship, requested, sender_address, ref, seq, re)
+                friendship, requested, sender_address, ref, seq, re, emoji)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?18 IS 0, ?19, ?20, ?21, ?22)",
+                     ?18, ?18 IS 0, ?19, ?20, ?21, ?22, ?23)",
             params![
                 m.kind.as_i64(),
                 m.recipient.login,
@@ -2489,6 +2493,7 @@ impl MessageStore for SqliteStore {
                 &reference[..],
                 seq,
                 m.re.as_ref().map(Reply::pack),
+                m.emoji.as_ref().map(EmojiRefs::pack),
             ],
         )
         .map_err(StoreError::new)?;
@@ -3319,7 +3324,7 @@ fn clamp_id(id: MessageId) -> i64 {
 
 const HISTORY_COLUMNS: &str = "id, channel, nick, login, login_fp, icon, flags, body, at, \
                                media_id, media_type, media_w, media_h, media_bytes, signed, \
-                               home_key, home_name, home_tag, home_tagged, re";
+                               home_key, home_name, home_tag, home_tagged, re, emoji";
 
 fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
     let id: i64 = r.get(0)?;
@@ -3340,6 +3345,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
         _ => None,
     };
     let re: Option<Vec<u8>> = r.get(19)?;
+    let emoji: Option<Vec<u8>> = r.get(20)?;
     Ok((|| {
         let media = media?;
         Ok(LogLine {
@@ -3366,6 +3372,7 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
                 .map_err(|_| StoreError::new("a chat line's home key is not 32 bytes"))?,
             home,
             re: unpack_reply(re)?,
+            emoji: unpack_emoji(emoji)?,
         })
     })())
 }
@@ -3374,6 +3381,16 @@ fn history_row(r: &Row<'_>) -> rusqlite::Result<Result<LogLine, StoreError>> {
 /// bytes are this file's alone.
 fn unpack_reply(re: Option<Vec<u8>>) -> Result<Option<Reply>, StoreError> {
     re.map(|b| Reply::unpack(&b).ok_or_else(|| StoreError::new("a stored reply is not one")))
+        .transpose()
+}
+
+/// An `emoji` column, as [`unpack_reply`] reads `re`.
+fn unpack_emoji(emoji: Option<Vec<u8>>) -> Result<Option<EmojiRefs>, StoreError> {
+    emoji
+        .map(|b| {
+            EmojiRefs::unpack(&b)
+                .ok_or_else(|| StoreError::new("stored emoji refs are not ones this file wrote"))
+        })
         .transpose()
 }
 
@@ -3675,6 +3692,7 @@ impl ChatLog for SqliteStore {
                     "UPDATE chat_line
                         SET nick = '', body = '', signed = NULL, signed_content = NULL,
                             home_name = NULL, home_tag = NULL, home_tagged = NULL, re = NULL,
+                            emoji = NULL,
                             flags = flags | ?1,
                             deleted_at = IFNULL(deleted_at, ?2),
                             deleted_by = IFNULL(deleted_by, ?3)
@@ -4190,6 +4208,7 @@ mod tests {
                     home_key: None,
                     home: None,
                     re: None,
+                    emoji: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -4262,6 +4281,7 @@ mod tests {
                     home_key: None,
                     home: None,
                     re: None,
+                    emoji: None,
                     channel: 0,
                     ghost: None,
                     from_nick: "n".into(),
@@ -4306,6 +4326,7 @@ mod tests {
             home_key: None,
             home: None,
             re: None,
+            emoji: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -4440,6 +4461,7 @@ mod tests {
             home_key: None,
             home: None,
             re: None,
+            emoji: None,
             channel: 0,
             ghost: None,
             from_nick: "n".into(),
@@ -4567,6 +4589,7 @@ mod tests {
                 friendship: None,
                 sender_address: None,
                 re: None,
+                emoji: None,
             };
             match s.push(&m, usize::MAX).unwrap() {
                 Pushed::Stored { reference, .. } => reference,
@@ -4841,6 +4864,7 @@ mod tests {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         assert_eq!(
             prune(Duration::from_secs(1000)),
@@ -5021,6 +5045,7 @@ mod tests {
                 home_key: None,
                 home: None,
                 re: Some(re.clone()),
+                emoji: None,
             })
             .unwrap();
         assert_eq!(store.line(id).unwrap().unwrap().re, Some(re));
@@ -5149,6 +5174,7 @@ mod tests {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         assert!(
             matches!(
@@ -6217,6 +6243,7 @@ mod tests {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 100,
             )
@@ -6352,6 +6379,7 @@ mod tests {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 100,
             )
@@ -6402,6 +6430,7 @@ mod tests {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 100,
             )
@@ -6430,6 +6459,7 @@ mod tests {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         assert!(matches!(a.push(&m, 100).unwrap(), Pushed::Stored { .. }));
         m.body = "twice".into();
@@ -6463,6 +6493,7 @@ mod tests {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         // While alice was linked, then after she unlinked: same guid,
         // two mailboxes as far as the store is concerned.
@@ -6524,6 +6555,7 @@ mod tests {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 100,
             )

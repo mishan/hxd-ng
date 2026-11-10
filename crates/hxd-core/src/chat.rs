@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, warn};
 
+use crate::emoji::{EmojiRef, EmojiRefs};
 use crate::history::{HistoryPage, HistoryQuery, LineFlags, LineHome, NewLine, Signature};
 use crate::inbox::{
     Cursor, Delivery, InboxCounts, Mailbox, MessageGuid, MessageId, MessageKind, MessageRef,
@@ -383,6 +384,8 @@ pub(crate) struct Staged {
     link: Option<crate::server_link::LinkForm>,
     /// What it answers. Never a ghost's: no reference crosses a link.
     re: Option<Reply>,
+    /// The server's emoji it names, kept. Never a ghost's, as `re`.
+    emoji: Option<EmojiRefs>,
 }
 
 impl Staged {
@@ -407,6 +410,7 @@ impl Staged {
             signed,
             link: None,
             re: None,
+            emoji: None,
         }
     }
 }
@@ -826,13 +830,14 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_all(from, 0, vec![(text, style, media)])
+        self.chat_public_all(from, 0, vec![(text, style, media, Vec::new())])
             .pop()
             .expect("an answer for each line")
     }
 
     /// Public chat lines one session sent one after another into `room`,
-    /// the lobby for 0, `(text, style, media)`, answered in their order:
+    /// the lobby for 0, `(text, style, media, emoji)`, answered in their
+    /// order, each keeping what [`Core::emoji_keep`] keeps of its refs:
     /// they share a commit rather than wait for one each, so a sender that
     /// got ahead of the log catches up at once. Each is judged as
     /// [`Core::chat_public`] judges one; a line that tips its sender over
@@ -842,13 +847,13 @@ impl Core {
         &self,
         from: Uid,
         room: u32,
-        lines: Vec<(String, u16, Option<crate::media::Handle>)>,
+        lines: Vec<(String, u16, Option<crate::media::Handle>, Vec<EmojiRef>)>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
-        self.chat_public_lines(
-            from,
-            room,
-            lines.into_iter().map(|l| (l, None, None, None)).collect(),
-        )
+        let lines = lines
+            .into_iter()
+            .map(|(text, style, media, emoji)| ((text, style, media), None, None, None, emoji))
+            .collect();
+        self.chat_public_lines(from, room, lines)
     }
 
     /// One line into `room`, as [`Core::chat_public_all`] sends one,
@@ -885,7 +890,7 @@ impl Core {
         signed: Option<SignedLine>,
         re: Option<Reply>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_lines(from, room, vec![(line, guid, signed, re)])
+        self.chat_public_lines(from, room, vec![(line, guid, signed, re, Vec::new())])
             .pop()
             .expect("an answer for each line")
     }
@@ -982,6 +987,7 @@ impl Core {
             Option<MessageGuid>,
             Option<SignedLine>,
             Option<Reply>,
+            Vec<EmojiRef>,
         )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         // Before the lines are counted, as a private chat's are.
@@ -1001,7 +1007,9 @@ impl Core {
         // heard before the room hears of the kick, as they would have
         // been sent one at a time.
         let mut tipped = None;
-        for (i, ((mut text, style, media), guid, signed, re)) in lines.into_iter().enumerate() {
+        for (i, ((mut text, style, media), guid, signed, re, emoji)) in
+            lines.into_iter().enumerate()
+        {
             let in_room = |re: &Reply| match re {
                 Reply::Line { room: r, .. } => *r == room,
                 Reply::Signed { .. } => true,
@@ -1116,6 +1124,7 @@ impl Core {
                 signed,
                 link,
                 re,
+                emoji: self.emoji_keep(&emoji),
             });
             at.push(i);
         }
@@ -1286,6 +1295,7 @@ impl Core {
                                 tagged: r.tagged,
                             }),
                             re: s.re.clone(),
+                            emoji: s.emoji.clone(),
                         }
                     })
                     .collect();
@@ -1365,6 +1375,7 @@ impl Core {
                 guid: None,
                 signed: s.signed.map(|s| s.form),
                 re: s.re.map(Box::new),
+                emoji: s.emoji,
             };
             // The sender's own copy carries its guid; nobody else's does.
             let mine = s.guid.as_ref().map(|(_, g)| {
@@ -1450,6 +1461,7 @@ impl Core {
         text: String,
         style: u16,
         media: Option<crate::media::Handle>,
+        emoji: &[EmojiRef],
     ) -> Result<(), ChatError> {
         // Membership is checked before the handle is resolved, and the
         // handle before anything is sent: a non-member learns nothing
@@ -1481,6 +1493,7 @@ impl Core {
             )),
             None => None,
         };
+        let emoji = self.emoji_keep(emoji);
         let mut r = self.roster.lock().unwrap();
         let Some(chat) = r.chats.get(&cid) else {
             return Err(ChatError::NoSuchChat);
@@ -1504,6 +1517,7 @@ impl Core {
             guid: None,
             signed: None,
             re: None,
+            emoji,
         };
         for uid in &members {
             r.send_to(*uid, ev.clone());
@@ -2117,14 +2131,16 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_signed(from, to, text, guid, media, None, None)
+        self.msg_signed(from, to, text, guid, media, None, None, &[])
     }
 
     /// [`Core::msg`], for a message that may be signed: its frontend
     /// checked the signature, and that its id is `guid` and its signer
     /// the sender's identity; `to` is the recipient fingerprint it names,
     /// which must be the recipient's (`docs/e2e-messages.md` §4.9).
-    /// `re` is what it answers, which must be between the two of them.
+    /// `re` is what it answers, which must be between the two of them,
+    /// and `emoji` the refs its sender sent, of which it keeps what
+    /// [`Core::emoji_keep`] keeps.
     #[allow(clippy::too_many_arguments)]
     pub fn msg_signed(
         &self,
@@ -2135,6 +2151,7 @@ impl Core {
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
         re: Option<Reply>,
+        emoji: &[EmojiRef],
     ) -> Result<MsgOutcome, ChatError> {
         // A message to the reserved account is a command line, not mail
         // (`docs/system-account.md` §1). Answered, never delivered and
@@ -2171,7 +2188,8 @@ impl Core {
                 },
             )
         };
-        let sent = self.deliver(sender, recipient, text, guid, media, signed, re);
+        let emoji = self.emoji_keep(emoji);
+        let sent = self.deliver(sender, recipient, text, guid, media, signed, re, emoji);
         if sent.is_ok() {
             self.guest_written_back(from, to);
         }
@@ -2190,7 +2208,7 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_login_signed(from, to, text, guid, media, None, None)
+        self.msg_login_signed(from, to, text, guid, media, None, None, &[])
     }
 
     /// [`Core::msg_login`], as [`Core::msg_signed`] is [`Core::msg`]:
@@ -2205,6 +2223,7 @@ impl Core {
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
         re: Option<Reply>,
+        emoji: &[EmojiRef],
     ) -> Result<MsgOutcome, ChatError> {
         // The same account by name, for a client that addresses by login.
         if self.is_system_login(to) {
@@ -2213,9 +2232,17 @@ impl Core {
             }
             return self.run_system_command(from, &text);
         }
-        if let Some(routed) =
-            self.messaging_route(from, to, &text, &guid, media.is_some(), &signed, &re)
-        {
+        let emoji = self.emoji_keep(emoji);
+        if let Some(routed) = self.messaging_route(
+            from,
+            to,
+            &text,
+            &guid,
+            media.is_some(),
+            &signed,
+            &re,
+            &emoji,
+        ) {
             return routed;
         }
         let directory = self.directory.as_ref().ok_or(ChatError::NoSuchUser)?;
@@ -2238,6 +2265,7 @@ impl Core {
             media,
             signed,
             re,
+            emoji,
         )
     }
 
@@ -2361,6 +2389,7 @@ impl Core {
         media: Option<crate::media::Handle>,
         signed: Option<SignedMsg>,
         re: Option<Reply>,
+        emoji: Option<EmojiRefs>,
     ) -> Result<MsgOutcome, ChatError> {
         let now = self.clock.wall();
         let from = sender.uid;
@@ -2487,6 +2516,7 @@ impl Core {
                 media,
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
+                emoji,
                 im: None,
                 reactions: None,
             };
@@ -2576,6 +2606,7 @@ impl Core {
                 media,
                 signed: signed.map(|s| s.form),
                 re: re.map(Box::new),
+                emoji,
                 im: None,
                 reactions: None,
             };
@@ -2615,6 +2646,7 @@ impl Core {
                     friendship: None,
                     sender_address: None,
                     re,
+                    emoji,
                 },
                 self.inbox_policy.max_queued,
             )
@@ -3103,6 +3135,7 @@ impl Core {
                             media: m.media.as_ref().and_then(|meta| media_now(&handles, meta)),
                             signed: m.signed.as_ref().map(|s| s.form.clone()),
                             re: m.re.clone().map(Box::new),
+                            emoji: m.emoji.clone(),
                             im: matches!(m.friendship, Some(SentOn::Relation(_)))
                                 .then(|| m.guid.clone())
                                 .flatten(),
@@ -3985,7 +4018,7 @@ mod tests {
         let (sender, _) = test_attach(&core, "spammer", chatter());
         drain(&mut rx);
         let lines = ["one", "two", "three", "four", "five"]
-            .map(|t| (t.to_string(), 0, None))
+            .map(|t| (t.to_string(), 0, None, vec![]))
             .into();
         let answered = core.chat_public_all(sender, 0, lines);
         assert!(answered[..3].iter().all(|r| matches!(r, Ok(Some(_)))));
@@ -4587,6 +4620,7 @@ mod tests {
                 home_key: None,
                 home: None,
                 re: None,
+                emoji: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "alice".into(),
@@ -4831,7 +4865,7 @@ mod tests {
         drain(&mut rx_m);
         drain(&mut rx_o);
         assert_eq!(
-            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None),
+            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None, &[]),
             Err(ChatError::Flooding)
         );
         assert_eq!(
@@ -4862,11 +4896,13 @@ mod tests {
         drain(&mut rx_b);
 
         core.chat_public(a, "lobby 1".into(), 0, None).unwrap();
-        core.chat_private(cid, b, "chat 1".into(), 0, None).unwrap();
+        core.chat_private(cid, b, "chat 1".into(), 0, None, &[])
+            .unwrap();
         core.chat_public(b, "lobby 2".into(), 1, None).unwrap();
         core.chat_notice(cid, a, "a notice".into());
-        core.chat_private(cid, a, "chat 2".into(), 0, None).unwrap();
-        core.chat_private(other, a, "elsewhere".into(), 0, None)
+        core.chat_private(cid, a, "chat 2".into(), 0, None, &[])
+            .unwrap();
+        core.chat_private(other, a, "elsewhere".into(), 0, None, &[])
             .unwrap();
         let numbered = |evs: Vec<Event>| -> Vec<(u32, u64)> {
             evs.into_iter()
@@ -5484,6 +5520,62 @@ mod tests {
     }
 
     #[test]
+    fn every_line_and_message_carries_what_emoji_keep_keeps_of_its_refs() {
+        use crate::emoji::{EmojiId, EmojiName, EmojiRef, EmojiStore, MemoryEmoji, NewEmojiName};
+        let store = Arc::new(MemoryEmoji::default());
+        let party = NewEmojiName::parse("party").unwrap();
+        let image = crate::emoji::conformance::image(1);
+        store.add(&party, &image, SystemTime::now(), 10).unwrap();
+        let log = Arc::new(crate::history::MemoryLog::default());
+        let core = Core::new()
+            .with_history(log.clone(), Default::default())
+            .with_emoji(store, Default::default())
+            .unwrap();
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, mut rx_b) = test_attach(&core, "bob", chatter());
+        let named = |id, name| EmojiRef {
+            id: EmojiId(id),
+            name: EmojiName::parse(name).unwrap(),
+        };
+        let sent = vec![named(1, "party"), named(2, "nope")];
+        let kept = core.emoji_keep(&sent);
+        assert_eq!(kept.as_ref().map(|k| k.refs()), Some(&sent[..1]));
+        let heard = |rx: &mut crate::roster::Events| -> Vec<Option<crate::emoji::EmojiRefs>> {
+            (drain(rx).into_iter())
+                .filter_map(|ev| match ev {
+                    Event::Chat { emoji, .. } | Event::Msg { emoji, .. } => Some(emoji),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (cid, _) = core.chat_create(a, b).unwrap();
+        core.chat_join(cid, b, "").unwrap();
+        drain(&mut rx_a);
+        drain(&mut rx_b);
+
+        let line = core
+            .chat_public_all(a, 0, vec![("hi :party:".into(), 0, None, sent.clone())])
+            .remove(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::history::ChatLog::line(&*log, line)
+                .unwrap()
+                .unwrap()
+                .emoji,
+            kept
+        );
+        core.chat_private(cid, a, "psst :party:".into(), 0, None, &sent)
+            .unwrap();
+        core.msg_signed(a, b, ":party:".into(), None, None, None, None, &sent)
+            .unwrap();
+        core.chat_public(a, "plain".into(), 0, None).unwrap();
+        let three = vec![kept.clone(); 3];
+        assert_eq!(heard(&mut rx_b), [three, vec![None]].concat());
+        assert_eq!(heard(&mut rx_a), [kept.clone(), kept, None]);
+    }
+
+    #[test]
     fn private_chat_lifecycle_create_invite_join_part() {
         let core = Core::new();
         let (a, mut rx_a) = test_attach(&core, "alice", chatter());
@@ -5499,7 +5591,7 @@ mod tests {
         // Chatting before joining is refused; joining via invite skips the
         // password.
         assert_eq!(
-            core.chat_private(cid, b, "early".into(), 0, None),
+            core.chat_private(cid, b, "early".into(), 0, None, &[]),
             Err(ChatError::NotAMember)
         );
         let (rows, _subject) = core.chat_join(cid, b, "").unwrap();
@@ -5508,7 +5600,8 @@ mod tests {
             matches!(&drain(&mut rx_a)[..], [Event::ChatUserJoined { user, .. }] if user.uid == b)
         );
 
-        core.chat_private(cid, b, "hello".into(), 0, None).unwrap();
+        core.chat_private(cid, b, "hello".into(), 0, None, &[])
+            .unwrap();
         assert_eq!(drain(&mut rx_a).len(), 1);
         assert_eq!(drain(&mut rx_b).len(), 1);
 
@@ -5793,7 +5886,7 @@ pub(crate) mod inbox_tests {
         };
         let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
         let send = |from, to, re: Reply| {
-            core.msg_signed(from, to, "yes".into(), None, None, None, Some(re))
+            core.msg_signed(from, to, "yes".into(), None, None, None, Some(re), &[])
         };
         let carols = Reply::im("carol".into(), guid.clone()).unwrap();
         for (case, re) in [
@@ -6666,6 +6759,7 @@ pub(crate) mod inbox_tests {
                 None,
                 Some(signed),
                 None,
+                &[],
             )
         };
         let first = send(m, 2, 1);
@@ -7038,7 +7132,7 @@ pub(crate) mod inbox_tests {
                 mailbox: dave,
                 has_inbox: true,
             };
-            core.deliver(sender, to, text.into(), None, None, None, None)
+            core.deliver(sender, to, text.into(), None, None, None, None, None)
         };
         assert!(matches!(send("hi"), Ok(MsgOutcome::Delivered(None))));
         core.inbox_block_uid(m, g, true).unwrap();

@@ -540,6 +540,7 @@ impl MessageStore for MemoryStore {
             signed: m.signed.clone(),
             friendship: m.friendship,
             re: m.re.clone(),
+            emoji: m.emoji.clone(),
             delivered_at: None,
             // A receipt is not something anyone reads; stamping it here
             // keeps it out of unread counts and ages it on the read clock
@@ -1189,6 +1190,7 @@ mod tests {
                     friendship: None,
                     sender_address: None,
                     re: None,
+                    emoji: None,
                 },
                 usize::MAX,
             )

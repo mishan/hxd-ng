@@ -5722,6 +5722,7 @@ sync = "full"
                 home_key: None,
                 home: None,
                 re: None,
+                emoji: None,
                 channel: 0,
                 ghost: None,
                 from_nick: "n".into(),
@@ -6339,6 +6340,7 @@ sync = "full"
                     home_key: None,
                     home: None,
                     re: None,
+                    emoji: None,
                 })
                 .unwrap();
             store
@@ -6531,6 +6533,7 @@ sync = "full"
                         friendship: None,
                         sender_address: None,
                         re: None,
+                        emoji: None,
                     },
                     usize::MAX,
                 )
@@ -6593,6 +6596,7 @@ sync = "full"
                 friendship: None,
                 sender_address: None,
                 re: None,
+                emoji: None,
             };
             let Pushed::Stored { id, reference, .. } = store.push(&sent, usize::MAX).unwrap()
             else {

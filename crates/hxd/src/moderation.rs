@@ -693,6 +693,7 @@ mod tests {
             friendship: None,
             sender_address: None,
             re: None,
+            emoji: None,
         };
         let Pushed::Stored { reference, .. } = store.push(&sent, usize::MAX).unwrap() else {
             panic!("stored");

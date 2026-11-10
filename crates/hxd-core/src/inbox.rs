@@ -254,6 +254,8 @@ pub struct NewMessage {
     pub sender_address: Option<String>,
     /// What it answers, as its sender named it.
     pub re: Option<crate::reply::Reply>,
+    /// The emoji refs its sender sent, as kept (`crate::emoji`).
+    pub emoji: Option<crate::emoji::EmojiRefs>,
 }
 
 /// A message as the store holds it.
@@ -277,6 +279,7 @@ pub struct StoredMessage {
     pub signed: Option<crate::history::Signature>,
     pub friendship: Option<crate::relationships::SentOn>,
     pub re: Option<crate::reply::Reply>,
+    pub emoji: Option<crate::emoji::EmojiRefs>,
     /// When the server handed this to a live connection — *not* when a
     /// client rendered it. A stronger guarantee needs per-message client
     /// acks, which is what fogWraith's `IM Acknowledge (812)` is for and
