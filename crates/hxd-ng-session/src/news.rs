@@ -10,7 +10,7 @@ use hxd_core::instrument;
 use hxd_core::news::{
     Article, ArticleId, BodyType, Hit, MarkdownMode, NewsError, Node, NodeId, NodeKind, NodeTree,
     Notified, PostRequest, Reference, SearchOrder, SearchRequest, SubScope, Subscription,
-    ThreadHead, ThreadQuery,
+    ThreadHead, ThreadQuery, TimelineItem, TimelineQuery,
 };
 use hxd_core::{Core, Uid};
 use serde::de::DeserializeOwned;
@@ -221,6 +221,14 @@ fn thread_json(h: &ThreadHead) -> Value {
     })
 }
 
+/// A timeline thread (§10.9): a [`thread_json`] and whether its
+/// category's badge counts it.
+fn timeline_json(i: &TimelineItem) -> Value {
+    let mut v = thread_json(&i.head);
+    v["unread"] = json!(i.unread);
+    v
+}
+
 /// The login reply's `news` block, present exactly when the `news` cap
 /// is. `post` and `subscribe` are this session's own permissions rather
 /// than the server's ceiling, so a client can gray out a compose button or
@@ -351,6 +359,16 @@ struct ThreadsParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct TimelineParams {
+    #[serde(default)]
+    before: Option<ArticleId>,
+    #[serde(default)]
+    after: Option<ArticleId>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ThreadParams {
     root: ArticleId,
     #[serde(default)]
@@ -408,7 +426,8 @@ struct NodeParams {
 }
 
 /// The subscription requests (§10.9): a scope, named as exactly one of
-/// `thread` and `category`, and what the request needs beside it.
+/// `thread` and `category`, and what the request needs beside it. Or,
+/// for `news_seen` alone, `timeline` in place of a scope.
 #[derive(Debug, Deserialize)]
 struct ScopeParams {
     #[serde(default)]
@@ -416,16 +435,20 @@ struct ScopeParams {
     #[serde(default)]
     category: Option<NodeId>,
     #[serde(default)]
+    timeline: bool,
+    #[serde(default)]
     muted: Option<bool>,
+    #[serde(default)]
+    from: Option<ArticleId>,
     #[serde(default)]
     up_to: Option<ArticleId>,
 }
 
 impl ScopeParams {
     fn scope(&self) -> Option<SubScope> {
-        match (self.thread, self.category) {
-            (Some(root), None) => Some(SubScope::Thread(root)),
-            (None, Some(category)) => Some(SubScope::Category(category)),
+        match (self.thread, self.category, self.timeline) {
+            (Some(root), None, false) => Some(SubScope::Thread(root)),
+            (None, Some(category), false) => Some(SubScope::Category(category)),
             _ => None,
         }
     }
@@ -524,6 +547,32 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     c.news_threads(uid, query).map(|page| {
                         json!({
                             "threads": page.threads.iter().map(thread_json).collect::<Vec<_>>(),
+                            "has_more": page.has_more,
+                        })
+                    })
+                })
+                .await,
+            )
+        }
+
+        "news_timeline" => {
+            let Some(p) = parse::<TimelineParams>(params) else {
+                return malformed();
+            };
+            let limit = match page_size(p.limit, 50, policy.max_page) {
+                Ok(n) => n,
+                Err(text) => return bad(&text),
+            };
+            let query = TimelineQuery {
+                before: p.before,
+                after: p.after,
+                limit,
+            };
+            answer(
+                off_reactor(core, move |c| {
+                    c.news_timeline(uid, query).map(|page| {
+                        json!({
+                            "threads": page.threads.iter().map(timeline_json).collect::<Vec<_>>(),
                             "has_more": page.has_more,
                         })
                     })
@@ -775,8 +824,24 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             let Some(p) = parse::<ScopeParams>(params) else {
                 return malformed();
             };
+            if p.timeline && p.thread.is_none() && p.category.is_none() && req.req == "news_seen" {
+                let (Some(from), Some(up_to)) = (p.from, p.up_to) else {
+                    return bad("`from` and `up_to` are the oldest and newest threads shown.");
+                };
+                return answer(
+                    off_reactor(core, move |c| {
+                        c.news_seen_timeline(uid, from, up_to)
+                            .map(|unread| json!({ "unread": unread }))
+                    })
+                    .await,
+                );
+            }
             let Some(scope) = p.scope() else {
-                return bad("Name exactly one of `thread` and `category`.");
+                return bad(match (req.req.as_str(), p.timeline) {
+                    ("news_seen", _) => "Name exactly one of `thread`, `category` and `timeline`.",
+                    (_, true) => "Only `news_seen` takes `timeline`.",
+                    _ => "Name exactly one of `thread` and `category`.",
+                });
             };
             match req.req.as_str() {
                 "news_subscribe" => answer(

@@ -125,9 +125,9 @@ fn request_weight(req: &str) -> u32 {
         | "friend_remove" | "friend_alias" | "presence" | "typing" | "requests"
         | "request_answer" | "react" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
-        | "news_node_delete" | "news_search" | "voice_join" | "voice_leave" | "video_start"
-        | "video_stop" | "video_subscribe" | "push_register" | "report" | "purge"
-        | "account_list" | "role_list" | "role_get" | "files_preview" | "room_create"
+        | "news_node_delete" | "news_search" | "news_timeline" | "voice_join" | "voice_leave"
+        | "video_start" | "video_stop" | "video_subscribe" | "push_register" | "report"
+        | "purge" | "account_list" | "role_list" | "role_get" | "files_preview" | "room_create"
         | "room_edit" | "room_archive" | "room_unarchive" | "device_cert" | "friend_add"
         | "requests_clear" | "find_user" | "user_profile" | "friendships_fetch" => 4,
         _ => 1,
@@ -426,9 +426,16 @@ pub(crate) async fn run(
                     let sealed = sealed.map_or(0, |b| (b.len() * 3 / 4 / 2048) as u32);
                     let objects = crate::friends::object_weight(&req)
                         .saturating_add(crate::reactions::targets_weight(&req));
+                    // `news_seen`'s timeline form reads and moves every
+                    // followed category, as `news_timeline` reads them.
+                    let timeline = req.req == "news_seen"
+                        && req.params.get("timeline") == Some(&Value::Bool(true));
+                    let timeline = u32::from(timeline) * request_weight("news_timeline")
+                        .saturating_sub(request_weight("news_seen"));
                     let cost = request_weight(&req.req)
                         .saturating_add(signed + sealed)
-                        .saturating_add(objects);
+                        .saturating_add(objects)
+                        .saturating_add(timeline);
                     let over = ctx.core.spend_request(state.uid, cost).err();
                     let newcomer = matches!(req.req.as_str(), "chat" | "msg" | "news_post")
                         .then(|| ctx.core.newcomer_wait(state.uid))
