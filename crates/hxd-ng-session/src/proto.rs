@@ -115,6 +115,10 @@ pub struct ChatParams {
     /// What it answers, with `replies` (§7.3).
     #[serde(default)]
     pub re: Option<Value>,
+    /// The server emoji its text names, with `emoji`
+    /// (`docs/server-emoji.md` §8).
+    #[serde(default)]
+    pub emoji: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -172,6 +176,9 @@ pub struct MsgParams {
     /// What it answers, with `replies` (§7.3).
     #[serde(default)]
     pub re: Option<Value>,
+    /// As on `chat`.
+    #[serde(default)]
+    pub emoji: Option<Value>,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -744,6 +751,8 @@ struct ChatData<'a> {
     signed: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     re: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emoji: Option<Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -763,8 +772,9 @@ struct FromData<'a> {
 /// `last_seq` accounting exact.
 ///
 /// `replies` is whether this session declared `replies`: only such a
-/// session is sent what a line or message answers.
-pub fn event_json(se: &SeqEvent, replies: bool) -> String {
+/// session is sent what a line or message answers. `emoji` likewise, for
+/// the server emoji a line or message names.
+pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
     // The presence events first, written without a tree: every login and
     // every departure is one of these to everyone present.
     let out = |ev, data| {
@@ -796,6 +806,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
         guid,
         signed,
         re,
+        emoji: refs,
         ..
     } = &se.event
     {
@@ -813,6 +824,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             guid: guid.as_ref().map(|g| g.as_str()),
             signed: signed.as_deref().map(b64url),
             re: re.as_deref().filter(|_| replies).map(crate::replies::json),
+            emoji: refs.as_ref().filter(|_| emoji).map(crate::emoji::json),
         };
         return serde_json::to_string(&EventOut {
             seq: se.seq,
@@ -846,6 +858,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             re,
             im,
             reactions,
+            emoji: refs,
             ..
         } => {
             // `uid` is 0 when a queued message's sender has no session
@@ -885,6 +898,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             }
             crate::reactions::add(&mut data, reactions.as_deref());
             crate::replies::add(&mut data, re.as_deref(), replies);
+            crate::emoji::add(&mut data, refs.as_ref(), emoji);
             ("msg", data)
         }
         // `id` and `queued: true` never: a sealed message is never stored.
@@ -1023,7 +1037,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
         Event::NewsNotify(n) => ("news_notify", crate::news::notified_json(n)),
         // A room's, only ever to a session that asked about rooms
         // (`docs/chat-rooms.md` §7.3); the lobby's never carry `room`.
-        Event::InRoom { room, event } => in_room_json(*room, event, replies),
+        Event::InRoom { room, event } => in_room_json(*room, event, replies, emoji),
         Event::RoomAdded(v) => ("room_added", json!({ "room": crate::rooms::room_json(v) })),
         Event::RoomChanged(v) => (
             "room_changed",
@@ -1068,6 +1082,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
         Event::Im(m) => {
             let mut data = crate::friends::im_json(m);
             crate::replies::add(&mut data, m.re.as_ref(), replies);
+            crate::emoji::add(&mut data, m.emoji.as_ref(), emoji);
             ("im", data)
         }
         Event::Receipt {
@@ -1096,6 +1111,8 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
             "reactions_changed",
             json!({ "changes": changes.iter().map(crate::reactions::change_json).collect::<Vec<_>>() }),
         ),
+        // Only ever to a session that declared `emoji`.
+        Event::EmojiChanged { revision } => ("emoji_changed", json!({ "revision": revision })),
         // No ng mapping yet (private-chat family, and any future event this
         // build predates): emit a placeholder so seq accounting stays
         // gapless. Clients ignore unknown `ev` values per spec.
@@ -1106,7 +1123,7 @@ pub fn event_json(se: &SeqEvent, replies: bool) -> String {
 
 /// An event about a room, as the lobby's would be with `room` added, or
 /// the placeholder for one this wire does not carry.
-fn in_room_json(room: u32, event: &Event, replies: bool) -> (&'static str, Value) {
+fn in_room_json(room: u32, event: &Event, replies: bool, emoji: bool) -> (&'static str, Value) {
     let (ev, mut data) = match event {
         Event::Chat {
             from,
@@ -1118,6 +1135,7 @@ fn in_room_json(room: u32, event: &Event, replies: bool) -> (&'static str, Value
             guid,
             signed,
             re,
+            emoji: refs,
             ..
         } => {
             let data = ChatData {
@@ -1134,6 +1152,7 @@ fn in_room_json(room: u32, event: &Event, replies: bool) -> (&'static str, Value
                 guid: guid.as_ref().map(|g| g.as_str()),
                 signed: signed.as_deref().map(b64url),
                 re: re.as_deref().filter(|_| replies).map(crate::replies::json),
+                emoji: refs.as_ref().filter(|_| emoji).map(crate::emoji::json),
             };
             (
                 "chat",
@@ -1356,6 +1375,7 @@ mod tests {
                     event: Event::Joined(u.clone()),
                 },
                 false,
+                false,
             ))
             .unwrap();
             assert_eq!(
@@ -1368,6 +1388,7 @@ mod tests {
                 seq: 10,
                 event: Event::Parted(7),
             },
+            false,
             false,
         ))
         .unwrap();
@@ -1430,6 +1451,7 @@ mod tests {
                         reactions: None,
                     },
                 },
+                false,
                 false,
             ))
             .unwrap();

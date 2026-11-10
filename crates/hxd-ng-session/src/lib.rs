@@ -8,6 +8,7 @@ pub mod accounts;
 pub mod avatar;
 pub mod banner;
 mod conn;
+mod emoji;
 pub mod enroll;
 mod files;
 mod files_upload;
@@ -173,7 +174,8 @@ pub struct HttpLimits {
     pub connections: usize,
     /// `POST /identity/challenge` one address may make a minute.
     pub challenges_per_minute: u32,
-    /// `GET /avatars/{id}` one address may make a minute.
+    /// `GET /avatars/{id}` one address may make a minute, and as many
+    /// `GET /emoji/{hash}` apart.
     pub avatar_fetches_per_minute: u32,
 }
 

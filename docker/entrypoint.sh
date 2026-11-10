@@ -23,7 +23,7 @@ HXD_CONFIG=${HXD_CONFIG:-/etc/hxd-ng/hxd-ng.toml}
 GENERATED=/run/hxd-ng/hxd-ng.toml
 
 case ${1:-} in
-    "" | -* | inbox | news-reindex | push | identity | registrar | account | role | room) ;;
+    "" | -* | inbox | news-reindex | push | identity | registrar | account | role | room | emoji) ;;
     *) exec "$@" ;;
 esac
 
@@ -336,6 +336,14 @@ generate() {
     if on HXD_AVATARS on; then
         echo
         echo "[avatars]"
+    fi
+    # And the emoji catalog, which needs one of the sections that name it.
+    if on HXD_EMOJI off; then
+        on HXD_INBOX on || on HXD_HISTORY on || on HXD_NEWS on ||
+            die "HXD_EMOJI needs HXD_INBOX, HXD_HISTORY or HXD_NEWS: the catalog is kept in their database"
+        echo
+        echo "[emoji]"
+        echo "enabled = true"
     fi
 
     if [ -n "${HXD_PUSH_CONTACT:-}" ]; then

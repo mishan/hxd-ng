@@ -66,7 +66,7 @@ docker run -d --name "$name" --network "$name" \
     -v "$tls_dir":/etc/hxd-ng/tls:ro \
     -e HXD_TLS_CERT=/etc/hxd-ng/tls/cert.pem -e HXD_TLS_KEY=/etc/hxd-ng/tls/key.pem \
     -e HXD_NAME=smoke -e HXD_IDENTITY_HOSTS=localhost \
-    -e HXD_ADMIN_LOGIN=Admin -e HXD_ADMIN_PASSWORD=smoke \
+    -e HXD_ADMIN_LOGIN=Admin -e HXD_ADMIN_PASSWORD=smoke -e HXD_EMOJI=on \
     "$image" >/dev/null
 
 legacy=$(docker port "$name" 5500/tcp | head -n1)
@@ -120,6 +120,10 @@ docker exec "$name" bash -c "$health" ||
 # The login is folded the way FileAuth folds it.
 docker exec "$name" test -f /var/lib/hxd-ng/accounts/admin.toml ||
     fail "no accounts/admin.toml"
+
+# The entry point hands `emoji` to hxd, which finds the catalog.
+docker exec "$name" hxd-entrypoint emoji list >/dev/null ||
+    fail "hxd-entrypoint emoji list fails"
 
 # Relay mode, with the server above as its classic server.
 docker run -d --name "$relay" --network "$name" \

@@ -870,7 +870,7 @@ impl Core {
         line: (String, u16, Option<crate::media::Handle>),
         guid: Option<MessageGuid>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_signed(from, room, line, guid, None, None)
+        self.chat_public_signed(from, room, line, guid, None, None, Vec::new())
     }
 
     /// [`Core::chat_public_guid`], for a line that may be signed: its
@@ -880,7 +880,9 @@ impl Core {
     /// thing in the same room, and refused as an equivocation otherwise
     /// (`docs/e2e-messages.md` §4.7), as far as the log and the room's
     /// memory of guids remember. `re` is what it answers, which must be
-    /// a line of this room, if a line at all.
+    /// a line of this room, if a line at all, and `emoji` the refs its
+    /// sender sent, outside what a signature covers.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_public_signed(
         &self,
         from: Uid,
@@ -889,8 +891,9 @@ impl Core {
         guid: Option<MessageGuid>,
         signed: Option<SignedLine>,
         re: Option<Reply>,
+        emoji: Vec<EmojiRef>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_lines(from, room, vec![(line, guid, signed, re, Vec::new())])
+        self.chat_public_lines(from, room, vec![(line, guid, signed, re, emoji)])
             .pop()
             .expect("an answer for each line")
     }
@@ -5504,7 +5507,10 @@ mod tests {
         let core = Core::new();
         let (a, mut rx_a) = test_attach(&core, "alice", chatter());
         let (_b, mut rx_b) = test_attach(&core, "bob", chatter());
-        let say = |re| core.chat_public_signed(a, 0, ("yes".into(), 0, None), None, None, Some(re));
+        let say = |re| {
+            let line = ("yes".into(), 0, None);
+            core.chat_public_signed(a, 0, line, None, None, Some(re), Vec::new())
+        };
         for re in [Reply::Line { room: 7, id: 1 }, Reply::Pm([1; 16])] {
             assert_eq!(say(re.clone()), Err(ChatError::ReplyScope), "{re:?}");
         }

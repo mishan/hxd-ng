@@ -99,7 +99,7 @@ ports on the public side too, since a classic client finds the transfer
 port by adding one to the port it connected to. The ng port is
 plaintext, and belongs behind a TLS-terminating proxy (below); it serves
 the WebSocket at `/` and `/ng`, discovery, the identity endpoints, the
-`/trtp` and `/htxf` tunnels, media, avatars, file downloads and uploads,
+`/trtp` and `/htxf` tunnels, media, avatars, emoji, file downloads and uploads,
 `/banner`, the registrar's routes and `/metrics`. The voice port is free
 to move: clients send media to the addresses `[voice] advertise` names
 ([Voice](#voice)).
@@ -844,7 +844,7 @@ a window needs its seconds.
 | `http_connections_per_v6_48` | 64 | The same from one IPv6 /48's /64s together; at least `http_connections_per_addr` |
 | `ng_connections` | 4096 | Connections everyone holds to the ng port |
 | `challenges_per_minute` | 30 | `POST /identity/challenge`, per address |
-| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address |
+| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address, and `GET /emoji/{hash}` apart |
 
 #### Flood and spam
 
@@ -1348,12 +1348,13 @@ enabled = false           # off unless turned on
 
 The Server Emoji draft's catalog of images an operator curates with
 `hxd emoji` ([Emoji](#emoji)). A server of this version keeps the
-catalog and rereads it on SIGHUP, offers it on the classic wire as
-capability bit 20 to a UTF-8 session, with the emoji a line or message
-names relayed beside its text, and not yet on the ng wire, where its
-ids are reaction keys ([server-emoji.md](server-emoji.md) §5, §7).
-Absent, or `enabled` left off, means bit 20 is never confirmed and a
-client's references are dropped. It needs a database: the catalog is
+catalog and rereads it on SIGHUP, and offers it on the classic wire as
+capability bit 20 to a UTF-8 session and on the ng wire as the `emoji`
+capability, with the emoji a line or message names relayed beside its
+text, and on the ng wire its ids as reaction keys
+([server-emoji.md](server-emoji.md) §5, §7, §8). Absent, or `enabled`
+left off, means neither is offered and a client's references are
+dropped. It needs a database: the catalog is
 kept in the one `[inbox]`, `[history]` or `[news]` names.
 
 ```toml

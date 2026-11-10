@@ -118,6 +118,9 @@ pub(crate) struct Gates {
     challenges: RateGate,
     /// `GET /avatars/{id}`, per address.
     avatar_fetches: RateGate,
+    /// `GET /emoji/{hash}`, per address, at the avatars' rate: a client
+    /// draws a chat's worth of each as it joins.
+    emoji_fetches: RateGate,
 }
 
 impl Gates {
@@ -144,6 +147,7 @@ impl Gates {
             reserve: Arc::new(Semaphore::new(EXEMPT_RESERVE)),
             challenges: RateGate::per_minute(l.challenges_per_minute, exempt.clone()),
             avatar_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
+            emoji_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
             exempt,
         }
     }
@@ -395,6 +399,20 @@ async fn route(
                     }
                 }
             }
+            _ => plain(StatusCode::NOT_FOUND, "not found"),
+        };
+        return cors(resp);
+    }
+
+    if let Some(hash) = path.strip_prefix("/emoji/") {
+        let resp = match *req.method() {
+            Method::GET => match gates.emoji_fetches.take(client.ip()) {
+                Ok(()) => boxed(crate::emoji::download(hash, &req, &ctx)),
+                Err(wait) => {
+                    hxd_core::instrument::throttled("fetch");
+                    slow_down_ng(wait, "too many emoji fetches")
+                }
+            },
             _ => plain(StatusCode::NOT_FOUND, "not found"),
         };
         return cors(resp);
@@ -692,6 +710,7 @@ fn cors_route(path: &str) -> bool {
         || path.starts_with("/media/")
         || path == "/avatar"
         || path.starts_with("/avatars/")
+        || path.starts_with("/emoji/")
         || path == crate::banner::BANNER_PATH
         || path.starts_with("/files/")
         || path == "/news/blob"
