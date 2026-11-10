@@ -54,6 +54,7 @@ fn req_label(req: &str) -> &'static str {
         "blocks",
         "chat",
         "device_cert",
+        "emoji_list",
         "history",
         "inbox",
         "login",
@@ -114,7 +115,7 @@ fn req_label(req: &str) -> &'static str {
 fn request_weight(req: &str) -> u32 {
     match req {
         "logout" => 0,
-        "voice_ice" => 1,
+        "voice_ice" | "emoji_list" => 1,
         "chat" | "msg" | "nick" | "signs" | "block" | "unblock" | "msg_read" | "avatar_clear"
         | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
@@ -1085,6 +1086,9 @@ async fn handle_login(
     if reactions {
         caps.push("reactions".into());
     }
+    if emoji {
+        caps.push("emoji".into());
+    }
     let mut ok = json!({
         "session": session_id,
         "token": token,
@@ -1206,6 +1210,9 @@ async fn handle_login(
     }
     if reactions {
         ok["reactions"] = crate::reactions::login_json(ctx);
+    }
+    if let Some(block) = emoji.then(|| crate::emoji::login_json(&ctx.core)).flatten() {
+        ok["emoji"] = block;
     }
     let reply = reply_ok_with_users(req.id, ok, &users);
     drop(users);
@@ -1382,7 +1389,12 @@ async fn handle_resume(
                 return None;
             }
             for se in &replay {
-                if !send_frame(ws_tx, Message::Text(event_json(se, state.replies))).await {
+                if !send_frame(
+                    ws_tx,
+                    Message::Text(event_json(se, state.replies, state.emoji)),
+                )
+                .await
+                {
                     lost(ctx);
                     return None;
                 }
@@ -1503,13 +1515,13 @@ async fn send_events(
     instrument::queue_depth(WIRE, events.len());
     let mut kicked = matches!(first.event, hxd_core::Event::Kicked);
     state.note(&first.event);
-    let mut batch = vec![event_json(&first, state.replies)];
+    let mut batch = vec![event_json(&first, state.replies, state.emoji)];
     let mut bytes = batch[0].len();
     while !kicked && bytes < WRITE_BATCH {
         let Ok(se) = events.try_recv() else { break };
         kicked = matches!(se.event, hxd_core::Event::Kicked);
         state.note(&se.event);
-        let text = event_json(&se, state.replies);
+        let text = event_json(&se, state.replies, state.emoji);
         bytes += text.len();
         batch.push(text);
     }
@@ -1636,7 +1648,12 @@ async fn handle_sync(
                 seq = seq.max(se.seq);
                 kicked |= matches!(se.event, hxd_core::Event::Kicked);
                 state.note(&se.event);
-                if !send_frame(ws_tx, Message::Text(event_json(&se, state.replies))).await {
+                if !send_frame(
+                    ws_tx,
+                    Message::Text(event_json(&se, state.replies, state.emoji)),
+                )
+                .await
+                {
                     return Flow::Dead;
                 }
             }
@@ -1765,7 +1782,9 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// Info and Move File, 7 each, an upload its Upload File, 3, and the
 /// account requests its New, Delete,
 /// Open and Set User, 20 each but Open's 10, and the role writes Set
-/// User's. Whatever else this wire asks
+/// User's; `emoji_list` its Get Emoji Catalog, at nothing, since a client
+/// fetches the catalog as it joins and the classic wire prices 713 at 0.
+/// Whatever else this wire asks
 /// for, it has no classic counterpart to be priced by, and is held to the
 /// request limit instead. So is the friend family but `msg`: mhxd's
 /// table predates the extension and would price it only by its
@@ -1779,6 +1798,7 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "room_join" => Some((0x73, 2)),
         "room_part" => Some((0x74, 1)),
         "nick" | "signs" => Some((0x130, 20)),
+        "emoji_list" => Some((0x2c9, 0)),
         "news_post" => Some((0x19a, 10)),
         "news_delete" => Some((0x19b, 10)),
         "news_node_create" => Some((0x17e, 10)),
@@ -1874,6 +1894,12 @@ async fn dispatch(
                         return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
                     }
                 };
+                let refs = match crate::emoji::param(state.emoji, p.emoji.as_ref()) {
+                    Ok(refs) => refs,
+                    Err(text) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
+                    }
+                };
                 let (uid, room) = (state.uid, p.room);
                 // Refused rather than cut over its limit: cutting would
                 // break the signature (`docs/e2e-messages.md` §4.7).
@@ -1890,7 +1916,7 @@ async fn dispatch(
                 let mut text = p.text;
                 text.truncate_to_char_boundary(4096);
                 let said = off_reactor(&ctx.core, move |c| {
-                    c.chat_public_signed(uid, room, (text, style, media), guid, signed, re)
+                    c.chat_public_signed(uid, room, (text, style, media), guid, signed, re, refs)
                 })
                 .await;
                 match said {
@@ -1982,6 +2008,7 @@ async fn dispatch(
                                     let fetchable = ctx.core.history_media_fetchable(uid, line);
                                     let mut v = history_line_json(line, fetchable);
                                     crate::replies::add(&mut v, line.re.as_ref(), true);
+                                    crate::emoji::add(&mut v, line.emoji.as_ref(), state.emoji);
                                     crate::reactions::add(&mut v, reacted.get(&line.id));
                                     let more = v.to_string().len() + usize::from(!shown.is_empty());
                                     if bytes + more > IDS_REPLY_BYTES && !shown.is_empty() {
@@ -2033,6 +2060,7 @@ async fn dispatch(
                                             line.re.as_ref(),
                                             state.replies,
                                         );
+                                        crate::emoji::add(&mut v, line.emoji.as_ref(), state.emoji);
                                         crate::reactions::add(&mut v, shown.get(&line.id));
                                         v
                                     })
@@ -2115,6 +2143,12 @@ async fn dispatch(
                     &["pm", "im", "signed"],
                 ) {
                     Ok(re) => re,
+                    Err(text) => {
+                        return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
+                    }
+                };
+                let refs = match crate::emoji::param(state.emoji, p.emoji.as_ref()) {
+                    Ok(refs) => refs,
                     Err(text) => {
                         return finish(ws_tx, reply_err(req.id, "bad_request", text)).await
                     }
@@ -2215,13 +2249,13 @@ async fn dispatch(
                             return finish(ws_tx, out).await;
                         }
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_signed(from, uid, text, guid, media, signed, re, &[])
+                            c.msg_signed(from, uid, text, guid, media, signed, re, &refs)
                         })
                         .await
                     }
                     (None, Some(login)) => {
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_login_signed(from, &login, text, guid, media, signed, re, &[])
+                            c.msg_login_signed(from, &login, text, guid, media, signed, re, &refs)
                         })
                         .await
                     }
@@ -2340,6 +2374,7 @@ async fn dispatch(
         },
 
         "device_cert" => crate::sealed::device_cert(ctx, state, req.id, &req.params).await,
+        "emoji_list" => crate::emoji::list(ctx, state.emoji, req.id, &req.params),
         "react" => crate::reactions::react(ctx, state, req.id, &req.params).await,
         "reactions" => crate::reactions::asked(ctx, state, req.id, &req.params).await,
 
@@ -2388,6 +2423,7 @@ async fn dispatch(
                                         .and_then(|meta| media_now(&ctx.core, meta));
                                     let mut v = stored_msg_json(m, media.as_ref());
                                     crate::replies::add(&mut v, m.re.as_ref(), state.replies);
+                                    crate::emoji::add(&mut v, m.emoji.as_ref(), state.emoji);
                                     crate::reactions::add(&mut v, reacted.get(&m.reference));
                                     v
                                 })

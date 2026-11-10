@@ -242,7 +242,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 | `HXD_HTTP_CONNECTIONS_PER_V6_48` | 64 | Connections the /64s of one IPv6 /48 may hold to the ng port between them; 0 for no limit. |
 | `HXD_NG_CONNECTIONS` | 4096 | Connections everyone together may hold to the ng port; 0 for no limit. Keep it below the container's descriptor limit, less a few: addresses in `HXD_LIMITS_EXEMPT` are kept places past it. |
 | `HXD_CHALLENGES_PER_MINUTE` | 30 | `POST /identity/challenge` one address may make a minute; 0 for no limit. |
-| `HXD_AVATAR_FETCHES_PER_MINUTE` | 600 | `GET /avatars/{id}` one address may make a minute; 0 for no limit. |
+| `HXD_AVATAR_FETCHES_PER_MINUTE` | 600 | `GET /avatars/{id}` one address may make a minute, and as many `GET /emoji/{hash}` apart; 0 for no limit. |
 | `HXD_LOGINS_IN_FLIGHT` | 32 | Logins the server works on at once, a quarter of them from one address at most. Past it a login is refused as busy and its user tries again, rather than every login slowing down together. |
 | `HXD_QUEUE_BUDGET_MB` | 128 | MiB the server may queue for its clients, all together. Past it, the clients furthest behind are dropped. The allocator holds a few times this, so keep it to a fraction of the container's memory. |
 
@@ -312,6 +312,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_NEWS_MAX_PER_AUTHOR` | 10000 | Articles one account may hold, the guests from one address counted together. |
 | `HXD_MEDIA` | `on` | Images in chat ([inline-media.md](inline-media.md)). Sending one needs the `send_media` bit: the account `HXD_ADMIN_LOGIN` writes has it, and any other account only if its file grants it. |
 | `HXD_AVATARS` | `on` | Users' pictures on both wires ([avatars.md](avatars.md)), kept in the database. |
+| `HXD_EMOJI` | `off` | The server's own emoji on both wires ([server-emoji.md](server-emoji.md)), kept in the database. Needs `HXD_INBOX`, `HXD_HISTORY` or `HXD_NEWS`. The catalog is edited with `hxd-entrypoint emoji`, from an image inside the container, and applied on SIGHUP ([below](#operating)). |
 | `HXD_PUSH_CONTACT` | | Turns on Web Push; a `mailto:` or `https:` contact for push services ([webpush-gateway.md](webpush-gateway.md)). The VAPID key is generated into the volume, and losing it silently breaks every subscription — back it up. |
 | `HXD_PUSH_CONTENT` | `sender` | `full`, `sender` or `generic`. |
 | `HXD_PUSH_GATEWAY` | `webpush` | `webpush` sends from the server itself; `uniqush` through a uniqush-push sidecar ([below](#push-through-uniqush)). |
@@ -482,6 +483,16 @@ configuration the server has:
 ```sh
 docker exec hxd-ng hxd-entrypoint registrar invites --add 5
 docker exec hxd-ng hxd-entrypoint inbox purge alice --dry-run
+```
+
+**Server emoji** are added from an image the container can read, then
+applied on SIGHUP, once for a batch of edits:
+
+```sh
+docker cp party.gif hxd-ng:/var/lib/hxd-ng/party.gif
+docker exec hxd-ng hxd-entrypoint emoji add party /var/lib/hxd-ng/party.gif
+docker exec hxd-ng rm /var/lib/hxd-ng/party.gif
+docker kill -s HUP hxd-ng
 ```
 
 **Revoking a key** depends on where the config comes from. With the

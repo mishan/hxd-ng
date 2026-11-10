@@ -32,6 +32,7 @@ const HDR_CHAT: u32 = 0x6a;
 struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
+    core: Arc<Core>,
     store: Arc<SqliteStore>,
     system: u16,
     stop: [tokio::task::AbortHandle; 2],
@@ -112,6 +113,8 @@ async fn start(dir: &Path) -> Server {
         )
         .with_moderation(store.clone(), ModerationPolicy::default())
         .with_news(store.clone(), NewsPolicy::default())
+        .with_emoji(store.clone(), hxd_core::emoji::EmojiPolicy::default())
+        .unwrap()
         .with_system(SystemPolicy::default())
         .with_rooms(
             Arc::new(hxd::rooms::FileRooms::new(&dir.join("rooms.toml"))),
@@ -158,7 +161,7 @@ async fn start(dir: &Path) -> Server {
         core.clone(),
     );
     let ng_ctx = NgCtx {
-        core,
+        core: core.clone(),
         auth,
         cfg: Arc::new(NgConfig {
             server_name: "signed".into(),
@@ -186,6 +189,7 @@ async fn start(dir: &Path) -> Server {
     Server {
         legacy,
         ng,
+        core,
         store,
         system,
         stop,
@@ -195,15 +199,19 @@ async fn start(dir: &Path) -> Server {
 /// A server started again on the same database, once every connection to
 /// the first has gone.
 async fn restart(server: Server, dir: &Path) -> Server {
-    server.stop.iter().for_each(tokio::task::AbortHandle::abort);
+    let Server {
+        core, store, stop, ..
+    } = server;
+    stop.iter().for_each(tokio::task::AbortHandle::abort);
+    drop(core);
     timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(&server.store) > 1 {
+        while Arc::strong_count(&store) > 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the first server let go of its store");
-    drop(server);
+    drop(store);
     start(dir).await
 }
 
@@ -823,6 +831,43 @@ async fn a_signed_message_is_delivered_kept_and_reported() {
         .unwrap()
         .data;
     assert_eq!(got["signed"], later);
+}
+
+/// Emoji refs ride beside what a signature covers, as the nick does.
+#[tokio::test]
+async fn a_signed_line_and_message_carry_their_emoji_beside_the_signature() {
+    use hxd_core::emoji::{EmojiStore, NewEmojiName};
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let party = NewEmojiName::parse("party").unwrap();
+    let image = hxd_core::emoji::conformance::image(1);
+    (server
+        .store
+        .add(&party, &image, std::time::SystemTime::now(), 10))
+    .unwrap();
+    server.core.emoji_reload().unwrap();
+    let (alice, bob) = (person(1, "alice"), person(2, "bob"));
+    let declared = json!({ "emoji": true });
+    let (mut a, _) = login_as(server.ng, &alice, declared.clone()).await;
+    let (mut b, _) = login_as(server.ng, &bob, declared).await;
+    let refs = json!([{ "name": "party", "id": 1 }]);
+
+    let g = guid(1);
+    let signed = signed_line(&alice, &line(&alice, &g, 0, "hi :party:"));
+    let said = json!({ "text": "hi :party:", "guid": g, "signed": signed, "emoji": refs });
+    let id = ok(&mut a, "chat", said).await["id"].clone();
+    let heard = b.event_where("chat", |d| d["id"] == id).await.unwrap().data;
+    assert_eq!((&heard["signed"], &heard["emoji"]), (&json!(signed), &refs));
+
+    let g = guid(2);
+    let signed = message(&alice, &g, &bob, "psst :party:");
+    let sent = json!({ "to": b.uid, "text": "psst :party:", "guid": g, "signed": signed,
+                       "emoji": refs });
+    ok(&mut a, "msg", sent).await;
+    let got = (b.event_where("msg", |d| d["text"] == "psst :party:").await)
+        .unwrap()
+        .data;
+    assert_eq!((&got["signed"], &got["emoji"]), (&json!(signed), &refs));
 }
 
 #[tokio::test]

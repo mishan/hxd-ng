@@ -9,13 +9,24 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Upgrading
 
-- No schema migration and no config change.
+- Schema 37 adds the server emoji catalog, and `[emoji]` is a new
+  config section, off unless enabled (docs/server-emoji.md).
 - The ng wire gains `news_timeline`: one stream, newest first, of the
   threads started in every news category an account follows and has
   not muted, each marked `unread` as its category's badge counts it,
   and `news_seen { timeline: true, from, up_to }` to say a run of it
   was shown (docs/news.md §10.8, §10.9). Each costs 4 of an ng
   session's request limit. A client that never asks sees no change.
+- Server emoji: a catalog of images the operator curates with `hxd
+  emoji` and the server rereads on SIGHUP. Where `[emoji]` is enabled,
+  the classic wire offers it as capability bit 20 to a UTF-8 session,
+  and the ng wire to a login that declares `emoji: true`: the `emoji`
+  capability and its block, `emoji_list`, `emoji_changed`, `GET
+  /emoji/{hash}` and the `emoji` refs on `chat` and `msg` and on what
+  carries them (docs/server-emoji.md §8). `GET /emoji/{hash}` is held
+  to `[limits] avatar_fetches_per_minute` per address, counted apart
+  from the avatars'. A client that never asks for either sees no
+  change. The Docker image turns the catalog on with `HXD_EMOJI`.
 
 ### Fixed
 

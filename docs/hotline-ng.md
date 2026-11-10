@@ -185,6 +185,7 @@ over them.
 | `guest_identities` | Identity guests' message requests: listed apart by `fingerprint` on `requests`, counted in `requests_changed`, and answered by `fingerprint` on `request_answer`. Listed only to a login that asked for it (§7.5) | §7.5 here; instant-messaging.md §4.1 | — |
 | `replies` | `re` on `chat` and `msg`, on the events, listings and pages that carry them, and `ids` on `history`. Listed only to a login that asked for it (§7.3) | §7.3 here | `replies` |
 | `reactions` | `react`, a line's reactions on the `history` that shows it, `reactions`, and `reactions_changed`. Listed only to a login that asked for it (§7.3) | §7.3 here | `reactions` |
+| `emoji` | The server's own emoji: `emoji_list`, `emoji_changed`, `GET /emoji/{hash}` (which serves any session), `emoji` on `chat` and `msg` and on the events, listings and pages that carry them, and a catalog id as a reaction key. Listed only to a login that asked for it (§6.1) | server-emoji.md §8 | `emoji` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -292,7 +293,7 @@ Starts a new session.
     "guest_identities": true, // optional: with messaging, identity guests' requests (§7.5)
     "replies": true,         // optional: it sends and reads `re` (§7.3)
     "reactions": true,       // optional: it reacts and reads reactions (§7.3)
-    "emoji": true            // optional: it knows the server's own emoji (§7.3)
+    "emoji": true            // optional: it knows the server's own emoji (server-emoji.md §8)
 } }
 ```
 
@@ -332,7 +333,7 @@ hotline-ng-identity.md §8.1 says.
 | `guest_identities` | Not echoed: `caps` lists `guest_identities` when it is granted, to a session that takes part (§7.5). Without `messaging`, it is ignored. A resume keeps what the login was granted. |
 | `replies` | Not echoed: `caps` lists `replies` when it is granted, which is whenever the server keeps any kind of target, and the `replies` block says which (§7.3). A resume keeps what the login was granted. |
 | `reactions` | Not echoed: `caps` lists `reactions` when it is granted, which is whenever the server takes reactions on any kind of target, and the `reactions` block says which (§7.3). A resume keeps what the login was granted. |
-| `emoji` | Not echoed: where the server keeps an emoji catalog (*hxd-ng:* `[emoji]`, server-emoji.md), it lets `react` and `reactions` take one of the server's own emoji as a key (§7.3); elsewhere it is ignored. *hxd-ng* does not yet list it in `caps` or send a block for it (server-emoji.md §11), so a client cannot yet tell whether it was granted. Until then a session granted it is sent an `unsupported` placeholder (§3) when the catalog changes. A resume keeps what the login was granted. |
+| `emoji` | Not echoed: `caps` lists `emoji` when it is granted, which is wherever the server keeps an emoji catalog (*hxd-ng:* `[emoji]`), and the `emoji` block carries the catalog's revision and limits (server-emoji.md §8). It also lets `react` and `reactions` take one of the server's own emoji as a key (§7.3). A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
 
 The roster is complete at the reply: the client needs no event to learn
@@ -502,7 +503,9 @@ repeated while `has_more`, to recover the gap's public chat; and with
 the `rooms` capability, the same for each room `sync` lists in
 `rooms.joined` whose `last_id` is past the client's cursor for that room,
 with `room` set, since a line id is a cursor in its own room alone
-(chat-rooms.md §7.4). A line
+(chat-rooms.md §7.4); and with the `emoji` capability, `emoji_list`
+from the revision it holds, since the gap may have held an
+`emoji_changed` (server-emoji.md §8). A line
 returned by `history` has the same id as its live `chat` event, so the
 client deduplicates by id. Mail that arrived while no connection was
 attached was never in the buffer; it is still pending, and `sync`
@@ -673,10 +676,10 @@ family document. Each family of §4 adds its own.
 | `req` | `params` | `ok` | Errors besides §10's universal set |
 |---|---|---|---|
 | `login` / `resume` / `sync` | §6 | §6 | §6 |
-| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?`, `re?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
+| `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?`, `re?`, `emoji?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; `emoji?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
 | `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `no_such_emoji`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
@@ -814,6 +817,13 @@ family document. Each family of §4 adds its own.
     is `bad_request`; from any other session it is ignored. When the lines do not fit one reply (*hxd-ng:* 64
     KiB of them) the highest ids are left out and `has_more` is `true`,
     for the client to ask again for those.
+- **`emoji`** on `chat` and `msg`, with the `emoji` capability, names
+  the server emoji the text uses, `[ { "name", "id" } ]`, and is
+  carried as kept on the `chat`, `msg` and `im` events, on `history`
+  lines, `inbox` rows and the messages of a `requests` listing, to
+  sessions that declared `emoji` alone (server-emoji.md §8). From such
+  a session one that is not such a list is `bad_request`; a session
+  that did not declare it has it ignored (§5).
 - **`react`**, with the `reactions` capability, adds a reaction, or with
   `remove: true` takes one away, and answers a line's key's `count`
   after. `target` is a `line` as `re` names one (`{ "line", "room"? }`),
@@ -1001,7 +1011,7 @@ family document. Each family of §4 adds its own.
     and their reactions with them.
 - **`inbox`** lists this account's stored messages, newest first, paging
   backward from `before`. Each is `{ id, ref, from: { nick, login? }, text,
-  at, read, media?, signed?, re?, im?, guid?, reactions?,
+  at, read, media?, signed?, re?, emoji?, im?, guid?, reactions?,
   reactions_mine? }`, `id` and `ref` as on the `msg` event (§7.1); there
   is no uid, which may have been reused since. A private message's row
   carries to a session that declared `reactions` its `reactions` and
@@ -1044,15 +1054,15 @@ blind (identity-registrar.md §7.3).
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. |
 | `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
-| `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"?, "re"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
+| `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"?, "re"?, "emoji"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"?, "re"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
+| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"?, "re"?, "emoji"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
-families — `voice_*`, `video_status`, `news_*`, `room_*` — are specified where §4
+families — `voice_*`, `video_status`, `news_*`, `room_*`, `emoji_changed` — are specified where §4
 says, `reactions_changed` in §7.3, and `media_revoked`, `chat_redacted`, `chat_purged`, `report` and `report_closed`
 in moderation.md §5, whose requests — `report`, `redact`, `revoke`,
 `purge`, `kick` and the rest — are specified there too. Every event, of any family,
@@ -1246,7 +1256,7 @@ before.
   `typing: false` when they stop, send or leave the conversation.
 - **`requests`** lists the message requests waiting for this account,
   by sender, oldest first, and its approvals: `requests` is `[{ login,
-  fingerprint?, messages: [{ id, ref, text, at, guid, signed?, re? }] }]`, with
+  fingerprint?, messages: [{ id, ref, text, at, guid, signed?, re?, emoji? }] }]`, with
   `id` the inbox cursor a `report` names it by (moderation.md §4.2), `ref`
   its reference, and
   `signed` as on `msg`; `approvals` is `[{ login, fingerprint? }]`; and
@@ -1301,7 +1311,7 @@ before.
 | `friend` | `{ "friend": {…} }` | A row changed, whole, as it now stands, or went (`removed`): to every session of the account that speaks the family, the one whose request changed it included, so all of them agree. A client replaces its copy. |
 | `friend_request` | `{ "login", "fingerprint"?, "note"? }` | Someone asked this account for friendship (804). |
 | `presence` | `{ "login", "fingerprint"?, "state", "status_text"? }` | A friend's presence changed (809): `state` as on the `friend` object. *hxd-ng* tells a burst of changes once, with its final state. |
-| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "ref"?, "signed"?, "approval"?, "re"? }` | An instant message (811). `id` and `ref` are its inbox row's, as on `msg` (§7.1), absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
+| `im` | `{ "from": { login, nick, fingerprint? }, "text", "at", "guid", "queued", "id"?, "ref"?, "signed"?, "approval"?, "re"?, "emoji"? }` | An instant message (811). `id` and `ref` are its inbox row's, as on `msg` (§7.1), absent for one past the sender's daily quota that was never stored; `queued` that it waited; `approval`, present and `true`, that it came under an approval rather than a friendship. |
 | `receipt` | `{ "login", "fingerprint"?, "guid", "read" }` | A friend received (`read` false) or read a message this account sent it under `guid`. Under an approval only reads are told. |
 | `typing` | `{ "login", "fingerprint"?, "typing" }` | A friend started or stopped typing to this account. |
 | `requests_changed` | `{ "count" }` | The number of senders whose requests wait changed: to sessions that understand requests alone. |
@@ -1597,8 +1607,9 @@ news body is different: it declares its own type (news.md §5).
   `video_stop`, `video_subscribe`, `push_register`, `report`,
   `purge`, `device_cert`, `friend_add`, `requests_clear`, `find_user`
   and `user_profile`. Every other request, the reads, a
-  trickled `voice_ice` candidate and a `receipt`, which a client sends
-  for each `im` a `friends` read hands over, among them, costs 1, and only `logout`
+  trickled `voice_ice` candidate, `emoji_list`, and a `receipt`, which a
+  client sends for each `im` a `friends` read hands over, among them,
+  costs 1, and only `logout`
   is free. `reactions` costs 1 more for each ten targets it names, or
   part of ten. A request the bucket cannot pay for costs nothing, and is
   answered `rate_limited` with `retry_after`, the whole seconds until it
@@ -1616,7 +1627,7 @@ news body is different: it declares its own type (news.md §5).
   `files_mkdir` is too; and
   `history`, `news_search`, `device_cert`, media and news-attachment
   uploads (asked before the body is read), media and news-image downloads, avatar
-  fetches and enrollment have limits of their own. Login attempts are
+  and emoji fetches and enrollment have limits of their own. Login attempts are
   limited per address and login: past `[limits] login_failures` wrong
   passwords for one login — here, on the classic wire, or at
   `/identity/auth` and `/identity/link` — a password login as that
@@ -1702,9 +1713,9 @@ news body is different: it declares its own type (news.md §5).
 | `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
 | `session_expired` | `resume` | Log in again. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
-| `not_available` | `history`, `files_*`, `react`, `reactions`, family requests | The server does not offer this. |
+| `not_available` | `history`, `files_*`, `react`, `reactions`, `emoji_list`, family requests | The server does not offer this. |
 | `no_such_target` | `react` | No such line, or one this session may not react to, or an instant message's party it may not message: one answer for all (§7.3). Never for a `pm` target, which is answered `{}`. |
-| `no_such_emoji` | `react` | A server emoji added as a key that no live catalog entry has: removed, or never added (§7.3). Never for taking one away. |
+| `no_such_emoji` | `react`, `GET /emoji/{hash}` | A server emoji added as a key that no live catalog entry has: removed, or never added (§7.3). Never for taking one away. From `GET /emoji/{hash}`, with 404: no live emoji has that hash (server-emoji.md §8). |
 | `too_many_reactions` | `react` | The line carries as many keys as it may, or this account as many of them as it may (§7.3). Never for a `pm` target. |
 | `no_such_room` | `room_*`, `chat`, `history` | No such room, or one this session may not see (chat-rooms.md §5). |
 | `not_a_member` | `room_part`, `chat` | Not in that room, which this session may see. |
