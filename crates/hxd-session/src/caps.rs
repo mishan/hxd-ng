@@ -134,6 +134,11 @@ pub mod cap {
     /// (`docs/chat-history.md` §12): each 106 that relays a line carries
     /// it as a history entry too.
     pub const STRUCTURED_CHAT: u8 = 17;
+    /// Server Emoji, a draft of this server's and unallocated
+    /// (`docs/server-emoji.md`): the catalog and the refs beside a
+    /// line's text. **Depends on [`TEXT_ENCODING`]**, as the draft
+    /// requires.
+    pub const SERVER_EMOJI: u8 = 20;
 }
 
 #[cfg(test)]

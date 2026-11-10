@@ -1348,10 +1348,13 @@ enabled = false           # off unless turned on
 
 The Server Emoji draft's catalog of images an operator curates with
 `hxd emoji` ([Emoji](#emoji)). A server of this version keeps the
-catalog and rereads it on SIGHUP, and offers the catalog on neither
-wire yet; its ids are reaction keys on the ng wire
-([server-emoji.md](server-emoji.md) §5). It needs a database: the
-catalog is kept in the one `[inbox]`, `[history]` or `[news]` names.
+catalog and rereads it on SIGHUP, offers it on the classic wire as
+capability bit 20 to a UTF-8 session, with the emoji a line or message
+names relayed beside its text, and not yet on the ng wire, where its
+ids are reaction keys ([server-emoji.md](server-emoji.md) §5, §7).
+Absent, or `enabled` left off, means bit 20 is never confirmed and a
+client's references are dropped. It needs a database: the catalog is
+kept in the one `[inbox]`, `[history]` or `[news]` names.
 
 ```toml
 [emoji]

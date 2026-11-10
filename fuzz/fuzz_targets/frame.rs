@@ -28,6 +28,8 @@ fuzz_target!(|data: &[u8]| {
         for (_, field) in &chunks {
             let _ = hxd_session::voice::parse_ice(field);
             let _ = hxd_session::video::parse_subscriptions(field);
+            let refs = hxd_session::emoji::parse_refs(field);
+            assert!(refs.len() <= hxd_core::emoji::MAX_REFS);
             let text = TextEncoding::MacRoman.decode(field);
             assert_eq!(TextEncoding::MacRoman.encode(&text), *field);
         }

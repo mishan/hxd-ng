@@ -44,6 +44,7 @@ use crate::accounts;
 use crate::banner::Banner;
 use crate::caps::{cap, Caps};
 use crate::device::{self, Arrival};
+use crate::emoji;
 use crate::encoding::TextEncoding;
 use crate::file_manage;
 use crate::files;
@@ -679,6 +680,7 @@ fn type_label(ty: u32) -> Kind<'static> {
         || file_manage::handles(ty)
         || accounts::handles(ty)
         || friends::handles(ty)
+        || emoji::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -1576,6 +1578,9 @@ struct Session {
     /// Get Icon List's allowance ([`ICON_LISTS`]), refilled continuously.
     icon_list_tokens: f64,
     icon_list_refill: Instant,
+    /// Get Emoji's ([`emoji::FETCH_BURST`]), likewise.
+    emoji_tokens: f64,
+    emoji_refill: Instant,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
     /// The image this session was told of and may still download: once,
@@ -1665,6 +1670,20 @@ impl Session {
             return false;
         }
         self.icon_list_tokens -= 1.0;
+        true
+    }
+
+    /// May this session have another Get Emoji now?
+    fn take_emoji_fetch(&mut self) -> bool {
+        let now = Instant::now();
+        self.emoji_tokens = (self.emoji_tokens
+            + now.duration_since(self.emoji_refill).as_secs_f64() * emoji::FETCHES_PER_SECOND)
+            .min(emoji::FETCH_BURST);
+        self.emoji_refill = now;
+        if self.emoji_tokens < 1.0 {
+            return false;
+        }
+        self.emoji_tokens -= 1.0;
         true
     }
 
@@ -2505,6 +2524,11 @@ async fn login_phase(
     if caps.has(cap::VIDEO) && !caps.has(cap::VOICE) {
         caps = Caps::from_bits(caps.bits() & !(1u64 << cap::VIDEO));
     }
+    // Bit 20 only beside bit 1, as the draft has it: a Mac Roman session
+    // keeps reading `:name:` as text.
+    if caps.has(cap::SERVER_EMOJI) && !caps.has(cap::TEXT_ENCODING) {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::SERVER_EMOJI));
+    }
     // Bit 3 the same way: without a configured pipeline there are no
     // handles to issue and 750 would answer nothing but errors.
     if caps.has(cap::INLINE_MEDIA) && !ctx.core.media_enabled() {
@@ -2553,6 +2577,7 @@ async fn login_phase(
         // Bit 15 is what lets this wire carry `DATA_FRIEND_IDENTITY`.
         guest_identities: caps.has(cap::FRIENDSHIPS),
         echoes_own_lines: caps.has(cap::STRUCTURED_CHAT),
+        emoji: caps.has(cap::SERVER_EMOJI),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -2669,6 +2694,9 @@ async fn login_phase(
     if caps.has(cap::MESSAGING) {
         login_reply.extend(friends::limits(&ctx.core, enc));
     }
+    if caps.has(cap::SERVER_EMOJI) {
+        login_reply.extend(emoji::login_fields(&ctx.core));
+    }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
             if history.max_lines != 0 {
@@ -2726,6 +2754,8 @@ async fn login_phase(
         quiet_icon_refusal: resends_icon_untasked(&req),
         icon_list_tokens: ICON_LISTS,
         icon_list_refill: Instant::now(),
+        emoji_tokens: emoji::FETCH_BURST,
+        emoji_refill: Instant::now(),
         banner_sent: false,
         banner_image: None,
         told_read_only: Vec::new(),
@@ -3014,6 +3044,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             id,
             ephemeral,
             at,
+            emoji,
             ..
         } => {
             // Format at the edge, in the connection's encoding, so the
@@ -3038,6 +3069,11 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             let media_reader = sess.caps.has(cap::INLINE_MEDIA);
             if let Some(media) = media.as_ref().filter(|_| media_reader) {
                 chunks.extend(media::companion_chunks(media));
+            }
+            // Beside the entry and never in it, so a bit-17 reader's 106
+            // is the same with refs or without.
+            if let Some(refs) = emoji.filter(|_| sess.has_cap(cap::SERVER_EMOJI)) {
+                chunks.push((emoji::DATA_EMOJI_REFS, emoji::refs_field(&refs)));
             }
             // Id 0 names a line to one session, never one a chat shares: a
             // line with neither number was for a chat gone as it was
@@ -3166,6 +3202,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             sent_at,
             queued,
             media,
+            emoji,
             ..
         } => {
             let body = if queued && ctx.cfg.stamp_queued {
@@ -3192,6 +3229,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             ];
             if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
                 chunks.extend(media::companion_chunks(&media));
+            }
+            if let Some(refs) = emoji.filter(|_| sess.has_cap(cap::SERVER_EMOJI)) {
+                chunks.push((emoji::DATA_EMOJI_REFS, emoji::refs_field(&refs)));
             }
             push(tx, hdr::MSG, chunks);
         }
@@ -3359,9 +3399,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport declared reactions, which this
         // one never does.
         Event::ReactionsChanged(_) => {}
-        // Sent only where the transport reads the emoji catalog, which
-        // this one does not yet.
-        Event::EmojiChanged { .. } => {}
+        // Sent only to a session that negotiated bit 20, with task id 0.
+        Event::EmojiChanged { revision } => {
+            notify(tx, emoji::CATALOG_CHANGED, emoji::changed(revision));
+        }
         // Sent only to a session that speaks the friend family, which on
         // this wire is one that negotiated bit 6.
         ev @ (Event::FriendEntry(_)
@@ -3371,9 +3412,12 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         | Event::Receipt { .. }
         | Event::Typing { .. }
         | Event::RequestsChanged { .. }) => {
-            if let Some((ty, chunks)) =
-                friends::event(&ev, sess.enc, sess.has_cap(cap::FRIENDSHIPS))
-                    .filter(|_| sess.has_cap(cap::MESSAGING))
+            let (friendships, refs) = (
+                sess.has_cap(cap::FRIENDSHIPS),
+                sess.has_cap(cap::SERVER_EMOJI),
+            );
+            if let Some((ty, chunks)) = friends::event(&ev, sess.enc, friendships, refs)
+                .filter(|_| sess.has_cap(cap::MESSAGING))
             {
                 notify(tx, ty, chunks);
             }
@@ -3562,6 +3606,7 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
     let points = friends::price(f.ty)
         .filter(|_| speaks_friends(sess, f.ty))
         .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
+        .or_else(|| emoji::price(f.ty).filter(|_| sess.has_cap(cap::SERVER_EMOJI)))
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
@@ -3586,8 +3631,17 @@ fn speaks_friends(sess: &Session, ty: u32) -> bool {
 /// 0 being the public room, and the line.
 struct ChatSend {
     cid: u32,
-    line: (String, u16, Option<hxd_core::media::Handle>),
+    line: ChatLine,
 }
+
+/// A line as the core takes it: its text, style, image and the emoji
+/// refs sent beside it.
+type ChatLine = (
+    String,
+    u16,
+    Option<hxd_core::media::Handle>,
+    Vec<hxd_core::emoji::EmojiRef>,
+);
 
 /// The chat send `f` is, or nothing when it is dropped, as the reference
 /// server drops what it will not relay: there is no task reply to refuse
@@ -3626,9 +3680,10 @@ fn chat_send(f: &Frame, sess: &Session, room: bool) -> Option<ChatSend> {
         }
         (handle, _) => handle,
     };
+    let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
     Some(ChatSend {
         cid,
-        line: (body, style, media),
+        line: (body, style, media, refs),
     })
 }
 
@@ -3639,15 +3694,12 @@ async fn public_chat(
     ctx: &ServerCtx,
     sess: &mut Session,
     room: u32,
-    lines: Vec<(String, u16, Option<hxd_core::media::Handle>)>,
+    lines: Vec<ChatLine>,
 ) {
     if lines.is_empty() {
         return;
     }
     let from = sess.uid;
-    let lines = (lines.into_iter())
-        .map(|(text, style, media)| (text, style, media, Vec::new()))
-        .collect();
     let Some(results) = off_reactor(&ctx.core, move |c| c.chat_public_all(from, room, lines)).await
     else {
         return;
@@ -4722,11 +4774,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             Some(ChatSend { cid: 0, line }) => public_chat(tx, ctx, sess, 0, vec![line]).await,
             Some(ChatSend {
                 cid,
-                line: (body, style, media),
+                line: (body, style, media, refs),
             }) => {
                 if let Err(e) = ctx
                     .core
-                    .chat_private(cid, sess.uid, body, style, media, &[])
+                    .chat_private(cid, sess.uid, body, style, media, &refs)
                 {
                     debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
                 }
@@ -4823,13 +4875,20 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         } else {
                             &line.text
                         };
-                        let media = match &line.media {
+                        let mut subfields = match &line.media {
                             Some(meta) if media_reader && !deleted => {
                                 let fetchable = ctx.core.history_media_fetchable(sess.uid, &line);
                                 history_media_subfields(meta, fetchable)
                             }
                             _ => Vec::new(),
                         };
+                        if let Some(refs) = line
+                            .emoji
+                            .as_ref()
+                            .filter(|_| sess.has_cap(cap::SERVER_EMOJI) && !deleted)
+                        {
+                            subfields.push((emoji::EMOJI_REFS, emoji::refs_field(refs)));
+                        }
                         entries.push(structured::entry(
                             sess.enc,
                             &structured::Line {
@@ -4839,7 +4898,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                                 icon: line.icon,
                                 nick: &nick,
                                 text: body,
-                                subfields: &media,
+                                subfields: &subfields,
                             },
                         ));
                     }
@@ -5068,7 +5127,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // No guid: the legacy wire has no way to carry one, so every
             // send from it is its own message and a retry is a resend.
             let from = sess.uid;
-            match off_reactor(&ctx.core, move |c| c.msg(from, to, body, None, media)).await {
+            let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
+            let sent = off_reactor(&ctx.core, move |c| {
+                c.msg_signed(from, to, body, None, media, None, None, &refs)
+            });
+            match sent.await {
                 Some(Ok(_)) => reply(tx, f.trans, vec![]),
                 Some(Err(e)) => reply_error(tx, f.trans, err_text(e)),
                 None => reply_error(tx, f.trans, "Server error."),
@@ -5852,7 +5915,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // domain's gate, and the fingerprints it is shown are ones
             // this server shows anyone (hxd-ng has no hidden links).
             let friendships = sess.has_cap(cap::FRIENDSHIPS);
-            let op = match friends::parse(f, sess.enc, friendships) {
+            let op = match friends::parse(f, sess.enc, friendships, sess.has_cap(cap::SERVER_EMOJI))
+            {
                 Ok(op) => op,
                 Err(text) => {
                     if friends::answers(t) {
@@ -5935,6 +5999,41 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 _ => reply_error(tx, f.trans, device::NOT_PROVED),
             }
         }
+
+        // --- Server emoji (docs/server-emoji.md) ----------------------
+        // To a session without bit 20, answered below as any transaction
+        // this server does not implement.
+        t if t == emoji::GET_CATALOG && sess.has_cap(cap::SERVER_EMOJI) => {
+            match emoji::catalog(&ctx.core, f) {
+                Some(chunks) => reply(tx, f.trans, chunks),
+                None => reply_error(tx, f.trans, "This server keeps no emoji."),
+            }
+        }
+        t if t == emoji::GET_EMOJI && sess.has_cap(cap::SERVER_EMOJI) => {
+            let reason =
+                |code: u16| vec![(structured::DATA_CHAT_REASON, code.to_be_bytes().to_vec())];
+            if !sess.take_emoji_fetch() {
+                reply_error_with(tx, f.trans, "Slow down.", reason(emoji::RATE_LIMITED));
+                return;
+            }
+            match emoji::image(&ctx.core, f) {
+                Some(chunks) => reply(tx, f.trans, chunks),
+                None => {
+                    reply_error_with(tx, f.trans, "No such emoji.", reason(emoji::NO_SUCH_EMOJI))
+                }
+            }
+        }
+        // The catalog is the operator's, kept with `hxd emoji`, whatever
+        // was asked; the image is never read.
+        t if t == emoji::MANAGE && sess.has_cap(cap::SERVER_EMOJI) => reply_error_with(
+            tx,
+            f.trans,
+            "This server's emoji are kept by its operator.",
+            vec![(
+                structured::DATA_CHAT_REASON,
+                emoji::NOT_ALLOWED.to_be_bytes().to_vec(),
+            )],
+        ),
 
         other => {
             debug!("unimplemented transaction {other:#x}");

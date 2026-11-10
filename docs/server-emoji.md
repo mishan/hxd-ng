@@ -1,9 +1,9 @@
 # Server emoji
 
 Status: the catalog, its images, `hxd emoji`, the server's copy of
-the catalog, server emoji as reaction keys on the ng wire and
-references in the domain are built (§10); neither wire offers the
-catalog or carries references yet. This binds
+the catalog, server emoji as reaction keys on the ng wire, references
+and the classic wire are built (§11); the ng wire does not offer the
+catalog or carry references yet. This binds
 nobody but this server: the protocol is the Server Emoji draft
 (`Capabilities-Server-Emoji.md`, a draft written for this server, in
 fogWraith's protocol documents and not yet allocated), which hxd-ng is
@@ -198,7 +198,47 @@ a private message and an instant message take them.
   linked user's line has none, and a message to one is sent without
   them.
 
-## 7. Restoring a backup
+## 7. The classic wire
+
+Capability bit 20, offered where the server serves a catalog, and
+confirmed only beside bit 1, as the draft requires: a Mac Roman session
+reads `:name:` as text. The draft's numbers are kept in
+`hxd-session/src/emoji.rs` until they are allocated. To a session
+without bit 20 nothing changes: 713, 714 and 716 are answered as any
+unknown transaction, not implemented; it is sent no 715 and no references.
+
+- **The login reply** beside a confirmed bit 20 carries the catalog's
+  revision, read after the session attached so a reload since is told
+  by the 715 that follows, and `max_count`, `max_bytes` and
+  `max_dimension`.
+- **Get Emoji Catalog (713)** answers §4's listing from the revision
+  the client sends, after the id it sends, as many entries as keep the
+  reply within 64 KiB, with `DATA_EMOJI_MORE` when more remain.
+  A delta and a whole listing look alike on this wire.
+- **Get Emoji (714)** answers a live entry's image, and a removed or
+  unknown id a task error with reason `NoSuchEmoji`. A session may fetch
+  100 at once and then two a second; past that it is refused
+  `RateLimited`.
+- **Emoji Catalog Changed (715)**, task id 0, carries the revision,
+  once per SIGHUP that moved it.
+- **Manage Emoji (716)** is refused `NotAllowed` whatever it asks, the
+  image unread: `hxd emoji` is the catalog's only writer.
+- **References** in `DATA_EMOJI_REFS` on 105, 108 and 810 are read from
+  a bit-20 session and dropped unread from any other, the text relayed
+  as ever. They are sent beside the text on 106, 104 and 811, and in a
+  700 entry as sub-field `0x0022`, never on a tombstone. A bit-17
+  session's structured line carries none: on 106 they are beside the
+  entry, so its entry is the same with references or without.
+- **Spam points**: 713, 714 and 716 cost none, as the icon fetches do. A
+  client fetching the images of a busy chat as it joins would be banned
+  at mhxd's price, and 714 is rationed on its own.
+
+The ng wire does not carry references yet: an ng reader is sent the text
+of a line or message that has them, as a period client is, and a catalog
+change reaches an ng session that declared `emoji` as an `unsupported`
+placeholder.
+
+## 8. Restoring a backup
 
 Restoring the database restores the catalog with it, and with it a
 revision a client may already have passed. A client holding a revision
@@ -209,7 +249,7 @@ names a different picture: the database's record of the ids it gave is
 restored with it, so an id given after the backup may be given again.
 A restore invalidates every client's cache.
 
-## 8. Limits
+## 9. Limits
 
 | What | Bound |
 |---|---|
@@ -220,11 +260,12 @@ A restore invalidates every client's cache.
 | An animation | 10 seconds |
 | A source | 1024 pixels a side; 2 MiB as `hxd emoji` reads it |
 | References | the first 32 sent, each id once |
+| 714 | 100 at once a session, then two a second |
 
 A lowered `max_bytes` or `max_dimension` holds new images to it; an
 image already stored stays as it was made.
 
-## 9. Failure modes
+## 10. Failure modes
 
 - **A store error at startup**: the server does not start. On SIGHUP:
   the copy in use stays, logged.
@@ -236,14 +277,14 @@ image already stored stays as it was made.
   an id, and is drawn as `:name:` once the catalog says the entry is
   removed.
 
-## 10. Stages
+## 11. Stages
 
 | Stage | Content | Built |
 |---|---|---|
 | E1 | The catalog's types, names and stores, schema V37, `[emoji]` | yes |
 | E2 | The emoji pipeline, `hxd emoji`, the server's copy and its reload on SIGHUP | yes |
 | E3 | Server emoji as reaction keys (§5) | yes |
-| E4 | References in the domain (§6), and the classic wire: bit 20, the catalog, image and notification transactions, references in and out | references |
+| E4 | References in the domain (§6), and the classic wire (§7) | yes |
 | E5 | The ng wire: `emoji` listed in `caps` with its block, `emoji_list`, `emoji_changed`, references, `GET /emoji/{hash}` | no |
 | E6, E7 | hx-ng, and the out-of-process suite | no |
 

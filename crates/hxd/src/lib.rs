@@ -2792,7 +2792,7 @@ impl Config {
 /// session. A capability lands here only once the code behind it is
 /// wired and enabled — never from a config key alone, because the echo
 /// is a promise that the extension's transactions will work.
-fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) -> Caps {
+fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>, emoji: bool) -> Caps {
     // Text-Encoding has nothing to wire: the domain is UTF-8 already, and
     // the session only has to stop converting. So it is always offered.
     let mut caps = Caps::empty().with(cap::TEXT_ENCODING);
@@ -2816,6 +2816,10 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>) ->
     }
     if config.structured_chat.as_ref().is_some_and(|s| s.enabled) {
         caps = caps.with(cap::STRUCTURED_CHAT);
+    }
+    // A catalog the server serves, which `[emoji] enabled` makes it.
+    if emoji {
+        caps = caps.with(cap::SERVER_EMOJI);
     }
     caps
 }
@@ -4922,6 +4926,7 @@ pub fn build_ctx(
         (None, Some(_)) => return Err("[push] store was not opened".into()),
     };
 
+    let emoji = core.emoji_policy().is_some();
     Ok(ServerCtx {
         core: Arc::new(core),
         auth,
@@ -4932,7 +4937,7 @@ pub fn build_ctx(
             login_timeout: Duration::from_secs(config.server.login_timeout),
             ban_time: Duration::from_secs(config.server.ban_time),
             stamp_queued: config.server.stamp_queued,
-            caps: legacy_caps(config, voice, files),
+            caps: legacy_caps(config, voice, files, emoji),
             mark_cleartext: config.server.mark_cleartext,
             trtp_login: match config.identity.as_ref().map(|i| i.trtp_login.as_str()) {
                 None | Some("verify") => TrtpLogin::Verify,
@@ -5518,7 +5523,7 @@ sync = "full"
         assert_eq!(history.max_days, 0);
         assert_eq!(history.max_page, 200);
         assert_eq!(history.replay, 0);
-        assert!(legacy_caps(&cfg, None, None).has(cap::CHAT_HISTORY));
+        assert!(legacy_caps(&cfg, None, None, false).has(cap::CHAT_HISTORY));
         assert_eq!(
             ng_caps(&cfg, None, None),
             vec!["history".to_string(), "inbox".to_string()]
@@ -5774,7 +5779,7 @@ sync = "full"
         #[cfg(feature = "inbox")]
         assert!(ng_caps(&cfg, None, None).contains(&"news".to_string()));
         assert!(
-            !legacy_caps(&cfg, None, None).has(cap::CHAT_HISTORY),
+            !legacy_caps(&cfg, None, None, false).has(cap::CHAT_HISTORY),
             "news claims no legacy capability bit"
         );
 
@@ -6930,7 +6935,7 @@ sync = "full"
         assert!(video_enabled(&c));
         // Text-Encoding is the one bit that needs nothing built.
         assert_eq!(
-            legacy_caps(&c, None, None),
+            legacy_caps(&c, None, None, false),
             Caps::empty().with(cap::TEXT_ENCODING)
         );
         assert!(ng_caps(&c, None, None).is_empty());
@@ -6961,7 +6966,7 @@ sync = "full"
         #[test]
         fn voice_alone_is_advertised_when_video_is_not_configured() {
             let (config, voice) = voiced(false);
-            let caps = legacy_caps(&config, Some(&voice), None);
+            let caps = legacy_caps(&config, Some(&voice), None, false);
             assert!(caps.has(cap::VOICE));
             assert!(!caps.has(cap::VIDEO));
             assert_eq!(
@@ -6973,7 +6978,7 @@ sync = "full"
         #[test]
         fn video_is_advertised_only_alongside_voice() {
             let (config, voice) = voiced(true);
-            let caps = legacy_caps(&config, Some(&voice), None);
+            let caps = legacy_caps(&config, Some(&voice), None, false);
             assert!(caps.has(cap::VOICE));
             assert!(caps.has(cap::VIDEO));
             assert_eq!(

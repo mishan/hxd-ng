@@ -562,6 +562,95 @@ async fn public_chat_crosses_the_link_both_ways_on_both_wires() {
 }
 
 #[tokio::test]
+async fn a_line_or_message_with_emoji_refs_crosses_the_link_as_its_text_alone() {
+    use hxd_core::emoji::{EmojiStore, NewEmojiName};
+    use hxd_session::emoji::DATA_EMOJI_REFS;
+    const EMOJI: u32 = 1 << 20 | 1 << 1;
+    // Both serving one catalog, the same emoji under the same id, so
+    // nothing but the rule keeps a ref from crossing.
+    let served = "[emoji]\nenabled = true\n";
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, served, served).await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    for s in [&a, &b] {
+        let db = s.config.parent().unwrap().join("hx.db");
+        let store =
+            hxd_store_sqlite::SqliteStore::open(db, hxd_store_sqlite::Synchronous::Normal).unwrap();
+        let party = NewEmojiName::parse("party").unwrap();
+        let image = hxd_core::emoji::conformance::image(2);
+        store
+            .add(&party, &image, std::time::SystemTime::now(), 10)
+            .unwrap();
+        s.core.emoji_reload().unwrap();
+    }
+    let guest = |nick| Login {
+        caps: Some(EMOJI),
+        ..Login::guest(nick)
+    };
+    let mut ann = legacy::Client::login_at(a.legacy, &guest("ann"))
+        .await
+        .unwrap();
+    let mut amy = legacy::Client::login_at(a.legacy, &guest("amy"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &guest("bob"))
+        .await
+        .unwrap();
+    let ann_there = row(&mut bob, "ann").await.uid;
+    let bob_here = row(&mut ann, "bob").await.uid;
+    let party = [&[0, 1, 0, 0, 0, 1, 5][..], b"party"].concat();
+
+    ann.send(
+        ClientHdr::Chat.as_u32(),
+        &[
+            (tag::BODY, b"a :party:".to_vec()),
+            (DATA_EMOJI_REFS, party.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let ann_here = ann.uid.map(u32::from);
+    let here = amy
+        .rx
+        .recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == ann_here)
+        .await
+        .unwrap();
+    assert_eq!(
+        here.bytes(DATA_EMOJI_REFS),
+        Some(party.clone()),
+        "kept here"
+    );
+    let there = bob
+        .rx
+        .recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(ann_there.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        there.bytes(tag::BODY).unwrap(),
+        b"\r          ann:  a :party:"
+    );
+    assert!(there.chunk(DATA_EMOJI_REFS).is_none(), "and none crossed");
+
+    ann.call(
+        ClientHdr::Msg.as_u32(),
+        &[
+            (tag::UID, bob_here.to_be_bytes().to_vec()),
+            (tag::BODY, b"psst :party:".to_vec()),
+            (DATA_EMOJI_REFS, party),
+        ],
+    )
+    .await
+    .unwrap();
+    let got = bob
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(ann_there.into()))
+        .await
+        .unwrap();
+    assert_eq!(got.bytes(tag::BODY).unwrap(), b"psst :party:");
+    assert!(got.chunk(DATA_EMOJI_REFS).is_none());
+}
+
+#[tokio::test]
 async fn an_ng_block_of_a_ghost_refuses_its_messages_until_unblocked() {
     let (a, b, _dirs) = linked("").await;
     let (mut ann, _) = ng::Client::guest(a.ng, "ann").await.unwrap();

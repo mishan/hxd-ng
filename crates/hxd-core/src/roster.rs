@@ -269,9 +269,10 @@ pub struct Transport {
     /// worth sending it (`docs/hotline-ng.md` §7.3). Kept, as `replies`.
     pub reactions: bool,
     /// It reads the server's emoji catalog (`docs/server-emoji.md`):
-    /// the ng wire's `emoji` declared, to a server that keeps one. Such
-    /// a session is told of a change to it, and may react with one of
-    /// its emoji. Kept, as `replies`.
+    /// the ng wire's `emoji` declared, or classic capability bit 20
+    /// confirmed, to a server that keeps one. Such a session is told of
+    /// a change to it, and on the ng wire may react with one of its
+    /// emoji. Kept, as `replies`.
     pub emoji: bool,
     /// It is sent its own public lines even where it may not read the
     /// lobby: classic capability bit 17, Structured Chat, whose echo is
