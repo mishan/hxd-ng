@@ -30,6 +30,7 @@ use crate::media::MediaType;
 use crate::Core;
 
 pub mod conformance;
+mod gemoji;
 
 /// A catalog entry's id, from 1. Deliberately not a
 /// [`crate::media::Handle`]: an emoji is anyone's to fetch, a handle is
@@ -37,7 +38,7 @@ pub mod conformance;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EmojiId(pub u32);
 
-/// A shortcode, `[a-z0-9_]{2,32}`. Lowercase only, so `:Party:` and
+/// A name, `[a-z0-9_]{2,32}`. Lowercase only, so `:Party:` and
 /// `:party:` are never two emoji, and nothing a name holds can be markup,
 /// a URL or a bidirectional control.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,6 +53,37 @@ impl EmojiName {
     }
 
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A name an entry may be given, by an add or a rename: an
+/// [`EmojiName`] that is not one of gemoji's shortcodes, which clients
+/// draw as the Unicode emoji they name whatever the server holds. The
+/// store's writes take only this, so every writer is held to it, while
+/// an entry already named one, before the list had it, loads as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewEmojiName(EmojiName);
+
+/// Why a name may not be given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameRefused {
+    /// Not an [`EmojiName`].
+    Malformed,
+    /// A common emoji's shortcode.
+    Shortcode,
+}
+
+impl NewEmojiName {
+    pub fn parse(s: &str) -> Result<Self, NameRefused> {
+        let name = EmojiName::parse(s).ok_or(NameRefused::Malformed)?;
+        if gemoji::is_shortcode(name.as_str()) {
+            return Err(NameRefused::Shortcode);
+        }
+        Ok(NewEmojiName(name))
+    }
+
+    pub fn name(&self) -> &EmojiName {
         &self.0
     }
 }
@@ -188,13 +220,13 @@ pub trait EmojiStore: Send + Sync + 'static {
     /// A new entry under a new id, unless `max_count` live entries exist.
     fn add(
         &self,
-        name: &EmojiName,
+        name: &NewEmojiName,
         image: &EmojiImage,
         at: SystemTime,
         max_count: usize,
     ) -> Result<u32, EmojiStoreError>;
     /// A live entry's new name; its own name again changes nothing.
-    fn rename(&self, id: EmojiId, name: &EmojiName) -> Result<u32, EmojiStoreError>;
+    fn rename(&self, id: EmojiId, name: &NewEmojiName) -> Result<u32, EmojiStoreError>;
     /// Marks a live entry removed and drops its image, then forgets the
     /// lowest-revision removed entries past `keep_removed`. By revision,
     /// never by time: the revision is the one order every writer agrees
@@ -220,11 +252,12 @@ impl EmojiStore for MemoryEmoji {
 
     fn add(
         &self,
-        name: &EmojiName,
+        name: &NewEmojiName,
         image: &EmojiImage,
         _at: SystemTime,
         max_count: usize,
     ) -> Result<u32, EmojiStoreError> {
+        let name = name.name();
         let (catalog, last_id) = &mut *self.inner.lock().unwrap();
         let live = || catalog.entries.iter().filter(|e| e.image.is_some());
         if live().any(|e| e.name == *name) {
@@ -244,7 +277,8 @@ impl EmojiStore for MemoryEmoji {
         Ok(catalog.revision)
     }
 
-    fn rename(&self, id: EmojiId, name: &EmojiName) -> Result<u32, EmojiStoreError> {
+    fn rename(&self, id: EmojiId, name: &NewEmojiName) -> Result<u32, EmojiStoreError> {
+        let name = name.name();
         let (catalog, _) = &mut *self.inner.lock().unwrap();
         let Some(at) = catalog
             .entries
@@ -446,6 +480,33 @@ mod tests {
     }
 
     #[test]
+    fn a_new_name_is_never_a_common_emojis_shortcode() {
+        for (name, given) in [
+            ("thumbsup", Err(NameRefused::Shortcode)),
+            ("joy", Err(NameRefused::Shortcode)),
+            ("zzz", Err(NameRefused::Shortcode)),
+            ("100", Err(NameRefused::Shortcode)),
+            ("+1", Err(NameRefused::Malformed)),
+            ("Party", Err(NameRefused::Malformed)),
+            ("thumbsup2", Ok(())),
+            ("joy_", Ok(())),
+            ("party", Ok(())),
+        ] {
+            assert_eq!(NewEmojiName::parse(name).map(|_| ()), given, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn gemojis_shortcodes_are_sorted_names() {
+        let list = gemoji::SHORTCODES;
+        assert!(
+            list.windows(2).all(|w| w[0] < w[1]),
+            "sorted, for the search"
+        );
+        assert!(list.iter().all(|n| EmojiName::parse(n).is_some()));
+    }
+
+    #[test]
     fn the_memory_store_passes_the_conformance_suite() {
         conformance::run(&|| Box::new(MemoryEmoji::default()));
     }
@@ -466,14 +527,14 @@ mod tests {
         }
         fn add(
             &self,
-            name: &EmojiName,
+            name: &NewEmojiName,
             image: &EmojiImage,
             at: SystemTime,
             max_count: usize,
         ) -> Result<u32, EmojiStoreError> {
             self.inner.add(name, image, at, max_count)
         }
-        fn rename(&self, id: EmojiId, name: &EmojiName) -> Result<u32, EmojiStoreError> {
+        fn rename(&self, id: EmojiId, name: &NewEmojiName) -> Result<u32, EmojiStoreError> {
             self.inner.rename(id, name)
         }
         fn remove(
@@ -489,7 +550,7 @@ mod tests {
     fn add(store: &dyn EmojiStore, name: &str, seed: u8) -> EmojiId {
         store
             .add(
-                &EmojiName::parse(name).unwrap(),
+                &NewEmojiName::parse(name).unwrap(),
                 &conformance::image(seed),
                 SystemTime::UNIX_EPOCH,
                 usize::MAX,
@@ -511,7 +572,9 @@ mod tests {
         let at = SystemTime::UNIX_EPOCH;
         store.remove(a, at, 0).unwrap(); // 5, forgotten at once: the floor
         store.remove(b, at, usize::MAX).unwrap(); // 6
-        store.rename(c, &EmojiName::parse("ee").unwrap()).unwrap(); // 7
+        store
+            .rename(c, &NewEmojiName::parse("ee").unwrap())
+            .unwrap(); // 7
         let core = served(store);
         for (since, after, budget, delta, ids, more) in [
             (None, None, 10, false, vec![b, c, d], false),
@@ -542,7 +605,9 @@ mod tests {
         let core = served(store.clone());
         let first = core.emoji_list(None, None, 1).unwrap();
         assert_eq!(first.entries[0].id, a);
-        store.rename(a, &EmojiName::parse("cc").unwrap()).unwrap();
+        store
+            .rename(a, &NewEmojiName::parse("cc").unwrap())
+            .unwrap();
         core.emoji_reload().unwrap();
         let second = core.emoji_list(None, Some(a), 1).unwrap();
         assert_eq!(second.entries[0].id, b);

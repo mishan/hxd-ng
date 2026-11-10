@@ -127,20 +127,20 @@ fn hxd_emoji_edits_the_catalog_a_running_server_serves_once_it_rereads() {
     let listed = emoji(&config, &["list"]).unwrap();
     assert!(listed.contains("#1 :party: 128x64 PNG"), "{listed}");
 
-    emoji(&config, &["rename", "#1", "parrot"]).unwrap();
-    let said = emoji(&config, &["rename", "parrot", "parrot"]).unwrap();
-    assert_eq!(said, "#1 is :parrot: already");
-    let said = emoji(&config, &["remove", "parrot"]).unwrap();
-    assert!(said.starts_with("removed :parrot: (#1)"), "{said}");
+    emoji(&config, &["rename", "#1", "polly"]).unwrap();
+    let said = emoji(&config, &["rename", "polly", "polly"]).unwrap();
+    assert_eq!(said, "#1 is :polly: already");
+    let said = emoji(&config, &["remove", "polly"]).unwrap();
+    assert!(said.starts_with("removed :polly: (#1)"), "{said}");
     assert_eq!(emoji(&config, &["list"]).unwrap(), "no emoji");
     let listed = emoji(&config, &["list", "--removed"]).unwrap();
-    assert_eq!(listed, "#1 :parrot: removed");
+    assert_eq!(listed, "#1 :polly: removed");
     server.emoji_reload().unwrap();
     assert_eq!(server.emoji_image(EmojiId(1)), None);
 
-    let said = emoji(&config, &["add", "parrot", &big]).unwrap();
+    let said = emoji(&config, &["add", "polly", &big]).unwrap();
     assert!(
-        said.starts_with("added :parrot: as #2"),
+        said.starts_with("added :polly: as #2"),
         "an id never given again: {said}"
     );
     server.emoji_reload().unwrap();
@@ -156,7 +156,7 @@ fn hxd_emoji_edits_the_catalog_a_running_server_serves_once_it_rereads() {
         .iter()
         .map(|e| (e.id.0, e.name.as_str(), e.image.is_some()))
         .collect();
-    assert_eq!(names, [(1, "parrot", false), (2, "parrot", true)]);
+    assert_eq!(names, [(1, "polly", false), (2, "polly", true)]);
 }
 
 #[test]
@@ -238,10 +238,10 @@ fn a_name_is_lowercase_letters_digits_and_underscores_and_live_ones_are_unique()
     let config = configured(td.path(), "enabled = true\n");
     let image = png_file(td.path(), "party.png", 32, 32);
     let image = image.as_str();
-    for good in ["ab", "a_1", "42"] {
+    for good in ["zz", "a_1", "42"] {
         emoji(&config, &["add", good, image]).unwrap();
     }
-    let all = ["#1 :ab: 32x32", "#2 :a_1: 32x32", "#3 :42: 32x32"];
+    let all = ["#1 :zz: 32x32", "#2 :a_1: 32x32", "#3 :42: 32x32"];
     assert_eq!(listed(&config), all);
     // The rules are `EmojiName`'s; enough to show both verbs hold to them.
     for bad in ["Party", "a", "par-ty"] {
@@ -250,19 +250,19 @@ fn a_name_is_lowercase_letters_digits_and_underscores_and_live_ones_are_unique()
             assert!(refused.contains("names are"), "{args:?}: {refused}");
         }
     }
-    for args in [vec!["add", "ab", image], vec!["rename", "a_1", "ab"]] {
+    for args in [vec!["add", "zz", image], vec!["rename", "a_1", "zz"]] {
         let refused = emoji(&config, &args).unwrap_err();
         assert!(refused.contains("already"), "{args:?}: {refused}");
     }
     assert_eq!(listed(&config), all, "nothing refused changed anything");
-    emoji(&config, &["remove", "ab"]).unwrap();
-    emoji(&config, &["rename", "a_1", "ab"]).expect("a removed entry's name is free");
+    emoji(&config, &["remove", "zz"]).unwrap();
+    emoji(&config, &["rename", "a_1", "zz"]).expect("a removed entry's name is free");
     emoji(&config, &["add", "a_1", image]).expect("and a renamed one's");
     assert_eq!(
         listed(&config),
         [
-            "#1 :ab: removed",
-            "#2 :ab: 32x32",
+            "#1 :zz: removed",
+            "#2 :zz: 32x32",
             "#3 :42: 32x32",
             "#4 :a_1: 32x32"
         ]
@@ -287,8 +287,8 @@ fn an_id_is_written_with_its_hash_mark_and_anything_else_is_a_name() {
         assert!(refused.contains(why), "{args:?}: {refused}");
     }
     emoji(&config, &["remove", "42"]).unwrap();
-    emoji(&config, &["rename", "#1", "tada"]).unwrap();
-    assert_eq!(listed(&config), ["#1 :tada: 32x32", "#2 :42: removed"]);
+    emoji(&config, &["rename", "#1", "hooray"]).unwrap();
+    assert_eq!(listed(&config), ["#1 :hooray: 32x32", "#2 :42: removed"]);
 }
 
 #[test]
@@ -605,4 +605,62 @@ fn sighup_has_the_running_binary_reread_what_hxd_emoji_wrote() {
         hangup();
         said(&mut server, &log, line).unwrap_or_else(|log| panic!("hxd exited:\n{log}"));
     }
+}
+
+#[test]
+fn a_common_emojis_shortcode_is_given_to_no_entry() {
+    let td = tempfile::tempdir().unwrap();
+    let config = configured(td.path(), "enabled = true\n");
+    let image = png_file(td.path(), "party.png", 32, 32);
+    let image = image.as_str();
+    emoji(&config, &["add", "party", image]).unwrap();
+    for (name, why) in [
+        ("thumbsup", "a common emoji's shortcode"),
+        ("joy", "a common emoji's shortcode"),
+        ("+1", "names are"),
+    ] {
+        for args in [vec!["add", name, image], vec!["rename", "party", name]] {
+            let refused = emoji(&config, &args).unwrap_err();
+            assert!(refused.contains(why), "{args:?}: {refused}");
+        }
+    }
+    emoji(&config, &["add", "thumbsup2", image]).expect("a near miss is a name");
+    emoji(&config, &["rename", "party", "joy_"]).expect("and so is this one");
+    assert_eq!(listed(&config), ["#1 :joy_: 32x32", "#2 :thumbsup2: 32x32"]);
+}
+
+#[test]
+fn an_entry_named_before_the_list_had_its_name_still_loads_and_serves() {
+    use sha2::Digest;
+    let td = tempfile::tempdir().unwrap();
+    let config = configured(td.path(), "enabled = true\n");
+    drop(core(&config));
+    // As an older server, whose list lacked the name, would have kept it.
+    let bytes = std::fs::read(png_file(td.path(), "joy.png", 32, 32)).unwrap();
+    let hash: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let db = rusqlite::Connection::open(td.path().join("hx.db")).unwrap();
+    db.execute(
+        "INSERT INTO emoji (name, revision, hash, mime, width, height, animated, bytes, added_at)
+         VALUES ('joy', 1, ?1, 'image/png', 32, 32, 0, ?2, 0)",
+        rusqlite::params![&hash[..], &bytes],
+    )
+    .unwrap();
+    db.execute("UPDATE emoji_meta SET revision = 1", [])
+        .unwrap();
+    drop(db);
+
+    let server = core(&config);
+    assert_eq!(server.emoji_image(EmojiId(1)).unwrap().hash, hash);
+    assert_eq!(server.emoji_by_hash(&hash).unwrap().hash, hash);
+    assert_eq!(server.emoji_reload(), Ok(false));
+    assert!(server.emoji_image(EmojiId(1)).is_some());
+    assert_eq!(listed(&config), ["#1 :joy: 32x32"]);
+    assert_eq!(
+        emoji(&config, &["rename", "joy", "joy"]),
+        Ok("#1 is :joy: already".into()),
+        "it keeps its name"
+    );
+    emoji(&config, &["rename", "joy", "joyful"]).expect("found by its name");
+    let refused = emoji(&config, &["rename", "joyful", "joy"]).unwrap_err();
+    assert!(refused.contains("a common emoji's shortcode"), "{refused}");
 }

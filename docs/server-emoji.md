@@ -22,13 +22,24 @@ An entry is:
 | Property | Meaning |
 |---|---|
 | id | From 1, assigned by the store, never given again and never changed: what references and reactions name |
-| name | `[a-z0-9_]`, 2 to 32 characters, unique among live entries; it may change |
+| name | `[a-z0-9_]`, 2 to 32 characters, unique among live entries, and given only if it is none of gemoji's shortcodes (§1.1); it may change |
 | revision | The catalog revision the entry last changed at |
 | image | The stored image, its SHA-256, its type, size and whether it is animated; gone once the entry is removed |
 
 An image is never changed: a new picture is a new entry, so an id always
 draws the same bytes and a client may cache them under it for good. One
 picture may be two entries.
+
+### 1.1 Shortcodes
+
+A name a client already turns into a Unicode emoji, `:joy:` or
+`:thumbsup:`, is never given to an entry: one would draw as the server's
+picture on one client and as the Unicode emoji on the next. The list is
+gemoji v4.1.0's shortcodes, kept in `hxd-core` (`emoji/gemoji.rs`, under
+gemoji's MIT license), less the few no name can be. An add or a rename to
+one is refused, by the type the store's writes take, so no writer can
+skip the check. An entry already named one keeps its name: a later
+release of the list, adopted here, refuses only new adds and renames.
 
 The catalog has a **revision**, spent once by every change, in the
 transaction that makes it. A rename to the entry's own name changes
@@ -93,7 +104,8 @@ hxd emoji remove <name|'#id'>
 
 It is the catalog's only writer. It opens the server's database, beside
 a running server or without one, and takes its limits from `[emoji]`. A
-refusal says why: a name that is taken or malformed, a catalog at
+refusal says why: a name that is taken, malformed or a common emoji's
+shortcode, a catalog at
 `max_count`, or an image the pipeline refused, the catalog unchanged.
 
 A running server applies an edit on SIGHUP (§4).

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{EmojiEntry, EmojiId, EmojiImage, EmojiName, EmojiStore, EmojiStoreError};
+use super::{EmojiEntry, EmojiId, EmojiImage, EmojiStore, EmojiStoreError, NewEmojiName};
 use crate::media::MediaType;
 
 /// The count the cases add and remove under, where the count is not the
@@ -25,8 +25,8 @@ fn t(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-fn name(s: &str) -> EmojiName {
-    EmojiName::parse(s).expect("a test name is a valid one")
+fn name(s: &str) -> NewEmojiName {
+    NewEmojiName::parse(s).expect("a test name is a valid one")
 }
 
 pub fn image(seed: u8) -> EmojiImage {
@@ -163,7 +163,7 @@ fn a_removed_entry_keeps_its_id_and_name_and_loses_its_image(store: &dyn EmojiSt
         entry(store, moving),
         Some(EmojiEntry {
             id: moving,
-            name: name("moving"),
+            name: name("moving").name().clone(),
             revision: rev,
             image: None,
         })

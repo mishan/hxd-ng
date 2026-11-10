@@ -624,10 +624,14 @@ what edits it, beside a running server or without one:
 
 ```sh
 hxd emoji add party party.gif      # fitted, re-encoded, and given the next id
-hxd emoji rename party tada        # or by id, quoted for the shell: '#1'
-hxd emoji remove tada              # keeps its id and last name; the image goes
+hxd emoji rename party hooray      # or by id, quoted for the shell: '#1'
+hxd emoji remove hooray            # keeps its id and last name; the image goes
 hxd emoji list --removed
 ```
+
+A name is 2 to 32 lowercase letters, digits and `_`, and never one of the
+shortcodes clients already draw as Unicode emoji (`joy`, `thumbsup`;
+gemoji's list): those are refused.
 
 `add` makes the image here, through the media pipeline: a PNG for a
 still and a GIF for an animation, fitted within `max_dimension` and

@@ -13,7 +13,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use hxd_core::emoji::{EmojiEntry, EmojiName, EmojiStore, EmojiStoreError};
+    use hxd_core::emoji::{EmojiEntry, EmojiStore, EmojiStoreError, NameRefused, NewEmojiName};
     use hxd_core::media::{MediaCodec, MediaReject};
 
     const USAGE: &str = "usage: hxd emoji list [--removed] | add <name> <file> | \
@@ -62,7 +62,13 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
         "a server serves it once [emoji] is enabled"
     };
     let name = |n: &str| {
-        EmojiName::parse(n).ok_or_else(|| format!("{n:?}: names are 2 to 32 of a-z, 0-9 and _"))
+        NewEmojiName::parse(n).map_err(|why| match why {
+            NameRefused::Malformed => format!("{n:?}: names are 2 to 32 of a-z, 0-9 and _"),
+            NameRefused::Shortcode => format!(
+                "{n:?} is a common emoji's shortcode (gemoji's), which clients draw as that \
+                 emoji whatever the server holds"
+            ),
+        })
     };
     let entries = || -> Result<Vec<EmojiEntry>, String> {
         Ok(store.load().map_err(|e| e.to_string())?.entries)
@@ -114,7 +120,8 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
             })
         }
         ["add", n, file] => {
-            let n = name(n)?;
+            let new = name(n)?;
+            let n = new.name();
             // Bounded before it is read: the codec would refuse it only after.
             let mut input = Vec::new();
             std::fs::File::open(file)
@@ -141,7 +148,7 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
                     other => format!("{file}: {}", other.text()),
                 })?;
             store
-                .add(&n, &image, SystemTime::now(), policy.max_count)
+                .add(&new, &image, SystemTime::now(), policy.max_count)
                 .map_err(refused)?;
             // Added already: a failed lookup is no reason to say otherwise.
             let id = find(n.as_str()).map_or("a new id".into(), |e| format!("#{}", e.id.0));
@@ -154,12 +161,14 @@ pub fn command(config: &Config, args: &[String]) -> Result<String, String> {
             ))
         }
         ["rename", what, new] => {
-            let new = name(new)?;
+            // Its own name again changes nothing, even one the list has
+            // gained since the entry was given it.
             let entry = find(what)?;
-            if entry.name == new {
+            if entry.name.as_str() == new {
                 return Ok(format!("#{} is :{new}: already", entry.id.0));
             }
-            store.rename(entry.id, &new).map_err(refused)?;
+            let given = name(new)?;
+            store.rename(entry.id, &given).map_err(refused)?;
             Ok(format!(
                 "renamed #{} :{}: to :{new}:; {applied}",
                 entry.id.0, entry.name
