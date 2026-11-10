@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
@@ -37,6 +37,13 @@ password = "pw-${name}"
 read_chat = true
 send_chat = true
 ${access}`;
+
+/** What a request came back as: `ok`, or the code it was refused with. */
+const code = (p) =>
+  p.then(
+    () => 'ok',
+    (e) => e.wire?.code ?? String(e),
+  );
 
 const EDITOR = `read_news = true
 post_news = true
@@ -69,6 +76,7 @@ describe('threaded news', () => {
         // posted and answered is not already in their badges.
         asker: account('asker', 'read_news = true\npost_news = true\n'),
         follower: account('follower', 'read_news = true\n'),
+        timeliner: account('timeliner', 'read_news = true\n'),
       },
     });
   });
@@ -167,11 +175,6 @@ describe('threaded news', () => {
     const { id: one } = await editor.conn.newsPost({ category: node.id, parent: root, subject: 's', body: 'b' });
     const { id: two } = await editor.conn.newsPost({ category: node.id, parent: one, subject: 's', body: 'b' });
 
-    const code = (p) =>
-      p.then(
-        () => 'ok',
-        (e) => e.wire?.code ?? String(e),
-      );
     assert.equal(await code(editor.conn.newsPost({ category: node.id, parent: two, subject: 's', body: 'b' })), 'too_deep');
     assert.equal(
       await code(editor.conn.newsPost({ category: node.id, subject: 's', body: 'b', mime: 'text/html' })),
@@ -295,6 +298,76 @@ describe('threaded news', () => {
     assert.equal(again.conn.news.unread, 0, 'the badge on the first frame agrees');
   });
 
+  test('the timeline merges what a reader follows, pages both ways, and is seen as far as it was shown', async () => {
+    const editor = await login('editor');
+    const alice = await login('alice');
+    const reader = await login('timeliner');
+    const made = async (name) => (await editor.conn.newsNodeCreate({ kind: 'category', name })).node.id;
+    const [quiet, busy, hushed, elsewhere] = [await made('Quiet'), await made('Busy'), await made('Hushed'), await made('Elsewhere')];
+    for (const category of [quiet, busy, hushed]) await reader.conn.newsSubscribe({ category });
+    await reader.conn.newsMute({ category: hushed }, true);
+    const start = async (category, subject) => (await alice.conn.newsPost({ category, subject, body: 'b' })).id;
+
+    const q1 = await start(quiet, 'Rarely');
+    await start(elsewhere, 'Not followed');
+    await start(hushed, 'Asked never to hear');
+    const b1 = await start(busy, 'One');
+    const b2 = await start(busy, 'Two');
+    const { id: reply } = await alice.conn.newsPost({ category: busy, parent: b1, subject: 'Re: One', body: 'no thread' });
+
+    const marks = ({ threads }) => threads.map((t) => [t.article.id, t.unread]);
+    const page = await reader.conn.newsTimeline({ limit: 2 });
+    assert.deepEqual(marks(page), [
+      [b2, true],
+      [b1, true],
+    ]);
+    assert.equal(page.has_more, true);
+    assert.deepEqual([page.threads[1].article.category, page.threads[1].replies, page.threads[1].last_id], [busy, 1, reply]);
+    const older = await reader.conn.newsTimeline({ before: b1, limit: 2 });
+    assert.deepEqual(marks(older), [[q1, true]], 'neither the muted category nor the unfollowed one');
+    assert.equal(older.has_more, false);
+    const oldest = await reader.conn.newsTimeline({ after: 0, limit: 2 });
+    assert.deepEqual(marks(oldest).map(([id]) => id), [b1, q1], 'an after page holds the nearest, newest first');
+    assert.equal(oldest.has_more, true);
+    const top = await reader.conn.newsTimeline({ after: b1, limit: 2 });
+    assert.deepEqual(marks(top).map(([id]) => id), [b2]);
+    assert.equal(top.has_more, false);
+
+    // The badge the timeline answers is its unmuted category rows', which
+    // the muted row, still counting its own thread, is no part of.
+    const rows = async () => {
+      const { subs } = await reader.conn.newsSubs();
+      const left = subs.filter((s) => s.scope === 'category' && !s.muted).reduce((n, s) => n + s.unread, 0);
+      return { left, muted: subs.find((s) => s.scope === 'category' && s.target === hushed).unread };
+    };
+    assert.deepEqual(await rows(), { left: 3, muted: 1 });
+
+    // Shown: the first page. Quiet's thread is older than it, so stays unread.
+    assert.deepEqual(await reader.conn.newsSeenTimeline(b1, b2), { unread: 1 });
+    assert.deepEqual(await rows(), { left: 1, muted: 1 });
+    assert.deepEqual(marks(await reader.conn.newsTimeline()), [
+      [b2, false],
+      [b1, false],
+      [q1, true],
+    ]);
+    assert.deepEqual(await reader.conn.newsSeenTimeline(0, b2), { unread: 0 }, 'a run that reached the end');
+    assert.deepEqual(await rows(), { left: 0, muted: 1 });
+
+    const fresh = await start(quiet, 'Again');
+    assert.deepEqual(marks(await reader.conn.newsTimeline({ after: b2 })), [[fresh, true]]);
+  });
+
+  test('a guest is refused the timeline by what its account file says', async () => {
+    const refusals = async () => {
+      const guest = await crew.connect({ nick: 'Passerby' });
+      return [await code(guest.conn.newsTimeline()), await code(guest.conn.newsSeenTimeline(0, 1))];
+    };
+    assert.deepEqual(await refusals(), ['access_denied', 'access_denied'], 'the guest the server bootstrapped reads no news');
+    const bootstrapped = readFileSync(join(server.dir, 'accounts', 'guest.toml'), 'utf8');
+    server.account('guest', `${bootstrapped}read_news = true\n`);
+    assert.deepEqual(await refusals(), ['no_mailbox', 'no_mailbox'], 'one that may read has nowhere to keep a follow');
+  });
+
   test('a signed article is posted, listed and read back as signed, and signed again it is the same article', async () => {
     const author = await enrolledDevice(server, 'news-author');
     server.account('scribe', `${account('scribe', 'read_news = true\npost_news = true\n')}[identity]\nfingerprint = "${author.fingerprint}"\n`);
@@ -375,11 +448,6 @@ describe('news attachments', () => {
   const login = (who) => crew.connect({ login: who, password: `pw-${who}`, nick: who });
   const stored = () =>
     readdirSync(join(server.dir, 'pictures'), { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).length;
-  const code = (p) =>
-    p.then(
-      () => 'ok',
-      (e) => e.wire?.code ?? String(e),
-    );
 
   test('an image staged over HTTP goes out with its article and comes back to another client', async () => {
     const editor = await login('editor');
@@ -424,4 +492,26 @@ describe('a news section the server cannot honor', () => {
     const flat = await startFailing({ config: { news: { db: 'news.sqlite', flat_reply: 'newest' } } });
     assert.match(flat.output, /flat_reply/);
   });
+});
+
+describe('a timeline the config file leaves out', () => {
+  // The gates in front of `news_timeline` are sections of the file:
+  // without `[news]` there is no news, and without `[news.notify]` no
+  // follows for a timeline to be made of.
+  for (const [what, config, refused] of [
+    ['no [news]', {}, 'no_news'],
+    ['no [news.notify]', { news: { db: 'news.sqlite' } }, 'not_available'],
+  ]) {
+    test(`with ${what} the timeline is ${refused}`, async () => {
+      const server = await startServer({ config, accounts: { reader: account('reader', 'read_news = true\n') } });
+      const crew = fleet(() => server);
+      try {
+        const { conn } = await crew.connect({ login: 'reader', password: 'pw-reader', nick: 'reader' });
+        assert.deepEqual([await code(conn.newsTimeline()), await code(conn.newsSeenTimeline(0, 1))], [refused, refused]);
+      } finally {
+        await crew.closeAll();
+        await server.stop();
+      }
+    });
+  }
 });
