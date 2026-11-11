@@ -27,8 +27,8 @@ use hxd_core::video::VideoKind;
 use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AccountRefused, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core,
-    Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof,
-    ReactError, SessionStatus, Share, Transport, Uid, UserInfo,
+    Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, MsgOutcome,
+    Proof, ReactError, SessionStatus, Share, Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr, NICK_COLOR_NONE};
 use hxproto::text;
@@ -2718,7 +2718,11 @@ async fn login_phase(
     if caps.has(cap::SERVER_EMOJI) {
         login_reply.extend(emoji::login_fields(&ctx.core));
     }
-    let reaction_targets = reactions::targets(ctx.core.rooms_enabled(), caps.has(cap::MESSAGING));
+    let reaction_targets = reactions::targets(
+        ctx.core.rooms_enabled(),
+        caps.has(cap::MESSAGING),
+        ctx.core.inbox_enabled(),
+    );
     if let Some(policy) = ctx
         .core
         .reaction_policy()
@@ -3233,10 +3237,13 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             from,
             from_nick,
             text,
+            reference,
             sent_at,
             queued,
             media,
             emoji,
+            im,
+            reactions: shown,
             ..
         } => {
             let body = if queued && ctx.cfg.stamp_queued {
@@ -3267,7 +3274,23 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             if let Some(refs) = emoji.filter(|_| sess.has_cap(cap::SERVER_EMOJI)) {
                 chunks.push((emoji::DATA_EMOJI_REFS, emoji::refs_field(&refs)));
             }
+            // An instant message handed over as mail is a target by its
+            // guid alone, which a 104 has no field for.
+            let reference = reference.filter(|_| sess.has_cap(cap::REACTIONS) && im.is_none());
+            if let Some(r) = &reference {
+                chunks.push((reactions::DATA_PM_ID, reactions::pm_id(r)));
+            }
             push(tx, hdr::MSG, chunks);
+            if let Some((r, shown)) = reference.zip(shown) {
+                let change = [reactions::waited(r, *shown)];
+                let now = Instant::now();
+                let messenger = sess.has_cap(cap::MESSENGER_SESSION);
+                for chunks in
+                    reactions::changed(&change, sess.enc, messenger, &mut sess.summaries, now)
+                {
+                    notify(tx, reactions::CHANGED, chunks);
+                }
+            }
         }
         Event::Broadcast {
             from,
@@ -5210,6 +5233,15 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 c.msg_signed(from, to, body, None, media, None, None, &refs)
             });
             match sent.await {
+                Some(Ok(MsgOutcome::Delivered(Some(r)) | MsgOutcome::Queued(r)))
+                    if sess.has_cap(cap::REACTIONS) =>
+                {
+                    reply(
+                        tx,
+                        f.trans,
+                        vec![(reactions::DATA_PM_ID, reactions::pm_id(&r))],
+                    );
+                }
                 Some(Ok(_)) => reply(tx, f.trans, vec![]),
                 Some(Err(e)) => reply_error(tx, f.trans, err_text(e)),
                 None => reply_error(tx, f.trans, "Server error."),
@@ -6133,7 +6165,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     }
 }
 
-/// Send Reaction (710) on a line or an instant message: read, refused
+/// Send Reaction (710) on a line or a message: read, refused
 /// here where the session alone can say so, and otherwise the core's to
 /// answer.
 async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
@@ -6153,7 +6185,8 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
         reactions::Send::Clear { .. } | reactions::Send::Unheld { clearing: true }
     );
     // A messenger is hidden from the lines' readers, which the core's
-    // clear does not ask; a line nobody keeps is answered only once who
+    // clear does not ask, and holds no stored message, whose mail waits
+    // for a visible session; a line nobody keeps is answered only once who
     // may react, or clear, has been.
     let may = match send {
         reactions::Send::Im { .. } => true,
@@ -6184,6 +6217,11 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
                 key,
                 add,
             } => c.react_im(uid, &target, &with, &key, add).map(|()| None),
+            reactions::Send::Pm {
+                reference,
+                key,
+                add,
+            } => c.react_pm(uid, reference, &key, add).map(|()| None),
             reactions::Send::Unheld { .. } => unreachable!("answered above"),
         })
         .await;
@@ -6210,7 +6248,7 @@ fn refuse_reaction(tx: &Tx, trans: u32, (text, code): (&str, Option<u16>)) {
 }
 
 /// Get Reactions (712): the lines asked for that this session could have
-/// read, as the core answers them.
+/// read, and the stored messages asked for, as the core answers them.
 async fn get_reactions(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     let fields = f.chunks().map(|c| (c.tag, c.data));
     let asked = reactions::parse_get(

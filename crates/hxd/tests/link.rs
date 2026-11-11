@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 struct Server {
     legacy: SocketAddr,
+    tls: SocketAddr,
     ng: SocketAddr,
     hub: hxd_link::Hub,
     core: Arc<hxd_core::Core>,
@@ -112,6 +113,7 @@ async fn start(
     let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
+        tls: tls.local_addr().unwrap(),
         ng,
         hub: hub.clone(),
         core: ctx.core.clone(),
@@ -379,6 +381,49 @@ async fn a_link_login_on_the_plain_port_is_refused() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+/// A link's login is confirmed what a link is, whatever else it offers:
+/// never bit 19, which this server confirms a user beside bits 1 and 17.
+#[tokio::test]
+async fn a_link_is_never_confirmed_bit_19() {
+    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 19;
+    let kept = "[structured_chat]\nenabled = true\n[reactions]\nenabled = true\n";
+    // `b` dials with a key `a` does not hold, so the link is the test's.
+    let (a, _b, _dirs) = pair_with(3, 1, kept, EVERY_FEATURE, "", "").await;
+    let mut user = legacy::Client::connect(a.legacy).await.unwrap();
+    let login = Login {
+        caps: Some(ON),
+        ..Login::account("alice", "alice", "pw")
+    };
+    let reply = user.login(&login).await.unwrap();
+    assert_eq!(reply.uint(tag::CAPABILITIES), Some(ON), "a user");
+
+    let (mut link, exporter) = legacy::Client::connect_tls_exporting(
+        a.tls,
+        "localhost",
+        hxd_testclient::tls::any(),
+        hxd_session::peer::EXPORTER_LABEL,
+    )
+    .await
+    .unwrap();
+    let key = hxd_link::LinkKey::from_seed(&[3; 32]);
+    let theirs = hxd_link::LinkKey::from_seed(&[1; 32]).public();
+    let proof = key.prove(hxd_link::Role::Dialer, &exporter.unwrap(), &theirs);
+    let reply = link
+        .call(
+            ClientHdr::Login.as_u32(),
+            &[
+                (tag::LOGIN, b"link-bb".iter().map(|b| !b).collect()),
+                (tag::CAPABILITIES, (ON | 1 << 11).to_be_bytes().to_vec()),
+                (0x0640, key.public().to_vec()),
+                (0x0641, proof.to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+    let confirmed = reply.uint(tag::CAPABILITIES).unwrap();
+    assert_eq!(confirmed & (1 << 11 | 1 << 19), 1 << 11);
 }
 
 #[tokio::test]

@@ -688,6 +688,13 @@ frontend, not in the stored body — and when Capabilities-Messaging lands
 it becomes the *fallback* path, for clients that negotiate no messaging
 capability (§12).
 
+**A stored message's reference** reaches a classic client that
+negotiated the Reactions draft's bit 19 (`reactions.md` §2): as
+`DATA_PM_ID` on the 104 that hands the message over, unless it is an
+instant message handed over as mail, and on the reply to the 108 that
+sent it: the stored flag, then the 16 bytes the ng `ref` carries. A client
+without the bit is sent the 104 it always was.
+
 **Addressing an account from 1.x is a command to the system account.**
 `/msg <login> …` exists, as a private message to the reserved account of
 system-account.md §3 — not as the pseudo-user with a command language

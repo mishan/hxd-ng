@@ -8,19 +8,22 @@
 //! an instant message's told to its other party or kept for its next Get
 //! Roster, a redaction and a purge, Get Reactions (712) and who reacted,
 //! a line's reactions on its 700 entry, Set Notifications (717) answered
-//! with no type, and a session without the bit sent what it always was.
+//! with no type, a stored private message named by its reference and
+//! reacted to by its parties, and a session without the bit sent what it
+//! always was.
 //!
 //! Targets, keys and summaries are laid out by hand from the draft here
 //! rather than by the server's encoder, so a disagreement between the
-//! two shows. The binary does not offer bit 19 yet, so each server here
-//! is given it by hand.
+//! two shows.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hxd_session::caps::cap;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
+
 use hxd_session::emoji::DATA_EMOJI_REFS;
 use hxd_session::reactions::{
     CHANGED, CLEAR_REASON, DATA_MAX_REACTIONS_PER_USER, DATA_MAX_REACTION_KEYS, DATA_NOTIFY_TYPES,
@@ -89,6 +92,8 @@ struct Opts<'a> {
     structured: bool,
     /// `[messaging]`, with the `[inbox]` it keeps instant messages in.
     messaging: bool,
+    /// `[inbox]`, with these keys, beside or without `[messaging]`.
+    inbox: Option<&'a str>,
     spam_points: u32,
     extra: &'a str,
 }
@@ -100,14 +105,14 @@ impl Default for Opts<'_> {
             rooms: true,
             structured: true,
             messaging: false,
+            inbox: None,
             spam_points: 0,
             extra: "",
         }
     }
 }
 
-/// A server keeping history and moderation in `dir`, built as `o` says,
-/// with bit 19 among what its classic port offers.
+/// A server keeping history and moderation in `dir`, built as `o` says.
 async fn start(dir: &Path, o: Opts<'_>) -> Server {
     let d = dir.display();
     let accounts = dir.join("accounts");
@@ -142,13 +147,17 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
     let reactions = o.reactions.map_or(String::new(), |r| {
         format!("[reactions]\nenabled = true\n{r}\n")
     });
-    let stores = if o.messaging {
-        format!("[inbox]\ndb = \"{d}/hx.db\"\n[history]\n[messaging]\nenabled = true\n")
+    let stores = match o.inbox.or(o.messaging.then_some("")) {
+        Some(keys) => format!("[inbox]\ndb = \"{d}/hx.db\"\n{keys}\n[history]\n"),
+        None => format!("[history]\ndb = \"{d}/hx.db\"\n"),
+    };
+    let messaging = if o.messaging {
+        "[messaging]\nenabled = true\n"
     } else {
-        format!("[history]\ndb = \"{d}/hx.db\"\n")
+        ""
     };
     let text = format!(
-        "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n{stores}\
+        "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n{stores}{messaging}\
          [limits]\nspam_points = {}\nchat_lines = 0\nng_requests = 0\n\
          [rooms]\nenabled = {}\nfile = \"{d}/rooms.toml\"\nannounce = false\n\
          [structured_chat]\nenabled = {}\n{reactions}{}",
@@ -158,9 +167,7 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
     std::fs::write(&path, &text).unwrap();
     let config = hxd::Config::load(&path).unwrap();
     hxd::check_config(&config).unwrap();
-    let mut ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
-    let caps = ctx.cfg.caps.with(cap::REACTIONS);
-    Arc::make_mut(&mut ctx.cfg).caps = caps;
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
@@ -385,8 +392,9 @@ fn confirmed(reply: &Frame) -> u32 {
 
 /// Bit 19 only beside bits 1 and 17, on a server that keeps reactions,
 /// and the login fields with it alone: lines, rooms where there are
-/// rooms, and instant messages beside bit 6, without which a session
-/// holds none to name, with the configured caps.
+/// rooms, instant messages beside bit 6, without which a session holds
+/// none to name, and stored messages where there is an inbox, with the
+/// configured caps.
 #[tokio::test]
 async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactions() {
     let caps = "max_keys = 7\nmax_per_user = 3";
@@ -410,6 +418,11 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
     let messaging = Opts {
         reactions: Some(caps),
         messaging: true,
+        ..Opts::default()
+    };
+    let inbox = Opts {
+        reactions: Some(caps),
+        inbox: Some(""),
         ..Opts::default()
     };
     let fields = |targets: u8| {
@@ -445,10 +458,11 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
             "messaging",
             messaging,
             vec![
-                ("with bit 6", ON | MESSAGING, fields(0x16)),
-                ("without it", ON, fields(0x12)),
+                ("with bit 6", ON | MESSAGING, fields(0x56)),
+                ("without it", ON, fields(0x52)),
             ],
         ),
+        ("inbox", inbox, vec![("with 1 and 17", ON, fields(0x52))]),
     ] {
         let td = tempfile::tempdir().unwrap();
         let s = start(td.path(), opts).await;
@@ -1525,8 +1539,8 @@ async fn an_instant_messages_reaction_crosses_the_wires() {
 }
 
 /// A messenger session (bit 8) reacts to instant messages and is told of
-/// them, but reacts to no line, clears none, even as a moderator, and
-/// reads none's reactions.
+/// them, but reacts to no line or stored message, clears none, even as a
+/// moderator, and reads none's reactions.
 #[tokio::test]
 async fn a_messenger_session_reacts_to_instant_messages_alone() {
     let td = tempfile::tempdir().unwrap();
@@ -1558,6 +1572,12 @@ async fn a_messenger_session_reacts_to_instant_messages_alone() {
             "{case}"
         );
     }
+    let mail = pm_target(&[[1].as_slice(), &[3; 16]].concat());
+    assert_eq!(
+        refused(&mut carol, &mail, ADD, Some(key("👍"))).await,
+        NOT_ALLOWED,
+        "a stored message"
+    );
     for (ty, fields) in [
         (GET, (DATA_TARGET, line)),
         (SET_NOTIFICATIONS, (DATA_NOTIFY_TYPES, vec![0; 4])),
@@ -1570,6 +1590,306 @@ async fn a_messenger_session_reacts_to_instant_messages_alone() {
             "{ty}"
         );
     }
+}
+
+/// The Replies draft's `DATA_PM_ID`, laid out by hand: the stored flag,
+/// then the reference's 16 bytes.
+const DATA_PM_ID: u16 = 0x0f23;
+
+/// The `DATA_PM_ID` of the message the ng wire names `reference`.
+fn pm_id(reference: &Value) -> Vec<u8> {
+    let bytes = B64.decode(reference.as_str().expect("a ref")).unwrap();
+    [&[1][..], &bytes].concat()
+}
+
+/// A stored message as a target, by its `DATA_PM_ID`.
+fn pm_target(id: &[u8]) -> Vec<u8> {
+    [&[5][..], id].concat()
+}
+
+/// `c`'s private message to `to`, answered.
+async fn msg(c: &mut Client, to: u16, text: &str) -> Frame {
+    let fields = [
+        (tag::UID, to.to_be_bytes().to_vec()),
+        (tag::BODY, text.as_bytes().to_vec()),
+    ];
+    let trans = c.send(ClientHdr::Msg.as_u32(), &fields).await.unwrap();
+    let reply = c.reply(trans).await.unwrap();
+    assert!(!reply.is_error(), "{:?}", reply.error_text());
+    reply
+}
+
+/// The next 104 whose text ends with `tail`.
+async fn pm_heard(c: &mut Client, tail: &str) -> Frame {
+    c.recv_where(|f| {
+        f.ty == push::MSG
+            && f.bytes(tag::BODY)
+                .is_some_and(|b| b.ends_with(tail.as_bytes()))
+    })
+    .await
+    .unwrap()
+}
+
+/// Until the ng session `uid` is detached.
+async fn detached(s: &Server, uid: u16) {
+    let mut tries = 0;
+    while s.core.user(uid).map(|u| u.status) != Some(hxd_core::SessionStatus::Detached) {
+        tries += 1;
+        assert!(tries < 500, "never detached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A stored private message is named by its reference to a session with
+/// bit 19, on the reply to its 108 and on the 104 that hands it over,
+/// live or queued, by the 16 bytes the ng wire names it by; never to a
+/// session without the bit, and never for a message past its sender's
+/// quota, which is not stored.
+#[tokio::test]
+async fn a_stored_message_is_named_by_its_reference_to_sessions_with_bit_19() {
+    let td = tempfile::tempdir().unwrap();
+    let o = Opts {
+        inbox: Some("max_sent_per_day = 4"),
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let mut bob = classic(&s, "bob", ON).await;
+    let mut frank = classic(&s, "frank", UTF8 | HISTORY | STRUCTURED).await;
+    let (bob_uid, frank_uid) = (bob.uid.unwrap(), frank.uid.unwrap());
+
+    let id = msg(&mut alice, bob_uid, "one").await.bytes(DATA_PM_ID);
+    assert_eq!(
+        id.as_ref().map(|i| (i.len(), i[0])),
+        Some((17, 1)),
+        "stored"
+    );
+    assert_eq!(pm_heard(&mut bob, "one").await.bytes(DATA_PM_ID), id);
+    let sent = msg(&mut alice, frank_uid, "two").await;
+    assert!(sent.chunk(DATA_PM_ID).is_some(), "to a sender with the bit");
+    let heard = pm_heard(&mut frank, "two").await;
+    assert!(heard.chunk(DATA_PM_ID).is_none(), "and none without it");
+    let sent = msg(&mut frank, bob_uid, "three").await;
+    assert!(sent.chunk(DATA_PM_ID).is_none(), "to a sender without it");
+    let heard = pm_heard(&mut bob, "three").await;
+    assert!(
+        heard.chunk(DATA_PM_ID).is_some(),
+        "and to a recipient with it"
+    );
+
+    let mut erin = ng_client(&s, "erin").await;
+    let erin_uid = erin.uid.unwrap() as u16;
+    let id = msg(&mut alice, erin_uid, "four").await.bytes(DATA_PM_ID);
+    let ev = erin.event_where("msg", |d| d["text"] == "four").await;
+    assert_eq!(id, Some(pm_id(&ev.unwrap().data["ref"])), "the ng ref");
+    erin.close().await.unwrap();
+    detached(&s, erin_uid).await;
+    let queued = msg(&mut alice, erin_uid, "five").await;
+    assert!(queued.chunk(DATA_PM_ID).is_some(), "queued");
+
+    let sent = msg(&mut alice, bob_uid, "six").await;
+    assert!(sent.chunk(DATA_PM_ID).is_none(), "past the quota");
+    let heard = pm_heard(&mut bob, "six").await;
+    assert!(heard.chunk(DATA_PM_ID).is_none(), "and unstored");
+}
+
+/// A reaction to a stored message is answered with no count, and told as
+/// a summary to the sessions of both parties on both wires but a
+/// classic reactor's own; one from a stranger, past a cap or naming nothing is
+/// answered alike and told to nobody. 712 shows a stranger nothing, and
+/// the sender nothing once its window ends, nor is it told more, while
+/// the recipient's kept message takes reactions still.
+#[tokio::test]
+async fn a_stored_messages_reaction_is_told_to_its_parties() {
+    let td = tempfile::tempdir().unwrap();
+    let o = Opts {
+        reactions: Some("max_per_user = 1"),
+        // A read message outlives its sender's window.
+        inbox: Some("retain_unread = 86400\nretain_read = 172800"),
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let mut alice_ng = ng_client(&s, "alice").await;
+    let mut bob = classic(&s, "bob", ON).await;
+    let mut other = classic(&s, "bob", ON).await;
+    let mut erin = classic(&s, "erin", ON).await;
+    let id = msg(&mut alice, bob.uid.unwrap(), "hi")
+        .await
+        .bytes(DATA_PM_ID);
+    let t = pm_target(&id.unwrap());
+    pm_heard(&mut bob, "hi").await;
+
+    let reply = send(&mut bob, &t, ADD, Some(key("👍"))).await;
+    assert!(!reply.is_error(), "{:?}", reply.error_text());
+    assert!(reply.chunk(DATA_REACTION_COUNT).is_none(), "no count");
+    let thumbs = [("👍", 1)];
+    assert_eq!(
+        changed(&mut alice, &t).await.1,
+        summary_group(&t, &thumbs, &[])
+    );
+    assert_eq!(
+        changed(&mut other, &t).await.1,
+        summary_group(&t, &thumbs, &[0])
+    );
+    let ng_pm = json!({ "pm": B64.encode(&t[2..]) });
+    let ev = alice_ng
+        .event_where("reactions_changed", |d| d["changes"][0]["target"] == ng_pm)
+        .await
+        .unwrap();
+    assert_eq!(
+        ev.data["changes"][0]["keys"],
+        json!([{ "key": { "emoji": "👍" }, "count": 1 }])
+    );
+
+    let nothing = pm_target(&[[1].as_slice(), &[9; 16]].concat());
+    for (case, c, target, emoji) in [
+        ("a stranger", &mut erin, &t, "🎉"),
+        ("past the cap", &mut bob, &t, "🎉"),
+        ("no message", &mut alice, &nothing, "🎉"),
+    ] {
+        let reply = send(c, target, ADD, Some(key(emoji))).await;
+        assert!(!reply.is_error(), "{case}: {:?}", reply.error_text());
+        assert!(reply.chunk(DATA_REACTION_COUNT).is_none(), "{case}");
+    }
+    let marker = lobby(say(&mut erin, 0, "marker").await);
+    react(&mut erin, &marker, "👋").await;
+    for c in [&mut bob, &mut erin, &mut alice, &mut other] {
+        never_told(c, &t, &marker).await;
+    }
+    assert_eq!(
+        refused(&mut alice, &t, CLEAR, None).await,
+        INVALID_TARGET,
+        "a clear"
+    );
+    let asked = [t.clone(), nothing.clone()];
+    assert_eq!(
+        got(&mut alice, &asked, None).await,
+        [
+            answer_group(&t, &thumbs, &[]),
+            answer_group(&nothing, &[], &[])
+        ]
+    );
+    assert_eq!(
+        got(&mut erin, std::slice::from_ref(&t), Some(key("👍"))).await,
+        [answer_group(&t, &[], &[])],
+        "a stranger"
+    );
+    let mut named = answer_group(&t, &thumbs, &[0]);
+    named.push((tag::NAME, b"bob".to_vec()));
+    assert_eq!(
+        got(&mut bob, std::slice::from_ref(&t), Some(key("👍"))).await,
+        [named]
+    );
+
+    ok(
+        &mut alice_ng,
+        "react",
+        json!({ "target": ng_pm, "key": { "emoji": "🎉" } }),
+    )
+    .await;
+    let both = [("👍", 1), ("🎉", 1)];
+    for c in [&mut bob, &mut other] {
+        assert_eq!(changed(c, &t).await.1, summary_group(&t, &both, &[0]));
+    }
+    assert_eq!(
+        changed(&mut alice, &t).await.1,
+        summary_group(&t, &both, &[1])
+    );
+
+    s.core.clock().advance(Duration::from_secs(86400 + 2));
+    s.core.prune_inbox();
+    let removed = send(&mut bob, &t, REMOVE, Some(key("👍"))).await;
+    assert!(!removed.is_error(), "{:?}", removed.error_text());
+    let party = [("🎉", 1)];
+    assert_eq!(
+        changed(&mut other, &t).await.1,
+        summary_group(&t, &party, &[])
+    );
+    let marker = lobby(say(&mut erin, 0, "later").await);
+    react(&mut erin, &marker, "👋").await;
+    never_told(&mut alice, &t, &marker).await;
+    assert_eq!(
+        got(&mut alice, std::slice::from_ref(&t), None).await,
+        [answer_group(&t, &[], &[])],
+        "the sender's window ended"
+    );
+    assert_eq!(
+        got(&mut bob, std::slice::from_ref(&t), None).await,
+        [answer_group(&t, &party, &[])],
+        "the recipient's kept"
+    );
+}
+
+/// A message that waited is handed over at login with its reference,
+/// and the reactions made while it waited follow its 104 in a 711.
+#[tokio::test]
+async fn a_reaction_to_a_queued_message_follows_its_104() {
+    let td = tempfile::tempdir().unwrap();
+    let o = Opts {
+        inbox: Some(""),
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let mut alice = ng_client(&s, "alice").await;
+    let sent = ok(
+        &mut alice,
+        "msg",
+        json!({ "to_login": "erin", "text": "later" }),
+    )
+    .await;
+    let pm = json!({ "pm": sent["ref"] });
+    ok(
+        &mut alice,
+        "react",
+        json!({ "target": pm, "key": { "emoji": "👍" } }),
+    )
+    .await;
+
+    let id = pm_id(&sent["ref"]);
+    let t = pm_target(&id);
+    let (mut erin, _) = logged_in(&s, "erin", Some(ON)).await;
+    let mut frames = erin.rx.take_backlog();
+    while !frames.iter().any(|f| names(f, &t)) {
+        frames.push(erin.recv_where(|_| true).await.unwrap());
+    }
+    let later = frames.iter().position(|f| {
+        f.ty == push::MSG && f.bytes(tag::BODY).is_some_and(|b| b.ends_with(b"later"))
+    });
+    let later = later.expect("the message");
+    assert_eq!(frames[later].bytes(DATA_PM_ID), Some(id));
+    let next = frames.get(later + 1).expect("a frame after it");
+    assert_eq!(groups(next), [summary_group(&t, &[("👍", 1)], &[])]);
+}
+
+/// An instant message handed over as mail, to a session without bit 6,
+/// is named by its guid alone, and its 104 carries no reference.
+#[tokio::test]
+async fn an_instant_message_handed_over_as_mail_carries_no_reference() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_messaging(td.path()).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let mut erin = classic(&s, "erin", ON | MESSAGING).await;
+    befriend(&mut alice, "alice", &mut erin, "erin").await;
+    let gone = erin.uid.unwrap();
+    erin.shutdown().await.unwrap();
+    let mut tries = 0;
+    while s.core.user(gone).is_some() {
+        tries += 1;
+        assert!(tries < 500, "erin's session never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let sent = alice
+        .ask(
+            ClientHdr::ImSend,
+            &im::im_send(b"erin", &guid(1), b"instant"),
+        )
+        .await
+        .unwrap();
+    assert!(!sent.is_error(), "{:?}", sent.error_text());
+    let mut erin = classic(&s, "erin", ON).await;
+    let im = pm_heard(&mut erin, "instant").await;
+    assert!(im.chunk(DATA_PM_ID).is_none());
 }
 
 /// What a client is sent, in order, as two runs of one script agree on
@@ -1598,8 +1918,9 @@ fn seen(frames: &[Frame]) -> Vec<(u32, Group)> {
 /// A period client and one with bit 17 alone, in the lobby and a room,
 /// and one with bit 6 alone in the lobby, while lines are reacted to,
 /// cleared and redacted around them and instant messages reacted to, one
-/// of the bit-6 client's among them: what each is sent, and what 700
-/// pages to the second, on a server keeping reactions and on one without.
+/// of the bit-6 client's among them, and the first two sent private
+/// messages that are reacted to: what each is sent, and what 700 pages to
+/// the second, on a server keeping reactions and on one without.
 async fn bystanders(reactions: bool) -> Vec<Vec<(u32, Group)>> {
     let td = tempfile::tempdir().unwrap();
     let o = Opts {
@@ -1638,6 +1959,14 @@ async fn bystanders(reactions: bool) -> Vec<Vec<(u32, Group)>> {
     let r = send_with(&mut erin, &theirs, Some("late"), ADD, Some(key("👍"))).await;
     assert_eq!(r.is_error(), !reactions, "{:?}", r.error_text());
     send_with(&mut erin, &hers, Some("alice"), ADD, Some(key("👍"))).await;
+    for to in [period.uid.unwrap(), structured.uid.unwrap()] {
+        let id = msg(&mut alice, to, "psst").await.bytes(DATA_PM_ID);
+        assert_eq!(id.is_some(), reactions, "a reference to the sender");
+        if let Some(id) = id {
+            let r = send(&mut alice, &pm_target(&id), ADD, Some(key("👍"))).await;
+            assert!(!r.is_error(), "{:?}", r.error_text());
+        }
+    }
     ok(
         &mut moderator,
         "redact",
