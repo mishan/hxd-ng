@@ -5,8 +5,8 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use hxd_core::{AuthBackend, Core};
-use hxd_session::{run_session, ServerConfig, ServerCtx};
+use hxd_core::{AuthBackend, Core, HistoryPolicy, MemoryLog, ReactionPolicy};
+use hxd_session::{cap, run_session, Caps, ServerConfig, ServerCtx};
 use libfuzzer_sys::fuzz_target;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -23,6 +23,12 @@ fn env() -> &'static Env {
         let dir = tempfile::tempdir().unwrap();
         let accounts = dir.path().join("accounts");
         hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
+        // An account that may react, which a guest may not.
+        std::fs::write(
+            accounts.join("fuzz.toml"),
+            "name = \"fuzz\"\npassword = \"fuzz\"\n[access]\nread_chat = true\nsend_chat = true\n",
+        )
+        .unwrap();
         Env {
             rt: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -31,6 +37,11 @@ fn env() -> &'static Env {
             auth: Arc::new(hxd_auth_file::FileAuth::new(accounts)),
             cfg: Arc::new(ServerConfig {
                 agreement: Some("agreement".into()),
+                caps: Caps::empty()
+                    .with(cap::TEXT_ENCODING)
+                    .with(cap::CHAT_HISTORY)
+                    .with(cap::STRUCTURED_CHAT)
+                    .with(cap::REACTIONS),
                 ..ServerConfig::default()
             }),
             _dir: dir,
@@ -41,9 +52,13 @@ fn env() -> &'static Env {
 fuzz_target!(|data: &[u8]| {
     let env = env();
     env.rt.block_on(async {
-        // A core per input, so no ban or flood count carries between them.
+        // A core per input, so no ban or flood count carries between them,
+        // with a log for its lines to be reacted to on.
+        let core = Core::new()
+            .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
+            .with_reactions(ReactionPolicy::default());
         let ctx = ServerCtx {
-            core: Arc::new(Core::new()),
+            core: Arc::new(core),
             auth: env.auth.clone(),
             cfg: env.cfg.clone(),
             files: None,

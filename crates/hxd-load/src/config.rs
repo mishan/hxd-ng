@@ -133,7 +133,7 @@ impl Scenario {
             Kind::Requests => self.requests.requesters_legacy > 0,
             // The moderator, and the victims on the linked servers.
             Kind::Moderation => true,
-            Kind::Reactions => false,
+            Kind::Reactions => self.reactions.readers_legacy + self.reactions.stalled_legacy > 0,
         };
         let needs_ng = match self.run.scenario {
             Kind::LoginStorm => {
@@ -538,7 +538,7 @@ pub enum Kind {
     Requests,
     /// L-7: kicks and bans of other servers' users while the room talks.
     Moderation,
-    /// R-1: a reaction storm on the room's recent lines, on the ng wire.
+    /// R-1: a reaction storm on the room's recent lines, from the ng wire.
     Reactions,
 }
 
@@ -552,6 +552,10 @@ pub struct Reactions {
     pub readers: usize,
     /// Clients that log in and then never read again.
     pub stalled: usize,
+    /// `readers` on the classic wire, offering bit 19.
+    pub readers_legacy: usize,
+    /// `stalled` on the classic wire.
+    pub stalled_legacy: usize,
     /// Reactions a second, every reactor together, on a fixed schedule.
     pub rate: f64,
     /// The lines reacted to: the room's most recent, so all of them
@@ -568,6 +572,8 @@ impl Default for Reactions {
             reactors: 20,
             readers: 20,
             stalled: 1,
+            readers_legacy: 0,
+            stalled_legacy: 0,
             rate: 50.0,
             lines: 20,
             batch: 1.0,

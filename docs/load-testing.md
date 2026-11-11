@@ -202,14 +202,20 @@ a rule the protocol does not make.
 
 ### Reaction storm (`reactions`)
 
-The ng wire alone, against a server with `[history]` and `[reactions]`.
+Reactions are made on the ng wire, against a server with `[history]`
+and `[reactions]`.
 `reactors` clients, each logged in to one of `[target] accounts`
 (`hxd-load accounts`, as for churn, since a guest may not react), react
 `rate` times a second together, evenly staggered, on the `lines` most
 recent lines the first of them said, each adding a key from a short set
 or taking away one it added. `readers` guests read, and `stalled`
-guests log in and never read again. Every client declares `reactions`;
+guests log in and never read again. Every ng client declares `reactions`;
 all but the stalled read every `reactions_changed` they are sent.
+`readers_legacy` and `stalled_legacy` are the same on the classic wire:
+guests offering bit 19, which the server confirms only beside
+`[structured_chat]`, each 711 one batch while a batch fits one frame.
+Once the storm stops, a classic reader asks Get Reactions (712) for
+every line, which costs spam points as the draft prices it.
 The server's own rate, `[reactions] burst` and `per_second`, must allow
 `rate / reactors` a second for each account, or its refusals are the
 reactors' errors; `lines` must sit inside its `live_window`, and
@@ -235,8 +241,8 @@ storm stops, the readers read on for two batches and `settle`.
 | `server.log_clean` | With `log`, the server wrote no panic and no `ERROR` line during the run (terminal colors stripped). |
 | `server.reachable` | With metrics, the server still answers once the run is over. A run whose server died still writes its report. |
 | `slow.disconnected`, `slow.bounded` | The slow consumer's verdicts, above. Its roster check takes the stalled clients as listed or not, since a server that does the right thing has dropped them. |
-| `reactions.one_per_window` | In the reaction storm, no client heard two `reactions_changed` less than half a batch apart: the server spaces them a whole batch, and half is room for a busy host's delivery while a batch per change, tens of milliseconds apart, still fails. |
-| `reactions.converged` | Once the storm has passed, every client's last summary of each line is the line's reactions as `history` shows them. |
+| `reactions.one_per_window` | In the reaction storm, no client heard two `reactions_changed`, or two 711s, less than half a batch apart: the server spaces them a whole batch, and half is room for a busy host's delivery while a batch per change, tens of milliseconds apart, still fails. |
+| `reactions.converged` | Once the storm has passed, every client's last summary of each line is the line's reactions as `history` shows them, or for a classic reader as 712 answers them. |
 | `reactions.backlog_bounded` | A stalled client was owed at most one batch a batch window over the run, read back once the run is over: what waits for a reader that stops grows with time, never with the reaction rate. |
 | `reactions.stayed` | No reader lost its connection. |
 

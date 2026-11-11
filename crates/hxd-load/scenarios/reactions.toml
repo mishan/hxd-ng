@@ -4,11 +4,13 @@
 #   hxd-load accounts <server's accounts dir> --prefix react --count 50 \
 #       --password <pw>
 #
-# and the server needs `[history]`, `[reactions] enabled`, a `burst` and
+# and the server needs `[history]`, `[reactions] enabled`,
+# `[structured_chat] enabled` for the classic readers, a `burst` and
 # `per_second` that let each account react `rate / reactors` times a
 # second, and `batch_seconds` equal to `[reactions] batch` here.
 
 [target]
+legacy = "127.0.0.1:5500"
 ng = "127.0.0.1:5700"
 metrics = true
 accounts = { prefix = "react", count = 50, password = "change-me" }
@@ -21,6 +23,8 @@ duration = 60
 reactors = 50
 readers = 200
 stalled = 2
+readers_legacy = 50
+stalled_legacy = 2
 rate = 100
 lines = 50
 batch = 1.0

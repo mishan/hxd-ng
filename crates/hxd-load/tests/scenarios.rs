@@ -265,7 +265,8 @@ async fn a_reaction_storm_is_told_a_batch_a_window_and_converges() {
     // rate does not refuse them.
     let reactions = format!(
         "[history]\ndb = \"{d}/history.sqlite\"\n\
-         [reactions]\nenabled = true\nburst = 1000\nper_second = 1000\n"
+         [reactions]\nenabled = true\nburst = 1000\nper_second = 1000\n\
+         [structured_chat]\nenabled = true\n"
     );
     let server = start(td.path(), &reactions).await;
     let accounts = Accounts {
@@ -286,16 +287,18 @@ async fn a_reaction_storm_is_told_a_batch_a_window_and_converges() {
     s.reactions.reactors = 4;
     s.reactions.readers = 3;
     s.reactions.stalled = 1;
+    s.reactions.readers_legacy = 2;
+    s.reactions.stalled_legacy = 1;
     s.reactions.rate = 40.0;
     s.reactions.lines = 5;
     let report = hxd_load::run(s).await.unwrap();
     assert_clean(&report);
     assert!(report.detail["reactions_sent"].as_u64().unwrap() > 40);
-    // Every reader and reactor, of every line.
-    assert_eq!(report.checks["reactions.converged"].held, 7 * 5);
+    // Every reader and reactor on both wires, of every line.
+    assert_eq!(report.checks["reactions.converged"].held, 9 * 5);
     assert!(report.checks["reactions.one_per_window"].held > 0);
     assert_eq!(report.checks["ng.seq_gapless"].held, 7);
-    assert_eq!(report.checks["reactions.backlog_bounded"].held, 1);
+    assert_eq!(report.checks["reactions.backlog_bounded"].held, 2);
     assert!(report.checks["roster.no_ghosts"].held == 1);
 }
 
