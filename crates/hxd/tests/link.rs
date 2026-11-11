@@ -510,6 +510,7 @@ async fn a_reaction_on_a_ghosts_line_counts_on_its_server_alone() {
     assert_eq!(told.bytes(DATA_REACTION_SUMMARY), Some(one.clone()));
     // Its home counts its own from nothing, and tells only its own.
     crossed(&mut alice, &mut bob, "reacted here").await;
+    assert!(!bob.rx.take_backlog().iter().any(|f| f.ty == CHANGED));
     assert_eq!(react(&mut bob, lobby(there), &thumbs).await, Some(1));
     let told = bob.rx.recv_type(CHANGED).await.unwrap();
     assert_eq!(told.bytes(DATA_TARGET), Some(lobby(there)));

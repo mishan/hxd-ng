@@ -299,6 +299,10 @@ async fn a_reaction_storm_is_told_a_batch_a_window_and_converges() {
     assert!(report.checks["reactions.one_per_window"].held > 0);
     assert_eq!(report.checks["ng.seq_gapless"].held, 7);
     assert_eq!(report.checks["reactions.backlog_bounded"].held, 2);
+    // A stalled client owed nothing would hold the bound vacuously.
+    for s in report.detail["stalled"].as_array().unwrap() {
+        assert!(s["batches"].as_u64().unwrap() > 0, "{s}");
+    }
     assert!(report.checks["roster.no_ghosts"].held == 1);
 }
 

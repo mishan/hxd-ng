@@ -608,6 +608,15 @@ async fn a_reader_keeping_up_through_a_purge_is_kept_and_reads_the_rest_with_712
     let after = told.values().next().unwrap().clone();
     assert!(told.values().all(|s| *s == after));
     assert_eq!(after[..2], (KEYS as u16).to_be_bytes());
+    let mut at = 2;
+    for _ in 0..KEYS {
+        assert_eq!(
+            after[at..at + 4],
+            1u32.to_be_bytes(),
+            "a key still counts Bob's"
+        );
+        at += 6 + u16::from_be_bytes([after[at + 4], after[at + 5]]) as usize;
+    }
 
     // Kept, and the lines it was not told of read back as they now are.
     for chunk in skipped.chunks(10) {
@@ -624,7 +633,10 @@ async fn a_reader_keeping_up_through_a_purge_is_kept_and_reads_the_rest_with_712
         };
         assert!(!reply.is_error(), "{:?}", reply.error_text());
         assert_eq!(reply.all(DATA_TARGET), chunk);
-        assert!(reply.all(DATA_REACTION_SUMMARY).iter().all(|s| *s == after));
+        assert_eq!(
+            reply.all(DATA_REACTION_SUMMARY),
+            vec![after.clone(); chunk.len()]
+        );
     }
 }
 
