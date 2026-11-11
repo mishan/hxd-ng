@@ -2718,7 +2718,7 @@ async fn login_phase(
     if caps.has(cap::SERVER_EMOJI) {
         login_reply.extend(emoji::login_fields(&ctx.core));
     }
-    let reaction_targets = reactions::targets(ctx.core.rooms_enabled());
+    let reaction_targets = reactions::targets(ctx.core.rooms_enabled(), caps.has(cap::MESSAGING));
     if let Some(policy) = ctx
         .core
         .reaction_policy()
@@ -3555,7 +3555,9 @@ async fn session_loop(
         // shows that could chat, message, invite or fetch files would
         // make bit 8 a stealth mode for any messaging account. A chat
         // line has no reply to refuse it with, and is dropped.
-        if sess.has_cap(cap::MESSENGER_SESSION) && !messenger_may(f.ty) {
+        if sess.has_cap(cap::MESSENGER_SESSION)
+            && !messenger_may(f.ty, sess.has_cap(cap::REACTIONS))
+        {
             if f.ty != ClientHdr::Chat.as_u32() {
                 reply_error(tx, f.trans, "A messenger session may not do that.");
             }
@@ -3598,10 +3600,12 @@ async fn session_loop(
 }
 
 /// What a messenger session (bit 8) may ask: the friend family, device
-/// proof, and what any session needs to finish its login and stay up.
-fn messenger_may(ty: u32) -> bool {
+/// proof, with bit 19 a reaction, which it may make to an instant message
+/// alone, and what any session needs to finish its login and stay up.
+fn messenger_may(ty: u32, reactions: bool) -> bool {
     friends::handles(ty)
         || device::handles(ty)
+        || (reactions && ty == reactions::SEND)
         || [
             ClientHdr::Ping,
             ClientHdr::AgreementAgree,
@@ -6129,14 +6133,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
     }
 }
 
-/// Send Reaction (710) on a line: read, refused here where the session
-/// alone can say so, and otherwise the core's to answer.
+/// Send Reaction (710) on a line or an instant message: read, refused
+/// here where the session alone can say so, and otherwise the core's to
+/// answer.
 async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     let fields = f.chunks().map(|c| (c.tag, c.data));
     let sent = reactions::parse_send(
         fields,
         sess.reaction_targets,
         sess.has_cap(cap::SERVER_EMOJI),
+        sess.enc,
     );
     let send = match sent {
         Ok(send) => send,
@@ -6150,6 +6156,8 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     // clear does not ask; a line nobody keeps is answered only once who
     // may react, or clear, has been.
     let may = match send {
+        reactions::Send::Im { .. } => true,
+        _ if sess.has_cap(cap::MESSENGER_SESSION) => false,
         reactions::Send::Unheld { clearing: true } => sess.account.moderate,
         reactions::Send::Unheld { clearing: false } => {
             sess.account.is_person() && sess.can(bit::SEND_CHAT)
@@ -6157,7 +6165,7 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
         _ => true,
     };
     let unheld = matches!(send, reactions::Send::Unheld { .. });
-    let refused = if sess.has_cap(cap::MESSENGER_SESSION) || !may {
+    let refused = if !may {
         Some(ReactError::NotAllowed)
     } else if unheld {
         Some(ReactError::NoSuchTarget)
@@ -6170,6 +6178,12 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
             reactions::Send::Clear { room, id } => c
                 .react_clear(uid, room, id, reactions::CLEAR_REASON)
                 .map(|()| None),
+            reactions::Send::Im {
+                target,
+                with,
+                key,
+                add,
+            } => c.react_im(uid, &target, &with, &key, add).map(|()| None),
             reactions::Send::Unheld { .. } => unreachable!("answered above"),
         })
         .await;

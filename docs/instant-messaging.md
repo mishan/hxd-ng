@@ -635,9 +635,10 @@ is never announced, so no user list, join, change or part names it;
 neither 108, a uid `msg`, a private chat's or a room's invite nor a
 kick by uid reaches it; it is flushed no private messages, which wait
 for a visible session of its account; and the friend family alone
-reaches it. It may itself send only the family's transactions and what
+reaches it. It may itself send only the family's transactions, what
 finishing its login and staying up need (the agreement, User Change
-for a 1.5 client's name, and the keep-alive); anything else is refused
+for a 1.5 client's name, and the keep-alive), and with bit 19 a
+reaction to an instant message; anything else is refused
 and a chat line dropped, since a session nobody can see that could chat,
 message, invite or fetch files would make bit 8 a stealth mode for any
 messaging account. A moderator ends one by banning or disabling its
@@ -680,6 +681,13 @@ requests add transactions 829–832, under the numbers fogWraith reserved
 A period client clears its requests as `/requests clear
 [newer|older <duration>]` to the system account (`system-account.md`),
 everything if no span is given.
+
+**Reactions** to instant messages, with the Reactions draft's bit 19
+beside bit 6, are `reactions.md`'s: Send Reaction (710) on an instant
+message names the conversation's other party, who is told it as a
+change in Reaction Changed (711), or for a party with no session to
+hear it, after the reply to the next Get Roster from a session with
+bit 19.
 
 What the classic wire says differently from the documents, on purpose:
 

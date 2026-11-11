@@ -2,11 +2,13 @@
 //! built from a real config: capability bit 19 confirmed beside bits 1
 //! and 17 on a server that keeps reactions, Send Reaction (710) on a
 //! lobby line and a room's, held to who may react, the caps and the rate,
-//! a moderator's clear, Reaction Changed (711) heard in one batch by the
+//! a moderator's clear, Send Reaction on an instant message, from a
+//! messenger session too, Reaction Changed (711) heard in one batch by the
 //! readers that negotiated the bit and crossing to the ng wire and back,
-//! a redaction and a purge, Get Reactions (712) and who reacted, a line's
-//! reactions on its 700 entry, Set Notifications (717) answered with no
-//! type, and a session without the bit sent what it always was.
+//! an instant message's told to its other party or kept for its next Get
+//! Roster, a redaction and a purge, Get Reactions (712) and who reacted,
+//! a line's reactions on its 700 entry, Set Notifications (717) answered
+//! with no type, and a session without the bit sent what it always was.
 //!
 //! Targets, keys and summaries are laid out by hand from the draft here
 //! rather than by the server's encoder, so a disagreement between the
@@ -16,6 +18,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hxd_session::caps::cap;
 use hxd_session::emoji::DATA_EMOJI_REFS;
@@ -26,12 +29,15 @@ use hxd_session::reactions::{
 };
 use hxd_session::structured::{DATA_CHAT_LINE, DATA_CHAT_REASON};
 use hxd_testclient::legacy::{push, Client, Frame, Login};
+use hxd_testclient::messaging as im;
 use hxd_testclient::ng;
 use hxproto::messages::{tag, ClientHdr};
 use serde_json::{json, Value};
 
 const UTF8: u32 = 1 << 1;
 const HISTORY: u32 = 1 << 4;
+const MESSAGING: u32 = 1 << 6;
+const MESSENGER: u32 = 1 << 8;
 const STRUCTURED: u32 = 1 << 17;
 const REACTIONS: u32 = 1 << 19;
 const EMOJI: u32 = 1 << 20;
@@ -53,7 +59,8 @@ const CLEAR: u16 = 3;
 const SUMMARY: u16 = 4;
 
 const MEMBER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = true\n\
-                      create_pchats = true\nuse_any_name = true\n";
+                      create_pchats = true\nuse_any_name = true\nsend_msgs = true\n\
+                      messaging = true\n";
 
 const LOUNGE: u32 = 4000;
 const STAFF: u32 = 4001;
@@ -80,6 +87,8 @@ struct Opts<'a> {
     reactions: Option<&'a str>,
     rooms: bool,
     structured: bool,
+    /// `[messaging]`, with the `[inbox]` it keeps instant messages in.
+    messaging: bool,
     spam_points: u32,
     extra: &'a str,
 }
@@ -90,6 +99,7 @@ impl Default for Opts<'_> {
             reactions: Some(""),
             rooms: true,
             structured: true,
+            messaging: false,
             spam_points: 0,
             extra: "",
         }
@@ -132,9 +142,13 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
     let reactions = o.reactions.map_or(String::new(), |r| {
         format!("[reactions]\nenabled = true\n{r}\n")
     });
+    let stores = if o.messaging {
+        format!("[inbox]\ndb = \"{d}/hx.db\"\n[history]\n[messaging]\nenabled = true\n")
+    } else {
+        format!("[history]\ndb = \"{d}/hx.db\"\n")
+    };
     let text = format!(
-        "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n\
-         [history]\ndb = \"{d}/hx.db\"\n\
+        "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n{stores}\
          [limits]\nspam_points = {}\nchat_lines = 0\nng_requests = 0\n\
          [rooms]\nenabled = {}\nfile = \"{d}/rooms.toml\"\nannounce = false\n\
          [structured_chat]\nenabled = {}\n{reactions}{}",
@@ -181,6 +195,14 @@ async fn start_with(dir: &Path, reactions: &str) -> Server {
 
 /// `who` logged in offering `caps`, and its login reply.
 async fn login(s: &Server, who: &str, caps: Option<u32>) -> (Client, Frame) {
+    let (mut c, reply) = logged_in(s, who, caps).await;
+    c.user_list().await.unwrap();
+    (c, reply)
+}
+
+/// [`login`] without the user list, which a messenger session may not
+/// ask for.
+async fn logged_in(s: &Server, who: &str, caps: Option<u32>) -> (Client, Frame) {
     let mut c = Client::connect(s.classic).await.unwrap();
     let password = if who == "guest" { "" } else { "pw" };
     let reply = c
@@ -190,7 +212,6 @@ async fn login(s: &Server, who: &str, caps: Option<u32>) -> (Client, Frame) {
         })
         .await
         .unwrap();
-    c.user_list().await.unwrap();
     (c, reply)
 }
 
@@ -266,10 +287,22 @@ fn key(emoji: &str) -> Vec<u8> {
 
 /// A 710's reply, refused or not.
 async fn send(c: &mut Client, target: &[u8], action: u16, key: Option<Vec<u8>>) -> Frame {
+    send_with(c, target, None, action, key).await
+}
+
+/// [`send`], naming an instant message's other party where `with` does.
+async fn send_with(
+    c: &mut Client,
+    target: &[u8],
+    with: Option<&str>,
+    action: u16,
+    key: Option<Vec<u8>>,
+) -> Frame {
     let mut fields = vec![
         (DATA_TARGET, target.to_vec()),
         (DATA_REACTION_ACTION, action.to_be_bytes().to_vec()),
     ];
+    fields.extend(with.map(|w| (tag::FRIEND_LOGIN, w.as_bytes().to_vec())));
     fields.extend(key.map(|k| (DATA_REACTION_KEY, k)));
     let trans = c.send(SEND, &fields).await.unwrap();
     c.reply(trans).await.unwrap()
@@ -351,8 +384,9 @@ fn confirmed(reply: &Frame) -> u32 {
 }
 
 /// Bit 19 only beside bits 1 and 17, on a server that keeps reactions,
-/// and the login fields with it alone: lines, and rooms where there are
-/// rooms, with the configured caps.
+/// and the login fields with it alone: lines, rooms where there are
+/// rooms, and instant messages beside bit 6, without which a session
+/// holds none to name, with the configured caps.
 #[tokio::test]
 async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactions() {
     let caps = "max_keys = 7\nmax_per_user = 3";
@@ -371,6 +405,11 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
     };
     let none = Opts {
         reactions: None,
+        ..Opts::default()
+    };
+    let messaging = Opts {
+        reactions: Some(caps),
+        messaging: true,
         ..Opts::default()
     };
     let fields = |targets: u8| {
@@ -402,6 +441,14 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
             vec![("with 1 and 17", ON, None)],
         ),
         ("no [reactions]", none, vec![("with 1 and 17", ON, None)]),
+        (
+            "messaging",
+            messaging,
+            vec![
+                ("with bit 6", ON | MESSAGING, fields(0x16)),
+                ("without it", ON, fields(0x12)),
+            ],
+        ),
     ] {
         let td = tempfile::tempdir().unwrap();
         let s = start(td.path(), opts).await;
@@ -617,7 +664,7 @@ async fn a_target_not_taken_is_invalid() {
         ("signed", [&[3][..], &[0; 80]].concat()),
         ("an unstored message", pm(0)),
         ("a stored message, on a server that takes none", pm(1)),
-        ("an instant message, to a session without bit 6", im),
+        ("an instant message, on a server without messaging", im),
         ("an unknown kind", target(9, 0, id)),
         ("short", lobby(id)[..12].to_vec()),
         ("long", [lobby(id), vec![0]].concat()),
@@ -1248,6 +1295,283 @@ async fn set_notifications_is_answered_with_no_type() {
     }
 }
 
+/// [`start`] with `[messaging]`.
+async fn start_messaging(dir: &Path) -> Server {
+    let o = Opts {
+        messaging: true,
+        ..Opts::default()
+    };
+    start(dir, o).await
+}
+
+/// A guid as the instant messaging extension lays one out.
+fn guid(n: u8) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    g[6] = 0x40;
+    g[8] = 0x80;
+    g[15] = n;
+    g
+}
+
+/// The instant message `sender` sent under `guid(n)`, as a target.
+fn im_target(sender: &str, n: u8) -> Vec<u8> {
+    let login = sender.as_bytes();
+    [&[2][..], &guid(n), &[login.len() as u8], login].concat()
+}
+
+/// `c` adds `emoji` on an instant message of its conversation with
+/// `with`, answered with no count.
+async fn react_im(c: &mut Client, target: &[u8], with: &str, emoji: &str) {
+    let reply = send_with(c, target, Some(with), ADD, Some(key(emoji))).await;
+    assert!(!reply.is_error(), "{:?}", reply.error_text());
+    assert!(reply.chunk(DATA_REACTION_COUNT).is_none(), "no count");
+}
+
+/// A change group as the draft lays it out.
+fn change_group(t: &[u8], action: u16, emoji: &str, from: &str) -> Group {
+    vec![
+        (DATA_TARGET, t.to_vec()),
+        (DATA_REACTION_ACTION, action.to_be_bytes().to_vec()),
+        (DATA_REACTION_KEY, key(emoji)),
+        (tag::FRIEND_LOGIN, from.as_bytes().to_vec()),
+    ]
+}
+
+/// `a` asks `b` to be friends, and `b` accepts.
+async fn befriend(a: &mut Client, a_login: &str, b: &mut Client, b_login: &str) {
+    let asked = a
+        .ask(
+            ClientHdr::AddFriend,
+            &im::add_friend(b_login.as_bytes(), None),
+        )
+        .await
+        .unwrap();
+    assert!(!asked.is_error(), "{:?}", asked.error_text());
+    let answered = b
+        .ask(
+            ClientHdr::FriendResponse,
+            &im::friend_response(a_login.as_bytes(), true),
+        )
+        .await
+        .unwrap();
+    assert!(!answered.is_error(), "{:?}", answered.error_text());
+}
+
+/// A reaction to an instant message is told to the conversation's other
+/// party as a change naming its reactor, and to nobody else; a stranger,
+/// a target naming neither party, one without the party named and a
+/// clear are refused.
+#[tokio::test]
+async fn an_instant_messages_reaction_is_told_to_its_other_party() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_messaging(td.path()).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let mut bob = classic(&s, "bob", ON | MESSAGING).await;
+    let mut erin = classic(&s, "erin", ON | MESSAGING).await;
+    befriend(&mut alice, "alice", &mut bob, "bob").await;
+    let sent = bob
+        .ask(ClientHdr::ImSend, &im::im_send(b"alice", &guid(1), b"hi"))
+        .await
+        .unwrap();
+    assert!(!sent.is_error(), "{:?}", sent.error_text());
+    let t = im_target("bob", 1);
+    react_im(&mut alice, &t, "bob", "👍").await;
+    let (f, g) = changed(&mut bob, &t).await;
+    assert_eq!(g, change_group(&t, ADD, "👍", "alice"));
+    assert_eq!(f.trans, 0, "a notification");
+    let removed = send_with(&mut alice, &t, Some("bob"), REMOVE, Some(key("👍"))).await;
+    assert!(!removed.is_error(), "{:?}", removed.error_text());
+    let (_, g) = changed(&mut bob, &t).await;
+    assert_eq!(g, change_group(&t, REMOVE, "👍", "alice"));
+
+    let theirs = im_target("erin", 2);
+    for (case, target, with, action, want) in [
+        ("a stranger's", &theirs, Some("erin"), ADD, NO_SUCH_TARGET),
+        ("naming neither", &theirs, Some("bob"), ADD, INVALID_TARGET),
+        (
+            "no party",
+            &im_target("alice", 3),
+            None,
+            ADD,
+            INVALID_TARGET,
+        ),
+        ("a clear", &t, Some("bob"), CLEAR, INVALID_TARGET),
+    ] {
+        let reply = send_with(&mut alice, target, with, action, Some(key("👍"))).await;
+        assert!(reply.is_error(), "{case}: not refused");
+        assert_eq!(reply.uint(DATA_CHAT_REASON), Some(want), "{case}");
+    }
+    let asked = get(&mut alice, std::slice::from_ref(&t), None).await;
+    assert_eq!(asked.uint(DATA_CHAT_REASON), Some(INVALID_TARGET), "712");
+    let mut unmessaging = classic(&s, "alice", ON).await;
+    let reply = send_with(&mut unmessaging, &t, Some("bob"), ADD, Some(key("👍"))).await;
+    assert_eq!(
+        reply.uint(DATA_CHAT_REASON),
+        Some(INVALID_TARGET),
+        "without bit 6"
+    );
+    let marker = lobby(say(&mut alice, 0, "marker").await);
+    react(&mut alice, &marker, "👋").await;
+    never_told(&mut erin, &t, &marker).await;
+}
+
+/// A reaction to an absent party's instant message waits for it: a Get
+/// Roster from a session of its account without bit 19 leaves it
+/// waiting, and one with the bit is told after Get Roster's reply, one
+/// 711 a conversation.
+#[tokio::test]
+async fn an_instant_messages_reaction_waits_for_get_roster() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_messaging(td.path()).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let mut carol = classic(&s, "carol", ON | MESSAGING).await;
+    let mut bob = classic(&s, "bob", ON | MESSAGING).await;
+    befriend(&mut alice, "alice", &mut bob, "bob").await;
+    befriend(&mut carol, "carol", &mut bob, "bob").await;
+    let gone = bob.uid.unwrap();
+    bob.shutdown().await.unwrap();
+    // Until bob's session is gone, a reaction would reach it.
+    let mut tries = 0;
+    while s.core.user(gone).is_some() {
+        tries += 1;
+        assert!(tries < 500, "bob's session never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (first, second) = (im_target("bob", 1), im_target("bob", 2));
+    react_im(&mut alice, &first, "bob", "👍").await;
+    react_im(&mut alice, &second, "bob", "🎉").await;
+    react_im(&mut carol, &first, "bob", "👀").await;
+
+    let mut plain = classic(&s, "bob", UTF8 | MESSAGING).await;
+    let roster = plain.ask(ClientHdr::GetRoster, &[]).await.unwrap();
+    assert!(!roster.is_error(), "{:?}", roster.error_text());
+
+    let mut bob = classic(&s, "bob", ON | MESSAGING).await;
+    let roster = bob.ask(ClientHdr::GetRoster, &[]).await.unwrap();
+    assert!(!roster.is_error(), "{:?}", roster.error_text());
+    assert!(
+        !bob.rx.take_backlog().iter().any(|f| f.ty == CHANGED),
+        "after the reply"
+    );
+    let (from_alice, _) = changed(&mut bob, &second).await;
+    assert_eq!(
+        groups(&from_alice),
+        [
+            change_group(&first, ADD, "👍", "alice"),
+            change_group(&second, ADD, "🎉", "alice"),
+        ]
+    );
+    let (from_carol, _) = changed(&mut bob, &first).await;
+    assert_eq!(
+        groups(&from_carol),
+        [change_group(&first, ADD, "👀", "carol")]
+    );
+}
+
+/// An instant message's reaction made on either wire is told on the
+/// other.
+#[tokio::test]
+async fn an_instant_messages_reaction_crosses_the_wires() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_messaging(td.path()).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let mut frank = ng::Client::connect(s.ng).await.unwrap();
+    frank
+        .login(json!({
+            "login": "frank", "password": "pw", "nick": "frank",
+            "reactions": true, "messaging": true,
+        }))
+        .await
+        .unwrap();
+    ok(&mut frank, "friends", json!({})).await;
+    let asked = alice
+        .ask(ClientHdr::AddFriend, &im::add_friend(b"frank", None))
+        .await
+        .unwrap();
+    assert!(!asked.is_error(), "{:?}", asked.error_text());
+    ok(
+        &mut frank,
+        "friend_respond",
+        json!({ "login": "alice", "accept": true }),
+    )
+    .await;
+
+    react_im(&mut alice, &im_target("frank", 1), "frank", "👍").await;
+    let target =
+        json!({ "im": { "login": "frank", "guid": "00000000-0000-4000-8000-000000000001" } });
+    let ev = frank
+        .event_where("reactions_changed", |d| d["changes"][0]["target"] == target)
+        .await
+        .unwrap();
+    assert_eq!(
+        ev.data["changes"][0],
+        json!({
+            "target": target, "action": "add",
+            "key": { "emoji": "👍" }, "from": { "login": "alice" },
+        })
+    );
+
+    let target =
+        json!({ "im": { "login": "alice", "guid": "00000000-0000-4000-8000-000000000002" } });
+    ok(
+        &mut frank,
+        "react",
+        json!({ "target": target, "with": "alice", "key": { "emoji": "🎉" } }),
+    )
+    .await;
+    let t = im_target("alice", 2);
+    let (_, g) = changed(&mut alice, &t).await;
+    assert_eq!(g, change_group(&t, ADD, "🎉", "frank"));
+}
+
+/// A messenger session (bit 8) reacts to instant messages and is told of
+/// them, but reacts to no line, clears none, even as a moderator, and
+/// reads none's reactions.
+#[tokio::test]
+async fn a_messenger_session_reacts_to_instant_messages_alone() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_messaging(td.path()).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let (mut carol, reply) = logged_in(&s, "carol", Some(ON | MESSAGING | MESSENGER)).await;
+    let both = REACTIONS | MESSENGER;
+    assert_eq!(confirmed(&reply) & both, both);
+    befriend(&mut alice, "alice", &mut carol, "carol").await;
+
+    let hers = im_target("alice", 1);
+    react_im(&mut carol, &hers, "alice", "👍").await;
+    let (_, g) = changed(&mut alice, &hers).await;
+    assert_eq!(g, change_group(&hers, ADD, "👍", "carol"));
+    let mine = im_target("carol", 2);
+    react_im(&mut alice, &mine, "carol", "🎉").await;
+    let (_, g) = changed(&mut carol, &mine).await;
+    assert_eq!(g, change_group(&mine, ADD, "🎉", "alice"));
+
+    let line = lobby(say(&mut alice, 0, "hi").await);
+    react(&mut alice, &line, "👋").await;
+    for (case, action, k) in [
+        ("a reaction", ADD, Some(key("👍"))),
+        ("a clear", CLEAR, None),
+    ] {
+        assert_eq!(
+            refused(&mut carol, &line, action, k).await,
+            NOT_ALLOWED,
+            "{case}"
+        );
+    }
+    for (ty, fields) in [
+        (GET, (DATA_TARGET, line)),
+        (SET_NOTIFICATIONS, (DATA_NOTIFY_TYPES, vec![0; 4])),
+    ] {
+        let trans = carol.send(ty, &[fields]).await.unwrap();
+        let reply = carol.reply(trans).await.unwrap();
+        assert_eq!(
+            reply.error_text().as_deref(),
+            Some("A messenger session may not do that."),
+            "{ty}"
+        );
+    }
+}
+
 /// What a client is sent, in order, as two runs of one script agree on
 /// it: each frame's type and fields, a history entry's timestamp zeroed.
 fn seen(frames: &[Frame]) -> Vec<(u32, Group)> {
@@ -1272,27 +1596,32 @@ fn seen(frames: &[Frame]) -> Vec<(u32, Group)> {
 }
 
 /// A period client and one with bit 17 alone, in the lobby and a room,
-/// while lines are reacted to, cleared and redacted around them: what
-/// each is sent, and what 700 pages to the second, on a server keeping
-/// reactions and on one without.
-async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
+/// and one with bit 6 alone in the lobby, while lines are reacted to,
+/// cleared and redacted around them and instant messages reacted to, one
+/// of the bit-6 client's among them: what each is sent, and what 700
+/// pages to the second, on a server keeping reactions and on one without.
+async fn bystanders(reactions: bool) -> Vec<Vec<(u32, Group)>> {
     let td = tempfile::tempdir().unwrap();
     let o = Opts {
         reactions: reactions.then_some(""),
+        messaging: true,
         ..Opts::default()
     };
     let s = start(td.path(), o).await;
-    let mut alice = classic(&s, "alice", ON).await;
-    let mut erin = classic(&s, "erin", ON).await;
+    let mut alice = classic(&s, "alice", ON | MESSAGING).await;
+    let mut erin = classic(&s, "erin", ON | MESSAGING).await;
     let mut carol = classic(&s, "carol", ON).await;
     let mut period = login(&s, "bob", None).await.0;
     let mut structured = classic(&s, "frank", UTF8 | HISTORY | STRUCTURED).await;
+    let mut messaging = classic(&s, "late", UTF8 | MESSAGING).await;
     let mut moderator = ng_client(&s, "carol").await;
+    befriend(&mut erin, "erin", &mut alice, "alice").await;
+    befriend(&mut erin, "erin", &mut messaging, "late").await;
     for c in [&mut alice, &mut erin, &mut period, &mut structured] {
         join(c, LOUNGE).await;
     }
     let start = say(&mut alice, 0, "start").await;
-    for c in [&mut period, &mut structured] {
+    for c in [&mut period, &mut structured, &mut messaging] {
         heard(c, "start").await;
         c.rx.take_backlog();
     }
@@ -1305,6 +1634,10 @@ async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
     send(&mut alice, &lobby(three), ADD, Some(key("👍"))).await;
     send(&mut alice, &lobby(one), ADD, Some(key("🎉"))).await;
     send(&mut carol, &lobby(one), CLEAR, None).await;
+    let (theirs, hers) = (im_target("late", 1), im_target("alice", 2));
+    let r = send_with(&mut erin, &theirs, Some("late"), ADD, Some(key("👍"))).await;
+    assert_eq!(r.is_error(), !reactions, "{:?}", r.error_text());
+    send_with(&mut erin, &hers, Some("alice"), ADD, Some(key("👍"))).await;
     ok(
         &mut moderator,
         "redact",
@@ -1314,10 +1647,11 @@ async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
     if reactions {
         changed(&mut erin, &lobby(one)).await;
         changed(&mut erin, &room(LOUNGE, two)).await;
+        changed(&mut alice, &hers).await;
     }
     say(&mut alice, 0, "end").await;
     let mut sent = Vec::new();
-    for c in [&mut period, &mut structured] {
+    for c in [&mut period, &mut structured, &mut messaging] {
         let end = heard(c, "end").await;
         let mut frames = c.rx.take_backlog();
         frames.push(end);
@@ -1328,16 +1662,15 @@ async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
         .await
         .unwrap();
     sent[1].extend(seen(&[page]));
-    let structured = sent.pop().unwrap();
-    (sent.pop().unwrap(), structured)
+    sent
 }
 
 /// A session without bit 19 is sent what it always was: no 711, no field
 /// of the family's reactions, and the same lines and history.
 #[tokio::test]
 async fn a_session_without_bit_19_is_sent_what_it_always_was() {
-    let (period, structured) = bystanders(true).await;
-    for (who, frames) in [("period", &period), ("bit 17", &structured)] {
+    let sent = bystanders(true).await;
+    for (who, frames) in ["period", "bit 17", "bit 6"].iter().zip(&sent) {
         for (ty, fields) in frames.iter() {
             assert_ne!(*ty, CHANGED, "{who}");
             for (t, _) in fields {
@@ -1345,7 +1678,7 @@ async fn a_session_without_bit_19_is_sent_what_it_always_was() {
             }
         }
     }
-    assert_eq!((period, structured), bystanders(false).await);
+    assert_eq!(sent, bystanders(false).await);
 }
 
 /// A reaction costs a session's spam points what a line does: past them,

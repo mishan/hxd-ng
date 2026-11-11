@@ -1,8 +1,9 @@
 //! Reactions on the classic wire (the Reactions draft): capability bit
-//! 19, Send Reaction (710) and Get Reactions (712) on the lines of the
-//! log, Reaction Changed (711) for every change the core tells a session
-//! that negotiated it, a line's reactions on its 700 entry, and Set
-//! Notifications (717) answered with no type.
+//! 19, Send Reaction (710) on the lines of the log and on instant
+//! messages, Get Reactions (712) on the lines, Reaction Changed (711) for
+//! every change the core tells a session that negotiated it, a line's
+//! reactions on its 700 entry, and Set Notifications (717) answered with
+//! no type.
 //!
 //! Only a session that negotiated bit 19, beside bits 1 and 17, is
 //! answered here or sent any of it; to every other these transactions do
@@ -14,7 +15,7 @@
 
 use std::time::Instant;
 
-use hxd_core::reply::{guid_bytes, guid_of};
+use hxd_core::reply::{guid_bytes, guid_of, ImTarget};
 use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reply};
 
 use crate::encoding::TextEncoding;
@@ -79,6 +80,7 @@ const STORED: u8 = 1;
 /// `DATA_REACTION_TARGETS`' bits: `1 << kind`, and bit 6 for stored
 /// private messages.
 pub const TARGETS_LINES: u16 = 1 << LINE;
+pub const TARGETS_IMS: u16 = 1 << IM;
 pub const TARGETS_EPHEMERAL: u16 = 1 << EPHEMERAL;
 pub const TARGETS_STORED_PMS: u16 = 1 << 6;
 
@@ -116,10 +118,12 @@ pub(crate) fn notify_types() -> (u16, Vec<u8>) {
 }
 
 /// The kinds of target this session may name, fixed at its login: lines
-/// always, and a room's, which this wire shows as a private chat, as
-/// kind 4 under its chat id where there are rooms.
-pub(crate) fn targets(rooms: bool) -> u16 {
-    TARGETS_LINES | if rooms { TARGETS_EPHEMERAL } else { 0 }
+/// always, a room's, which this wire shows as a private chat, as kind 4
+/// under its chat id where there are rooms, and instant messages where it
+/// negotiated bit 6, without which it holds none.
+pub(crate) fn targets(rooms: bool, ims: bool) -> u16 {
+    let bit = |on: bool, b: u16| if on { b } else { 0 };
+    TARGETS_LINES | bit(rooms, TARGETS_EPHEMERAL) | bit(ims, TARGETS_IMS)
 }
 
 /// The login reply's fields beside a confirmed bit 19.
@@ -265,6 +269,14 @@ pub(crate) enum Send {
     },
     /// Every reaction on a line taken by a moderator.
     Clear { room: u32, id: u64 },
+    /// One key added to, or taken from, an instant message in the
+    /// conversation with `with`.
+    Im {
+        target: ImTarget,
+        with: String,
+        key: ReactionKey,
+        add: bool,
+    },
     /// Kind 4 on chat 0, well formed, a clear or not, answered by the
     /// frontend once it has said who may react or clear.
     Unheld { clearing: bool },
@@ -296,26 +308,35 @@ pub(crate) fn malformed(m: Malformed) -> (&'static str, Option<u16>) {
 }
 
 /// 710's fields, from a session that may name `offered`, and with
-/// `emoji`, the server's emoji: the target first, then the action,
-/// then the key, which a clear does not take.
+/// `emoji`, the server's emoji: the target first, with an instant
+/// message's other party, then the action, then the key, which a clear,
+/// of a line alone, does not take.
 pub(crate) fn parse_send<'a>(
     fields: impl Iterator<Item = (u16, &'a [u8])> + Clone,
     offered: u16,
     emoji: bool,
+    enc: TextEncoding,
 ) -> Result<Send, Malformed> {
     let field = |tag| fields.clone().find(|(t, _)| *t == tag).map(|(_, d)| d);
     let target = field(DATA_TARGET)
         .and_then(|b| parse_target(b, offered))
         .ok_or(Malformed::Target)?;
-    let line = match target {
-        Target::Named(Reply::Line { room, id }) => Some((room, id)),
-        Target::Unheld => None,
+    let (line, im) = match target {
+        Target::Named(Reply::Line { room, id }) => (Some((room, id)), None),
+        Target::Unheld => (None, None),
+        Target::Named(Reply::Im(t)) => {
+            let with = field(DATA_FRIEND_LOGIN)
+                .filter(|l| !l.is_empty())
+                .ok_or(Malformed::Target)?;
+            (None, Some((t, enc.decode(with))))
+        }
         Target::Named(_) => return Err(Malformed::Target),
     };
     let action = field(DATA_REACTION_ACTION)
         .filter(|d| matches!(d.len(), 2 | 4))
         .map(|d| d.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)));
     let add = match action {
+        Some(3) if im.is_some() => return Err(Malformed::Target),
         Some(3) => {
             return Ok(match line {
                 Some((room, id)) => Send::Clear { room, id },
@@ -329,9 +350,15 @@ pub(crate) fn parse_send<'a>(
     let key = field(DATA_REACTION_KEY)
         .and_then(|k| parse_key(k, emoji))
         .ok_or(Malformed::Key)?;
-    Ok(match line {
-        Some((room, id)) => Send::Line { room, id, key, add },
-        None => Send::Unheld { clearing: false },
+    Ok(match (line, im) {
+        (Some((room, id)), _) => Send::Line { room, id, key, add },
+        (None, Some((target, with))) => Send::Im {
+            target,
+            with,
+            key,
+            add,
+        },
+        (None, None) => Send::Unheld { clearing: false },
     })
 }
 
@@ -540,7 +567,7 @@ mod tests {
 
     use hxd_core::emoji::EmojiId;
 
-    const ALL: u16 = TARGETS_LINES | 1 << IM | TARGETS_EPHEMERAL | TARGETS_STORED_PMS;
+    const ALL: u16 = TARGETS_LINES | TARGETS_IMS | TARGETS_EPHEMERAL | TARGETS_STORED_PMS;
 
     fn line_bytes(kind: u8, chat: u32, id: u64) -> Vec<u8> {
         [&[kind][..], &chat.to_be_bytes(), &id.to_be_bytes()].concat()
@@ -898,9 +925,15 @@ mod tests {
     }
 
     #[test]
-    fn the_targets_offered_follow_the_rooms() {
-        assert_eq!(targets(false), 0x0002);
-        assert_eq!(targets(true), 0x0012);
+    fn the_targets_offered_follow_the_rooms_and_bit_6() {
+        for (rooms, ims, want) in [
+            (false, false, 0x0002),
+            (true, false, 0x0012),
+            (false, true, 0x0006),
+            (true, true, 0x0016),
+        ] {
+            assert_eq!(targets(rooms, ims), want, "rooms {rooms}, bit 6 {ims}");
+        }
     }
 
     #[test]
@@ -985,10 +1018,57 @@ mod tests {
                 Err(Malformed::Target),
             ),
             (
-                "a target this wire does not act on yet",
+                "an instant message, its party named",
                 vec![
                     (DATA_TARGET, im_bytes(b"bob", 3)),
+                    (DATA_FRIEND_LOGIN, b"alice".to_vec()),
+                    (DATA_REACTION_ACTION, act(2)),
+                    (DATA_REACTION_KEY, key.clone()),
+                ],
+                Ok(Send::Im {
+                    target: match Reply::im("bob".into(), guid()) {
+                        Some(Reply::Im(t)) => t,
+                        other => panic!("{other:?}"),
+                    },
+                    with: "alice".into(),
+                    key: thumbs(),
+                    add: false,
+                }),
+            ),
+            (
+                "an instant message, its party not named",
+                vec![
+                    (DATA_TARGET, im_bytes(b"bob", 3)),
+                    (DATA_REACTION_ACTION, act(1)),
+                    (DATA_REACTION_KEY, key.clone()),
+                ],
+                Err(Malformed::Target),
+            ),
+            (
+                "an instant message, its party empty",
+                vec![
+                    (DATA_TARGET, im_bytes(b"bob", 3)),
+                    (DATA_FRIEND_LOGIN, vec![]),
+                    (DATA_REACTION_ACTION, act(1)),
+                    (DATA_REACTION_KEY, key.clone()),
+                ],
+                Err(Malformed::Target),
+            ),
+            (
+                "a clear on an instant message",
+                vec![
+                    (DATA_TARGET, im_bytes(b"bob", 3)),
+                    (DATA_FRIEND_LOGIN, b"alice".to_vec()),
                     (DATA_REACTION_ACTION, act(3)),
+                ],
+                Err(Malformed::Target),
+            ),
+            (
+                "a stored message",
+                vec![
+                    (DATA_TARGET, [&[PM, STORED][..], &[3; 16]].concat()),
+                    (DATA_REACTION_ACTION, act(1)),
+                    (DATA_REACTION_KEY, key.clone()),
                 ],
                 Err(Malformed::Target),
             ),
@@ -1043,7 +1123,11 @@ mod tests {
             ),
         ] {
             let it = fields.iter().map(|(t, d)| (*t, d.as_slice()));
-            assert_eq!(parse_send(it, ALL, false), want, "{case}");
+            assert_eq!(
+                parse_send(it, ALL, false, TextEncoding::Utf8),
+                want,
+                "{case}"
+            );
         }
     }
 
