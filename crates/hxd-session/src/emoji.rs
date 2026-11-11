@@ -38,9 +38,8 @@ pub const DATA_MAX_EMOJI_DIMENSION: u16 = 0x0f42;
 /// 106 carries them beside the entry.
 pub const EMOJI_REFS: u16 = 0x0022;
 
-/// The draft's reason codes, in Structured Chat's `DATA_CHAT_REASON`.
-pub const NOT_ALLOWED: u16 = 2;
-pub const RATE_LIMITED: u16 = 6;
+/// The draft's reason code, in Structured Chat's `DATA_CHAT_REASON`
+/// beside the family's ([`crate::structured`]).
 pub const NO_SUCH_EMOJI: u16 = 7;
 
 /// Get Emoji's allowance: enough that a client opening a busy chat

@@ -432,6 +432,17 @@ pub fn rate_limited(wire: &'static str, reason: &'static str) {
     let _ = (wire, reason);
 }
 
+/// A line's reaction summary not sent to a session on `wire`, past what
+/// it may be sent of them at once: the line is left to be read again.
+pub fn reaction_summary_skipped(wire: &'static str) {
+    #[cfg(feature = "metrics")]
+    handle!(counter("hxd_reaction_summaries_skipped_total", "wire" => wire), |h| {
+        h.increment(1)
+    });
+    #[cfg(not(feature = "metrics"))]
+    let _ = wire;
+}
+
 /// A login refused because the server was already working on as many as
 /// it takes (`Core::admit_login`).
 pub fn login_refused_busy() {
