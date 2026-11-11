@@ -335,7 +335,7 @@ image already stored stays as it was made.
 | E3 | Server emoji as reaction keys (§5) | yes |
 | E4 | References in the domain (§6), and the classic wire (§7) | yes |
 | E5 | The ng wire (§8) | yes |
-| E6, E7 | hx-ng, and the out-of-process suite | no |
+| E6, E7 | hx-ng, and the out-of-process suite | yes |
 
 Managing the catalog from either wire, rather than from `hxd emoji`
 alone, comes after.
