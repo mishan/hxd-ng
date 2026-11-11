@@ -1141,7 +1141,10 @@ pub enum ReactError {
     /// A line that does not exist, is a tombstone, is another room's,
     /// cannot be read, or has not been relayed yet: all one answer.
     NoSuchTarget,
-    TooManyReactions,
+    /// A new key on a line that carries as many as it may.
+    TooManyKeys,
+    /// A key past those one account may hold on a line.
+    TooManyOfYours,
     /// A server emoji added that no live entry has: one never added,
     /// one removed, or any on a server without a catalog.
     NoSuchEmoji,
@@ -1237,7 +1240,8 @@ impl Core {
         match self.desk_react(act) {
             Ok(Reacted::Count(n) | Reacted::Held(n)) => Ok(n),
             Ok(Reacted::NoSuchLine) => Err(ReactError::NoSuchTarget),
-            Ok(Reacted::TooManyKeys | Reacted::TooManyOfYours) => Err(ReactError::TooManyReactions),
+            Ok(Reacted::TooManyKeys) => Err(ReactError::TooManyKeys),
+            Ok(Reacted::TooManyOfYours) => Err(ReactError::TooManyOfYours),
             Err(e) => {
                 tracing::warn!("chat log would not take a reaction: {e}");
                 Err(ReactError::ServerError)
@@ -2662,6 +2666,36 @@ mod tests {
             Err(ReactError::RateLimited(wait)) if wait <= Duration::from_secs(1)
         ));
         assert_eq!(core.react(bob, 0, said, &thumbs(), true), Ok(2));
+    }
+
+    /// A line full of keys and an account full on a line are refused
+    /// apart, since the classic wire gives each a code of its own.
+    #[test]
+    fn a_reaction_past_a_cap_says_which_cap() {
+        use bit::{READ_CHAT, SEND_CHAT};
+        let (core, _log) = server(ReactionPolicy {
+            max_keys: 3,
+            max_per_user: 2,
+            ..ReactionPolicy::default()
+        });
+        let chatter = bits(&[READ_CHAT, SEND_CHAT]);
+        let alice = person(&core, "alice", chatter, true);
+        let bob = person(&core, "bob", chatter, true);
+        let carol = person(&core, "carol", chatter, true);
+        let said = core
+            .chat_public(alice, "hi".into(), 0, None)
+            .unwrap()
+            .unwrap();
+        let key = |e: &str| ReactionKey::emoji(e).unwrap();
+        for (uid, e, want) in [
+            (alice, "👍", Ok(1)),
+            (alice, "🎉", Ok(1)),
+            (alice, "🔥", Err(ReactError::TooManyOfYours)),
+            (bob, "🔥", Ok(1)),
+            (carol, "😀", Err(ReactError::TooManyKeys)),
+        ] {
+            assert_eq!(core.react(uid, 0, said, &key(e), true), want, "{e}");
+        }
     }
 
     #[test]

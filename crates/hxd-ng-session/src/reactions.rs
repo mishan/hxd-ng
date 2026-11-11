@@ -247,7 +247,7 @@ pub(crate) async fn react(ctx: &NgCtx, state: &SessState, id: u64, params: &Valu
             reply_err(id, "no_such_target", "No such line or message.")
         }
         Some(Err(ReactError::NoSuchEmoji)) => reply_err(id, "no_such_emoji", "No such emoji."),
-        Some(Err(ReactError::TooManyReactions)) => reply_err(
+        Some(Err(ReactError::TooManyKeys | ReactError::TooManyOfYours)) => reply_err(
             id,
             "too_many_reactions",
             "That line has as many reactions as it may.",
