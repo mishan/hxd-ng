@@ -4,8 +4,9 @@
 //! lobby line and a room's, held to who may react, the caps and the rate,
 //! a moderator's clear, Reaction Changed (711) heard in one batch by the
 //! readers that negotiated the bit and crossing to the ng wire and back,
-//! a redaction and a purge, and a session without the bit sent what it
-//! always was.
+//! a redaction and a purge, Get Reactions (712) and who reacted, a line's
+//! reactions on its 700 entry, Set Notifications (717) answered with no
+//! type, and a session without the bit sent what it always was.
 //!
 //! Targets, keys and summaries are laid out by hand from the draft here
 //! rather than by the server's encoder, so a disagreement between the
@@ -17,10 +18,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hxd_session::caps::cap;
+use hxd_session::emoji::DATA_EMOJI_REFS;
 use hxd_session::reactions::{
-    CHANGED, CLEAR_REASON, DATA_MAX_REACTIONS_PER_USER, DATA_MAX_REACTION_KEYS,
+    CHANGED, CLEAR_REASON, DATA_MAX_REACTIONS_PER_USER, DATA_MAX_REACTION_KEYS, DATA_NOTIFY_TYPES,
     DATA_REACTION_ACTION, DATA_REACTION_COUNT, DATA_REACTION_KEY, DATA_REACTION_MINE,
-    DATA_REACTION_SUMMARY, DATA_REACTION_TARGETS, DATA_TARGET, SEND,
+    DATA_REACTION_SUMMARY, DATA_REACTION_TARGETS, DATA_TARGET, GET, SEND, SET_NOTIFICATIONS,
 };
 use hxd_session::structured::{DATA_CHAT_LINE, DATA_CHAT_REASON};
 use hxd_testclient::legacy::{push, Client, Frame, Login};
@@ -43,6 +45,7 @@ const TOO_MANY_OF_YOURS: u32 = 5;
 const RATE_LIMITED: u32 = 6;
 const NO_SUCH_EMOJI: u32 = 7;
 const INVALID_TARGET: u32 = 12;
+const TOO_MANY_TARGETS: u32 = 13;
 
 const ADD: u16 = 1;
 const REMOVE: u16 = 2;
@@ -947,6 +950,304 @@ async fn a_redaction_tells_classic_nothing_and_a_purge_is_told_as_summaries() {
     }
 }
 
+/// A 712's reply, refused or not, for `targets` and, with one, `key`.
+async fn get(c: &mut Client, targets: &[Vec<u8>], key: Option<Vec<u8>>) -> Frame {
+    let mut fields: Vec<_> = targets.iter().map(|t| (DATA_TARGET, t.clone())).collect();
+    fields.extend(key.map(|k| (DATA_REACTION_KEY, k)));
+    let trans = c.send(GET, &fields).await.unwrap();
+    c.reply(trans).await.unwrap()
+}
+
+/// A 712's groups, refused if it was.
+async fn got(c: &mut Client, targets: &[Vec<u8>], key: Option<Vec<u8>>) -> Vec<Group> {
+    let reply = get(c, targets, key).await;
+    assert!(!reply.is_error(), "{:?}", reply.error_text());
+    groups(&reply)
+}
+
+/// A 712 answer's group: a summary group without the action.
+fn answer_group(t: &[u8], keys: &[(&str, u32)], mine: &[u8]) -> Group {
+    let mut g = summary_group(t, keys, mine);
+    g.remove(1);
+    g
+}
+
+/// Each line asked about that this session could have read is answered
+/// in the order asked, as often as it is named; a tombstone, a line it
+/// cannot read, one never said and one nobody keeps are left out alike.
+/// With a key, who holds it, newest first, by the nick each reacted
+/// under and never by login. More targets than a request takes, or a key
+/// beside more than one, are refused.
+#[tokio::test]
+async fn get_reactions_answers_what_could_have_been_read_in_the_order_asked() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let mut bob = Client::connect(s.classic).await.unwrap();
+    bob.login(&Login {
+        caps: Some(ON),
+        ..Login::account("Bobby", "bob", "pw")
+    })
+    .await
+    .unwrap();
+    let mut erin = classic(&s, "erin", ON).await;
+    let mut carol = classic(&s, "carol", ON).await;
+    let mut moderator = ng_client(&s, "carol").await;
+    join(&mut carol, STAFF).await;
+    let staff = room(STAFF, say(&mut carol, STAFF, "staff only").await);
+    let one = lobby(say(&mut alice, 0, "one").await);
+    let two = lobby(say(&mut alice, 0, "two").await);
+    let gone = say(&mut alice, 0, "gone").await;
+    ok(
+        &mut moderator,
+        "redact",
+        json!({ "id": gone, "reason": "no" }),
+    )
+    .await;
+    react(&mut bob, &one, "👍").await;
+    bob.send(
+        ClientHdr::UserChange.as_u32(),
+        &[(tag::NAME, b"Robert".to_vec())],
+    )
+    .await
+    .unwrap();
+    // Answered once the rename has been made.
+    got(&mut bob, std::slice::from_ref(&two), None).await;
+    react(&mut alice, &one, "🎉").await;
+    react(&mut erin, &one, "👍").await;
+
+    let never = lobby(u64::from_be_bytes(two[5..].try_into().unwrap()) + 1000);
+    let asked = [
+        two.clone(),
+        lobby(gone),
+        one.clone(),
+        staff,
+        never,
+        room(0, 1),
+        one.clone(),
+    ];
+    let mine = answer_group(&one, &[("👍", 2), ("🎉", 1)], &[1]);
+    assert_eq!(
+        got(&mut alice, &asked, None).await,
+        [answer_group(&two, &[], &[]), mine.clone(), mine.clone()]
+    );
+    let name = |n: &str| (tag::NAME, n.as_bytes().to_vec());
+    let mut who = mine;
+    who.extend([name("erin"), name("Bobby")]);
+    assert_eq!(
+        got(&mut alice, std::slice::from_ref(&one), Some(key("👍"))).await,
+        [who]
+    );
+
+    let reason = |f: Frame| {
+        assert!(f.is_error());
+        f.uint(DATA_CHAT_REASON)
+    };
+    let im = [&[2][..], &[7; 16], &[3], b"bob"].concat();
+    for (case, targets, k, want) in [
+        ("fifty", vec![one.clone(); 50], None, None),
+        (
+            "fifty-one",
+            vec![one.clone(); 51],
+            None,
+            Some(TOO_MANY_TARGETS),
+        ),
+        (
+            "a key beside two",
+            vec![one.clone(); 2],
+            Some(key("👍")),
+            Some(TOO_MANY_TARGETS),
+        ),
+        ("none", vec![], None, Some(INVALID_TARGET)),
+        (
+            "an instant message",
+            vec![one.clone(), im],
+            None,
+            Some(INVALID_TARGET),
+        ),
+        (
+            "a bad key",
+            vec![one.clone()],
+            Some(key("ok")),
+            Some(INVALID_KEY),
+        ),
+    ] {
+        let reply = get(&mut alice, &targets, k).await;
+        match want {
+            None => assert_eq!(groups(&reply).len(), targets.len(), "{case}"),
+            Some(code) => assert_eq!(reason(reply), Some(code), "{case}"),
+        }
+    }
+}
+
+/// A line said before a session without history's permission logged in
+/// is one it could not have read, and is left out; one it heard is
+/// answered.
+#[tokio::test]
+async fn get_reactions_leaves_out_a_line_said_before_without_history() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let before = lobby(say(&mut alice, 0, "before").await);
+    let mut late = classic(&s, "late", ON).await;
+    let after = lobby(say(&mut alice, 0, "after").await);
+    heard(&mut late, "after").await;
+    assert_eq!(
+        got(&mut late, &[before, after.clone()], None).await,
+        [answer_group(&after, &[], &[])]
+    );
+}
+
+/// A 712 costs a point more for each ten targets it names: past a
+/// session's spam points, it is kicked.
+#[tokio::test]
+async fn get_reactions_costs_more_the_more_targets_it_names() {
+    let td = tempfile::tempdir().unwrap();
+    // The user list at login is 20 of them, leaving 9.
+    let o = Opts {
+        spam_points: 29,
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let mut bob = classic(&s, "bob", ON).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let t = lobby(say(&mut bob, 0, "hi").await);
+    got(&mut alice, &vec![t.clone(); 50], None).await;
+    got(&mut alice, std::slice::from_ref(&t), None).await;
+    let trans = alice.send(GET, &[(DATA_TARGET, t)]).await.unwrap();
+    assert!(alice.reply(trans).await.is_err(), "kicked, not answered");
+}
+
+/// A 700 entry's sub-fields, past its text.
+fn subfields(entry: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let be16 = |at: usize| usize::from(u16::from_be_bytes([entry[at], entry[at + 1]]));
+    let msg_at = 22 + be16(20);
+    let mut at = msg_at + 2 + be16(msg_at);
+    let mut out = Vec::new();
+    while at < entry.len() {
+        let (ty, len) = (be16(at) as u16, be16(at + 2));
+        out.push((ty, entry[at + 4..at + 4 + len].to_vec()));
+        at += 4 + len;
+    }
+    out
+}
+
+/// The sub-fields of line `id`'s entry as `c` pages the lobby.
+async fn paged(c: &mut Client, id: u64) -> Vec<(u16, Vec<u8>)> {
+    let page = c
+        .call(700, &[(tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec())])
+        .await
+        .unwrap();
+    let entry = page
+        .all(tag::HISTORY_ENTRY)
+        .into_iter()
+        .find(|e| u64::from_be_bytes(e[..8].try_into().unwrap()) == id)
+        .expect("the line's entry");
+    subfields(&entry)
+}
+
+/// A reader with bit 19 is paged a line's reactions as sub-fields of its
+/// entry, the shared summary and its own keys, in type order beside the
+/// emoji refs; a reader whose account holds none is sent no `MINE`.
+#[tokio::test]
+async fn history_carries_a_lines_reactions_to_a_reader_with_bit_19() {
+    let td = tempfile::tempdir().unwrap();
+    let o = Opts {
+        extra: &format!(
+            "[inbox]\ndb = \"{}/hx.db\"\n[emoji]\nenabled = true\n",
+            td.path().display()
+        ),
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let png = s.dir.join("party.png");
+    image::RgbaImage::from_pixel(32, 32, image::Rgba([1, 2, 3, 0xff]))
+        .save(&png)
+        .unwrap();
+    let args = ["add".to_string(), "party".into(), png.display().to_string()];
+    hxd::emoji::command(&s.config, &args).unwrap();
+    s.core.emoji_reload().unwrap();
+    let party = s.core.emoji_list(None, None, 10).unwrap().entries[0].id.0;
+    let mut alice = classic(&s, "alice", ON | EMOJI).await;
+    let mut bob = classic(&s, "bob", ON | EMOJI).await;
+    let refs = [&[0, 1][..], &party.to_be_bytes(), &[5], b"party"].concat();
+    alice
+        .send(
+            ClientHdr::Chat.as_u32(),
+            &[
+                (tag::BODY, b":party: hi".to_vec()),
+                (DATA_EMOJI_REFS, refs.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    let echo = heard(&mut alice, ":party: hi").await;
+    let id = u64::from_be_bytes(echo.bytes(DATA_CHAT_LINE).unwrap()[..8].try_into().unwrap());
+    let plain = say(&mut alice, 0, "plain").await;
+    react(&mut alice, &lobby(id), "👍").await;
+    react(&mut bob, &lobby(id), "🎉").await;
+    let shared = answer_group(&lobby(id), &[("👍", 1), ("🎉", 1)], &[]);
+    let summary = (0x0021, shared[1].1.clone());
+    assert_eq!(
+        paged(&mut alice, id).await,
+        [
+            summary.clone(),
+            (0x0022, refs.clone()),
+            (0x0023, vec![1, 0])
+        ]
+    );
+    let mut erin = classic(&s, "erin", ON | EMOJI).await;
+    assert_eq!(
+        paged(&mut erin, id).await,
+        [summary, (0x0022, refs)],
+        "no MINE for a reader holding none"
+    );
+    assert_eq!(paged(&mut erin, plain).await, [], "a line with none");
+}
+
+/// Set Notifications (717), and a login that asks for types, is answered
+/// with none to a session with bit 19, since nothing here sends one; to
+/// a session without it, 717 and 712 are no transactions and the login
+/// is answered as before.
+#[tokio::test]
+async fn set_notifications_is_answered_with_no_type() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    let asks = (DATA_NOTIFY_TYPES, 3u32.to_be_bytes().to_vec());
+    for (case, caps, asking, want) in [
+        ("bit 19", ON, true, Some(0)),
+        ("bit 19, not asking", ON, false, None),
+        ("bit 17 alone", UTF8 | HISTORY | STRUCTURED, true, None),
+    ] {
+        let mut c = Client::connect(s.classic).await.unwrap();
+        let mut fields = Login {
+            caps: Some(caps),
+            ..Login::account("alice", "alice", "pw")
+        }
+        .chunks();
+        fields.extend(asking.then(|| asks.clone()));
+        let reply = c.call(ClientHdr::Login.as_u32(), &fields).await.unwrap();
+        assert_eq!(reply.uint(DATA_NOTIFY_TYPES), want, "{case}: login");
+    }
+    let mut alice = classic(&s, "alice", ON).await;
+    let reply = alice
+        .call(SET_NOTIFICATIONS, std::slice::from_ref(&asks))
+        .await
+        .unwrap();
+    assert_eq!(reply.uint(DATA_NOTIFY_TYPES), Some(0));
+    let mut frank = classic(&s, "frank", UTF8 | HISTORY | STRUCTURED).await;
+    let t = lobby(say(&mut alice, 0, "hi").await);
+    for (ty, fields) in [(SET_NOTIFICATIONS, asks), (GET, (DATA_TARGET, t))] {
+        let trans = frank.send(ty, &[fields]).await.unwrap();
+        let reply = frank.reply(trans).await.unwrap();
+        assert_eq!(
+            reply.error_text().as_deref(),
+            Some("Not implemented."),
+            "{ty}"
+        );
+    }
+}
+
 /// What a client is sent, in order, as two runs of one script agree on
 /// it: each frame's type and fields, a history entry's timestamp zeroed.
 fn seen(frames: &[Frame]) -> Vec<(u32, Group)> {
@@ -990,7 +1291,7 @@ async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
     for c in [&mut alice, &mut erin, &mut period, &mut structured] {
         join(c, LOUNGE).await;
     }
-    say(&mut alice, 0, "start").await;
+    let start = say(&mut alice, 0, "start").await;
     for c in [&mut period, &mut structured] {
         heard(c, "start").await;
         c.rx.take_backlog();
@@ -998,6 +1299,7 @@ async fn bystanders(reactions: bool) -> (Vec<(u32, Group)>, Vec<(u32, Group)>) {
     let one = say(&mut alice, 0, "one").await;
     let two = say(&mut alice, LOUNGE, "two").await;
     let three = say(&mut alice, 0, "three").await;
+    send(&mut erin, &lobby(start), ADD, Some(key("👍"))).await;
     send(&mut erin, &lobby(one), ADD, Some(key("👍"))).await;
     send(&mut erin, &room(LOUNGE, two), ADD, Some(key("🎉"))).await;
     send(&mut alice, &lobby(three), ADD, Some(key("👍"))).await;

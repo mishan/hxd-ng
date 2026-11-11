@@ -235,7 +235,8 @@ impl Login {
         }
     }
 
-    pub(crate) fn chunks(&self) -> Vec<(u16, Vec<u8>)> {
+    /// The login's fields, which a test may add one of its own to.
+    pub fn chunks(&self) -> Vec<(u16, Vec<u8>)> {
         let mut c = vec![
             (tag::NAME, self.nick.as_bytes().to_vec()),
             (tag::ICON, self.icon.to_be_bytes().to_vec()),

@@ -890,8 +890,9 @@ family document. Each family of §4 adds its own.
     account holds; each is left off when empty, and a tombstone has
     neither. A redaction takes a line's reactions with its words,
     retention takes them with the line, and a purge of a person takes
-    those they made within its window (moderation.md §3.3). Nothing
-    changes on the classic wire, and nothing crosses a server link.
+    those they made within its window (moderation.md §3.3). The classic
+    wire's binding, capability bit 19, is reactions.md's, and nothing
+    crosses a server link.
   - **`reactions`** reads again the reactions on 1 to 50 `line` and
     `pm` targets: a line older than the live window, every line shown
     after a `resync_required`, or a stored message. Each line this
