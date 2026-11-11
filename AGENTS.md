@@ -664,7 +664,8 @@ Three layers, all `cargo test --workspace`:
   sealed messages to a ghost, its certificate through Link Device Keys,
   and pasted evidence of a ghost's line; and a line or message with
   emoji refs, between two servers serving one catalog, crossing as its
-  text alone),
+  text alone; and a classic reaction on a ghost's line counted on its
+  server alone),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: Blowfish carrying both
   ways, an ng client seeing the session encrypted and a guest's not, the
@@ -684,8 +685,11 @@ Three layers, all `cargo test --workspace`:
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the
-  ng one resumes into a resync; and clients each inside their own
-  bounds dropped once together they pass the server's budget) and
+  ng one resumes into a resync; clients each inside their own
+  bounds dropped once together they pass the server's budget; and a
+  classic reader with bit 19 kept through a purge whose one batch of
+  reactions owes it more than its writer holds, reading the rest with
+  712) and
   `metrics.rs` (`GET
   /metrics` from a config's `[metrics]`:
   a scrape that accounts for a client on each wire and for their
@@ -712,7 +716,8 @@ Three layers, all `cargo test --workspace`:
   container.
 - **Fuzzing**, in `fuzz/`, a workspace of its own on nightly: `frame`
   (the classic framer and the field decoders) and `session` (a whole
-  classic connection, hello to dispatch). `cargo run --example seeds`
+  classic connection, hello to dispatch, against a core keeping a log
+  and its reactions). `cargo run --example seeds`
   there writes a corpus of real frames, then `cargo +nightly fuzz run
   <target>`.
 - **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.

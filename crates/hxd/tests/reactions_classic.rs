@@ -24,6 +24,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 
+use hxd_session::caps::cap;
 use hxd_session::emoji::DATA_EMOJI_REFS;
 use hxd_session::reactions::{
     CHANGED, CLEAR_REASON, DATA_MAX_REACTIONS_PER_USER, DATA_MAX_REACTION_KEYS, DATA_NOTIFY_TYPES,
@@ -96,6 +97,9 @@ struct Opts<'a> {
     inbox: Option<&'a str>,
     spam_points: u32,
     extra: &'a str,
+    /// Bit 19 offered whatever the config says, so that only the login's
+    /// check of the core keeps it from being confirmed.
+    force_19: bool,
 }
 
 impl Default for Opts<'_> {
@@ -108,6 +112,7 @@ impl Default for Opts<'_> {
             inbox: None,
             spam_points: 0,
             extra: "",
+            force_19: false,
         }
     }
 }
@@ -167,7 +172,11 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
     std::fs::write(&path, &text).unwrap();
     let config = hxd::Config::load(&path).unwrap();
     hxd::check_config(&config).unwrap();
-    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let mut ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    if o.force_19 {
+        let caps = ctx.cfg.caps.with(cap::REACTIONS);
+        Arc::make_mut(&mut ctx.cfg).caps = caps;
+    }
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
@@ -415,6 +424,11 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
         reactions: None,
         ..Opts::default()
     };
+    let forced = Opts {
+        reactions: None,
+        force_19: true,
+        ..Opts::default()
+    };
     let messaging = Opts {
         reactions: Some(caps),
         messaging: true,
@@ -454,6 +468,11 @@ async fn bit_19_is_confirmed_beside_bits_1_and_17_on_a_server_that_keeps_reactio
             vec![("with 1 and 17", ON, None)],
         ),
         ("no [reactions]", none, vec![("with 1 and 17", ON, None)]),
+        (
+            "no [reactions], bit 19 offered",
+            forced,
+            vec![("with 1 and 17", ON, None)],
+        ),
         (
             "messaging",
             messaging,

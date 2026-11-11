@@ -8,9 +8,15 @@
 //! reader heard every line, in order, and that the server hung up on the
 //! one that did not read — instead of holding everything addressed to it
 //! for as long as its socket stayed open, which it did before.
+//!
+//! And one that does read is not dropped for what one batch of reactions
+//! owes it at once, past those bounds: what it is not sent, it reads with
+//! Get Reactions (712).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -36,14 +42,16 @@ const LINE: usize = 4000;
 struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
+    core: Arc<hxd_core::Core>,
 }
 
 async fn start(dir: &Path) -> Server {
     start_with(dir, "").await
 }
 
-/// With `server` lines for the config's `[server]` section. The talker
-/// floods on purpose, so the flood and request limits are off.
+/// With `server` lines for the config's `[server]` section, and any
+/// sections after it. The talker floods on purpose, so the flood and
+/// request limits are off.
 async fn start_with(dir: &Path, server: &str) -> Server {
     let d = dir.display();
     let text = format!(
@@ -68,7 +76,11 @@ async fn start_with(dir: &Path, server: &str) -> Server {
     let server = Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
+        core: ctx.core.clone(),
     };
+    if ctx.core.reaction_policy().is_some() {
+        tokio::spawn(hxd::reactions_flusher(ctx.core.clone()));
+    }
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
     server
@@ -448,4 +460,200 @@ async fn budget_case() {
         assert!(lines < n, "stalled{i} heard {lines} of {n} lines");
     }
     drop(talking);
+}
+
+/// A reader with bit 19 that keeps up is kept through a purge whose one
+/// batch owes it summaries well past its writer's bound, and reads with
+/// 712 the lines it was not sent them for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_reader_keeping_up_through_a_purge_is_kept_and_reads_the_rest_with_712() {
+    use hxd_session::reactions::{CHANGED, DATA_REACTION_SUMMARY, DATA_TARGET, GET};
+    use hxd_session::structured::DATA_CHAT_LINE;
+    use hxd_testclient::legacy::{push, Client, Frame, Login};
+
+    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 19;
+    // Each line at the most keys a line takes, each as long as a key may
+    // be: some 17 KB of summary a line, and the lines together past
+    // `MAX_SEND_QUEUE`.
+    const LINES: usize = 300;
+    const KEYS: usize = 255;
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let server = start_with(
+        td.path(),
+        &format!(
+            "[history]\ndb = \"{d}/hx.db\"\n[structured_chat]\nenabled = true\n\
+             [reactions]\nenabled = true\nmax_keys = {KEYS}\nmax_per_user = {KEYS}\n\
+             burst = 1000000\nper_second = 1000000\nlive_window = 500\n"
+        ),
+    )
+    .await;
+    for (login, extra) in [
+        ("alice", ""),
+        ("bob", ""),
+        ("erin", ""),
+        ("carol", "disconnect_users = true\n"),
+    ] {
+        std::fs::write(
+            td.path().join(format!("accounts/{login}.toml")),
+            format!(
+                "name = \"{login}\"\npassword = \"pw\"\n[access]\nread_chat = true\n\
+                 send_chat = true\nread_chat_history = true\n{extra}"
+            ),
+        )
+        .unwrap();
+    }
+    let login = |who: &str, caps| Login {
+        caps: Some(caps),
+        ..Login::account(who, who, "pw")
+    };
+    let (mut tx, mut rx) = Client::login_at(server.legacy, &login("erin", ON))
+        .await
+        .unwrap()
+        .split();
+    // Read as fast as the socket is written to, whatever the test is
+    // doing meanwhile.
+    let (frames, mut heard) = tokio::sync::mpsc::unbounded_channel::<Frame>();
+    tokio::spawn(async move {
+        while let Ok(f) = rx.recv_forever().await {
+            if frames.send(f).is_err() {
+                break;
+            }
+        }
+    });
+    let mut alice = Client::login_at(server.legacy, &login("alice", 1 << 1 | 1 << 17))
+        .await
+        .unwrap();
+    let bob = Client::login_at(server.legacy, &login("bob", 1 << 1))
+        .await
+        .unwrap();
+    let mut lines = Vec::new();
+    for n in 0..LINES {
+        alice.chat(format!("line {n}").as_bytes()).await.unwrap();
+    }
+    while lines.len() < LINES {
+        let f = alice.rx.recv_type(push::CHAT).await.unwrap();
+        let entry = f.bytes(DATA_CHAT_LINE).unwrap();
+        lines.push(u64::from_be_bytes(entry[..8].try_into().unwrap()));
+    }
+    // A subdivision flag's tag sequence: one emoji in 60 bytes.
+    let keys: Vec<_> = (0..KEYS)
+        .map(|n| {
+            let tag = |c: usize| char::from_u32(0xE0061 + c as u32).unwrap();
+            let mut k = String::from('\u{1F3F4}');
+            k.extend([tag(n / 26), tag(n % 26)]);
+            k.extend(std::iter::repeat_n(tag(0), 11));
+            k.push('\u{E007F}');
+            hxd_core::reaction::ReactionKey::emoji(&k).unwrap()
+        })
+        .collect();
+    let keys = Arc::new(keys);
+    // Straight to the core, many at once, so the desk commits them
+    // together: on the wire this would be most of the run.
+    let (alice_uid, bob_uid) = (alice.uid.unwrap(), bob.uid.unwrap());
+    let mut reacting = Vec::new();
+    for (i, chunk) in lines.chunks(LINES / 16).enumerate() {
+        let (core, keys, chunk) = (server.core.clone(), keys.clone(), chunk.to_vec());
+        reacting.push(tokio::task::spawn_blocking(move || {
+            for &line in &chunk {
+                for k in keys.iter() {
+                    core.react(alice_uid, 0, line, k, true).unwrap();
+                }
+                // Bob's, the one each line loses to the purge.
+                core.react(bob_uid, 0, line, &keys[i % KEYS], true).unwrap();
+            }
+        }));
+    }
+    for r in reacting {
+        r.await.unwrap();
+    }
+    // The batches the reactions themselves owed, gone by.
+    drain(&mut heard).await;
+
+    let mut carol = hxd_testclient::ng::Client::connect(server.ng)
+        .await
+        .unwrap();
+    carol
+        .login(serde_json::json!({ "login": "carol", "password": "pw", "nick": "carol" }))
+        .await
+        .unwrap();
+    carol
+        .request(
+            "purge",
+            serde_json::json!({ "login": "bob", "since": 3600, "reason": "stuffing" }),
+        )
+        .await
+        .unwrap();
+    let told: HashMap<Vec<u8>, Vec<u8>> = drain(&mut heard)
+        .await
+        .iter()
+        // Every group here is a line's summary, so the two line up.
+        .filter(|f| f.ty == CHANGED)
+        .flat_map(|f| {
+            let targets = f.all(DATA_TARGET);
+            targets.into_iter().zip(f.all(DATA_REACTION_SUMMARY))
+        })
+        .collect();
+    let lobby = |id: u64| [&[1, 0, 0, 0, 0][..], &id.to_be_bytes()].concat();
+    let skipped: Vec<_> = lines
+        .iter()
+        .map(|&id| lobby(id))
+        .filter(|t| !told.contains_key(t))
+        .collect();
+    assert!(
+        !skipped.is_empty(),
+        "every summary sent: the budget was not reached"
+    );
+    // Every line ends alike: each key once, Bob's taken away.
+    let after = told.values().next().unwrap().clone();
+    assert!(told.values().all(|s| *s == after));
+    assert_eq!(after[..2], (KEYS as u16).to_be_bytes());
+    let mut at = 2;
+    for _ in 0..KEYS {
+        assert_eq!(
+            after[at..at + 4],
+            1u32.to_be_bytes(),
+            "a key still counts Bob's"
+        );
+        at += 6 + u16::from_be_bytes([after[at + 4], after[at + 5]]) as usize;
+    }
+
+    // Kept, and the lines it was not told of read back as they now are.
+    for chunk in skipped.chunks(10) {
+        let fields: Vec<_> = chunk.iter().map(|t| (DATA_TARGET, t.clone())).collect();
+        let trans = tx.send(GET, &fields).await.unwrap();
+        let reply = loop {
+            let f = timeout(Duration::from_secs(10), heard.recv())
+                .await
+                .unwrap()
+                .expect("the reader was dropped");
+            if f.ty == HDR_TASK && f.trans == trans {
+                break f;
+            }
+        };
+        assert!(!reply.is_error(), "{:?}", reply.error_text());
+        assert_eq!(reply.all(DATA_TARGET), chunk);
+        assert_eq!(
+            reply.all(DATA_REACTION_SUMMARY),
+            vec![after.clone(); chunk.len()]
+        );
+    }
+}
+
+/// What a reader is sent from its next frame until it has gone a batch
+/// and more without one.
+async fn drain(
+    heard: &mut tokio::sync::mpsc::UnboundedReceiver<hxd_testclient::legacy::Frame>,
+) -> Vec<hxd_testclient::legacy::Frame> {
+    let mut got = Vec::new();
+    let mut wait = Duration::from_secs(10);
+    loop {
+        match timeout(wait, heard.recv()).await {
+            Ok(Some(f)) => got.push(f),
+            Ok(None) => panic!("the reader was dropped"),
+            Err(_) if got.is_empty() => panic!("the reader was sent nothing"),
+            Err(_) => return got,
+        }
+        wait = Duration::from_millis(2500);
+    }
 }

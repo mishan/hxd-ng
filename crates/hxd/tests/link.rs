@@ -104,6 +104,9 @@ async fn start(
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
+    if ctx.core.reaction_policy().is_some() {
+        tokio::spawn(hxd::reactions_flusher(ctx.core.clone()));
+    }
     let hub = hxd::link::build(&config, ctx.core.clone())
         .unwrap()
         .unwrap();
@@ -424,6 +427,100 @@ async fn a_link_is_never_confirmed_bit_19() {
         .unwrap();
     let confirmed = reply.uint(tag::CAPABILITIES).unwrap();
     assert_eq!(confirmed & (1 << 11 | 1 << 19), 1 << 11);
+}
+
+/// A reaction on a ghost's lobby line is this server's alone: it counts
+/// here, and nothing of it reaches the line's home, where the line's own
+/// reactions count apart.
+#[tokio::test]
+async fn a_reaction_on_a_ghosts_line_counts_on_its_server_alone() {
+    use hxd_session::reactions::{
+        CHANGED, DATA_REACTION_ACTION, DATA_REACTION_COUNT, DATA_REACTION_KEY,
+        DATA_REACTION_SUMMARY, DATA_TARGET, GET, SEND,
+    };
+    use hxd_session::structured::DATA_CHAT_LINE;
+    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 19;
+    let kept = "[structured_chat]\nenabled = true\n[reactions]\nenabled = true\n";
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, kept, kept).await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let on = |who| Login {
+        caps: Some(ON),
+        ..Login::account(who, who, "pw")
+    };
+    let mut alice = legacy::Client::login_at(a.legacy, &on("alice"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &on("bob"))
+        .await
+        .unwrap();
+    let ghost = row(&mut alice, "bob").await.uid;
+    let bob_uid = bob.uid.map(u32::from);
+    bob.chat(b"hi").await.unwrap();
+    let id = |f: legacy::Frame| {
+        let entry = f.bytes(DATA_CHAT_LINE).expect("an entry");
+        u64::from_be_bytes(entry[..8].try_into().unwrap())
+    };
+    let there = id(bob
+        .rx
+        .recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == bob_uid)
+        .await
+        .unwrap());
+    let here = id(alice
+        .rx
+        .recv_where(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(ghost.into()))
+        .await
+        .unwrap());
+    let lobby = |id: u64| [&[1, 0, 0, 0, 0][..], &id.to_be_bytes()].concat();
+    let thumbs = [&[1][..], "\u{1F44D}".as_bytes()].concat();
+    async fn react(c: &mut legacy::Client, target: Vec<u8>, key: &[u8]) -> Option<u32> {
+        let fields = [
+            (DATA_TARGET, target),
+            (DATA_REACTION_ACTION, 1u16.to_be_bytes().to_vec()),
+            (DATA_REACTION_KEY, key.to_vec()),
+        ];
+        c.call(SEND, &fields)
+            .await
+            .unwrap()
+            .uint(DATA_REACTION_COUNT)
+    }
+    // A line said after a reaction is heard across the link after
+    // anything the reaction could have sent over it.
+    async fn crossed(from: &mut legacy::Client, to: &mut legacy::Client, text: &str) {
+        from.chat(text.as_bytes()).await.unwrap();
+        to.rx
+            .recv_where(|f| {
+                f.ty == push::CHAT
+                    && f.bytes(tag::BODY)
+                        .is_some_and(|b| b.ends_with(text.as_bytes()))
+            })
+            .await
+            .unwrap();
+    }
+    let one = [
+        &[0, 1, 0, 0, 0, 1][..],
+        &(thumbs.len() as u16).to_be_bytes(),
+        &thumbs,
+    ]
+    .concat();
+
+    assert_eq!(react(&mut alice, lobby(here), &thumbs).await, Some(1));
+    let told = alice.rx.recv_type(CHANGED).await.unwrap();
+    assert_eq!(told.bytes(DATA_TARGET), Some(lobby(here)));
+    assert_eq!(told.bytes(DATA_REACTION_SUMMARY), Some(one.clone()));
+    // Its home counts its own from nothing, and tells only its own.
+    crossed(&mut alice, &mut bob, "reacted here").await;
+    assert!(!bob.rx.take_backlog().iter().any(|f| f.ty == CHANGED));
+    assert_eq!(react(&mut bob, lobby(there), &thumbs).await, Some(1));
+    let told = bob.rx.recv_type(CHANGED).await.unwrap();
+    assert_eq!(told.bytes(DATA_TARGET), Some(lobby(there)));
+    assert_eq!(told.bytes(DATA_REACTION_SUMMARY), Some(one.clone()));
+    crossed(&mut bob, &mut alice, "reacted there").await;
+    let asked = alice
+        .call(GET, &[(DATA_TARGET, lobby(here))])
+        .await
+        .unwrap();
+    assert_eq!(asked.bytes(DATA_REACTION_SUMMARY), Some(one));
 }
 
 #[tokio::test]
