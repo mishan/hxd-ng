@@ -1,9 +1,9 @@
 # Reactions on the classic wire
 
-Status: lines are built: Send Reaction (710), Reaction Changed (711),
-Get Reactions (712) and a line's reactions on its Get Chat History (700)
-entry. Instant messages and stored private messages as targets are not,
-and the binary does not offer capability bit 19 until they are. This
+Status: lines and instant messages are built: Send Reaction (710),
+Reaction Changed (711), Get Reactions (712) and a line's reactions on
+its Get Chat History (700) entry. Stored private messages as targets are
+not, and the binary does not offer capability bit 19 until they are. This
 binds nobody but this server: the protocol is the Reactions draft
 (`Capabilities-Reactions.md`, a draft written for this server, in
 fogWraith's protocol documents and not yet allocated), with the targets
@@ -23,7 +23,8 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   reactions (`[reactions] enabled`, which needs `[history]`), which the
   configured bits do not promise. A link's login never holds it.
 - **The login reply** beside it carries `DATA_REACTION_TARGETS`, lines
-  (`0x0002`) always and kind 4 (`0x0010`) where there are rooms (§2), and
+  (`0x0002`) always, kind 4 (`0x0010`) where there are rooms and
+  instant messages (`0x0004`) to a session that negotiated bit 6 (§2), and
   `[reactions] max_keys` and `max_per_user` as `DATA_MAX_REACTION_KEYS`
   and `DATA_MAX_REACTIONS_PER_USER`. The targets are fixed for the
   session as it was told them.
@@ -56,9 +57,17 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   check, with overwhelming probability rather than certainty: were the
   two to meet, a reaction meant for a notice would land on a kept line
   of the same room that its reactor could read.
-- **Kinds 2, 3 and 5** (instant messages, signed lines, private
-  messages) are not taken yet and are `InvalidTarget`, as is anything
-  malformed.
+- **An instant message** is kind 2, its sender's login and guid as the
+  friend family carries them (`instant-messaging.md` §7). It is offered
+  only to a session that negotiated bit 6, since without it a session
+  holds no instant message to name, though the draft describes the
+  field as what the server accepts. 710 names the conversation's other
+  party in `DATA_FRIEND_LOGIN`, and is checked as IM Acknowledge (812)
+  is: the two must be friends or share an approval, neither blocking
+  the other. The message is never looked up, and kept nowhere to be
+  read again, so 712 refuses it.
+- **Kinds 3 and 5** (signed lines, private messages) are not taken yet
+  and are `InvalidTarget`, as is anything malformed.
 
 ## 3. Send Reaction (710)
 
@@ -67,6 +76,10 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   the server's own by id. The core spells an emoji key in its
   fully-qualified form, so U+2764 comes back in a summary as U+2764
   U+FE0F.
+- **A messenger session** (bit 8) may hold bit 19 and send 710 on an
+  instant message alone: a line, or a clear, is `NotAllowed`, since it
+  is hidden from the lines' readers. Its 712 and 717 are refused, as
+  anything outside the friend family is.
 - **A clear** needs the `moderate` permission and a line the moderator
   could have read, by an author it may moderate. 710 carries no reason
   and the moderation trail takes no act without one, so the clear is
@@ -75,18 +88,18 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
 
 | Code | When |
 |---|---|
-| 1 `NoSuchTarget` | A line missing, tombstoned, unreadable, not yet relayed, or kept by nobody |
+| 1 `NoSuchTarget` | A line missing, tombstoned, unreadable, not yet relayed, or kept by nobody; an instant message with a party the reactor may not message |
 | 2 `NotAllowed` | A guest, no send-chat, a messenger session on a line, an archived room, a read-only one under `[reactions] read_only_rooms = "deny"`, or a clear from anyone but a moderator or on a protected author's line |
 | 3 `InvalidKey` | Not one emoji, past 64 bytes, a server's without bit 20 |
 | 4 `TooManyKeys` | The line has `max_keys` keys |
 | 5 `TooManyOfYours` | The account holds `max_per_user` on the line |
 | 6 `RateLimited` | Past the account's `[reactions] burst` and `per_second` |
 | 7 `NoSuchEmoji` | A server emoji added that is not live |
-| 12 `InvalidTarget` | A kind this server does not take, or malformed |
+| 12 `InvalidTarget` | A kind this server does not take, or malformed; an instant message without its party, naming neither the reactor nor its party as sender, or cleared |
 
   An action the draft does not define has no code, and is "Malformed
   request." alone. A success carries the key's count after, for an add
-  or a remove, and nothing for a clear.
+  or a remove on a line, and nothing for a clear or an instant message.
 - **Price.** 2 spam points, as a line is. A reaction is not a line and
   never counts toward the chat flood.
 
@@ -94,8 +107,17 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
 
 - One event the core sends is one 711, with task id 0, its groups in the
   event's order: a line's summary, with the reader's own keys where it
-  holds any, and a moderator's clear. The core's batching holds: at most
-  one a room a batch, for the most recent lines of each.
+  holds any, a moderator's clear, and an instant message's change. The
+  core's batching holds: at most one a room a batch, for the most recent
+  lines of each.
+- **An instant message's change** is action 1 or 2, the key, and the
+  reactor's login in `DATA_FRIEND_LOGIN`, told to the other party's
+  sessions with bits 6 and 19 (under an approval, those that understand
+  requests) and no one else. For a party with none, the domain keeps it
+  as the ng wire does (`hotline-ng.md` §7.3) and tells it after the reply
+  to the next Get Roster from a session with bit 19, one 711 a
+  conversation; a Get Roster from a session without the bit leaves it
+  waiting.
 - **A frame's worth.** A 711 past the frame budget, a frame's data less
   room for what precedes the groups, is split between groups, never
   inside one.
@@ -105,8 +127,8 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   on a per-session allowance, a burst of 1 MiB earned back at 256 KiB a
   second; one past it is not sent, the line left to 712 as one outside
   the live window is, and it is counted in
-  `hxd_reaction_summaries_skipped_total` (`metrics.md`). Clears are
-  always sent.
+  `hxd_reaction_summaries_skipped_total` (`metrics.md`). Clears and
+  instant messages' changes are always sent.
 - **A redaction** tells this wire nothing, since it shows no
   redactions; 700 pages the line's tombstone, which carries no
   reactions.
@@ -158,8 +180,8 @@ login that carries `DATA_NOTIFY_TYPES`. It costs 1 spam point.
 
 ## 8. Not yet
 
-- Instant messages and stored private messages as targets, and
-  `DATA_PM_ID` on a private message.
+- Stored private messages as targets, and `DATA_PM_ID` on a private
+  message.
 - Bit 19 among what the binary offers.
 - Reactions across a server link, which the draft leaves on the server
   they were made on.

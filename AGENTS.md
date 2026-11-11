@@ -465,16 +465,21 @@ Three layers, all `cargo test --workspace`:
   still shows those it kept), `reactions_classic.rs` (capability bit
   19 from a real config, given by hand until the binary offers it:
   confirmed beside bits 1 and 17 where the core keeps reactions, with
-  its targets and caps; 710 on a lobby line and on a room's as kind 4,
-  a private chat's and kind 4 on chat 0 no target, held to who may
-  react, the caps apart, the rate and a removed server emoji, and a
-  moderator's clear recorded with its fixed reason; 711 in one batch a
-  room to the readers with the bit and across to the ng wire and back,
-  a redaction telling it nothing and a purge as summaries; 712 in the
+  its targets and caps, instant messages only beside bit 6; 710 on a
+  lobby line and on a room's as kind 4, a private chat's and kind 4 on
+  chat 0 no target, held to who may react, the caps apart, the rate and
+  a removed server emoji, and a moderator's clear recorded with its
+  fixed reason; 711 in one batch a room to the readers with the bit and
+  across to the ng wire and back, a redaction telling it nothing and a
+  purge as summaries; an instant message's reaction told to its other
+  party as a change, across the wires too, kept for an absent one until
+  a Get Roster from a session with the bit, refused to a stranger, and
+  made by a messenger session that may react to no line; 712 in the
   order asked, what could not have been read left out, who reacted by
   the nick it reacted under, and priced by its targets; 700's
   sub-fields beside the emoji refs; 717 answered with no type; and a
-  session without the bit sent the same bytes throughout),
+  session without the bit, one with bit 6 among them, sent the same
+  bytes throughout),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
