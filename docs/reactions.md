@@ -1,11 +1,11 @@
 # Reactions on the classic wire
 
-Status: lines and instant messages are built: Send Reaction (710),
-Reaction Changed (711), Get Reactions (712) and a line's reactions on
-its Get Chat History (700) entry. Stored private messages as targets are
-not, and the binary does not offer capability bit 19 until they are. This
-binds nobody but this server: the protocol is the Reactions draft
-(`Capabilities-Reactions.md`, a draft written for this server, in
+Status: built, on lines, instant messages and stored private messages:
+Send Reaction (710), Reaction Changed (711), Get Reactions (712), a
+line's reactions on its Get Chat History (700) entry, and a stored
+private message's reference on the 104 that hands it over and the 108
+reply. This binds nobody but this server: the protocol is the Reactions
+draft (`Capabilities-Reactions.md`, a draft written for this server, in
 fogWraith's protocol documents and not yet allocated), with the targets
 and the notification mechanism it takes from the Replies draft and the
 line ids and reply shape it takes from Structured Chat.
@@ -18,13 +18,15 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
 
 ## 1. Negotiation
 
-- **Bit 19** is confirmed only beside bits 1 (Text Encoding) and 17
+- **Bit 19** is offered where `[reactions]` and `[structured_chat]` are
+  both enabled (`[reactions]` needs `[history]`), and needs no key of its
+  own. It is confirmed only beside bits 1 (Text Encoding) and 17
   (Structured Chat), as the draft requires, and only where the core keeps
-  reactions (`[reactions] enabled`, which needs `[history]`), which the
-  configured bits do not promise. A link's login never holds it.
+  reactions. A link's login never holds it.
 - **The login reply** beside it carries `DATA_REACTION_TARGETS`, lines
-  (`0x0002`) always, kind 4 (`0x0010`) where there are rooms and
-  instant messages (`0x0004`) to a session that negotiated bit 6 (§2), and
+  (`0x0002`) always, kind 4 (`0x0010`) where there are rooms,
+  instant messages (`0x0004`) to a session that negotiated bit 6 (§2),
+  stored private messages (`0x0040`) where there is an `[inbox]`, and
   `[reactions] max_keys` and `max_per_user` as `DATA_MAX_REACTION_KEYS`
   and `DATA_MAX_REACTIONS_PER_USER`. The targets are fixed for the
   session as it was told them.
@@ -66,8 +68,29 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   is: the two must be friends or share an approval, neither blocking
   the other. The message is never looked up, and kept nowhere to be
   read again, so 712 refuses it.
-- **Kinds 3 and 5** (signed lines, private messages) are not taken yet
-  and are `InvalidTarget`, as is anything malformed.
+- **A stored private message** is kind 5, the stored flag set and the
+  16 bytes the ng wire names it by (its `ref`). A session with bit 19 is
+  given them as `DATA_PM_ID` on the 104 that hands the message over,
+  live or after it waited, and on the reply to the 108 that sent it. A
+  message nothing stored has none: on a server or to an account without
+  an inbox, from a plain guest, past the sender's daily quota (then it is
+  delivered live and kept nowhere), and to or from a linked server's
+  user. The Replies draft has an unstored message stamped with an
+  ephemeral reference, which this server does not make (§8). An instant
+  message handed over as mail has none either, since it is a target by
+  its guid, which a 104 has no field for (§8). 710
+  takes the target alone and answers success with no count whatever
+  became of the reaction, as the ng wire does (`hotline-ng.md` §7.3): a
+  message the reactor is no party to or no longer sees, one either party
+  has blocked the other over, and a cap drop it alike, so that nothing
+  tells a sender whether its message was read. A message that came as a
+  message request carries a reference too, and a reaction to it is
+  dropped, as on the ng wire. The sender sees a
+  message until `[inbox] retain_unread` has passed since it was sent,
+  and the recipient for as long as the message is kept, or until the
+  sender's view ends if that is later.
+- **Kind 3** (signed lines), kind 5 with the stored flag clear, and
+  anything malformed are `InvalidTarget`.
 
 ## 3. Send Reaction (710)
 
@@ -78,7 +101,8 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   U+FE0F.
 - **A messenger session** (bit 8) may hold bit 19 and send 710 on an
   instant message alone: a line, or a clear, is `NotAllowed`, since it
-  is hidden from the lines' readers. Its 712 and 717 are refused, as
+  is hidden from the lines' readers, and so is a stored message, since
+  its mail waits for a session that is not. Its 712 and 717 are refused, as
   anything outside the friend family is.
 - **A clear** needs the `moderate` permission and a line the moderator
   could have read, by an author it may moderate. 710 carries no reason
@@ -89,17 +113,17 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
 | Code | When |
 |---|---|
 | 1 `NoSuchTarget` | A line missing, tombstoned, unreadable, not yet relayed, or kept by nobody; an instant message with a party the reactor may not message |
-| 2 `NotAllowed` | A guest, no send-chat, a messenger session on a line, an archived room, a read-only one under `[reactions] read_only_rooms = "deny"`, or a clear from anyone but a moderator or on a protected author's line |
+| 2 `NotAllowed` | A guest, no send-chat, a messenger session on a line or a stored message, an archived room, a read-only one under `[reactions] read_only_rooms = "deny"`, or a clear from anyone but a moderator or on a protected author's line |
 | 3 `InvalidKey` | Not one emoji, past 64 bytes, a server's without bit 20 |
 | 4 `TooManyKeys` | The line has `max_keys` keys |
 | 5 `TooManyOfYours` | The account holds `max_per_user` on the line |
 | 6 `RateLimited` | Past the account's `[reactions] burst` and `per_second` |
 | 7 `NoSuchEmoji` | A server emoji added that is not live |
-| 12 `InvalidTarget` | A kind this server does not take, or malformed; an instant message without its party, naming neither the reactor nor its party as sender, or cleared |
+| 12 `InvalidTarget` | A kind this server does not take, or malformed; an instant message without its party, naming neither the reactor nor its party as sender, or cleared; a stored message cleared |
 
   An action the draft does not define has no code, and is "Malformed
   request." alone. A success carries the key's count after, for an add
-  or a remove on a line, and nothing for a clear or an instant message.
+  or a remove on a line, and nothing for a clear or a message.
 - **Price.** 2 spam points, as a line is. A reaction is not a line and
   never counts toward the chat flood.
 
@@ -118,6 +142,13 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   to the next Get Roster from a session with bit 19, one 711 a
   conversation; a Get Roster from a session without the bit leaves it
   waiting.
+- **A stored message's summary** is told to the sessions of both
+  parties with bit 19 but the reactor's: the recipient's once the
+  message is handed over, the sender's while it sees the message. A
+  messenger session is told none, holding no reference to match it by.
+  A message that gathered reactions while it waited has its summary
+  told in a 711 right after the 104 that hands it over, since the 104
+  has no place for it (the ng wire's `msg` carries it).
 - **A frame's worth.** A 711 past the frame budget, a frame's data less
   room for what precedes the groups, is split between groups, never
   inside one.
@@ -144,7 +175,9 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   by Send Reaction's read rules, in the order asked and as often as it
   is named: the target, the summary, and the reader's own keys where it
   holds any. A line it could not have read, a tombstone, one that does
-  not exist and one nobody keeps are left out alike.
+  not exist and one nobody keeps are left out alike. A stored message
+  is always answered: with its summary to a party that sees it, and an
+  empty one to anyone else, a sender past its window included.
 - **Who reacted.** With a key and one target, the group goes on with a
   `FieldUserName` for each account holding the key, newest first and at
   most 100, each the nick it reacted under, cut as a user list cuts one.
@@ -180,9 +213,11 @@ login that carries `DATA_NOTIFY_TYPES`. It costs 1 spam point.
 
 ## 8. Not yet
 
-- Stored private messages as targets, and `DATA_PM_ID` on a private
-  message.
-- Bit 19 among what the binary offers.
+- Unstored private messages as targets (`DATA_REACTION_TARGETS` bit 5)
+  and the ephemeral references they are named by.
+- An instant message's guid on a 104 that hands it over as mail, which
+  the draft requires of a server listing instant messages among stored
+  ones and gives the 104 no field for.
 - Reactions across a server link, which the draft leaves on the server
   they were made on.
 - The draft's optional notice to a line's author.

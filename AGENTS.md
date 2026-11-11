@@ -463,9 +463,9 @@ Three layers, all `cargo test --workspace`:
   already is kept and may be taken away, kept
   across a resume, and refused on a server serving no catalog, which
   still shows those it kept), `reactions_classic.rs` (capability bit
-  19 from a real config, given by hand until the binary offers it:
-  confirmed beside bits 1 and 17 where the core keeps reactions, with
-  its targets and caps, instant messages only beside bit 6; 710 on a
+  19 from a real config: confirmed beside bits 1 and 17 where the core
+  keeps reactions, with its targets and caps, instant messages only
+  beside bit 6 and stored messages where there is an inbox; 710 on a
   lobby line and on a room's as kind 4, a private chat's and kind 4 on
   chat 0 no target, held to who may react, the caps apart, the rate and
   a removed server emoji, and a moderator's clear recorded with its
@@ -477,9 +477,15 @@ Three layers, all `cargo test --workspace`:
   made by a messenger session that may react to no line; 712 in the
   order asked, what could not have been read left out, who reacted by
   the nick it reacted under, and priced by its targets; 700's
-  sub-fields beside the emoji refs; 717 answered with no type; and a
+  sub-fields beside the emoji refs; 717 answered with no type; a stored
+  message's reference on the 104, live or after it waited, and on the
+  108 reply to a session with the bit alone, none past the sender's
+  quota or on an instant message handed over as mail, a reaction to one
+  answered alike whatever became of it and told to both parties on both
+  wires but the reactor's session, the sender's view ending with its
+  window, and what a waiting message gathered told after its 104; and a
   session without the bit, one with bit 6 among them, sent the same
-  bytes throughout),
+  bytes throughout, private messages included),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
@@ -635,7 +641,9 @@ Three layers, all `cargo test --workspace`:
   either side did not configure refused, a peer removed on reload
   unlinked with its dialer stopped, a suspended one unlinked until
   resumed, `hxd link reset-id` refused while the server runs, a key
-  changed on reload closing the link, bit 11 on the plain port or a key proof without it refused, users
+  changed on reload closing the link, bit 11 on the plain port or a key
+  proof without it refused, a link confirmed no bit 19 where a user is,
+  users
   crossing both ways on both wires and leaving, public chat crossing
   both ways in order and formatted where it is heard, private messages
   and user info crossing on both wires and refused where the link does

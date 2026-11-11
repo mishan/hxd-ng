@@ -303,7 +303,7 @@ All of these share one SQLite file, `/var/lib/hxd-ng/hxd-ng.sqlite`.
 | `HXD_HISTORY` | `on` | Chat scrollback ([chat-history.md](chat-history.md)). |
 | `HXD_HISTORY_MAX_LINES` | 10000 | Lines kept; 0 is unlimited. |
 | `HXD_HISTORY_MAX_DAYS` | 0 | Days kept; 0 is unlimited. |
-| `HXD_REACTIONS` | `off` | Emoji reactions on chat lines, on the ng wire ([hotline-ng.md](hotline-ng.md) §7.3). Needs `HXD_HISTORY`. |
+| `HXD_REACTIONS` | `off` | Emoji reactions on chat lines and messages, on the ng wire ([hotline-ng.md](hotline-ng.md) §7.3), and beside `HXD_STRUCTURED_CHAT` for classic clients that ask, capability bit 19 ([reactions.md](reactions.md)). Needs `HXD_HISTORY`. |
 | `HXD_STRUCTURED_CHAT` | `off` | Chat lines as data for classic clients that ask, capability bit 17 ([chat-history.md](chat-history.md) §12). |
 | `HXD_NEWS` | `on` | Threaded news ([news.md](news.md)). |
 | `HXD_NEWS_RETAIN_DAYS` | 0 | A thread's life after its last post; 0 is forever. |

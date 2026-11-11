@@ -1293,8 +1293,10 @@ replay = 0                # plain chat lines replayed to old legacy clients
 ### `[reactions]`
 
 Absent, or `enabled` left off, means no reactions: the ng wire never
-offers the `reactions` cap, and classic clients see nothing new either
-way. It needs `[history]`: reactions are kept beside the lines, in the
+offers the `reactions` cap, and the classic port never offers
+capability bit 19. Turned on beside `[structured_chat]`, classic
+clients that ask get reactions as bit 19 ([reactions.md](reactions.md));
+those that do not see nothing new. It needs `[history]`: reactions are kept beside the lines, in the
 same database, and `hxd inbox purge` takes an account's. Who may react is an account of one person that may send chat;
 guests never may. See [hotline-ng.md](hotline-ng.md) §7.3.
 

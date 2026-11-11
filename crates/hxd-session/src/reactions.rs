@@ -1,9 +1,10 @@
 //! Reactions on the classic wire (the Reactions draft): capability bit
-//! 19, Send Reaction (710) on the lines of the log and on instant
-//! messages, Get Reactions (712) on the lines, Reaction Changed (711) for
-//! every change the core tells a session that negotiated it, a line's
-//! reactions on its 700 entry, and Set Notifications (717) answered with
-//! no type.
+//! 19, Send Reaction (710) on the lines of the log, on instant messages
+//! and on stored private messages, Get Reactions (712) on the lines and
+//! the stored messages, Reaction Changed (711) for every change the core
+//! tells a session that negotiated it, a line's reactions on its 700
+//! entry, a stored message's reference on the 104 and the 108 reply, and
+//! Set Notifications (717) answered with no type.
 //!
 //! Only a session that negotiated bit 19, beside bits 1 and 17, is
 //! answered here or sent any of it; to every other these transactions do
@@ -15,8 +16,9 @@
 
 use std::time::Instant;
 
+use hxd_core::inbox::MessageRef;
 use hxd_core::reply::{guid_bytes, guid_of, ImTarget};
-use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reply};
+use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reactions, Reply};
 
 use crate::encoding::TextEncoding;
 use crate::frame::Frame;
@@ -34,6 +36,8 @@ pub const GET: u32 = 712;
 /// may send too.
 pub const SET_NOTIFICATIONS: u32 = 717;
 
+/// The Replies draft's: a private message's reference.
+pub const DATA_PM_ID: u16 = 0x0f23;
 pub const DATA_TARGET: u16 = 0x0f24;
 pub const DATA_REACTION_KEY: u16 = 0x0f25;
 pub const DATA_REACTION_ACTION: u16 = 0x0f26;
@@ -119,11 +123,21 @@ pub(crate) fn notify_types() -> (u16, Vec<u8>) {
 
 /// The kinds of target this session may name, fixed at its login: lines
 /// always, a room's, which this wire shows as a private chat, as kind 4
-/// under its chat id where there are rooms, and instant messages where it
-/// negotiated bit 6, without which it holds none.
-pub(crate) fn targets(rooms: bool, ims: bool) -> u16 {
+/// under its chat id where there are rooms, instant messages where it
+/// negotiated bit 6, without which it holds none, and stored private
+/// messages where there is an inbox.
+pub(crate) fn targets(rooms: bool, ims: bool, inbox: bool) -> u16 {
     let bit = |on: bool, b: u16| if on { b } else { 0 };
-    TARGETS_LINES | bit(rooms, TARGETS_EPHEMERAL) | bit(ims, TARGETS_IMS)
+    TARGETS_LINES
+        | bit(rooms, TARGETS_EPHEMERAL)
+        | bit(ims, TARGETS_IMS)
+        | bit(inbox, TARGETS_STORED_PMS)
+}
+
+/// `DATA_PM_ID` for a stored message: the stored flag, then the
+/// reference the ng wire names it by.
+pub(crate) fn pm_id(reference: &MessageRef) -> Vec<u8> {
+    [&[STORED][..], reference].concat()
 }
 
 /// The login reply's fields beside a confirmed bit 19.
@@ -214,8 +228,8 @@ pub(crate) fn pack_target(target: &Reply) -> Option<Vec<u8>> {
             out.extend_from_slice(t.login().as_bytes());
         }
         Reply::Pm(r) => {
-            out.extend_from_slice(&[PM, STORED]);
-            out.extend_from_slice(r);
+            out.push(PM);
+            out.extend_from_slice(&pm_id(r));
         }
         Reply::Signed { .. } => return None,
     }
@@ -257,6 +271,17 @@ pub(crate) fn mine(indexes: &[u8]) -> Vec<u8> {
     [&[indexes.len() as u8][..], indexes].concat()
 }
 
+/// What a stored message gathered while it waited, which the 104 that
+/// hands it over has no place for: told after it, as a later change
+/// would be.
+pub(crate) fn waited(reference: MessageRef, shown: Reactions) -> ReactionChange {
+    ReactionChange::Summary {
+        target: Reply::Pm(reference),
+        keys: shown.keys.into(),
+        mine: shown.mine,
+    }
+}
+
 /// What Send Reaction (710) asks, once its fields are read.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Send {
@@ -274,6 +299,12 @@ pub(crate) enum Send {
     Im {
         target: ImTarget,
         with: String,
+        key: ReactionKey,
+        add: bool,
+    },
+    /// One key added to, or taken from, a stored private message.
+    Pm {
+        reference: MessageRef,
         key: ReactionKey,
         add: bool,
     },
@@ -321,22 +352,23 @@ pub(crate) fn parse_send<'a>(
     let target = field(DATA_TARGET)
         .and_then(|b| parse_target(b, offered))
         .ok_or(Malformed::Target)?;
-    let (line, im) = match target {
-        Target::Named(Reply::Line { room, id }) => (Some((room, id)), None),
-        Target::Unheld => (None, None),
+    let (line, im, pm) = match target {
+        Target::Named(Reply::Line { room, id }) => (Some((room, id)), None, None),
+        Target::Unheld => (None, None, None),
         Target::Named(Reply::Im(t)) => {
             let with = field(DATA_FRIEND_LOGIN)
                 .filter(|l| !l.is_empty())
                 .ok_or(Malformed::Target)?;
-            (None, Some((t, enc.decode(with))))
+            (None, Some((t, enc.decode(with))), None)
         }
+        Target::Named(Reply::Pm(r)) => (None, None, Some(r)),
         Target::Named(_) => return Err(Malformed::Target),
     };
     let action = field(DATA_REACTION_ACTION)
         .filter(|d| matches!(d.len(), 2 | 4))
         .map(|d| d.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)));
     let add = match action {
-        Some(3) if im.is_some() => return Err(Malformed::Target),
+        Some(3) if im.is_some() || pm.is_some() => return Err(Malformed::Target),
         Some(3) => {
             return Ok(match line {
                 Some((room, id)) => Send::Clear { room, id },
@@ -350,15 +382,20 @@ pub(crate) fn parse_send<'a>(
     let key = field(DATA_REACTION_KEY)
         .and_then(|k| parse_key(k, emoji))
         .ok_or(Malformed::Key)?;
-    Ok(match (line, im) {
-        (Some((room, id)), _) => Send::Line { room, id, key, add },
-        (None, Some((target, with))) => Send::Im {
+    Ok(match (line, im, pm) {
+        (Some((room, id)), _, _) => Send::Line { room, id, key, add },
+        (None, Some((target, with)), _) => Send::Im {
             target,
             with,
             key,
             add,
         },
-        (None, None) => Send::Unheld { clearing: false },
+        (None, None, Some(reference)) => Send::Pm {
+            reference,
+            key,
+            add,
+        },
+        (None, None, None) => Send::Unheld { clearing: false },
     })
 }
 
@@ -925,14 +962,22 @@ mod tests {
     }
 
     #[test]
-    fn the_targets_offered_follow_the_rooms_and_bit_6() {
-        for (rooms, ims, want) in [
-            (false, false, 0x0002),
-            (true, false, 0x0012),
-            (false, true, 0x0006),
-            (true, true, 0x0016),
+    fn the_targets_offered_follow_the_rooms_bit_6_and_the_inbox() {
+        for (rooms, ims, inbox, want) in [
+            (false, false, false, 0x0002),
+            (true, false, false, 0x0012),
+            (false, true, false, 0x0006),
+            (true, true, false, 0x0016),
+            (false, false, true, 0x0042),
+            (true, false, true, 0x0052),
+            (false, true, true, 0x0046),
+            (true, true, true, 0x0056),
         ] {
-            assert_eq!(targets(rooms, ims), want, "rooms {rooms}, bit 6 {ims}");
+            assert_eq!(
+                targets(rooms, ims, inbox),
+                want,
+                "rooms {rooms}, bit 6 {ims}, inbox {inbox}"
+            );
         }
     }
 
@@ -1069,6 +1114,18 @@ mod tests {
                     (DATA_TARGET, [&[PM, STORED][..], &[3; 16]].concat()),
                     (DATA_REACTION_ACTION, act(1)),
                     (DATA_REACTION_KEY, key.clone()),
+                ],
+                Ok(Send::Pm {
+                    reference: [3; 16],
+                    key: thumbs(),
+                    add: true,
+                }),
+            ),
+            (
+                "a clear on a stored message",
+                vec![
+                    (DATA_TARGET, [&[PM, STORED][..], &[3; 16]].concat()),
+                    (DATA_REACTION_ACTION, act(3)),
                 ],
                 Err(Malformed::Target),
             ),

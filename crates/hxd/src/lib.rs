@@ -2816,6 +2816,10 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>, em
     }
     if config.structured_chat.as_ref().is_some_and(|s| s.enabled) {
         caps = caps.with(cap::STRUCTURED_CHAT);
+        // Confirmed only beside bit 17, so offered only with it.
+        if config.reactions.as_ref().is_some_and(|r| r.enabled) {
+            caps = caps.with(cap::REACTIONS);
+        }
     }
     // A catalog the server serves, which `[emoji] enabled` makes it.
     if emoji {
@@ -6939,6 +6943,32 @@ sync = "full"
             Caps::empty().with(cap::TEXT_ENCODING)
         );
         assert!(ng_caps(&c, None, None).is_empty());
+    }
+
+    #[test]
+    fn bit_19_is_offered_where_reactions_are_kept_beside_bit_17() {
+        let structured = "[structured_chat]\nenabled = true\n";
+        let reactions = "[reactions]\nenabled = true\n";
+        for (case, sections, want) in [
+            ("both", format!("{structured}{reactions}"), true),
+            ("no [reactions]", structured.to_string(), false),
+            (
+                "[reactions] off",
+                format!("{structured}[reactions]\nenabled = false\n"),
+                false,
+            ),
+            ("no [structured_chat]", reactions.to_string(), false),
+            (
+                "[structured_chat] off",
+                format!("[structured_chat]\nenabled = false\n{reactions}"),
+                false,
+            ),
+        ] {
+            let c = parse(&format!("[history]\ndb = \"hx.db\"\n{sections}")).unwrap();
+            check_config(&c).unwrap();
+            let caps = legacy_caps(&c, None, None, false);
+            assert_eq!(caps.has(cap::REACTIONS), want, "{case}");
+        }
     }
 
     /// The capability answers with a real SFU behind them. Building one
