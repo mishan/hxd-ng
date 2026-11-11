@@ -992,7 +992,7 @@ fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
 /// Mac Roman egress is lossy (`?` for unmappable), and either way a nick
 /// is cut to the wire's 31 bytes *after* conversion, at a character
 /// boundary.
-fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
+pub(crate) fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
     enc.encode_capped(nick, 31)
 }
 
@@ -1454,6 +1454,8 @@ struct LoginRequest {
     clientversion: Option<u16>,
     /// The extensions the client says it implements (`0x01F0`).
     caps: Caps,
+    /// Whether it asked for notification types (the Replies draft's).
+    notify: bool,
     /// A 1-byte all-zero LOGIN chunk: the HOPE session-key probe.
     hope_probe: bool,
     /// A key-mode link login's key and proof (`docs/server-link.md` §7.1).
@@ -1469,6 +1471,7 @@ fn parse_login(f: &Frame) -> LoginRequest {
             tag::ICON => req.icon = c.as_uint() as u16,
             tag::VERSION => req.clientversion = Some(c.as_uint() as u16),
             tag::CAPABILITIES => req.caps = Caps::from_wire(c.data),
+            reactions::DATA_NOTIFY_TYPES => req.notify = true,
             crate::peer::field::SERVER_KEY => req.server_key = c.data.try_into().ok(),
             crate::peer::field::KEY_PROOF => req.link_proof = c.data.try_into().ok(),
             tag::LOGIN => {
@@ -2722,6 +2725,9 @@ async fn login_phase(
         .filter(|_| caps.has(cap::REACTIONS))
     {
         login_reply.extend(reactions::login_fields(&policy, reaction_targets));
+        if req.notify {
+            login_reply.push(reactions::notify_types());
+        }
     }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
@@ -3648,7 +3654,7 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
         .filter(|_| speaks_friends(sess, f.ty))
         .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
         .or_else(|| emoji::price(f.ty).filter(|_| sess.has_cap(cap::SERVER_EMOJI)))
-        .or_else(|| reactions::price(f.ty).filter(|_| sess.has_cap(cap::REACTIONS)))
+        .or_else(|| reactions::price(f).filter(|_| sess.has_cap(cap::REACTIONS)))
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
@@ -4890,8 +4896,26 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 limit: requested.min(policy.max_page),
             };
             let uid = sess.uid;
-            match off_reactor(&ctx.core, move |c| c.history(uid, query)).await {
-                Some(Ok(page)) => {
+            let reacting = sess.has_cap(cap::REACTIONS);
+            let paged = off_reactor(&ctx.core, move |c| {
+                let page = c.history(uid, query)?;
+                let ids: Vec<_> = (page.lines.iter())
+                    .filter(|l| !l.flags.contains(hxd_core::LineFlags::DELETED))
+                    .map(|l| l.id)
+                    .collect();
+                // A log that will not answer leaves the page without them
+                // rather than unanswered.
+                let shown = match reacting {
+                    false => Default::default(),
+                    true => c.line_reactions(uid, &ids).unwrap_or_else(|e| {
+                        warn!(uid, "chat log would not read reactions: {e}");
+                        Default::default()
+                    }),
+                };
+                Ok::<_, ChatError>((page, shown))
+            });
+            match paged.await {
+                Some(Ok((page, shown))) => {
                     let mut entries = Vec::with_capacity(page.lines.len());
                     let media_reader = sess.has_cap(cap::INLINE_MEDIA);
                     for line in page.lines {
@@ -4924,12 +4948,20 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             }
                             _ => Vec::new(),
                         };
+                        // In the draft's order, a sub-field's type ascending.
+                        let reacted = shown.get(&line.id);
+                        if let Some(r) = reacted {
+                            subfields.push((reactions::REACTIONS, reactions::summary(&r.keys)));
+                        }
                         if let Some(refs) = line
                             .emoji
                             .as_ref()
                             .filter(|_| sess.has_cap(cap::SERVER_EMOJI) && !deleted)
                         {
                             subfields.push((emoji::EMOJI_REFS, emoji::refs_field(refs)));
+                        }
+                        if let Some(r) = reacted.filter(|r| !r.mine.is_empty()) {
+                            subfields.push((reactions::REACTIONS_MINE, reactions::mine(&r.mine)));
                         }
                         entries.push(structured::entry(
                             sess.enc,
@@ -6083,6 +6115,12 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         t if t == reactions::SEND && sess.has_cap(cap::REACTIONS) => {
             send_reaction(f, tx, ctx, sess).await;
         }
+        t if t == reactions::GET && sess.has_cap(cap::REACTIONS) => {
+            get_reactions(f, tx, ctx, sess).await;
+        }
+        t if t == reactions::SET_NOTIFICATIONS && sess.has_cap(cap::REACTIONS) => {
+            reply(tx, f.trans, vec![reactions::notify_types()]);
+        }
 
         other => {
             debug!("unimplemented transaction {other:#x}");
@@ -6094,10 +6132,6 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
 /// Send Reaction (710) on a line: read, refused here where the session
 /// alone can say so, and otherwise the core's to answer.
 async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
-    let refuse = |text: &str, code: Option<u16>| {
-        let extra = code.map(|c| (structured::DATA_CHAT_REASON, c.to_be_bytes().to_vec()));
-        reply_error_with(tx, f.trans, text, extra.into_iter().collect());
-    };
     let fields = f.chunks().map(|c| (c.tag, c.data));
     let sent = reactions::parse_send(
         fields,
@@ -6106,16 +6140,7 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     );
     let send = match sent {
         Ok(send) => send,
-        Err(reactions::Malformed::Target) => {
-            return refuse(
-                "That is not a target this server takes.",
-                Some(structured::INVALID_TARGET),
-            )
-        }
-        Err(reactions::Malformed::Key) => {
-            return refuse("That is not a reaction.", Some(reactions::INVALID_KEY))
-        }
-        Err(reactions::Malformed::Action) => return reply_error(tx, f.trans, "Malformed request."),
+        Err(m) => return refuse_reaction(tx, f.trans, reactions::malformed(m)),
     };
     let clearing = matches!(
         send,
@@ -6161,8 +6186,48 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     if matches!(refused, Some(ReactError::RateLimited(_))) {
         instrument::rate_limited(WIRE, "react");
     }
-    let (text, code) = reactions::refusal(refused, clearing);
-    refuse(text, code);
+    refuse_reaction(tx, f.trans, reactions::refusal(refused, clearing));
+}
+
+/// A refusal in the draft's reply shape, its reason code where it has one.
+fn refuse_reaction(tx: &Tx, trans: u32, (text, code): (&str, Option<u16>)) {
+    let extra = code.map(|c| (structured::DATA_CHAT_REASON, c.to_be_bytes().to_vec()));
+    reply_error_with(tx, trans, text, extra.into_iter().collect());
+}
+
+/// Get Reactions (712): the lines asked for that this session could have
+/// read, as the core answers them.
+async fn get_reactions(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
+    let fields = f.chunks().map(|c| (c.tag, c.data));
+    let asked = reactions::parse_get(
+        fields,
+        sess.reaction_targets,
+        sess.has_cap(cap::SERVER_EMOJI),
+    );
+    let (targets, key) = match asked {
+        Ok(asked) => asked,
+        Err(m) => return refuse_reaction(tx, f.trans, reactions::malformed(m)),
+    };
+    let uid = sess.uid;
+    let answered = off_reactor(&ctx.core, move |c| {
+        c.reactions_asked(uid, &targets, key.as_ref())
+    })
+    .await;
+    match answered {
+        Some(Ok(answers)) => match reactions::asked(&answers, sess.enc) {
+            Some(chunks) => reply(tx, f.trans, chunks),
+            None => refuse_reaction(
+                tx,
+                f.trans,
+                reactions::malformed(reactions::Malformed::TooManyTargets),
+            ),
+        },
+        Some(Err(e)) => {
+            warn!(uid, "chat log would not read reactions: {e}");
+            reply_error(tx, f.trans, "Server error.");
+        }
+        None => reply_error(tx, f.trans, "Server error."),
+    }
 }
 
 /// How many Get Icon Lists a session may have in a burst, and how often
@@ -6360,7 +6425,13 @@ mod tests {
     /// cannot read.
     #[test]
     fn reaction_requests_have_a_label() {
-        assert!(matches!(type_label(reactions::SEND), Kind::Type(_)));
+        for ty in [
+            reactions::SEND,
+            reactions::GET,
+            reactions::SET_NOTIFICATIONS,
+        ] {
+            assert!(matches!(type_label(ty), Kind::Type(_)), "{ty}");
+        }
     }
 
     /// Every type `dispatch` answers by name is in `HANDLED`. Read from

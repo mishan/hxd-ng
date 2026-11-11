@@ -1,6 +1,8 @@
 //! Reactions on the classic wire (the Reactions draft): capability bit
-//! 19, Send Reaction (710) on the lines of the log, and Reaction Changed
-//! (711) for every change the core tells a session that negotiated it.
+//! 19, Send Reaction (710) and Get Reactions (712) on the lines of the
+//! log, Reaction Changed (711) for every change the core tells a session
+//! that negotiated it, a line's reactions on its 700 entry, and Set
+//! Notifications (717) answered with no type.
 //!
 //! Only a session that negotiated bit 19, beside bits 1 and 17, is
 //! answered here or sent any of it; to every other these transactions do
@@ -13,16 +15,23 @@
 use std::time::Instant;
 
 use hxd_core::reply::{guid_bytes, guid_of};
-use hxd_core::{ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reply};
+use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reply};
 
 use crate::encoding::TextEncoding;
+use crate::frame::Frame;
 use crate::friends::PAGE_BUDGET;
-use crate::structured::{INVALID_TARGET, NOT_ALLOWED, NO_SUCH_TARGET, RATE_LIMITED};
+use crate::structured::{
+    INVALID_TARGET, NOT_ALLOWED, NO_SUCH_TARGET, RATE_LIMITED, TOO_MANY_TARGETS,
+};
 
 type Chunks = Vec<(u16, Vec<u8>)>;
 
 pub const SEND: u32 = 710;
 pub const CHANGED: u32 = 711;
+pub const GET: u32 = 712;
+/// The Replies draft's Set Notifications, which a session with bit 19
+/// may send too.
+pub const SET_NOTIFICATIONS: u32 = 717;
 
 pub const DATA_TARGET: u16 = 0x0f24;
 pub const DATA_REACTION_KEY: u16 = 0x0f25;
@@ -33,6 +42,17 @@ pub const DATA_REACTION_TARGETS: u16 = 0x0f2b;
 pub const DATA_MAX_REACTION_KEYS: u16 = 0x0f2c;
 pub const DATA_MAX_REACTIONS_PER_USER: u16 = 0x0f2d;
 pub const DATA_REACTION_MINE: u16 = 0x0f31;
+/// The Replies draft's: the notification types a session asks for, and
+/// is granted.
+pub const DATA_NOTIFY_TYPES: u16 = 0x0f2e;
+
+/// A 700 entry's sub-fields: the line's `DATA_REACTION_SUMMARY`, and the
+/// reader's `DATA_REACTION_MINE`.
+pub const REACTIONS: u16 = 0x0021;
+pub const REACTIONS_MINE: u16 = 0x0023;
+
+/// The most targets one 712 names.
+const MAX_TARGETS: usize = 50;
 
 /// `DATA_FRIEND_LOGIN`, the instant messaging extension's: an instant
 /// message's other party, and in a change group its reactor.
@@ -66,15 +86,33 @@ pub const TARGETS_STORED_PMS: u16 = 1 << 6;
 /// the trail takes no clear without one.
 pub const CLEAR_REASON: &str = "Cleared on the classic wire.";
 
-/// Is `ty` one of the draft's requests?
+/// Is `ty` one of the requests a session with bit 19 may send?
 pub(crate) fn handles(ty: u32) -> bool {
-    ty == SEND
+    matches!(ty, SEND | GET | SET_NOTIFICATIONS)
 }
 
 /// What each costs a session that negotiated bit 19: a reaction what a
-/// line or a message does.
-pub(crate) fn price(ty: u32) -> Option<u32> {
-    handles(ty).then_some(2)
+/// line or a message does, a 712 more the more targets it names, as the
+/// draft asks, and a 717 what any small request does.
+pub(crate) fn price(f: &Frame) -> Option<u32> {
+    match f.ty {
+        SEND => Some(2),
+        GET => Some(get_price(
+            f.chunks().filter(|c| c.tag == DATA_TARGET).count(),
+        )),
+        SET_NOTIFICATIONS => Some(1),
+        _ => None,
+    }
+}
+
+fn get_price(targets: usize) -> u32 {
+    1 + targets.div_ceil(10) as u32
+}
+
+/// What 717, and a login that asks, is answered: no type, since this
+/// server sends no notification.
+pub(crate) fn notify_types() -> (u16, Vec<u8>) {
+    (DATA_NOTIFY_TYPES, 0u32.to_be_bytes().to_vec())
 }
 
 /// The kinds of target this session may name, fixed at its login: lines
@@ -232,13 +270,29 @@ pub(crate) enum Send {
     Unheld { clearing: bool },
 }
 
-/// Why a 710 was refused before the core was asked.
+/// Why a 710 or a 712 was refused as malformed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Malformed {
     Target,
     Key,
     /// No action the draft defines, for which it has no code.
     Action,
+    /// More targets than a 712 takes, a key beside more than one, or a
+    /// reply past one frame.
+    TooManyTargets,
+}
+
+/// A [`Malformed`] request's text and reason code.
+pub(crate) fn malformed(m: Malformed) -> (&'static str, Option<u16>) {
+    match m {
+        Malformed::Target => (
+            "That is not a target this server takes.",
+            Some(INVALID_TARGET),
+        ),
+        Malformed::Key => ("That is not a reaction.", Some(INVALID_KEY)),
+        Malformed::Action => ("Malformed request.", None),
+        Malformed::TooManyTargets => ("Too many targets for one request.", Some(TOO_MANY_TARGETS)),
+    }
 }
 
 /// 710's fields, from a session that may name `offered`, and with
@@ -279,6 +333,65 @@ pub(crate) fn parse_send<'a>(
         Some((room, id)) => Send::Line { room, id, key, add },
         None => Send::Unheld { clearing: false },
     })
+}
+
+/// 712's fields: 1 to [`MAX_TARGETS`] targets, counted before any is
+/// read, of the kinds kept to be read again, and a key beside one alone.
+/// A line nobody keeps is left out, as the core leaves out one it does
+/// not hold.
+pub(crate) fn parse_get<'a>(
+    fields: impl Iterator<Item = (u16, &'a [u8])> + Clone,
+    offered: u16,
+    emoji: bool,
+) -> Result<(Vec<Reply>, Option<ReactionKey>), Malformed> {
+    let sent = || fields.clone().filter(|(t, _)| *t == DATA_TARGET);
+    let n = sent().count();
+    if n == 0 {
+        return Err(Malformed::Target);
+    }
+    if n > MAX_TARGETS {
+        return Err(Malformed::TooManyTargets);
+    }
+    let mut targets = Vec::with_capacity(n);
+    for (_, b) in sent() {
+        match parse_target(b, offered) {
+            Some(Target::Named(Reply::Im(_))) | None => return Err(Malformed::Target),
+            Some(Target::Named(t)) => targets.push(t),
+            Some(Target::Unheld) => {}
+        }
+    }
+    let key = match fields.clone().find(|(t, _)| *t == DATA_REACTION_KEY) {
+        None => None,
+        Some(_) if n != 1 => return Err(Malformed::TooManyTargets),
+        Some((_, k)) => Some(parse_key(k, emoji).ok_or(Malformed::Key)?),
+    };
+    Ok((targets, key))
+}
+
+/// 712's reply: a group for each target answered, in the order asked,
+/// and with a key who holds it, by the nick each reacted under. `None`
+/// past what one frame carries, which only targets at the largest caps
+/// reach.
+pub(crate) fn asked(answers: &[Asked], enc: TextEncoding) -> Option<Chunks> {
+    let mut out = Chunks::new();
+    for a in answers {
+        let Some(target) = pack_target(&a.target) else {
+            continue;
+        };
+        out.push((DATA_TARGET, target));
+        out.push((DATA_REACTION_SUMMARY, summary(&a.shown.keys)));
+        if !a.shown.mine.is_empty() {
+            out.push((DATA_REACTION_MINE, mine(&a.shown.mine)));
+        }
+        let from = a.from.iter().flatten();
+        out.extend(from.map(|nick| {
+            (
+                hxproto::messages::tag::NAME,
+                crate::session::wire_nick(enc, nick),
+            )
+        }));
+    }
+    (group_len(&out) <= PAGE_BUDGET).then_some(out)
 }
 
 /// A refusal's text and reason code: none where the draft has none.
@@ -932,6 +1045,157 @@ mod tests {
             let it = fields.iter().map(|(t, d)| (*t, d.as_slice()));
             assert_eq!(parse_send(it, ALL, false), want, "{case}");
         }
+    }
+
+    #[test]
+    fn a_712_takes_one_to_fifty_kept_targets_and_a_key_beside_one() {
+        let lobby = line_bytes(1, 0, 9);
+        let key = thumbs().pack();
+        let line = |room, id| Reply::Line { room, id };
+        let targets = |list: &[Vec<u8>]| -> Vec<(u16, Vec<u8>)> {
+            list.iter().map(|t| (DATA_TARGET, t.clone())).collect()
+        };
+        let with_key = |mut f: Vec<(u16, Vec<u8>)>, k: Vec<u8>| {
+            f.push((DATA_REACTION_KEY, k));
+            f
+        };
+        let fifty = vec![lobby.clone(); 50];
+        let alone = targets(std::slice::from_ref(&lobby));
+        for (case, fields, want) in [
+            (
+                "a line in each kind, and one nobody keeps left out",
+                targets(&[
+                    line_bytes(4, 5, 9),
+                    line_bytes(4, 0, 9),
+                    line_bytes(1, 5, 9),
+                    lobby.clone(),
+                ]),
+                Ok((vec![line(5, 9), line(5, 9), line(0, 9)], None)),
+            ),
+            ("fifty", targets(&fifty), Ok((vec![line(0, 9); 50], None))),
+            (
+                "a key beside one",
+                with_key(alone.clone(), key.clone()),
+                Ok((vec![line(0, 9)], Some(thumbs()))),
+            ),
+            (
+                "none",
+                vec![(DATA_REACTION_KEY, key.clone())],
+                Err(Malformed::Target),
+            ),
+            (
+                "fifty-one, counted before any is read",
+                targets(&[fifty.clone(), vec![vec![3]]].concat()),
+                Err(Malformed::TooManyTargets),
+            ),
+            (
+                "a key beside two",
+                with_key(targets(&[lobby.clone(), lobby.clone()]), key.clone()),
+                Err(Malformed::TooManyTargets),
+            ),
+            (
+                "an instant message, kept nowhere",
+                targets(&[lobby.clone(), im_bytes(b"bob", 3)]),
+                Err(Malformed::Target),
+            ),
+            (
+                "one malformed",
+                targets(&[lobby.clone(), vec![1, 0]]),
+                Err(Malformed::Target),
+            ),
+            (
+                "a key that is no emoji",
+                with_key(alone.clone(), vec![1, b'a']),
+                Err(Malformed::Key),
+            ),
+            (
+                "a server's without bit 20",
+                with_key(alone.clone(), vec![2, 0, 0, 0, 1]),
+                Err(Malformed::Key),
+            ),
+        ] {
+            let it = fields.iter().map(|(t, d)| (*t, d.as_slice()));
+            assert_eq!(parse_get(it, ALL, false), want, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_712_is_priced_one_and_one_for_each_ten_targets() {
+        for (targets, points) in [(1, 2), (10, 2), (11, 3), (50, 6)] {
+            assert_eq!(get_price(targets), points, "{targets}");
+        }
+    }
+
+    fn answer(target: Reply, keys: Vec<(ReactionKey, u32)>, mine: Vec<u8>) -> Asked {
+        Asked {
+            target,
+            shown: hxd_core::Reactions { keys, mine },
+            from: None,
+        }
+    }
+
+    /// Each answer is its group, its target named as this wire names its
+    /// channel, with who holds the key by nick, cut as a user list cuts
+    /// one.
+    #[test]
+    fn a_712_reply_is_a_group_for_each_answer() {
+        let long = "n".repeat(40);
+        let answers = [
+            answer(Reply::Line { room: 5, id: 9 }, vec![(thumbs(), 2)], vec![0]),
+            answer(
+                Reply::Signed {
+                    signer: [0; 32],
+                    id: [0; 16],
+                    hash: [0; 32],
+                },
+                vec![],
+                vec![],
+            ),
+            Asked {
+                from: Some(vec!["bobby".into(), long.clone()]),
+                ..answer(Reply::Line { room: 0, id: 3 }, vec![(thumbs(), 2)], vec![])
+            },
+            answer(Reply::Line { room: 0, id: 4 }, vec![], vec![]),
+        ];
+        let name = |n: &[u8]| (hxproto::messages::tag::NAME, n.to_vec());
+        let want = vec![
+            (DATA_TARGET, line_bytes(4, 5, 9)),
+            (DATA_REACTION_SUMMARY, summary(&[(thumbs(), 2)])),
+            (DATA_REACTION_MINE, vec![1, 0]),
+            (DATA_TARGET, line_bytes(1, 0, 3)),
+            (DATA_REACTION_SUMMARY, summary(&[(thumbs(), 2)])),
+            name(b"bobby"),
+            name(&long.as_bytes()[..31]),
+            (DATA_TARGET, line_bytes(1, 0, 4)),
+            (DATA_REACTION_SUMMARY, vec![0, 0]),
+        ];
+        assert_eq!(asked(&answers, TextEncoding::Utf8), Some(want));
+    }
+
+    /// A reply that fills a frame is sent, and one a byte past it is not.
+    #[test]
+    fn a_712_reply_is_held_to_one_frame() {
+        let mut answers: Vec<Asked> = (0..14)
+            .map(|id| {
+                answer(
+                    Reply::Line { room: 7, id },
+                    worst_keys().to_vec(),
+                    vec![0; 255],
+                )
+            })
+            .collect();
+        let used = group_len(&asked(&answers, TextEncoding::Utf8).unwrap());
+        // A target, and a summary of one key of `n` bytes.
+        let rest = PAGE_BUDGET - used - (4 + 13) - (4 + 2 + 4 + 2 + 1);
+        let last = |n: usize| {
+            let key = ReactionKey::Emoji("x".repeat(n));
+            answer(Reply::Line { room: 7, id: 99 }, vec![(key, 1)], vec![])
+        };
+        answers.push(last(rest));
+        let full = asked(&answers, TextEncoding::Utf8).expect("a full frame");
+        assert_eq!(group_len(&full), PAGE_BUDGET);
+        *answers.last_mut().unwrap() = last(rest + 1);
+        assert_eq!(asked(&answers, TextEncoding::Utf8), None);
     }
 
     #[test]
