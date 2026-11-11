@@ -28,7 +28,7 @@ use hxd_core::voice::VoiceError;
 use hxd_core::{
     Account, AccountRefused, AttachInfo, AuthBackend, AuthError, ChatError, ConnPermit, Core,
     Event, Events, FileEntry, FileKind, FilePrincipal, LinkAuthority, LinkOutcome, Proof,
-    SessionStatus, Share, Transport, Uid, UserInfo,
+    ReactError, SessionStatus, Share, Transport, Uid, UserInfo,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr, NICK_COLOR_NONE};
 use hxproto::text;
@@ -52,6 +52,7 @@ use crate::frame::{pack_frame, read_frame, Frame, ReadError, MAX_FRAME_DATA};
 use crate::friends;
 use crate::media;
 use crate::news::{self, LegacyNews};
+use crate::reactions;
 use crate::structured;
 use crate::video;
 use crate::voice;
@@ -681,6 +682,7 @@ fn type_label(ty: u32) -> Kind<'static> {
         || accounts::handles(ty)
         || friends::handles(ty)
         || emoji::handles(ty)
+        || reactions::handles(ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
@@ -1581,6 +1583,11 @@ struct Session {
     /// Get Emoji's ([`emoji::FETCH_BURST`]), likewise.
     emoji_tokens: f64,
     emoji_refill: Instant,
+    /// The kinds of reaction target this session was told it may name,
+    /// kept as told until it logs in again.
+    reaction_targets: u16,
+    /// What it may be sent of lines' reaction summaries now.
+    summaries: reactions::SummaryBudget,
     /// Whether this session has been sent the banner, which happens once.
     banner_sent: bool,
     /// The image this session was told of and may still download: once,
@@ -2534,6 +2541,16 @@ async fn login_phase(
     if caps.has(cap::INLINE_MEDIA) && !ctx.core.media_enabled() {
         caps = Caps::from_bits(caps.bits() & !(1u64 << cap::INLINE_MEDIA));
     }
+    // Bit 19 only beside bits 1 and 17, as the draft has it, and only
+    // where the core keeps reactions, which the configured bits do not
+    // promise.
+    if caps.has(cap::REACTIONS)
+        && !(caps.has(cap::TEXT_ENCODING)
+            && caps.has(cap::STRUCTURED_CHAT)
+            && ctx.core.reaction_policy().is_some())
+    {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::REACTIONS));
+    }
     // Bits 6 and 8 are the account's as much as the server's, so the
     // domain decides them rather than `ServerConfig::caps`, and bit 8 only
     // beside bit 6 (`docs/instant-messaging.md` §7).
@@ -2578,6 +2595,7 @@ async fn login_phase(
         guest_identities: caps.has(cap::FRIENDSHIPS),
         echoes_own_lines: caps.has(cap::STRUCTURED_CHAT),
         emoji: caps.has(cap::SERVER_EMOJI),
+        reactions: caps.has(cap::REACTIONS),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -2697,6 +2715,14 @@ async fn login_phase(
     if caps.has(cap::SERVER_EMOJI) {
         login_reply.extend(emoji::login_fields(&ctx.core));
     }
+    let reaction_targets = reactions::targets(ctx.core.rooms_enabled());
+    if let Some(policy) = ctx
+        .core
+        .reaction_policy()
+        .filter(|_| caps.has(cap::REACTIONS))
+    {
+        login_reply.extend(reactions::login_fields(&policy, reaction_targets));
+    }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
             if history.max_lines != 0 {
@@ -2756,6 +2782,8 @@ async fn login_phase(
         icon_list_refill: Instant::now(),
         emoji_tokens: emoji::FETCH_BURST,
         emoji_refill: Instant::now(),
+        reaction_targets,
+        summaries: reactions::SummaryBudget::new(Instant::now()),
         banner_sent: false,
         banner_image: None,
         told_read_only: Vec::new(),
@@ -3396,9 +3424,22 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         // Sent only where the transport shows roles, which this one does
         // not.
         Event::RolesChanged(_) | Event::RosterStale => {}
-        // Sent only where the transport declared reactions, which this
-        // one never does.
-        Event::ReactionsChanged(_) => {}
+        // Sent only to a session that negotiated bit 19, with task id 0.
+        Event::ReactionsChanged(changes) => {
+            if sess.has_cap(cap::REACTIONS) {
+                let messenger = sess.has_cap(cap::MESSENGER_SESSION);
+                let frames = reactions::changed(
+                    &changes,
+                    sess.enc,
+                    messenger,
+                    &mut sess.summaries,
+                    Instant::now(),
+                );
+                for chunks in frames {
+                    notify(tx, reactions::CHANGED, chunks);
+                }
+            }
+        }
         // Sent only to a session that negotiated bit 20, with task id 0.
         Event::EmojiChanged { revision } => {
             notify(tx, emoji::CATALOG_CHANGED, emoji::changed(revision));
@@ -3607,6 +3648,7 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
         .filter(|_| speaks_friends(sess, f.ty))
         .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
         .or_else(|| emoji::price(f.ty).filter(|_| sess.has_cap(cap::SERVER_EMOJI)))
+        .or_else(|| reactions::price(f.ty).filter(|_| sess.has_cap(cap::REACTIONS)))
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
@@ -6013,7 +6055,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             let reason =
                 |code: u16| vec![(structured::DATA_CHAT_REASON, code.to_be_bytes().to_vec())];
             if !sess.take_emoji_fetch() {
-                reply_error_with(tx, f.trans, "Slow down.", reason(emoji::RATE_LIMITED));
+                reply_error_with(tx, f.trans, "Slow down.", reason(structured::RATE_LIMITED));
                 return;
             }
             match emoji::image(&ctx.core, f) {
@@ -6031,15 +6073,96 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             "This server's emoji are kept by its operator.",
             vec![(
                 structured::DATA_CHAT_REASON,
-                emoji::NOT_ALLOWED.to_be_bytes().to_vec(),
+                structured::NOT_ALLOWED.to_be_bytes().to_vec(),
             )],
         ),
+
+        // --- Reactions (the Reactions draft) --------------------------
+        // To a session without bit 19, answered below as any transaction
+        // this server does not implement.
+        t if t == reactions::SEND && sess.has_cap(cap::REACTIONS) => {
+            send_reaction(f, tx, ctx, sess).await;
+        }
 
         other => {
             debug!("unimplemented transaction {other:#x}");
             reply_error(tx, f.trans, "Not implemented.");
         }
     }
+}
+
+/// Send Reaction (710) on a line: read, refused here where the session
+/// alone can say so, and otherwise the core's to answer.
+async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
+    let refuse = |text: &str, code: Option<u16>| {
+        let extra = code.map(|c| (structured::DATA_CHAT_REASON, c.to_be_bytes().to_vec()));
+        reply_error_with(tx, f.trans, text, extra.into_iter().collect());
+    };
+    let fields = f.chunks().map(|c| (c.tag, c.data));
+    let sent = reactions::parse_send(
+        fields,
+        sess.reaction_targets,
+        sess.has_cap(cap::SERVER_EMOJI),
+    );
+    let send = match sent {
+        Ok(send) => send,
+        Err(reactions::Malformed::Target) => {
+            return refuse(
+                "That is not a target this server takes.",
+                Some(structured::INVALID_TARGET),
+            )
+        }
+        Err(reactions::Malformed::Key) => {
+            return refuse("That is not a reaction.", Some(reactions::INVALID_KEY))
+        }
+        Err(reactions::Malformed::Action) => return reply_error(tx, f.trans, "Malformed request."),
+    };
+    let clearing = matches!(
+        send,
+        reactions::Send::Clear { .. } | reactions::Send::Unheld { clearing: true }
+    );
+    // A messenger is hidden from the lines' readers, which the core's
+    // clear does not ask; a line nobody keeps is answered only once who
+    // may react, or clear, has been.
+    let may = match send {
+        reactions::Send::Unheld { clearing: true } => sess.account.moderate,
+        reactions::Send::Unheld { clearing: false } => {
+            sess.account.is_person() && sess.can(bit::SEND_CHAT)
+        }
+        _ => true,
+    };
+    let unheld = matches!(send, reactions::Send::Unheld { .. });
+    let refused = if sess.has_cap(cap::MESSENGER_SESSION) || !may {
+        Some(ReactError::NotAllowed)
+    } else if unheld {
+        Some(ReactError::NoSuchTarget)
+    } else {
+        let uid = sess.uid;
+        let reacted = off_reactor(&ctx.core, move |c| match send {
+            reactions::Send::Line { room, id, key, add } => {
+                c.react(uid, room, id, &key, add).map(Some)
+            }
+            reactions::Send::Clear { room, id } => c
+                .react_clear(uid, room, id, reactions::CLEAR_REASON)
+                .map(|()| None),
+            reactions::Send::Unheld { .. } => unreachable!("answered above"),
+        })
+        .await;
+        match reacted {
+            Some(Ok(Some(count))) => {
+                let count = count.to_be_bytes().to_vec();
+                return reply(tx, f.trans, vec![(reactions::DATA_REACTION_COUNT, count)]);
+            }
+            Some(Ok(None)) => return reply(tx, f.trans, vec![]),
+            Some(Err(e)) => Some(e),
+            None => None,
+        }
+    };
+    if matches!(refused, Some(ReactError::RateLimited(_))) {
+        instrument::rate_limited(WIRE, "react");
+    }
+    let (text, code) = reactions::refusal(refused, clearing);
+    refuse(text, code);
 }
 
 /// How many Get Icon Lists a session may have in a burst, and how often
@@ -6231,6 +6354,13 @@ mod tests {
             stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(60)),
             "1970-01-01 00:00 UTC"
         );
+    }
+
+    /// The draft's requests are dispatched by a guard the scan below
+    /// cannot read.
+    #[test]
+    fn reaction_requests_have_a_label() {
+        assert!(matches!(type_label(reactions::SEND), Kind::Type(_)));
     }
 
     /// Every type `dispatch` answers by name is in `HANDLED`. Read from

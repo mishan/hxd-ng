@@ -1046,7 +1046,7 @@ fn named_group(from: &Mailbox, enc: TextEncoding, friendships: bool) -> Chunks {
 
 /// The fields a reply of groups may hold: a frame, with room for what
 /// goes before the groups.
-const PAGE_BUDGET: usize = MAX_FRAME_DATA as usize - 64;
+pub(crate) const PAGE_BUDGET: usize = MAX_FRAME_DATA as usize - 64;
 
 /// What one waiting message adds to its group of Get Message Requests
 /// beside its body: its guid's and timestamp's fields, and its body's

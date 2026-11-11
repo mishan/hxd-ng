@@ -17,6 +17,7 @@ mod hope;
 pub mod media;
 pub mod news;
 pub mod peer;
+pub mod reactions;
 pub mod session;
 pub mod structured;
 pub mod tls;
