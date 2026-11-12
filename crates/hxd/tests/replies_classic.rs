@@ -4,7 +4,8 @@
 //! no type under bit 18 alone, `DATA_REPLY_TO` on a line of the lobby, a
 //! room and a private chat, relayed on 106 and paged on 700 as the entry's
 //! sub-field, crossing to the ng wire and back, dropped where it breaks
-//! the draft and the line relayed, 700 by line id, a stored private
+//! the draft and the line relayed, 700 by line id, a 700's refusal
+//! carrying the family's reason code under bit 18 alone, a stored private
 //! message's reference to a session with bit 18 and a private message's
 //! reply on 104, an instant message's reply on 811, and every session
 //! without the bit sent what it always was.
@@ -22,7 +23,7 @@ use base64::Engine;
 
 use hxd_session::reactions::{CHANGED, DATA_NOTIFY_TYPES, SET_NOTIFICATIONS};
 use hxd_session::replies::{DATA_LINE_ID, DATA_REPLY_TARGETS, DATA_REPLY_TO};
-use hxd_session::structured::DATA_CHAT_LINE;
+use hxd_session::structured::{self, DATA_CHAT_LINE, DATA_CHAT_REASON};
 use hxd_testclient::legacy::{push, Client, Frame, Login};
 use hxd_testclient::messaging as im;
 use hxd_testclient::ng;
@@ -900,6 +901,139 @@ async fn lines_by_id_are_answered_under_the_readers_own_checks() {
         slowed += usize::from(r.error_text().as_deref() == Some("Slow down."));
     }
     assert!(slowed > 0, "the history rate");
+}
+
+/// A 700 refused for a session with bit 18 carries the family's reason
+/// code beside its text where one says what went wrong; the very same
+/// request from any other session is refused with the text alone, as it
+/// always was.
+#[tokio::test]
+async fn a_700_refusal_carries_its_reason_to_bit_18_alone() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    std::fs::write(
+        td.path().join("accounts/gina.toml"),
+        "name = \"gina\"\npassword = \"pw\"\n[access]\nread_chat = true\nread_chat_history = false\n",
+    )
+    .unwrap();
+    const BIT_17: u32 = UTF8 | HISTORY | STRUCTURED;
+    let mut sessions = std::collections::HashMap::new();
+    for (who, login, caps) in [
+        ("bit 18", "alice", ON),
+        ("bit 17", "frank", BIT_17),
+        ("bit 4", "dave", HISTORY),
+        ("bit 18 without 4", "bob", UTF8 | STRUCTURED | REPLIES),
+        ("bit 17 without 4", "boss", UTF8 | STRUCTURED),
+        ("period", "erin", 0),
+        ("bit 18 unprivileged", "gina", ON),
+        ("bit 17 unprivileged", "gina", BIT_17),
+        ("bit 4 unprivileged", "gina", HISTORY),
+    ] {
+        let c = classic(&s, login, Some(caps).filter(|c| *c != 0)).await;
+        sessions.insert(who, (c, caps));
+    }
+    let refused = |f: &Frame| {
+        f.chunks()
+            .map(|c| (c.tag, c.data.to_vec()))
+            .collect::<Vec<_>>()
+    };
+    let want = |text: &str, code: Option<u16>| {
+        let mut fields = vec![(tag::TASK_ERROR, text.as_bytes().to_vec())];
+        fields.extend(code.map(|c| (DATA_CHAT_REASON, c.to_be_bytes().to_vec())));
+        fields
+    };
+
+    let channel = |id: u32| (tag::CHANNEL_ID, id.to_be_bytes().to_vec());
+    let fifty_one: Vec<u64> = (1..=51).collect();
+    let malformed = "Malformed chat history request.";
+    let readers = ["bit 18", "bit 17", "bit 4"];
+    for (case, fields, text, code, asked) in [
+        (
+            "not negotiated",
+            vec![channel(0)],
+            "Chat history was not negotiated.",
+            None,
+            &["bit 18 without 4", "bit 17 without 4", "period"][..],
+        ),
+        (
+            "not allowed",
+            vec![channel(0)],
+            "You are not allowed to read chat history.",
+            Some(structured::NOT_ALLOWED),
+            &[
+                "bit 18 unprivileged",
+                "bit 17 unprivileged",
+                "bit 4 unprivileged",
+            ],
+        ),
+        ("no channel", vec![], malformed, None, &readers),
+        (
+            "a short channel",
+            vec![(tag::CHANNEL_ID, vec![0; 3])],
+            malformed,
+            None,
+            &readers,
+        ),
+        // Ids are no field a session without bit 18 knows, so it is paged.
+        (
+            "a short id",
+            vec![channel(0), (DATA_LINE_ID, vec![0; 7])],
+            malformed,
+            Some(structured::INVALID_TARGET),
+            &["bit 18"],
+        ),
+        (
+            "51 ids",
+            by_ids(&fifty_one, &[]),
+            malformed,
+            Some(structured::TOO_MANY_TARGETS),
+            &["bit 18"],
+        ),
+        (
+            "51 ids without a channel",
+            by_ids(&fifty_one, &[])[1..].to_vec(),
+            malformed,
+            None,
+            &["bit 18"],
+        ),
+        (
+            "a room",
+            vec![channel(LOUNGE)],
+            "No such channel.",
+            None,
+            &readers,
+        ),
+    ] {
+        for who in asked {
+            let (c, caps) = sessions.get_mut(who).unwrap();
+            let code = code.filter(|_| *caps & REPLIES != 0);
+            let trans = c.send(700, &fields).await.unwrap();
+            let got = c.reply(trans).await.unwrap();
+            assert!(got.is_error(), "{case}: {who}");
+            assert_eq!(refused(&got), want(text, code), "{case}: {who}");
+        }
+    }
+
+    for who in readers {
+        let (c, caps) = sessions.get_mut(who).unwrap();
+        let code = (*caps & REPLIES != 0).then_some(structured::RATE_LIMITED);
+        let mut sent = Vec::new();
+        for _ in 0..30 {
+            sent.push(c.send(700, &[channel(0)]).await.unwrap());
+        }
+        let mut slowed = Vec::new();
+        for trans in sent {
+            let r = c.reply(trans).await.unwrap();
+            if r.is_error() {
+                slowed.push(refused(&r));
+            }
+        }
+        assert!(!slowed.is_empty(), "{who}: the history rate");
+        assert!(
+            slowed.iter().all(|f| *f == want("Slow down.", code)),
+            "{who}: {slowed:?}"
+        );
+    }
 }
 
 /// The Replies draft's `DATA_PM_ID`.

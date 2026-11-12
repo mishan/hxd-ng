@@ -17,6 +17,7 @@
 use hxd_core::Reply;
 
 use crate::frame::Frame;
+use crate::structured;
 use crate::target::{im, line, EPHEMERAL, IM, LINE, PM, STORED};
 
 /// A line's history id, repeated in a 700 that asks for lines by id.
@@ -82,13 +83,17 @@ pub(crate) fn reply_to(f: &Frame, offered: u16, said: Said) -> Result<Option<Rep
     }
 }
 
-/// The lines a 700 asks for by id, none for a page; `None` past
-/// [`MAX_IDS`] or for an id that is not 8 bytes.
-pub(crate) fn line_ids(f: &Frame) -> Option<Vec<u64>> {
-    let ids: Option<Vec<u64>> = (f.chunks().filter(|c| c.tag == DATA_LINE_ID))
-        .map(|c| c.data.try_into().ok().map(u64::from_be_bytes))
-        .collect();
-    ids.filter(|ids| ids.len() <= MAX_IDS)
+/// The lines a 700 asks for by id, none for a page; past [`MAX_IDS`], or
+/// with an id that is not 8 bytes, the reason code it is refused with.
+pub(crate) fn line_ids(f: &Frame) -> Result<Vec<u64>, u16> {
+    let ids: Vec<u64> = (f.chunks().filter(|c| c.tag == DATA_LINE_ID))
+        .map(|c| c.data.try_into().map(u64::from_be_bytes))
+        .collect::<Result<_, _>>()
+        .map_err(|_| structured::INVALID_TARGET)?;
+    match ids.len() <= MAX_IDS {
+        true => Ok(ids),
+        false => Err(structured::TOO_MANY_TARGETS),
+    }
 }
 
 /// `DATA_REPLY_TO` as sent, said where `said` is. Kind 1 names a kept
@@ -143,6 +148,7 @@ pub(crate) fn parse(b: &[u8], offered: u16, said: Said) -> Result<Reply, &'stati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structured::{INVALID_TARGET, TOO_MANY_TARGETS};
     use hxd_core::reply::guid_of;
     use hxproto::messages::tag;
 
@@ -385,11 +391,15 @@ mod tests {
         let id = |n: u64| (DATA_LINE_ID, n.to_be_bytes().to_vec());
         let channel = (tag::CHANNEL_ID, vec![0; 4]);
         for (case, ids, want) in [
-            ("none", vec![], Some(vec![])),
-            ("one", vec![id(7)], Some(vec![7])),
-            ("50", (1..=50).map(id).collect(), Some((1..=50).collect())),
-            ("51", (1..=51).map(id).collect(), None),
-            ("7 bytes", vec![id(7), (DATA_LINE_ID, vec![0; 7])], None),
+            ("none", vec![], Ok(vec![])),
+            ("one", vec![id(7)], Ok(vec![7])),
+            ("50", (1..=50).map(id).collect(), Ok((1..=50).collect())),
+            ("51", (1..=51).map(id).collect(), Err(TOO_MANY_TARGETS)),
+            (
+                "7 bytes",
+                vec![id(7), (DATA_LINE_ID, vec![0; 7])],
+                Err(INVALID_TARGET),
+            ),
         ] {
             let fields = [vec![channel.clone()], ids].concat();
             let packed = crate::frame::pack_frame(700, 1, 0, &fields);

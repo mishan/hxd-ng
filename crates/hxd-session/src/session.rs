@@ -4929,17 +4929,26 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         },
 
         t if t == ClientHdr::GetChatHistory.as_u32() => {
+            // Bit 18 makes 700 one of the Structured Chat family's
+            // requests, by line id, so this server refuses every 700 from
+            // it in the family's reply shape. Bit 17 alone sends no request
+            // of the family's: every other session is refused with the
+            // text alone, as is a refusal none of the family's codes
+            // describes.
+            let refuse = |text: &str, code: Option<u16>| {
+                let code = code.filter(|_| sess.has_cap(cap::REPLIES));
+                refuse_with_reason(tx, f.trans, (text, code))
+            };
             if !sess.has_cap(cap::CHAT_HISTORY) {
                 reply_error(tx, f.trans, "Chat history was not negotiated.");
                 return;
             }
             if !sess.can(bit::CHAT_HISTORY) {
-                reply_error(tx, f.trans, "You are not allowed to read chat history.");
-                return;
+                let text = "You are not allowed to read chat history.";
+                return refuse(text, Some(structured::NOT_ALLOWED));
             }
             if !ctx.core.allow_history_request(sess.uid).unwrap_or(false) {
-                reply_error(tx, f.trans, "Slow down.");
-                return;
+                return refuse("Slow down.", Some(structured::RATE_LIMITED));
             }
 
             let (mut channel, mut before, mut after, mut limit) = (None, None, None, None);
@@ -4970,11 +4979,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // To a session without bit 18 the ids are no field it knows.
             let ids = match sess.has_cap(cap::REPLIES) {
                 true => replies::line_ids(f),
-                false => Some(Vec::new()),
+                false => Ok(Vec::new()),
             };
-            let Some(ids) = ids.filter(|_| !malformed && channel.is_some()) else {
-                reply_error(tx, f.trans, "Malformed chat history request.");
-                return;
+            let ids = match ids {
+                Ok(ids) if !malformed && channel.is_some() => ids,
+                ids => {
+                    let code = ids.err().filter(|_| !malformed && channel.is_some());
+                    return refuse("Malformed chat history request.", code);
+                }
             };
             if channel != Some(0) {
                 reply_error(tx, f.trans, "No such channel.");
@@ -6276,7 +6288,7 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     );
     let send = match sent {
         Ok(send) => send,
-        Err(m) => return refuse_reaction(tx, f.trans, reactions::malformed(m)),
+        Err(m) => return refuse_with_reason(tx, f.trans, reactions::malformed(m)),
     };
     let clearing = matches!(
         send,
@@ -6336,11 +6348,12 @@ async fn send_reaction(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     if matches!(refused, Some(ReactError::RateLimited(_))) {
         instrument::rate_limited(WIRE, "react");
     }
-    refuse_reaction(tx, f.trans, reactions::refusal(refused, clearing));
+    refuse_with_reason(tx, f.trans, reactions::refusal(refused, clearing));
 }
 
-/// A refusal in the draft's reply shape, its reason code where it has one.
-fn refuse_reaction(tx: &Tx, trans: u32, (text, code): (&str, Option<u16>)) {
+/// A refusal in the Structured Chat family's reply shape, its reason code
+/// where it has one.
+fn refuse_with_reason(tx: &Tx, trans: u32, (text, code): (&str, Option<u16>)) {
     let extra = code.map(|c| (structured::DATA_CHAT_REASON, c.to_be_bytes().to_vec()));
     reply_error_with(tx, trans, text, extra.into_iter().collect());
 }
@@ -6356,7 +6369,7 @@ async fn get_reactions(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     );
     let (targets, key) = match asked {
         Ok(asked) => asked,
-        Err(m) => return refuse_reaction(tx, f.trans, reactions::malformed(m)),
+        Err(m) => return refuse_with_reason(tx, f.trans, reactions::malformed(m)),
     };
     let uid = sess.uid;
     let answered = off_reactor(&ctx.core, move |c| {
@@ -6366,7 +6379,7 @@ async fn get_reactions(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     match answered {
         Some(Ok(answers)) => match reactions::asked(&answers, sess.enc) {
             Some(chunks) => reply(tx, f.trans, chunks),
-            None => refuse_reaction(
+            None => refuse_with_reason(
                 tx,
                 f.trans,
                 reactions::malformed(reactions::Malformed::TooManyTargets),
