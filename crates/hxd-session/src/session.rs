@@ -1406,11 +1406,12 @@ fn format_replay(line: &hxd_core::LogLine, enc: TextEncoding) -> Vec<u8> {
 ///
 /// Entries arrive and leave oldest-first, and are dropped from the end
 /// the client is paging *away* from: an `after` query continues from the
-/// newest id it was handed, so the newest go; every other query
-/// continues from the oldest, so the oldest go. What is left is still
-/// contiguous with the cursor the client will send next, and the caller
-/// turns a drop into `has_more`, which means "more in the direction of
-/// the query".
+/// newest id it was handed, so the newest go, as they do from lines
+/// asked for by id, asked for again past the last one handed; every
+/// other query continues from the oldest, so the oldest go. What is left
+/// is still contiguous with the cursor the client will send next, and
+/// the caller turns a drop into `has_more`, which means "more in the
+/// direction of the query".
 fn fit_history_entries(mut entries: Vec<Vec<u8>>, paging_newer: bool) -> (Vec<Vec<u8>>, bool) {
     // CHANNEL_ID and HAS_MORE ride along in the same transaction, and
     // the chunk count sits inside the counted data size.
@@ -4950,10 +4951,15 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     _ => {}
                 }
             }
-            if malformed || channel.is_none() {
+            // To a session without bit 18 the ids are no field it knows.
+            let ids = match sess.has_cap(cap::REPLIES) {
+                true => replies::line_ids(f),
+                false => Some(Vec::new()),
+            };
+            let Some(ids) = ids.filter(|_| !malformed && channel.is_some()) else {
                 reply_error(tx, f.trans, "Malformed chat history request.");
                 return;
-            }
+            };
             if channel != Some(0) {
                 reply_error(tx, f.trans, "No such channel.");
                 return;
@@ -4974,8 +4980,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             };
             let uid = sess.uid;
             let reacting = sess.has_cap(cap::REACTIONS);
+            // Lines by id ignore the cursors, as the draft has it.
+            let by_ids = !ids.is_empty();
             let paged = off_reactor(&ctx.core, move |c| {
-                let page = c.history(uid, query)?;
+                let page = match by_ids {
+                    true => hxd_core::HistoryPage {
+                        lines: c.history_ids(uid, 0, &ids)?,
+                        has_more: false,
+                    },
+                    false => c.history(uid, query)?,
+                };
                 let ids: Vec<_> = (page.lines.iter())
                     .filter(|l| !l.flags.contains(hxd_core::LineFlags::DELETED))
                     .map(|l| l.id)
@@ -5058,7 +5072,8 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             },
                         ));
                     }
-                    let (entries, trimmed) = fit_history_entries(entries, after.is_some());
+                    let (entries, trimmed) =
+                        fit_history_entries(entries, by_ids || after.is_some());
                     let mut chunks = Vec::with_capacity(entries.len() + 2);
                     chunks.push((tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec()));
                     chunks.extend(entries.into_iter().map(|e| (tag::HISTORY_ENTRY, e)));

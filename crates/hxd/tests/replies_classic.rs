@@ -4,9 +4,9 @@
 //! no type under bit 18 alone, `DATA_REPLY_TO` on a line of the lobby, a
 //! room and a private chat, relayed on 106 and paged on 700 as the entry's
 //! sub-field, crossing to the ng wire and back, dropped where it breaks
-//! the draft and the line relayed, a stored private message's reference
-//! to a session with bit 18, and every session without the bit sent what
-//! it always was.
+//! the draft and the line relayed, 700 by line id, a stored private
+//! message's reference to a session with bit 18, and every session
+//! without the bit sent what it always was.
 //!
 //! Targets and sub-fields are laid out by hand from the draft here rather
 //! than by the server's encoder, so a disagreement between the two shows.
@@ -20,7 +20,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 
 use hxd_session::reactions::{CHANGED, DATA_NOTIFY_TYPES, SET_NOTIFICATIONS};
-use hxd_session::replies::{DATA_REPLY_TARGETS, DATA_REPLY_TO};
+use hxd_session::replies::{DATA_LINE_ID, DATA_REPLY_TARGETS, DATA_REPLY_TO};
 use hxd_session::structured::DATA_CHAT_LINE;
 use hxd_testclient::legacy::{push, Client, Frame, Login};
 use hxd_testclient::ng;
@@ -45,9 +45,12 @@ const MEMBER: &str = "read_chat = true\nsend_chat = true\nread_chat_history = tr
 
 const LOUNGE: u32 = 4000;
 const STAFF: u32 = 4001;
+/// A room alice alone may read.
+const HIDDEN: u32 = 4002;
 
 const ROOMS: &str = "[[room]]\nid = 4000\nname = \"lounge\"\n\n\
-                     [[room]]\nid = 4001\nname = \"staff\"\n";
+                     [[room]]\nid = 4001\nname = \"staff\"\n\n\
+                     [[room]]\nid = 4002\nname = \"hidden\"\nread = [\"alice\"]\n";
 
 struct Server {
     classic: SocketAddr,
@@ -734,6 +737,154 @@ async fn history_carries_a_replys_target_in_type_order() {
 
 fn id_from(entry: &[u8]) -> u64 {
     u64::from_be_bytes(entry[..8].try_into().unwrap())
+}
+
+/// A 700 for the lobby's lines by `ids`, with `more` beside them.
+fn by_ids(ids: &[u64], more: &[(u16, Vec<u8>)]) -> Vec<(u16, Vec<u8>)> {
+    let mut fields = vec![(tag::CHANNEL_ID, 0u32.to_be_bytes().to_vec())];
+    fields.extend((ids.iter()).map(|id| (DATA_LINE_ID, id.to_be_bytes().to_vec())));
+    fields.extend_from_slice(more);
+    fields
+}
+
+/// A 700 reply's entries by id, in order, and its `HAS_MORE`.
+fn answered(f: &Frame) -> (Vec<u64>, bool) {
+    assert!(!f.is_error(), "{:?}", f.error_text());
+    let ids = f
+        .all(tag::HISTORY_ENTRY)
+        .iter()
+        .map(|e| id_from(e))
+        .collect();
+    (ids, f.bytes(tag::HISTORY_HAS_MORE) == Some(vec![1]))
+}
+
+async fn refusal(c: &mut Client, fields: &[(u16, Vec<u8>)]) -> Option<String> {
+    let trans = c.send(700, fields).await.unwrap();
+    c.reply(trans).await.unwrap().error_text()
+}
+
+/// Lines by id are the lobby's among them, ascending, under the reader's
+/// own checks: another room's, read or not, and one that does not exist
+/// are left out alike, a tombstone is one, and cursors beside the ids are
+/// ignored. Past 50 ids is malformed, a room's chat id no channel, past
+/// one frame the highest are left to ask for again, and the history rate
+/// holds. A session without bit 18 is paged.
+#[tokio::test]
+async fn lines_by_id_are_answered_under_the_readers_own_checks() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    let mut alice = classic(&s, "alice", Some(ON)).await;
+    let mut bob = classic(&s, "bob", Some(ON)).await;
+    let mut dave = classic(&s, "dave", Some(UTF8 | HISTORY)).await;
+    let mut carol = ng_client(&s, "carol").await;
+    for room in [LOUNGE, HIDDEN] {
+        join(&mut alice, room).await;
+    }
+    join(&mut bob, LOUNGE).await;
+    let hidden = say(&mut alice, HIDDEN, "alice only").await;
+    let lounge = say(&mut alice, LOUNGE, "in the lounge").await;
+    let first = say(&mut alice, 0, "one").await;
+    let second = say(&mut alice, 0, "two").await;
+    let third = line_id(&reply(&mut alice, 0, "three", &lobby(first)).await);
+    ok(&mut carol, "redact", json!({ "id": second, "reason": "x" })).await;
+
+    let cursors = [
+        (tag::HISTORY_BEFORE, first.to_be_bytes().to_vec()),
+        (tag::HISTORY_LIMIT, 1u16.to_be_bytes().to_vec()),
+    ];
+    let asked = [third, hidden, second, lounge, first, third + 1000, first];
+    let got = bob.call(700, &by_ids(&asked, &cursors)).await.unwrap();
+    assert_eq!(answered(&got), (vec![first, second, third], false));
+    let entries = got.all(tag::HISTORY_ENTRY);
+    let parse = |e| hxproto::parse::parse_history_entry(e).unwrap();
+    assert_eq!(parse(&entries[0]).message, b"one");
+    let tombstone = parse(&entries[1]);
+    assert_eq!(
+        (tombstone.flags & 1 << 2, tombstone.message),
+        (1 << 2, &b""[..])
+    );
+    assert_eq!(subfields(&entries[2]), [(REPLY_TO, lobby(first))]);
+    let mine = alice
+        .call(700, &by_ids(&[hidden, first], &[]))
+        .await
+        .unwrap();
+    assert_eq!(
+        answered(&mine),
+        (vec![first], false),
+        "a room's, read or not"
+    );
+
+    let channel = |id: u32| (tag::CHANNEL_ID, id.to_be_bytes().to_vec());
+    let room = [
+        channel(LOUNGE),
+        (DATA_LINE_ID, lounge.to_be_bytes().to_vec()),
+    ];
+    let fifty_one: Vec<u64> = (first..first + 51).collect();
+    for (case, fields, want) in [
+        (
+            "51 ids",
+            by_ids(&fifty_one, &[]),
+            "Malformed chat history request.",
+        ),
+        ("a room", room.to_vec(), "No such channel."),
+    ] {
+        assert_eq!(
+            refusal(&mut bob, &fields).await.as_deref(),
+            Some(want),
+            "{case}"
+        );
+    }
+
+    // Without bit 18 the ids are no field it knows, whatever they hold.
+    let short = [(DATA_LINE_ID, vec![0; 7])];
+    for (case, fields) in [
+        ("one", by_ids(&[first], &[])),
+        ("51", by_ids(&fifty_one, &[])),
+        ("7 bytes", by_ids(&[], &short)),
+    ] {
+        let page = dave.call(700, &fields).await.unwrap();
+        let (ids, _) = answered(&page);
+        assert!(
+            ids.contains(&first) && ids.contains(&third),
+            "{case}: {ids:?}"
+        );
+    }
+
+    // Lines that together overrun one frame: a period client's 4096 Mac
+    // Roman bytes are three times as many in UTF-8.
+    drop((alice, dave));
+    let mut erin = classic(&s, "erin", None).await;
+    let mut said = Vec::new();
+    for n in 0..25 {
+        let text = [vec![0xa5; 4090], format!("#{n:02}").into_bytes()].concat();
+        erin.send(ClientHdr::Chat.as_u32(), &[(tag::BODY, text)])
+            .await
+            .unwrap();
+        said.push(line_id(&heard(&mut bob, &format!("#{n:02}")).await));
+    }
+    let got = bob.call(700, &by_ids(&said, &[])).await.unwrap();
+    let (shown, more) = answered(&got);
+    assert!(
+        more && !shown.is_empty() && shown.len() < said.len(),
+        "{shown:?}"
+    );
+    assert_eq!(shown, said[..shown.len()], "the lowest ids kept");
+    let rest = bob
+        .call(700, &by_ids(&said[shown.len()..], &[]))
+        .await
+        .unwrap();
+    assert_eq!(answered(&rest), (said[shown.len()..].to_vec(), false));
+
+    let mut sent = Vec::new();
+    for _ in 0..30 {
+        sent.push(bob.send(700, &by_ids(&[first], &[])).await.unwrap());
+    }
+    let mut slowed = 0;
+    for trans in sent {
+        let r = bob.reply(trans).await.unwrap();
+        slowed += usize::from(r.error_text().as_deref() == Some("Slow down."));
+    }
+    assert!(slowed > 0, "the history rate");
 }
 
 /// The Replies draft's `DATA_PM_ID`.

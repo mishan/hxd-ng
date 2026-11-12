@@ -718,7 +718,8 @@ entry, and a bit-4 session is not replayed to.
 **Replies.** To a session that also negotiated bit 18
 (`replies.md`), a 106's entry and a 700 entry carry what the line
 answers as the Replies draft's sub-field `0x0020`, after media's and
-before every later one; a tombstone carries none.
+before every later one; a tombstone carries none. Such a session may
+also ask 700 for lines by id (`replies.md` §4).
 
 **Reactions.** To a session that also negotiated bit 19
 (`reactions.md`), a 700 entry carries the line's reactions as the
