@@ -1176,6 +1176,40 @@ impl Core {
         self
     }
 
+    /// Each open room's newest lines, the lobby's too, read from the log
+    /// and live as if relayed in order, tombstones among them as the live
+    /// path keeps them, so a restart leaves none untold. Once the rooms
+    /// are read, before any session.
+    pub fn with_live_lines(mut self) -> Self {
+        let Some(window) = self.reaction_policy().map(|p| p.live_window) else {
+            return self;
+        };
+        let Some(log) = self.history.clone().filter(|_| window > 0) else {
+            return self;
+        };
+        let rooms: Vec<u32> = {
+            let r = self.roster.lock().unwrap();
+            let open = (r.rooms.iter())
+                .filter(|(_, e)| e.room.archived_at.is_none() && !e.room.deleted)
+                .map(|(id, _)| *id);
+            std::iter::once(0).chain(open).collect()
+        };
+        let live = self.desk.live.get_mut().unwrap_or_else(|e| e.into_inner());
+        for channel in rooms {
+            let query = crate::history::HistoryQuery {
+                channel,
+                before: None,
+                after: None,
+                limit: window,
+            };
+            match log.query(&query) {
+                Ok(page) => page.lines.iter().for_each(|l| live.relayed(channel, l.id)),
+                Err(e) => tracing::warn!("chat history: room {channel}'s live lines: {e}"),
+            }
+        }
+        self
+    }
+
     /// The policy, where lines can take reactions: the log keeps them.
     pub fn reaction_policy(&self) -> Option<ReactionPolicy> {
         self.reactions.filter(|_| self.history.is_some())

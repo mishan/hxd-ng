@@ -470,9 +470,10 @@ Three layers, all `cargo test --workspace`:
   chat 0 no target, held to who may react, the caps apart, the rate and
   a removed server emoji, and a moderator's clear recorded with its
   fixed reason; 711 in one batch a room to the readers with the bit and
-  across to the ng wire and back, a redaction telling it nothing and a
-  purge as summaries; an instant message's reaction told to its other
-  party as a change, across the wires too, kept for an absent one until
+  across to the ng wire and back, a line said before a restart told
+  after it, a redaction telling it nothing and a purge as summaries;
+  an instant message's reaction told to its other party as a change,
+  across the wires too, kept for an absent one until
   a Get Roster from a session with the bit, refused to a stranger, and
   made by a messenger session that may react to no line; 712 in the
   order asked, what could not have been read left out, who reacted by

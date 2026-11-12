@@ -1337,6 +1337,62 @@ fn a_rooms_reactions_are_told_to_its_members_alone() {
     assert_eq!(told(&mut ralice), [there]);
 }
 
+/// After a restart over the same log, each open room's newest lines are
+/// live, the lobby's too, oldest first beside the lines relayed since: a
+/// change to one is told, and one to a line past the window is not.
+#[test]
+fn a_restart_keeps_each_open_rooms_newest_lines_live() {
+    let log = Arc::new(MemoryLog::default());
+    let rooms = Arc::new(MemoryRooms::default());
+    let start = || {
+        Core::new()
+            .with_history(log.clone(), HistoryPolicy::default())
+            .with_reactions(crate::ReactionPolicy {
+                live_window: 2,
+                ..crate::ReactionPolicy::default()
+            })
+            .with_rooms(rooms.clone(), RoomPolicy::default())
+            .unwrap()
+            .with_live_lines()
+    };
+    let core = start();
+    let (boss, _) = attach(&core, manager("boss"));
+    let lounge = core.room_create(boss, named("lounge")).unwrap().id;
+    let [old, a, b] = ["old", "a", "b"].map(|t| say(&core, boss, 0, t).unwrap().unwrap());
+    core.room_join(boss, lounge).unwrap();
+    let inside = say(&core, boss, lounge, "here").unwrap().unwrap();
+    drop(core);
+
+    let core = start();
+    let boss = Who {
+        access: member("boss").access.with(bit::CHAT_HISTORY),
+        ..manager("boss")
+    };
+    let (boss, mut rx) = attach(&core, boss);
+    core.room_join(boss, lounge).unwrap();
+    let c = say(&core, boss, 0, "c").unwrap().unwrap();
+    for (room, line) in [(0, old), (0, a), (0, b), (0, c), (lounge, inside)] {
+        core.react(boss, room, line, &thumbs(), true).unwrap();
+    }
+    core.reactions_flush(core.clock.now() + std::time::Duration::from_secs(5));
+    let mut told: Vec<(u32, LineId)> = (drain(&mut rx).into_iter())
+        .filter_map(|e| match e {
+            Event::ReactionsChanged(changes) => Some(changes),
+            _ => None,
+        })
+        .flatten()
+        .map(|c| match c {
+            crate::ReactionChange::Summary {
+                target: crate::reply::Reply::Line { room, id },
+                ..
+            } => (room, id),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    told.sort();
+    assert_eq!(told, [(0, b), (0, c), (lounge, inside)]);
+}
+
 /// Get Reactions finds a line in the room it was said in alone, for a
 /// reader who sees both that room and the one it is named in.
 #[test]
