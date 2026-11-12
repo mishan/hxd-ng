@@ -774,7 +774,8 @@ async fn waiting(alice: &mut ng::Client, text: &str) -> Vec<u8> {
 /// reply where nothing else follows it.
 async fn handed(c: &mut Client, tail: &str) -> (Frame, Frame) {
     let pm = pm_heard(c, tail).await;
-    c.rx.take_backlog();
+    let before = c.rx.take_backlog();
+    assert!(before.iter().all(|f| f.ty != CHANGED), "{before:?}");
     c.send(ClientHdr::Ping.as_u32(), &[]).await.unwrap();
     (pm, c.recv_where(|_| true).await.unwrap())
 }
