@@ -41,6 +41,7 @@ fn env() -> &'static Env {
                     .with(cap::TEXT_ENCODING)
                     .with(cap::CHAT_HISTORY)
                     .with(cap::STRUCTURED_CHAT)
+                    .with(cap::REPLIES)
                     .with(cap::REACTIONS),
                 ..ServerConfig::default()
             }),

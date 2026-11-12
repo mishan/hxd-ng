@@ -7,9 +7,10 @@
 //! Set Notifications (717) answered with no type.
 //!
 //! Only a session that negotiated bit 19, beside bits 1 and 17, is
-//! answered here or sent any of it; to every other these transactions do
-//! not exist. Who may react, the caps, the rate, the batches and who is
-//! told are `hxd_core::reaction`'s: this is a translation of its calls.
+//! answered here or sent any of it, but for the reference and 717, which
+//! the Replies draft's bit 18 is sent and answered too; to every other
+//! these transactions do not exist. Who may react, the caps, the rate,
+//! the batches and who is told are `hxd_core::reaction`'s: this is a translation of its calls.
 //!
 //! The draft's numbers are kept here, as Structured Chat's are in
 //! [`crate::structured`], until they are allocated.
@@ -17,7 +18,7 @@
 use std::time::Instant;
 
 use hxd_core::inbox::MessageRef;
-use hxd_core::reply::{guid_bytes, guid_of, ImTarget};
+use hxd_core::reply::ImTarget;
 use hxd_core::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reactions, Reply};
 
 use crate::encoding::TextEncoding;
@@ -26,6 +27,7 @@ use crate::friends::PAGE_BUDGET;
 use crate::structured::{
     INVALID_TARGET, NOT_ALLOWED, NO_SUCH_TARGET, RATE_LIMITED, TOO_MANY_TARGETS,
 };
+use crate::target::{im, line, pack as pack_target, EPHEMERAL, IM, LINE, PM, STORED};
 
 type Chunks = Vec<(u16, Vec<u8>)>;
 
@@ -72,14 +74,6 @@ pub const ADD: u16 = 1;
 pub const REMOVE: u16 = 2;
 pub const CLEAR: u16 = 3;
 pub const SUMMARY: u16 = 4;
-
-const LINE: u8 = 1;
-const IM: u8 = 2;
-const EPHEMERAL: u8 = 4;
-const PM: u8 = 5;
-
-/// A private message reference's flag for one the server stores.
-const STORED: u8 = 1;
 
 /// `DATA_REACTION_TARGETS`' bits: `1 << kind`, and bit 6 for stored
 /// private messages.
@@ -180,60 +174,18 @@ pub(crate) fn parse_target(b: &[u8], offered: u16) -> Option<Target> {
     if offered & bit == 0 {
         return None;
     }
-    let line = |rest: &[u8]| {
-        let (chat, id) = <&[u8; 12]>::try_from(rest).ok()?.split_at(4);
-        Some((
-            u32::from_be_bytes(chat.try_into().ok()?),
-            u64::from_be_bytes(id.try_into().ok()?),
-        ))
-    };
     match kind {
         LINE => line(rest).map(|(room, id)| Target::Named(Reply::Line { room, id })),
         EPHEMERAL => line(rest).map(|(chat, id)| match chat {
             0 => Target::Unheld,
             room => Target::Named(Reply::Line { room, id }),
         }),
-        IM => {
-            let (guid, rest) = rest.split_first_chunk::<16>()?;
-            let (&len, login) = rest.split_first()?;
-            if login.len() != usize::from(len) {
-                return None;
-            }
-            let login = String::from_utf8(login.to_vec()).ok()?;
-            Reply::im(login, guid_of(guid)?).map(Target::Named)
-        }
+        IM => im(rest).map(Target::Named),
         PM => <[u8; 17]>::try_from(rest)
             .ok()
             .map(|r| Target::Named(Reply::Pm(r[1..].try_into().expect("16 bytes")))),
         _ => None,
     }
-}
-
-/// `target` as this wire names it to a reader: a lobby line kind 1 on
-/// channel 0 and a room's kind 4 under its chat id, however it was
-/// asked, since a session names a channel one way. A signed target has
-/// no form here, and no reaction names a line the server does not keep.
-pub(crate) fn pack_target(target: &Reply) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    match target {
-        Reply::Line { room, id } => {
-            out.push(if *room == 0 { LINE } else { EPHEMERAL });
-            out.extend_from_slice(&room.to_be_bytes());
-            out.extend_from_slice(&id.to_be_bytes());
-        }
-        Reply::Im(t) => {
-            out.push(IM);
-            out.extend_from_slice(&guid_bytes(t.guid()));
-            out.push(t.login().len() as u8);
-            out.extend_from_slice(t.login().as_bytes());
-        }
-        Reply::Pm(r) => {
-            out.push(PM);
-            out.extend_from_slice(&pm_id(r));
-        }
-        Reply::Signed { .. } | Reply::Ephemeral { .. } => return None,
-    }
-    Some(out)
 }
 
 /// `DATA_REACTION_KEY` as sent: one emoji, or from a session that
@@ -603,6 +555,7 @@ mod tests {
     use std::time::Duration;
 
     use hxd_core::emoji::EmojiId;
+    use hxd_core::reply::guid_of;
 
     const ALL: u16 = TARGETS_LINES | TARGETS_IMS | TARGETS_EPHEMERAL | TARGETS_STORED_PMS;
 

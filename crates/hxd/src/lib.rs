@@ -2815,8 +2815,9 @@ fn legacy_caps(config: &Config, voice: Option<&Voice>, files: Option<&Files>, em
         caps = caps.with(cap::LARGE_FILES);
     }
     if config.structured_chat.as_ref().is_some_and(|s| s.enabled) {
-        caps = caps.with(cap::STRUCTURED_CHAT);
-        // Confirmed only beside bit 17, so offered only with it.
+        // Replies and reactions are confirmed only beside bit 17, so
+        // offered only with it; replies need nothing else.
+        caps = caps.with(cap::STRUCTURED_CHAT).with(cap::REPLIES);
         if config.reactions.as_ref().is_some_and(|r| r.enabled) {
             caps = caps.with(cap::REACTIONS);
         }

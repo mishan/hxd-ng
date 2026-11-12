@@ -34,9 +34,11 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   account holding the send-chat privilege, the interim gate until the
   draft's React access bit is allocated.
 - **A session without bit 19**, a period client and one with bit 17
-  alone included, is sent exactly what it was: 710, 712 and 717 are
+  alone included, is sent exactly what it was: 710 and 712 are
   answered "Not implemented." as any transaction this server does not
-  know, and no 711 or field of the family's reactions reaches it.
+  know, and so is 717 without the Replies draft's bit 18
+  (`replies.md` §6), and no 711 or field of the family's reactions
+  reaches it.
 
 ## 2. Targets
 
@@ -69,9 +71,10 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   the other. The message is never looked up, and kept nowhere to be
   read again, so 712 refuses it.
 - **A stored private message** is kind 5, the stored flag set and the
-  16 bytes the ng wire names it by (its `ref`). A session with bit 19 is
-  given them as `DATA_PM_ID` on the 104 that hands the message over,
-  live or after it waited, and on the reply to the 108 that sent it. A
+  16 bytes the ng wire names it by (its `ref`). A session with bit 19,
+  or the Replies draft's bit 18, is given them as `DATA_PM_ID` on the
+  104 that hands the message over, live or after it waited, and on the
+  reply to the 108 that sent it. A
   message nothing stored has none: on a server or to an account without
   an inbox, from a plain guest, past the sender's daily quota (then it is
   delivered live and kept nowhere), and to or from a linked server's
