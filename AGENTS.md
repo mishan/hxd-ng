@@ -53,7 +53,7 @@ been exercised on newer toolchains; CI runs stable.
 | Crate | Role |
 |---|---|
 | `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, what a line or message answers (`reply`), the emoji an account reacts to a line or a stored message with (`reaction`, every change to a line's made in order at one desk, `reaction::desk`, and to a message's under a mutex of its own, `reaction::pm`), the news tree, avatars, the server's emoji catalog, the copy of it the server serves from and what a line or message keeps of the emoji it names (`emoji`), access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
-| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`), the friend family of fogWraith's instant messaging extension and the message requests draft (`friends.rs`), device proof, with the checks behind a `DeviceProver` the binary wires in (`device.rs`), a chat line as its history entry, for 700 and for Structured Chat's 106 alike (`structured.rs`), the Server Emoji draft's catalog, images and refs (`emoji.rs`), and the Reactions draft's Send Reaction, Reaction Changed and Get Reactions and a line's reactions in its 700 entry (`reactions.rs`, `docs/reactions.md`). `run_session` is generic over the byte stream so the ng port can feed it a tunneled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
+| `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`), the friend family of fogWraith's instant messaging extension and the message requests draft (`friends.rs`), device proof, with the checks behind a `DeviceProver` the binary wires in (`device.rs`), a chat line as its history entry, for 700 and for Structured Chat's 106 alike (`structured.rs`), the Server Emoji draft's catalog, images and refs (`emoji.rs`), and the Reactions draft's Send Reaction, Reaction Changed and Get Reactions and a line's reactions in its 700 entry (`reactions.rs`, `docs/reactions.md`), the Replies draft's `DATA_REPLY_TO` on a line and its sub-field on 106 and 700 (`replies.rs`, `docs/replies.md`), and the packed target the two drafts share (`target.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunneled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the server's emoji, their refs and `GET /emoji/{hash}` (`emoji.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hl-identity` | Identity objects for `docs/hotline-ng-identity.md`: keys, device certificates, user cards, attestations, login proofs and the classic wire's device proofs (`proof.rs`), and the registrar's requests, records and signed lists (with the one record verifier they all share), and the signed messages of `docs/e2e-messages.md` §3 (`message.rs`) and their sealing with HPKE (`sealed.rs`), and the server key handover of `docs/server-key-handover.md` with a client's check of a served chain (`handover.rs`), and the friendship objects of `docs/proposals/friendship-objects.md` (`friendship.rs`) — deterministic CBOR, domain-separated Ed25519. Transport-free by design; shared with clients, proxies and relays, so it may eventually belong beside `hxproto` in hx-libs. |
 | `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, user groups (`users.rs`), the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins, the task fanning the core's export feed out to the links, and each link's ghosts), one session loop per link, the dialer, and the user keys draft's certificates fetched by hash, the checks of a ghost's signed line or message, and the sessions seen to sign (`keys.rs`). Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
@@ -487,6 +487,19 @@ Three layers, all `cargo test --workspace`:
   window, and what a waiting message gathered told after its 104; and a
   session without the bit, one with bit 6 among them, sent the same
   bytes throughout, private messages included),
+  `replies_classic.rs` (capability bit 18 from a real config: confirmed
+  beside bits 1 and 17 wherever there is Structured Chat, its targets
+  following `[history]`, and 717 answered with no type and at its own
+  price under it alone; a reply on a lobby line, a room's as kind 4 and
+  a private chat's, heard by readers with the bit as the entry's
+  sub-field on 106, the sender's echo too, and by ng as `re`, and from
+  ng back; one to a line nobody keeps heard on ng as the text alone;
+  each structural drop relaying the line without it; 700's sub-field
+  in type order between media's and reactions', a tombstone bare and a
+  reply to a redacted line keeping its target; a stored message's
+  reference to a session with bit 18 alone, told no reactions after its
+  104; and a session without the bit, a period client, one with bit 17
+  alone and one with bit 19, sent a reply as its twin without one),
   `structured_chat.rs`
   (capability bit 17 from a real config: a period client's and an ng
   client's frames the same with the bit offered or not, a live entry
@@ -643,7 +656,8 @@ Three layers, all `cargo test --workspace`:
   unlinked with its dialer stopped, a suspended one unlinked until
   resumed, `hxd link reset-id` refused while the server runs, a key
   changed on reload closing the link, bit 11 on the plain port or a key
-  proof without it refused, a link confirmed no bit 19 where a user is,
+  proof without it refused, a link confirmed no bit 18 or 19 where a
+  user is,
   users
   crossing both ways on both wires and leaving, public chat crossing
   both ways in order and formatted where it is heard, private messages
@@ -665,8 +679,9 @@ Three layers, all `cargo test --workspace`:
   sealed messages to a ghost, its certificate through Link Device Keys,
   and pasted evidence of a ghost's line; and a line or message with
   emoji refs, between two servers serving one catalog, crossing as its
-  text alone; and a classic reaction on a ghost's line counted on its
-  server alone),
+  text alone; a classic reaction on a ghost's line counted on its
+  server alone, and a classic reply to one heard at its home as its
+  text alone),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: Blowfish carrying both
   ways, an ng client seeing the session encrypted and a guest's not, the

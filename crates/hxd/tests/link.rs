@@ -387,10 +387,11 @@ async fn a_link_login_on_the_plain_port_is_refused() {
 }
 
 /// A link's login is confirmed what a link is, whatever else it offers:
-/// never bit 19, which this server confirms a user beside bits 1 and 17.
+/// never bit 18 or 19, which this server confirms a user beside bits 1
+/// and 17.
 #[tokio::test]
-async fn a_link_is_never_confirmed_bit_19() {
-    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 19;
+async fn a_link_is_never_confirmed_bit_18_or_19() {
+    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 18 | 1 << 19;
     let kept = "[structured_chat]\nenabled = true\n[reactions]\nenabled = true\n";
     // `b` dials with a key `a` does not hold, so the link is the test's.
     let (a, _b, _dirs) = pair_with(3, 1, kept, EVERY_FEATURE, "", "").await;
@@ -426,7 +427,79 @@ async fn a_link_is_never_confirmed_bit_19() {
         .await
         .unwrap();
     let confirmed = reply.uint(tag::CAPABILITIES).unwrap();
-    assert_eq!(confirmed & (1 << 11 | 1 << 19), 1 << 11);
+    assert_eq!(confirmed & (1 << 11 | 1 << 18 | 1 << 19), 1 << 11);
+}
+
+/// A reply to a ghost's lobby line is this server's: relayed here with
+/// its target, and heard at the line's home as a line that answers
+/// nothing is.
+#[tokio::test]
+async fn a_reply_to_a_ghosts_line_crosses_the_link_as_its_text_alone() {
+    use hxd_session::replies::DATA_REPLY_TO;
+    use hxd_session::structured::DATA_CHAT_LINE;
+    const ON: u32 = 1 << 1 | 1 << 4 | 1 << 17 | 1 << 18;
+    let kept = "[structured_chat]\nenabled = true\n";
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, kept, kept).await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let on = |who| Login {
+        caps: Some(ON),
+        ..Login::account(who, who, "pw")
+    };
+    let mut alice = legacy::Client::login_at(a.legacy, &on("alice"))
+        .await
+        .unwrap();
+    let mut carol = legacy::Client::login_at(a.legacy, &on("carol"))
+        .await
+        .unwrap();
+    let mut bob = legacy::Client::login_at(b.legacy, &on("bob"))
+        .await
+        .unwrap();
+    row(&mut alice, "bob").await;
+    row(&mut bob, "alice").await;
+    bob.chat(b"hi").await.unwrap();
+    async fn said(c: &mut legacy::Client, text: &str) -> legacy::Frame {
+        c.rx.recv_where(|f| {
+            f.ty == push::CHAT
+                && f.bytes(tag::BODY)
+                    .is_some_and(|b| b.ends_with(text.as_bytes()))
+        })
+        .await
+        .unwrap()
+    }
+    let entry = said(&mut alice, "hi").await.bytes(DATA_CHAT_LINE).unwrap();
+    let t = [&[1, 0, 0, 0, 0][..], &entry[..8]].concat();
+    let line = |re: bool| {
+        let mut fields = vec![(tag::BODY, b"hello bob".to_vec())];
+        fields.extend(re.then(|| (DATA_REPLY_TO, t.clone())));
+        fields
+    };
+    let chat = ClientHdr::Chat.as_u32();
+    alice.send(chat, &line(true)).await.unwrap();
+    let here = said(&mut carol, "hello bob")
+        .await
+        .bytes(DATA_CHAT_LINE)
+        .unwrap();
+    assert!(
+        here.ends_with(&[&[0, 0x20, 0, 13][..], &t].concat()),
+        "here"
+    );
+    let with = said(&mut bob, "hello bob").await;
+    let there = with.bytes(DATA_CHAT_LINE).unwrap();
+    assert!(there.ends_with(b"hello bob"), "no sub-field at its home");
+    alice.send(chat, &line(false)).await.unwrap();
+    let without = said(&mut bob, "hello bob").await;
+    let zeroed = |f: &legacy::Frame| {
+        let fields = f.chunks().map(|c| {
+            let mut d = c.data.to_vec();
+            if c.tag == DATA_CHAT_LINE {
+                d[..16].fill(0);
+            }
+            (c.tag, d)
+        });
+        fields.collect::<Vec<_>>()
+    };
+    assert_eq!(zeroed(&with), zeroed(&without), "at its home");
 }
 
 /// A reaction on a ghost's lobby line is this server's alone: it counts

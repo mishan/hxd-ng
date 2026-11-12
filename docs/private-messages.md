@@ -689,7 +689,8 @@ it becomes the *fallback* path, for clients that negotiate no messaging
 capability (§12).
 
 **A stored message's reference** reaches a classic client that
-negotiated the Reactions draft's bit 19 (`reactions.md` §2): as
+negotiated the Replies draft's bit 18 or the Reactions draft's bit 19
+(`replies.md` §5, `reactions.md` §2): as
 `DATA_PM_ID` on the 104 that hands the message over, unless it is an
 instant message handed over as mail, and on the reply to the 108 that
 sent it: the stored flag, then the 16 bytes the ng `ref` carries. A client

@@ -1,0 +1,113 @@
+# Replies on the classic wire
+
+Status: built for lines of chat: `DATA_REPLY_TO` on Send Chat (105) in
+the lobby, a room and a private chat, relayed on Chat Message (106) and
+paged on Get Chat History (700) as the entry's sub-field, and a stored
+private message's reference to a session that negotiated the bit. This
+binds nobody but this server: the protocol is the Replies draft
+(`Capabilities-Replies.md`, a draft written for this server, in
+fogWraith's protocol documents and not yet allocated), with the line ids
+and reply shape it takes from Structured Chat.
+
+The ng wire's replies are `hotline-ng.md` §7.3. Both wires carry one
+reference the core keeps (`hxd_core::reply`): a reply made on either is
+heard on both. What this document covers is `hxd_session::replies` and
+the choices the draft left to it.
+
+## 1. Negotiation
+
+- **Bit 18** is offered wherever `[structured_chat]` is enabled, and
+  needs no key of its own. It is confirmed only beside bits 1 (Text
+  Encoding) and 17 (Structured Chat), as the draft requires. A link's
+  login never holds it.
+- **The login reply** beside it carries `DATA_REPLY_TARGETS`: kept lines
+  (`0x0002`, kind 1) where there is `[history]`, and lines nobody keeps
+  (`0x0010`, kind 4) always. The targets are fixed for the session as
+  it was told them.
+- **A session without bit 18**, a period client and one with bit 17 or
+  19 alone included, is sent exactly what it was, and a `DATA_REPLY_TO`
+  it sends is ignored. The draft's `Replies.ClassicForm` is `none` here
+  and is not a setting: the server never looks a target up, so no
+  formatted line or 104 is ever decorated.
+
+## 2. Targets
+
+- **A lobby line** is kind 1 on channel 0, by its history id.
+- **A line nobody keeps** is kind 4 under its chat's id, by the id that
+  chat counted it under (`chat-history.md` §12): the lobby's notices, and
+  its lines on a server without `[history]`, on chat 0; a private chat's
+  under its chat id.
+- **A room** shows on this wire as a private chat under its id, so its
+  line is kind 4 under that id: the room's kept line where there is
+  `[history]`, and one nobody keeps where there is not. Kind 1 on a
+  room's 105 is dropped, as the draft's table has it, since this wire's
+  700 answers no room for a kind 1 to name; reactions take it
+  (`reactions.md` §2).
+- **Two id spaces under one chat id.** A room's notices and its kept
+  lines are both kind 4 under the room's id, and a reference to a notice
+  is kept as one to the room's line of that id. Nothing is looked up, so
+  nothing collides: the reply names no line, and is drawn as its text
+  alone.
+- **Never resolved.** A target retired, redacted, never relayed or
+  never seen by its reader is kept and relayed as sent. A kept lobby line
+  answering a notice is stored with its kind 4 reference, which a server
+  older than this one cannot read back: a downgrade answers every page
+  holding such a line "Server error.".
+
+## 3. What is dropped
+
+105 has no reply to refuse a line with, so a reference the draft does
+not allow is dropped and the line relayed without it: one from a sender
+without bit 18, of a kind the login did not offer (kind 3 among them),
+of a kind a line does not take, malformed, past 128 bytes, naming line
+id 0, two in one request, and one naming a chat other than the one the
+line is said in. That last is the core's own rule (`Reply::in_room`),
+which it also holds every frontend's line to, a private chat's
+included, refusing the whole line; the parse here asks it first, so the
+classic wire never loses a line to it.
+
+## 4. Relay and history
+
+- **106.** To a reader with bit 18, a reply's entry carries sub-field
+  `0x0020` `REPLY_TO`, the target as this wire names it, after media's
+  and before anything later, the sender's echo included. A reply from ng
+  is heard here as kind 1 for the lobby and kind 4 under a room's id.
+- **The ng wire** hears a classic reply as `re`, `{ "line" }` or
+  `{ "line", "room" }`; one naming a line nobody keeps has no form there,
+  and is heard as its text alone.
+- **700.** To a reader with bit 18, a line's entry carries the same
+  sub-field, in type order after media's and before the Reactions
+  draft's `0x0021`. A tombstone carries none: a redaction takes a reply's
+  target with its words, while a reply to a redacted line keeps its own.
+  A reader without the bit is paged the same bytes as before.
+
+## 5. Private messages' references
+
+A stored private message's reference reaches a session with bit 18, as
+one with the Reactions draft's bit 19 (`reactions.md` §2): as
+`DATA_PM_ID` on the 104 that hands the message over and on the reply to
+the 108 that sent it. The reactions a message gathered while it waited
+are told after its 104 only to a session with bit 19.
+
+## 6. Notifications
+
+This server sends no Notification (718). Set Notifications (717) is the
+draft's to answer for bit 18 or 19, so to a session with either it is
+answered `DATA_NOTIFY_TYPES` = 0, and so is a login that carries
+`DATA_NOTIFY_TYPES`, whether or not the server keeps reactions; a
+messenger session (bit 8) is refused it, as anything outside the friend
+family. It costs 1 spam point.
+
+## 7. Server links
+
+No reference crosses a link (`server-link.md`): a classic reply to a
+ghost's lobby line is kept and relayed here, and heard at the line's
+home as its text alone.
+
+## 8. Not yet
+
+- Get Chat History by `DATA_LINE_ID`, for a client to fetch the lines a
+  page's replies quote.
+- Replies on instant messages (IM Send and IM Deliver, kind 2) and on
+  private messages (108 and 104, kind 5).
+- The draft's notification to a line's author.

@@ -1460,7 +1460,7 @@ impl Core {
     }
 
     /// A private chat line; membership is the only gate. `re` is what it
-    /// answers, relayed as sent: its frontend keeps it to this chat.
+    /// answers, relayed as sent, and refused when it names another chat.
     #[allow(clippy::too_many_arguments)]
     pub fn chat_private(
         &self,
@@ -1491,6 +1491,10 @@ impl Core {
                 serial: sess.serial,
             }
         };
+        // Whichever frontend sent it, as public chat holds a line's.
+        if re.as_ref().is_some_and(|re| !re.in_room(cid)) {
+            return Err(ChatError::ReplyScope);
+        }
         // After membership, as mhxd's `rcv_chat` drops a line to a room
         // its sender is not in before `hxd_rcv_chat` counts it.
         self.chat_flood_check(from, cid, &text)?;
@@ -5521,7 +5525,7 @@ mod tests {
     }
 
     #[test]
-    fn each_line_of_a_run_and_of_a_private_chat_carries_its_own_reply() {
+    fn each_line_of_a_run_and_of_a_private_chat_carries_its_own_reply_and_none_from_elsewhere() {
         use crate::reply::Reply;
         let core = Core::new();
         let (a, mut rx_a) = test_attach(&core, "alice", chatter());
@@ -5538,6 +5542,18 @@ mod tests {
             .into();
         assert!(core.chat_public_all(a, 0, lines).iter().all(Result::is_ok));
         let in_chat = Some(Reply::Ephemeral { chat: cid, id: 3 });
+        for out in [
+            lobby(3),
+            Some(Reply::Ephemeral {
+                chat: cid + 1,
+                id: 3,
+            }),
+            Some(Reply::Line { room: 0, id: 3 }),
+            Some(Reply::Pm([1; 16])),
+        ] {
+            let sent = core.chat_private(cid, a, "astray".into(), 0, None, out.clone(), &[]);
+            assert_eq!(sent, Err(ChatError::ReplyScope), "{out:?}");
+        }
         core.chat_private(cid, a, "psst".into(), 0, None, in_chat.clone(), &[])
             .unwrap();
         let heard = |rx: &mut crate::Events| -> Vec<(u32, Option<Reply>)> {

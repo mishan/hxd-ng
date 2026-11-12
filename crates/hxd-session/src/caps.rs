@@ -134,6 +134,10 @@ pub mod cap {
     /// (`docs/chat-history.md` §12): each 106 that relays a line carries
     /// it as a history entry too.
     pub const STRUCTURED_CHAT: u8 = 17;
+    /// Replies, a draft of this server's and unallocated: what a line
+    /// answers (`crate::replies`). **Depends on [`TEXT_ENCODING`] and
+    /// [`STRUCTURED_CHAT`]**, as the draft requires.
+    pub const REPLIES: u8 = 18;
     /// Reactions, a draft of this server's and unallocated: Send
     /// Reaction and Reaction Changed (`crate::reactions`). **Depends on
     /// [`TEXT_ENCODING`] and [`STRUCTURED_CHAT`]**, as the draft requires,

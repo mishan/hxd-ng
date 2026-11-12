@@ -807,8 +807,12 @@ family document. Each family of §4 adds its own.
     listing, to sessions that declared `replies` alone. A redaction
     takes a line's `re` with its words; a reply to a redacted line
     keeps its own. A session that did not declare `replies` has its
-    `re` ignored (§5). Nothing changes on the classic wire, and no `re`
-    crosses a server link.
+    `re` ignored (§5). The classic wire carries a line's reference too
+    (replies.md), and drops one this wire refuses, having no refusal to
+    give; whichever frontend sends it, the core refuses a line whose
+    `re` names another room or chat. A classic reply to a line nobody
+    keeps, which this wire has no target for, is heard here as its text
+    alone. No `re` crosses a server link.
   - `history` with `ids`, 1 to 50 line ids, from a session that
     declared `replies`, answers the lines of `room` among them, under
     the reader's checks as a page is, ascending; one of another room

@@ -53,7 +53,9 @@ use crate::friends;
 use crate::media;
 use crate::news::{self, LegacyNews};
 use crate::reactions;
+use crate::replies;
 use crate::structured;
+use crate::target;
 use crate::video;
 use crate::voice;
 
@@ -1589,6 +1591,8 @@ struct Session {
     /// The kinds of reaction target this session was told it may name,
     /// kept as told until it logs in again.
     reaction_targets: u16,
+    /// The kinds of target its replies may name, as its login was told.
+    reply_targets: u16,
     /// What it may be sent of lines' reaction summaries now.
     summaries: reactions::SummaryBudget,
     /// Whether this session has been sent the banner, which happens once.
@@ -2544,9 +2548,12 @@ async fn login_phase(
     if caps.has(cap::INLINE_MEDIA) && !ctx.core.media_enabled() {
         caps = Caps::from_bits(caps.bits() & !(1u64 << cap::INLINE_MEDIA));
     }
-    // Bit 19 only beside bits 1 and 17, as the draft has it, and only
-    // where the core keeps reactions, which the configured bits do not
-    // promise.
+    // Bit 18 only beside bits 1 and 17, as the draft has it.
+    if caps.has(cap::REPLIES) && !(caps.has(cap::TEXT_ENCODING) && caps.has(cap::STRUCTURED_CHAT)) {
+        caps = Caps::from_bits(caps.bits() & !(1u64 << cap::REPLIES));
+    }
+    // Bit 19 the same way, and only where the core keeps reactions,
+    // which the configured bits do not promise.
     if caps.has(cap::REACTIONS)
         && !(caps.has(cap::TEXT_ENCODING)
             && caps.has(cap::STRUCTURED_CHAT)
@@ -2599,6 +2606,7 @@ async fn login_phase(
         echoes_own_lines: caps.has(cap::STRUCTURED_CHAT),
         emoji: caps.has(cap::SERVER_EMOJI),
         reactions: caps.has(cap::REACTIONS),
+        replies: caps.has(cap::REPLIES),
         identity: transport
             .identity
             .map(|t| t.on_account(account.identity.fingerprint)),
@@ -2729,9 +2737,16 @@ async fn login_phase(
         .filter(|_| caps.has(cap::REACTIONS))
     {
         login_reply.extend(reactions::login_fields(&policy, reaction_targets));
-        if req.notify {
-            login_reply.push(reactions::notify_types());
-        }
+    }
+    let reply_targets = replies::targets(ctx.core.history_policy().is_some());
+    if caps.has(cap::REPLIES) {
+        login_reply.push((
+            replies::DATA_REPLY_TARGETS,
+            reply_targets.to_be_bytes().to_vec(),
+        ));
+    }
+    if req.notify && (caps.has(cap::REACTIONS) || caps.has(cap::REPLIES)) {
+        login_reply.push(reactions::notify_types());
     }
     if caps.has(cap::CHAT_HISTORY) {
         if let Some(history) = ctx.core.history_policy() {
@@ -2793,6 +2808,7 @@ async fn login_phase(
         emoji_tokens: emoji::FETCH_BURST,
         emoji_refill: Instant::now(),
         reaction_targets,
+        reply_targets,
         summaries: reactions::SummaryBudget::new(Instant::now()),
         banner_sent: false,
         banner_image: None,
@@ -3083,6 +3099,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             ephemeral,
             at,
             emoji,
+            re,
             ..
         } => {
             // Format at the edge, in the connection's encoding, so the
@@ -3122,12 +3139,15 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                 (None, None) => None,
             };
             if let Some((id, flags)) = numbered.filter(|_| sess.has_cap(cap::STRUCTURED_CHAT)) {
-                let subfields = match &media {
+                let mut subfields = match &media {
                     // Relayed to this session just now, so its handle is
                     // one it may fetch.
                     Some(m) if media_reader => history_media_subfields(&m.to_meta(), true),
                     _ => Vec::new(),
                 };
+                if let Some(re) = re.as_deref().filter(|_| sess.has_cap(cap::REPLIES)) {
+                    subfields.extend(target::pack(re).map(|t| (replies::REPLY_TO, t)));
+                }
                 // As a 700 entry reads to a session that cannot show
                 // the image.
                 let text = if text.is_empty() && media.is_some() && !media_reader {
@@ -3276,12 +3296,14 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             }
             // An instant message handed over as mail is a target by its
             // guid alone, which a 104 has no field for.
-            let reference = reference.filter(|_| sess.has_cap(cap::REACTIONS) && im.is_none());
+            let named = sess.has_cap(cap::REACTIONS) || sess.has_cap(cap::REPLIES);
+            let reference = reference.filter(|_| named && im.is_none());
             if let Some(r) = &reference {
                 chunks.push((reactions::DATA_PM_ID, reactions::pm_id(r)));
             }
             push(tx, hdr::MSG, chunks);
-            if let Some((r, shown)) = reference.zip(shown) {
+            let reacting = sess.has_cap(cap::REACTIONS);
+            if let Some((r, shown)) = reference.zip(shown).filter(|_| reacting) {
                 let change = [reactions::waited(r, *shown)];
                 let now = Instant::now();
                 let messenger = sess.has_cap(cap::MESSENGER_SESSION);
@@ -3681,7 +3703,10 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
         .filter(|_| speaks_friends(sess, f.ty))
         .or_else(|| device::price(f.ty).filter(|_| sess.has_cap(cap::DEVICE_PROOF)))
         .or_else(|| emoji::price(f.ty).filter(|_| sess.has_cap(cap::SERVER_EMOJI)))
-        .or_else(|| reactions::price(f).filter(|_| sess.has_cap(cap::REACTIONS)))
+        .or_else(|| {
+            let set_notifications = f.ty == reactions::SET_NOTIFICATIONS && notifies(sess);
+            reactions::price(f).filter(|_| sess.has_cap(cap::REACTIONS) || set_notifications)
+        })
         .unwrap_or_else(|| spam_points(f.ty));
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
@@ -3692,6 +3717,12 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
             false
         }
     }
+}
+
+/// May this session send Set Notifications (717): bit 18 or 19, as the
+/// Replies draft has it?
+fn notifies(sess: &Session) -> bool {
+    sess.has_cap(cap::REPLIES) || sess.has_cap(cap::REACTIONS)
 }
 
 /// Is `ty` one of the friend family's that this session negotiated: bit
@@ -3757,9 +3788,23 @@ fn chat_send(f: &Frame, sess: &Session, room: bool) -> Option<ChatSend> {
         (handle, _) => handle,
     };
     let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
+    let said = match cid {
+        0 => replies::Said::Lobby,
+        _ if room => replies::Said::Room(cid),
+        _ => replies::Said::Chat(cid),
+    };
+    let sent = (sess.has_cap(cap::REPLIES)).then(|| replies::reply_to(f, sess.reply_targets, said));
+    let re = match sent {
+        Some(Ok(re)) => re,
+        Some(Err(why)) => {
+            debug!(uid = sess.uid, "reply dropped: {why}");
+            None
+        }
+        None => None,
+    };
     Some(ChatSend {
         cid,
-        line: (body, style, media, None, refs),
+        line: (body, style, media, re, refs),
     })
 }
 
@@ -3807,6 +3852,8 @@ async fn public_chat(
             }
             // Kicked for it; the kick is the answer.
             Err(ChatError::Flooding) => debug!(uid = sess.uid, "chat dropped: flooding"),
+            // Never: `replies::parse` drops what the core would refuse.
+            Err(ChatError::ReplyScope) => warn!(uid = sess.uid, room, "reply out of scope"),
             Err(e) => warn!(uid = sess.uid, "public chat store failed: {e:?}"),
             Ok(_) => {}
         }
@@ -4852,11 +4899,13 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 cid,
                 line: (body, style, media, re, refs),
             }) => {
-                if let Err(e) = ctx
+                match ctx
                     .core
                     .chat_private(cid, sess.uid, body, style, media, re, &refs)
                 {
-                    debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
+                    Err(ChatError::ReplyScope) => warn!(uid = sess.uid, cid, "reply out of scope"),
+                    Err(e) => debug!(uid = sess.uid, cid, "private chat dropped: {e:?}"),
+                    Ok(()) => {}
                 }
             }
             None => {}
@@ -4977,6 +5026,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                             _ => Vec::new(),
                         };
                         // In the draft's order, a sub-field's type ascending.
+                        if let Some(re) =
+                            (line.re.as_ref()).filter(|_| sess.has_cap(cap::REPLIES) && !deleted)
+                        {
+                            subfields.extend(target::pack(re).map(|t| (replies::REPLY_TO, t)));
+                        }
                         let reacted = shown.get(&line.id);
                         if let Some(r) = reacted {
                             subfields.push((reactions::REACTIONS, reactions::summary(&r.keys)));
@@ -5235,7 +5289,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             });
             match sent.await {
                 Some(Ok(MsgOutcome::Delivered(Some(r)) | MsgOutcome::Queued(r)))
-                    if sess.has_cap(cap::REACTIONS) =>
+                    if sess.has_cap(cap::REACTIONS) || sess.has_cap(cap::REPLIES) =>
                 {
                     reply(
                         tx,
@@ -6155,7 +6209,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
         t if t == reactions::GET && sess.has_cap(cap::REACTIONS) => {
             get_reactions(f, tx, ctx, sess).await;
         }
-        t if t == reactions::SET_NOTIFICATIONS && sess.has_cap(cap::REACTIONS) => {
+        t if t == reactions::SET_NOTIFICATIONS && notifies(sess) => {
             reply(tx, f.trans, vec![reactions::notify_types()]);
         }
 

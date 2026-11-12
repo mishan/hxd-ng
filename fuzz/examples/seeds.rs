@@ -131,6 +131,39 @@ fn main() {
         0,
         &[(0xf24, line(1, 0, 1)), (0xf25, key)],
     ));
+    // Bits 1, 4, 17 and 18, as a client of the replies draft offers them,
+    // then a line to answer and Send Chat (105) with `DATA_REPLY_TO` of
+    // each kind, in the lobby and under a chat id, and malformed.
+    let login_replying = login_as(b"fuzz", b"fuzz", vec![0, 0x06, 0, 0x12]);
+    let mut replying = vec![pack_frame(0x69, 2, 0, &[(0x65, b"answer me".to_vec())])];
+    let answers = [
+        line(1, 0, 1),
+        line(4, 0, 1),
+        line(4, 4000, 1),
+        line(1, 0, 0),
+        line(3, 0, 1),
+        [&[2][..], &[7; 16], &[4], b"fuzz"].concat(),
+        [&[5, 1][..], &[9; 16]].concat(),
+        line(1, 0, 1)[..12].to_vec(),
+        [line(1, 0, 1), vec![0; 116]].concat(),
+    ];
+    for re in &answers {
+        for chat in [None, Some(4000u32)] {
+            let mut fields = vec![(0x65, b"yes".to_vec()), (0xf21, re.clone())];
+            fields.extend(chat.map(|c| (0x72, c.to_be_bytes().to_vec())));
+            replying.push(pack_frame(0x69, replying.len() as u32 + 2, 0, &fields));
+        }
+    }
+    replying.push(pack_frame(
+        0x69,
+        replying.len() as u32 + 2,
+        0,
+        &[
+            (0x65, b"twice".to_vec()),
+            (0xf21, line(1, 0, 1)),
+            (0xf21, line(4, 0, 1)),
+        ],
+    ));
     for dir in ["corpus/frame", "corpus/session"] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -152,4 +185,12 @@ fn main() {
         session.extend_from_slice(r);
     }
     std::fs::write("corpus/session/reactions", &session).unwrap();
+    let mut session = b"TRTPHOTL\x00\x01\x00\x02".to_vec();
+    session.extend_from_slice(&login_replying);
+    for (n, r) in replying.iter().enumerate() {
+        std::fs::write(format!("corpus/frame/reply-{n}"), r).unwrap();
+        session.extend_from_slice(r);
+    }
+    std::fs::write("corpus/frame/login-replies", &login_replying).unwrap();
+    std::fs::write("corpus/session/replies", &session).unwrap();
 }

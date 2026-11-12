@@ -1340,7 +1340,10 @@ confirmed. Turned on, a classic client that asks for it is sent each
 chat line as a Chat History entry beside the formatted text: its id,
 time, sender and raw text. Clients that do not ask see no change. It
 needs nothing else: without `[history]`, lines carry ids counted in
-memory. See [chat-history.md](chat-history.md) §12.
+memory. See [chat-history.md](chat-history.md) §12. It also offers
+capability bit 18, a line naming the one it answers
+([replies.md](replies.md)); a kept lobby line answering a server
+notice is stored in a form an older server cannot read back.
 
 ```toml
 [structured_chat]

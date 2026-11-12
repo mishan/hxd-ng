@@ -715,6 +715,11 @@ the echo is how it learns its line's id: the domain learns the bit
 for that alone (`Transport::echoes_own_lines`). Legacy replay carries no
 entry, and a bit-4 session is not replayed to.
 
+**Replies.** To a session that also negotiated bit 18
+(`replies.md`), a 106's entry and a 700 entry carry what the line
+answers as the Replies draft's sub-field `0x0020`, after media's and
+before every later one; a tombstone carries none.
+
 **Reactions.** To a session that also negotiated bit 19
 (`reactions.md`), a 700 entry carries the line's reactions as the
 Reactions draft's sub-fields, `0x0021` the summary every reader shares
@@ -725,9 +730,10 @@ and 106 never does, since a live line has none yet.
 **What it does not do.** No `DATA_CHANNEL_ID` beside a room's line,
 which the draft allows: this wire's 700 answers channel 0 alone, so it
 would name a history the client cannot fetch. A room's line is then a
-private chat's to the client, so a reaction names it as the Replies
-draft names such a line, kind 4 under the chat id, which this server
-reads as the room's kept line (`reactions.md` §2). History ids are one
+private chat's to the client, so a reaction or a reply names it as the
+Replies draft names such a line, kind 4 under the chat id, which this
+server reads as the room's kept line (`reactions.md` §2, `replies.md`
+§2). History ids are one
 `AUTOINCREMENT` across channels (`chat-rooms.md` §3), so a room member
 sees the gaps the lobby and other rooms leave; the draft names that as
 a leak a server may accept, and `chat-rooms.md` accepted it for both
