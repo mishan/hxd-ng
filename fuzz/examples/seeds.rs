@@ -182,6 +182,20 @@ fn main() {
     ] {
         replying.push(pack_frame(0x2bc, replying.len() as u32 + 2, 0, &fields));
     }
+    // Send Instant Msg (108) to this session with `DATA_REPLY_TO` naming
+    // a stored message, one not stored, a line, cut short, and two.
+    let pm = [&[5, 1][..], &[9; 16]].concat();
+    for answers in [
+        vec![pm.clone()],
+        vec![[&[5, 0][..], &[9; 16]].concat()],
+        vec![line(1, 0, 1)],
+        vec![pm[..17].to_vec()],
+        vec![pm.clone(), pm.clone()],
+    ] {
+        let mut fields = vec![(0x67, vec![0, 1]), (0x65, b"yes".to_vec())];
+        fields.extend(answers.into_iter().map(|re| (0xf21, re)));
+        replying.push(pack_frame(0x6c, replying.len() as u32 + 2, 0, &fields));
+    }
     // Bits 1, 4, 6, 17 and 18, then IM Send (810) with `DATA_REPLY_TO`
     // naming either party's message, a third party's, a line, malformed,
     // and two at once.

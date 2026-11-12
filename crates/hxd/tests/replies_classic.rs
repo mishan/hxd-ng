@@ -5,9 +5,9 @@
 //! room and a private chat, relayed on 106 and paged on 700 as the entry's
 //! sub-field, crossing to the ng wire and back, dropped where it breaks
 //! the draft and the line relayed, 700 by line id, a stored private
-//! message's reference to a session with bit 18, an instant message's
-//! reply on 811, and every session without the bit sent what it always
-//! was.
+//! message's reference to a session with bit 18 and a private message's
+//! reply on 104, an instant message's reply on 811, and every session
+//! without the bit sent what it always was.
 //!
 //! Targets and sub-fields are laid out by hand from the draft here rather
 //! than by the server's encoder, so a disagreement between the two shows.
@@ -308,7 +308,7 @@ fn answers(f: &Frame) -> Option<Vec<u8>> {
 
 /// A frame as two lines or messages that differ in their ids and times
 /// alone send it: an entry's id and timestamp zeroed, and a message's
-/// guid and timestamp.
+/// guid, timestamp and reference.
 fn twin(f: &Frame) -> (u32, Vec<(u16, Vec<u8>)>) {
     let fields = f
         .chunks()
@@ -318,7 +318,9 @@ fn twin(f: &Frame) -> (u32, Vec<(u16, Vec<u8>)>) {
                 d[..16].fill(0);
                 (c.tag, d)
             }
-            tag::MESSAGE_GUID | tag::MESSAGE_TIMESTAMP => (c.tag, vec![0; c.data.len()]),
+            tag::MESSAGE_GUID | tag::MESSAGE_TIMESTAMP | DATA_PM_ID => {
+                (c.tag, vec![0; c.data.len()])
+            }
             t => (t, c.data.to_vec()),
         })
         .collect();
@@ -331,8 +333,8 @@ fn confirmed(reply: &Frame) -> u32 {
 
 /// Bit 18 only beside bits 1 and 17, wherever there is Structured Chat,
 /// and `DATA_REPLY_TARGETS` with it alone: kept lines where there is
-/// `[history]`, lines nobody keeps everywhere, and instant messages
-/// beside bit 6. Private messages are not yet among them.
+/// `[history]`, lines nobody keeps everywhere, instant messages beside
+/// bit 6, and stored private messages where there is an `[inbox]`.
 #[tokio::test]
 async fn bit_18_is_confirmed_beside_bits_1_and_17_with_the_kinds_kept() {
     let unkept = Opts {
@@ -370,8 +372,8 @@ async fn bit_18_is_confirmed_beside_bits_1_and_17_with_the_kinds_kept() {
             "inbox and messaging",
             messaging(),
             vec![
-                ("with bit 6", ON | MESSAGING, Some(0x0016)),
-                ("without", ON, Some(0x0012)),
+                ("with bit 6", ON | MESSAGING, Some(0x0036)),
+                ("without", ON, Some(0x0032)),
             ],
         ),
     ] {
@@ -904,12 +906,19 @@ async fn lines_by_id_are_answered_under_the_readers_own_checks() {
 const DATA_PM_ID: u16 = 0x0f23;
 
 async fn msg(c: &mut Client, to: u16, text: &str) -> Frame {
-    let fields = [
+    msg_with(c, to, text, &[]).await
+}
+
+/// `c` sends `to` a private message with `fields` beside it, and the
+/// reply.
+async fn msg_with(c: &mut Client, to: u16, text: &str, fields: &[(u16, Vec<u8>)]) -> Frame {
+    let mut all = vec![
         (tag::UID, to.to_be_bytes().to_vec()),
         (tag::BODY, text.as_bytes().to_vec()),
     ];
-    let reply = c.call(ClientHdr::Msg.as_u32(), &fields).await.unwrap();
-    assert!(!reply.is_error(), "{:?}", reply.error_text());
+    all.extend_from_slice(fields);
+    let reply = c.call(ClientHdr::Msg.as_u32(), &all).await.unwrap();
+    assert!(!reply.is_error(), "{text}: {:?}", reply.error_text());
     reply
 }
 
@@ -979,6 +988,121 @@ async fn a_stored_messages_reference_reaches_a_session_with_bit_18() {
             assert!(tries < 500, "erin's session never ended");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+}
+
+/// A private message target: kind 5, then the message's `DATA_PM_ID`.
+fn pm_target(pm_id: &[u8]) -> Vec<u8> {
+    [&[5][..], pm_id].concat()
+}
+
+/// A private message's reply names a stored message by its reference:
+/// kind 5 on the 104 to a session with bit 18, live and after it waited,
+/// whoever's message it names, since a reference is never looked up, and
+/// crossing both ways with ng, whose `ref` is the same 16 bytes. One not
+/// stored, of another kind, cut short, two at once, or from a sender
+/// without bit 18 is dropped and the message delivered; and a reference
+/// of a kind its reader's login was not offered is not sent it.
+#[tokio::test]
+async fn a_private_messages_reply_names_a_stored_message() {
+    let td = tempfile::tempdir().unwrap();
+    let o = Opts {
+        inbox: true,
+        ..Opts::default()
+    };
+    let s = start(td.path(), o).await;
+    let mut alice = classic(&s, "alice", Some(ON)).await;
+    let mut bob = classic(&s, "bob", Some(ON)).await;
+    let a = alice.uid.unwrap();
+    let id = msg(&mut alice, bob.uid.unwrap(), "lunch?").await;
+    let t = pm_target(&id.bytes(DATA_PM_ID).unwrap());
+    let field = |t: &[u8]| (DATA_REPLY_TO, t.to_vec());
+    msg_with(&mut bob, a, "yes", &[field(&t)]).await;
+    let answers = |f: Frame| f.bytes(DATA_REPLY_TO);
+    assert_eq!(answers(pm_heard(&mut alice, "yes").await), Some(t.clone()));
+    let mut dave = classic(&s, "dave", Some(ON)).await;
+    msg_with(&mut dave, a, "me too", &[field(&t)]).await;
+    let heard = answers(pm_heard(&mut alice, "me too").await);
+    assert_eq!(heard, Some(t.clone()), "another pair's");
+
+    let mut unasked = classic(&s, "bob", Some(UTF8 | STRUCTURED)).await;
+    let unstored = [&[5, 0][..], &t[2..]].concat();
+    for (n, (case, from_unasked, fields)) in [
+        ("not stored", false, vec![field(&unstored)]),
+        ("a line", false, vec![field(&lobby(1))]),
+        (
+            "an instant message",
+            false,
+            vec![field(&im_target("bob", 1))],
+        ),
+        ("cut short", false, vec![field(&t[..17])]),
+        ("two", false, vec![field(&t), field(&t)]),
+        ("a sender without bit 18", true, vec![field(&t)]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (text, marker) = (format!("dropped {n}"), format!("kept {n}"));
+        let sender = if from_unasked { &mut unasked } else { &mut bob };
+        msg_with(sender, a, &text, &fields).await;
+        let heard = answers(pm_heard(&mut alice, &text).await);
+        assert_eq!(heard, None, "{case}");
+        msg_with(&mut bob, a, &marker, &[field(&t)]).await;
+        let kept = answers(pm_heard(&mut alice, &marker).await);
+        assert_eq!(kept, Some(t.clone()), "{case}: the marker");
+    }
+
+    let mut carol = ng_client(&s, "carol").await;
+    let to_carol = carol.uid.unwrap() as u16;
+    let id = msg(&mut alice, to_carol, "classic asks").await;
+    let asked = pm_target(&id.bytes(DATA_PM_ID).unwrap());
+    let heard = carol
+        .event_where("msg", |d| d["text"] == "classic asks")
+        .await
+        .unwrap();
+    assert_eq!(heard.data["ref"], json!(B64.encode(&asked[2..])));
+    let re = json!({ "pm": heard.data["ref"] });
+    let ng_answers = json!({ "to": a, "text": "ng answers", "re": re });
+    ok(&mut carol, "msg", ng_answers).await;
+    let heard = answers(pm_heard(&mut alice, "ng answers").await);
+    assert_eq!(heard, Some(asked.clone()));
+    msg_with(&mut alice, to_carol, "classic again", &[field(&asked)]).await;
+    let heard = carol
+        .event_where("msg", |d| d["text"] == "classic again")
+        .await
+        .unwrap();
+    assert_eq!(heard.data["re"], re);
+
+    let later = ok(
+        &mut carol,
+        "msg",
+        json!({ "to_login": "erin", "text": "later" }),
+    )
+    .await;
+    let waited = json!({ "pm": later["ref"] });
+    let ng_waits = json!({ "to_login": "erin", "text": "re later", "re": waited });
+    ok(&mut carol, "msg", ng_waits).await;
+    let (mut erin, _) = logged_in(&s, "erin", Some(ON)).await;
+    let later = B64.decode(later["ref"].as_str().unwrap()).unwrap();
+    let want = pm_target(&[&[1][..], &later].concat());
+    assert_eq!(answers(pm_heard(&mut erin, "re later").await), Some(want));
+
+    // An instant message's reference reaches a 104 only where its
+    // login was offered kind 2.
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), messaging()).await;
+    let mut carol = ng_client(&s, "carol").await;
+    let offered = Some(im_target("alice", 1));
+    for (case, caps, want) in [
+        ("without bit 6", ON, None),
+        ("with", ON | MESSAGING, offered),
+    ] {
+        let mut alice = classic(&s, "alice", Some(caps)).await;
+        let re = json!({ "im": { "login": "alice", "guid": ng_guid(1) } });
+        let text = format!("ng im {case}");
+        let sent = json!({ "to": alice.uid.unwrap(), "text": text, "re": re });
+        ok(&mut carol, "msg", sent).await;
+        assert_eq!(answers(pm_heard(&mut alice, &text).await), want, "{text}");
     }
 }
 
@@ -1054,10 +1178,10 @@ fn im_answers(f: &Frame) -> Option<Vec<u8>> {
 /// An instant message's reply names a message of its conversation, by
 /// either party's login in any case: kind 2 on the 811 to a session with
 /// bit 18, heard live and after waiting for Get Roster, and crossing to
-/// ng as `{ im }` and back, where ng's naming a private message, which
-/// 810 cannot carry, is heard as the text alone. One naming a third party's message, a line,
-/// two at once, or from a sender without bit 18 is dropped and the
-/// message delivered.
+/// ng as `{ im }` and back, and ng's naming a stored private message,
+/// which 810 cannot carry, heard as kind 5. One naming a third party's
+/// message, a line, two at once, or from a sender without bit 18 is
+/// dropped and the message delivered.
 #[tokio::test]
 async fn an_instant_messages_reply_names_a_message_of_its_conversation() {
     let td = tempfile::tempdir().unwrap();
@@ -1137,7 +1261,8 @@ async fn an_instant_messages_reply_names_a_message_of_its_conversation() {
     let re = json!({ "pm": "AAAAAAAAAAAAAAAAAAAAAA" });
     let ng_mail = json!({ "to_login": "alice", "text": "ng mail", "re": re });
     ok(&mut erin, "msg", ng_mail).await;
-    assert_eq!(im_answers(&im_heard(&mut alice, "ng mail").await), None);
+    let heard = im_answers(&im_heard(&mut alice, "ng mail").await);
+    assert_eq!(heard, Some(pm_target(&[&[1][..], &[0; 16]].concat())));
 
     for mut c in [bob, unasked] {
         let gone = c.uid.unwrap();
@@ -1164,8 +1289,8 @@ async fn told(c: &mut Client, tail: &str) -> Frame {
     heard(c, tail).await
 }
 
-/// While replies of every kind flow in the lobby, a room, a private chat
-/// and instant messages, from classic and from ng, and a sender without
+/// While replies of every kind flow in the lobby, a room, a private chat,
+/// instant and private messages, from classic and from ng, and a sender without
 /// bit 18 sends a reference anyway, a period client, one with bit 17
 /// alone and one with bits 17 and 19 are sent each reply as they are
 /// sent its twin said without one, ids and times aside, and paged them
@@ -1244,17 +1369,36 @@ async fn a_session_without_bit_18_is_sent_what_it_always_was() {
     im_heard(&mut frank_18, "re im").await;
     let told_im = im_heard(&mut frank_18, "re im").await;
     assert_eq!(im_answers(&told_im), Some(im_target("frank", 9)));
+    let pm = (DATA_REPLY_TO, pm_target(&[&[1][..], &[9; 16]].concat()));
+    for to in [&period, &frank, &erin].map(|c| c.uid.unwrap()) {
+        msg(&mut alice, to, "re pm").await;
+        msg_with(&mut alice, to, "re pm", std::slice::from_ref(&pm)).await;
+    }
+    msg_with(
+        &mut alice,
+        frank_18.uid.unwrap(),
+        "re pm",
+        std::slice::from_ref(&pm),
+    )
+    .await;
+    let told_pm = pm_heard(&mut frank_18, "re pm").await;
+    assert_eq!(told_pm.bytes(DATA_REPLY_TO), Some(pm.1.clone()));
+    let to = period.uid.unwrap();
+    let mut ng_pm = json!({ "to": to, "text": "ng re pm" });
+    ok(&mut carol, "msg", ng_pm.clone()).await;
+    ng_pm["re"] = json!({ "pm": B64.encode([9; 16]) });
+    ok(&mut carol, "msg", ng_pm).await;
 
     say(&mut alice, 0, "end").await;
-    for (who, c, ims) in [
-        ("period", &mut period, 0),
-        ("bit 17", &mut frank, 1),
-        ("bit 19", &mut erin, 1),
+    for (who, c, ims, pms) in [
+        ("period", &mut period, 0, 2),
+        ("bit 17", &mut frank, 1, 1),
+        ("bit 19", &mut erin, 1, 1),
     ] {
         let end = heard(c, "end").await;
         let mut frames = c.rx.take_backlog();
         frames.push(end);
-        let pairs = pairs + ims;
+        let pairs = pairs + ims + pms;
         assert_eq!(frames.len(), 2 * pairs + 1, "{who}: {frames:?}");
         for pair in frames[..2 * pairs].chunks(2) {
             assert_eq!(twin(&pair[0]), twin(&pair[1]), "{who}");

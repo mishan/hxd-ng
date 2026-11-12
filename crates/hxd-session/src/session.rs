@@ -1226,7 +1226,8 @@ fn err_text(e: ChatError) -> &'static str {
         ChatError::NotFriends | ChatError::RequestFull | ChatError::RosterFull => {
             "That user is not accepting messages from you."
         }
-        // This wire names no stored message, and sends no reply.
+        // This wire names no stored message by its cursor, and
+        // `replies::parse` drops a reference the core would refuse.
         ChatError::UnknownCursor | ChatError::ReplyScope => "No such message.",
         ChatError::ServerError => "Server error.",
     }
@@ -1592,7 +1593,8 @@ struct Session {
     /// The kinds of reaction target this session was told it may name,
     /// kept as told until it logs in again.
     reaction_targets: u16,
-    /// The kinds of target its replies may name, as its login was told.
+    /// The kinds of target its replies may name, as its login was told,
+    /// and so the kinds of reference it is sent.
     reply_targets: u16,
     /// What it may be sent of lines' reaction summaries now.
     summaries: reactions::SummaryBudget,
@@ -2742,6 +2744,7 @@ async fn login_phase(
     let reply_targets = replies::targets(
         ctx.core.history_policy().is_some(),
         caps.has(cap::MESSAGING),
+        ctx.core.inbox_enabled(),
     );
     if caps.has(cap::REPLIES) {
         login_reply.push((
@@ -3150,7 +3153,8 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                     _ => Vec::new(),
                 };
                 if let Some(re) = re.as_deref().filter(|_| sess.has_cap(cap::REPLIES)) {
-                    subfields.extend(target::pack(re).map(|t| (replies::REPLY_TO, t)));
+                    let t = replies::for_reader(re, sess.reply_targets);
+                    subfields.extend(t.map(|t| (replies::REPLY_TO, t)));
                 }
                 // As a 700 entry reads to a session that cannot show
                 // the image.
@@ -3267,6 +3271,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             media,
             emoji,
             im,
+            re,
             reactions: shown,
             ..
         } => {
@@ -3304,6 +3309,13 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             let reference = reference.filter(|_| named && im.is_none());
             if let Some(r) = &reference {
                 chunks.push((reactions::DATA_PM_ID, reactions::pm_id(r)));
+            }
+            let targets = sess.has_cap(cap::REPLIES).then_some(sess.reply_targets);
+            if let Some(t) = re
+                .zip(targets)
+                .and_then(|(re, t)| replies::for_reader(&re, t))
+            {
+                chunks.push((replies::DATA_REPLY_TO, t));
             }
             push(tx, hdr::MSG, chunks);
             let reacting = sess.has_cap(cap::REACTIONS);
@@ -3511,7 +3523,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             let (friendships, refs, replies) = (
                 sess.has_cap(cap::FRIENDSHIPS),
                 sess.has_cap(cap::SERVER_EMOJI),
-                sess.has_cap(cap::REPLIES),
+                sess.has_cap(cap::REPLIES).then_some(sess.reply_targets),
             );
             if let Some((ty, chunks)) = friends::event(&ev, sess.enc, friendships, refs, replies)
                 .filter(|_| sess.has_cap(cap::MESSAGING))
@@ -5303,8 +5315,18 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // send from it is its own message and a retry is a resend.
             let from = sess.uid;
             let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
+            let re = match (sess.has_cap(cap::REPLIES))
+                .then(|| replies::reply_to(f, sess.reply_targets, replies::Said::Pm))
+            {
+                Some(Ok(re)) => re,
+                Some(Err(why)) => {
+                    debug!(uid = sess.uid, "reply dropped: {why}");
+                    None
+                }
+                None => None,
+            };
             let sent = off_reactor(&ctx.core, move |c| {
-                c.msg_signed(from, to, body, None, media, None, None, &refs)
+                c.msg_signed(from, to, body, None, media, None, re, &refs)
             });
             match sent.await {
                 Some(Ok(MsgOutcome::Delivered(Some(r)) | MsgOutcome::Queued(r)))

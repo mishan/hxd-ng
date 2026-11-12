@@ -693,8 +693,9 @@ bit 19.
 bit 6, are `replies.md`'s: IM Send (810) may carry `DATA_REPLY_TO`
 naming a message of the conversation by its sender's login and guid,
 which IM Deliver (811) carries to a session with bit 18, live or after
-Get Roster; one naming any other message is dropped and the message
-delivered.
+Get Roster, as it carries an ng instant message's naming a stored
+private message; one naming any other message is dropped and the
+message delivered.
 
 What the classic wire says differently from the documents, on purpose:
 

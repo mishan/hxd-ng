@@ -502,6 +502,75 @@ async fn a_reply_to_a_ghosts_line_crosses_the_link_as_its_text_alone() {
     assert_eq!(zeroed(&with), zeroed(&without), "at its home");
 }
 
+/// A private message to or from a ghost names nothing and can be named
+/// by nothing, though both servers keep mail: a reply's 108 to a ghost
+/// is answered without `DATA_PM_ID` and heard at its home as its text
+/// alone, and the ghost's answer reaches a session with bit 18 without
+/// a reference either.
+#[tokio::test]
+async fn a_private_message_across_the_link_carries_no_reference() {
+    use hxd_session::reactions::DATA_PM_ID;
+    use hxd_session::replies::DATA_REPLY_TO;
+    const ON: u32 = 1 << 1 | 1 << 17 | 1 << 18;
+    let kept = "[structured_chat]\nenabled = true\n";
+    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, kept, kept).await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let on = |who| Login {
+        caps: Some(ON),
+        ..Login::account(who, who, "pw")
+    };
+    let mut alice = legacy::Client::connect(a.legacy).await.unwrap();
+    let confirmed = alice.login(&on("alice")).await.unwrap();
+    assert_eq!(confirmed.uint(tag::CAPABILITIES), Some(ON), "bit 18");
+    let mut bob = legacy::Client::login_at(b.legacy, &on("bob"))
+        .await
+        .unwrap();
+    let (bob_here, alice_there) = (
+        row(&mut alice, "bob").await.uid,
+        row(&mut bob, "alice").await.uid,
+    );
+    let pm = [&[5, 1][..], &[9; 16]].concat();
+    let send = |to: u16, re: bool| {
+        let mut fields = vec![
+            (tag::UID, to.to_be_bytes().to_vec()),
+            (tag::BODY, b"yes".to_vec()),
+        ];
+        fields.extend(re.then(|| (DATA_REPLY_TO, pm.clone())));
+        fields
+    };
+    let mut heard = Vec::new();
+    for re in [true, false] {
+        let fields = send(bob_here, re);
+        let sent = alice.call(ClientHdr::Msg.as_u32(), &fields).await.unwrap();
+        assert!(!sent.is_error(), "{:?}", sent.error_text());
+        assert_eq!(sent.bytes(DATA_PM_ID), None, "the sender");
+        let got = bob
+            .rx
+            .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(alice_there.into()))
+            .await
+            .unwrap();
+        heard.push(
+            got.chunks()
+                .map(|c| (c.tag, c.data.to_vec()))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(heard[0], heard[1], "at its home");
+    let named = |t: &u16| [DATA_PM_ID, DATA_REPLY_TO].contains(t);
+    assert!(!heard[0].iter().any(|(t, _)| named(t)), "{:?}", heard[0]);
+
+    bob.call(ClientHdr::Msg.as_u32(), &send(alice_there, true))
+        .await
+        .unwrap();
+    let got = alice
+        .rx
+        .recv_where(|f| f.ty == push::MSG && f.uint(tag::UID) == Some(bob_here.into()))
+        .await
+        .unwrap();
+    assert!(!got.chunks().any(|c| named(&c.tag)), "from a ghost");
+}
+
 /// A reaction on a ghost's lobby line is this server's alone: it counts
 /// here, and nothing of it reaches the line's home, where the line's own
 /// reactions count apart.

@@ -771,13 +771,14 @@ fn refusal(e: MessagingError) -> Answer {
 }
 
 /// The notification a domain event is on this wire, for one of the
-/// family's, an instant message's reference carried where `replies`.
+/// family's, an instant message's reference carried where `replies`
+/// holds the kinds a bit-18 login was offered and the reference is one.
 pub(crate) fn event(
     ev: &Event,
     enc: TextEncoding,
     friendships: bool,
     emoji: bool,
-    replies: bool,
+    replies: Option<u16>,
 ) -> Option<(u32, Chunks)> {
     Some(match ev {
         Event::FriendEntry(e) => (
@@ -830,10 +831,10 @@ pub(crate) fn event(
                     crate::emoji::refs_field(refs),
                 ));
             }
-            // 810 carries kind 2 alone, so another kind an ng sender
-            // named is heard here as the text alone.
-            if let Some(re @ Reply::Im(_)) = im.re.as_ref().filter(|_| replies) {
-                c.extend(crate::target::pack(re).map(|t| (replies::DATA_REPLY_TO, t)));
+            if let Some(t) = (im.re.as_ref().zip(replies))
+                .and_then(|(re, offered)| replies::for_reader(re, offered))
+            {
+                c.push((replies::DATA_REPLY_TO, t));
             }
             (ServerHdr::ImDeliver.as_u32(), c)
         }
