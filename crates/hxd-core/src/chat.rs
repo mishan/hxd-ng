@@ -5949,6 +5949,7 @@ pub(crate) mod inbox_tests {
         for (case, re) in [
             ("an im of a third party's", carols),
             ("a public line", Reply::Line { room: 0, id: 1 }),
+            ("a line nobody keeps", Reply::Ephemeral { chat: 0, id: 1 }),
         ] {
             assert_eq!(send(d, a, re), Err(ChatError::ReplyScope), "{case}");
         }

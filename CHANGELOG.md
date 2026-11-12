@@ -27,6 +27,30 @@ as AGENTS.md's "Releasing" describes it.
   to `[limits] avatar_fetches_per_minute` per address, counted apart
   from the avatars'. A client that never asks for either sees no
   change. The Docker image turns the catalog on with `HXD_EMOJI`.
+- Reactions on the classic wire: capability bit 19, the Reactions
+  draft's, offered where `[reactions]` and `[structured_chat]` are both
+  enabled, and confirmed only beside bits 1 and 17. No new key: the
+  login reply carries `[reactions] max_keys` and `max_per_user`, and the
+  account's `burst` and `per_second` hold classic reactions as they do
+  ng's. Send Reaction (710) reacts to a lobby or room line, an instant
+  message or a stored private message, Reaction Changed (711) tells the
+  change in batches, Get Reactions (712) reads them back, and a line's
+  reactions ride its Get Chat History (700) entry. A stored private
+  message's reference reaches a client with bit 19 as `DATA_PM_ID` on
+  its 104 and on the reply to the 108 that sent it. 710 costs a line's
+  spam points and 712 one and one for each ten targets
+  (docs/reactions.md). A client without the bit sees no change.
+- Replies on the classic wire: capability bit 18, the Replies draft's,
+  offered wherever `[structured_chat]` is enabled and confirmed only
+  beside bits 1 and 17, with no key of its own. A line of the lobby, a
+  room or a private chat, an instant message and a private message may
+  say which one it answers, by its line id, its guid or its stored
+  message's reference, heard on both wires; Get Chat History (700) takes
+  line ids to fetch a page's quoted lines in one request, under the
+  history rate (docs/replies.md). A client without the bit sees no
+  change. **A server that has kept a reply to a lobby notice cannot be
+  downgraded cleanly**: an older one answers every 700 and ng `history`
+  page holding such a line "Server error.".
 
 ### Fixed
 

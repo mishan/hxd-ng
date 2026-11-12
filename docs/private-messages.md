@@ -693,8 +693,10 @@ negotiated the Replies draft's bit 18 or the Reactions draft's bit 19
 (`replies.md` §5, `reactions.md` §2): as
 `DATA_PM_ID` on the 104 that hands the message over, unless it is an
 instant message handed over as mail, and on the reply to the 108 that
-sent it: the stored flag, then the 16 bytes the ng `ref` carries. A client
-without the bit is sent the 104 it always was.
+sent it: the stored flag, then the 16 bytes the ng `ref` carries. With
+bit 18, a 108 may name one as what it answers, in `DATA_REPLY_TO`, which
+the reply's 104 carries to a recipient with the bit (`replies.md` §5). A client
+without either bit is sent the 104 it always was.
 
 **Addressing an account from 1.x is a command to the system account.**
 `/msg <login> …` exists, as a private message to the reserved account of

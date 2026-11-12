@@ -1,10 +1,11 @@
 # Replies on the classic wire
 
-Status: built for lines of chat and instant messages: `DATA_REPLY_TO`
-on Send Chat (105) in the lobby, a room and a private chat, relayed on
-Chat Message (106) and paged on Get Chat History (700) as the entry's
-sub-field, 700 by line id for the lines a page's replies answer,
-`DATA_REPLY_TO` on IM Send (810) relayed on IM Deliver (811), and a
+Status: built for lines of chat, private messages and instant
+messages: `DATA_REPLY_TO` on Send Chat (105) in the lobby, a room and a
+private chat, relayed on Chat Message (106) and paged on Get Chat
+History (700) as the entry's sub-field, 700 by line id for the lines a
+page's replies answer, on Send Instant Msg (108) relayed on Server
+Message (104), and on IM Send (810) relayed on IM Deliver (811), and a
 stored private message's reference to a session that negotiated the
 bit. This
 binds nobody but this server: the protocol is the Replies draft
@@ -25,9 +26,11 @@ the choices the draft left to it.
   login never holds it.
 - **The login reply** beside it carries `DATA_REPLY_TARGETS`: kept lines
   (`0x0002`, kind 1) where there is `[history]`, lines nobody keeps
-  (`0x0010`, kind 4) always, and instant messages (`0x0004`, kind 2) to
-  a session that negotiated the friend family's bit 6. The targets are
-  fixed for the session as it was told them.
+  (`0x0010`, kind 4) always, instant messages (`0x0004`, kind 2) to
+  a session that negotiated the friend family's bit 6, and private
+  messages (`0x0020`, kind 5) where there is `[inbox]`. The targets are
+  fixed for the session as it was told them, and a session is sent no
+  reference of a kind they leave out.
 - **A session without bit 18**, a period client and one with bit 17 or
   19 alone included, is sent exactly what it was, and a `DATA_REPLY_TO`
   it sends is ignored. The draft's `Replies.ClassicForm` is `none` here
@@ -56,6 +59,12 @@ the choices the draft left to it.
   and names a message of the conversation it is said in: its login is
   the sending account's or the 810's `DATA_FRIEND_LOGIN`, either in any
   case, and is kept as sent.
+- **A private message** is kind 5, by the reference it was stored
+  under (§5), whoever's message it is: its reader resolves it from its
+  own mail, where another pair's resolves to nothing. Only a stored
+  message has a reference, so one whose stored flag is clear is
+  dropped; the draft's references for messages the server does not
+  store are not built, on this wire or ng.
 - **Never resolved.** A target retired, redacted, never relayed or
   never seen by its reader is kept and relayed as sent. A kept lobby line
   answering a notice is stored with its kind 4 reference, which a server
@@ -65,15 +74,16 @@ the choices the draft left to it.
 ## 3. What is dropped
 
 105 has no reply to refuse a line with, so a reference the draft does
-not allow is dropped and the line relayed without it, and 810 drops one
-alike, as the draft has every transaction do: one from a sender without
+not allow is dropped and the line relayed without it, and 108 and 810
+drop one alike, as the draft has every transaction do: one from a sender without
 bit 18, of a kind the login did not offer (kind 3 among them), of a
-kind a line or an instant message does not take, malformed, past 128
-bytes, naming line id 0, two in one request, and one naming a chat
+kind a line or a message does not take, malformed, past 128 bytes,
+naming line id 0, a private message not stored, two in one request,
+and one naming a chat
 other than the one the line is said in, or an instant message of
 neither party's. Those last two are the core's own rules
 (`Reply::in_room`, `Reply::between`), which it also holds every
-frontend's line and instant message to, refusing the whole of it; the
+frontend's line and message to, refusing the whole of it; the
 parse here asks them first, so the classic wire never loses a line or a
 message to them.
 
@@ -83,13 +93,21 @@ message to them.
   `0x0020` `REPLY_TO`, the target as this wire names it, after media's
   and before anything later, the sender's echo included. A reply from ng
   is heard here as kind 1 for the lobby and kind 4 under a room's id.
+- **104.** To a session with bit 18, a private message's reply carries
+  `DATA_REPLY_TO`, live and when it waited, beside the reply's own
+  `DATA_PM_ID` where the reply was stored. A reply
+  from ng is heard here as kind 5, or kind 2 for one naming an instant
+  message.
 - **811.** To a session with bit 18, an instant message's reply carries
   `DATA_REPLY_TO`, live and when it waited for Get Roster. A reply from
-  ng is heard here as kind 2, and one naming a private message, which
-  810 cannot carry, as its text alone.
+  ng is heard here as kind 2, or kind 5 for one naming a private
+  message, which 810 cannot send.
+- **Only what a reader was offered.** A 106, 104 or 811 carries a
+  reference only of a kind its reader's login listed, so a session without bit 6
+  is never sent an instant message's, which it could not resolve.
 - **The ng wire** hears a classic reply as `re`, `{ "line" }`,
-  `{ "line", "room" }` or `{ "im" }`; one naming a line nobody keeps has
-  no form there, and is heard as its text alone.
+  `{ "line", "room" }`, `{ "im" }` or `{ "pm" }`; one naming a line
+  nobody keeps has no form there, and is heard as its text alone.
 - **700.** To a reader with bit 18, a line's entry carries the same
   sub-field, in type order after media's and before the Reactions
   draft's `0x0021`. A tombstone carries none: a redaction takes a reply's
@@ -116,7 +134,10 @@ A stored private message's reference reaches a session with bit 18, as
 one with the Reactions draft's bit 19 (`reactions.md` §2): as
 `DATA_PM_ID` on the 104 that hands the message over and on the reply to
 the 108 that sent it. The reactions a message gathered while it waited
-are told after its 104 only to a session with bit 19.
+are told after its 104 only to a session with bit 19. A 108 with bit 18
+may carry `DATA_REPLY_TO` naming one as kind 5: the flag, which must
+say stored, then the same 16 bytes, which the ng wire spells as its
+`pm` target.
 
 ## 6. Notifications
 
@@ -131,10 +152,11 @@ family. It costs 1 spam point.
 
 No reference crosses a link (`server-link.md`): a classic reply to a
 ghost's lobby line is kept and relayed here, and heard at the line's
-home as its text alone.
+home as its text alone. A private message to or from a ghost is never
+stored, so it has no `DATA_PM_ID` and cannot be named, and a reply's
+108 to a ghost is heard there as its text alone.
 
 ## 8. Not yet
 
-- Replies on private messages (108 and 104, kind 5), and an instant
-  message's reference on the 104 that hands it over as mail.
 - The draft's notification to a line's author.
+- References for private messages the server does not store.

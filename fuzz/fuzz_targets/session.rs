@@ -5,14 +5,16 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
-use hxd_core::{AuthBackend, Core, HistoryPolicy, MemoryLog, ReactionPolicy};
+use hxd_core::{
+    AuthBackend, Core, HistoryPolicy, InboxPolicy, MemoryLog, MemoryStore, ReactionPolicy,
+};
 use hxd_session::{cap, run_session, Caps, ServerConfig, ServerCtx};
 use libfuzzer_sys::fuzz_target;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Env {
     rt: tokio::runtime::Runtime,
-    auth: Arc<dyn AuthBackend>,
+    auth: Arc<hxd_auth_file::FileAuth>,
     cfg: Arc<ServerConfig>,
     _dir: tempfile::TempDir,
 }
@@ -23,10 +25,11 @@ fn env() -> &'static Env {
         let dir = tempfile::tempdir().unwrap();
         let accounts = dir.path().join("accounts");
         hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-        // An account that may react, which a guest may not.
+        // An account that may react and answer mail, which a guest may not.
         std::fs::write(
             accounts.join("fuzz.toml"),
-            "name = \"fuzz\"\npassword = \"fuzz\"\n[access]\nread_chat = true\nsend_chat = true\n",
+            "name = \"fuzz\"\npassword = \"fuzz\"\n[access]\nread_chat = true\nsend_chat = true\n\
+             send_msgs = true\n",
         )
         .unwrap();
         Env {
@@ -54,13 +57,19 @@ fuzz_target!(|data: &[u8]| {
     let env = env();
     env.rt.block_on(async {
         // A core per input, so no ban or flood count carries between them,
-        // with a log for its lines to be reacted to on.
+        // with a log for its lines to be reacted to on and an inbox for
+        // its messages to be answered by.
         let core = Core::new()
             .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
-            .with_reactions(ReactionPolicy::default());
+            .with_reactions(ReactionPolicy::default())
+            .with_inbox(
+                Arc::new(MemoryStore::new()),
+                env.auth.clone(),
+                InboxPolicy::default(),
+            );
         let ctx = ServerCtx {
             core: Arc::new(core),
-            auth: env.auth.clone(),
+            auth: env.auth.clone() as Arc<dyn AuthBackend>,
             cfg: env.cfg.clone(),
             files: None,
             banner: None,
