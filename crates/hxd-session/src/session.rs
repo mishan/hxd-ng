@@ -2739,7 +2739,10 @@ async fn login_phase(
     {
         login_reply.extend(reactions::login_fields(&policy, reaction_targets));
     }
-    let reply_targets = replies::targets(ctx.core.history_policy().is_some());
+    let reply_targets = replies::targets(
+        ctx.core.history_policy().is_some(),
+        caps.has(cap::MESSAGING),
+    );
     if caps.has(cap::REPLIES) {
         login_reply.push((
             replies::DATA_REPLY_TARGETS,
@@ -3505,11 +3508,12 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         | Event::Receipt { .. }
         | Event::Typing { .. }
         | Event::RequestsChanged { .. }) => {
-            let (friendships, refs) = (
+            let (friendships, refs, replies) = (
                 sess.has_cap(cap::FRIENDSHIPS),
                 sess.has_cap(cap::SERVER_EMOJI),
+                sess.has_cap(cap::REPLIES),
             );
-            if let Some((ty, chunks)) = friends::event(&ev, sess.enc, friendships, refs)
+            if let Some((ty, chunks)) = friends::event(&ev, sess.enc, friendships, refs, replies)
                 .filter(|_| sess.has_cap(cap::MESSAGING))
             {
                 notify(tx, ty, chunks);
@@ -6095,8 +6099,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // domain's gate, and the fingerprints it is shown are ones
             // this server shows anyone (hxd-ng has no hidden links).
             let friendships = sess.has_cap(cap::FRIENDSHIPS);
-            let op = match friends::parse(f, sess.enc, friendships, sess.has_cap(cap::SERVER_EMOJI))
-            {
+            let replies = (sess.has_cap(cap::REPLIES))
+                .then_some((sess.reply_targets, sess.account.login.as_str()));
+            let emoji = sess.has_cap(cap::SERVER_EMOJI);
+            let op = match friends::parse(f, sess.enc, friendships, emoji, replies) {
                 Ok(op) => op,
                 Err(text) => {
                     if friends::answers(t) {

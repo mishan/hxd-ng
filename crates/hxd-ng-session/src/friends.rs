@@ -371,6 +371,7 @@ fn messaging_err(id: u64, e: MessagingError) -> String {
             "You have asked as many new people today as this server allows.",
         ),
         MessagingError::MessageTooLong => ("bad_request", "Too long."),
+        MessagingError::ReplyScope => ("bad_request", "`re` names no message between you."),
         MessagingError::QueueFull => ("mailbox_full", "That user's mailbox is full."),
         MessagingError::SignedElsewhere | MessagingError::Equivocation => {
             ("bad_signature", "That signature does not fit this message.")

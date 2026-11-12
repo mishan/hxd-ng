@@ -413,6 +413,9 @@ async fn a_reply_to_a_message_and_to_an_instant_message() {
         event(&mut alice, "im", |d| d["text"] == "yes").await["re"],
         re
     );
+    let theirs = json!({ "im": { "login": "dave", "guid": guid(1) } });
+    let params = json!({ "to_login": "alice", "text": "x", "re": theirs });
+    assert_eq!(refused(&mut bob, "msg", params).await, "bad_request");
 }
 
 #[tokio::test]

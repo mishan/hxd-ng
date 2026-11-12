@@ -182,6 +182,29 @@ fn main() {
     ] {
         replying.push(pack_frame(0x2bc, replying.len() as u32 + 2, 0, &fields));
     }
+    // Bits 1, 4, 6, 17 and 18, then IM Send (810) with `DATA_REPLY_TO`
+    // naming either party's message, a third party's, a line, malformed,
+    // and two at once.
+    let login_im_replying = login_as(b"fuzz", b"fuzz", vec![0, 0x06, 0, 0x52]);
+    let im_of = |login: &[u8]| [&[2][..], &[7; 16], &[login.len() as u8], login].concat();
+    let mut im_replying = Vec::new();
+    for fields in [
+        vec![(0xf21, im_of(b"fuzz"))],
+        vec![(0xf21, im_of(b"FRIEND"))],
+        vec![(0xf21, im_of(b"other"))],
+        vec![(0xf21, im_of(b""))],
+        vec![(0xf21, im_of(b"friend")[..20].to_vec())],
+        vec![(0xf21, line(1, 0, 1))],
+        vec![(0xf21, im_of(b"fuzz")), (0xf21, im_of(b"friend"))],
+    ] {
+        let mut all = vec![
+            (0x600, b"friend".to_vec()),
+            (0x605, vec![7; 16]),
+            (0x606, b"yes".to_vec()),
+        ];
+        all.extend(fields);
+        im_replying.push(pack_frame(810, im_replying.len() as u32 + 2, 0, &all));
+    }
     for dir in ["corpus/frame", "corpus/session"] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -211,4 +234,11 @@ fn main() {
     }
     std::fs::write("corpus/frame/login-replies", &login_replying).unwrap();
     std::fs::write("corpus/session/replies", &session).unwrap();
+    let mut session = b"TRTPHOTL\x00\x01\x00\x02".to_vec();
+    session.extend_from_slice(&login_im_replying);
+    for (n, r) in im_replying.iter().enumerate() {
+        std::fs::write(format!("corpus/frame/im-reply-{n}"), r).unwrap();
+        session.extend_from_slice(r);
+    }
+    std::fs::write("corpus/session/im-replies", &session).unwrap();
 }

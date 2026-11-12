@@ -5,8 +5,9 @@
 //! room and a private chat, relayed on 106 and paged on 700 as the entry's
 //! sub-field, crossing to the ng wire and back, dropped where it breaks
 //! the draft and the line relayed, 700 by line id, a stored private
-//! message's reference to a session with bit 18, and every session
-//! without the bit sent what it always was.
+//! message's reference to a session with bit 18, an instant message's
+//! reply on 811, and every session without the bit sent what it always
+//! was.
 //!
 //! Targets and sub-fields are laid out by hand from the draft here rather
 //! than by the server's encoder, so a disagreement between the two shows.
@@ -23,8 +24,10 @@ use hxd_session::reactions::{CHANGED, DATA_NOTIFY_TYPES, SET_NOTIFICATIONS};
 use hxd_session::replies::{DATA_LINE_ID, DATA_REPLY_TARGETS, DATA_REPLY_TO};
 use hxd_session::structured::DATA_CHAT_LINE;
 use hxd_testclient::legacy::{push, Client, Frame, Login};
+use hxd_testclient::messaging as im;
 use hxd_testclient::ng;
-use hxproto::messages::{tag, ClientHdr};
+use hxproto::messages::{tag, ClientHdr, ServerHdr};
+use hxproto::messaging::ReasonCode;
 use serde_json::{json, Value};
 
 const UTF8: u32 = 1 << 1;
@@ -138,6 +141,16 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
 
 async fn start_on(dir: &Path) -> Server {
     start(dir, Opts::default()).await
+}
+
+/// A server with `[messaging]`, and the `[inbox]` it keeps instant
+/// messages in.
+fn messaging() -> Opts<'static> {
+    Opts {
+        inbox: true,
+        extra: "[messaging]\nenabled = true\n",
+        ..Opts::default()
+    }
 }
 
 /// `who` logged in offering `caps`, without the user list, and its
@@ -293,8 +306,9 @@ fn answers(f: &Frame) -> Option<Vec<u8>> {
     found.map(|(_, d)| d)
 }
 
-/// A frame as two lines that differ in their ids and times alone send
-/// it: an entry's id and timestamp zeroed.
+/// A frame as two lines or messages that differ in their ids and times
+/// alone send it: an entry's id and timestamp zeroed, and a message's
+/// guid and timestamp.
 fn twin(f: &Frame) -> (u32, Vec<(u16, Vec<u8>)>) {
     let fields = f
         .chunks()
@@ -304,6 +318,7 @@ fn twin(f: &Frame) -> (u32, Vec<(u16, Vec<u8>)>) {
                 d[..16].fill(0);
                 (c.tag, d)
             }
+            tag::MESSAGE_GUID | tag::MESSAGE_TIMESTAMP => (c.tag, vec![0; c.data.len()]),
             t => (t, c.data.to_vec()),
         })
         .collect();
@@ -316,8 +331,8 @@ fn confirmed(reply: &Frame) -> u32 {
 
 /// Bit 18 only beside bits 1 and 17, wherever there is Structured Chat,
 /// and `DATA_REPLY_TARGETS` with it alone: kept lines where there is
-/// `[history]`, and lines nobody keeps everywhere. Instant and private
-/// messages are not yet among them.
+/// `[history]`, lines nobody keeps everywhere, and instant messages
+/// beside bit 6. Private messages are not yet among them.
 #[tokio::test]
 async fn bit_18_is_confirmed_beside_bits_1_and_17_with_the_kinds_kept() {
     let unkept = Opts {
@@ -327,11 +342,6 @@ async fn bit_18_is_confirmed_beside_bits_1_and_17_with_the_kinds_kept() {
     };
     let unstructured = Opts {
         structured: false,
-        ..Opts::default()
-    };
-    let mail = Opts {
-        inbox: true,
-        extra: "[messaging]\nenabled = true\n",
         ..Opts::default()
     };
     for (server, opts, cases) in [
@@ -358,8 +368,11 @@ async fn bit_18_is_confirmed_beside_bits_1_and_17_with_the_kinds_kept() {
         ),
         (
             "inbox and messaging",
-            mail,
-            vec![("with bit 6", ON | MESSAGING, Some(0x0012))],
+            messaging(),
+            vec![
+                ("with bit 6", ON | MESSAGING, Some(0x0016)),
+                ("without", ON, Some(0x0012)),
+            ],
         ),
     ] {
         let td = tempfile::tempdir().unwrap();
@@ -969,27 +982,208 @@ async fn a_stored_messages_reference_reaches_a_session_with_bit_18() {
     }
 }
 
+fn guid(n: u8) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    g[6] = 0x40;
+    g[8] = 0x80;
+    g[15] = n;
+    g
+}
+
+fn ng_guid(n: u8) -> String {
+    format!("00000000-0000-4000-8000-0000000000{n:02x}")
+}
+
+/// The instant message `sender` sent under `guid(n)`, as a target.
+fn im_target(sender: &str, n: u8) -> Vec<u8> {
+    let login = sender.as_bytes();
+    [&[2][..], &guid(n), &[login.len() as u8], login].concat()
+}
+
+/// `a` asks `b` to be friends, and `b` accepts.
+async fn befriend(a: &mut Client, a_login: &str, b: &mut Client, b_login: &str) {
+    let asked = a
+        .ask(
+            ClientHdr::AddFriend,
+            &im::add_friend(b_login.as_bytes(), None),
+        )
+        .await
+        .unwrap();
+    assert!(!asked.is_error(), "{:?}", asked.error_text());
+    let answered = b
+        .ask(
+            ClientHdr::FriendResponse,
+            &im::friend_response(a_login.as_bytes(), true),
+        )
+        .await
+        .unwrap();
+    assert!(!answered.is_error(), "{:?}", answered.error_text());
+}
+
+/// `c` sends `to` an instant message under `guid(n)`, with `fields`
+/// beside it, and the reply's reason.
+async fn im_send(
+    c: &mut Client,
+    to: &str,
+    n: u8,
+    text: &str,
+    fields: &[(u16, Vec<u8>)],
+) -> Option<ReasonCode> {
+    let mut all = im::im_send(to.as_bytes(), &guid(n), text.as_bytes());
+    all.extend_from_slice(fields);
+    let sent = c.ask(ClientHdr::ImSend, &all).await.unwrap();
+    assert!(!sent.is_error(), "{text}: {:?}", sent.error_text());
+    im::reason(&sent)
+}
+
+/// The 811 carrying `text`.
+async fn im_heard(c: &mut Client, text: &str) -> Frame {
+    c.recv_where(|f| {
+        f.ty == ServerHdr::ImDeliver.as_u32()
+            && f.bytes(tag::MESSAGE_BODY).as_deref() == Some(text.as_bytes())
+    })
+    .await
+    .unwrap_or_else(|e| panic!("no 811 {text:?}: {e}"))
+}
+
+/// What an 811 answers, if anything.
+fn im_answers(f: &Frame) -> Option<Vec<u8>> {
+    f.bytes(DATA_REPLY_TO)
+}
+
+/// An instant message's reply names a message of its conversation, by
+/// either party's login in any case: kind 2 on the 811 to a session with
+/// bit 18, heard live and after waiting for Get Roster, and crossing to
+/// ng as `{ im }` and back, where ng's naming a private message, which
+/// 810 cannot carry, is heard as the text alone. One naming a third party's message, a line,
+/// two at once, or from a sender without bit 18 is dropped and the
+/// message delivered.
+#[tokio::test]
+async fn an_instant_messages_reply_names_a_message_of_its_conversation() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), messaging()).await;
+    let mut alice = classic(&s, "alice", Some(ON | MESSAGING)).await;
+    let mut bob = classic(&s, "bob", Some(ON | MESSAGING)).await;
+    befriend(&mut alice, "alice", &mut bob, "bob").await;
+    im_send(&mut alice, "bob", 1, "lunch?", &[]).await;
+    let field = |t: Vec<u8>| (DATA_REPLY_TO, t);
+    for (n, t) in [(2, im_target("alice", 1)), (3, im_target("BOB", 2))] {
+        let text = format!("yes {n}");
+        im_send(&mut bob, "alice", n, &text, &[field(t.clone())]).await;
+        assert_eq!(im_answers(&im_heard(&mut alice, &text).await), Some(t));
+    }
+
+    let mut unasked = classic(&s, "bob", Some(UTF8 | STRUCTURED | MESSAGING)).await;
+    for (n, (case, from_unasked, fields)) in [
+        ("a third party's", false, vec![field(im_target("carol", 1))]),
+        ("a line", false, vec![field(lobby(1))]),
+        (
+            "two",
+            false,
+            vec![field(im_target("alice", 1)), field(im_target("bob", 2))],
+        ),
+        (
+            "a sender without bit 18",
+            true,
+            vec![field(im_target("alice", 1))],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (text, marker) = (format!("dropped {n}"), format!("kept {n}"));
+        let n = 10 + 2 * n as u8;
+        let sender = if from_unasked { &mut unasked } else { &mut bob };
+        im_send(sender, "alice", n, &text, &fields).await;
+        assert_eq!(
+            im_answers(&im_heard(&mut alice, &text).await),
+            None,
+            "{case}"
+        );
+        let t = im_target("alice", 1);
+        im_send(&mut bob, "alice", n + 1, &marker, &[field(t.clone())]).await;
+        let kept = im_heard(&mut alice, &marker).await;
+        assert_eq!(im_answers(&kept), Some(t), "{case}: the marker");
+    }
+
+    let mut erin = ng::Client::connect(s.ng).await.unwrap();
+    let hello = json!({
+        "login": "erin", "password": "pw", "nick": "erin", "messaging": true, "replies": true,
+    });
+    erin.login(hello).await.unwrap();
+    let asked = alice
+        .ask(ClientHdr::AddFriend, &im::add_friend(b"erin", None))
+        .await
+        .unwrap();
+    assert!(!asked.is_error(), "{:?}", asked.error_text());
+    let answer = json!({ "login": "alice", "accept": true });
+    ok(&mut erin, "friend_respond", answer).await;
+    let ng_asks = json!({ "to_login": "alice", "text": "ng asks", "guid": ng_guid(40) });
+    ok(&mut erin, "msg", ng_asks).await;
+    im_heard(&mut alice, "ng asks").await;
+    let t = im_target("erin", 40);
+    im_send(&mut alice, "erin", 41, "classic answers", &[field(t)]).await;
+    let heard = erin
+        .event_where("im", |d| d["text"] == "classic answers")
+        .await
+        .unwrap();
+    let want = json!({ "im": { "login": "erin", "guid": ng_guid(40) } });
+    assert_eq!(heard.data["re"], want);
+    let re = json!({ "im": { "login": "alice", "guid": ng_guid(41) } });
+    let ng_answers = json!({ "to_login": "alice", "text": "ng answers", "re": re });
+    ok(&mut erin, "msg", ng_answers).await;
+    let heard = im_heard(&mut alice, "ng answers").await;
+    assert_eq!(im_answers(&heard), Some(im_target("alice", 41)));
+    let re = json!({ "pm": "AAAAAAAAAAAAAAAAAAAAAA" });
+    let ng_mail = json!({ "to_login": "alice", "text": "ng mail", "re": re });
+    ok(&mut erin, "msg", ng_mail).await;
+    assert_eq!(im_answers(&im_heard(&mut alice, "ng mail").await), None);
+
+    for mut c in [bob, unasked] {
+        let gone = c.uid.unwrap();
+        c.shutdown().await.unwrap();
+        let mut tries = 0;
+        while s.core.user(gone).is_some() {
+            tries += 1;
+            assert!(tries < 500, "bob's session never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let t = im_target("bob", 2);
+    let queued = im_send(&mut alice, "bob", 50, "while away", &[field(t.clone())]).await;
+    assert_eq!(queued, Some(ReasonCode::OfflineQueued));
+    let mut bob = classic(&s, "bob", Some(ON | MESSAGING)).await;
+    let roster = bob.ask(ClientHdr::GetRoster, &[]).await.unwrap();
+    assert!(!roster.is_error(), "{:?}", roster.error_text());
+    assert_eq!(im_answers(&im_heard(&mut bob, "while away").await), Some(t));
+}
+
 /// The second 106 ending in `tail`, a reply heard after its twin.
 async fn told(c: &mut Client, tail: &str) -> Frame {
     heard(c, tail).await;
     heard(c, tail).await
 }
 
-/// While replies of every kind flow in the lobby, a room and a private
-/// chat, from classic and from ng, and a sender without bit 18 sends a
-/// reference anyway, a period client, one with bit 17 alone and one
-/// with bits 17 and 19 are sent each reply as they are sent its twin
-/// said without one, ids and times aside, and paged them alike.
+/// While replies of every kind flow in the lobby, a room, a private chat
+/// and instant messages, from classic and from ng, and a sender without
+/// bit 18 sends a reference anyway, a period client, one with bit 17
+/// alone and one with bits 17 and 19 are sent each reply as they are
+/// sent its twin said without one, ids and times aside, and paged them
+/// alike.
 #[tokio::test]
 async fn a_session_without_bit_18_is_sent_what_it_always_was() {
     let td = tempfile::tempdir().unwrap();
-    let s = start_on(td.path()).await;
-    let mut alice = classic(&s, "alice", Some(ON)).await;
+    let s = start(td.path(), messaging()).await;
+    let mut alice = classic(&s, "alice", Some(ON | MESSAGING)).await;
     let mut bob = classic(&s, "bob", Some(ON)).await;
     let mut boss = classic(&s, "boss", Some(UTF8 | HISTORY | STRUCTURED)).await;
     let mut period = classic(&s, "dave", None).await;
-    let mut frank = classic(&s, "frank", Some(UTF8 | HISTORY | STRUCTURED)).await;
-    let mut erin = classic(&s, "erin", Some(UTF8 | HISTORY | STRUCTURED | REACTIONS)).await;
+    let bit_17 = UTF8 | HISTORY | STRUCTURED | MESSAGING;
+    let mut frank = classic(&s, "frank", Some(bit_17)).await;
+    let mut erin = classic(&s, "erin", Some(bit_17 | REACTIONS)).await;
+    befriend(&mut alice, "alice", &mut frank, "frank").await;
+    befriend(&mut alice, "alice", &mut erin, "erin").await;
+    let mut frank_18 = classic(&s, "frank", Some(ON | MESSAGING)).await;
     let mut carol = ng_client(&s, "carol").await;
     for c in [&mut alice, &mut bob, &mut period, &mut frank, &mut erin] {
         join(c, LOUNGE).await;
@@ -1042,16 +1236,25 @@ async fn a_session_without_bit_18_is_sent_what_it_always_was() {
     say_with(&mut boss, 0, "unasked", &[]).await;
     say_with(&mut boss, 0, "unasked", &[(DATA_REPLY_TO, lobby(one))]).await;
     pairs += 1;
+    for (n, to) in [(1, "frank"), (3, "erin")] {
+        let t = (DATA_REPLY_TO, im_target(to, 9));
+        im_send(&mut alice, to, n, "re im", &[]).await;
+        im_send(&mut alice, to, n + 1, "re im", &[t]).await;
+    }
+    im_heard(&mut frank_18, "re im").await;
+    let told_im = im_heard(&mut frank_18, "re im").await;
+    assert_eq!(im_answers(&told_im), Some(im_target("frank", 9)));
 
     say(&mut alice, 0, "end").await;
-    for (who, c) in [
-        ("period", &mut period),
-        ("bit 17", &mut frank),
-        ("bit 19", &mut erin),
+    for (who, c, ims) in [
+        ("period", &mut period, 0),
+        ("bit 17", &mut frank, 1),
+        ("bit 19", &mut erin, 1),
     ] {
         let end = heard(c, "end").await;
         let mut frames = c.rx.take_backlog();
         frames.push(end);
+        let pairs = pairs + ims;
         assert_eq!(frames.len(), 2 * pairs + 1, "{who}: {frames:?}");
         for pair in frames[..2 * pairs].chunks(2) {
             assert_eq!(twin(&pair[0]), twin(&pair[1]), "{who}");

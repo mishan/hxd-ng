@@ -281,26 +281,6 @@ impl Core {
         if media || text.len() > self.messaging_policy.max_message_bytes {
             return friend.is_none().then_some(Err(ChatError::NotFriends));
         }
-        // Out of scope is told only to a sender `them` has not blocked,
-        // which `route` answers as the block.
-        if let Some(re) = re {
-            let login = if sending.guest {
-                ""
-            } else {
-                sending.mailbox.login.as_str()
-            };
-            if let Err(e) = Self::reply_in_scope(re, login, &them.login) {
-                match self
-                    .friends_store()
-                    .ok()?
-                    .is_blocked(&them, &sending.mailbox)
-                {
-                    Ok(true) => {}
-                    Ok(false) => return Some(Err(e)),
-                    Err(e) => return Some(Err(chat_error(store_failed(e)))),
-                }
-            }
-        }
         Some(
             self.route(uid, sending, them, friend, text, guid, signed, re, emoji)
                 .map_err(chat_error),
@@ -312,8 +292,7 @@ impl Core {
     /// account and a text too long is refused as one, and a request is
     /// made only from a session that understands them, as the requests
     /// draft has it, where `/msg <login>` makes one from any classic
-    /// session. `re` is relayed as sent, unchecked: its frontend keeps it
-    /// [`Reply::between`] the two.
+    /// session.
     pub fn im_send_login(
         &self,
         uid: Uid,
@@ -366,6 +345,14 @@ impl Core {
         // A block reads as no account at all, before any bound.
         if rel.is_blocked(&them, &me.mailbox).map_err(store_failed)? {
             return Err(MessagingError::AccountNotFound);
+        }
+        // Whichever frontend sent it, as public chat holds a line's.
+        let login = if sending.guest { "" } else { &me.mailbox.login };
+        if re
+            .as_ref()
+            .is_some_and(|re| !re.between(login, &them.login))
+        {
+            return Err(MessagingError::ReplyScope);
         }
         if signed
             .as_ref()
@@ -1173,6 +1160,7 @@ fn chat_error(e: MessagingError) -> ChatError {
         MessagingError::RateLimited => ChatError::SendQuota,
         MessagingError::QueueFull => ChatError::MailboxFull,
         MessagingError::SignedElsewhere => ChatError::SignedElsewhere,
+        MessagingError::ReplyScope => ChatError::ReplyScope,
         MessagingError::Equivocation => ChatError::Equivocation,
         // A request a block has just deleted reads as no account, as the
         // block does.

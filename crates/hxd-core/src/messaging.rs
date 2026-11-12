@@ -263,6 +263,9 @@ pub enum MessagingError {
     RateLimited,
     /// Past `max_message_bytes`.
     MessageTooLong,
+    /// A reply naming no message between the two
+    /// ([`crate::Reply::between`]).
+    ReplyScope,
     /// The recipient has as many messages waiting as it may.
     QueueFull,
     /// A signature that does not name the recipient's identity.

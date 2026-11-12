@@ -19,7 +19,7 @@ use hxd_core::messaging::{Fetched, PresentResult, Presented, RequestAction, Requ
 use hxd_core::relationships::Profile;
 use hxd_core::{
     ChatError, Core, Event, FoundUser, FriendEntry, MessagingError, MsgOutcome, Presence,
-    PresenceUpdate, RosterState, Uid,
+    PresenceUpdate, Reply, RosterState, Uid,
 };
 use hxproto::messages::{tag, ClientHdr, ServerHdr};
 use hxproto::messaging::{
@@ -29,6 +29,8 @@ use hxproto::messaging::{
 
 use crate::encoding::TextEncoding;
 use crate::frame::{Frame, MAX_FRAME_DATA};
+use crate::replies;
+use tracing::{debug, warn};
 
 type Chunks = Vec<(u16, Vec<u8>)>;
 
@@ -166,7 +168,13 @@ pub(crate) enum Op {
     Respond(String, bool, Option<Vec<u8>>),
     Block(String, bool, Option<Vec<u8>>),
     Presence(PresenceUpdate),
-    Send(String, MessageGuid, String, Vec<hxd_core::emoji::EmojiRef>),
+    Send(
+        String,
+        MessageGuid,
+        String,
+        Option<Reply>,
+        Vec<hxd_core::emoji::EmojiRef>,
+    ),
     Ack(String, MessageGuid, bool),
     Typing(String, bool),
     Find(Named, bool),
@@ -213,13 +221,15 @@ const MALFORMED: &str = "Malformed request.";
 /// Read `f`, a transaction [`handles`] says is the family's, with what
 /// only bit 15 adds read where `friendships` says the session negotiated
 /// it, and ignored, as any field unknown to the extension is, where not;
-/// and an instant message's emoji refs where `emoji` says it negotiated
-/// bit 20.
+/// an instant message's emoji refs where `emoji` says it negotiated bit
+/// 20; and its reference where `replies` holds the targets offered at a
+/// bit-18 login and the account's login.
 pub(crate) fn parse(
     f: &Frame,
     enc: TextEncoding,
     friendships: bool,
     emoji: bool,
+    replies: Option<(u16, &str)>,
 ) -> Result<Op, &'static str> {
     let field = |t: u16| f.chunks().find(|c| c.tag == t).map(|c| c.data.to_vec());
     // A friendship object, within its field's bound.
@@ -336,10 +346,18 @@ pub(crate) fn parse(
             let body = field(tag::MESSAGE_BODY)
                 .filter(|b| !b.is_empty())
                 .ok_or(MALFORMED)?;
+            let with = login()?;
+            let re = replies.and_then(|(offered, me)| {
+                let said = replies::Said::Im { me, with: &with };
+                (replies::reply_to(f, offered, said))
+                    .inspect_err(|why| debug!("reply dropped: {why}"))
+                    .ok()?
+            });
             Op::Send(
-                login()?,
+                with,
                 guid()?,
                 enc.decode(&body),
+                re,
                 crate::emoji::refs_in(f, emoji),
             )
         }
@@ -543,8 +561,8 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
             }
         }
         Op::Presence(update) => done(core.set_presence(uid, update)),
-        Op::Send(login, guid, text, refs) => {
-            match core.im_send_login(uid, &login, text, Some(guid), None, &refs) {
+        Op::Send(login, guid, text, re, refs) => {
+            match core.im_send_login(uid, &login, text, Some(guid), re, &refs) {
                 Ok(outcome) => {
                     let reason = match outcome {
                         MsgOutcome::Delivered(_) | MsgOutcome::Im { queued: false, .. } => {
@@ -557,7 +575,12 @@ pub(crate) fn act(core: &Core, uid: Uid, enc: TextEncoding, friendships: bool, o
                     };
                     Answer::ok(vec![reason_chunk(reason)])
                 }
-                Err(e) => refusal(e),
+                Err(e) => {
+                    if e == MessagingError::ReplyScope {
+                        warn!(uid, "reply out of scope");
+                    }
+                    refusal(e)
+                }
             }
         }
         Op::Ack(login, guid, read) => done(core.im_ack(uid, &login, &guid, read)),
@@ -737,21 +760,24 @@ fn refusal(e: MessagingError) -> Answer {
         ),
         MessagingError::TooMany => ("At most 32 objects, and one withdrawal for a pair.", None),
         // Signed messages are not negotiated on this wire, so neither of
-        // these can be asked for here.
+        // the first two can be asked for here, and `replies::parse`
+        // drops what the domain would refuse as out of scope.
         MessagingError::SignedElsewhere
         | MessagingError::Equivocation
+        | MessagingError::ReplyScope
         | MessagingError::ServerError => ("Server error.", None),
     };
     Answer::Refused { text, reason }
 }
 
 /// The notification a domain event is on this wire, for one of the
-/// family's.
+/// family's, an instant message's reference carried where `replies`.
 pub(crate) fn event(
     ev: &Event,
     enc: TextEncoding,
     friendships: bool,
     emoji: bool,
+    replies: bool,
 ) -> Option<(u32, Chunks)> {
     Some(match ev {
         Event::FriendEntry(e) => (
@@ -803,6 +829,11 @@ pub(crate) fn event(
                     crate::emoji::DATA_EMOJI_REFS,
                     crate::emoji::refs_field(refs),
                 ));
+            }
+            // 810 carries kind 2 alone, so another kind an ng sender
+            // named is heard here as the text alone.
+            if let Some(re @ Reply::Im(_)) = im.re.as_ref().filter(|_| replies) {
+                c.extend(crate::target::pack(re).map(|t| (replies::DATA_REPLY_TO, t)));
             }
             (ServerHdr::ImDeliver.as_u32(), c)
         }
