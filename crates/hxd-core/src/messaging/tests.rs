@@ -926,6 +926,43 @@ fn a_send_by_login_from_a_session_without_an_inbox_is_refused() {
     assert!(s.inbox.all().is_empty());
 }
 
+/// Whichever frontend sends it, as an ng `msg` is.
+#[test]
+fn a_send_by_login_answers_only_its_own_conversation() {
+    use crate::reply::Reply;
+    let s = server(&["alice", "bob", "carol"]);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+    let im = |login: &str| Reply::im(login.into(), guid.clone()).unwrap();
+    let send =
+        |re: &Reply| (s.core).im_send_login(a, "bob", "yes".into(), None, Some(re.clone()), &[]);
+    for (re, kept) in [
+        (im("alice"), true),
+        (im("BOB"), true),
+        (Reply::Pm([3; 16]), true),
+        (im("carol"), false),
+        (Reply::Line { room: 0, id: 1 }, false),
+        (Reply::Ephemeral { chat: 0, id: 1 }, false),
+    ] {
+        let sent = send(&re);
+        let heard: Vec<_> = (drain(&mut rb).into_iter())
+            .filter_map(|e| match e {
+                Event::Im(im) => Some(im.re),
+                _ => None,
+            })
+            .collect();
+        if kept {
+            assert!(sent.is_ok(), "{re:?}: {sent:?}");
+            assert_eq!(heard, [Some(re)]);
+        } else {
+            assert_eq!(sent, Err(MessagingError::ReplyScope), "{re:?}");
+            assert!(heard.is_empty(), "{re:?}: {heard:?}");
+        }
+    }
+}
+
 #[test]
 fn an_im_is_handed_to_a_friend_and_again_until_it_is_acknowledged() {
     let s = server(&["alice", "bob"]);

@@ -689,6 +689,13 @@ change in Reaction Changed (711), or for a party with no session to
 hear it, after the reply to the next Get Roster from a session with
 bit 19.
 
+**Replies** to instant messages, with the Replies draft's bit 18 beside
+bit 6, are `replies.md`'s: IM Send (810) may carry `DATA_REPLY_TO`
+naming a message of the conversation by its sender's login and guid,
+which IM Deliver (811) carries to a session with bit 18, live or after
+Get Roster; one naming any other message is dropped and the message
+delivered.
+
 What the classic wire says differently from the documents, on purpose:
 
 - **Prices.** Every request of the family spends spam points as its

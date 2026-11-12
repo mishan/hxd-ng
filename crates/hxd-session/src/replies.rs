@@ -1,13 +1,14 @@
 //! Replies on the classic wire (the Replies draft, `docs/replies.md`):
-//! capability bit 18, `DATA_REPLY_TO` on a line of chat, kept and relayed
-//! as sent to the sessions that negotiated it, on Chat Message (106) and
-//! in Get Chat History (700) as the entry's sub-field, and 700 by line id
+//! capability bit 18, `DATA_REPLY_TO` on a line of chat and an instant
+//! message, kept and relayed as sent to the sessions that negotiated it,
+//! on Chat Message (106) and in Get Chat History (700) as the entry's
+//! sub-field and on IM Deliver (811) as the field, and 700 by line id
 //! for the lines a page's replies answer.
 //!
 //! The server never looks a target up: every reference is parsed, held
 //! to the conversation it is said in by the core's own scope rule, and
-//! dropped from the line where it breaks it, since 105 has no reply to
-//! refuse it with.
+//! dropped from the line or message where it breaks it, as the draft has
+//! it, since 105 has no reply to refuse it with.
 //!
 //! The draft's numbers are kept here, as Structured Chat's are in
 //! [`crate::structured`], until they are allocated.
@@ -15,7 +16,7 @@
 use hxd_core::Reply;
 
 use crate::frame::Frame;
-use crate::target::{line, EPHEMERAL, LINE};
+use crate::target::{im, line, EPHEMERAL, IM, LINE};
 
 /// A line's history id, repeated in a 700 that asks for lines by id.
 pub const DATA_LINE_ID: u16 = 0x0f20;
@@ -29,6 +30,7 @@ pub const REPLY_TO: u16 = 0x0020;
 
 pub const TARGETS_LINES: u16 = 1 << LINE;
 pub const TARGETS_EPHEMERAL: u16 = 1 << EPHEMERAL;
+pub const TARGETS_IMS: u16 = 1 << IM;
 
 /// The longest `DATA_REPLY_TO` the draft allows.
 const MAX_PACKED: usize = 128;
@@ -37,18 +39,22 @@ const MAX_PACKED: usize = 128;
 const MAX_IDS: usize = 50;
 
 /// The kinds of target a session may name, fixed at its login: kept
-/// lines where lines are kept, and lines nobody keeps, a private chat's,
-/// a notice's and the unkept lobby's or a room's, always.
-pub(crate) fn targets(lines_kept: bool) -> u16 {
-    TARGETS_EPHEMERAL | if lines_kept { TARGETS_LINES } else { 0 }
+/// lines where lines are kept, lines nobody keeps, a private chat's, a
+/// notice's and the unkept lobby's or a room's, always, and instant
+/// messages to a session that speaks the friend family.
+pub(crate) fn targets(lines_kept: bool, messaging: bool) -> u16 {
+    let when = |on: bool, bit: u16| if on { bit } else { 0 };
+    TARGETS_EPHEMERAL | when(lines_kept, TARGETS_LINES) | when(messaging, TARGETS_IMS)
 }
 
-/// Where a line is said: the lobby, a room or a private chat by its id.
+/// Where a reply is said: the lobby, a room or a private chat by its
+/// id, or an instant message from the account `me` to `with`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Said {
+pub(crate) enum Said<'a> {
     Lobby,
     Room(u32),
     Chat(u32),
+    Im { me: &'a str, with: &'a str },
 }
 
 /// The reference `f` carries, from a session that may name `offered`:
@@ -75,7 +81,7 @@ pub(crate) fn line_ids(f: &Frame) -> Option<Vec<u64>> {
 /// lobby line on channel 0; kind 4 an unkept line under its chat's id,
 /// or in a room where lines are kept, which `offered` says by holding
 /// kind 1, the room's kept line, as the room is addressed by its chat id
-/// on this wire.
+/// on this wire; kind 2 an instant message of either party's.
 pub(crate) fn parse(b: &[u8], offered: u16, said: Said) -> Result<Reply, &'static str> {
     if b.len() > MAX_PACKED {
         return Err("past the bound");
@@ -84,18 +90,21 @@ pub(crate) fn parse(b: &[u8], offered: u16, said: Said) -> Result<Reply, &'stati
     if kind >= 16 || offered & 1 << kind == 0 {
         return Err("a kind not offered");
     }
-    if !matches!(kind, LINE | EPHEMERAL) {
-        return Err("a kind a line does not take");
-    }
-    let (chat, id) = line(rest).ok_or("malformed")?;
-    if id == 0 {
-        return Err("line id 0");
-    }
     let (here, room) = match said {
+        Said::Im { me, with } if kind == IM => {
+            let re = im(rest).ok_or("malformed")?;
+            return re.between(me, with).then_some(re).ok_or("out of scope");
+        }
+        Said::Im { .. } => return Err("a kind a message does not take"),
+        _ if !matches!(kind, LINE | EPHEMERAL) => return Err("a kind a line does not take"),
         Said::Lobby => (0, false),
         Said::Room(r) => (r, true),
         Said::Chat(c) => (c, false),
     };
+    let (chat, id) = line(rest).ok_or("malformed")?;
+    if id == 0 {
+        return Err("line id 0");
+    }
     let re = match kind {
         LINE if here == 0 => Reply::Line { room: chat, id },
         LINE => return Err("kind 1 off the lobby"),
@@ -108,7 +117,8 @@ pub(crate) fn parse(b: &[u8], offered: u16, said: Said) -> Result<Reply, &'stati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{IM, PM, STORED};
+    use crate::target::{PM, STORED};
+    use hxd_core::reply::guid_of;
     use hxproto::messages::tag;
 
     fn line_bytes(kind: u8, chat: u32, id: u64) -> Vec<u8> {
@@ -125,7 +135,7 @@ mod tests {
     /// lines kept and without.
     #[test]
     fn a_reference_is_taken_only_as_the_draft_allows_where_it_is_said() {
-        let (kept, unkept, all) = (targets(true), targets(false), u16::MAX);
+        let (kept, unkept, all) = (targets(true, false), targets(false, false), u16::MAX);
         let line = |room, id| Ok(Reply::Line { room, id });
         let eph = |chat, id| Ok(Reply::Ephemeral { chat, id });
         let l = |kind, chat| line_bytes(kind, chat, 9);
@@ -198,6 +208,47 @@ mod tests {
         }
     }
 
+    /// An instant message's reference names one of its two parties, in
+    /// any case, and is taken only of a session offered kind 2: the one
+    /// check 810's reference meets before the domain's.
+    #[test]
+    fn an_instant_messages_reference_names_either_party_alone() {
+        let guid = guid_of(&[7; 16]).unwrap();
+        let im_of = |login: &[u8]| {
+            let len = [login.len() as u8];
+            [&[IM][..], &[7; 16], &len, login].concat()
+        };
+        let named = |login: &str| Ok(Reply::im(login.into(), guid.clone()).unwrap());
+        let (ims, lines, all) = (targets(true, true), targets(true, false), u16::MAX);
+        let said = Said::Im {
+            me: "alice",
+            with: "bob",
+        };
+        let (scope, bad, offer) = ("out of scope", "malformed", "a kind not offered");
+        let kind = "a kind a message does not take";
+        let cut = im_of(b"bob")[..20].to_vec();
+        let (line, eph) = (line_bytes(LINE, 0, 9), line_bytes(EPHEMERAL, 0, 9));
+        let pm = [&[PM, STORED][..], &[3; 16]].concat();
+        for (case, bytes, offered, want) in [
+            ("the account's", im_of(b"alice"), ims, named("alice")),
+            ("the account's, cased", im_of(b"ALICE"), ims, named("ALICE")),
+            ("the friend's", im_of(b"bob"), ims, named("bob")),
+            ("the friend's, cased", im_of(b"Bob"), ims, named("Bob")),
+            ("a third party's", im_of(b"carol"), ims, no(scope)),
+            ("an empty login", im_of(b""), ims, no(bad)),
+            ("not UTF-8", im_of(b"\xffob"), ims, no(bad)),
+            ("a login cut short", cut, ims, no(bad)),
+            ("a guid cut short", vec![IM, 7, 7], ims, no(bad)),
+            ("past 128", im_of(&[b'a'; 111]), all, no("past the bound")),
+            ("not offered", im_of(b"bob"), lines, no(offer)),
+            ("a line", line, all, no(kind)),
+            ("a line nobody keeps", eph, all, no(kind)),
+            ("a PM", pm, all, no(kind)),
+        ] {
+            assert_eq!(parse(&bytes, offered, said), want, "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn a_frame_carries_one_reference_or_none() {
         let field = |id: u64| (DATA_REPLY_TO, line_bytes(1, 0, id));
@@ -220,7 +271,11 @@ mod tests {
             let f = crate::frame::read_frame(&mut packed.as_slice())
                 .await
                 .unwrap();
-            assert_eq!(reply_to(&f, targets(true), Said::Lobby), want, "{case}");
+            assert_eq!(
+                reply_to(&f, targets(true, false), Said::Lobby),
+                want,
+                "{case}"
+            );
         }
     }
 
