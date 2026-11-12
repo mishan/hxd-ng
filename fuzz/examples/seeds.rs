@@ -164,6 +164,24 @@ fn main() {
             (0xf21, line(4, 0, 1)),
         ],
     ));
+    // Get Chat History (700) by `DATA_LINE_ID`: one, 50 and 51 ids, a
+    // short one, and cursors beside them.
+    let by_ids = |n: u64, more: &[(u16, Vec<u8>)]| {
+        let mut fields = vec![(0xf01, vec![0; 4])];
+        fields.extend((1..=n).map(|id| (0xf20, id.to_be_bytes().to_vec())));
+        fields.extend_from_slice(more);
+        fields
+    };
+    let cursors = [(0xf02, 9u64.to_be_bytes().to_vec()), (0xf04, vec![0, 1])];
+    for fields in [
+        by_ids(1, &[]),
+        by_ids(50, &[]),
+        by_ids(51, &[]),
+        by_ids(1, &[(0xf20, vec![0; 7])]),
+        by_ids(2, &cursors),
+    ] {
+        replying.push(pack_frame(0x2bc, replying.len() as u32 + 2, 0, &fields));
+    }
     for dir in ["corpus/frame", "corpus/session"] {
         std::fs::create_dir_all(dir).unwrap();
     }

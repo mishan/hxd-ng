@@ -69,7 +69,9 @@ covers is `hxd_session::reactions` and the choices the draft left to it.
   party in `DATA_FRIEND_LOGIN`, and is checked as IM Acknowledge (812)
   is: the two must be friends or share an approval, neither blocking
   the other. The message is never looked up, and kept nowhere to be
-  read again, so 712 refuses it.
+  read again, so 712 refuses it; nothing counts the keys on it either,
+  so the login's `DATA_MAX_REACTION_KEYS` and
+  `DATA_MAX_REACTIONS_PER_USER` do not apply to it.
 - **A stored private message** is kind 5, the stored flag set and the
   16 bytes the ng wire names it by (its `ref`). A session with bit 19,
   or the Replies draft's bit 18, is given them as `DATA_PM_ID` on the

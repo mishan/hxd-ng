@@ -2,7 +2,8 @@
 
 Status: built for lines of chat: `DATA_REPLY_TO` on Send Chat (105) in
 the lobby, a room and a private chat, relayed on Chat Message (106) and
-paged on Get Chat History (700) as the entry's sub-field, and a stored
+paged on Get Chat History (700) as the entry's sub-field, 700 by line
+id for the lines a page's replies answer, and a stored
 private message's reference to a session that negotiated the bit. This
 binds nobody but this server: the protocol is the Replies draft
 (`Capabilities-Replies.md`, a draft written for this server, in
@@ -80,6 +81,20 @@ classic wire never loses a line to it.
   draft's `0x0021`. A tombstone carries none: a redaction takes a reply's
   target with its words, while a reply to a redacted line keeps its own.
   A reader without the bit is paged the same bytes as before.
+- **700 by id.** A session with bits 4 and 18 may ask for at most 50
+  lines by `DATA_LINE_ID` (`0x0f20`) in place of the cursors, which
+  beside them are ignored, so that it can draw a page's quotes in one
+  request. `DATA_CHANNEL_ID` is still required and 0, a room's chat id
+  being "No such channel." as for a page. The answer is the lobby's lines
+  among the ids, ascending, each entry built as a page builds it, an id
+  asked twice answered once: another room's line, whether the reader may
+  read it or not, and one that does not exist are left out alike, and a
+  tombstone is sent as one. Where they overrun one frame the highest ids
+  are left out and `DATA_HISTORY_HAS_MORE` is 1, for the client to ask
+  again for those past the last it was handed. More than 50 ids, or one
+  not 8 bytes, is "Malformed chat history request.". It costs no spam
+  points and is held to the history rate, as a page is. A session
+  without bit 18 is paged, its `DATA_LINE_ID` a field it does not know.
 
 ## 5. Private messages' references
 
@@ -106,8 +121,6 @@ home as its text alone.
 
 ## 8. Not yet
 
-- Get Chat History by `DATA_LINE_ID`, for a client to fetch the lines a
-  page's replies quote.
 - Replies on instant messages (IM Send and IM Deliver, kind 2) and on
   private messages (108 and 104, kind 5).
 - The draft's notification to a line's author.

@@ -1,7 +1,8 @@
 //! Replies on the classic wire (the Replies draft, `docs/replies.md`):
 //! capability bit 18, `DATA_REPLY_TO` on a line of chat, kept and relayed
 //! as sent to the sessions that negotiated it, on Chat Message (106) and
-//! in Get Chat History (700) as the entry's sub-field.
+//! in Get Chat History (700) as the entry's sub-field, and 700 by line id
+//! for the lines a page's replies answer.
 //!
 //! The server never looks a target up: every reference is parsed, held
 //! to the conversation it is said in by the core's own scope rule, and
@@ -16,6 +17,8 @@ use hxd_core::Reply;
 use crate::frame::Frame;
 use crate::target::{line, EPHEMERAL, LINE};
 
+/// A line's history id, repeated in a 700 that asks for lines by id.
+pub const DATA_LINE_ID: u16 = 0x0f20;
 /// What a line or message answers, as a packed target.
 pub const DATA_REPLY_TO: u16 = 0x0f21;
 /// The login reply's: the kinds of target this server keeps, `1 << kind`.
@@ -29,6 +32,9 @@ pub const TARGETS_EPHEMERAL: u16 = 1 << EPHEMERAL;
 
 /// The longest `DATA_REPLY_TO` the draft allows.
 const MAX_PACKED: usize = 128;
+
+/// The most lines one 700 may ask for by id.
+const MAX_IDS: usize = 50;
 
 /// The kinds of target a session may name, fixed at its login: kept
 /// lines where lines are kept, and lines nobody keeps, a private chat's,
@@ -54,6 +60,15 @@ pub(crate) fn reply_to(f: &Frame, offered: u16, said: Said) -> Result<Option<Rep
         (Some(_), Some(_)) => Err("more than one"),
         (Some(c), None) => parse(c.data, offered, said).map(Some),
     }
+}
+
+/// The lines a 700 asks for by id, none for a page; `None` past
+/// [`MAX_IDS`] or for an id that is not 8 bytes.
+pub(crate) fn line_ids(f: &Frame) -> Option<Vec<u64>> {
+    let ids: Option<Vec<u64>> = (f.chunks().filter(|c| c.tag == DATA_LINE_ID))
+        .map(|c| c.data.try_into().ok().map(u64::from_be_bytes))
+        .collect();
+    ids.filter(|ids| ids.len() <= MAX_IDS)
 }
 
 /// `DATA_REPLY_TO` as sent, said where `said` is. Kind 1 names a kept
@@ -206,6 +221,26 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reply_to(&f, targets(true), Said::Lobby), want, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_700_asks_for_at_most_50_lines_of_8_byte_ids() {
+        let id = |n: u64| (DATA_LINE_ID, n.to_be_bytes().to_vec());
+        let channel = (tag::CHANNEL_ID, vec![0; 4]);
+        for (case, ids, want) in [
+            ("none", vec![], Some(vec![])),
+            ("one", vec![id(7)], Some(vec![7])),
+            ("50", (1..=50).map(id).collect(), Some((1..=50).collect())),
+            ("51", (1..=51).map(id).collect(), None),
+            ("7 bytes", vec![id(7), (DATA_LINE_ID, vec![0; 7])], None),
+        ] {
+            let fields = [vec![channel.clone()], ids].concat();
+            let packed = crate::frame::pack_frame(700, 1, 0, &fields);
+            let f = crate::frame::read_frame(&mut packed.as_slice())
+                .await
+                .unwrap();
+            assert_eq!(line_ids(&f), want, "{case}");
         }
     }
 
