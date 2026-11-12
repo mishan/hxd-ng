@@ -17,6 +17,11 @@ pub enum Reply {
     /// A public line, by its log id, in the room it was said in (0 for
     /// the lobby), which is the room the reply is said in.
     Line { room: u32, id: LineId },
+    /// A line the server does not keep, by the id its chat counted it
+    /// under: a private chat's, a room's or the lobby's where lines are
+    /// not logged, or a notice's, in the chat it is said in (0 for the
+    /// lobby).
+    Ephemeral { chat: u32, id: u64 },
     /// An instant message, by its sender's login and its guid, which
     /// both parties hold. Made by [`Reply::im`] alone.
     Im(ImTarget),
@@ -53,6 +58,7 @@ impl ImTarget {
 const LINE: u8 = 1;
 const IM: u8 = 2;
 const SIGNED: u8 = 3;
+const EPHEMERAL: u8 = 4;
 const PM: u8 = 5;
 
 /// The 16 bytes a guid spells, as a signed object's id is.
@@ -87,6 +93,11 @@ impl Reply {
                 out.extend_from_slice(&room.to_be_bytes());
                 out.extend_from_slice(&id.to_be_bytes());
             }
+            Reply::Ephemeral { chat, id } => {
+                out.push(EPHEMERAL);
+                out.extend_from_slice(&chat.to_be_bytes());
+                out.extend_from_slice(&id.to_be_bytes());
+            }
             Reply::Im(ImTarget { login, guid }) => {
                 out.push(IM);
                 out.extend_from_slice(&guid_bytes(guid));
@@ -115,6 +126,10 @@ impl Reply {
                 room: u32::from_be_bytes(rest[..4].try_into().ok()?),
                 id: u64::from_be_bytes(rest[4..].try_into().ok()?),
             }),
+            EPHEMERAL if rest.len() == 12 => Some(Reply::Ephemeral {
+                chat: u32::from_be_bytes(rest[..4].try_into().ok()?),
+                id: u64::from_be_bytes(rest[4..].try_into().ok()?),
+            }),
             IM if rest.len() > 17 && rest.len() == 17 + usize::from(rest[16]) => Reply::im(
                 String::from_utf8(rest[17..].to_vec()).ok()?,
                 guid_of(&rest[..16])?,
@@ -128,6 +143,33 @@ impl Reply {
             _ => None,
         }
     }
+
+    /// Does a line said in `room` (0 for the lobby, else a room's or a
+    /// private chat's id) stay there in answering this? A signed target
+    /// is bound by its own signature.
+    pub fn in_room(&self, room: u32) -> bool {
+        match self {
+            Reply::Line { room: r, .. } | Reply::Ephemeral { chat: r, .. } => *r == room,
+            Reply::Signed { .. } => true,
+            Reply::Im(_) | Reply::Pm(_) => false,
+        }
+    }
+
+    /// Does a message between `me` and `them` stay between them in
+    /// answering this? By what it names alone, never by what the store
+    /// holds, which would tell the sender whether a message still
+    /// exists. A `pm` is any reference: a reader resolves it from its
+    /// own mail, where another pair's resolves to nothing. A signed
+    /// target is bound by its own signature.
+    pub fn between(&self, me: &str, them: &str) -> bool {
+        match self {
+            Reply::Line { .. } | Reply::Ephemeral { .. } => false,
+            Reply::Signed { .. } | Reply::Pm(_) => true,
+            Reply::Im(im) => {
+                im.login().eq_ignore_ascii_case(me) || im.login().eq_ignore_ascii_case(them)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +181,7 @@ mod tests {
         let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
         for re in [
             Reply::Line { room: 7, id: 98124 },
+            Reply::Ephemeral { chat: 7, id: 98124 },
             Reply::im("alice".into(), guid.clone()).unwrap(),
             Reply::im("a".repeat(MAX_PACKED - 18), guid).unwrap(),
             Reply::Pm([9; 16]),
@@ -152,6 +195,9 @@ mod tests {
             assert!(packed.len() <= MAX_PACKED, "{re:?}");
             assert_eq!(Reply::unpack(&packed), Some(re));
         }
+        // The drafts' kind, so a kept reference reads as the classic wire
+        // names it.
+        assert_eq!(Reply::Ephemeral { chat: 7, id: 1 }.pack()[0], 4);
     }
 
     /// The only way to an instant message target, so none that `unpack`
@@ -170,8 +216,47 @@ mod tests {
     #[test]
     fn what_was_never_packed_does_not_unpack() {
         let line = Reply::Line { room: 0, id: 1 }.pack();
-        for bad in [&[][..], &[0], &[4, 0], &line[..12], &[PM; 16]] {
+        let ephemeral = Reply::Ephemeral { chat: 0, id: 1 }.pack();
+        let long = [&ephemeral[..], &[0]].concat();
+        for bad in [
+            &[][..],
+            &[0],
+            &[4, 0],
+            &line[..12],
+            &ephemeral[..12],
+            &long,
+            &[PM; 16],
+        ] {
             assert_eq!(Reply::unpack(bad), None, "{bad:?}");
         }
+    }
+
+    /// The scope rule every frontend's targets are held to, said once.
+    #[test]
+    fn a_reply_stays_in_its_room_or_between_its_pair() {
+        let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
+        let im = |login: &str| Reply::im(login.into(), guid.clone()).unwrap();
+        let signed = Reply::Signed {
+            signer: [1; 32],
+            id: [2; 16],
+            hash: [3; 32],
+        };
+        // (target, room 7, `alice` and `bob`)
+        for (re, in_room, between) in [
+            (Reply::Line { room: 7, id: 1 }, true, false),
+            (Reply::Line { room: 0, id: 1 }, false, false),
+            (Reply::Ephemeral { chat: 7, id: 1 }, true, false),
+            (Reply::Ephemeral { chat: 0, id: 1 }, false, false),
+            (im("alice"), false, true),
+            (im("BOB"), false, true),
+            (im("carol"), false, false),
+            (im("alic"), false, false),
+            (Reply::Pm([9; 16]), false, true),
+            (signed, true, true),
+        ] {
+            assert_eq!(re.in_room(7), in_room, "{re:?} in room 7");
+            assert_eq!(re.between("alice", "bob"), between, "{re:?} between");
+        }
+        assert!(Reply::Ephemeral { chat: 0, id: 1 }.in_room(0), "the lobby");
     }
 }

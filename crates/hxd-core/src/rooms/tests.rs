@@ -114,7 +114,7 @@ fn named(name: &str) -> RoomEdit {
 }
 
 fn say(core: &Core, uid: Uid, room: u32, text: &str) -> Result<Option<LineId>, ChatError> {
-    core.chat_public_all(uid, room, vec![(text.into(), 0, None, vec![])])
+    core.chat_public_all(uid, room, vec![(text.into(), 0, None, None, vec![])])
         .pop()
         .unwrap()
 }
@@ -270,7 +270,11 @@ fn a_room_line_its_image_and_its_redaction_stay_in_the_room() {
         UploadOutcome::Token(_) => panic!("a single-shot upload answered with a token"),
     };
     let id = core
-        .chat_public_all(alice, room, vec![("look".into(), 0, Some(handle), vec![])])
+        .chat_public_all(
+            alice,
+            room,
+            vec![("look".into(), 0, Some(handle), None, vec![])],
+        )
         .pop()
         .unwrap()
         .unwrap()

@@ -34,6 +34,7 @@ fn kind(re: &Reply) -> &'static str {
         Reply::Pm(_) => "pm",
         Reply::Im(_) => "im",
         Reply::Signed { .. } => "signed",
+        Reply::Ephemeral { .. } => "ephemeral",
     }
 }
 
@@ -98,9 +99,11 @@ pub(crate) fn param(
     Ok(Some(re))
 }
 
-/// A kept `re`, as a reader is sent it.
-pub(crate) fn json(re: &Reply) -> Value {
-    match re {
+/// A kept `re`, as a reader is sent it, or `None` for a line the server
+/// does not keep, which this wire has no way to name: its reader hears
+/// the reply's text alone.
+pub(crate) fn json(re: &Reply) -> Option<Value> {
+    Some(match re {
         Reply::Line { room: 0, id } => json!({ "line": id }),
         Reply::Line { room, id } => json!({ "line": id, "room": room }),
         Reply::Pm(r) => json!({ "pm": b64url(r) }),
@@ -110,13 +113,14 @@ pub(crate) fn json(re: &Reply) -> Value {
             "id": guid_of(id).expect("any 16 bytes are a guid").as_str(),
             "hash": b64url(hash),
         } }),
-    }
+        Reply::Ephemeral { .. } => return None,
+    })
 }
 
 /// Put a kept `re` on `v`, for a reader that declared `replies`.
 pub(crate) fn add(v: &mut Value, re: Option<&Reply>, replies: bool) {
-    if let Some(re) = re.filter(|_| replies) {
-        v["re"] = json(re);
+    if let Some(re) = re.filter(|_| replies).and_then(json) {
+        v["re"] = re;
     }
 }
 
@@ -141,7 +145,7 @@ mod tests {
             } }),
         ] {
             let re = parse(&v, ALL).unwrap_or_else(|| panic!("{v}"));
-            assert_eq!(json(&re), v);
+            assert_eq!(json(&re), Some(v));
         }
     }
 

@@ -3709,12 +3709,13 @@ struct ChatSend {
     line: ChatLine,
 }
 
-/// A line as the core takes it: its text, style, image and the emoji
-/// refs sent beside it.
+/// A line as the core takes it: its text, style, image, what it answers
+/// and the emoji refs sent beside it.
 type ChatLine = (
     String,
     u16,
     Option<hxd_core::media::Handle>,
+    Option<hxd_core::Reply>,
     Vec<hxd_core::emoji::EmojiRef>,
 );
 
@@ -3758,7 +3759,7 @@ fn chat_send(f: &Frame, sess: &Session, room: bool) -> Option<ChatSend> {
     let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
     Some(ChatSend {
         cid,
-        line: (body, style, media, refs),
+        line: (body, style, media, None, refs),
     })
 }
 
@@ -4849,11 +4850,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             Some(ChatSend { cid: 0, line }) => public_chat(tx, ctx, sess, 0, vec![line]).await,
             Some(ChatSend {
                 cid,
-                line: (body, style, media, refs),
+                line: (body, style, media, re, refs),
             }) => {
                 if let Err(e) = ctx
                     .core
-                    .chat_private(cid, sess.uid, body, style, media, &refs)
+                    .chat_private(cid, sess.uid, body, style, media, re, &refs)
                 {
                     debug!(uid = sess.uid, cid, "private chat dropped: {e:?}");
                 }

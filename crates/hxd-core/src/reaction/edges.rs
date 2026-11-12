@@ -563,7 +563,7 @@ fn a_reader_that_lost_the_line_before_its_batch_hears_nothing() {
             }
         };
         let line = core
-            .chat_public_all(boss, room, vec![("hi".into(), 0, None, vec![])])
+            .chat_public_all(boss, room, vec![("hi".into(), 0, None, None, vec![])])
             .pop()
             .unwrap()
             .unwrap()

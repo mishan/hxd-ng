@@ -581,7 +581,7 @@ fn a_private_room_captures_its_members_at_that_moment() {
     core.chat_join(cid, bob, "").unwrap();
 
     let handle = upload(&core, alice, b"an image").unwrap().id.unwrap();
-    core.chat_private(cid, alice, "look".into(), 0, Some(handle), &[])
+    core.chat_private(cid, alice, "look".into(), 0, Some(handle), None, &[])
         .unwrap();
     assert!(chat_media(&drain(&mut rb)).is_some());
     assert!(core.media_fetch(bob, &handle).is_some());
