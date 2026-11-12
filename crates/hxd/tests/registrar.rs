@@ -693,19 +693,19 @@ fn a_registrar_section_is_checked_before_anything_starts() {
 
 /// The `hlid` binary, built fresh for the reason `identity.rs` gives.
 fn hlid_binary() -> PathBuf {
-    let ok = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-p", "hlid"])
+    let out = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "hlid", "--message-format=json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("cargo build -p hlid")
-        .success();
-    assert!(ok, "cargo build -p hlid failed");
-    let mut dir = std::env::current_exe().unwrap();
-    dir.pop();
-    dir.pop();
-    let bin = dir.join(if cfg!(windows) { "hlid.exe" } else { "hlid" });
-    assert!(bin.exists(), "no hlid binary at {}", bin.display());
-    bin
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo build -p hlid");
+    assert!(out.status.success(), "cargo build -p hlid failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["target"]["name"] == "hlid")
+        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .expect("cargo named no hlid executable")
 }
 
 async fn hlid(bin: &Path, home: &Path, args: &[&str]) -> (bool, String, String) {

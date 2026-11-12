@@ -4122,8 +4122,9 @@ async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
 // the long poll, and a bundle that comes back and actually verifies.
 
 /// The `hlid` binary. `CARGO_BIN_EXE_*` exists only for the crate that
-/// declares the binary and this is not that crate, so it is found beside
-/// this test's own executable.
+/// declares the binary and this is not that crate, so the path is the one
+/// cargo names for the build, which no layout of the target directory
+/// can move.
 ///
 /// The build always runs rather than only when the file is missing.
 /// `cargo build` is a no-op the moment nothing has changed, and the
@@ -4132,20 +4133,19 @@ async fn opening_a_session_takes_an_empty_body_but_not_a_broken_one() {
 /// silently exercises code that is not the code under test. This cost
 /// an afternoon before it was written down.
 fn hlid_binary() -> std::path::PathBuf {
-    let ok = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-p", "hlid"])
+    let out = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "hlid", "--message-format=json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("cargo build -p hlid")
-        .success();
-    assert!(ok, "cargo build -p hlid failed");
-
-    let mut dir = std::env::current_exe().expect("the test binary has a path");
-    dir.pop(); // deps/
-    dir.pop(); // debug/ or release/
-    let bin = dir.join(if cfg!(windows) { "hlid.exe" } else { "hlid" });
-    assert!(bin.exists(), "no hlid binary at {}", bin.display());
-    bin
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo build -p hlid");
+    assert!(out.status.success(), "cargo build -p hlid failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["target"]["name"] == "hlid")
+        .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("cargo named no hlid executable")
 }
 
 /// The pairing code out of a line of `hlid`'s output — the same thing a
