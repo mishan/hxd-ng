@@ -500,7 +500,9 @@ Three layers, all `cargo test --workspace`:
   the lobby's lines among them under the reader's checks, a tombstone
   as one and cursors ignored, refusing 51 ids and a room, leaving the
   highest past one frame to ask for again, under the history rate, and
-  paging a session without the bit; a stored message's
+  paging a session without the bit; a 700's refusal carrying its reason
+  code to a session with bit 18 alone, the rest sent the text as ever;
+  a stored message's
   reference to a session with bit 18 alone, told no reactions after its
   104; a private message's reply naming a stored message on 104, live
   and after it waited, whoever's message it names, crossing to ng and

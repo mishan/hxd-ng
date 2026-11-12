@@ -387,7 +387,9 @@ as the spec says.
 Then: bit 56 or "You are not allowed to read chat history."; the
 per-session rate limit (10 requests per second, token bucket, the spec's
 suggested figure) or "Slow down."; `off_reactor` into
-`Core::history(uid, query)`; encode.
+`Core::history(uid, query)`; encode. To a session with the Replies
+draft's bit 18, a refusal also carries the Structured Chat family's
+`DATA_CHAT_REASON` where one of its codes fits (`replies.md` §4).
 
 Encoding an entry is the mirror of `parse_history_entry` in the shared
 crate, and lands beside it in `hxproto` as `build_history_entry`

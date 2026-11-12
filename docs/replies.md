@@ -127,6 +127,19 @@ message to them.
   not 8 bytes, is "Malformed chat history request.". It costs no spam
   points and is held to the history rate, as a page is. A session
   without bit 18 is paged, its `DATA_LINE_ID` a field it does not know.
+- **700's refusals.** The draft makes 700 by line id one of the
+  Structured Chat family's requests, and this server refuses any 700
+  from a session with bit 18 in the family's reply shape, since it
+  cannot tell what was asked before it refuses for permission or rate:
+  the text unchanged and `DATA_CHAT_REASON` beside it: `NotAllowed` (2)
+  without bit 56,
+  `RateLimited` (6) past the history rate, `InvalidTarget` (12) for an
+  id not 8 bytes and `TooManyTargets` (13) for more than 50. A request
+  malformed in its channel or cursors, a channel that is not 0, a
+  session without bit 4, and the server's own failures have no code of
+  the family's that describes them, and carry none. Bit 17 alone sends
+  no request of the family's, so every other session, bit 17's too, is
+  refused with the text alone, the bytes it always was.
 
 ## 5. Private messages' references
 

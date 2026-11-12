@@ -50,7 +50,11 @@ as AGENTS.md's "Releasing" describes it.
   history rate (docs/replies.md). A client without the bit sees no
   change. **A server that has kept a reply to a lobby notice cannot be
   downgraded cleanly**: an older one answers every 700 and ng `history`
-  page holding such a line "Server error.".
+  page holding such a line "Server error.". A 700 refused for a
+  session with the bit carries the Structured Chat family's
+  `DATA_CHAT_REASON` beside its text, so a client tells a rate refusal
+  (6) from a refused permission (2), a malformed id (12) or too many
+  (13) without reading the text.
 
 ### Fixed
 
