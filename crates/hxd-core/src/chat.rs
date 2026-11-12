@@ -830,28 +830,36 @@ impl Core {
         style: u16,
         media: Option<crate::media::Handle>,
     ) -> Result<Option<crate::history::LineId>, ChatError> {
-        self.chat_public_all(from, 0, vec![(text, style, media, Vec::new())])
+        self.chat_public_all(from, 0, vec![(text, style, media, None, Vec::new())])
             .pop()
             .expect("an answer for each line")
     }
 
     /// Public chat lines one session sent one after another into `room`,
-    /// the lobby for 0, `(text, style, media, emoji)`, answered in their
-    /// order, each keeping what [`Core::emoji_keep`] keeps of its refs:
+    /// the lobby for 0, `(text, style, media, re, emoji)`, answered in
+    /// their order, each keeping what [`Core::emoji_keep`] keeps of its
+    /// refs:
     /// they share a commit rather than wait for one each, so a sender that
     /// got ahead of the log catches up at once. Each is judged as
     /// [`Core::chat_public`] judges one; a line that tips its sender over
     /// its chat lines kicks it, and none from then on is logged. A room's
     /// lines go to its members, from a member that may send there.
+    #[allow(clippy::type_complexity)]
     pub fn chat_public_all(
         &self,
         from: Uid,
         room: u32,
-        lines: Vec<(String, u16, Option<crate::media::Handle>, Vec<EmojiRef>)>,
+        lines: Vec<(
+            String,
+            u16,
+            Option<crate::media::Handle>,
+            Option<Reply>,
+            Vec<EmojiRef>,
+        )>,
     ) -> Vec<Result<Option<crate::history::LineId>, ChatError>> {
         let lines = lines
             .into_iter()
-            .map(|(text, style, media, emoji)| ((text, style, media), None, None, None, emoji))
+            .map(|(text, style, media, re, emoji)| ((text, style, media), None, None, re, emoji))
             .collect();
         self.chat_public_lines(from, room, lines)
     }
@@ -1013,12 +1021,7 @@ impl Core {
         for (i, ((mut text, style, media), guid, signed, re, emoji)) in
             lines.into_iter().enumerate()
         {
-            let in_room = |re: &Reply| match re {
-                Reply::Line { room: r, .. } => *r == room,
-                Reply::Signed { .. } => true,
-                Reply::Im(_) | Reply::Pm(_) => false,
-            };
-            if re.as_ref().is_some_and(|re| !in_room(re)) {
+            if re.as_ref().is_some_and(|re| !re.in_room(room)) {
                 results[i] = Some(Err(ChatError::ReplyScope));
                 continue;
             }
@@ -1456,7 +1459,9 @@ impl Core {
             .collect()
     }
 
-    /// A private chat line; membership is the only gate.
+    /// A private chat line; membership is the only gate. `re` is what it
+    /// answers, relayed as sent: its frontend keeps it to this chat.
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_private(
         &self,
         cid: u32,
@@ -1464,6 +1469,7 @@ impl Core {
         text: String,
         style: u16,
         media: Option<crate::media::Handle>,
+        re: Option<Reply>,
         emoji: &[EmojiRef],
     ) -> Result<(), ChatError> {
         // Membership is checked before the handle is resolved, and the
@@ -1519,7 +1525,7 @@ impl Core {
             media: media.as_ref().map(|(_, r)| r.clone()),
             guid: None,
             signed: None,
-            re: None,
+            re: re.map(Box::new),
             emoji,
         };
         for uid in &members {
@@ -2361,21 +2367,10 @@ impl Core {
         Ok(MsgOutcome::Delivered(None))
     }
 
-    /// Does a private message's `re` stay between `me` and `them`? By
-    /// what it names alone, never by what the store holds, which would
-    /// tell the sender whether a message still exists. A `pm` is any
-    /// reference: a reader resolves it from its own mail, where another
-    /// pair's resolves to nothing. A signed target is bound by its own
-    /// signature.
+    /// Does a private message's `re` stay between `me` and `them`
+    /// ([`Reply::between`])?
     pub(crate) fn reply_in_scope(re: &Reply, me: &str, them: &str) -> Result<(), ChatError> {
-        let ok = match re {
-            Reply::Line { .. } => false,
-            Reply::Signed { .. } | Reply::Pm(_) => true,
-            Reply::Im(im) => {
-                im.login().eq_ignore_ascii_case(me) || im.login().eq_ignore_ascii_case(them)
-            }
-        };
-        if ok {
+        if re.between(me, them) {
             Ok(())
         } else {
             Err(ChatError::ReplyScope)
@@ -4021,7 +4016,7 @@ mod tests {
         let (sender, _) = test_attach(&core, "spammer", chatter());
         drain(&mut rx);
         let lines = ["one", "two", "three", "four", "five"]
-            .map(|t| (t.to_string(), 0, None, vec![]))
+            .map(|t| (t.to_string(), 0, None, None, vec![]))
             .into();
         let answered = core.chat_public_all(sender, 0, lines);
         assert!(answered[..3].iter().all(|r| matches!(r, Ok(Some(_)))));
@@ -4868,7 +4863,7 @@ mod tests {
         drain(&mut rx_m);
         drain(&mut rx_o);
         assert_eq!(
-            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None, &[]),
+            core.chat_private(cid, spammer, "a\rb\rc\rd".into(), 0, None, None, &[]),
             Err(ChatError::Flooding)
         );
         assert_eq!(
@@ -4899,13 +4894,13 @@ mod tests {
         drain(&mut rx_b);
 
         core.chat_public(a, "lobby 1".into(), 0, None).unwrap();
-        core.chat_private(cid, b, "chat 1".into(), 0, None, &[])
+        core.chat_private(cid, b, "chat 1".into(), 0, None, None, &[])
             .unwrap();
         core.chat_public(b, "lobby 2".into(), 1, None).unwrap();
         core.chat_notice(cid, a, "a notice".into());
-        core.chat_private(cid, a, "chat 2".into(), 0, None, &[])
+        core.chat_private(cid, a, "chat 2".into(), 0, None, None, &[])
             .unwrap();
-        core.chat_private(other, a, "elsewhere".into(), 0, None, &[])
+        core.chat_private(other, a, "elsewhere".into(), 0, None, None, &[])
             .unwrap();
         let numbered = |evs: Vec<Event>| -> Vec<(u32, u64)> {
             evs.into_iter()
@@ -5526,6 +5521,42 @@ mod tests {
     }
 
     #[test]
+    fn each_line_of_a_run_and_of_a_private_chat_carries_its_own_reply() {
+        use crate::reply::Reply;
+        let core = Core::new();
+        let (a, mut rx_a) = test_attach(&core, "alice", chatter());
+        let (b, mut rx_b) = test_attach(&core, "bob", chatter());
+        let (_c, mut rx_c) = test_attach(&core, "carol", chatter());
+        let (cid, _) = core.chat_create(a, b).unwrap();
+        core.chat_join(cid, b, "").unwrap();
+        for rx in [&mut rx_a, &mut rx_b, &mut rx_c] {
+            drain(rx);
+        }
+        let lobby = |id| Some(Reply::Ephemeral { chat: 0, id });
+        let lines = [lobby(1), None, lobby(2)]
+            .map(|re| ("run".to_string(), 0, None, re, vec![]))
+            .into();
+        assert!(core.chat_public_all(a, 0, lines).iter().all(Result::is_ok));
+        let in_chat = Some(Reply::Ephemeral { chat: cid, id: 3 });
+        core.chat_private(cid, a, "psst".into(), 0, None, in_chat.clone(), &[])
+            .unwrap();
+        let heard = |rx: &mut crate::Events| -> Vec<(u32, Option<Reply>)> {
+            drain(rx)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Chat { cid, re, .. } => Some((cid, re.map(|r| *r))),
+                    _ => None,
+                })
+                .collect()
+        };
+        let run = [(0, lobby(1)), (0, None), (0, lobby(2))];
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert_eq!(heard(rx), [&run[..], &[(cid, in_chat.clone())]].concat());
+        }
+        assert_eq!(heard(&mut rx_c), run);
+    }
+
+    #[test]
     fn every_line_and_message_carries_what_emoji_keep_keeps_of_its_refs() {
         use crate::emoji::{EmojiId, EmojiName, EmojiRef, EmojiStore, MemoryEmoji, NewEmojiName};
         let store = Arc::new(MemoryEmoji::default());
@@ -5560,7 +5591,11 @@ mod tests {
         drain(&mut rx_b);
 
         let line = core
-            .chat_public_all(a, 0, vec![("hi :party:".into(), 0, None, sent.clone())])
+            .chat_public_all(
+                a,
+                0,
+                vec![("hi :party:".into(), 0, None, None, sent.clone())],
+            )
             .remove(0)
             .unwrap()
             .unwrap();
@@ -5571,7 +5606,7 @@ mod tests {
                 .emoji,
             kept
         );
-        core.chat_private(cid, a, "psst :party:".into(), 0, None, &sent)
+        core.chat_private(cid, a, "psst :party:".into(), 0, None, None, &sent)
             .unwrap();
         core.msg_signed(a, b, ":party:".into(), None, None, None, None, &sent)
             .unwrap();
@@ -5597,7 +5632,7 @@ mod tests {
         // Chatting before joining is refused; joining via invite skips the
         // password.
         assert_eq!(
-            core.chat_private(cid, b, "early".into(), 0, None, &[]),
+            core.chat_private(cid, b, "early".into(), 0, None, None, &[]),
             Err(ChatError::NotAMember)
         );
         let (rows, _subject) = core.chat_join(cid, b, "").unwrap();
@@ -5606,7 +5641,7 @@ mod tests {
             matches!(&drain(&mut rx_a)[..], [Event::ChatUserJoined { user, .. }] if user.uid == b)
         );
 
-        core.chat_private(cid, b, "hello".into(), 0, None, &[])
+        core.chat_private(cid, b, "hello".into(), 0, None, None, &[])
             .unwrap();
         assert_eq!(drain(&mut rx_a).len(), 1);
         assert_eq!(drain(&mut rx_b).len(), 1);

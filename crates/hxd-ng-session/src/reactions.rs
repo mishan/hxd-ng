@@ -79,12 +79,17 @@ pub(crate) fn add(v: &mut Value, shown: Option<&Reactions>) {
     }
 }
 
+/// A reaction's target, which is always one this wire can name.
+fn target_json(target: &Reply) -> Value {
+    crate::replies::json(target).expect("a reaction never names an ephemeral line")
+}
+
 /// A change as `reactions_changed` carries it.
 pub(crate) fn change_json(change: &ReactionChange) -> Value {
     match change {
         ReactionChange::Summary { target, keys, mine } => {
             let mut v = json!({
-                "target": crate::replies::json(target),
+                "target": target_json(target),
                 "action": "summary",
                 "keys": keys_json(keys),
             });
@@ -94,7 +99,7 @@ pub(crate) fn change_json(change: &ReactionChange) -> Value {
             v
         }
         ReactionChange::Clear { target } => {
-            json!({ "target": crate::replies::json(target), "action": "clear" })
+            json!({ "target": target_json(target), "action": "clear" })
         }
         ReactionChange::Changed {
             target,
@@ -102,7 +107,7 @@ pub(crate) fn change_json(change: &ReactionChange) -> Value {
             add,
             from,
         } => json!({
-            "target": crate::replies::json(target),
+            "target": target_json(target),
             "action": if *add { "add" } else { "remove" },
             "key": key_json(key),
             "from": { "login": from },
@@ -315,7 +320,7 @@ fn asked_params(
 
 fn asked_json(a: &Asked) -> Value {
     let mut v = json!({
-        "target": crate::replies::json(&a.target),
+        "target": target_json(&a.target),
         "keys": keys_json(&a.shown.keys),
     });
     if !a.shown.mine.is_empty() {

@@ -312,13 +312,15 @@ impl Core {
     /// account and a text too long is refused as one, and a request is
     /// made only from a session that understands them, as the requests
     /// draft has it, where `/msg <login>` makes one from any classic
-    /// session.
+    /// session. `re` is relayed as sent, unchecked: its frontend keeps it
+    /// [`Reply::between`] the two.
     pub fn im_send_login(
         &self,
         uid: Uid,
         to: &str,
         text: String,
         guid: Option<MessageGuid>,
+        re: Option<Reply>,
         emoji: &[EmojiRef],
     ) -> Result<MsgOutcome, MessagingError> {
         let me = self.messenger(uid)?;
@@ -340,9 +342,7 @@ impl Core {
             classic: false,
         };
         let emoji = self.emoji_keep(emoji);
-        self.route(
-            uid, sending, them, friend, &text, &guid, &None, &None, &emoji,
-        )
+        self.route(uid, sending, them, friend, &text, &guid, &None, &re, &emoji)
     }
 
     #[allow(clippy::too_many_arguments)]

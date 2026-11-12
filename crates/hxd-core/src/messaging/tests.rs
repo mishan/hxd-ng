@@ -920,7 +920,7 @@ fn a_send_by_login_from_a_session_without_an_inbox_is_refused() {
         .unwrap()
         .has_inbox = false;
     assert_eq!(
-        s.core.im_send_login(a, "bob", "hi".into(), None, &[]),
+        s.core.im_send_login(a, "bob", "hi".into(), None, None, &[]),
         Err(MessagingError::NotEnabled)
     );
     assert!(s.inbox.all().is_empty());

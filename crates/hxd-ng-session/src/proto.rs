@@ -823,7 +823,10 @@ pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
             media: media.as_ref().map(crate::media::media_json),
             guid: guid.as_ref().map(|g| g.as_str()),
             signed: signed.as_deref().map(b64url),
-            re: re.as_deref().filter(|_| replies).map(crate::replies::json),
+            re: re
+                .as_deref()
+                .filter(|_| replies)
+                .and_then(crate::replies::json),
             emoji: refs.as_ref().filter(|_| emoji).map(crate::emoji::json),
         };
         return serde_json::to_string(&EventOut {
@@ -1151,7 +1154,10 @@ fn in_room_json(room: u32, event: &Event, replies: bool, emoji: bool) -> (&'stat
                 media: media.as_ref().map(crate::media::media_json),
                 guid: guid.as_ref().map(|g| g.as_str()),
                 signed: signed.as_deref().map(b64url),
-                re: re.as_deref().filter(|_| replies).map(crate::replies::json),
+                re: re
+                    .as_deref()
+                    .filter(|_| replies)
+                    .and_then(crate::replies::json),
                 emoji: refs.as_ref().filter(|_| emoji).map(crate::emoji::json),
             };
             (

@@ -212,7 +212,7 @@ pub(crate) fn parse_target(b: &[u8], offered: u16) -> Option<Target> {
 /// `target` as this wire names it to a reader: a lobby line kind 1 on
 /// channel 0 and a room's kind 4 under its chat id, however it was
 /// asked, since a session names a channel one way. A signed target has
-/// no form here.
+/// no form here, and no reaction names a line the server does not keep.
 pub(crate) fn pack_target(target: &Reply) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match target {
@@ -231,7 +231,7 @@ pub(crate) fn pack_target(target: &Reply) -> Option<Vec<u8>> {
             out.push(PM);
             out.extend_from_slice(&pm_id(r));
         }
-        Reply::Signed { .. } => return None,
+        Reply::Signed { .. } | Reply::Ephemeral { .. } => return None,
     }
     Some(out)
 }

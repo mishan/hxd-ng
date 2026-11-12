@@ -1292,6 +1292,7 @@ pub mod conformance {
                 id: [2; 16],
                 hash: [3; 32],
             },
+            Reply::Ephemeral { chat: 0, id: 1 },
         ];
         log.append(&line(1)).unwrap();
         for (n, re) in (2..).zip(&replies) {
@@ -1969,7 +1970,7 @@ mod core_tests {
         let (b, _) = test_attach(&core, "bob", access);
         let (cid, _) = core.chat_create(a, b).unwrap();
         core.chat_join(cid, b, "").unwrap();
-        core.chat_private(cid, a, "secret".into(), 0, None, &[])
+        core.chat_private(cid, a, "secret".into(), 0, None, None, &[])
             .unwrap();
         assert!(log
             .query(&HistoryQuery {
