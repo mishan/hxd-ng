@@ -5,8 +5,9 @@
 //! a moderator's clear, Send Reaction on an instant message, from a
 //! messenger session too, Reaction Changed (711) heard in one batch by the
 //! readers that negotiated the bit and crossing to the ng wire and back,
-//! an instant message's told to its other party or kept for its next Get
-//! Roster, a redaction and a purge, Get Reactions (712) and who reacted,
+//! a line said before a restart told after it, an instant message's told
+//! to its other party or kept for its next Get Roster, a redaction and a
+//! purge, Get Reactions (712) and who reacted,
 //! a line's reactions on its 700 entry, Set Notifications (717) answered
 //! with no type, a stored private message named by its reference and
 //! reacted to by its parties, and a session without the bit sent what it
@@ -82,6 +83,25 @@ struct Server {
     core: Arc<hxd_core::Core>,
     config: hxd::Config,
     dir: std::path::PathBuf,
+    serving: [tokio::task::JoinHandle<()>; 3],
+}
+
+impl Server {
+    /// Stop serving and let go of the stores, as a process that exits
+    /// would, so a restart is the only server on its files.
+    async fn stop(self) {
+        for task in self.serving {
+            task.abort();
+            assert!(task.await.is_err_and(|e| e.is_cancelled()));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&self.core) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stopped server's core is let go");
+    }
 }
 
 /// What a server is built with beside history and moderation.
@@ -180,19 +200,20 @@ async fn start(dir: &Path, o: Opts<'_>) -> Server {
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
-    tokio::spawn(hxd::reactions_flusher(ctx.core.clone()));
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = Server {
+    Server {
         classic: l1.local_addr().unwrap(),
         ng: l2.local_addr().unwrap(),
         core: ctx.core.clone(),
         config,
         dir: dir.to_path_buf(),
-    };
-    tokio::spawn(hxd_session::serve(l1, ctx));
-    tokio::spawn(hxd_ng_session::serve(l2, ng_ctx));
-    server
+        serving: [
+            tokio::spawn(hxd::reactions_flusher(ctx.core.clone())),
+            tokio::spawn(hxd_session::serve(l1, ctx)),
+            tokio::spawn(hxd_ng_session::serve(l2, ng_ctx)),
+        ],
+    }
 }
 
 /// [`start`] with `[reactions]` at its defaults.
@@ -573,6 +594,31 @@ async fn a_burst_is_one_711_and_a_line_past_the_window_none() {
     assert_eq!(groups(&f).len(), 1, "the line past the window is not in it");
     react(&mut alice, &b, "👍").await;
     never_told(&mut erin, &old, &b).await;
+}
+
+/// A restart over the same database keeps each room's newest lines
+/// live: a lobby line and a room's said before it are told after it.
+#[tokio::test]
+async fn a_line_said_before_a_restart_is_told_after_it() {
+    let td = tempfile::tempdir().unwrap();
+    let s = start_on(td.path()).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    join(&mut alice, LOUNGE).await;
+    let out = lobby(say(&mut alice, 0, "out here").await);
+    let said = [out, room(LOUNGE, say(&mut alice, LOUNGE, "in here").await)];
+    drop(alice);
+    s.stop().await;
+    let s = start_on(td.path()).await;
+    let mut alice = classic(&s, "alice", ON).await;
+    let mut erin = classic(&s, "erin", ON).await;
+    for c in [&mut alice, &mut erin] {
+        join(c, LOUNGE).await;
+    }
+    for t in &said {
+        react(&mut alice, t, "👍").await;
+        let (_, g) = changed(&mut erin, t).await;
+        assert_eq!(g, summary_group(t, &[("👍", 1)], &[]));
+    }
 }
 
 /// A room's line is named kind 4 under the room's chat id, sent and

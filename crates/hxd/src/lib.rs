@@ -4877,7 +4877,7 @@ pub fn build_ctx(
         None => core,
     };
     // After the log, whose channels no room's id may be.
-    let core = rooms::with_rooms(core, config)?;
+    let core = rooms::with_rooms(core, config)?.with_live_lines();
     let core = match (stores.news, config.news.as_ref()) {
         // The accounts too, whether or not there is an inbox: whether a
         // subscriber may still read the news is a question about an
