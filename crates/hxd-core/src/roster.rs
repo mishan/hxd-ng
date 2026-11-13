@@ -1216,6 +1216,9 @@ pub(crate) struct UserSession {
     pub(crate) announced: Announced,
     /// One of a person's sessions sharing its row (`crate::coalesce`).
     pub(crate) grouped: bool,
+    /// The nick, icon and color this session last sent of itself: one it
+    /// sends again is no change to its person (`crate::coalesce`).
+    pub(crate) sent: crate::coalesce::Sent,
     /// The avatar `info.avatar` describes, with its bytes.
     pub(crate) avatar: Option<crate::avatar::Avatar>,
     pub(crate) outbox: Outbox,
@@ -1509,8 +1512,15 @@ impl RosterInner {
         if !self.users.get(&uid).is_some_and(|s| s.live()) {
             return;
         }
-        if let Some(ev) = self.changed_event(uid) {
-            self.broadcast(&ev, None);
+        match self.changed_event(uid) {
+            Some(ev) => self.tell_row(ev),
+            // A change to this device alone, its signs say, that leaves
+            // the row others see as it was: told to the device itself.
+            None => {
+                if let Some(own) = self.own_row(uid) {
+                    self.send_to(uid, Event::Changed(own));
+                }
+            }
         }
         self.export_changed(uid);
     }
@@ -1698,7 +1708,7 @@ impl RosterInner {
                     self.freed_uids.hold(uid, Instant::now());
                 }
                 if let Some(ev) = changed {
-                    self.broadcast(&ev, None);
+                    self.tell_row(*ev);
                 }
             }
         }
@@ -1716,7 +1726,7 @@ impl RosterInner {
         let messaging = sess.messaging.is_some().then(|| sess.mailbox());
         if sess.live() {
             if let Some(ev) = self.changed_event(uid) {
-                self.broadcast(&ev, None);
+                self.tell_row(ev);
             }
             self.export_changed(uid);
         }
@@ -2461,6 +2471,7 @@ impl Core {
     /// under the roster lock so a revocation's sweep cannot miss a
     /// session that attaches while it runs.
     pub fn attach(&self, info: AttachInfo) -> Option<(Uid, Events)> {
+        let (sent_nick, sent_icon) = (info.nick.clone(), info.icon);
         let role_color = info
             .account
             .as_ref()
@@ -2542,6 +2553,11 @@ impl Core {
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 announced: Announced::Pending,
                 grouped: false,
+                sent: crate::coalesce::Sent {
+                    nick: sent_nick,
+                    icon: sent_icon,
+                    color: None,
+                },
                 avatar: None,
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
@@ -2573,7 +2589,7 @@ impl Core {
                 match r.coalesce_join(uid) {
                     crate::coalesce::Joined::Another(changed) => {
                         if let Some(ev) = changed {
-                            r.broadcast(&ev, None);
+                            r.tell_row(*ev);
                         }
                     }
                     _ => {
@@ -2609,15 +2625,25 @@ impl Core {
         color: Option<Option<u32>>,
     ) -> bool {
         let mut r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get_mut(&uid) else {
-            return false;
-        };
-        let mut changed = false;
         // A nick that shows as nothing is no change, on either wire: a
         // user is always shown by a name, and a Structured Chat line
         // relies on one. mhxd takes an empty name from 304; this
         // deliberately does not.
-        if let Some(n) = nick.filter(|n| !crate::nameless(n)) {
+        let nick = nick.filter(|n| !crate::nameless(n));
+        if r.users.get(&uid).is_some_and(|s| s.grouped) {
+            let Some(ev) = r.person_update(uid, nick, icon, color) else {
+                return false;
+            };
+            r.tell_row(ev);
+            r.export_changed(uid);
+            return true;
+        }
+        let Some(sess) = r.users.get_mut(&uid) else {
+            return false;
+        };
+        sess.sent.note(nick.as_deref(), icon, color);
+        let mut changed = false;
+        if let Some(n) = nick {
             if sess.info.nick != n {
                 sess.info.nick = n;
                 changed = true;
@@ -2637,7 +2663,7 @@ impl Core {
         }
         if changed && sess.live() {
             if let Some(ev) = r.changed_event(uid) {
-                r.broadcast(&ev, None);
+                r.tell_row(ev);
             }
             r.export_changed(uid);
         }
@@ -2686,7 +2712,7 @@ impl Core {
         }
         sess.proved_late = true;
         if let Some(ev) = r.changed_event(uid) {
-            r.broadcast(&ev, None);
+            r.tell_row(ev);
         }
         true
     }

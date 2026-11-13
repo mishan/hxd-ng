@@ -642,7 +642,7 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     }
     for (info, only_roles) in once {
         let info = r.row_now(info);
-        r.broadcast_where(&Event::Changed(info), None, |s| {
+        r.tell_row_where(Event::Changed(info), |s| {
             let syncs = s.info.transport.roles;
             !(stale && syncs) && (!only_roles || syncs)
         });
