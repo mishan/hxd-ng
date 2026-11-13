@@ -1884,7 +1884,7 @@ impl Core {
     pub fn chat_create(&self, creator: Uid, invitee: Uid) -> Result<(u32, UserInfo), ChatError> {
         let mut r = self.roster.lock().unwrap();
         // A session no list shows is nobody to invite.
-        if !r.users.get(&invitee).is_some_and(|s| s.live()) {
+        if r.named(invitee).is_none() {
             return Err(ChatError::NoSuchUser);
         }
         let me = r
@@ -1938,7 +1938,7 @@ impl Core {
             .get(&by)
             .map(|s| s.info.nick.clone())
             .ok_or(ChatError::NoSuchUser)?;
-        if !r.users.get(&target).is_some_and(|s| s.live()) {
+        if r.named(target).is_none() {
             return Err(ChatError::NoSuchUser);
         }
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
@@ -2178,11 +2178,7 @@ impl Core {
         let (sender, recipient) = {
             let r = self.roster.lock().unwrap();
             let sender = Sender::resolve(&r, from)?;
-            let sess = r
-                .users
-                .get(&to)
-                .filter(|s| s.live())
-                .ok_or(ChatError::NoSuchUser)?;
+            let sess = r.named(to).ok_or(ChatError::NoSuchUser)?;
             (
                 sender,
                 Recipient {
@@ -3334,9 +3330,8 @@ impl Core {
         let other = {
             let r = self.roster.lock().unwrap();
             let sess = r
-                .users
-                .get(&other)
-                .filter(|s| s.live() && (s.has_inbox || s.identity.is_some()))
+                .named(other)
+                .filter(|s| s.has_inbox || s.identity.is_some())
                 .ok_or(ChatError::NoSuchUser)?;
             sess.mailbox()
         };
@@ -3584,11 +3579,7 @@ impl Core {
             // A session no list shows is nobody to kick by uid, as it is
             // nobody to message or ask about: a messenger session
             // (`Transport::messenger_session`) is ended by a ban.
-            let sess = r
-                .users
-                .get_mut(&target)
-                .filter(|s| s.live())
-                .ok_or(ChatError::NoSuchUser)?;
+            let sess = r.named_mut(target).ok_or(ChatError::NoSuchUser)?;
             // The server cannot be kicked off its own roster
             // (`docs/system-account.md` §2). Refused the same way a kick
             // of somebody who is not there is refused, because from the

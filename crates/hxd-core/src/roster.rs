@@ -1390,6 +1390,18 @@ pub(crate) struct RosterInner {
 }
 
 impl RosterInner {
+    /// The session a uid a client names stands for: a live one, or none.
+    /// Every lookup of a uid from a request goes through here and its
+    /// `_mut` twin, so that what a uid names is decided in one place, and
+    /// changes there when a person's sessions share one row.
+    pub(crate) fn named(&self, uid: Uid) -> Option<&UserSession> {
+        self.users.get(&uid).filter(|s| s.live())
+    }
+
+    pub(crate) fn named_mut(&mut self, uid: Uid) -> Option<&mut UserSession> {
+        self.users.get_mut(&uid).filter(|s| s.live())
+    }
+
     /// End the oldest detached sessions `counted` picks out until no
     /// more than `cap` are left.
     fn end_oldest_detached(&mut self, cap: usize, counted: impl Fn(&UserSession) -> bool) {
@@ -2855,7 +2867,7 @@ impl Core {
     /// The fuller view of a *visible* user (the user-info op).
     pub fn user_details(&self, uid: Uid) -> Option<UserDetails> {
         let r = self.roster.lock().unwrap();
-        r.users.get(&uid).filter(|s| s.live()).map(|s| UserDetails {
+        r.named(uid).map(|s| UserDetails {
             info: s.info.clone(),
             login: s.login.clone(),
             addr: s.addr,

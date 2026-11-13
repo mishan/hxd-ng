@@ -1063,9 +1063,8 @@ impl Core {
             PersonRef::Uid(uid) => {
                 let r = self.roster.lock().unwrap();
                 let sess = r
-                    .users
-                    .get(uid)
-                    .filter(|s| s.live() && !s.system)
+                    .named(*uid)
+                    .filter(|s| !s.system)
                     .ok_or(ModError::NoSuchUser)?;
                 if !(sess.is_person || sess.identity.is_some()) {
                     return Err(ModError::NoIdentity);
@@ -1676,9 +1675,8 @@ impl Core {
                     PersonRef::Uid(uid) => {
                         let r = self.roster.lock().unwrap();
                         let sess = r
-                            .users
-                            .get(uid)
-                            .filter(|s| s.live() && !s.system)
+                            .named(*uid)
+                            .filter(|s| !s.system)
                             .ok_or(ModError::NoSuchTarget)?;
                         Subject {
                             login: sess.is_person.then(|| sess.login.clone()),
