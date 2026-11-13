@@ -882,12 +882,12 @@ impl Core {
             if !crate::rooms::sees(&r.users[&uid], &entry.room) {
                 return Err(VoiceError::NoSuchChat);
             }
-            if !entry.members.contains(&uid) {
+            if !entry.members.contains(&r.row_of(uid)) {
                 return Err(VoiceError::NotAMember);
             }
         } else if cid != 0 {
             let chat = r.chats.get(&cid).ok_or(VoiceError::NoSuchChat)?;
-            if !chat.members.contains(&uid) {
+            if !chat.members.contains(&r.row_of(uid)) {
                 return Err(VoiceError::NotAMember);
             }
         }

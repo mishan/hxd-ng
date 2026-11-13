@@ -23,7 +23,7 @@ use crate::chat::ChatCommit;
 use crate::history::LineId;
 use crate::inbox::StoreError;
 use crate::instrument::TimedMutex;
-use crate::roster::{Core, Event, LogSerial, RosterInner, Uid, UserInfo, UserSession};
+use crate::roster::{Core, Event, LogSerial, RosterInner, RowId, Uid, UserInfo, UserSession};
 
 /// The longest room name, in characters.
 pub const NAME_MAX: usize = 32;
@@ -330,7 +330,7 @@ impl RoomEdit {
 /// A room as the roster holds it.
 pub(crate) struct RoomEntry {
     pub(crate) room: Room,
-    pub(crate) members: Vec<Uid>,
+    pub(crate) members: Vec<RowId>,
     /// Archived or deleted when last reconciled, so its close is
     /// answered once rather than at every room write.
     pub(crate) closed: bool,
@@ -496,7 +496,7 @@ impl RosterInner {
             room,
             event: Box::new(event),
         };
-        for uid in members {
+        for uid in self.members_sessions(&members) {
             if self.users.get(&uid).is_some_and(&pred) {
                 self.send_to(uid, ev.clone());
             }
@@ -517,10 +517,11 @@ impl RosterInner {
         pred: impl Fn(&UserSession) -> bool,
     ) -> bool {
         self.voice_part_room(uid, room);
+        let row = self.row_of(uid);
         let Some(entry) = self.rooms.get_mut(&room) else {
             return false;
         };
-        let Some(pos) = entry.members.iter().position(|u| *u == uid) else {
+        let Some(pos) = entry.members.iter().position(|u| *u == row) else {
             return false;
         };
         entry.members.remove(pos);
@@ -548,10 +549,10 @@ impl RosterInner {
             }
             entry.closed = is_closed;
             let entry = &self.rooms[&room];
-            let (stay, lost): (Vec<Uid>, Vec<Uid>) = entry
+            let (stay, lost): (Vec<RowId>, Vec<RowId>) = entry
                 .members
                 .iter()
-                .partition(|uid| self.users.get(uid).is_some_and(|s| admits(s, &entry.room)));
+                .partition(|row| self.row_user(**row).is_some_and(|s| admits(s, &entry.room)));
             if lost.is_empty() {
                 continue;
             }
@@ -565,14 +566,18 @@ impl RosterInner {
                 room,
                 event: Box::new(event),
             };
-            for &uid in &lost {
-                self.voice_part_room(uid, room);
-                if let Some(sess) = self.users.get_mut(&uid) {
-                    sess.heard_from.remove(&room);
+            let staying = self.members_sessions(&stay);
+            for &row in &lost {
+                let uid = row.uid();
+                for session in self.members_sessions(&[row]) {
+                    self.voice_part_room(session, room);
+                    if let Some(sess) = self.users.get_mut(&session) {
+                        sess.heard_from.remove(&room);
+                    }
+                    // Why is the parted session's business alone.
+                    self.send_to(session, about(Event::RoomParted { uid, reason }));
                 }
-                // Why is the parted session's business alone.
-                self.send_to(uid, about(Event::RoomParted { uid, reason }));
-                for &member in &stay {
+                for &member in &staying {
                     self.send_to(member, about(Event::ChatUserParted { cid: room, uid }));
                 }
             }
@@ -593,7 +598,7 @@ impl RosterInner {
             .get(&room)
             .filter(|e| sees(sess, &e.room))
             .ok_or(crate::ChatError::NoSuchChat)?;
-        if !entry.members.contains(&uid) {
+        if !entry.members.contains(&self.row_of(uid)) {
             return Err(crate::ChatError::NotAMember);
         }
         // The gates alone: one they let post that cannot sign is told a
@@ -623,13 +628,13 @@ impl RosterInner {
         if !sees(inviter, &entry.room) {
             return Err(ChatError::NoSuchChat);
         }
-        if !entry.members.contains(&by) {
+        if !entry.members.contains(&self.row_of(by)) {
             return Err(ChatError::NotAMember);
         }
         if !sees(invitee, &entry.room) {
             return Err(ChatError::NoSuchChat);
         }
-        if entry.members.contains(&target) {
+        if entry.members.contains(&self.row_of(target)) {
             return Err(ChatError::AlreadyThere);
         }
         let ev = Event::ChatInvite {
@@ -645,10 +650,11 @@ impl RosterInner {
     /// session is not told: the session's own departure says it, and a
     /// part as well would be the same news twice (§7.3).
     pub(crate) fn room_leave_all(&mut self, uid: Uid) {
+        let row = self.row_of(uid);
         let rooms: Vec<u32> = self
             .rooms
             .iter()
-            .filter(|(_, e)| e.members.contains(&uid))
+            .filter(|(_, e)| e.members.contains(&row))
             .map(|(id, _)| *id)
             .collect();
         for room in rooms {
@@ -669,7 +675,7 @@ impl RosterInner {
             .filter(|(uid, s)| {
                 s.info.transport.redactions
                     && sees(s, &entry.room)
-                    && (s.rooms_aware || entry.members.contains(uid))
+                    && (s.rooms_aware || entry.members.contains(&self.row_of(**uid)))
             })
             .map(|(uid, _)| *uid)
             .collect();
@@ -721,7 +727,11 @@ impl RosterInner {
             .rooms
             .iter()
             .filter(|(id, _)| rooms.is_none_or(|ids| ids.contains(id)))
-            .flat_map(|(id, e)| e.members.iter().map(move |uid| (*id, *uid)))
+            .flat_map(|(id, e)| {
+                self.members_sessions(&e.members)
+                    .into_iter()
+                    .map(move |uid| (*id, uid))
+            })
             .collect();
         let mut sends = Vec::new();
         for &(uid, room) in before.keys().filter(|k| !after.contains_key(k)) {
@@ -1282,17 +1292,18 @@ impl Core {
             .ok_or(RoomError::NoSuchRoom)?;
         let me = sess.info.clone();
         let topic = entry.room.topic.clone();
-        if !entry.members.contains(&uid) {
+        let row = r.row_of(uid);
+        if !entry.members.contains(&row) {
             let joined = r
                 .rooms
                 .values()
-                .filter(|e| e.members.contains(&uid))
+                .filter(|e| e.members.contains(&row))
                 .count();
             if joined >= self.room_state.policy.max_joined {
                 return Err(RoomError::TooManyRooms);
             }
             r.room_send_where(id, Event::ChatUserJoined { cid: id, user: me }, |_| true);
-            r.rooms.get_mut(&id).expect("found above").members.push(uid);
+            r.rooms.get_mut(&id).expect("found above").members.push(row);
             let from = r.last_ids.get(&id).copied().unwrap_or(0);
             if let Some(sess) = r.users.get_mut(&uid) {
                 sess.heard_from.insert(id, from);
@@ -1301,7 +1312,7 @@ impl Core {
         let members = r.rooms[&id]
             .members
             .iter()
-            .filter_map(|m| r.users.get(m).map(|s| s.info.clone()))
+            .filter_map(|m| r.row_user(*m).map(|s| s.info.clone()))
             .collect();
         Ok((members, topic))
     }
@@ -1365,7 +1376,7 @@ impl Core {
         let mut ids: Vec<u32> = r
             .rooms
             .iter()
-            .filter(|(_, e)| e.members.contains(&uid))
+            .filter(|(_, e)| e.members.contains(&r.row_of(uid)))
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
