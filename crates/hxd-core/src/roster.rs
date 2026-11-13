@@ -44,6 +44,10 @@ pub type Uid = u16;
 /// and demands a resync.
 pub const OUTBOX_BUFFER_CAP: usize = 512;
 
+/// Detached sessions one login may hold at one network, unless the
+/// server says otherwise ([`Core::with_detached_per_login`]).
+pub const DETACHED_PER_LOGIN: usize = 2;
+
 /// How many events an attached session's channel holds before its client
 /// is judged not to be keeping up.
 ///
@@ -1195,6 +1199,13 @@ pub(crate) struct UserSession {
     pub(crate) guest: crate::messaging::GuestRequests,
 }
 
+impl UserSession {
+    /// The network its address counts in: [`crate::limits::limit_key`].
+    fn net(&self) -> Option<IpAddr> {
+        self.addr.map(crate::limits::limit_key)
+    }
+}
+
 /// What a transport hands the roster at login.
 #[derive(Debug, Clone)]
 pub struct AttachInfo {
@@ -1359,6 +1370,25 @@ pub(crate) struct RosterInner {
 }
 
 impl RosterInner {
+    /// End the oldest detached sessions `counted` picks out until no
+    /// more than `cap` are left.
+    fn end_oldest_detached(&mut self, cap: usize, counted: impl Fn(&UserSession) -> bool) {
+        let mut detached: Vec<(Instant, Uid)> = self
+            .users
+            .iter()
+            .filter(|(_, s)| counted(s))
+            .filter_map(|(u, s)| match s.outbox.sink {
+                Sink::Buffering { since, .. } => Some((since, *u)),
+                Sink::Live(..) | Sink::Lagged(_) => None,
+            })
+            .collect();
+        detached.sort();
+        let excess = detached.len().saturating_sub(cap);
+        for (_, oldest) in detached.into_iter().take(excess) {
+            self.end_session(oldest);
+        }
+    }
+
     /// [`Core::set_signs`] without telling anyone of the row: whether
     /// it changed. A change to `can_sign` is told at once.
     pub(crate) fn set_signs(&mut self, uid: Uid, signs: bool, can_sign: bool) -> bool {
@@ -1735,6 +1765,9 @@ pub struct Core {
     /// a wire that can sync is sent `roster_stale` instead; `None` for
     /// [`crate::admin::BULK_ROWS`].
     pub(crate) bulk_rows: Option<usize>,
+    /// Detached sessions one login may hold at one network
+    /// ([`Core::with_detached_per_login`]).
+    pub(crate) detached_per_login: Option<usize>,
     pub(crate) inbox_policy: InboxPolicy,
     /// What `[messaging]` says (`crate::messaging`).
     pub(crate) messaging_policy: crate::messaging::MessagingPolicy,
@@ -2032,6 +2065,13 @@ impl Core {
     /// rather than [`crate::admin::BULK_ROWS`].
     pub fn with_bulk_rows(mut self, n: usize) -> Self {
         self.bulk_rows = Some(n);
+        self
+    }
+
+    /// Let one login hold at most `n` detached sessions at one network
+    /// rather than [`DETACHED_PER_LOGIN`].
+    pub fn with_detached_per_login(mut self, n: usize) -> Self {
+        self.detached_per_login = Some(n);
         self
     }
 
@@ -2517,10 +2557,13 @@ impl Core {
         r.end_session(uid);
     }
 
-    /// The attached transport died. If the account may detach (and the
-    /// per-address cap allows), the session parks `Detached`, buffering
-    /// events for a resume, and everyone sees the status change; otherwise
-    /// the session ends as if [`Core::end_session`] were called.
+    /// The attached transport died. If the account may detach, the
+    /// session parks `Detached`, buffering events for a resume, and
+    /// everyone sees the status change; otherwise the session ends as if
+    /// [`Core::end_session`] were called. Parking it ends the oldest
+    /// detached session past either cap at its address: its login's
+    /// ([`Core::with_detached_per_login`]) or everyone's
+    /// (`max_detached_per_addr`).
     ///
     /// Returns `true` when the session survives detached.
     pub fn connection_lost(&self, uid: Uid, max_detached_per_addr: usize) -> bool {
@@ -2560,36 +2603,26 @@ impl Core {
             share: self.queue_budget.share(),
             broken: lagged,
         };
-        let addr = sess.addr;
         r.voice_part(uid);
         if !r.users.contains_key(&uid) {
             return false;
         }
         r.set_status(uid, SessionStatus::Detached);
 
-        // Per-address backstop: a spammer with detach permission still
-        // can't park an unbounded crowd. Oldest detached at this address
-        // goes first (docs/hotline-ng.md §2).
-        if let Some(addr) = addr {
-            loop {
-                let mut detached: Vec<(Uid, Instant)> = r
-                    .users
-                    .iter()
-                    .filter(|(_, s)| s.addr == Some(addr))
-                    .filter_map(|(u, s)| match s.outbox.sink {
-                        Sink::Buffering { since, .. } => Some((*u, since)),
-                        Sink::Live(..) | Sink::Lagged(_) => None,
-                    })
-                    .collect();
-                if detached.len() <= max_detached_per_addr {
-                    break;
-                }
-                detached.sort_by_key(|(_, since)| *since);
-                let (oldest, _) = detached[0];
-                r.end_session(oldest);
-            }
+        // One login at one network (docs/hotline-ng.md §2) is held to a
+        // few, so a phone that keeps reconnecting cannot pile up parked
+        // copies. Logins are counted apart because many people share one
+        // address behind carrier-grade NAT or a home router, and the
+        // network as well because a shared login is many people too.
+        // Every login at one network together is the backstop, since an
+        // identity that makes its own account costs nothing.
+        if let Some(net) = r.users[&uid].net() {
+            let login = r.users[&uid].login.clone();
+            let per_login = self.detached_per_login.unwrap_or(DETACHED_PER_LOGIN);
+            r.end_oldest_detached(per_login, |s| s.login == login && s.net() == Some(net));
+            r.end_oldest_detached(max_detached_per_addr, |s| s.net() == Some(net));
         }
-        true
+        r.users.contains_key(&uid)
     }
 
     /// Re-attach a connection to a detached (or live — takeover) session.
@@ -3654,6 +3687,42 @@ mod tests {
         assert!(matches!(core.resume(a1, 0), Resume::Gone));
         assert!(core.is_detached(a2));
         assert!(core.is_detached(a3));
+    }
+
+    #[test]
+    fn logins_behind_one_address_keep_their_detached_sessions() {
+        let core = Core::new().with_detached_per_login(1);
+        let (a, _ra) = ng_attach(&core, "ann", "10.0.0.9");
+        let (b, _rb) = ng_attach(&core, "bob", "10.0.0.9");
+        let (c, _rc) = ng_attach(&core, "cy", "10.0.0.9");
+        for uid in [a, b, c] {
+            assert!(core.connection_lost(uid, 32));
+        }
+        assert!([a, b, c].iter().all(|&u| core.is_detached(u)));
+    }
+
+    #[test]
+    fn one_login_at_one_address_keeps_its_newest_detached() {
+        let core = Core::new().with_detached_per_login(1);
+        let (old, _r1) = ng_attach(&core, "ann", "10.0.0.9");
+        let (new, _r2) = ng_attach(&core, "ann", "10.0.0.9");
+        let (away, _r3) = ng_attach(&core, "ann", "10.0.0.10");
+        for uid in [old, new, away] {
+            assert!(core.connection_lost(uid, 32));
+        }
+        assert!(matches!(core.resume(old, 0), Resume::Gone));
+        assert!([new, away].iter().all(|&u| core.is_detached(u)));
+    }
+
+    #[test]
+    fn the_address_backstop_counts_an_ipv6_slash_64_together() {
+        let core = Core::new();
+        let (a, _ra) = ng_attach(&core, "ann", "2001:db8:1:2::a");
+        let (b, _rb) = ng_attach(&core, "bob", "2001:db8:1:2::b");
+        assert!(core.connection_lost(a, 1));
+        assert!(core.connection_lost(b, 1));
+        assert!(matches!(core.resume(a, 0), Resume::Gone));
+        assert!(core.is_detached(b));
     }
 
     #[test]

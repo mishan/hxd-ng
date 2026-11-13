@@ -232,6 +232,7 @@ generate() {
         echo "[ng]"
         kv bind "${HXD_NG_BIND:-0.0.0.0:5700}"
         num HXD_NG_GRACE grace
+        num HXD_NG_MAX_DETACHED_PER_LOGIN max_detached_per_login
         num HXD_NG_MAX_DETACHED_PER_ADDR max_detached_per_addr
         addresses HXD_NG_TRUSTED_PROXIES "${HXD_NG_TRUSTED_PROXIES-127.0.0.1,::1}" trusted_proxies
         str HXD_NG_FORWARDED_HEADER forwarded_header

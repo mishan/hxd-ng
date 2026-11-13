@@ -1026,7 +1026,9 @@ Enabling `[ng]` turns on the WebSocket protocol — see
 [ng]
 bind = "127.0.0.1:5700"    # plaintext; put a WSS-terminating proxy in front
 grace = 300                # detached-session grace window, seconds
-max_detached_per_addr = 2
+# Detached sessions per address (IPv6: per /64): one login's, everyone's.
+max_detached_per_login = 2
+max_detached_per_addr = 32
 
 # Proxies only. The address walk skips whatever is listed here, and the
 # mTLS binding header (X-Hotline-Client-Cert) is believed from these hosts
