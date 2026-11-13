@@ -1724,12 +1724,7 @@ impl RosterInner {
         }
         sess.info.status = status;
         let messaging = sess.messaging.is_some().then(|| sess.mailbox());
-        if sess.live() {
-            if let Some(ev) = self.changed_event(uid) {
-                self.tell_row(ev);
-            }
-            self.export_changed(uid);
-        }
+        self.row_changed(uid);
         if let Some(m) = messaging {
             self.presence_soon(&crate::messaging::Key::of(&m));
         }
@@ -2635,7 +2630,13 @@ impl Core {
                 return false;
             };
             r.tell_row(ev);
-            r.export_changed(uid);
+            // Each member is its own user to a link, and each was renamed.
+            let members = r
+                .person_members(r.row_uid(uid))
+                .map_or_else(|| vec![uid], <[Uid]>::to_vec);
+            for m in members {
+                r.export_changed(m);
+            }
             return true;
         }
         let Some(sess) = r.users.get_mut(&uid) else {

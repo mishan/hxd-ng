@@ -713,6 +713,41 @@ mod tests {
     }
 
     #[test]
+    fn a_device_going_away_alone_is_told_its_own_status_and_nobody_else_anything() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, mut rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut watching);
+        drain(&mut rx2);
+        core.roster
+            .lock()
+            .unwrap()
+            .set_status(a2, SessionStatus::Idle);
+        assert_eq!(told(&mut watching), []);
+        assert!(drain(&mut rx2).iter().any(
+            |e| matches!(e, Event::Changed(u) if u.uid == a1 && u.status == SessionStatus::Idle)
+        ));
+    }
+
+    #[test]
+    fn a_rename_from_one_device_reaches_the_links_for_each() {
+        let core = Core::new().with_coalesce(true);
+        let mut feed = core.peer_feed(16);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        assert!(core.update(a2, Some("Ally".into()), None));
+        let mut renamed = vec![];
+        while let Ok((_, e)) = feed.try_recv() {
+            if let crate::server_link::PeerEvent::Changed(u) = e {
+                renamed.push((u.uid, u.nick));
+            }
+        }
+        renamed.sort();
+        assert_eq!(renamed, [(a1, "Ally".into()), (a2, "Ally".into())]);
+    }
+
+    #[test]
     fn a_person_is_shown_as_safe_as_its_least_safe_device() {
         let core = Core::new().with_coalesce(true);
         let tls = Transport {
