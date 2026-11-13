@@ -164,7 +164,10 @@ fn usage() -> ! {
         "recovery code instead and shows the code once, and --delete takes one\n",
         "away. `hlid restore` fetches it back with the passphrase, or the code\n",
         "with --recovery, and writes the identity into $HLID_HOME as `init`\n",
-        "does, with a new device and the card the registrar keeps.\n",
+        "does, with a new device and the card the registrar keeps. Where it\n",
+        "keeps none, the new card commits to no successor, so a later register\n",
+        "needs --successor-commit --successor-key with the original successor\n",
+        "key, which no envelope holds.\n",
         "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",
@@ -396,9 +399,14 @@ pub(crate) const CARD_FILE: &str = "card.bin";
 pub(crate) const LAID_OUT: [&str; 4] = [IDENTITY_KEY, DEVICE_KEY, CERT_FILE, CARD_FILE];
 
 /// The first of [`LAID_OUT`] already in `home`, which nothing writes
-/// over.
+/// over. A symlink counts whether or not it leads anywhere: one dangling
+/// at `identity.key` would have a later write land on the new key.
 pub(crate) fn laid_out_already(home: &Path) -> R<()> {
-    match LAID_OUT.iter().map(|f| home.join(f)).find(|p| p.exists()) {
+    match LAID_OUT
+        .iter()
+        .map(|f| home.join(f))
+        .find(|p| p.symlink_metadata().is_ok())
+    {
         Some(p) => Err(format!(
             "{} already exists; hlid will not write over an identity",
             p.display()
@@ -1319,5 +1327,20 @@ async fn tunnel_one(
     tokio::select! {
         r = up => r,
         r = down => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_where_an_identity_goes_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(home.path().join(IDENTITY_KEY), home.path().join(CARD_FILE))
+            .unwrap();
+        let err = laid_out_already(home.path()).unwrap_err();
+        assert!(err.contains(CARD_FILE), "{err}");
     }
 }

@@ -1531,6 +1531,37 @@ fn revocation_and_rotation_take_the_envelopes_with_them() {
 }
 
 #[test]
+fn a_rotation_that_came_due_is_published_by_a_salt_lookup_or_a_fetch() {
+    for by_fetch in [false, true] {
+        let r = backups_with(Arc::new(MemoryStore::new()), |c| c.rotation_delay = DAY);
+        let (bob, bob2) = (id(2), id(12));
+        register(&r, &bob, "bobby", T).unwrap();
+        let keys = put(&r, &bob, &Secret::Passphrase("p"), T);
+        let rotate = Rotation {
+            identity: bob.public(),
+            successor: bob2.public(),
+            time: T + 1,
+        }
+        .sign(&bob, &bob2)
+        .unwrap();
+        r.post_record(&rotate, T + 1).unwrap();
+        let due = T + 1 + DAY;
+        if by_fetch {
+            assert_eq!(
+                r.fetch_envelope("bobby", 1, keys.auth(), addr(1), due),
+                Err(Refusal::NotFound)
+            );
+        } else {
+            assert_eq!(
+                salt(&r, "bobby", 1, due),
+                Kdf::decoy(&SECRET, "bobby", EnvelopeKind::Passphrase)
+            );
+        }
+        assert_eq!(r.store.envelope(&bob.public(), 1).unwrap(), None);
+    }
+}
+
+#[test]
 fn a_registrar_without_envelopes_answers_as_if_the_endpoint_were_not_there() {
     let r = registrar();
     let alice = id(1);

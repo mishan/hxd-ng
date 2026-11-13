@@ -2010,3 +2010,77 @@ async fn hlid_backs_up_and_restores_an_identity() {
     assert!(!ok);
     assert!(err.contains("no passphrase envelope for alice"), "{err}");
 }
+
+#[tokio::test]
+async fn a_restore_with_no_card_to_take_says_the_successor_must_commit_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let bin = hlid_binary();
+    let url = format!("http://{}", s.ng);
+    // Registered with a commitment, and never a card put at the registrar.
+    let (alice, successor) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let mut req = request(&alice, "alice");
+    req.successor = Some(commitment(&successor));
+    assert_eq!(register(&s, req, &alice).await.status, 200);
+    back_up(&s, &alice, &Secret::Passphrase("correct horse battery")).await;
+    let pass = dir.path().join("passphrase");
+    std::fs::write(&pass, "correct horse battery\n").unwrap();
+    let home = dir.path().join("restored");
+
+    let (ok, out, err) = hlid(
+        &bin,
+        &home,
+        &[
+            "restore",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--password-file",
+            pass.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(ok, "{err}");
+    assert!(out.contains("--successor-key"), "{out}");
+
+    let register_again = |extra: Vec<String>| {
+        let mut args = vec![
+            "register",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        args.extend(extra);
+        args
+    };
+    let args = register_again(vec![]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, _, err) = hlid(&bin, &home, &words).await;
+    assert!(!ok && err.contains("successor_mismatch"), "{err}");
+
+    let key = dir.path().join("successor.key");
+    let hex: String = successor
+        .seed()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(&key, hex).unwrap();
+    let args = register_again(vec![
+        "--successor-commit".into(),
+        "--successor-key".into(),
+        key.to_str().unwrap().into(),
+    ]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, out, err) = hlid(&bin, &home, &words).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("reissued alice@127.0.0.1"), "{out}");
+}

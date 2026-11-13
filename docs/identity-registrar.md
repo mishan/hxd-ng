@@ -1155,6 +1155,16 @@ certifying a device) is not in this document: it would widen what a
 stolen device can do to gain what an envelope already gives, and it
 needs a threat-model entry this document would rather not write.
 
+An envelope holds the identity seed and nothing else: not the card,
+and not the successor key a card commits to (§5.4). A restore takes the
+card the registrar keeps (§6.4), which carries the commitment. Where
+the registrar keeps none, a new card commits to nothing, and the
+registrar, holding the commitment, refuses the next registration
+`successor_mismatch` until a card commits to the same successor again
+— which takes the original successor key, kept apart from the identity
+key on purpose. `hlid restore` says so, and `hlid register
+--successor-commit --successor-key FILE` makes that commitment again.
+
 ---
 
 ## 10. Bounds and rate limits

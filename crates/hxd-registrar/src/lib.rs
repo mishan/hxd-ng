@@ -1466,6 +1466,9 @@ impl Registrar {
         let kind = envelope_kind(kind)?;
         let handle = Self::envelope_handle(handle)?;
         self.lookup_limit(addr, now)?;
+        // A rotation that came due moves the handle and takes the
+        // predecessor's envelopes; whoever looks first publishes it.
+        self.writing(|| self.publish_due(now))?;
         // Made whether or not it is answered, so the two answers take the
         // same work.
         let decoy = Kdf::decoy(&decoy_secret, &handle, kind);
@@ -1521,6 +1524,7 @@ impl Registrar {
         }
         let presented = digest(auth);
         self.writing(|| {
+            self.publish_due(now)?;
             let epoch = self.store.unlock_epoch(&handle, kind)?.to_be_bytes();
             let prefix = match prefix {
                 IpAddr::V4(v4) => v4.octets().to_vec(),

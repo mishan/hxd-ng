@@ -706,5 +706,16 @@ pub(crate) fn restore_cmd(args: &[String]) -> R<()> {
             ", with a new card"
         }
     );
+    // A new card names no successor, and no envelope holds the successor
+    // key, while the registrar may hold a commitment to it.
+    if card.is_none() {
+        println!(
+            "the registrar keeps no card for this identity, so the new one commits to no \
+             successor. If the identity committed to one, `hlid register` is refused until \
+             it commits again with the original successor key \
+             (hlid register --successor-commit --successor-key FILE …), and `hlid rotate` \
+             takes only that key"
+        );
+    }
     Ok(())
 }
