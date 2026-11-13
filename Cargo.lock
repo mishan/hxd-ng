@@ -1237,13 +1237,12 @@ dependencies = [
 [[package]]
 name = "hl-identity"
 version = "0.1.0"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hmac",
  "hpke",
- "serde",
- "serde_json",
  "sha2",
  "url",
  "x25519-dalek",
@@ -1393,7 +1392,7 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 [[package]]
 name = "hxcrypto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7ca8e270d20039fb19096470a9be64a960568463#7ca8e270d20039fb19096470a9be64a960568463"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 dependencies = [
  "blowfish",
  "chacha20poly1305",
@@ -1734,7 +1733,7 @@ dependencies = [
 [[package]]
 name = "hxfiles-xfer"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7ca8e270d20039fb19096470a9be64a960568463#7ca8e270d20039fb19096470a9be64a960568463"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 dependencies = [
  "sha2",
 ]
@@ -1742,12 +1741,12 @@ dependencies = [
 [[package]]
 name = "hxhfs"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7ca8e270d20039fb19096470a9be64a960568463#7ca8e270d20039fb19096470a9be64a960568463"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 
 [[package]]
 name = "hxhope"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7ca8e270d20039fb19096470a9be64a960568463#7ca8e270d20039fb19096470a9be64a960568463"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 dependencies = [
  "flate2",
  "hxcrypto",
@@ -1758,7 +1757,7 @@ dependencies = [
 [[package]]
 name = "hxproto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7ca8e270d20039fb19096470a9be64a960568463#7ca8e270d20039fb19096470a9be64a960568463"
+source = "git+https://github.com/mishan/hx-libs.git?rev=ce3df8147824d1b4ddcdd565bdf8b79ea280024c#ce3df8147824d1b4ddcdd565bdf8b79ea280024c"
 
 [[package]]
 name = "hybrid-array"

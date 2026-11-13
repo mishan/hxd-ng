@@ -31,10 +31,10 @@ to another project.
 | [identity-records.md](identity-records.md) — a verifying server applying a registrar's records: plan and staging for registrar §7 | R1–R3; not standing and probation (R4) | ng | design |
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |
-| [identity-test-vectors.json](identity-test-vectors.json) — signed objects and reject cases | yes | — | spec |
+| [identity-test-vectors.json](https://github.com/mishan/hx-libs/blob/main/crates/hl-identity/vectors/identity-test-vectors.json), in hx-libs — signed objects and reject cases | yes | — | spec |
 | [e2e-messages.md](e2e-messages.md) — messages signed by a device key (private messages, public chat, news) and private messages sealed to its `device_enc` key | no | ng | spec |
 | [server-key-handover.md](server-key-handover.md) — rotating the server key through a signed handover to a pre-committed successor, keeping the old key as an alias | yes | ng | spec |
-| [server-handover-vectors.json](server-handover-vectors.json) — handovers, challenges with `next`, and the client's decisions | yes | — | spec |
+| [server-handover-vectors.json](https://github.com/mishan/hx-libs/blob/main/crates/hl-identity/vectors/server-handover-vectors.json), in hx-libs — handovers, challenges with `next`, and the client's decisions | yes | — | spec |
 | [push-notifications.md](push-notifications.md) — the notify decision, the subscriber model, and the multi-vendor sidecar | yes, through the Web Push gateway or a uniqush-push 2.11 sidecar; not the sidecar's APNs and FCM devices | ng | design |
 | [webpush-gateway.md](webpush-gateway.md) — the in-process Web Push sender and the device registry | yes | ng | design |
 
@@ -88,7 +88,8 @@ to another project.
    `voice.md` §6, `capabilities-video.md` — the ng request families,
    each in its own document.
 5. `identity-test-vectors.json`, and `server-handover-vectors.json` for
-   a client that follows a handover — check your objects against them
+   a client that follows a handover, in hx-libs'
+   `crates/hl-identity/vectors/` — check your objects against them
    before anything else.
 
 Everything else is how this server does it, and is worth reading for

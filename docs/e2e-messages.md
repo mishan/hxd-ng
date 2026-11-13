@@ -1775,4 +1775,4 @@ RFC 9180 prints no vector for the HPKE suite; the CFRG's
 `test-vectors.json` for HPKE has them, and an implementation should
 pass every one it has for this suite, in base and auth mode, first.
 hl-identity checks its HPKE against them, kept for this suite in
-`crates/hl-identity/tests/rfc9180-vectors.json`.
+hx-libs' `crates/hl-identity/tests/rfc9180-vectors.json`.

@@ -1,7 +1,8 @@
 # Hotline identity — portable identity, and the identity profile for hotline-ng
 
-Status: partial. Built in hxd-ng: the identity objects (§3,
-`crates/hl-identity`, with test vectors in `identity-test-vectors.json`),
+Status: partial. Built in hxd-ng: the identity objects (§3, in
+hx-libs' `hl-identity`, with test vectors in its
+`vectors/identity-test-vectors.json`),
 the profile's part of authentication (§5), cards (§7), account
 association including `trtp_login` (§8), the `hlid` tool, the
 server-local revocation list of `identity-registrar.md` §7.3 (§12's

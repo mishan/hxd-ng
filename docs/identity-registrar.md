@@ -1297,7 +1297,7 @@ the `retry_after` on `rate_limited` during `newcomer_delay` (§7.3).
 
 `identity-threat-model.md`: §13 here.
 
-`crates/hl-identity`: the `ack` rule (§4.1) in `signed.rs`; the seven
+hx-libs' `hl-identity`: the `ack` rule (§4.1) in `signed.rs`; the seven
 new codecs; the envelope derivation.
 
 ---
