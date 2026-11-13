@@ -705,7 +705,7 @@ fn give_account(
     shown |= renamed;
     // A change to its roles alone, to the wires that can show one.
     let only_roles = !shown && roles_changed;
-    let shown = ((shown || roles_changed) && s.visible).then(|| s.info.clone());
+    let shown = ((shown || roles_changed) && s.live()).then(|| s.info.clone());
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
     // The admin bit never crosses a link; only the name does.
     if shown.is_some() && renamed {

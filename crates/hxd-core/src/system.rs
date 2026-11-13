@@ -707,7 +707,7 @@ impl Core {
         let r = self.roster.lock().unwrap();
         let mut found = None;
         for (uid, sess) in r.users.iter() {
-            if sess.visible && !sess.system && sess.info.nick.eq_ignore_ascii_case(nick) {
+            if sess.live() && !sess.system && sess.info.nick.eq_ignore_ascii_case(nick) {
                 if found.is_some() {
                     return None;
                 }

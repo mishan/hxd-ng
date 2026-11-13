@@ -144,7 +144,7 @@ impl Core {
             let target = r
                 .users
                 .get(&of)
-                .filter(|s| s.visible)
+                .filter(|s| s.live())
                 .ok_or(SealedError::NoSuchUser)?;
             (target.mailbox(), asker)
         };
@@ -153,7 +153,7 @@ impl Core {
         let target = r
             .users
             .get(&of)
-            .filter(|s| s.visible && s.mailbox() == owner)
+            .filter(|s| s.live() && s.mailbox() == owner)
             .ok_or(SealedError::NoSuchUser)?;
         let device = self.sealable(target).ok_or(SealedError::NotSealed)?;
         Ok(device.cert.clone())
@@ -180,7 +180,7 @@ impl Core {
             let target = r
                 .users
                 .get(&to)
-                .filter(|s| s.visible)
+                .filter(|s| s.live())
                 .ok_or(SealedError::NoSuchUser)?;
             self.sealed_to(target, &sealed_to)?;
             (target.mailbox(), sender.mailbox(), target.serial)
@@ -205,7 +205,7 @@ impl Core {
         let target = r
             .users
             .get(&to)
-            .filter(|s| s.visible && s.serial == serial)
+            .filter(|s| s.live() && s.serial == serial)
             .ok_or(SealedError::NoSuchUser)?;
         self.sealed_to(target, &sealed_to)?;
         if let Some((mine, all)) = target.outbox.sealed_held(&from_fingerprint) {

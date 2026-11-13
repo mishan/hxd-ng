@@ -929,7 +929,7 @@ fn rename(w: &mut Waiting, old: &Key, to: &Mailbox) {
 fn hears(r: &RosterInner, room: u32, uid: Uid, s: &UserSession) -> bool {
     s.info.transport.reactions
         && match room {
-            0 => s.visible && reads_public_chat(s),
+            0 => s.live() && reads_public_chat(s),
             _ => r
                 .rooms
                 .get(&room)

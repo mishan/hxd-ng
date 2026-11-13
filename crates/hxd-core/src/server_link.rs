@@ -409,7 +409,7 @@ pub(crate) struct Feed {
 /// the server's own account, which a private message turns into commands
 /// that no other server's user has any business sending.
 fn exported(sess: &UserSession) -> bool {
-    sess.visible && !sess.system
+    sess.live() && !sess.system
 }
 
 impl RosterInner {
@@ -1274,7 +1274,7 @@ impl Core {
         let mut rows: Vec<UserInfo> = r
             .users
             .values()
-            .filter(|s| s.visible)
+            .filter(|s| s.live())
             .map(|s| s.info.clone())
             .chain(
                 r.ghosts

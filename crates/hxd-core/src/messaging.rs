@@ -40,7 +40,7 @@ use crate::relationships::{
     AccountUpdate, LedgerEntry, PendingOut, Profile, RelationId, Relationship, RelationshipStore,
     RequestKind, Requester,
 };
-use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserSession};
+use crate::roster::{Announced, Event, RosterInner, SessionStatus, Uid, UserSession};
 use crate::Core;
 
 mod im;
@@ -806,7 +806,7 @@ impl Core {
             let sess = r
                 .users
                 .get(&uid)
-                .filter(|s| !s.visible && session_takes_part(s))?;
+                .filter(|s| s.announced == Announced::Pending && session_takes_part(s))?;
             sess.mailbox()
         };
         // Read whether or not the mailbox has an entry now: one in the

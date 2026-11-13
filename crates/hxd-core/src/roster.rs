@@ -1093,6 +1093,22 @@ impl Outbox {
     }
 }
 
+/// Where a session is between its login and the roster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Announced {
+    /// Attached, not yet announced: between login and its completion, a
+    /// 1.5 client at the agreement among them, its identity still open to
+    /// Prove Device.
+    Pending,
+    /// Announced as a bit-8 messenger session
+    /// (`Transport::messenger_session`): on no list, deaf to public chat,
+    /// taking instant messages but not mail, which waits for a session
+    /// that is [`Announced::Live`].
+    Messenger,
+    /// Announced: on the user list, hearing what the roster hears.
+    Live,
+}
+
 /// One user's presence and its outbox.
 pub(crate) struct UserSession {
     /// Distinguishes this session from any other that ever held the same
@@ -1181,9 +1197,8 @@ pub(crate) struct UserSession {
     /// News search's ration, kept the same way and for the same reason.
     pub(crate) search_refill: Instant,
     pub(crate) search_tokens: f64,
-    /// Whether this session has been announced (shows on the user list,
-    /// generates events). False between login and login-completion.
-    pub(crate) visible: bool,
+    /// Where the session is between its login and the roster.
+    pub(crate) announced: Announced,
     /// The avatar `info.avatar` describes, with its bytes.
     pub(crate) avatar: Option<crate::avatar::Avatar>,
     pub(crate) outbox: Outbox,
@@ -1200,6 +1215,11 @@ pub(crate) struct UserSession {
 }
 
 impl UserSession {
+    /// On the user list and hearing what it hears.
+    pub(crate) fn live(&self) -> bool {
+        self.announced == Announced::Live
+    }
+
     /// The network its address counts in: [`crate::limits::limit_key`].
     fn net(&self) -> Option<IpAddr> {
         self.addr.map(crate::limits::limit_key)
@@ -1411,7 +1431,7 @@ impl RosterInner {
 
     /// `uid`'s row changed: told to everyone who sees it, and the links.
     pub(crate) fn row_changed(&mut self, uid: Uid) {
-        let Some(sess) = self.users.get(&uid).filter(|s| s.visible) else {
+        let Some(sess) = self.users.get(&uid).filter(|s| s.live()) else {
             return;
         };
         let ev = Event::Changed(sess.info.clone());
@@ -1507,7 +1527,7 @@ impl RosterInner {
         let mut tally = instrument::Tally::default();
         let mut reached = 0;
         for (uid, sess) in self.users.iter_mut() {
-            if Some(*uid) == skip || !sess.visible || !pred(sess) {
+            if Some(*uid) == skip || !sess.live() || !pred(sess) {
                 continue;
             }
             tally.add(sess.outbox.push(ev.clone()));
@@ -1536,10 +1556,7 @@ impl RosterInner {
         self.users
             .iter()
             .filter(|(uid, sess)| {
-                Some(**uid) != skip
-                    && sess.visible
-                    && sess.info.transport.inline_media
-                    && pred(sess)
+                Some(**uid) != skip && sess.live() && sess.info.transport.inline_media && pred(sess)
             })
             .map(|(uid, sess)| crate::media::Principal::Session {
                 uid: *uid,
@@ -1576,7 +1593,7 @@ impl RosterInner {
         }
         self.export_gone(&sess);
         self.freed_uids.hold(uid, Instant::now());
-        if sess.visible {
+        if sess.live() {
             self.broadcast(&Event::Parted(uid), Some(uid));
         }
     }
@@ -1591,7 +1608,7 @@ impl RosterInner {
         }
         sess.info.status = status;
         let messaging = sess.messaging.is_some().then(|| sess.mailbox());
-        if sess.visible {
+        if sess.live() {
             let ev = Event::Changed(sess.info.clone());
             self.broadcast(&ev, None);
             self.export_changed(uid);
@@ -2409,7 +2426,7 @@ impl Core {
                 history_tokens: 10.0,
                 search_refill: Instant::now(),
                 search_tokens: f64::from(self.news_policy.search_per_minute),
-                visible: false,
+                announced: Announced::Pending,
                 avatar: None,
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
@@ -2431,11 +2448,13 @@ impl Core {
             let Some(sess) = r.users.get_mut(&uid) else {
                 return;
             };
-            if sess.visible || sess.messaging.is_some() {
+            if sess.announced != Announced::Pending {
                 return;
             }
-            if !sess.info.transport.messenger_session {
-                sess.visible = true;
+            if sess.info.transport.messenger_session {
+                sess.announced = Announced::Messenger;
+            } else {
+                sess.announced = Announced::Live;
                 let ev = Event::Joined(sess.info.clone());
                 r.broadcast(&ev, Some(uid));
                 r.export_shown(uid);
@@ -2492,7 +2511,7 @@ impl Core {
                 changed = true;
             }
         }
-        if changed && sess.visible {
+        if changed && sess.live() {
             let ev = Event::Changed(sess.info.clone());
             r.broadcast(&ev, None);
             r.export_changed(uid);
@@ -2536,12 +2555,12 @@ impl Core {
         }
         let fingerprint = tag.fingerprint;
         sess.info.transport.identity = Some(tag);
-        if !sess.visible && sess.messaging.is_none() {
+        if sess.announced == Announced::Pending {
             sess.identity.get_or_insert(fingerprint);
             return true;
         }
         sess.proved_late = true;
-        if sess.visible {
+        if sess.live() {
             let ev = Event::Changed(sess.info.clone());
             r.broadcast(&ev, None);
         }
@@ -2725,7 +2744,7 @@ impl Core {
                 c.live_bytes += bytes;
                 c.live_bytes_max = c.live_bytes_max.max(bytes);
             }
-            if !sess.visible {
+            if !sess.live() {
                 c.hidden += 1;
                 continue;
             }
@@ -2818,7 +2837,7 @@ impl Core {
         let mut v: Vec<_> = r
             .users
             .values()
-            .filter(|s| s.visible)
+            .filter(|s| s.live())
             .map(|s| s.info.clone())
             .collect();
         v.sort_by_key(|u| u.uid);
@@ -2836,19 +2855,16 @@ impl Core {
     /// The fuller view of a *visible* user (the user-info op).
     pub fn user_details(&self, uid: Uid) -> Option<UserDetails> {
         let r = self.roster.lock().unwrap();
-        r.users
-            .get(&uid)
-            .filter(|s| s.visible)
-            .map(|s| UserDetails {
-                info: s.info.clone(),
-                login: s.login.clone(),
-                addr: s.addr,
-                connected_at: s.connected_at,
-                roles: s
-                    .account
-                    .as_ref()
-                    .map_or_else(Vec::new, |a| a.roles.clone()),
-            })
+        r.users.get(&uid).filter(|s| s.live()).map(|s| UserDetails {
+            info: s.info.clone(),
+            login: s.login.clone(),
+            addr: s.addr,
+            connected_at: s.connected_at,
+            roles: s
+                .account
+                .as_ref()
+                .map_or_else(Vec::new, |a| a.roles.clone()),
+        })
     }
 
     /// Tell the session `uid`, if it is still the one with `serial`, where

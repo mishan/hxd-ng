@@ -267,7 +267,7 @@ presence: `announce`, `update_with_color`, `set_status`, `apply_account`
 (when the name changes: the admin bit never crosses),
 `RosterInner::end_session` (which every way of leaving goes through), and
 the broadcast step of `chat_commit_batch`, which checks there that the
-sender is exported (`chat_public` does not check `visible`, so a line
+sender is exported (`chat_public` does not check `live()`, so a line
 could otherwise reach the feed ahead of its sender's `Shown`). They sit at
 the call sites, not
 inside `broadcast_where`, which also carries ghosts' own `Joined` events.
