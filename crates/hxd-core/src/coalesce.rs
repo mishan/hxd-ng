@@ -87,6 +87,18 @@ impl RosterInner {
         }
         let login = sess.login.clone();
         let info = sess.info.clone();
+        // A person is one identity: a session of the login under another
+        // (its link changed while the first was on) stands apart.
+        let identity = sess.identity;
+        let other_identity = self.persons.by_login.get(&login).is_some_and(|p| {
+            p.members
+                .first()
+                .and_then(|m| self.users.get(m))
+                .is_some_and(|front| front.identity != identity)
+        });
+        if other_identity {
+            return Joined::Alone;
+        }
         self.users.get_mut(&uid).expect("got above").grouped = true;
         match self.persons.by_login.get_mut(&login) {
             Some(p) => {
@@ -129,6 +141,21 @@ impl RosterInner {
         }
     }
 
+    /// `info`, a row about to be told: a person's as it stands now, and
+    /// noted as told, so a later change compares with what was sent.
+    pub(crate) fn row_now(&mut self, info: UserInfo) -> UserInfo {
+        let Some(login) = self.persons.rows.get(&info.uid).cloned() else {
+            return info;
+        };
+        let Some(view) = self.person_view(&login) else {
+            return info;
+        };
+        if let Some(p) = self.persons.by_login.get_mut(&login) {
+            p.told = view.clone();
+        }
+        view
+    }
+
     /// The person's row as it stands, if it is not as the roster was told.
     fn retell(&mut self, login: &str) -> Option<Event> {
         let view = self.person_view(login)?;
@@ -146,6 +173,10 @@ impl RosterInner {
         let front = self.users.get(p.members.first()?)?;
         let mut info = front.info.clone();
         info.uid = p.row;
+        // Sealed to by device, which the row is not.
+        if let Some(identity) = info.transport.identity.as_mut() {
+            identity.sealed = None;
+        }
         info.status = p
             .members
             .iter()
@@ -465,5 +496,31 @@ mod tests {
         assert_eq!(core.user(a2).map(|u| u.uid), Some(a1));
         assert_eq!(core.own_details(a2).map(|d| d.login), Some("alice".into()));
         assert!(core.user_details(a2).is_none());
+    }
+
+    #[test]
+    fn a_message_from_a_device_to_its_own_row_is_from_nobody() {
+        let core = Core::new().with_coalesce(true);
+        let (a1, mut rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut rx1);
+        core.msg(a2, a1, "note to self".into(), None, None).unwrap();
+        let from: Vec<Uid> = drain(&mut rx1)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Msg { from, .. } => Some(from),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(from, [0]);
+    }
+
+    #[test]
+    fn a_session_under_another_identity_of_the_login_stands_apart() {
+        let core = Core::new().with_coalesce(true);
+        let relinked = [9; 32];
+        attach(&core, "alice", Some(ALICE), Some(ALICE));
+        attach(&core, "alice", Some(relinked), Some(relinked));
+        assert_eq!(rows(&core).len(), 2);
     }
 }

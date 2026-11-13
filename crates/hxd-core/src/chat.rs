@@ -238,6 +238,18 @@ fn named_sessions(r: &RosterInner, mailbox: &Mailbox, named: Option<Uid>, sender
     }
 }
 
+/// Who a message is shown from: the sender's row, or nobody where that
+/// is the recipient's own (one of a person's devices writing to its
+/// row), since a reply to it would be to oneself.
+fn shown_from(r: &RosterInner, sender: Uid, to: Option<Uid>) -> Uid {
+    let row = r.row_uid(sender);
+    if to.map(|t| r.row_uid(t)) == Some(row) {
+        0
+    } else {
+        row
+    }
+}
+
 /// A store that would not answer is a server-side failure, not the
 /// client's fault. The detail goes to the log; the client gets the
 /// generic error, like every other backend failure here.
@@ -373,6 +385,10 @@ fn v6_stands_alone(v6: std::net::Ipv6Addr) -> bool {
 /// A public line on its way to the log and the room.
 pub(crate) struct Staged {
     info: UserInfo,
+    /// The row the line is shown from, taken where the session was last
+    /// checked: a grouped session that ends before its line is relayed
+    /// is still shown as its person, never under its own uid.
+    shown: Option<UserInfo>,
     login: Option<String>,
     fingerprint: Option<[u8; 32]>,
     /// The sending session; `None` for a linked server's user, a ghost,
@@ -406,6 +422,7 @@ impl Staged {
     ) -> Staged {
         Staged {
             info,
+            shown: None,
             login: None,
             fingerprint: None,
             principal: None,
@@ -1126,6 +1143,7 @@ impl Core {
             };
             staged.push(Staged {
                 info,
+                shown: None,
                 login,
                 fingerprint,
                 principal: Some(principal),
@@ -1219,7 +1237,10 @@ impl Core {
                         // post there: not heard there.
                         match (room != 0).then(|| r.room_send_check(room, uid, sess)) {
                             Some(Err(e)) => *result = Some(Err(e)),
-                            _ => s.info = sess.info.clone(),
+                            _ => {
+                                s.info = sess.info.clone();
+                                s.shown = Some(r.row_view(sess));
+                            }
                         }
                     }
                     _ => *result = Some(Err(ChatError::NoSuchUser)),
@@ -1379,7 +1400,10 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             let ev = Event::Chat {
                 cid: room,
-                from: r.shown_info(s.info),
+                from: match s.shown {
+                    Some(shown) => shown,
+                    None => r.shown_info(s.info),
+                },
                 text: s.text,
                 style: s.style,
                 id,
@@ -2522,10 +2546,22 @@ impl Core {
             // is why `media_capture` takes principals rather than
             // looking them up.
             if let Some(handle) = &image {
-                self.media_capture(handle, audience.clone());
+                // A person's sessions are each handed it, and each may
+                // fetch it: the grant is the mailbox's where there is one,
+                // and each session's where there is not.
+                let mut who = audience.to_vec();
+                if !to.has_inbox {
+                    who.extend(uids.iter().filter_map(|&uid| {
+                        r.users.get(&uid).map(|s| crate::media::Principal::Session {
+                            uid,
+                            serial: s.serial,
+                        })
+                    }));
+                }
+                self.media_capture(handle, who);
             }
             let ev = Event::Msg {
-                from: r.row_uid(sender.uid),
+                from: shown_from(&r, sender.uid, to.uid),
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
@@ -2615,7 +2651,7 @@ impl Core {
                 self.media_capture(handle, audience.clone());
             }
             let ev = Event::Msg {
-                from: r.row_uid(sender.uid),
+                from: shown_from(&r, sender.uid, to.uid),
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
@@ -3141,6 +3177,9 @@ impl Core {
                                 .find(|u| r.row_uid(*u) != r.row_uid(uid))
                         })
                         .map_or(0, |s| r.row_uid(s));
+                    // Never the recipient's own row, whichever way the
+                    // sender was found: a reply to it is to oneself.
+                    let from = if from == r.row_uid(uid) { 0 } else { from };
                     let from_login = m
                         .sender
                         .as_ref()

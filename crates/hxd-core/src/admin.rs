@@ -630,9 +630,18 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     if stale {
         r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
     }
-    // A person's sessions are one row, told once.
-    let mut told = std::collections::HashSet::new();
-    for (info, only_roles) in rows.into_iter().filter(|(info, _)| told.insert(info.uid)) {
+    // A person's sessions are one row, told once, as it stands once every
+    // session's account is changed, and only to the roles wires if no
+    // session of it changed more than its roles.
+    let mut once: Vec<Row> = Vec::new();
+    for (info, only_roles) in rows {
+        match once.iter_mut().find(|(seen, _)| seen.uid == info.uid) {
+            Some((_, only)) => *only &= only_roles,
+            None => once.push((info, only_roles)),
+        }
+    }
+    for (info, only_roles) in once {
+        let info = r.row_now(info);
         r.broadcast_where(&Event::Changed(info), None, |s| {
             let syncs = s.info.transport.roles;
             !(stale && syncs) && (!only_roles || syncs)

@@ -175,7 +175,8 @@ impl Core {
         let (owner, other, serial) = {
             let r = self.roster.lock().unwrap();
             let sender = r.users.get(&from).ok_or(SealedError::NoSuchUser)?;
-            if sealed_of(sender).is_none() {
+            // Nor from one, whose own uid its reader could not answer.
+            if sealed_of(sender).is_none() || sender.grouped {
                 return Err(SealedError::SelfNotSealed);
             }
             // A person's sessions are sealed to by device, which a client
