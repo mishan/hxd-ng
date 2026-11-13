@@ -178,10 +178,13 @@ describe('a registrar section the binary refuses', () => {
     assert.match(output, /no port/);
   });
 
-  test('promising key backup it does not have', async () => {
+  test('with envelopes larger than an envelope can be', async () => {
     const { output } = await startFailing({
-      config: { identity: {}, registrar: { host: 'hl.example', envelopes: true } },
+      config: {
+        identity: {},
+        registrar: { host: 'hl.example', envelopes: true, envelope_max: 2048 },
+      },
     });
-    assert.match(output, /not built/);
+    assert.match(output, /envelope_max must be from 256 to 1024/);
   });
 });

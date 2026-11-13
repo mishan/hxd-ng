@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 hl-identity = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 # The OS CSPRNG, for invite codes. The same source hl-identity draws keys
 # from.
 getrandom = "0.2"

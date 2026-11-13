@@ -27,7 +27,7 @@ to another project.
 | [relay.md](relay.md) — running `hlrelay`, the WebSocket front for a classic server | without authentication or its own bans | ng clients reaching a classic server | design |
 | [hotline-ng-identity.md](hotline-ng-identity.md) — the identity objects, the identity profile at auth, cards, account association | yes, to the registrar stub | ng, tunnel | spec |
 | [identity-enrollment.md](identity-enrollment.md) — certifying a device through a mailbox and a code | server side | ng | spec |
-| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | the registrar, the server-local revocation list, and a server applying a registrar's records; not standing and probation, or key backup | ng | spec |
+| [identity-registrar.md](identity-registrar.md) — handles, revocation, rotation, freeze, key backup, transparency, standing and probation | the registrar and its key backup, the server-local revocation list, and a server applying a registrar's records; not standing and probation | ng | spec |
 | [identity-records.md](identity-records.md) — a verifying server applying a registrar's records: plan and staging for registrar §7 | R1–R3; not standing and probation (R4) | ng | design |
 | [identity-vouch.md](identity-vouch.md) — a member lending standing to a key | no | ng; local form from any account | spec |
 | [identity-threat-model.md](identity-threat-model.md) — what identity defends against | — | — | design |

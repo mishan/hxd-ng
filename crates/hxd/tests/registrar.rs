@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hl_identity::envelope::{Kdf, Keys, Kind, Secret};
 use hl_identity::{
-    cert, Attestation, Card, DeviceCert, DeviceKey, IdentityKey, ListKind, LoginProof, Record,
-    RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
+    cert, Attestation, Card, DeviceCert, DeviceKey, EnvelopePut, IdentityKey, KeyEnvelope,
+    ListKind, LoginProof, Record, RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +29,7 @@ struct Server {
     config: hxd::Config,
     config_path: PathBuf,
     registrar: Arc<hxd_registrar::Registrar>,
+    clock: hxd_core::clock::Clock,
 }
 
 /// A server built the way `hxd` builds one, from a config file with an
@@ -55,12 +57,14 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
         .unwrap()
         .unwrap();
     let registrar = ng_ctx.registrar.clone().expect("[registrar] builds one");
+    let clock = ng_ctx.core.clock().clone();
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
     Server {
         ng,
         config,
         config_path,
         registrar,
+        clock,
     }
 }
 
@@ -677,7 +681,10 @@ fn a_registrar_section_is_checked_before_anything_starts() {
         "host = \"hl.example\"\nhandle_min = 5\nhandle_max = 4",
         "handle_min",
     );
-    bad("host = \"hl.example\"\nenvelopes = true", "not built");
+    bad(
+        "host = \"hl.example\"\nenvelopes = true\nenvelope_max = 2048",
+        "envelope_max",
+    );
     bad(
         "host = \"hl.example\"\n[registrar.rate]\nregistrations_per_hour = 0",
         "at least 1",
@@ -1634,4 +1641,446 @@ async fn a_key_nobody_answers_for_waits_before_it_may_chat() {
 
     identity.clock().advance(Duration::from_secs(wait));
     c.chat("hello").await.unwrap();
+}
+
+// --- key backup (§9) -------------------------------------------------------
+
+/// A registrar keeping envelopes, its decoy secret inside `dir`.
+async fn start_backups(dir: &Path) -> Server {
+    let secret = dir.join("envelope.secret");
+    start(
+        dir,
+        &format!(
+            "signup = \"open\"\nenvelopes = true\nenvelope_secret = \"{}\"",
+            secret.display()
+        ),
+    )
+    .await
+}
+
+async fn send_put(s: &Server, put: &[u8]) -> Reply {
+    http_as(
+        s.ng,
+        &s.ng.to_string(),
+        "PUT",
+        "/registrar/envelopes",
+        &[("Content-Type", "application/json")],
+        json!({ "request": b64(put) }).to_string().as_bytes(),
+    )
+    .await
+}
+
+/// Seal `who` under `secret` and put it, as the server's clock has it.
+async fn back_up(s: &Server, who: &IdentityKey, secret: &Secret<'_>) -> Keys {
+    let (env, keys) = KeyEnvelope::seal(who, secret).unwrap();
+    let put = EnvelopePut::store(who, HOST, s.clock.unix(), &env, &keys).unwrap();
+    let r = send_put(s, &put).await;
+    assert_eq!((r.status, r.json()), (200, json!({ "stored": true })));
+    keys
+}
+
+async fn salt(s: &Server, handle: &str, kind: u8) -> Kdf {
+    let r = post(
+        s,
+        "/registrar/envelopes/params",
+        json!({ "handle": handle, "kind": kind }),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    Kdf::parse(&unb64(r.json()["kdf"].as_str().unwrap())).unwrap()
+}
+
+async fn fetch(s: &Server, handle: &str, kind: u8, auth: &[u8; 32]) -> Reply {
+    post(
+        s,
+        "/registrar/envelopes/fetch",
+        json!({ "handle": handle, "kind": kind, "auth": b64(auth) }),
+    )
+    .await
+}
+
+fn hex32(path: &Path) -> [u8; 32] {
+    let text = std::fs::read_to_string(path).unwrap();
+    let t = text.trim();
+    (0..32)
+        .map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).unwrap())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+
+/// The envelope the registrar's own file holds, read beside the server.
+fn stored(dir: &Path, who: &IdentityKey, kind: u8) -> Option<hxd_registrar::EnvelopeRow> {
+    use hxd_registrar::RegistrarStore;
+    hxd_store_sqlite::SqliteRegistrarStore::open(
+        dir.join("registrar.db"),
+        hxd_store_sqlite::Synchronous::Normal,
+    )
+    .unwrap()
+    .envelope(&who.public(), kind)
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_envelope_is_found_by_its_salt_fetched_and_opened_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let doc = get(&s, "/.well-known/hotline").await.json();
+    assert_eq!(
+        doc["registrar"]["endpoints"]["envelopes"],
+        "/registrar/envelopes"
+    );
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    assert_eq!(
+        register(&s, request(&alice, "alice"), &alice).await.status,
+        200
+    );
+    let secret = Secret::Passphrase("correct horse battery");
+    back_up(&s, &alice, &secret).await;
+
+    // As a device with nothing but the handle and the passphrase.
+    let keys = Keys::derive(&secret, salt(&s, "Alice", 1).await).unwrap();
+    let r = fetch(&s, "alice", 1, keys.auth()).await;
+    assert_eq!(r.status, 200);
+    let body = r.json();
+    let identity: [u8; 32] = unb64(body["identity"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let env = KeyEnvelope::parse(&unb64(body["envelope"].as_str().unwrap())).unwrap();
+    assert_eq!(env.open(&identity, &keys).unwrap().public(), alice.public());
+}
+
+#[tokio::test]
+async fn every_fetch_miss_answers_alike_and_every_salt_without_an_envelope_is_a_decoy() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let (alice, bob) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    for (who, handle) in [(&alice, "alice"), (&bob, "bobby")] {
+        assert_eq!(register(&s, request(who, handle), who).await.status, 200);
+    }
+    let keys = back_up(&s, &alice, &Secret::Passphrase("correct horse")).await;
+    let bobs = back_up(&s, &bob, &Secret::Passphrase("battery staple")).await;
+    hxd::registrar::freeze(&s.config, &bob.fingerprint().to_string(), false).unwrap();
+
+    let mut answers = Vec::new();
+    for (handle, kind, auth) in [
+        ("carol", 1, keys.auth()),
+        ("alice", 2, keys.auth()),
+        ("alice", 1, &[0; 32]),
+        ("bobby", 1, bobs.auth()),
+    ] {
+        let r = fetch(&s, handle, kind, auth).await;
+        // Everything but the time it was sent.
+        let headers: Vec<_> = r
+            .headers
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("date"))
+            .collect();
+        answers.push((r.status, headers, r.body));
+    }
+    assert_eq!(answers[0].0, 404);
+    assert!(answers.iter().all(|a| *a == answers[0]), "{answers:?}");
+
+    let secret = hex32(&dir.path().join("envelope.secret"));
+    for (handle, kind, k) in [
+        ("carol", 1, Kind::Passphrase),
+        ("alice", 2, Kind::RecoveryCode),
+        ("bobby", 1, Kind::Passphrase),
+    ] {
+        let decoy = Kdf::decoy(&secret, handle, k);
+        assert_eq!(salt(&s, handle, kind).await, decoy, "{handle}");
+        assert_eq!(salt(&s, handle, kind).await, decoy, "{handle}, asked again");
+    }
+}
+
+#[tokio::test]
+async fn a_handle_guessed_at_is_locked_out_until_the_clock_moves_past_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    assert_eq!(
+        register(&s, request(&alice, "alice"), &alice).await.status,
+        200
+    );
+    let keys = back_up(&s, &alice, &Secret::Passphrase("correct horse")).await;
+    for i in 0..10 {
+        assert_eq!(
+            fetch(&s, "alice", 1, &[i; 32]).await.status,
+            404,
+            "guess {i}"
+        );
+    }
+    let r = fetch(&s, "alice", 1, keys.auth()).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone(), r.header("Retry-After")),
+        (429, json!("rate_limited"), Some("3600"))
+    );
+    s.clock.advance(Duration::from_secs(3600));
+    assert_eq!(fetch(&s, "alice", 1, keys.auth()).await.status, 200);
+
+    // Locked again, for twice as long, until the operator forgets the
+    // counts. The guess that locks it is told so in its own reply.
+    let mut last = None;
+    for i in 0..10 {
+        last = Some(fetch(&s, "alice", 1, &[i; 32]).await);
+    }
+    let last = last.unwrap();
+    assert_eq!(
+        (last.status, last.header("Retry-After")),
+        (429, Some("7200"))
+    );
+    hxd::registrar::unlock(&s.config, "alice", Some("passphrase")).unwrap();
+    assert_eq!(fetch(&s, "alice", 1, keys.auth()).await.status, 200);
+}
+
+#[tokio::test]
+async fn a_put_is_refused_for_another_registrar_and_for_an_identity_that_may_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let (alice, frozen, stranger) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[3; 32]),
+    );
+    for (who, handle) in [(&alice, "alice"), (&frozen, "frozen")] {
+        assert_eq!(register(&s, request(who, handle), who).await.status, 200);
+    }
+    hxd::registrar::freeze(&s.config, &frozen.fingerprint().to_string(), false).unwrap();
+    for (who, host, status, error) in [
+        (&alice, "elsewhere.example", 400, "bad_request"),
+        (&frozen, HOST, 403, "frozen"),
+        (&stranger, HOST, 404, "not_registered"),
+    ] {
+        let (env, keys) = KeyEnvelope::seal(who, &Secret::Passphrase("p")).unwrap();
+        let put = EnvelopePut::store(who, host, s.clock.unix(), &env, &keys).unwrap();
+        let r = send_put(&s, &put).await;
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (status, json!(error))
+        );
+        assert_eq!(stored(dir.path(), who, 1), None);
+    }
+}
+
+#[tokio::test]
+async fn revocation_and_rotation_take_the_envelopes_with_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let (alice, bob, bob2) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[12; 32]),
+    );
+    for (who, handle) in [(&alice, "alice"), (&bob, "bobby")] {
+        assert_eq!(register(&s, request(who, handle), who).await.status, 200);
+        back_up(&s, who, &Secret::Passphrase("p")).await;
+        assert!(stored(dir.path(), who, 1).is_some());
+    }
+    let revoke = hl_identity::IdentityRevocation {
+        identity: alice.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    let rotate = Rotation {
+        identity: bob.public(),
+        successor: bob2.public(),
+        time: now(),
+    }
+    .sign(&bob, &bob2)
+    .unwrap();
+    for record in [revoke, rotate] {
+        let r = post(&s, "/registrar/records", json!({ "record": b64(&record) })).await;
+        assert_eq!(r.json()["published"], true);
+    }
+    for who in [&alice, &bob] {
+        assert_eq!(stored(dir.path(), who, 1), None);
+    }
+}
+
+#[tokio::test]
+async fn hlid_backs_up_and_restores_an_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let url = format!("http://{}", s.ng);
+    let pass = dir.path().join("passphrase");
+    std::fs::write(&pass, "correct horse battery staple\n").unwrap();
+    let pass = pass.to_str().unwrap();
+    let (ok, _, err) = hlid(&bin, &home, &["init", "--name", "Alice"]).await;
+    assert!(ok, "{err}");
+    let (ok, _, err) = hlid(
+        &bin,
+        &home,
+        &["register", "--registrar", &url, "--handle", "alice"],
+    )
+    .await;
+    assert!(ok, "{err}");
+    let (ok, _, err) = hlid(
+        &bin,
+        &home,
+        &["backup", "--registrar", &url, "--password-file", pass],
+    )
+    .await;
+    assert!(ok, "{err}");
+    let (ok, out, err) = hlid(&bin, &home, &["backup", "--registrar", &url, "--recovery"]).await;
+    assert!(ok, "{err}");
+    let code = out
+        .lines()
+        .find_map(|l| l.strip_prefix("recovery code: "))
+        .unwrap_or_else(|| panic!("no code shown: {out}"));
+    let code_file = dir.path().join("code");
+    std::fs::write(&code_file, code).unwrap();
+    let original = hex32(&home.join("identity.key"));
+
+    for (name, secret, recovery) in [
+        ("by-passphrase", pass, false),
+        ("by-code", code_file.to_str().unwrap(), true),
+    ] {
+        let restored = dir.path().join(name);
+        let mut args = vec![
+            "restore",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--password-file",
+            secret,
+        ];
+        if recovery {
+            args.push("--recovery");
+        }
+        let (ok, out, err) = hlid(&bin, &restored, &args).await;
+        assert!(ok, "{name}: {err}");
+        assert!(out.contains("with the card the registrar keeps"), "{out}");
+        assert_eq!(hex32(&restored.join("identity.key")), original, "{name}");
+        let card = Card::parse(&std::fs::read(restored.join("card.bin")).unwrap()).unwrap();
+        assert_eq!(card.attestations[0].full_handle(), "alice@127.0.0.1");
+        let cert = DeviceCert::parse(&std::fs::read(restored.join("cert.bin")).unwrap()).unwrap();
+        assert_eq!(cert.identity, IdentityKey::from_seed(&original).public());
+    }
+
+    // A passphrase on the command line is one `ps` shows.
+    let (ok, _, err) = hlid(
+        &bin,
+        &dir.path().join("in-ps"),
+        &[
+            "restore",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--password",
+            "correct horse battery staple",
+        ],
+    )
+    .await;
+    assert!(!ok && err.contains("`ps`"), "{err}");
+
+    // A put in the second of the last one is signed again once the
+    // second turns: the second put lands in the first one's second.
+    let start = now();
+    while now() == start {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let id = IdentityKey::from_seed(&original);
+    let put = EnvelopePut::delete(&id, HOST, Kind::Passphrase, now()).unwrap();
+    assert_eq!(send_put(&s, &put).await.status, 200);
+    let (ok, _, err) = hlid(&bin, &home, &["backup", "--registrar", &url, "--delete"]).await;
+    assert!(ok, "{err}");
+    let (ok, _, err) = hlid(
+        &bin,
+        &dir.path().join("too-late"),
+        &[
+            "restore",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--password-file",
+            pass,
+        ],
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("no passphrase envelope for alice"), "{err}");
+}
+
+#[tokio::test]
+async fn a_restore_with_no_card_to_take_says_the_successor_must_commit_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_backups(dir.path()).await;
+    let bin = hlid_binary();
+    let url = format!("http://{}", s.ng);
+    // Registered with a commitment, and never a card put at the registrar.
+    let (alice, successor) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let mut req = request(&alice, "alice");
+    req.successor = Some(commitment(&successor));
+    assert_eq!(register(&s, req, &alice).await.status, 200);
+    back_up(&s, &alice, &Secret::Passphrase("correct horse battery")).await;
+    let pass = dir.path().join("passphrase");
+    std::fs::write(&pass, "correct horse battery\n").unwrap();
+    let home = dir.path().join("restored");
+
+    let (ok, out, err) = hlid(
+        &bin,
+        &home,
+        &[
+            "restore",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--password-file",
+            pass.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(ok, "{err}");
+    assert!(out.contains("--successor-key"), "{out}");
+
+    let register_again = |extra: Vec<String>| {
+        let mut args = vec![
+            "register",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        args.extend(extra);
+        args
+    };
+    let args = register_again(vec![]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, _, err) = hlid(&bin, &home, &words).await;
+    assert!(!ok && err.contains("successor_mismatch"), "{err}");
+
+    let key = dir.path().join("successor.key");
+    let hex: String = successor
+        .seed()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(&key, hex).unwrap();
+    let args = register_again(vec![
+        "--successor-commit".into(),
+        "--successor-key".into(),
+        key.to_str().unwrap().into(),
+    ]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, out, err) = hlid(&bin, &home, &words).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("reissued alice@127.0.0.1"), "{out}");
 }

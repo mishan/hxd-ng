@@ -83,8 +83,7 @@ desktops and in the browser on a phone, in one room.
   ([docs/identity-records.md](docs/identity-records.md)) — but standing,
   probation and vouches
   ([docs/identity-registrar.md](docs/identity-registrar.md) §7.5,
-  [docs/identity-vouch.md](docs/identity-vouch.md)) are design, and so is
-  a registrar's key backup.
+  [docs/identity-vouch.md](docs/identity-vouch.md)) are design.
 - **Importing another server's news.** mhxd's and Mobius's news cannot
   be brought over yet ([docs/news.md](docs/news.md) §12.6).
 

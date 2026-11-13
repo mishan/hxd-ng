@@ -76,10 +76,16 @@ pub struct RegistrarSection {
     pub rotation_delay: u64,
     #[serde(default = "default_records_max_age")]
     pub records_max_age: u64,
-    /// Key backup (§9). Not built: `true` is refused rather than
-    /// promised.
+    /// Key backup (§9).
     #[serde(default)]
     pub envelopes: bool,
+    #[serde(default = "default_envelope_max")]
+    pub envelope_max: usize,
+    /// What a salt lookup's decoys are made from (§9.2). Generated on
+    /// first start, owner-only; replacing it changes every decoy, which
+    /// tells a watcher which handles' salts did not change.
+    #[serde(default = "default_envelope_secret")]
+    pub envelope_secret: PathBuf,
     #[serde(default)]
     pub rate: RateSection,
 }
@@ -107,6 +113,12 @@ pub struct RateSection {
     pub lookups_per_minute: u32,
     #[serde(default = "default_devices_kept")]
     pub device_revocations_kept: usize,
+    #[serde(default = "default_fetches_per_handle")]
+    pub envelope_fetches_per_handle: u32,
+    #[serde(default = "default_fetches_per_handle_daily")]
+    pub envelope_fetches_per_handle_daily: u32,
+    #[serde(default = "default_fetches_per_address")]
+    pub envelope_fetches_per_address: u32,
 }
 
 impl Default for RateSection {
@@ -118,6 +130,9 @@ impl Default for RateSection {
             records_per_identity: r.records_per_identity,
             lookups_per_minute: r.lookups_per_address,
             device_revocations_kept: r.device_revocations_kept,
+            envelope_fetches_per_handle: r.envelope_fetches_per_handle,
+            envelope_fetches_per_handle_daily: r.envelope_fetches_per_handle_daily,
+            envelope_fetches_per_address: r.envelope_fetches_per_address,
         }
     }
 }
@@ -161,6 +176,24 @@ fn default_lookups() -> u32 {
 fn default_devices_kept() -> usize {
     Rates::default().device_revocations_kept
 }
+fn default_fetches_per_handle() -> u32 {
+    Rates::default().envelope_fetches_per_handle
+}
+fn default_fetches_per_handle_daily() -> u32 {
+    Rates::default().envelope_fetches_per_handle_daily
+}
+fn default_fetches_per_address() -> u32 {
+    Rates::default().envelope_fetches_per_address
+}
+fn default_envelope_max() -> usize {
+    hl_identity::envelope::MAX_BYTES
+}
+fn default_envelope_secret() -> PathBuf {
+    "registrar-envelope.secret".into()
+}
+
+/// Room for a v1 envelope, which is a few hundred bytes at most.
+const ENVELOPE_MIN: usize = 256;
 
 /// The largest handle an attestation can carry (identity spec §3.5).
 const HANDLE_MAX_BYTES: usize = 64;
@@ -248,10 +281,13 @@ impl RegistrarSection {
         if self.records_max_age == 0 {
             return Err("[registrar] records_max_age must be at least 1".into());
         }
-        if self.envelopes {
-            return Err(
-                "[registrar] envelopes: key backup (identity-registrar.md §9) is not built".into(),
-            );
+        if self.envelopes
+            && !(ENVELOPE_MIN..=hl_identity::envelope::MAX_BYTES).contains(&self.envelope_max)
+        {
+            return Err(format!(
+                "[registrar] envelope_max must be from {ENVELOPE_MIN} to {} bytes",
+                hl_identity::envelope::MAX_BYTES
+            ));
         }
         let retiring = self
             .retiring
@@ -268,6 +304,9 @@ impl RegistrarSection {
             || rate.records_per_identity == 0
             || rate.lookups_per_minute == 0
             || rate.device_revocations_kept == 0
+            || rate.envelope_fetches_per_handle == 0
+            || rate.envelope_fetches_per_handle_daily == 0
+            || rate.envelope_fetches_per_address == 0
         {
             return Err(
                 "[registrar.rate] every ceiling must be at least 1; use signup = closed \
@@ -295,6 +334,9 @@ impl RegistrarSection {
                 records_per_identity: rate.records_per_identity,
                 lookups_per_address: rate.lookups_per_minute,
                 device_revocations_kept: rate.device_revocations_kept,
+                envelope_fetches_per_handle: rate.envelope_fetches_per_handle,
+                envelope_fetches_per_handle_daily: rate.envelope_fetches_per_handle_daily,
+                envelope_fetches_per_address: rate.envelope_fetches_per_address,
             },
         })
     }
@@ -352,7 +394,7 @@ fn read_invites(path: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-pub use imp::{build, freeze, invites_add, open, recover, reload, revoke};
+pub use imp::{build, freeze, invites_add, open, recover, reload, revoke, unlock};
 
 #[cfg(feature = "inbox")]
 mod imp {
@@ -394,11 +436,19 @@ mod imp {
             return Ok(None);
         };
         let key = crate::load_key(&section.key, "registrar")?;
-        let reg = assemble(config, key)?.map(Arc::new);
+        let mut reg = assemble(config, key)?.expect("the section is there");
+        if section.envelopes {
+            reg = reg.with_envelopes(hxd_registrar::Envelopes {
+                max: section.envelope_max,
+                secret: crate::load_secret(&section.envelope_secret, "registrar envelope secret")?,
+            });
+        }
+        let reg = Some(Arc::new(reg));
         if let Some(reg) = &reg {
             tracing::info!(
                 host = %reg.config().host,
                 key = %hl_identity::Fingerprint::of(&reg.public_key()).short(),
+                envelopes = reg.envelopes(),
                 "registrar enabled"
             );
         }
@@ -484,6 +534,20 @@ mod imp {
             .map_err(|e| e.to_string())
     }
 
+    /// `hxd registrar unlock <handle> [--kind passphrase|recovery]`
+    /// (§9.2): both kinds unless one is named.
+    pub fn unlock(config: &Config, handle: &str, kind: Option<&str>) -> Result<(), String> {
+        let kinds: &[u8] = match kind {
+            None => &[1, 2],
+            Some("passphrase") => &[1],
+            Some("recovery") => &[2],
+            Some(other) => return Err(format!("--kind {other:?}: passphrase or recovery")),
+        };
+        open(config)?
+            .unlock(handle, kinds)
+            .map_err(|e| e.to_string())
+    }
+
     /// `hxd registrar invites --add N`: new codes, appended to the
     /// invites file and added to the store, so a running server honors
     /// them without a reload.
@@ -528,6 +592,9 @@ mod imp {
         Err(NO_STORE.into())
     }
     pub fn invites_add(_: &Config, _: usize) -> Result<Vec<String>, String> {
+        Err(NO_STORE.into())
+    }
+    pub fn unlock(_: &Config, _: &str, _: Option<&str>) -> Result<(), String> {
         Err(NO_STORE.into())
     }
 }

@@ -3,10 +3,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use hl_identity::envelope::{Keys, Secret};
 use hl_identity::registrar::{attestation_reason, device_reason};
 use hl_identity::{
     Attestation, Card, DeviceCert, DeviceKey, DeviceRevocation, IdentityKey, IdentityRevocation,
-    ListKind, Record, RegisterRequest, RegistrarKeys, Rotation, ServerKey, SignedList, Stats,
+    ListKind, Record, RecoveryCode, RegisterRequest, RegistrarKeys, Rotation, ServerKey,
+    SignedList, Stats,
 };
 use sha2::{Digest, Sha256};
 
@@ -1061,6 +1063,41 @@ impl RegistrarStore for FailingCommit {
     fn add_invites(&self, hashes: &[[u8; 32]]) -> Result<usize, StoreError> {
         self.inner.add_invites(hashes)
     }
+    fn envelope(&self, identity: &Key, kind: u8) -> Result<Option<EnvelopeRow>, StoreError> {
+        self.inner.envelope(identity, kind)
+    }
+    fn last_put(&self, identity: &Key, kind: u8) -> Result<Option<u64>, StoreError> {
+        self.inner.last_put(identity, kind)
+    }
+    fn put_envelope(&self, row: &EnvelopeRow) -> Result<(), StoreError> {
+        self.inner.put_envelope(row)
+    }
+    fn delete_envelope(&self, identity: &Key, kind: u8, at: u64) -> Result<(), StoreError> {
+        self.inner.delete_envelope(identity, kind, at)
+    }
+    fn envelope_guesses(&self, identity: &Key, kind: u8) -> Result<Lockout, StoreError> {
+        self.inner.envelope_guesses(identity, kind)
+    }
+    fn set_envelope_guesses(
+        &self,
+        identity: &Key,
+        kind: u8,
+        l: &Lockout,
+    ) -> Result<(), StoreError> {
+        self.inner.set_envelope_guesses(identity, kind, l)
+    }
+    fn lockout_slot(&self, slot: u32) -> Result<Option<([u8; 32], Lockout)>, StoreError> {
+        self.inner.lockout_slot(slot)
+    }
+    fn set_lockout_slot(&self, slot: u32, tag: &[u8; 32], l: &Lockout) -> Result<(), StoreError> {
+        self.inner.set_lockout_slot(slot, tag, l)
+    }
+    fn unlock_epoch(&self, handle: &str, kind: u8) -> Result<u64, StoreError> {
+        self.inner.unlock_epoch(handle, kind)
+    }
+    fn bump_unlock_epoch(&self, handle: &str, kind: u8) -> Result<(), StoreError> {
+        self.inner.bump_unlock_epoch(handle, kind)
+    }
 }
 
 #[test]
@@ -1086,4 +1123,457 @@ fn a_registration_whose_commit_failed_is_not_replayed() {
     // Once committed, the same bytes are answered from the replay cache.
     r.register(&bytes, addr(1), T + 2).unwrap();
     assert_eq!(store.issued.load(SeqCst), 2);
+}
+
+// --- §9 envelopes ------------------------------------------------------------
+
+const SECRET: [u8; 32] = [9; 32];
+
+fn backups_with(store: Arc<MemoryStore>, f: impl FnOnce(&mut Config)) -> Registrar {
+    let mut cfg = Config::new(HOST);
+    cfg.signup = Signup::Open;
+    cfg.level = 0;
+    f(&mut cfg);
+    Registrar::new(cfg, reg_key(), store).with_envelopes(Envelopes {
+        max: 1024,
+        secret: SECRET,
+    })
+}
+
+fn backups_on(store: Arc<MemoryStore>) -> Registrar {
+    backups_with(store, |_| {})
+}
+
+fn backups() -> Registrar {
+    backups_on(Arc::new(MemoryStore::new()))
+}
+
+fn put(r: &Registrar, who: &IdentityKey, secret: &Secret, now: u64) -> Keys {
+    let (env, keys) = KeyEnvelope::seal(who, secret).unwrap();
+    let bytes = EnvelopePut::store(who, HOST, now, &env, &keys).unwrap();
+    assert_eq!(r.put_envelope(&bytes, now), Ok(Stored::Stored));
+    keys
+}
+
+/// A fetch from `from`, opened as a device opens it.
+fn restore_from(
+    r: &Registrar,
+    handle: &str,
+    kind: u64,
+    keys: &Keys,
+    from: IpAddr,
+    now: u64,
+) -> Result<IdentityKey, Refusal> {
+    let (identity, bytes) = r.fetch_envelope(handle, kind, keys.auth(), from, now)?;
+    Ok(KeyEnvelope::parse(&bytes)
+        .unwrap()
+        .open(&identity, keys)
+        .unwrap())
+}
+
+fn restore(
+    r: &Registrar,
+    handle: &str,
+    kind: u64,
+    keys: &Keys,
+    now: u64,
+) -> Result<IdentityKey, Refusal> {
+    restore_from(r, handle, kind, keys, addr(1), now)
+}
+
+fn salt(r: &Registrar, handle: &str, kind: u64, now: u64) -> Kdf {
+    Kdf::parse(&r.envelope_params(handle, kind, addr(1), now).unwrap()).unwrap()
+}
+
+#[test]
+fn an_envelope_is_put_found_by_its_salt_fetched_replaced_and_deleted() {
+    let r = backups();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let keys = put(&r, &alice, &Secret::Passphrase("correct horse"), T);
+    let stored = r.store.envelope(&alice.public(), 1).unwrap().unwrap();
+    assert_eq!(
+        salt(&r, "Alice", 1, T),
+        KeyEnvelope::parse(&stored.bytes).unwrap().kdf
+    );
+    assert_eq!(
+        restore(&r, "Alice", 1, &keys, T).unwrap().public(),
+        alice.public()
+    );
+
+    // A replacement is under a fresh salt, so the old key fetches nothing.
+    let again = put(&r, &alice, &Secret::Passphrase("correct horse"), T + 1);
+    assert_eq!(
+        restore(&r, "alice", 1, &keys, T + 1).err(),
+        Some(Refusal::NotFound)
+    );
+    assert!(restore(&r, "alice", 1, &again, T + 1).is_ok());
+
+    let delete = EnvelopePut::delete(&alice, HOST, EnvelopeKind::Passphrase, T + 2).unwrap();
+    assert_eq!(r.put_envelope(&delete, T + 2), Ok(Stored::Deleted));
+    assert_eq!(
+        restore(&r, "alice", 1, &again, T + 2).err(),
+        Some(Refusal::NotFound)
+    );
+    assert_eq!(
+        salt(&r, "alice", 1, T + 2),
+        Kdf::decoy(&SECRET, "alice", EnvelopeKind::Passphrase)
+    );
+}
+
+#[test]
+fn every_miss_is_one_answer_and_every_salt_without_an_envelope_a_decoy() {
+    let r = backups();
+    let (alice, bob) = (id(1), id(2));
+    register(&r, &alice, "alice", T).unwrap();
+    register(&r, &bob, "bobby", T).unwrap();
+    let keys = put(&r, &alice, &Secret::Passphrase("correct horse"), T);
+    let bobs = put(&r, &bob, &Secret::Passphrase("battery staple"), T);
+    r.freeze(&bob.fingerprint().0, true, T).unwrap();
+    for (case, handle, kind, auth) in [
+        ("no such handle", "carol", 1, *keys.auth()),
+        ("no envelope of the kind", "alice", 2, *keys.auth()),
+        ("the wrong key", "alice", 1, [0; 32]),
+        ("frozen", "bobby", 1, *bobs.auth()),
+    ] {
+        assert_eq!(
+            r.fetch_envelope(handle, kind, &auth, addr(1), T),
+            Err(Refusal::NotFound),
+            "{case}"
+        );
+    }
+    for (handle, kind) in [("carol", 1), ("alice", 2), ("bobby", 1)] {
+        let k = envelope_kind(kind).unwrap();
+        assert_eq!(salt(&r, handle, kind, T), Kdf::decoy(&SECRET, handle, k));
+    }
+}
+
+#[test]
+fn an_envelope_is_fetched_for_a_handle_lapsed_within_its_hold() {
+    let r = backups();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let keys = put(&r, &alice, &Secret::Passphrase("correct horse"), T);
+    let lapsed = T + 400 * DAY;
+    assert_eq!(
+        r.store
+            .handle("alice")
+            .unwrap()
+            .unwrap()
+            .state(lapsed, 365 * DAY),
+        HandleState::Lapsed
+    );
+    assert!(restore(&r, "alice", 1, &keys, lapsed).is_ok());
+}
+
+#[test]
+fn a_put_is_this_registrars_from_an_attested_unfrozen_identity_and_newer() {
+    let r = backups();
+    let (alice, stranger) = (id(1), id(2));
+    register(&r, &alice, "alice", T).unwrap();
+    let (env, keys) = KeyEnvelope::seal(&alice, &Secret::Passphrase("p")).unwrap();
+    let to = |who: &IdentityKey, host: &str, time: u64| {
+        EnvelopePut::store(who, host, time, &env, &keys).unwrap()
+    };
+    assert!(matches!(
+        r.put_envelope(&to(&alice, "elsewhere.example", T), T),
+        Err(Refusal::BadRequest(_))
+    ));
+    assert_eq!(
+        r.put_envelope(&to(&alice, HOST, T - 301), T),
+        Err(Refusal::BadTime)
+    );
+    let (s_env, s_keys) = KeyEnvelope::seal(&stranger, &Secret::Passphrase("p")).unwrap();
+    let theirs = EnvelopePut::store(&stranger, HOST, T, &s_env, &s_keys).unwrap();
+    assert_eq!(r.put_envelope(&theirs, T), Err(Refusal::NotRegistered));
+    let small = registrar().with_envelopes(Envelopes {
+        max: 64,
+        secret: SECRET,
+    });
+    register(&small, &alice, "alice", T).unwrap();
+    assert_eq!(
+        small.put_envelope(&to(&alice, HOST, T), T),
+        Err(Refusal::TooLarge)
+    );
+    r.freeze(&alice.fingerprint().0, true, T).unwrap();
+    assert_eq!(
+        r.put_envelope(&to(&alice, HOST, T), T),
+        Err(Refusal::Frozen)
+    );
+}
+
+#[test]
+fn a_put_no_newer_than_the_last_is_refused_even_after_a_restart() {
+    let store = Arc::new(MemoryStore::new());
+    let r = backups_on(store.clone());
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let (old, old_keys) = KeyEnvelope::seal(&alice, &Secret::Passphrase("old")).unwrap();
+    let first = EnvelopePut::store(&alice, HOST, T, &old, &old_keys).unwrap();
+    assert_eq!(r.put_envelope(&first, T), Ok(Stored::Stored));
+    assert_eq!(r.put_envelope(&first, T), Err(Refusal::BadTime), "a replay");
+    let new = put(&r, &alice, &Secret::Passphrase("new"), T + 2);
+    let between = EnvelopePut::delete(&alice, HOST, EnvelopeKind::Passphrase, T + 1).unwrap();
+    assert_eq!(r.put_envelope(&between, T + 3), Err(Refusal::BadTime));
+    let restarted = backups_on(store);
+    assert_eq!(restarted.put_envelope(&first, T + 3), Err(Refusal::BadTime));
+    assert!(restore(&restarted, "alice", 1, &new, T + 3).is_ok());
+}
+
+#[test]
+fn puts_are_limited_per_identity() {
+    let r = backups();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let delete = |t| EnvelopePut::delete(&alice, HOST, EnvelopeKind::Passphrase, t).unwrap();
+    for i in 0..20 {
+        assert_eq!(r.put_envelope(&delete(T + i), T + i), Ok(Stored::Deleted));
+    }
+    assert!(matches!(
+        r.put_envelope(&delete(T + 20), T + 20),
+        Err(Refusal::RateLimited { .. })
+    ));
+}
+
+#[test]
+fn one_address_guessing_at_a_handle_is_locked_out_longer_each_time_and_its_owner_is_not() {
+    let store = Arc::new(MemoryStore::new());
+    let r = backups_on(store.clone());
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let keys = put(&r, &alice, &Secret::Passphrase("correct horse"), T);
+    // A handle with an envelope and one without are locked out alike, and
+    // a handle is one whatever its case.
+    for (handle, guesser) in [("alice", addr(1)), ("nobody", addr(3))] {
+        let mut now = T;
+        for (round, lock) in [(0, 3600), (1, 7200)] {
+            for i in 0..10 {
+                let asked = if i % 2 == 0 {
+                    handle.to_ascii_uppercase()
+                } else {
+                    handle.to_owned()
+                };
+                assert_eq!(
+                    r.fetch_envelope(&asked, 1, &[0; 32], guesser, now),
+                    Err(Refusal::NotFound),
+                    "{handle} fetch {i} of round {round}"
+                );
+            }
+            assert_eq!(
+                r.fetch_envelope(handle, 1, keys.auth(), guesser, now),
+                Err(Refusal::RateLimited { retry_after: lock }),
+                "{handle} round {round}"
+            );
+            // A new process over the same store has not forgotten.
+            let restarted = backups_on(store.clone());
+            assert_eq!(
+                restarted.fetch_envelope(handle, 1, keys.auth(), guesser, now + lock - 1),
+                Err(Refusal::RateLimited { retry_after: 1 })
+            );
+            now += lock;
+        }
+    }
+    // The owner, from anywhere else, and the other kind from the guesser,
+    // are counted apart.
+    assert!(restore_from(&r, "alice", 1, &keys, addr(2), T).is_ok());
+    assert_eq!(
+        r.fetch_envelope("alice", 2, &[0; 32], addr(1), T),
+        Err(Refusal::NotFound)
+    );
+    // The operator's unlock forgets the guesser's lockout too.
+    r.unlock("alice", &[1]).unwrap();
+    assert!(restore_from(&r, "alice", 1, &keys, addr(1), T + 3600 + 1).is_ok());
+}
+
+#[test]
+fn guesses_from_everywhere_stop_at_the_daily_ceiling_until_unlocked() {
+    let r = backups_with(Arc::new(MemoryStore::new()), |c| {
+        c.rates.envelope_fetches_per_handle_daily = 5
+    });
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let keys = put(&r, &alice, &Secret::Passphrase("correct horse"), T);
+    for handle in ["alice", "nobody"] {
+        for i in 0..5 {
+            assert_eq!(
+                r.fetch_envelope(handle, 1, &[0; 32], addr(10 + i), T),
+                Err(Refusal::NotFound),
+                "{handle} from address {i}"
+            );
+        }
+        assert_eq!(
+            r.fetch_envelope(handle, 1, keys.auth(), addr(20), T + 10),
+            Err(Refusal::RateLimited {
+                retry_after: DAY - 10
+            }),
+            "{handle}"
+        );
+    }
+    assert!(restore_from(&r, "alice", 1, &keys, addr(20), T + DAY).is_ok());
+    for i in 0..4 {
+        let _ = r.fetch_envelope("alice", 1, &[0; 32], addr(30 + i), T + DAY);
+    }
+    assert!(restore_from(&r, "alice", 1, &keys, addr(20), T + DAY).is_err());
+    r.unlock("Alice", &[1, 2]).unwrap();
+    assert!(restore_from(&r, "alice", 1, &keys, addr(20), T + DAY).is_ok());
+}
+
+#[test]
+fn fetches_are_limited_per_address_its_ipv6_64_and_its_48() {
+    let v6 = |net: u16, sub: u16, host: u16| {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, net, sub, 0, 0, 0, host))
+    };
+    let mapped = |n: u8| IpAddr::V6(Ipv4Addr::new(192, 0, 2, n).to_ipv6_mapped());
+    // Thirty fetches from inside one counted prefix, and one from outside.
+    let cases = [
+        ("an IPv4 address", vec![addr(1); 30], addr(2)),
+        // Within the /64, the host part changes nothing.
+        (
+            "an IPv6 /64",
+            (0..30).map(|i| v6(1, 1, i)).collect(),
+            v6(1, 2, 1),
+        ),
+        // One IPv4-mapped address is not every other's /64.
+        ("an IPv4-mapped address", vec![mapped(1); 30], mapped(2)),
+    ];
+    for (case, inside, other) in cases {
+        let r = backups();
+        let same = inside[0];
+        for (i, &from) in inside.iter().enumerate() {
+            assert_eq!(
+                r.fetch_envelope(&format!("user{i}"), 1, &[0; 32], from, T),
+                Err(Refusal::NotFound),
+                "{case} {i}"
+            );
+        }
+        assert!(
+            matches!(
+                r.fetch_envelope("user99", 1, &[0; 32], same, T),
+                Err(Refusal::RateLimited { .. })
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            r.fetch_envelope("user99", 1, &[0; 32], other, T),
+            Err(Refusal::NotFound),
+            "{case}"
+        );
+    }
+    let r = backups();
+    for i in 0..30 * FETCHES_PER_48 {
+        assert_eq!(
+            r.fetch_envelope(&format!("user{i}"), 1, &[0; 32], v6(1, i as u16, 1), T),
+            Err(Refusal::NotFound)
+        );
+    }
+    assert!(matches!(
+        r.fetch_envelope("user", 1, &[0; 32], v6(1, 9999, 1), T),
+        Err(Refusal::RateLimited { .. })
+    ));
+    assert_eq!(
+        r.fetch_envelope("user", 1, &[0; 32], v6(2, 1, 1), T),
+        Err(Refusal::NotFound)
+    );
+}
+
+#[test]
+fn a_flood_of_fetches_leaves_registrations_lookups_and_new_fetchers_their_room() {
+    let r = backups();
+    for i in 0..MAX_WINDOWS as u32 + 1 {
+        let from = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
+        let _ = r.fetch_envelope(&format!("user{i}"), 1, &[0; 32], from, T);
+    }
+    let alice = id(1);
+    let bytes = request(&alice, "alice", T).sign(&alice).unwrap();
+    let fresh = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+    assert!(r.register(&bytes, fresh, T).is_ok());
+    assert!(r.lookup_handle("alice", fresh, T).is_ok());
+    // Nor are fetches refused to an address the flood never used.
+    assert_eq!(
+        r.fetch_envelope("alice", 1, &[0; 32], fresh, T),
+        Err(Refusal::NotFound)
+    );
+}
+
+#[test]
+fn revocation_and_rotation_take_the_envelopes_with_them() {
+    let r = backups();
+    let (alice, bob, bob2) = (id(1), id(2), id(12));
+    register(&r, &alice, "alice", T).unwrap();
+    register(&r, &bob, "bobby", T).unwrap();
+    put(&r, &alice, &Secret::Passphrase("p"), T);
+    put(
+        &r,
+        &alice,
+        &Secret::RecoveryCode(&RecoveryCode::generate()),
+        T,
+    );
+    put(&r, &bob, &Secret::Passphrase("p"), T);
+    let revoke = IdentityRevocation {
+        identity: alice.public(),
+        time: T + 1,
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    r.post_record(&revoke, T + 1).unwrap();
+    let rotate = Rotation {
+        identity: bob.public(),
+        successor: bob2.public(),
+        time: T + 1,
+    }
+    .sign(&bob, &bob2)
+    .unwrap();
+    r.post_record(&rotate, T + 1).unwrap();
+    for (who, kind) in [(&alice, 1), (&alice, 2), (&bob, 1)] {
+        assert_eq!(r.store.envelope(&who.public(), kind).unwrap(), None);
+    }
+}
+
+#[test]
+fn a_rotation_that_came_due_is_published_by_a_salt_lookup_or_a_fetch() {
+    for by_fetch in [false, true] {
+        let r = backups_with(Arc::new(MemoryStore::new()), |c| c.rotation_delay = DAY);
+        let (bob, bob2) = (id(2), id(12));
+        register(&r, &bob, "bobby", T).unwrap();
+        let keys = put(&r, &bob, &Secret::Passphrase("p"), T);
+        let rotate = Rotation {
+            identity: bob.public(),
+            successor: bob2.public(),
+            time: T + 1,
+        }
+        .sign(&bob, &bob2)
+        .unwrap();
+        r.post_record(&rotate, T + 1).unwrap();
+        let due = T + 1 + DAY;
+        if by_fetch {
+            assert_eq!(
+                r.fetch_envelope("bobby", 1, keys.auth(), addr(1), due),
+                Err(Refusal::NotFound)
+            );
+        } else {
+            assert_eq!(
+                salt(&r, "bobby", 1, due),
+                Kdf::decoy(&SECRET, "bobby", EnvelopeKind::Passphrase)
+            );
+        }
+        assert_eq!(r.store.envelope(&bob.public(), 1).unwrap(), None);
+    }
+}
+
+#[test]
+fn a_registrar_without_envelopes_answers_as_if_the_endpoint_were_not_there() {
+    let r = registrar();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let delete = EnvelopePut::delete(&alice, HOST, EnvelopeKind::Passphrase, T).unwrap();
+    assert_eq!(r.put_envelope(&delete, T), Err(Refusal::NotFound));
+    assert_eq!(
+        r.envelope_params("alice", 1, addr(1), T),
+        Err(Refusal::NotFound)
+    );
+    assert_eq!(
+        r.fetch_envelope("alice", 1, &[0; 32], addr(1), T),
+        Err(Refusal::NotFound)
+    );
 }

@@ -1,4 +1,4 @@
-//! The registrar's HTTP surface (`docs/identity-registrar.md` §3, §6).
+//! The registrar's HTTP surface (`docs/identity-registrar.md` §3, §6, §9).
 //!
 //! | route | |
 //! |---|---|
@@ -10,6 +10,9 @@
 //! | `GET  /registrar/lookup?identity=<fp>` | §6.3 |
 //! | `GET  /registrar/log?since=` | §6.6: the issuance log |
 //! | `GET  /registrar/stats` | §6.6 |
+//! | `PUT  /registrar/envelopes` | §9.2: `{ "request": b64 }` → stored or deleted |
+//! | `POST /registrar/envelopes/params` | §9.2: `{ "handle", "kind" }` → the salt |
+//! | `POST /registrar/envelopes/fetch` | §9.2: `{ "handle", "kind", "auth": b64 }` → the envelope |
 //!
 //! None of these takes a transport token: every write is a signed
 //! object, and every read is public (§6). The signed lists and the stats
@@ -22,11 +25,12 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hxd_registrar::{Posted, Refusal, Registrar};
+use hxd_core::clock::Clock;
+use hxd_registrar::{Posted, Refusal, Registrar, Stored};
 use hyper::body::Incoming;
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, RETRY_AFTER};
 use hyper::{Method, Request, Response, StatusCode};
@@ -43,13 +47,6 @@ const MAX_BODY: usize = 16 * 1024;
 const BODY_WINDOW: Duration = Duration::from_secs(10);
 
 pub const PREFIX: &str = "/registrar";
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// The `registrar` block of discovery (§3), or `null` when this server
 /// is not one — or when the document was asked for under a name other
@@ -83,14 +80,22 @@ pub fn discovery(reg: Option<&Registrar>, host_header: Option<&str>) -> Value {
         "attestation_days": cfg.attestation_days,
         "handle": { "min": cfg.handle_min, "max": cfg.handle_max },
         "records_max_age": cfg.records_max_age,
-        "endpoints": {
-            "register": "/registrar/register",
-            "records": "/registrar/records",
-            "lookup": "/registrar/lookup",
-            "log": "/registrar/log",
-            "stats": "/registrar/stats",
-        },
+        "endpoints": endpoints(reg),
     })
+}
+
+fn endpoints(reg: &Registrar) -> Value {
+    let mut e = json!({
+        "register": "/registrar/register",
+        "records": "/registrar/records",
+        "lookup": "/registrar/lookup",
+        "log": "/registrar/log",
+        "stats": "/registrar/stats",
+    });
+    if reg.envelopes() {
+        e["envelopes"] = json!("/registrar/envelopes");
+    }
+    e
 }
 
 /// `Host` without its port. An IPv6 literal keeps its brackets, and so
@@ -104,7 +109,13 @@ fn strip_port(host: &str) -> &str {
 
 /// Every route under [`PREFIX`]. `client` is the request's address after
 /// the proxy rules, which is what the rate limits count.
-pub async fn route(req: Request<Incoming>, client: IpAddr, reg: Arc<Registrar>) -> Resp {
+pub async fn route(
+    req: Request<Incoming>,
+    client: IpAddr,
+    reg: Arc<Registrar>,
+    clock: Clock,
+) -> Resp {
+    let now = || clock.unix();
     let path = req.uri().path().to_owned();
     let query = req.uri().query().map(str::to_owned);
     let rest = path.strip_prefix(PREFIX).unwrap_or("");
@@ -225,8 +236,65 @@ pub async fn route(req: Request<Incoming>, client: IpAddr, reg: Arc<Registrar>) 
                 Err(e) => refused(e),
             }
         }
+        (Method::PUT, "/envelopes") => {
+            let Some(bytes) = signed_body(req, "request").await else {
+                return bad_body("request");
+            };
+            let now = now();
+            match blocking(move || reg.put_envelope(&bytes, now)).await {
+                Ok(Stored::Stored) => json_resp(StatusCode::OK, json!({ "stored": true })),
+                Ok(Stored::Deleted) => json_resp(StatusCode::OK, json!({ "deleted": true })),
+                Err(e) => refused(e),
+            }
+        }
+        (Method::POST, "/envelopes/params") => {
+            let Some((handle, kind, _)) = envelope_body(req, false).await else {
+                return bad_envelope_body();
+            };
+            let now = now();
+            match blocking(move || reg.envelope_params(&handle, kind, client, now)).await {
+                Ok(kdf) => json_resp(StatusCode::OK, json!({ "kdf": b64(&kdf) })),
+                Err(e) => refused(e),
+            }
+        }
+        (Method::POST, "/envelopes/fetch") => {
+            let Some((handle, kind, Some(auth))) = envelope_body(req, true).await else {
+                return bad_envelope_body();
+            };
+            let now = now();
+            match blocking(move || reg.fetch_envelope(&handle, kind, &auth, client, now)).await {
+                Ok((identity, envelope)) => json_resp(
+                    StatusCode::OK,
+                    json!({ "identity": b64(&identity), "envelope": b64(&envelope) }),
+                ),
+                Err(e) => refused(e),
+            }
+        }
         _ => refused(Refusal::NotFound),
     }
+}
+
+/// `{ "handle", "kind" }`, and with `auth` its 32 bytes too.
+async fn envelope_body(
+    req: Request<Incoming>,
+    auth: bool,
+) -> Option<(String, u64, Option<[u8; 32]>)> {
+    let v = json_body(req).await?;
+    let handle = v.get("handle")?.as_str()?.to_owned();
+    let kind = v.get("kind")?.as_u64()?;
+    let auth = match auth {
+        true => Some(unb64(v.get("auth")?.as_str()?)?.try_into().ok()?),
+        false => None,
+    };
+    Some((handle, kind, auth))
+}
+
+fn bad_envelope_body() -> Resp {
+    refused(Refusal::BadRequest(
+        "expected a JSON body with \"handle\", \"kind\" and, to fetch, \"auth\": \
+         base64url 32 bytes"
+            .into(),
+    ))
 }
 
 async fn blocking<T: Send + 'static>(
@@ -241,15 +309,22 @@ async fn blocking<T: Send + 'static>(
         })
 }
 
-/// A JSON body with one base64url field holding a signed object.
-async fn signed_body(req: Request<Incoming>, field: &str) -> Option<Vec<u8>> {
+async fn json_body(req: Request<Incoming>) -> Option<Value> {
     let limited = Limited::new(req.into_body(), MAX_BODY);
     let body = match tokio::time::timeout(BODY_WINDOW, limited.collect()).await {
         Ok(Ok(c)) => c.to_bytes(),
         _ => return None,
     };
-    let v: Value = serde_json::from_slice(&body).ok()?;
-    v.get(field).and_then(Value::as_str).and_then(unb64)
+    serde_json::from_slice(&body).ok()
+}
+
+/// A JSON body with one base64url field holding a signed object.
+async fn signed_body(req: Request<Incoming>, field: &str) -> Option<Vec<u8>> {
+    json_body(req)
+        .await?
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(unb64)
 }
 
 fn bad_body(field: &str) -> Resp {

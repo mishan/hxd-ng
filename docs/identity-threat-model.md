@@ -92,9 +92,11 @@ Can:
 - see every envelope fetch attempt and its source address
   (`identity-registrar.md` §9.2)
 - hold envelope ciphertext and mount an offline KDF attack on it, bounded
-  by the floor of `identity-registrar.md` §9.1 and the user's passphrase
+  by the parameters of `identity-registrar.md` §9.1 and the user's passphrase
 - freeze an identity (`identity-registrar.md` §4.7, §8.1): refuse it
-  reissue, records and envelope fetches, and cancel a pending rotation
+  reissue, records and envelope puts, answer its fetches as misses, and
+  cancel a pending rotation
+- unlock a handle's envelope fetch counts (`hxd registrar unlock`)
 - delay a rotation by `rotation_delay` (`identity-registrar.md` §5.4)
 - see presence records and their ACLs, if presence is hosted at the
   registrar — federation spec, not defined
@@ -226,7 +228,7 @@ vouch that it is the same person (`identity-vouch.md` §7).
 Attacker holds envelope ciphertext — a registrar breach, or a malicious
 registrar — and no passphrase.
 
-Mitigations: Argon2id at the floor of `identity-registrar.md` §9.1 makes
+Mitigations: Argon2id at the parameters of `identity-registrar.md` §9.1 makes
 a weak passphrase expensive and a recovery code (100 bits, §9.3 there)
 infeasible; the envelope is bound to one identity by its associated
 data, so a swapped envelope fails to open rather than opening wrong.
@@ -238,12 +240,52 @@ say so at creation.
 Attacker who knows a handle hammers the envelope fetch until the
 registrar locks it (`identity-registrar.md` §9.2, §10).
 
-Mitigations: the lockout caps at 24 hours; the owner's other devices are
-unaffected; the recovery-code envelope is a separate `kind` with its
-own counter.
+Mitigations: the hourly lockout is per handle *and address* (an IPv6
+/64), so one address locks out only itself and the owner fetching from
+anywhere else is unaffected; the recovery-code envelope is a separate
+`kind` with its own counts; the operator can `hxd registrar unlock` the
+handle for an owner who asks.
 
-Residual risk: a day without restore-from-passphrase for a targeted
-user.
+Residual risk: a botnet can still lock the owner out by spending the
+handle's daily ceiling (`envelope_fetches_per_handle_daily`, 200)
+before the owner does, for as long as it keeps spending it.
+
+### Online guessing at an envelope
+Attacker who knows a handle guesses its passphrase through the fetch
+(`identity-registrar.md` §9.2).
+
+Mitigations: each guess costs the guesser an Argon2id derivation; one
+address is held to ten an hour, then locked out for longer each time;
+every address together is held to the daily ceiling, kept in the store
+across restarts.
+
+Residual risk: guessing is capped at the daily ceiling, not stopped: a
+weak passphrase falls to that many guesses a day in time. The recovery
+code's 100 bits do not.
+
+### Evicting a fetch count
+Attacker floods the envelope fetch with other handles to take over the
+slots fetch counts are kept in (`identity-registrar.md` §9.2).
+
+Residual risk: an address's lockout, and its doubling, can be forgotten
+early; and a handle with no envelope keeps its daily count in such a
+slot, where one with an envelope keeps it on its own row, so after
+bringing a handle to the daily ceiling and evicting its slot, an
+attacker sees `not_found` for a handle with no envelope and
+`rate_limited` for one with. That costs roughly the ceiling plus the
+table's size in fetches across many addresses, and tells only whether
+the handle keeps an envelope of that kind. The daily ceiling on
+guessing at a real envelope is not evictable.
+
+### Salt polling
+Attacker polls the salt lookup for a handle (`identity-registrar.md`
+§9.2).
+
+Residual risk: a real salt changes when its envelope is resealed and
+becomes the decoy when it is deleted or its holder frozen, revoked or
+rotated, so polling shows that and when, though not what the envelope
+holds. Replacing the registrar's envelope secret shows the same of every
+handle at once.
 
 ### Sybil keys
 Keys are free; new registrar accounts are as cheap as the registrar's

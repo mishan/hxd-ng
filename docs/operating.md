@@ -544,6 +544,7 @@ acting on the store the running server uses:
 
 ```sh
 hxd registrar invites --add 10                  # print ten new invite codes
+hxd registrar unlock <handle>                   # forget its envelope fetch counts
 hxd registrar freeze <fingerprint>              # a holder reports a theft
 hxd registrar freeze --lift <fingerprint>
 hxd registrar revoke <handle> --reason abuse    # withdraw the name; or lapsed, unspecified
@@ -559,6 +560,9 @@ And the user's, with `hlid`:
 hlid register --registrar hl.example --handle alice --proof ABCD-EFGH-JKMN-PQRS --successor-commit
 hlid revoke --registrar hl.example --device-cert lost-phone.cert --reason stolen
 hlid rotate --registrar hl.example --to ~/.hlid/successor.key
+hlid backup --registrar hl.example --password-file pass   # with envelopes = true
+hlid backup --registrar hl.example --recovery             # shows a recovery code once
+hlid restore --registrar hl.example --handle alice --password-file pass
 ```
 
 `register` puts the attestation into your card and publishes the card
@@ -568,6 +572,20 @@ with your identity key from rotating anywhere else. A server that
 should trust the registrar's names lists its key in
 `[identity] registrar_keys`, or its host in `trusted_registrars`. Behind
 a proxy, forward `Host` ([above](#behind-a-reverse-proxy)).
+
+With `envelopes = true` the registrar keeps each identity's key sealed
+under its holder's passphrase or recovery code, which it cannot open,
+for a device that has lost every other copy: `backup` puts one,
+`restore` brings the identity back into `$HLID_HOME`. Fetches are
+counted per handle from each address, which locks out only that
+address, and per handle from everywhere, which caps guessing at
+`envelope_fetches_per_handle_daily` and lets a botnet that spends it
+lock the owner out. The counts are kept in the store, so a restart
+does not reset them. For an owner locked out that way:
+
+```sh
+hxd registrar unlock alice                    # both kinds; or --kind passphrase|recovery
+```
 
 ## The inbox
 
@@ -745,6 +763,7 @@ row says otherwise; each is whatever its key names.
 | `registrar.key` | `[registrar] key` | Every attestation the registrar signed stops verifying, and every server that lists the key must be given a new one. |
 | `registrar.db` | `[registrar] store` | Every handle, attestation and published record, and the invites. |
 | `registrar-invites` | `[registrar] invites` | Codes written by hand and not yet imported; the store keeps the rest. |
+| `registrar-envelope.secret` | `[registrar] envelope_secret` | A new one is made, and every salt lookup's decoy changes with it, which shows a watcher which handles keep an envelope. The envelopes themselves are in `registrar.db`. |
 | `link-server.key`, and `link-state.toml` beside it | `[link] key` | The server's ID on the linked network: every peer must be given the new key, and bans asked of linked servers cannot be lifted. `link-state.toml` holds the suspensions: a suspended peer links again. |
 | The TLS key and certificate | `[tls] key`, `cert` | A CA's pair is issued again. A self-signed one is not: every client that pinned it warns. |
 | The file area | `[files] root` | The files, and in `.hxd-state` their Finder metadata, resource forks and partial uploads. |
@@ -1803,7 +1822,11 @@ rotation_delay = 0           # seconds to hold a rotation back so a freeze
                              # can meet it
 records_max_age = 3600       # seconds the record lists it publishes are
                              # good for: their `expires`
-envelopes = false            # key backup; not built, and true is refused
+envelopes = false            # key backup (§9): keep identity keys sealed
+                             # under their holders' passphrases
+envelope_max = 1024          # bytes; from 256 to 1024
+envelope_secret = "registrar-envelope.secret"   # what salt lookups' decoys
+                             # are made from; generated on first run
 
 [registrar.rate]
 registrations_per_address = 5     # an hour
@@ -1812,6 +1835,12 @@ records_per_identity = 20         # an hour
 lookups_per_minute = 60           # per address
 device_revocations_kept = 256     # per identity, on the full list; not a
                                   # rate: the oldest `until` goes first
+envelope_fetches_per_handle = 10  # an hour from one address, then that
+                                  # address is locked out from an hour,
+                                  # doubling to a day; kept across restarts
+envelope_fetches_per_handle_daily = 200  # a day from everywhere: the
+                                  # ceiling on guessing
+envelope_fetches_per_address = 30 # an hour
 ```
 
 ### `[moderation]`

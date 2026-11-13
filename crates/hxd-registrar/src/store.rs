@@ -238,6 +238,9 @@ pub enum Effect {
     GrantRecovery(Recovery),
     SetPending(Pending),
     DropPending(Key),
+    /// Every envelope of the identity is gone (§9.2): it was revoked or
+    /// rotated away.
+    DeleteEnvelopes(Key),
 }
 
 /// One or more records and their effects: one transaction.
@@ -277,6 +280,79 @@ pub struct Counts {
     pub revoked_total: u64,
     pub frozen: u64,
     pub log_seq: u64,
+}
+
+/// One envelope an identity keeps here (§9.2), by kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeRow {
+    pub identity: Key,
+    pub kind: u8,
+    /// `SHA-256(auth_key)`, what a fetch's `auth` is compared against.
+    pub auth_hash: [u8; 32],
+    pub bytes: Vec<u8>,
+    /// The put's `time`.
+    pub updated: u64,
+}
+
+/// A count of envelope fetches (§10): one handle's from one address,
+/// or one handle's from everywhere. Kept in the store because it is the
+/// only thing between a passphrase and an online guess, and a restart
+/// must not hand out a fresh allowance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lockout {
+    /// When the current window's count began.
+    pub start: u64,
+    pub count: u32,
+    /// Refused until then.
+    pub until: u64,
+    /// Lockouts so far, which each double the next.
+    pub strikes: u32,
+}
+
+impl Lockout {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 86_400;
+
+    /// Count one fetch, or say how long until one is allowed. Past `max`
+    /// in an hour it is locked for an hour, doubling with each lockout up
+    /// to a day; a day after the last lockout ends, the doubling is
+    /// forgotten.
+    pub fn charge(&mut self, max: u32, now: u64) -> Result<(), u64> {
+        if now < self.until {
+            return Err(self.until - now);
+        }
+        if self.strikes > 0 && now >= self.until.saturating_add(Self::DAY) {
+            self.strikes = 0;
+        }
+        if now >= self.start.saturating_add(Self::HOUR) {
+            (self.start, self.count) = (now, 0);
+        }
+        if self.count >= max {
+            let lock = Self::HOUR
+                .checked_shl(self.strikes)
+                .unwrap_or(Self::DAY)
+                .min(Self::DAY);
+            self.until = now + lock;
+            self.strikes = self.strikes.saturating_add(1);
+            (self.start, self.count) = (now, 0);
+            return Err(lock);
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Count one fetch against `max` a day, with no lockout beyond the
+    /// day's end: the ceiling on guesses from everywhere together.
+    pub fn charge_daily(&mut self, max: u32, now: u64) -> Result<(), u64> {
+        if now >= self.start.saturating_add(Self::DAY) {
+            (self.start, self.count) = (now, 0);
+        }
+        if self.count >= max {
+            return Err(self.start + Self::DAY - now);
+        }
+        self.count += 1;
+        Ok(())
+    }
 }
 
 /// How much one entry costs a page's `budget`: its bytes and the most
@@ -356,4 +432,28 @@ pub trait RegistrarStore: Send + Sync + 'static {
     /// Add invites; ones already known, spent or not, are left alone.
     /// Returns how many were new.
     fn add_invites(&self, hashes: &[[u8; 32]]) -> Result<usize, StoreError>;
+
+    fn envelope(&self, identity: &Key, kind: u8) -> Result<Option<EnvelopeRow>, StoreError>;
+    /// The `time` of the identity's last put of this kind, a delete's
+    /// included, so a put no newer is refused across restarts.
+    fn last_put(&self, identity: &Key, kind: u8) -> Result<Option<u64>, StoreError>;
+    /// Store an envelope, replacing the identity's one of that kind and
+    /// keeping its daily count.
+    fn put_envelope(&self, row: &EnvelopeRow) -> Result<(), StoreError>;
+    /// Delete the envelope, remembering `at` as its last put.
+    fn delete_envelope(&self, identity: &Key, kind: u8, at: u64) -> Result<(), StoreError>;
+    /// The envelope's fetches from everywhere today; default when there
+    /// is none.
+    fn envelope_guesses(&self, identity: &Key, kind: u8) -> Result<Lockout, StoreError>;
+    /// Does nothing when there is no envelope row.
+    fn set_envelope_guesses(&self, identity: &Key, kind: u8, l: &Lockout)
+        -> Result<(), StoreError>;
+
+    /// One slot of the fixed table counts are kept in, and the tag of
+    /// whoever counted there last.
+    fn lockout_slot(&self, slot: u32) -> Result<Option<([u8; 32], Lockout)>, StoreError>;
+    fn set_lockout_slot(&self, slot: u32, tag: &[u8; 32], l: &Lockout) -> Result<(), StoreError>;
+    /// How many times the operator has unlocked this handle's kind.
+    fn unlock_epoch(&self, handle: &str, kind: u8) -> Result<u64, StoreError>;
+    fn bump_unlock_epoch(&self, handle: &str, kind: u8) -> Result<(), StoreError>;
 }

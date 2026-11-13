@@ -9,6 +9,28 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Upgrading
 
+- Key backup at the registrar (docs/identity-registrar.md §9):
+  `[registrar] envelopes = true`, refused at startup until now, keeps
+  each identity's key sealed under its holder's passphrase or recovery
+  code, which the registrar cannot open, and advertises `envelopes` in
+  discovery. Three routes: `PUT /registrar/envelopes` to store or
+  delete one, `POST /registrar/envelopes/params` for the salt (a decoy
+  for a handle with none) and `POST /registrar/envelopes/fetch`. New
+  keys `envelope_max` (1024), `envelope_secret`
+  (`registrar-envelope.secret`, generated on first start; back it up
+  with the registrar key), and `[registrar.rate]
+  envelope_fetches_per_handle` (10 an hour per handle from one address,
+  then that address is locked out from an hour, doubling to a day),
+  `envelope_fetches_per_handle_daily` (200 a day per handle from
+  everywhere, the ceiling on guessing) and
+  `envelope_fetches_per_address` (30 an hour, 240 per IPv6 /48). Counts
+  are kept in the store; `hxd registrar unlock <handle>` forgets them.
+  Envelope puts are held to `records_per_identity`, and one no newer
+  than the last is refused. The registrar database moves to schema 2 on
+  first start, adding the envelopes and the fetch counts. An identity's
+  envelopes go when it is revoked or rotated. `hlid backup` and `hlid
+  restore` are the user's side.
+
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]
   max_detached_per_addr` is now the backstop for every login there

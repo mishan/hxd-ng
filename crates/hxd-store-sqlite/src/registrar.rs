@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use hxd_registrar::store::entry_cost;
 use hxd_registrar::{
-    Counts, Effect, HandleRow, IdentityRow, Issue, Issued, Key, Page, Pending, Publish,
-    RecordFilter, RecordKind, Recovery, RegistrarStore, StoreError,
+    Counts, Effect, EnvelopeRow, HandleRow, IdentityRow, Issue, Issued, Key, Lockout, Page,
+    Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore, StoreError,
 };
 use rusqlite::{
     params, Connection, OptionalExtension, Row, Savepoint, Transaction, TransactionBehavior,
@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use crate::Synchronous;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE registrar_identity (
@@ -96,6 +96,37 @@ CREATE TABLE registrar_invite (
   code_hash BLOB    PRIMARY KEY,
   used_by   BLOB,
   used_at   INTEGER
+);
+";
+
+/// Key backup (§9). A deleted envelope keeps its row, `bytes` NULL, so
+/// its last put's `updated` still refuses a replay. Fetch counts are a
+/// fixed number of slots chosen by a keyed hash, so nobody can grow the
+/// table past it, and `registrar_unlock` is the operator's alone.
+const SCHEMA_V2: &str = "
+CREATE TABLE registrar_envelope (
+  identity    BLOB    NOT NULL,
+  kind        INTEGER NOT NULL,
+  auth_hash   BLOB,
+  bytes       BLOB,
+  updated     INTEGER NOT NULL,
+  guess_start INTEGER NOT NULL DEFAULT 0,
+  guess_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (identity, kind)
+);
+CREATE TABLE registrar_lockout (
+  slot    INTEGER PRIMARY KEY,
+  tag     BLOB    NOT NULL,
+  start   INTEGER NOT NULL,
+  count   INTEGER NOT NULL,
+  until   INTEGER NOT NULL,
+  strikes INTEGER NOT NULL
+);
+CREATE TABLE registrar_unlock (
+  handle TEXT    NOT NULL,
+  kind   INTEGER NOT NULL,
+  epoch  INTEGER NOT NULL,
+  PRIMARY KEY (handle, kind)
 );
 ";
 
@@ -236,15 +267,26 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             "registrar database is schema version {v}, but this build writes \
              {SCHEMA_VERSION} — it was made by a newer hxd"
         ))),
-        Some(v) => Err(StoreError(format!(
+        Some(v) if v < 1 => Err(StoreError(format!(
             "registrar database is schema version {v}, which this build cannot migrate"
         ))),
         // The schema and the row declaring it go in together, so a crash
         // between them cannot leave tables with no version.
-        None => sql(conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;\n{SCHEMA_V1}\n\
-             INSERT INTO registrar_meta (version) VALUES ({SCHEMA_VERSION});\nCOMMIT;"
-        ))),
+        from => {
+            let mut steps = String::from("BEGIN IMMEDIATE;\n");
+            if from.is_none() {
+                steps.push_str(SCHEMA_V1);
+            }
+            if from.is_none_or(|v| v < 2) {
+                steps.push_str(SCHEMA_V2);
+            }
+            steps.push_str(&match from {
+                None => format!("INSERT INTO registrar_meta (version) VALUES ({SCHEMA_VERSION});"),
+                Some(_) => format!("UPDATE registrar_meta SET version = {SCHEMA_VERSION};"),
+            });
+            steps.push_str("\nCOMMIT;");
+            sql(conn.execute_batch(&steps))
+        }
     }
 }
 
@@ -354,6 +396,12 @@ fn apply(tx: &Connection, e: &Effect) -> rusqlite::Result<()> {
         Effect::DropPending(key) => {
             tx.execute(
                 "DELETE FROM registrar_pending WHERE identity = ?1",
+                params![&key[..]],
+            )?;
+        }
+        Effect::DeleteEnvelopes(key) => {
+            tx.execute(
+                "DELETE FROM registrar_envelope WHERE identity = ?1",
                 params![&key[..]],
             )?;
         }
@@ -732,6 +780,172 @@ impl RegistrarStore for SqliteRegistrarStore {
         sql(tx.commit())?;
         Ok(added)
     }
+
+    fn envelope(&self, identity: &Key, kind: u8) -> Result<Option<EnvelopeRow>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row = sql(conn
+            .query_row(
+                "SELECT auth_hash, bytes, updated FROM registrar_envelope
+                 WHERE identity = ?1 AND kind = ?2 AND bytes IS NOT NULL",
+                params![&identity[..], kind],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional())?;
+        row.map(|(auth_hash, bytes, updated)| {
+            Ok(EnvelopeRow {
+                identity: *identity,
+                kind,
+                auth_hash: key32(auth_hash, "envelope auth hash")?,
+                bytes,
+                updated: uint(updated),
+            })
+        })
+        .transpose()
+    }
+
+    fn last_put(&self, identity: &Key, kind: u8) -> Result<Option<u64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let t: Option<i64> = sql(conn
+            .query_row(
+                "SELECT updated FROM registrar_envelope WHERE identity = ?1 AND kind = ?2",
+                params![&identity[..], kind],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(t.map(uint))
+    }
+
+    fn put_envelope(&self, row: &EnvelopeRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO registrar_envelope (identity, kind, auth_hash, bytes, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (identity, kind) DO UPDATE SET
+               auth_hash = excluded.auth_hash, bytes = excluded.bytes,
+               updated = excluded.updated",
+            params![
+                &row.identity[..],
+                row.kind,
+                &row.auth_hash[..],
+                row.bytes,
+                int(row.updated)
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn delete_envelope(&self, identity: &Key, kind: u8, at: u64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO registrar_envelope (identity, kind, updated) VALUES (?1, ?2, ?3)
+             ON CONFLICT (identity, kind) DO UPDATE SET
+               auth_hash = NULL, bytes = NULL, updated = excluded.updated",
+            params![&identity[..], kind, int(at)],
+        ))?;
+        Ok(())
+    }
+
+    fn envelope_guesses(&self, identity: &Key, kind: u8) -> Result<Lockout, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let l = sql(conn
+            .query_row(
+                "SELECT guess_start, guess_count FROM registrar_envelope
+                 WHERE identity = ?1 AND kind = ?2",
+                params![&identity[..], kind],
+                |r| {
+                    Ok(Lockout {
+                        start: uint(r.get(0)?),
+                        count: r.get(1)?,
+                        ..Lockout::default()
+                    })
+                },
+            )
+            .optional())?;
+        Ok(l.unwrap_or_default())
+    }
+
+    fn set_envelope_guesses(
+        &self,
+        identity: &Key,
+        kind: u8,
+        l: &Lockout,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "UPDATE registrar_envelope SET guess_start = ?3, guess_count = ?4
+             WHERE identity = ?1 AND kind = ?2",
+            params![&identity[..], kind, int(l.start), l.count],
+        ))?;
+        Ok(())
+    }
+
+    fn lockout_slot(&self, slot: u32) -> Result<Option<([u8; 32], Lockout)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row = sql(conn
+            .query_row(
+                "SELECT tag, start, count, until, strikes FROM registrar_lockout WHERE slot = ?1",
+                params![slot],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        Lockout {
+                            start: uint(r.get(1)?),
+                            count: r.get(2)?,
+                            until: uint(r.get(3)?),
+                            strikes: r.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .optional())?;
+        row.map(|(tag, l)| Ok((key32(tag, "lockout tag")?, l)))
+            .transpose()
+    }
+
+    fn set_lockout_slot(&self, slot: u32, tag: &[u8; 32], l: &Lockout) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT OR REPLACE INTO registrar_lockout (slot, tag, start, count, until, strikes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                slot,
+                &tag[..],
+                int(l.start),
+                l.count,
+                int(l.until),
+                l.strikes
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn unlock_epoch(&self, handle: &str, kind: u8) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let e: Option<i64> = sql(conn
+            .query_row(
+                "SELECT epoch FROM registrar_unlock WHERE handle = ?1 AND kind = ?2",
+                params![handle, kind],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(e.map(uint).unwrap_or(0))
+    }
+
+    fn bump_unlock_epoch(&self, handle: &str, kind: u8) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO registrar_unlock (handle, kind, epoch) VALUES (?1, ?2, 1)
+             ON CONFLICT (handle, kind) DO UPDATE SET epoch = epoch + 1",
+            params![handle, kind],
+        ))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -782,6 +996,53 @@ mod tests {
         server.rollback();
         assert!(!server.invite_open(&[3; 32]).unwrap());
         assert_eq!(server.add_invites(&[[3; 32]]).unwrap(), 1);
+    }
+
+    #[test]
+    fn counts_and_the_last_put_outlive_the_process_that_wrote_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registrar.db");
+        let locked = Lockout {
+            start: 1,
+            count: 0,
+            until: 2,
+            strikes: 3,
+        };
+        {
+            let s = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+            s.set_lockout_slot(7, &[1; 32], &locked).unwrap();
+            s.delete_envelope(&[1; 32], 1, 99).unwrap();
+            s.bump_unlock_epoch("alice", 1).unwrap();
+        }
+        let s = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(s.lockout_slot(7).unwrap(), Some(([1; 32], locked)));
+        assert_eq!(s.last_put(&[1; 32], 1).unwrap(), Some(99));
+        assert_eq!(s.unlock_epoch("alice", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_first_version_file_gains_the_envelopes_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registrar.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE registrar_meta (version INTEGER NOT NULL);\n{SCHEMA_V1}\n\
+                 INSERT INTO registrar_meta (version) VALUES (1);\n\
+                 INSERT INTO registrar_invite (code_hash) VALUES (x'{}');",
+                "01".repeat(32)
+            ))
+            .unwrap();
+        let s = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+        assert!(s.invite_open(&[1; 32]).unwrap());
+        s.set_lockout_slot(1, &[0; 32], &Lockout::default())
+            .unwrap();
+        drop(s);
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT version FROM registrar_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
