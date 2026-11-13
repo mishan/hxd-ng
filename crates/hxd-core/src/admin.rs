@@ -630,7 +630,18 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     if stale {
         r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
     }
+    // A person's sessions are one row, told once, as it stands once every
+    // session's account is changed, and only to the roles wires if no
+    // session of it changed more than its roles.
+    let mut once: Vec<Row> = Vec::new();
     for (info, only_roles) in rows {
+        match once.iter_mut().find(|(seen, _)| seen.uid == info.uid) {
+            Some((_, only)) => *only &= only_roles,
+            None => once.push((info, only_roles)),
+        }
+    }
+    for (info, only_roles) in once {
+        let info = r.row_now(info);
         r.broadcast_where(&Event::Changed(info), None, |s| {
             let syncs = s.info.transport.roles;
             !(stale && syncs) && (!only_roles || syncs)
@@ -705,7 +716,7 @@ fn give_account(
     shown |= renamed;
     // A change to its roles alone, to the wires that can show one.
     let only_roles = !shown && roles_changed;
-    let shown = ((shown || roles_changed) && s.live()).then(|| s.info.clone());
+    let shown = ((shown || roles_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
     // The admin bit never crosses a link; only the name does.
     if shown.is_some() && renamed {

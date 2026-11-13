@@ -1336,7 +1336,7 @@ async fn handle_resume(
     // outlived its connection, not its account. An account that can no
     // longer be read gets none of them.
     let auth = ctx.auth.clone();
-    let login = ctx.core.user_details(uid).map(|details| details.login);
+    let login = ctx.core.own_details(uid).map(|details| details.login);
     let mask = ctx.core.mask_of(uid);
     let account = crate::spawn_blocking("login", move || {
         login.and_then(|login| auth.lookup(&login).ok())

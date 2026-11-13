@@ -490,7 +490,7 @@ async fn upload(
     }
     let (Some(serial), Some(details)) = (
         ctx.core.session_serial(state.uid),
-        ctx.core.user_details(state.uid),
+        ctx.core.own_details(state.uid),
     ) else {
         return crate::proto::reply_err(req.id, "not_authorized", "Session ended.");
     };
@@ -595,7 +595,7 @@ async fn fetchable(
     };
     let (Some(serial), Some(details)) = (
         ctx.core.session_serial(state.uid),
-        ctx.core.user_details(state.uid),
+        ctx.core.own_details(state.uid),
     ) else {
         return Err(crate::proto::reply_err(
             req.id,

@@ -553,11 +553,16 @@ impl Core {
             sess.avatar = avatar.clone();
             sess.info.avatar = meta.clone();
             if sess.live() {
-                changed.push(sess.info.clone());
+                changed.push(*u);
             }
         }
-        for info in changed {
-            r.broadcast_where(&Event::AvatarChanged(info), None, |_| true);
+        // A person's sessions are one row, told once.
+        let mut told = std::collections::HashSet::new();
+        for uid in changed {
+            let info = r.row_view(&r.users[&uid]);
+            if told.insert(info.uid) {
+                r.broadcast_where(&Event::AvatarChanged(info), None, |_| true);
+            }
         }
         Ok(())
     }
@@ -574,8 +579,8 @@ impl Core {
         let mut all: Vec<_> = r
             .users
             .iter()
-            .filter(|(_, s)| s.live())
-            .filter_map(|(uid, s)| s.avatar.clone().map(|a| (*uid, a)))
+            .filter(|(uid, s)| s.live() && r.listed(**uid, s))
+            .filter_map(|(uid, s)| s.avatar.clone().map(|a| (r.row_uid(*uid), a)))
             .collect();
         all.sort_by_key(|(uid, _)| *uid);
         all
