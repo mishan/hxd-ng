@@ -49,7 +49,7 @@ pub(crate) fn offered(ctx: &NgCtx) -> bool {
 fn link_form<T: Object>(signed: &Signed<T>) -> Option<LinkForm> {
     Some(LinkForm {
         form: signed.link().ok()?.into(),
-        cert: signed.message.cert().into(),
+        cert: signed.message().cert().into(),
     })
 }
 
@@ -106,10 +106,10 @@ fn of_this_session<T: Object>(
     if signed.signer() != device.identity {
         return Err(Refused::BadSignature("Signed by another identity."));
     }
-    if signed.cert.device != device.key {
+    if signed.cert().device != device.key {
         return Err(Refused::BadSignature("Signed by another device."));
     }
-    if signed.message.sent().abs_diff(now) > SKEW {
+    if signed.message().sent().abs_diff(now) > SKEW {
         return Err(Refused::BadSignature("signed too long ago; sign it again"));
     }
     Ok(())
@@ -119,7 +119,7 @@ fn of_this_session<T: Object>(
 fn under_guid<T: Object>(signed: &Signed<T>, guid: Option<&MessageGuid>) -> Result<(), Refused> {
     match guid {
         None => Err(Refused::BadRequest("A signed message carries its `guid`.")),
-        Some(g) if id_of(g) != signed.message.id() => Err(Refused::BadSignature(
+        Some(g) if id_of(g) != signed.message().id() => Err(Refused::BadSignature(
             "The signed id is not the request's `guid`.",
         )),
         Some(_) => Ok(()),
@@ -163,13 +163,13 @@ pub(crate) fn line(
     of_this_session(state, &line, now)?;
     under_guid(&line, guid)?;
     let server = ctx.identity.as_ref().map(|st| st.server_key());
-    if Some(line.message.server) != server {
+    if Some(line.message().server) != server {
         return Err(Refused::BadSignature("Signed for another server."));
     }
-    if line.message.room != u64::from(room) {
+    if line.message().room != u64::from(room) {
         return Err(Refused::BadSignature("Signed for another room."));
     }
-    if line.message.act != action {
+    if line.message().act != action {
         return Err(Refused::BadSignature("Signed in another style."));
     }
     Ok(SignedLine {
@@ -198,7 +198,7 @@ pub(crate) fn msg(
     under_guid(&msg, guid)?;
     Ok((
         SignedMsg {
-            to: msg.message.to.0,
+            to: msg.message().to.0,
             signature: Signature {
                 content: msg.content_sha256(),
                 form,
@@ -242,13 +242,13 @@ pub(crate) fn article(
         Signed::<Article>::parse_detached(&form, [subject, body], now).map_err(invalid)?;
     of_this_session(state, &article, now)?;
     let server = ctx.identity.as_ref().map(|st| st.server_key());
-    if Some(article.message.server) != server {
+    if Some(article.message().server) != server {
         return Err(Refused::BadSignature("Signed for another server."));
     }
-    if article.message.mime != mime {
+    if article.message().mime != mime {
         return Err(Refused::BadSignature("Signed as another `mime`."));
     }
-    if article.message.parent.map(|p| p.article) != parent.map(u64::from) {
+    if article.message().parent.map(|p| p.article) != parent.map(u64::from) {
         return Err(Refused::BadSignature(
             "Signed as a reply to another article.",
         ));
@@ -257,12 +257,12 @@ pub(crate) fn article(
         signature: ArticleSignature {
             content: article.content_sha256(),
             signer: article.signer().0,
-            id: article.message.id,
+            id: article.message().id,
             form,
         },
-        category: article.message.category,
+        category: article.message().category,
         parent: article
-            .message
+            .message()
             .parent
             .and_then(|p| p.signed)
             .map(|(id, by)| (id, by.0)),
@@ -313,21 +313,21 @@ pub(crate) fn pasted(
         (Some(text), true) => {
             let line = Signed::<ChatLine>::parse_detached(&form, [text], *sent).map_err(invalid)?;
             let server = ctx.identity.as_ref().map(|st| st.server_key());
-            if Some(line.message.server) != server {
-                elsewhere = Some(line.message.server);
+            if Some(line.message().server) != server {
+                elsewhere = Some(line.message().server);
             }
-            (line.signer(), line.message.text)
+            (line.signer(), line.message().text.clone())
         }
         (Some(text), false) => {
             let msg =
                 Signed::<PrivateMessage>::parse_detached(&form, [text], *sent).map_err(invalid)?;
             to_reporter(&msg, reporter)?;
-            (msg.signer(), msg.message.text)
+            (msg.signer(), msg.message().text.clone())
         }
         (None, _) => {
             let msg = Signed::<PrivateMessage>::parse(&form, *sent).map_err(invalid)?;
             to_reporter(&msg, reporter)?;
-            (msg.signer(), msg.message.text)
+            (msg.signer(), msg.message().text.clone())
         }
     };
     Ok(Pasted {
@@ -339,7 +339,7 @@ pub(crate) fn pasted(
 }
 
 fn to_reporter(msg: &Signed<PrivateMessage>, reporter: Option<Fingerprint>) -> Result<(), Refused> {
-    if Some(msg.message.to) == reporter {
+    if Some(msg.message().to) == reporter {
         Ok(())
     } else {
         Err(Refused::BadSignature("Signed to someone else."))

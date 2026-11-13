@@ -317,7 +317,7 @@ Domain `hl-identity/records/v1`, signed by the registrar key. What the
 | `expires` | uint | yes | `issued + records_max_age`. A cache serves it until then |
 | `fingerprint` | bstr(32) | no | Present on a per-identity list: `SHA-256` of the key it was asked for, and every entry concerns that key. The fingerprint rather than the key, because the list for a key the registrar has never seen can name it no other way |
 | `since` | uint | no | Present on a delta: entries have `seq > since` |
-| `more` | bool | no | `true` when the page was cut at the size bound; fetch again with `since` = the last `seq` |
+| `more` | bool | no | `true` when the page was cut at the size bound; fetch again with `since` = the last `seq`. A page with `more` and no entries has no last `seq` and is refused |
 | `entries` | array | yes | Each `[seq, record]`: a registrar-assigned `uint`, monotonic across the registrar, and the record's encoded bytes as `bstr` |
 | `sig` | bstr(64) | yes | |
 

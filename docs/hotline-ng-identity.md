@@ -180,7 +180,9 @@ encoded.
 
 ### 3.5 Attestation
 
-Domain `hl-identity/attestation/v1`, signed by a registrar key.
+Domain `hl-identity/attestation/v1`, signed by a registrar key. At most
+1 KiB encoded, checked before it is decoded; inside a card the card's
+own bound applies.
 
 | Key | Type | Req | Notes |
 |---|---|---|---|

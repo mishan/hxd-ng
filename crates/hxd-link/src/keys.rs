@@ -78,7 +78,7 @@ pub(crate) fn check<T: Object>(
         // The cache is by hash, so a certificate held may be another
         // user's: without a fingerprint to hold it to, nothing is known.
         Ok(_) if signer.is_none() => Checked::Unverifiable,
-        Ok(s) if signer.is_some_and(|fp| fp != s.signer().0) || !scoped(&s.message) => {
+        Ok(s) if signer.is_some_and(|fp| fp != s.signer().0) || !scoped(s.message()) => {
             Checked::Failed
         }
         Ok(s) => match s.detached() {

@@ -427,7 +427,7 @@ async fn a_sealed_message_reaches_the_device_it_was_sealed_to_alone() {
     let Opened::Verified { message: got, .. } = opened(&ev, &alice, &bob) else {
         panic!("not verified");
     };
-    assert_eq!(got.message.text, "only you");
+    assert_eq!(got.message().text, "only you");
 
     // A box to the laptop's key is not the phone's to receive.
     let to_phone = sealed_msg(p_uid, &sealed, &alice.cert);
@@ -708,7 +708,7 @@ async fn a_held_sealed_message_waits_for_its_resume_and_no_longer() {
     let Opened::Verified { message: got, .. } = opened(&ev, &alice, &bob) else {
         panic!("not verified");
     };
-    assert_eq!(got.message.text, "while you were out");
+    assert_eq!(got.message().text, "while you were out");
 
     // One sender holds so much and no more, and leaves room for others.
     let (session, seq) = away(a).await;
