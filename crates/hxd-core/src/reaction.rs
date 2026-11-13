@@ -930,10 +930,9 @@ fn hears(r: &RosterInner, room: u32, uid: Uid, s: &UserSession) -> bool {
     s.info.transport.reactions
         && match room {
             0 => s.live() && reads_public_chat(s),
-            _ => r
-                .rooms
-                .get(&room)
-                .is_some_and(|e| e.members.contains(&uid) && crate::rooms::sees(s, &e.room)),
+            _ => r.rooms.get(&room).is_some_and(|e| {
+                e.members.contains(&r.row_of(uid)) && crate::rooms::sees(s, &e.room)
+            }),
         }
 }
 

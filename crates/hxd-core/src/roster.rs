@@ -1093,6 +1093,21 @@ impl Outbox {
     }
 }
 
+/// A row of the roster, as a membership list holds it: a room's, a private
+/// chat's, an invitation. Until a person's sessions are grouped every
+/// session is its own row; once they are, a row may stand for several.
+/// So it is not a key into `users`: [`RosterInner::row_sessions`] gives a
+/// row's sessions, and [`RosterInner::row_of`] a session's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RowId(Uid);
+
+impl RowId {
+    /// The uid the wire shows for this row.
+    pub(crate) fn uid(self) -> Uid {
+        self.0
+    }
+}
+
 /// Where a session is between its login and the roster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Announced {
@@ -1402,6 +1417,30 @@ impl RosterInner {
         self.users.get_mut(&uid).filter(|s| s.live())
     }
 
+    /// The row a session is shown as.
+    pub(crate) fn row_of(&self, session: Uid) -> RowId {
+        RowId(session)
+    }
+
+    /// The sessions a row stands for, as far as the roster still holds them.
+    pub(crate) fn row_sessions(&self, row: RowId) -> impl Iterator<Item = Uid> + '_ {
+        self.users.contains_key(&row.0).then_some(row.0).into_iter()
+    }
+
+    /// Every session a membership list's rows stand for.
+    pub(crate) fn members_sessions(&self, rows: &[RowId]) -> Vec<Uid> {
+        rows.iter()
+            .flat_map(|row| self.row_sessions(*row))
+            .collect()
+    }
+
+    /// The session a row is shown as, for its line in a member list.
+    pub(crate) fn row_user(&self, row: RowId) -> Option<&UserSession> {
+        self.row_sessions(row)
+            .next()
+            .and_then(|uid| self.users.get(&uid))
+    }
+
     /// End the oldest detached sessions `counted` picks out until no
     /// more than `cap` are left.
     fn end_oldest_detached(&mut self, cap: usize, counted: impl Fn(&UserSession) -> bool) {
@@ -1578,12 +1617,13 @@ impl RosterInner {
     }
 
     /// The same, for a named set of sessions (a private room's members).
-    pub(crate) fn media_audience_of(&self, uids: &[Uid]) -> Vec<crate::media::Principal> {
-        uids.iter()
-            .filter_map(|uid| self.users.get(uid).map(|s| (uid, s)))
+    pub(crate) fn media_audience_of(&self, rows: &[RowId]) -> Vec<crate::media::Principal> {
+        self.members_sessions(rows)
+            .into_iter()
+            .filter_map(|uid| self.users.get(&uid).map(|s| (uid, s)))
             .filter(|(_, sess)| sess.info.transport.inline_media)
             .map(|(uid, sess)| crate::media::Principal::Session {
-                uid: *uid,
+                uid,
                 serial: sess.serial,
             })
             .collect()

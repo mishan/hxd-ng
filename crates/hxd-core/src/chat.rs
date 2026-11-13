@@ -34,7 +34,7 @@ use crate::inbox::{
 };
 use crate::relationships::{RelationshipStore, SentOn};
 use crate::reply::Reply;
-use crate::roster::{is_live, reads_public_chat, Event, RosterInner, Uid, UserInfo};
+use crate::roster::{is_live, reads_public_chat, Event, RosterInner, RowId, Uid, UserInfo};
 use crate::Core;
 
 /// Who a private message is from, resolved once under the roster lock.
@@ -264,9 +264,9 @@ pub(crate) struct PrivateChat {
     /// Who opened it, while that session lasts: what
     /// [`crate::ChatLimits::per_creator`] counts. Cleared when the
     /// session ends, so a recycled uid inherits nothing.
-    pub(crate) creator: Option<Uid>,
-    pub(crate) members: Vec<Uid>,
-    pub(crate) invited: Vec<Uid>,
+    pub(crate) creator: Option<RowId>,
+    pub(crate) members: Vec<RowId>,
+    pub(crate) invited: Vec<RowId>,
     pub(crate) subject: String,
     pub(crate) password: String,
 }
@@ -1480,7 +1480,7 @@ impl Core {
             let Some(chat) = r.chats.get(&cid) else {
                 return Err(ChatError::NoSuchChat);
             };
-            if !chat.members.contains(&from) {
+            if !chat.members.contains(&r.row_of(from)) {
                 return Err(ChatError::NotAMember);
             }
             let Some(sess) = r.users.get(&from) else {
@@ -1511,7 +1511,7 @@ impl Core {
         let Some(chat) = r.chats.get(&cid) else {
             return Err(ChatError::NoSuchChat);
         };
-        if !chat.members.contains(&from) {
+        if !chat.members.contains(&r.row_of(from)) {
             return Err(ChatError::NotAMember);
         }
         let members = chat.members.clone();
@@ -1532,8 +1532,8 @@ impl Core {
             re: re.map(Box::new),
             emoji,
         };
-        for uid in &members {
-            r.send_to(*uid, ev.clone());
+        for uid in r.members_sessions(&members) {
+            r.send_to(uid, ev.clone());
         }
         // A room's set is its membership at this moment, media-capable
         // members only, and nothing is added to it afterwards — someone
@@ -1870,7 +1870,7 @@ impl Core {
         } else if r.rooms.contains_key(&cid) {
             r.room_send_where(cid, ev, |_| true);
         } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
-            for uid in members {
+            for uid in r.members_sessions(&members) {
                 r.send_to(uid, ev.clone());
             }
         }
@@ -1900,7 +1900,7 @@ impl Core {
             || (limits.per_creator > 0
                 && r.chats
                     .values()
-                    .filter(|c| c.creator == Some(creator))
+                    .filter(|c| c.creator == Some(r.row_of(creator)))
                     .count()
                     >= limits.per_creator)
         {
@@ -1908,12 +1908,12 @@ impl Core {
         }
         let cid = r.next_chat_id().ok_or(ChatError::ServerError)?;
         let mut chat = PrivateChat {
-            creator: Some(creator),
-            members: vec![creator],
+            creator: Some(r.row_of(creator)),
+            members: vec![r.row_of(creator)],
             ..Default::default()
         };
         if invitee != creator {
-            chat.invited.push(invitee);
+            chat.invited.push(r.row_of(invitee));
         }
         r.chats.insert(cid, chat);
         if invitee != creator {
@@ -1941,15 +1941,16 @@ impl Core {
         if r.named(target).is_none() {
             return Err(ChatError::NoSuchUser);
         }
+        let (by_row, target_row) = (r.row_of(by), r.row_of(target));
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&by) {
+        if !chat.members.contains(&by_row) {
             return Err(ChatError::NotAMember);
         }
-        if chat.members.contains(&target) {
+        if chat.members.contains(&target_row) {
             return Err(ChatError::AlreadyThere);
         }
-        if !chat.invited.contains(&target) {
-            chat.invited.push(target);
+        if !chat.invited.contains(&target_row) {
+            chat.invited.push(target_row);
         }
         let ev = Event::ChatInvite {
             cid,
@@ -1963,8 +1964,9 @@ impl Core {
     /// Decline an invitation (or quietly drop a stale one).
     pub fn chat_decline(&self, cid: u32, uid: Uid) {
         let mut r = self.roster.lock().unwrap();
+        let row = r.row_of(uid);
         if let Some(chat) = r.chats.get_mut(&cid) {
-            chat.invited.retain(|u| *u != uid);
+            chat.invited.retain(|u| *u != row);
         }
     }
 
@@ -1984,25 +1986,28 @@ impl Core {
             .get(&uid)
             .map(|s| s.info.clone())
             .ok_or(ChatError::NoSuchUser)?;
+        let row = r.row_of(uid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if chat.members.contains(&uid) {
+        if chat.members.contains(&row) {
             return Err(ChatError::AlreadyThere);
         }
-        if let Some(pos) = chat.invited.iter().position(|u| *u == uid) {
+        if let Some(pos) = chat.invited.iter().position(|u| *u == row) {
             chat.invited.remove(pos);
         } else if !chat.password.is_empty() && chat.password != password {
             return Err(ChatError::WrongPassword);
         }
-        chat.members.push(uid);
+        chat.members.push(row);
         let members = chat.members.clone();
         let subject = chat.subject.clone();
         let ev = Event::ChatUserJoined { cid, user: me };
         let mut rows = Vec::with_capacity(members.len());
         for m in &members {
-            if *m != uid {
-                r.send_to(*m, ev.clone());
+            if *m != row {
+                for s in r.members_sessions(&[*m]) {
+                    r.send_to(s, ev.clone());
+                }
             }
-            if let Some(s) = r.users.get(m) {
+            if let Some(s) = r.row_user(*m) {
                 rows.push(s.info.clone());
             }
         }
@@ -2039,12 +2044,14 @@ impl Core {
             self.topic_changed(0);
             return Ok(());
         }
+        let row = r.row_of(uid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&uid) {
+        if !chat.members.contains(&row) {
             return Err(ChatError::NotAMember);
         }
         chat.subject = subject;
-        for m in chat.members.clone() {
+        let members = chat.members.clone();
+        for m in r.members_sessions(&members) {
             r.send_to(m, ev.clone());
         }
         Ok(())
@@ -2054,13 +2061,15 @@ impl Core {
     /// mirroring the reference server).
     pub fn chat_password(&self, cid: u32, uid: Uid, password: String) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
+        let row = r.row_of(uid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&uid) {
+        if !chat.members.contains(&row) {
             return Err(ChatError::NotAMember);
         }
         chat.password = password.clone();
         let ev = Event::ChatPassword { cid, password };
-        for m in chat.members.clone() {
+        let members = chat.members.clone();
+        for m in r.members_sessions(&members) {
             r.send_to(m, ev.clone());
         }
         Ok(())
@@ -2073,7 +2082,7 @@ impl Core {
         let mut v: Vec<u32> = r
             .chats
             .iter()
-            .filter(|(_, c)| c.members.contains(&uid))
+            .filter(|(_, c)| c.members.contains(&r.row_of(uid)))
             .map(|(cid, _)| *cid)
             .collect();
         v.sort_unstable();
@@ -2081,15 +2090,16 @@ impl Core {
     }
 
     pub(crate) fn leave_all_chats(r: &mut RosterInner, uid: Uid) {
+        let row = r.row_of(uid);
         for chat in r.chats.values_mut() {
-            if chat.creator == Some(uid) {
+            if chat.creator == Some(row) {
                 chat.creator = None;
             }
         }
         let cids: Vec<u32> = r
             .chats
             .iter()
-            .filter(|(_, c)| c.members.contains(&uid) || c.invited.contains(&uid))
+            .filter(|(_, c)| c.members.contains(&row) || c.invited.contains(&row))
             .map(|(cid, _)| *cid)
             .collect();
         for cid in cids {
@@ -2104,11 +2114,12 @@ impl Core {
         // Ahead of the early returns below: voice outlives a chat whose
         // membership has already been torn up.
         r.voice_part_room(uid, cid);
+        let row = r.row_of(uid);
         let Some(chat) = r.chats.get_mut(&cid) else {
             return;
         };
-        chat.invited.retain(|u| *u != uid);
-        let Some(pos) = chat.members.iter().position(|u| *u == uid) else {
+        chat.invited.retain(|u| *u != row);
+        let Some(pos) = chat.members.iter().position(|u| *u == row) else {
             return;
         };
         chat.members.remove(pos);
@@ -2119,7 +2130,7 @@ impl Core {
         }
         let members = chat.members.clone();
         let ev = Event::ChatUserParted { cid, uid };
-        for m in members {
+        for m in r.members_sessions(&members) {
             r.send_to(m, ev.clone());
         }
     }
