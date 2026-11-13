@@ -269,7 +269,7 @@ impl Default for NgConfig {
             agreement: None,
             login_timeout: Duration::from_secs(10),
             grace: Duration::from_secs(300),
-            max_detached_per_addr: 2,
+            max_detached_per_addr: 32,
             caps: Vec::new(),
             trusted_proxies: TrustedProxies::default(),
             forwarded_header: ForwardedHeader::default(),

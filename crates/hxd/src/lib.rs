@@ -2238,7 +2238,12 @@ pub struct NgSection {
     /// Seconds a detached session survives without a connection.
     #[serde(default = "default_grace")]
     pub grace: u64,
-    /// Detached-sessions-per-address backstop.
+    /// Detached sessions one login may hold at one address (IPv6: its
+    /// /64).
+    #[serde(default = "default_max_detached_per_login")]
+    pub max_detached_per_login: usize,
+    /// Detached sessions every login together may hold at one address:
+    /// the backstop.
     #[serde(default = "default_max_detached")]
     pub max_detached_per_addr: usize,
     /// Reverse-proxy addresses whose `X-Hotline-Client-Cert` header is
@@ -2263,8 +2268,11 @@ fn default_ng_bind() -> String {
 fn default_grace() -> u64 {
     300
 }
+fn default_max_detached_per_login() -> usize {
+    hxd_core::DETACHED_PER_LOGIN
+}
 fn default_max_detached() -> usize {
-    2
+    32
 }
 
 #[derive(Debug, Deserialize)]
@@ -4810,6 +4818,10 @@ pub fn build_ctx(
     };
 
     let core = core.with_bulk_rows(config.roles.bulk_rows);
+    let core = match &config.ng {
+        Some(ng) => core.with_detached_per_login(ng.max_detached_per_login),
+        None => core,
+    };
     let core = core.with_sealed_holds(hxd_core::SealedHolds {
         per_sender: config.sealed.held_per_sender_kb.saturating_mul(1024),
         all: config.sealed.held_kb.saturating_mul(1024),

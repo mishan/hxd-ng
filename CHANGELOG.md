@@ -9,6 +9,16 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Upgrading
 
+- `[ng] max_detached_per_login` (default 2) is a new key: how many
+  detached sessions one login may hold at one address. `[ng]
+  max_detached_per_addr` is now the backstop for every login there
+  together, and its default rises from 2 to 32. An IPv6 address counts
+  as its /64. Behind carrier-grade NAT or a shared router, one person's
+  dropped connection no longer ends someone else's detached session
+  until the address holds 32. A
+  config that set `max_detached_per_addr = 2` keeps the old cap, IPv6
+  now counted by /64, until it is raised. The Docker image takes
+  `HXD_NG_MAX_DETACHED_PER_LOGIN`.
 - Schema 37 adds the server emoji catalog, and `[emoji]` is a new
   config section, off unless enabled (docs/server-emoji.md).
 - The ng wire gains `news_timeline`: one stream, newest first, of the

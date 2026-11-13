@@ -276,7 +276,8 @@ the same way with `hxd-entrypoint room …` and applied on SIGHUP.
 | `HXD_NG_TRUSTED_PROXIES` | `127.0.0.1,::1` | Addresses and CIDR blocks the proxy headers are believed from. `gateway` is the container's default gateway — read [the proxy](#the-proxy) before adding it. Empty or `none` believes nobody. |
 | `HXD_NG_FORWARDED_HEADER` | `x-forwarded-for` | Or `forwarded`, or `none`. |
 | `HXD_NG_GRACE` | 300 | Seconds a dropped ng session waits to be resumed. |
-| `HXD_NG_MAX_DETACHED_PER_ADDR` | 2 | Detached sessions per client address. |
+| `HXD_NG_MAX_DETACHED_PER_LOGIN` | 2 | Detached sessions one login may hold at one client address (IPv6: its /64). |
+| `HXD_NG_MAX_DETACHED_PER_ADDR` | 32 | Detached sessions every login together may hold there. |
 | `HXD_IDENTITY` | `on` | Portable identity and the `/trtp` tunnel ([hotline-ng-identity.md](hotline-ng-identity.md)). The server key is generated into the volume on first start. Needs `HXD_IDENTITY_HOSTS`: left at its default, a volume with no server key yet starts with identity off until they are set, saying so in the log. |
 | `HXD_IDENTITY_NEW_ACCOUNTS` | `guest` | `deny`, `guest` or `create`. |
 | `HXD_IDENTITY_UNATTESTED` | `guest` | `deny`, `guest` or `allow`. |
