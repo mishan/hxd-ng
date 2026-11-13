@@ -68,13 +68,13 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-media` | The inline-media pipeline (`docs/inline-media.md`): magic-byte sniff, hand-written JPEG/PNG/GIF container walkers that refuse polyglots, a bounded decode and a re-encode that strips every byte of metadata by construction, and the fitting that makes an avatar and its legacy GIF (`docs/avatars.md`) and a server emoji (`docs/server-emoji.md`). Behind `hxd-core`'s `MediaCodec` trait and the `media` Cargo feature, and knows nothing about Hotline. |
 | `hxd-markdown` | Markdown news bodies (`docs/news.md` §5): pulldown-cmark, built without its HTML writer, folded into the plain-text downgrade that search and legacy clients read, and the references a body makes. Text in, text out — nothing here ever produces markup. Behind `hxd-core`'s `BodyRenderer` trait and the `markdown` Cargo feature. |
 | `hxd-voice` | The voice **and video** SFU: str0m, one UDP port, hand-written SDP, RTP forwarding, VP8 passthrough and keyframe requests. Behind `hxd-core`'s `VoiceMedia` trait and the `voice` Cargo feature, and knows nothing about Hotline. |
-| `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
+| `hxd-registrar` | The identity registrar (`docs/identity-registrar.md`): handles and their lifecycle, attestations, the records it publishes (revocation, rotation, freeze), the issuance log and stats, key backup's envelopes, salts and per-handle lockouts (§9), rate limits and replay, the operator's freeze, revoke and recover. Signed bytes in, signed bytes out; no HTTP, no roster, no account table beyond the reserved names it is handed. Its `RegistrarStore` trait, an in-memory store and the conformance suite live here. |
 | `hxd-store-sqlite` | The durable store for the private-message inbox, chat history, news, the moderation trail and the bans: one SQLite file, WAL checkpointed by a thread and a connection of its own (never inside a commit, and one checkpointer to a file), public chat's log on a connection of its own beside the others' (`open_beside`), the schema and migrations of `docs/private-messages.md` §5, `docs/news.md` §4 and `docs/moderation.md` §7, the emoji catalog (`emoji.rs`), and the conformance suites both stores of each kind are run against. Behind `hxd-core`'s `MessageStore`, `RelationshipStore`, `ChatLog`, `NewsStore`, `ModerationStore`, `AvatarStore` and `EmojiStore` traits and the `inbox` Cargo feature; the in-memory stores beside them in `hxd-core` are what the domain tests use. The registrar's store is here too, in a file and a schema of its own. |
 | `hxd-push-webpush` | The push sender (`docs/webpush-gateway.md`): a VAPID keypair and its RFC 8292 token, RFC 8291 payload encryption, RFC 8030's headers, the destination check a client-chosen URL demands, and a per-origin circuit breaker. Behind `hxd-core`'s `NotificationGateway` trait, reading the devices out of its `PushStore`, and knowing nothing about Hotline. |
 | `hxd-push-uniqush` | The second gateway (`docs/push-notifications.md` §4.1): a uniqush-push sidecar over TCP with its token or over its Unix socket, the mailbox as a subscriber (`subscriber.rs`), the store's rows kept as the record with uniqush's copy subscribed, unsubscribed and pruned in step by a task of its own, and the in-process sender's payload, collapse key and breaker. Behind the same trait and the `uniqush` Cargo feature, chosen by `[push] gateway`. |
 | `hxd-feeds` | The feed reader (`docs/news-feeds.md` §5, §7): the fetch, through `hxd-fetch`; the parse of RSS, RDF, Atom and JSON Feed into items oldest first, each known by a hash of its identity; and the conversion of a feed's HTML into markdown that holds none, over a tokenizer and a stack it bounds itself. Hands its caller normalized items and knows nothing about Hotline. |
 | `hxd-fetch` | The outbound GET to a URL the operator chose (`docs/news-feeds.md` §4), for feeds and, by `docs/identity-records.md`, registrars: conditional and bounded in time and in bytes after decompression, a URL on the local network fetched as configured and any other's every hop of a redirect resolved once and checked by the push sender's classifier before it is connected to, and a proxy only when one is configured. |
-| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar. |
+| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar, and `backup` and `restore` keep the identity key there sealed and bring it back. |
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, with the instant messaging extension's requests built and replies read by `hxproto`'s own (`messaging.rs`), and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
@@ -532,8 +532,15 @@ Three layers, all `cargo test --workspace`:
   `[registrar]` section: discovery under its own host only, handles,
   rotations published under both keys, a card's commitment, invites from
   the file and the command, the operator's commands on the running
-  store, and `hlid register`, `revoke` and `rotate` driven as a user
-  would), `signed.rs` (signed lines and messages signed with a real
+  store, `hlid register`, `revoke` and `rotate` driven as a user
+  would, and key backup: an envelope put, found by its salt, fetched and
+  opened, every miss one answer and every salt without an envelope a
+  stable decoy, a guessed-at handle locked out until the clock moves
+  or `hxd registrar unlock`, a
+  put refused for another registrar and an identity that may not, the
+  envelopes gone with a revocation and a rotation, and `hlid backup`
+  then `hlid restore` bringing back the same identity by passphrase and
+  by recovery code), `signed.rs` (signed lines and messages signed with a real
   device key: a line heard with its signature on the ng wire and as an
   unsigned one's text on the classic, kept across a restart, signed
   again and answered as itself, and refused under its id with other
@@ -779,9 +786,10 @@ Three layers, all `cargo test --workspace`:
 sees what the server decides a minute or a day on without waiting for
 it, while its sockets and timers run in real time. The verifying
 side's identity state and registrars read it (`IdentityState`,
-`Registrars`; `IdentityState::clock` hands it to a test), and code moved
-onto it reads no other clock; everything else, the registrar server and
-enrollment included, is on real time. A new test that would sleep past
+`Registrars`; `IdentityState::clock` hands it to a test), and so do the
+registrar's routes; code moved onto it reads no other clock. Everything
+else, the registrar's operator commands and enrollment included, is on
+real time. A new test that would sleep past
 a deadline in that code advances the clock instead. More of the server
 moves onto it as tests need it.
 

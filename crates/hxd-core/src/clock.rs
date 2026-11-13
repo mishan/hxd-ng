@@ -3,7 +3,8 @@
 //! without waiting for it. What reads a clock reads its
 //! [`Core`](crate::Core)'s, so each server a test starts keeps time of
 //! its own; so far that is the verifying side's identity state and
-//! registrars, and the rest of the server is on real time.
+//! registrars, and the registrar's routes, and the rest of the server is
+//! on real time.
 //! Timers (tokio's sleeps and timeouts) stay on real time: the offset
 //! moves what the server decides, not when it wakes.
 

@@ -4,14 +4,14 @@ Status: draft; the registrar is built, and so is the verifying server but for §
 hxd-ng is a registrar when `[registrar]` is configured (§11): discovery
 (§3), the objects of §4 in `hl-identity` with their test vectors (§15),
 handles and their lifecycle (§5, with `signup = open`, `proof` by invite,
-or `closed`), every endpoint of §6 but the envelopes, the operator's
-freeze, revocation and recovery (§8), the ceilings of §10, and `hlid
-register`, `revoke` and `rotate`. The server-local revocation list of
+or `closed`), every endpoint of §6, key backup's envelopes (§9), the
+operator's freeze, revocation and recovery (§8), the ceilings of §10,
+and `hlid register`, `revoke`, `rotate`, `backup` and `restore`. The server-local revocation list of
 §7.3 — `[identity] revoked_identities` and `revoked_devices`, written by
 `hxd identity revoke` and re-read on SIGHUP — is built too, because it
 needs no registrar, and so is a server fetching and applying a
 registrar's records, rotations included (`identity-records.md` R1–R3).
-Not built: standing and probation (§7.5); key backup (§9); `proof` by `email`, `oidc` or `vouch`, and vouches
+Not built: standing and probation (§7.5); `proof` by `email`, `oidc` or `vouch`, and vouches
 in the record lists; and reports (§6.7, deferred by design). This is the
 document `hotline-ng-identity.md`
 calls "the registrar spec" and its §5.2 step 4, §8.5 and §12 wait on. It
@@ -474,7 +474,7 @@ Request and response bodies are JSON unless stated; signed objects
 travel as base64url CBOR. Errors are `{ "error": code, "text": "…" }`
 with the status in the table at §6.5. None of these endpoints takes a
 transport token: every write is a signed object, and every read is
-public.
+public. Key backup's three, under `envelopes`, are §9.2.
 
 ### 6.1 `register`
 
@@ -580,19 +580,19 @@ service. The registrar anchors the card's `successor` as §5.4 says.
 
 | code | status | |
 |---|---|---|
-| `bad_request` | 400 | malformed JSON or CBOR, missing field, wrong `registrar` |
+| `bad_request` | 400 | malformed JSON or CBOR, missing field, wrong `registrar`, an envelope of other parameters than v1's |
 | `bad_signature` | 401 | a signature did not verify, including `ack` |
 | `bad_time` | 401 | `time` outside skew; a stale request is a replay |
 | `handle_invalid`, `handle_reserved`, `handle_taken`, `handle_held` | 409 | §5.1, §5.2 |
 | `proof_required`, `proof_invalid` | 403 | §5.3; the former carries `url` when there is one |
 | `signup_closed` | 403 | |
-| `frozen` | 403 | §8.1; reissue, records and envelopes all refuse |
+| `frozen` | 403 | §8.1; reissue, records and envelope puts all refuse. An envelope fetch is answered `not_found` (§9.2) |
 | `revoked` | 403 | identity revoked or rotated away; the body names `successor` when there is one |
 | `successor_mismatch` | 409 | §5.4 |
 | `not_registered` | 404 | a record for an identity this registrar does not attest to |
-| `not_found` | 404 | lookups; envelopes |
+| `not_found` | 404 | lookups; every envelope fetch that is not a match; every route under `envelopes` at a registrar that keeps none |
 | `too_large` | 413 | the object's size bound |
-| `rate_limited` | 429 | §10 |
+| `rate_limited` | 429 | §10, with `retry_after`; an envelope fetch's lockout too |
 
 ### 6.6 Transparency: the issuance log and stats
 
@@ -890,8 +890,10 @@ address from signup, by the recovery code (§9.3), or by whatever the
 registrar's `level` says it verifies. The operator's tool publishes a
 §4.7 record with `frozen = true`.
 
-While frozen the registrar refuses reissue, records and envelope fetches
-for that identity (`frozen`) and cancels any pending rotation. A freeze
+While frozen the registrar refuses reissue, records and envelope puts
+for that identity (`frozen`), answers its envelope fetches as it
+answers a miss and its salt lookups with a decoy (§9.2), and cancels
+any pending rotation. A freeze
 is lifted by a `frozen = false` record when the holder has rotated
 (§8.2) or recovered (§8.3), or when the report turns out to be wrong.
 
@@ -958,7 +960,7 @@ the AEAD's. At most 1 KiB.
 |---|---|---|---|
 | `v` | uint | yes | `1` |
 | `kind` | uint | yes | 1 passphrase, 2 recovery code |
-| `kdf` | map | yes | `{ "alg": "argon2id", "m": KiB, "t": iterations, "p": lanes, "salt": bstr(16) }` |
+| `kdf` | map | yes | `{ "alg": "argon2id", "m": 65536, "t": 3, "p": 1, "salt": bstr(16) }` |
 | `nonce` | bstr(24) | yes | |
 | `ct` | bstr(48) | yes | XChaCha20-Poly1305 over the 32-byte identity seed |
 
@@ -977,18 +979,31 @@ ct       = XChaCha20-Poly1305.seal(enc_key, nonce,
 The associated data binds the envelope to one identity: a registrar
 that served the wrong envelope, or an attacker who swapped one, gets an
 authentication failure at the client rather than a wrong key that
-"works". Minimum parameters a registrar accepts: `m ≥ 65536` (64 MiB),
-`t ≥ 3`, `p ≥ 1`. A client should use more when the device allows.
-`kdf` is in the clear so the registrar can enforce the floor and the
-client can derive before it has anything else.
+"works".
+
+**v1 has one set of parameters**: `m = 65536` (64 MiB), `t = 3`,
+`p = 1`, which a phone can afford. A reader refuses any other, so a
+registrar can never ask a device to spend more than v1 does, and only
+the salt varies. The `kdf` map is **closed**: exactly those five keys.
+It is unsigned, so a key this version does not define is refused
+rather than left for some later reader to give a meaning. Stronger
+parameters are a new version.
+
+**Each seal draws a fresh 16-byte salt** from the OS CSPRNG, and a
+fresh nonce. One salt and one secret make one key, so a fresh salt is
+what makes a replaced envelope's `auth_key` a different one: an
+envelope sealed again under the same passphrase is fetched by another
+key than the one it replaced, and whoever learned the old one has
+nothing.
 
 Two keys from one derivation: `enc_key` never leaves the client;
 `auth_key` is what the client sends to fetch, and the registrar stores
 `SHA-256(auth_key)`. Neither the passphrase nor `enc_key` is ever
 derivable from what the registrar holds without the envelope *and* an
-offline attack on the KDF, which is why the floor is what it is.
+offline attack on the KDF, which is why the parameters are what they
+are.
 
-### 9.2 Put, fetch, delete
+### 9.2 Put, salt, fetch, delete
 
 `PUT <envelopes>` with `{ "request": "…" }`, domain
 `hl-identity/envelope-put/v1`, signed by the identity key, ≤ 2 KiB:
@@ -997,43 +1012,126 @@ offline attack on the KDF, which is why the floor is what it is.
 |---|---|---|---|
 | `v` | uint | yes | `1` |
 | `identity` | bstr(32) | yes | |
+| `registrar` | tstr | yes | this registrar's `host` (§3), so a put made for one cannot be replayed at another |
 | `kind` | uint | yes | one envelope per kind per identity; a put replaces |
 | `time` | uint | yes | |
-| `auth_hash` | bstr(32) | no | `SHA-256(auth_key)`. Required with `envelope` |
-| `envelope` | bstr | no | the §9.1 object. Absent: delete this kind |
+| `auth_hash` | bstr(32) | no | `SHA-256(auth_key)`. Present exactly when `envelope` is |
+| `envelope` | bstr | no | the §9.1 object, of this `kind`, at most `envelope_max`. Absent: delete this kind |
 | `sig` | bstr(64) | yes | |
 
-Only an attested, unfrozen identity may put; the registrar answers
-`{ "stored": true }` or `{ "deleted": true }`.
+The registrar checks the signature, `registrar` against its own host
+(`bad_request`), `time` against its skew tolerance (`bad_time`), and
+the envelope's form, v1's parameters included. A put's `time` must also
+be later than the last put of its kind for that identity, to the
+second, a delete included, which the store keeps across restarts
+(`bad_time`): a put sent again, or an older one sent over a newer,
+changes nothing. A client that lost the reply, or puts twice in one
+second, signs the put again once the second has turned. Puts are held to the
+record posts' rate per identity (§10). Only an attested identity may put (`not_registered`), and
+only an unfrozen one (`frozen`) that is neither revoked nor rotated away
+(`revoked`). It answers `{ "stored": true }` or `{ "deleted": true }`.
+A client opens what it is about to put with the keys it will fetch with
+before sending it, so that what is stored is what those keys open.
 
-`POST <envelopes>/fetch` with `{ "handle": "alice", "kind": 1, "auth":
-"…base64url auth_key…" }`. The registrar resolves the handle, hashes
-`auth`, compares in constant time, and on a match returns
-`{ "identity": "…base64url pubkey…", "envelope": "…" }`. **Every other
-outcome is `not_found`**: no such handle, no envelope of that kind, wrong
-key, frozen. One answer, so that the endpoint confirms nothing about a
-handle to someone who does not hold its secret.
+A device with nothing but the handle and the secret first asks for the
+salt. `POST <envelopes>/params` with `{ "handle": "alice", "kind": 1 }`
+answers `{ "kdf": "…base64url…" }`, the CBOR `kdf` map of §9.1: the
+stored envelope's, for a handle whose holder keeps an envelope of that
+kind here. **For anything else** — no such handle, no envelope of that
+kind, a frozen holder — it answers a **decoy**: v1's parameters under
+`HMAC-SHA256(decoy_secret, "hl-identity/envelope-decoy/v1" || 0x00 ||
+lowercase(handle) || 0x00 || kind)`, cut to 16 bytes, where
+`decoy_secret` is the registrar's own and never published. A decoy is
+the same each time it is asked for and unpredictable without the
+secret, so one lookup confirms nothing about a handle: a real salt and
+a decoy look alike. Asked again over time they do not behave alike,
+and that is a residual risk: a real salt changes when its envelope is
+sealed again, and turns into the decoy when the envelope is deleted or
+its holder frozen, revoked or rotated, so someone polling `params` for
+a handle learns that its envelope changed and roughly when, though not
+what it holds. Replacing `envelope_secret` changes every decoy at once
+and shows the same of every handle whose salt did not change. Salt
+lookups are lookups, and are held to §10's lookup limit per address.
+
+The device derives from that salt, then `POST <envelopes>/fetch` with
+`{ "handle": "alice", "kind": 1, "auth": "…base64url auth_key…" }`. The
+registrar resolves the handle — held, or lapsed within the hold, since
+an attestation that ran out while its only device was lost is what a
+backup is for — hashes `auth`, compares in constant time, and on a
+match returns `{ "identity": "…base64url pubkey…", "envelope": "…" }`.
+**Every other outcome is `not_found`**, with one body: no such handle,
+no envelope of that kind, wrong key, frozen. One answer, so that the
+endpoint confirms nothing about a handle to someone who does not hold
+its secret. The device opens the envelope with the keys it derived; an
+envelope under any other salt than the lookup gave is refused rather
+than derived for again.
 
 The fetch is the one place an unauthenticated caller can spend the
 registrar's time on someone else's account, and it is rate-limited
-accordingly (§10): per handle, hard, with a lockout that lengthens. A
-locked-out handle answers `rate_limited`, which is the one exception to
-"every other outcome is `not_found`", because the owner needs to know
-why their own passphrase stopped working. The lockout is an availability
-cost the owner pays for a name someone else is hammering; that is the
-trade every password-recovery endpoint makes and this one does not
-pretend otherwise.
+accordingly (§10), by two counts, both per handle *asked for* and per
+kind, whether or not the handle exists, and both kept in the store, so
+a restart grants no fresh allowance — they are the only thing between a
+passphrase and an online guess:
 
-On identity revocation or rotation the registrar deletes the identity's
-envelopes (§4.5, §5.4).
+- **Per handle, per address** (an IPv4 address, or an IPv6 /64): 10 an
+  hour, then a lockout of an hour, doubling with each lockout to a day.
+  What it buys: one address guesses slowly, and locking it out locks
+  out that address alone, so **one address can no longer lock the owner
+  out**. What it costs: nothing for the owner, who fetches from
+  somewhere else.
+- **Per handle, from everywhere**: 200 a day
+  (`envelope_fetches_per_handle_daily`). What it buys: **guessing is
+  capped** at that many a day however many addresses the guesser has,
+  which against a passphrase worth guessing at Argon2id's cost is the
+  number that matters. What it costs: **a botnet can still lock the
+  owner out**, by spending the day's fetches before the owner does, for
+  as long as it keeps spending them at that rate.
+
+The operator's `hxd registrar unlock <handle> [--kind
+passphrase|recovery]` forgets both counts for a handle, on the running
+store, for the owner who asks out of band. Counts sit in a fixed number
+of slots chosen by `HMAC-SHA256(envelope_secret, …)` of the handle, the
+kind and the address, so nobody can grow the table; two counts share a
+slot only by a collision no one without the secret can aim for, and
+the later takes it over. Where there is an envelope its day's count is
+kept with it instead, so no flood of other handles can evict it.
+
+Eviction makes the per-address count best-effort. A slot taken over
+starts afresh, so an address's lockout, and its doubling, can be
+forgotten before the day after its last lockout that §10 gives it —
+by an attacker filling the table, which takes on the order of the
+table's size in fetches, each held to the per-address rate. Guessing
+stays capped by the day's count, which for a handle with an envelope
+cannot be evicted.
+
+A handle refused by either answers `rate_limited` with `retry_after`,
+which is the one exception to "every other outcome is `not_found`",
+because the owner needs to know why their own passphrase stopped
+working. A handle with no envelope is counted the same way as one with,
+so a lockout says nothing a miss does not, with one residual: its day's
+count is kept in an evictable slot, where an envelope's is kept on its
+own row. An attacker who brings a handle to the daily ceiling, then
+spends on the order of the table's size in fetches of other handles to
+evict its slot, and asks again, sees `not_found` where the handle has
+no envelope and still `rate_limited` where it has one. That costs
+roughly the ceiling plus the table's size in fetches, across enough
+addresses to pass the per-address rates, and tells only whether the
+handle keeps an envelope of that kind — what the salt lookup's decoy
+otherwise hides.
+
+On identity revocation (§4.5) or an accepted rotation (§5.4) the
+registrar deletes the identity's envelopes in the same transaction as
+the record.
 
 ### 9.3 Recovery code
 
 An envelope of `kind = 2` is wrapped by a **recovery code**: 20
 characters of Crockford base32 from the OS CSPRNG (100 bits), shown once
 at creation as four groups of five, never stored by the client. The
-same derivation applies; the KDF floor is the same so that one code path
-serves both kinds.
+same derivation applies under the same parameters, so that one code
+path serves both kinds; the code is typed back forgiving case, spaces,
+hyphens and Crockford's confusables (`O` for `0`, `I` and `L` for `1`),
+since it is read off paper. A new code replaces the old one's envelope.
 
 The code covers loss (threat model): a user who has forgotten the
 passphrase, or set none, types the code. It also serves the registrar
@@ -1070,11 +1168,16 @@ ceiling is a setting with a default.
 | Registrations per hour, registrar-wide | 120 | `rate_limited`; reissues exempt |
 | Record posts per hour, per identity | 20 | `rate_limited` |
 | Device revocations kept per identity | 256 | oldest-`until` pruned from the full list; per-identity list keeps all |
-| Envelope fetches per hour, per handle | 10 | `rate_limited`, then lockout doubling from 1 hour, capped at 24 |
-| Envelope fetches per hour, per address | 30 | `rate_limited` |
+| Envelope fetches per hour, per handle, per address | 10 | `rate_limited`, then lockout doubling from 1 hour, capped at 24 and forgotten a day after the last ends, or sooner if its slot is taken over (§9.2). Per kind, for any handle asked after, kept in the store |
+| Envelope fetches per day, per handle | 200 | `rate_limited` until the day turns; per kind, kept in the store |
+| Envelope fetches per hour, per address | 30, and 8 times that per IPv6 /48 | `rate_limited`. Counted in memory, apart from registrations and lookups so a flood of fetches leaves them their room; past 16384 addresses at once a new one goes uncounted rather than refused, since the stored counts are the bound on guessing. An IPv4-mapped IPv6 address counts as its IPv4 |
+| Fetch count slots | 65536 | fixed; a new count takes a slot over, so a full table refuses nobody |
+| Envelope puts per hour, per identity | the record posts' 20 | `rate_limited` |
+| Salt lookups per minute, per address | counted as lookups | `rate_limited` |
 | Lookups per minute, per address | 60 | `rate_limited` |
 | Record-list page | 1 MiB | `more = true` |
 | Envelopes per identity | 2 (one per kind) | a put replaces |
+| Envelope size | `envelope_max`, 1024 | `too_large` |
 | Clock skew | 300 s | `bad_time` |
 | Pending rotations | 1 per identity | second refused `bad_request` |
 
@@ -1082,7 +1185,8 @@ Signed requests are replay-checked by `time` and a seen-set of request
 digests held for the skew window, as the transport does for proofs. A
 registration request seen again inside the window is answered with the
 reply it got the first time and issues nothing, so a client that lost
-the reply can resend it; records are idempotent by digest (§6.2).
+the reply can resend it; records are idempotent by digest (§6.2); an
+envelope put must be newer than the last of its kind (§9.2).
 
 ---
 
@@ -1111,9 +1215,10 @@ startup error, as `[identity]` without `[ng]` is.
 | `records_max_age` | `3600` | §4.9 |
 | `reporting_servers` | empty | §6.7; *(deferred)* servers whose vouch reports are believed, keyed by `server_key` |
 | `vouch_reports` | `2` | §6.7; distinct reporting servers before `proof = vouch` is refused from a voucher |
-| `envelopes` | `false` | §9. Not built: `true` is a startup error |
-| `envelope_max` | `1024` | bytes |
-| `rate.*` | §10's column | one key per row of §10: `registrations_per_address`, `registrations_per_hour`, `records_per_identity`, `lookups_per_minute`, `device_revocations_kept` |
+| `envelopes` | `false` | §9: keep envelopes, and advertise `envelopes` in discovery |
+| `envelope_max` | `1024` | bytes; from 256 to 1024 |
+| `envelope_secret` | `registrar-envelope.secret` | The secret of §9.2's decoys and fetch-count slots; generated on first run, mode 0600. Replacing it changes every decoy at once, which shows a watcher which handles' salts stayed put, and forgets every count kept outside an envelope |
+| `rate.*` | §10's column | one key per row of §10: `registrations_per_address`, `registrations_per_hour`, `records_per_identity` (envelope puts too), `lookups_per_minute` (salt lookups too), `device_revocations_kept`, `envelope_fetches_per_handle` (per address), `envelope_fetches_per_handle_daily`, `envelope_fetches_per_address` |
 
 The clock-skew tolerance is `[identity] clock_skew`: one server, one
 clock.
@@ -1149,19 +1254,20 @@ hxd registrar freeze   <fingerprint> [--lift]
 hxd registrar revoke   <handle> --reason abuse|lapsed|unspecified   # abuse also bars the holder
 hxd registrar recover  <handle> --identity <new fingerprint> [--keep-age]
 hxd registrar invites  --add 10
+hxd registrar unlock   <handle> [--kind passphrase|recovery]   # §9.2: forget its fetch counts
 hxd registrar inspect  <host>            # §6.6: fetch log and stats, print the last month
 ```
 
-User tools, in `hlid`. The first three are built; `--registrar` also
-takes a full URL, for a test rig:
+User tools, in `hlid`, built; `--registrar` also takes a full URL, for
+a test rig:
 
 ```sh
 hlid register    --registrar hl.example --handle alice [--proof CODE] [--successor-commit]
 hlid revoke      --registrar hl.example (--device-cert FILE | --device-pub HEX) [--reason stolen] [--by-device]
 hlid revoke      --registrar hl.example --identity-revoke --yes
 hlid rotate      --registrar hl.example --to <successor key file>
-hlid backup      --registrar hl.example [--recovery-code]
-hlid restore     alice@hl.example
+hlid backup      --registrar hl.example [--recovery] [--delete]
+hlid restore     --registrar hl.example --handle alice [--recovery]
 ```
 
 A device revocation names the device's *key*, which a fingerprint
@@ -1169,7 +1275,13 @@ cannot give back, so `hlid revoke` takes its certificate — whose
 `expires` is then the record's `until` — or its public key. `register`
 puts the attestation into the card, re-signs it and publishes it at the
 registrar; `--successor-commit` makes a successor key beside the
-identity key and commits the card and the registration to it.
+identity key and commits the card and the registration to it. `backup`
+puts a passphrase envelope, or with `--recovery` makes a recovery code,
+shows it once and puts its envelope; `--delete` removes one kind.
+`restore` looks up the salt, derives, fetches and opens, and lays the
+identity out in `$HLID_HOME` as `hlid init` does, with a new device and
+the card the registrar keeps. Both read the secret from `--password-file` or
+`--password-stdin`, and refuse `--password`, which `ps` would show.
 
 ---
 
@@ -1185,7 +1297,8 @@ identity key and commits the card and the registration to it.
   identity, registered, state, lapsed_at), `attestation` (identity,
   handle, issued, expires, bytes), `record` (seq, kind, identity,
   other_identity, device, until, bytes), `envelope` (identity, kind,
-  auth_hash, bytes, updated), `invite` (code_hash, used_by, used_at).
+  auth_hash, bytes, updated), `lockout` (handle, kind, start, count,
+  until, strikes, forget_at), `invite` (code_hash, used_by, used_at).
   `record.other_identity` is what makes the per-identity list find a
   rotation under the successor.
 - **The verifier is one function**, in `hl-identity`, over the records
@@ -1208,10 +1321,9 @@ identity key and commits the card and the registration to it.
   reserved-name list, which reads account logins once at startup and
   on reload. The feature mounts under the ng listener beside the identity
   endpoints and can be built with the rest of the server off.
-- **hlid** gains the codecs for §4.2 and §4.4–§4.6 (built, through
-  `hl-identity`), the envelope codec and derivation (`argon2` and
-  `chacha20poly1305` are the two new dependencies, with §9), and the
-  commands of §11.
+- **hlid** gains the codecs for §4.2 and §4.4–§4.6 and the envelope
+  codec and derivation, all through `hl-identity` (which brings `argon2`
+  and `chacha20poly1305` for §9), and the commands of §11.
 - **A pending rotation has no timer.** It is published by the first
   read or write of the registrar after its delay, under the write lock,
   so there is nothing to miss across a restart.
@@ -1229,21 +1341,35 @@ To fold into `identity-threat-model.md`:
 
 - **Registrar operator, can:** see envelope fetch attempts and their
   source addresses; hold envelope ciphertext and mount an offline KDF
-  attack on it, bounded by §9.1's floor and the user's passphrase; delay
+  attack on it, bounded by §9.1's parameters and the user's passphrase; delay
   a rotation by `rotation_delay`. **Cannot:** publish a rotation to a
   key other than the committed one; unfreeze a record it did not sign
   (it signed all of them — the point is that a lift is as visible as a
   freeze).
 - **New scenario, envelope brute force.** Attacker with the ciphertext
   (registrar breach or a malicious registrar) and no passphrase.
-  Mitigation: Argon2id at the floor makes a weak passphrase expensive
+  Mitigation: Argon2id at v1's parameters makes a weak passphrase expensive
   and a recovery code (100 bits) infeasible. Residual: a weak passphrase
   is a weak passphrase; clients should say so at creation.
 - **New scenario, handle lockout.** Attacker who knows a handle
-  hammers the fetch until it locks. Mitigation: the lockout caps at 24
-  hours; the owner's other devices are unaffected; the recovery code
-  path is a separate `kind` with its own counter. Residual: a day
-  without restore-from-passphrase for a targeted user.
+  hammers the fetch until it locks. Mitigation: an address locks out
+  only itself, so the owner fetching from anywhere else is unaffected;
+  the recovery code path is a separate `kind` with its own counts; the
+  operator can unlock a handle. Residual: a botnet spending the handle's
+  daily ceiling locks the owner out for as long as it keeps doing so.
+- **New scenario, distributed guessing.** Attacker with many addresses
+  guesses at a handle's passphrase online. Mitigation: the daily
+  ceiling caps guesses at `envelope_fetches_per_handle_daily` whatever
+  the number of addresses. Residual: that many guesses a day, forever,
+  against a weak passphrase.
+- **New scenario, salt polling.** Attacker polls `params` for a handle.
+  Residual: learns when its envelope is resealed or goes, not what it
+  holds (§9.2).
+- **New scenario, evicting a count.** Attacker floods fetches of other
+  handles to take over count slots. Residual: an address's lockout can
+  be forgotten early, and a handle at its daily ceiling can be told
+  apart as having an envelope or not, for roughly the ceiling plus the
+  slot table's size in fetches (§9.2).
 - **Stolen identity key, amended.** The registrar's refusal to publish
   a non-committed rotation and its delay-and-notify window are the
   mitigations that were previously listed as "registrar freeze" alone.
@@ -1306,8 +1432,8 @@ new codecs; the envelope derivation.
 
 In `identity-test-vectors.json`, with the same identity, device and
 registrar keys as the rest so that the objects chain, and checked by
-`hl-identity`'s `tests/vectors.rs`. All but the envelopes are there;
-those wait on §9:
+`hl-identity`'s `tests/vectors.rs` (the envelopes in
+`tests/envelope.rs`):
 
 - `register`: a first registration with `successor`, and a reissue.
 - `revoke_device`: one signed by the identity key; one signed by a
@@ -1321,7 +1447,8 @@ those wait on §9:
   and the list signature input; an empty per-identity list.
 - `envelope`: a `kind = 1` envelope with fixed salt and nonce, the
   passphrase in the clear, `enc_key`, `auth_key`, `auth_hash`, and the
-  seed; a `kind = 2` envelope with its code.
+  seed; a `kind = 2` envelope with its code; a decoy salt; and the
+  envelopes, `kdf` maps and puts that must be refused.
 
 ---
 

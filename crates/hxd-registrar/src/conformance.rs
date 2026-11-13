@@ -10,8 +10,8 @@
 use sha2::{Digest, Sha256};
 
 use crate::store::{
-    Effect, HandleRow, Issue, Issued, Key, NewRecord, Pending, Publish, RecordFilter, RecordKind,
-    Recovery, RegistrarStore,
+    Effect, EnvelopeRow, HandleRow, Issue, Issued, Key, Lockout, NewRecord, Pending, Publish,
+    RecordFilter, RecordKind, Recovery, RegistrarStore,
 };
 
 /// Run every case against a freshly built store.
@@ -31,6 +31,8 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RegistrarStore>) {
     attestation_expiry_is_bounded_by_issue_time(&*new_store());
     counts_are_what_the_stats_say(&*new_store());
     identities_are_found_by_fingerprint(&*new_store());
+    an_envelope_is_one_per_kind_and_goes_with_its_identity(&*new_store());
+    a_lockout_slot_holds_its_last_tag_and_an_unlock_counts_up(&*new_store());
 }
 
 const T: u64 = 1_750_000_000;
@@ -586,4 +588,83 @@ fn identities_are_found_by_fingerprint(s: &dyn RegistrarStore) {
     );
     assert!(s.identity_by_fingerprint(&fp(&key(2))).unwrap().is_none());
     assert!(s.identity_by_fingerprint(&key(1)).unwrap().is_none());
+}
+
+fn envelope(id: Key, kind: u8, tag: u8) -> EnvelopeRow {
+    EnvelopeRow {
+        identity: id,
+        kind,
+        auth_hash: [tag; 32],
+        bytes: vec![tag; 100],
+        updated: T + u64::from(tag),
+    }
+}
+
+fn an_envelope_is_one_per_kind_and_goes_with_its_identity(s: &dyn RegistrarStore) {
+    s.issue(&issue(key(1), "alice", T)).unwrap();
+    s.issue(&issue(key(2), "bob", T)).unwrap();
+    assert_eq!(s.envelope(&key(1), 1).unwrap(), None);
+    assert_eq!(s.last_put(&key(1), 1).unwrap(), None);
+    s.put_envelope(&envelope(key(1), 1, 1)).unwrap();
+    let counted = Lockout {
+        start: T,
+        count: 4,
+        ..Lockout::default()
+    };
+    s.set_envelope_guesses(&key(1), 1, &counted).unwrap();
+    s.put_envelope(&envelope(key(1), 1, 2)).unwrap();
+    s.put_envelope(&envelope(key(1), 2, 3)).unwrap();
+    s.put_envelope(&envelope(key(2), 1, 4)).unwrap();
+    assert_eq!(
+        s.envelope(&key(1), 1).unwrap(),
+        Some(envelope(key(1), 1, 2))
+    );
+    assert_eq!(
+        s.envelope(&key(1), 2).unwrap(),
+        Some(envelope(key(1), 2, 3))
+    );
+    assert_eq!(
+        s.envelope_guesses(&key(1), 1).unwrap(),
+        counted,
+        "a replacement keeps the day's count"
+    );
+    assert_eq!(s.envelope_guesses(&key(2), 1).unwrap(), Lockout::default());
+
+    // A delete leaves its time behind, for the next put to be newer than.
+    s.delete_envelope(&key(1), 2, T + 50).unwrap();
+    assert_eq!(s.envelope(&key(1), 2).unwrap(), None);
+    assert_eq!(s.last_put(&key(1), 2).unwrap(), Some(T + 50));
+    assert_eq!(s.last_put(&key(1), 1).unwrap(), Some(T + 2));
+
+    publish(s, vec![], vec![Effect::DeleteEnvelopes(key(1))]);
+    assert_eq!(s.envelope(&key(1), 1).unwrap(), None);
+    assert_eq!(s.last_put(&key(1), 2).unwrap(), None);
+    assert_eq!(
+        s.envelope(&key(2), 1).unwrap(),
+        Some(envelope(key(2), 1, 4))
+    );
+}
+
+fn a_lockout_slot_holds_its_last_tag_and_an_unlock_counts_up(s: &dyn RegistrarStore) {
+    let locked = Lockout {
+        start: T,
+        count: 0,
+        until: T + 3600,
+        strikes: 1,
+    };
+    assert_eq!(s.lockout_slot(5).unwrap(), None);
+    s.set_lockout_slot(5, &[1; 32], &locked).unwrap();
+    assert_eq!(s.lockout_slot(5).unwrap(), Some(([1; 32], locked)));
+    s.set_lockout_slot(5, &[2; 32], &Lockout::default())
+        .unwrap();
+    assert_eq!(
+        s.lockout_slot(5).unwrap(),
+        Some(([2; 32], Lockout::default()))
+    );
+
+    assert_eq!(s.unlock_epoch("alice", 1).unwrap(), 0);
+    s.bump_unlock_epoch("alice", 1).unwrap();
+    s.bump_unlock_epoch("alice", 1).unwrap();
+    assert_eq!(s.unlock_epoch("alice", 1).unwrap(), 2);
+    assert_eq!(s.unlock_epoch("alice", 2).unwrap(), 0);
 }

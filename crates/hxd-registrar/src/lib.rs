@@ -32,16 +32,20 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
+use hl_identity::envelope::{Kdf, Kind as EnvelopeKind};
 use hl_identity::registrar::{attestation_reason, handle_is_canonical};
 use hl_identity::{
-    Attestation, AttestationRevocation, Card, Fingerprint, Freeze, ListKind, PublicKey, Record,
-    RegisterRequest, RegistrarKeys, Rotation, ServerKey, SignedList, Stats,
+    Attestation, AttestationRevocation, Card, EnvelopePut, Fingerprint, Freeze, KeyEnvelope,
+    ListKind, PublicKey, Record, RegisterRequest, RegistrarKeys, Rotation, ServerKey, SignedList,
+    Stats,
 };
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 pub use store::{
-    Counts, Effect, HandleRow, HandleState, IdentityRow, Issue, Issued, Key, NewRecord, Page,
-    Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore, StoreError,
+    Counts, Effect, EnvelopeRow, HandleRow, HandleState, IdentityRow, Issue, Issued, Key, Lockout,
+    NewRecord, Page, Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore,
+    StoreError,
 };
 
 const DAY: u64 = 86_400;
@@ -69,6 +73,11 @@ pub struct Rates {
     pub records_per_identity: u32,
     pub lookups_per_address: u32,
     pub device_revocations_kept: usize,
+    /// From one address (its /64 for IPv6), an hour.
+    pub envelope_fetches_per_handle: u32,
+    /// From everywhere together, a day: the ceiling on guessing.
+    pub envelope_fetches_per_handle_daily: u32,
+    pub envelope_fetches_per_address: u32,
 }
 
 impl Default for Rates {
@@ -79,6 +88,9 @@ impl Default for Rates {
             records_per_identity: 20,
             lookups_per_address: 60,
             device_revocations_kept: 256,
+            envelope_fetches_per_handle: 10,
+            envelope_fetches_per_handle_daily: 200,
+            envelope_fetches_per_address: 30,
         }
     }
 }
@@ -322,9 +334,24 @@ pub struct Found {
     pub expires: u64,
 }
 
+/// The IPv6 /48 an address is in, which a site is given to make many
+/// /64s of; `None` for IPv4.
+fn address_48(addr: IpAddr) -> Option<IpAddr> {
+    match addr.to_canonical() {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[6..].fill(0);
+            Some(IpAddr::V6(o.into()))
+        }
+    }
+}
+
 /// A request's address, as the limits count it: an IPv6 host is given a
-/// /64 to wander in, so the /64 is what is counted.
+/// /64 to wander in, so the /64 is what is counted. An IPv4-mapped
+/// address, as a dual-stack socket or a proxy may give one, is its IPv4.
 fn address_key(addr: IpAddr) -> IpAddr {
+    let addr = addr.to_canonical();
     match addr {
         IpAddr::V4(_) => addr,
         IpAddr::V6(v6) => {
@@ -341,6 +368,10 @@ enum Limit {
     RegisterAll,
     Records(Key),
     LookupFrom(IpAddr),
+    Puts(Key),
+    FetchFrom(IpAddr),
+    /// An IPv6 /48, which holds many /64s.
+    FetchFrom48(IpAddr),
 }
 
 impl Limit {
@@ -355,10 +386,14 @@ impl Limit {
 /// Fixed windows per key. Bounded like every table an unauthenticated
 /// caller can grow: past the ceiling, expired windows are dropped, and if
 /// that is not enough the caller is refused — a full table must never be
-/// a way out of being counted.
+/// a way out of being counted — unless `fail_open`.
 #[derive(Debug, Default)]
 struct Limits {
     windows: HashMap<Limit, (u64, u32)>,
+    /// A full table lets a new key through uncounted, where refusing it
+    /// would let whoever filled it shut everyone else out. For fetches,
+    /// whose real bound is the stored per-handle counts.
+    fail_open: bool,
     /// Registrations accepted inside the skew window, by the digest of
     /// the request, with the answer each got and the time it may be
     /// forgotten (§10).
@@ -381,15 +416,19 @@ impl Limits {
         if !self.windows.contains_key(&key) && self.windows.len() >= MAX_WINDOWS {
             self.windows
                 .retain(|k, (start, _)| now < *start + k.window());
-            if self.windows.len() >= MAX_WINDOWS {
+            if self.windows.len() >= MAX_WINDOWS && !self.fail_open {
                 return Err(w);
             }
         }
         Ok(())
     }
 
+    /// Past the ceiling a new key is not counted at all: see `fail_open`.
     fn charge(&mut self, key: Limit, now: u64) {
         let w = key.window();
+        if !self.windows.contains_key(&key) && self.windows.len() >= MAX_WINDOWS {
+            return;
+        }
         let e = self.windows.entry(key).or_insert((now, 0));
         if now >= e.0 + w {
             *e = (now, 0);
@@ -428,6 +467,10 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// The display alphabet of invite codes: Crockford's, which has no I, L,
 /// O or U to misread.
 const INVITE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -459,8 +502,54 @@ pub fn new_invite_code() -> String {
         .join("-")
 }
 
+/// Key backup (§9), when this registrar offers it.
+#[derive(Clone)]
+pub struct Envelopes {
+    /// The largest envelope a put may store, in bytes.
+    pub max: usize,
+    /// What a salt lookup's decoys and the fetch counts' slots are made
+    /// from: the registrar's own, and never published.
+    pub secret: [u8; 32],
+}
+
+impl fmt::Debug for Envelopes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Envelopes")
+            .field("max", &self.max)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a put did (§9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    Stored,
+    Deleted,
+}
+
+/// Slots fetch counts are kept in (§10). Fixed, so nobody can grow the
+/// table; a handle's count is found by a keyed hash, so two counts share
+/// a slot only by a collision nobody without the secret can aim for, and
+/// the later evicts the earlier rather than adding to it.
+const LOCKOUT_SLOTS: u32 = 1 << 16;
+const LOCKOUT_DOMAIN: &str = "hl-registrar/envelope-lockout/v1";
+
+/// Fetches an hour from an IPv6 /48, as a multiple of a /64's.
+const FETCHES_PER_48: u32 = 8;
+
+fn envelope_kind(kind: u64) -> Result<EnvelopeKind, Refusal> {
+    match kind {
+        1 => Ok(EnvelopeKind::Passphrase),
+        2 => Ok(EnvelopeKind::RecoveryCode),
+        _ => Err(Refusal::BadRequest(
+            "kind is 1 (passphrase) or 2 (recovery code)".into(),
+        )),
+    }
+}
+
 pub struct Registrar {
     cfg: Config,
+    envelopes: Option<Envelopes>,
     /// Reloadable separately from the rest, because the server's account
     /// logins change without the registrar's settings changing.
     reserved: RwLock<HashSet<String>>,
@@ -468,6 +557,10 @@ pub struct Registrar {
     store: Arc<dyn RegistrarStore>,
     write: Mutex<()>,
     limits: Mutex<Limits>,
+    /// Apart from `limits`, so that a flood of fetches from many
+    /// addresses cannot fill the table registrations and lookups are
+    /// counted in.
+    fetch_limits: Mutex<Limits>,
     /// Stats are recomputed at most hourly (§6.6).
     stats: Mutex<Option<(u64, Vec<u8>)>>,
 }
@@ -485,16 +578,31 @@ impl Registrar {
         Registrar {
             reserved: RwLock::new(cfg.reserved.clone()),
             cfg,
+            envelopes: None,
             key,
             store,
             write: Mutex::new(()),
             limits: Mutex::new(Limits::default()),
+            fetch_limits: Mutex::new(Limits {
+                fail_open: true,
+                ..Limits::default()
+            }),
             stats: Mutex::new(None),
         }
     }
 
+    /// Offer key backup (§9).
+    pub fn with_envelopes(mut self, envelopes: Envelopes) -> Registrar {
+        self.envelopes = Some(envelopes);
+        self
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    pub fn envelopes(&self) -> bool {
+        self.envelopes.is_some()
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -863,6 +971,7 @@ impl Registrar {
                             Effect::Revoke(identity),
                             Effect::LapseHandles { identity, at: now },
                             Effect::DropPending(identity),
+                            Effect::DeleteEnvelopes(identity),
                         ],
                     })?;
                     Posted::Published { seq: seq[0] }
@@ -970,6 +1079,7 @@ impl Registrar {
             effects: vec![
                 Effect::Rotate { from, to, at: now },
                 Effect::DropPending(from),
+                Effect::DeleteEnvelopes(from),
             ],
         })?;
         tracing::info!(
@@ -1228,6 +1338,266 @@ impl Registrar {
                     fingerprint = %Fingerprint::of(&card.identity).short(),
                     "registrar recorded a successor commitment from a card"
                 );
+            }
+            Ok(())
+        })
+    }
+
+    // --- §9 envelopes ---------------------------------------------------------
+
+    fn envelope_settings(&self) -> Result<&Envelopes, Refusal> {
+        self.envelopes.as_ref().ok_or(Refusal::NotFound)
+    }
+
+    /// `PUT <envelopes>` (§9.2): store, replace or delete one kind of an
+    /// attested identity's envelopes.
+    pub fn put_envelope(&self, bytes: &[u8], now: u64) -> Result<Stored, Refusal> {
+        let max = self.envelope_settings()?.max;
+        let put = EnvelopePut::parse(bytes).map_err(parse_refusal)?;
+        if put.registrar != self.cfg.host {
+            return Err(Refusal::BadRequest(format!(
+                "this registrar is {}, not {}",
+                self.cfg.host, put.registrar
+            )));
+        }
+        self.check_time(put.time, now)?;
+        if put.envelope.as_ref().is_some_and(|e| e.len() > max) {
+            return Err(Refusal::TooLarge);
+        }
+        let kind = put.kind as u8;
+        let reply = self.writing(|| -> Result<Stored, Refusal> {
+            self.publish_due(now)?;
+            let row = self
+                .store
+                .identity(&put.identity)?
+                .ok_or(Refusal::NotRegistered)?;
+            Self::usable(&row)?;
+            // Each put must be newer than the last of its kind, a delete
+            // included, and the store remembers across restarts: a replay
+            // inside the skew window, or an older put sent over a newer
+            // one, is refused.
+            if self
+                .store
+                .last_put(&put.identity, kind)?
+                .is_some_and(|last| put.time <= last)
+            {
+                return Err(Refusal::BadTime);
+            }
+            self.limit(
+                Limit::Puts(put.identity),
+                self.cfg.rates.records_per_identity,
+                now,
+            )?;
+            let reply = match (&put.envelope, put.auth_hash) {
+                (Some(envelope), Some(auth_hash)) => {
+                    self.store.put_envelope(&EnvelopeRow {
+                        identity: put.identity,
+                        kind,
+                        auth_hash,
+                        bytes: envelope.clone(),
+                        updated: put.time,
+                    })?;
+                    Stored::Stored
+                }
+                _ => {
+                    self.store.delete_envelope(&put.identity, kind, put.time)?;
+                    Stored::Deleted
+                }
+            };
+            self.limits
+                .lock()
+                .unwrap()
+                .charge(Limit::Puts(put.identity), now);
+            Ok(reply)
+        })?;
+        tracing::info!(
+            fingerprint = %Fingerprint::of(&put.identity).short(),
+            kind,
+            ?reply,
+            "registrar took an envelope put"
+        );
+        Ok(reply)
+    }
+
+    /// The envelope a handle's holder keeps here, if the handle is still
+    /// theirs and they may use it. Lapsed counts: an attestation that ran
+    /// out while its only device was lost is what a backup is for.
+    fn envelope_of(
+        &self,
+        handle: &str,
+        kind: u8,
+        now: u64,
+    ) -> Result<Option<EnvelopeRow>, Refusal> {
+        let Some(h) = self.store.handle(handle)? else {
+            return Ok(None);
+        };
+        if h.state(now, self.hold()) == HandleState::Released {
+            return Ok(None);
+        }
+        match self.store.identity(&h.identity)? {
+            Some(row) if Self::usable(&row).is_ok() => {
+                Ok(self.store.envelope(&h.identity, kind)?)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A handle as a fetch or a salt lookup names it: lowercase, and of a
+    /// form a handle could take.
+    fn envelope_handle(handle: &str) -> Result<String, Refusal> {
+        let handle = handle.to_ascii_lowercase();
+        if !handle_is_canonical(&handle, 1, 64) {
+            return Err(Refusal::BadRequest("malformed handle".into()));
+        }
+        Ok(handle)
+    }
+
+    /// `POST <envelopes>/params` (§9.2): the salt to derive with. A handle
+    /// with no envelope of this kind is answered with a decoy, the same
+    /// each time, so the answer confirms nothing.
+    pub fn envelope_params(
+        &self,
+        handle: &str,
+        kind: u64,
+        addr: IpAddr,
+        now: u64,
+    ) -> Result<Vec<u8>, Refusal> {
+        let decoy_secret = self.envelope_settings()?.secret;
+        let kind = envelope_kind(kind)?;
+        let handle = Self::envelope_handle(handle)?;
+        self.lookup_limit(addr, now)?;
+        // Made whether or not it is answered, so the two answers take the
+        // same work.
+        let decoy = Kdf::decoy(&decoy_secret, &handle, kind);
+        let kdf = match self.envelope_of(&handle, kind as u8, now)? {
+            Some(row) => {
+                KeyEnvelope::parse(&row.bytes)
+                    .map_err(|e| Refusal::Store(StoreError(format!("a stored envelope: {e}"))))?
+                    .kdf
+            }
+            None => decoy,
+        };
+        Ok(kdf.encode())
+    }
+
+    /// `POST <envelopes>/fetch` (§9.2): the envelope, to whoever presents
+    /// its `auth_key`. Every miss is `not_found`. A handle is counted per
+    /// address and per day from everywhere, whether or not it has an
+    /// envelope, so a lockout says no more than a miss does.
+    pub fn fetch_envelope(
+        &self,
+        handle: &str,
+        kind: u64,
+        auth: &[u8; 32],
+        addr: IpAddr,
+        now: u64,
+    ) -> Result<(PublicKey, Vec<u8>), Refusal> {
+        let secret = self.envelope_settings()?.secret;
+        let kind = envelope_kind(kind)? as u8;
+        let handle = Self::envelope_handle(handle)?;
+        let prefix = address_key(addr);
+        {
+            let rates = &self.cfg.rates;
+            let mut limits = self.fetch_limits.lock().unwrap();
+            let refused = |retry_after| Refusal::RateLimited { retry_after };
+            let per_48 = rates
+                .envelope_fetches_per_address
+                .saturating_mul(FETCHES_PER_48);
+            if let Some(wide) = address_48(addr) {
+                limits
+                    .check(Limit::FetchFrom48(wide), per_48, now)
+                    .map_err(refused)?;
+            }
+            limits
+                .take(
+                    Limit::FetchFrom(prefix),
+                    rates.envelope_fetches_per_address,
+                    now,
+                )
+                .map_err(refused)?;
+            if let Some(wide) = address_48(addr) {
+                limits.charge(Limit::FetchFrom48(wide), now);
+            }
+        }
+        let presented = digest(auth);
+        self.writing(|| {
+            let epoch = self.store.unlock_epoch(&handle, kind)?.to_be_bytes();
+            let prefix = match prefix {
+                IpAddr::V4(v4) => v4.octets().to_vec(),
+                IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            // Charged before the comparison and committed with it, so no
+            // guess is free and a restart forgets none.
+            self.charge_slot(
+                &secret,
+                &[b"address", handle.as_bytes(), &[kind], &epoch, &prefix],
+                now,
+                |l, now| l.charge(self.cfg.rates.envelope_fetches_per_handle, now),
+            )?;
+            let daily = self.cfg.rates.envelope_fetches_per_handle_daily;
+            match self.envelope_of(&handle, kind, now)? {
+                Some(row) => {
+                    let mut guesses = self.store.envelope_guesses(&row.identity, kind)?;
+                    let charged = guesses.charge_daily(daily, now);
+                    self.store
+                        .set_envelope_guesses(&row.identity, kind, &guesses)?;
+                    charged.map_err(|retry_after| Refusal::RateLimited { retry_after })?;
+                    if constant_time_eq(&row.auth_hash, &presented) {
+                        return Ok((row.identity, row.bytes));
+                    }
+                }
+                // Where there is no envelope to keep it with, the day's
+                // count is kept as the address's is, so a handle with none
+                // reaches the ceiling as one with does.
+                None => self.charge_slot(
+                    &secret,
+                    &[b"handle", handle.as_bytes(), &[kind], &epoch],
+                    now,
+                    |l, now| l.charge_daily(daily, now),
+                )?,
+            }
+            Err(Refusal::NotFound)
+        })
+    }
+
+    /// Count one fetch in the slot `parts` hash to, a slot last counted in
+    /// for something else being taken over as new.
+    fn charge_slot(
+        &self,
+        secret: &[u8; 32],
+        parts: &[&[u8]],
+        now: u64,
+        charge: impl FnOnce(&mut Lockout, u64) -> Result<(), u64>,
+    ) -> Result<(), Refusal> {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("any key length");
+        mac.update(LOCKOUT_DOMAIN.as_bytes());
+        for part in parts {
+            mac.update(&(part.len() as u32).to_be_bytes());
+            mac.update(part);
+        }
+        let tag: [u8; 32] = mac.finalize().into_bytes().into();
+        let slot = u32::from_be_bytes(tag[..4].try_into().expect("4 bytes")) % LOCKOUT_SLOTS;
+        let mut lockout = match self.store.lockout_slot(slot)? {
+            Some((held, l)) if held == tag => l,
+            _ => Lockout::default(),
+        };
+        let charged = charge(&mut lockout, now);
+        self.store.set_lockout_slot(slot, &tag, &lockout)?;
+        charged.map_err(|retry_after| Refusal::RateLimited { retry_after })
+    }
+
+    /// `hxd registrar unlock` (§9.2): forget every count kept for the
+    /// handle's kinds, so its owner can fetch again at once.
+    pub fn unlock(&self, handle: &str, kinds: &[u8]) -> Result<(), OpError> {
+        let handle = handle.to_ascii_lowercase();
+        self.writing(|| {
+            let holder = self.store.handle(&handle)?;
+            for &kind in kinds {
+                self.store.bump_unlock_epoch(&handle, kind)?;
+                if let Some(h) = &holder {
+                    self.store
+                        .set_envelope_guesses(&h.identity, kind, &Lockout::default())?;
+                }
             }
             Ok(())
         })

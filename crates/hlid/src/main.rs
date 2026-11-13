@@ -32,12 +32,16 @@
 //! hlid revoke  --registrar HOST (--device-cert FILE | --device-pub HEX) [--reason R] [--by-device]
 //! hlid revoke  --registrar HOST --identity-revoke --yes
 //! hlid rotate  --registrar HOST --to SUCCESSOR_KEY
+//! hlid backup  --registrar HOST [--recovery | --delete [--recovery]]
+//!              the identity key sealed under a passphrase or a recovery code
+//! hlid restore --registrar HOST --handle S [--recovery]
+//!              the identity key back from its envelope, laid out as `init` does
 //! ```
 //!
 //! `--password` puts a secret on the command line, where anyone on the
 //! machine can read it out of `ps`. `--password-file` and
-//! `--password-stdin` don't; prefer them, and prompt-based entry lands
-//! with the registrar spec's password-wrapped key envelope.
+//! `--password-stdin` don't; prefer them. `backup` and `restore` read
+//! their passphrase or recovery code from those two alone.
 //!
 //! `--identity`, `--device`, `--cert` and `--card` fall back to fixed
 //! names in `$HLID_HOME` (default `~/.hlid`), which is what `hlid init`
@@ -46,10 +50,8 @@
 //! identity key, and a pre-filled path that guesses is right only for
 //! whoever followed one particular tutorial.
 //!
-//! Key files are the raw seed in hex. That is the prototype's storage;
-//! the registrar spec's password-wrapped envelope replaces it, and the
-//! seed format is what that envelope will wrap, so nothing here is
-//! thrown away.
+//! Key files are the raw seed in hex, the seed being what a registrar's
+//! envelope wraps (`hlid backup`).
 
 mod enroll;
 mod registrar;
@@ -88,6 +90,8 @@ fn main() {
         "register" => registrar::register_cmd(&args[1..]),
         "revoke" => registrar::revoke_cmd(&args[1..]),
         "rotate" => registrar::rotate_cmd(&args[1..]),
+        "backup" => registrar::backup_cmd(&args[1..]),
+        "restore" => registrar::restore_cmd(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = r {
@@ -116,6 +120,8 @@ fn usage() -> ! {
         "  hlid revoke --registrar HOST|URL (--device-cert FILE | --device-pub HEX) [--reason lost|stolen|retired] [--by-device]\n",
         "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
         "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--identity K]\n",
+        "  hlid backup --registrar HOST|URL [--recovery] [--delete] [--identity K] [--password-file F | --password-stdin]\n",
+        "  hlid restore --registrar HOST|URL --handle S [--recovery] [--name S] (--password-file F | --password-stdin)\n",
         "\n",
         "`hlid init` writes identity.key, device.key, cert.bin and card.bin into\n",
         "$HLID_HOME (default ~/.hlid), and --identity, --device, --cert and --card\n",
@@ -152,6 +158,13 @@ fn usage() -> ! {
         "thief with your identity key from moving them anywhere else. `revoke`\n",
         "publishes a device's revocation, or with --identity-revoke the\n",
         "identity's own, which is final.\n",
+        "\n",
+        "`hlid backup` seals the identity key under a passphrase and keeps it at\n",
+        "the registrar, which cannot open it; --recovery seals it under a new\n",
+        "recovery code instead and shows the code once, and --delete takes one\n",
+        "away. `hlid restore` fetches it back with the passphrase, or the code\n",
+        "with --recovery, and writes the identity into $HLID_HOME as `init`\n",
+        "does, with a new device and the card the registrar keeps.\n",
         "\n",
         "--bundle writes the certificate and the identity's card as one object\n",
         "instead of the certificate alone — the same thing enrollment carries, so\n",
@@ -191,6 +204,8 @@ const BARE: &[&str] = &[
     "password-stdin",
     "no-create",
     "create",
+    "recovery",
+    "delete",
 ];
 
 pub(crate) fn parse(args: &[String]) -> Args {
@@ -240,7 +255,7 @@ impl Args {
     /// A password from the least-bad source the user offered.
     /// `--password` is accepted because scripts exist, but it is visible
     /// in `ps` to everyone on the machine, so the other two come first.
-    fn password(&self) -> R<Option<String>> {
+    pub(crate) fn password(&self) -> R<Option<String>> {
         if self.has("password-stdin") {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
@@ -377,6 +392,20 @@ pub(crate) const IDENTITY_KEY: &str = "identity.key";
 const DEVICE_KEY: &str = "device.key";
 const CERT_FILE: &str = "cert.bin";
 pub(crate) const CARD_FILE: &str = "card.bin";
+/// What `hlid init` writes, and `hlid restore` does.
+pub(crate) const LAID_OUT: [&str; 4] = [IDENTITY_KEY, DEVICE_KEY, CERT_FILE, CARD_FILE];
+
+/// The first of [`LAID_OUT`] already in `home`, which nothing writes
+/// over.
+pub(crate) fn laid_out_already(home: &Path) -> R<()> {
+    match LAID_OUT.iter().map(|f| home.join(f)).find(|p| p.exists()) {
+        Some(p) => Err(format!(
+            "{} already exists; hlid will not write over an identity",
+            p.display()
+        )),
+        None => Ok(()),
+    }
+}
 
 pub(crate) fn read_seed(path: &Path) -> R<[u8; 32]> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -505,26 +534,39 @@ fn init(args: &[String]) -> R<()> {
     let a = parse(args);
     let name = a.one("name")?;
     let home = hlid_home()?;
-    create_private_dir(&home)?;
+    let id = IdentityKey::generate();
+    lay_out(&home, &id, None, name, &a)?;
+    println!(
+        "identity written to {}\n\
+         name:        {name}\n\
+         fingerprint: {}\n\
+         \n\
+         Every other hlid command falls back to these files, so --identity,\n\
+         --device, --cert and --card can be left off from here on.",
+        home.display(),
+        id.fingerprint()
+    );
+    Ok(())
+}
+
+/// `home` as `hlid init` fills it: the identity key, a new device key
+/// and its certificate, and `card`, or a new card under `name`.
+pub(crate) fn lay_out(
+    home: &Path,
+    id: &IdentityKey,
+    card: Option<&[u8]>,
+    name: &str,
+    a: &Args,
+) -> R<()> {
+    create_private_dir(home)?;
 
     // Check all four before writing any: a second `init` over a live
     // identity that failed half way would leave the directory holding a
     // device key certified by nothing, which is harder to explain than
     // refusing outright.
-    for f in [IDENTITY_KEY, DEVICE_KEY, CERT_FILE, CARD_FILE] {
-        let p = home.join(f);
-        if p.exists() {
-            return Err(format!(
-                "{} already exists; hlid init will not write over an identity",
-                p.display()
-            ));
-        }
-    }
+    laid_out_already(home)?;
 
-    let mut id_seed = [0u8; 32];
-    getrandom_seed(&mut id_seed);
-    write_private(&home.join(IDENTITY_KEY), &hex(&id_seed))?;
-    let id = IdentityKey::from_seed(&id_seed);
+    write_private(&home.join(IDENTITY_KEY), &hex(&*id.seed()))?;
 
     let mut dev_seed = [0u8; 32];
     getrandom_seed(&mut dev_seed);
@@ -537,30 +579,21 @@ fn init(args: &[String]) -> R<()> {
     // the key file next to it. Restricted certificates are for the
     // devices this one goes on to certify.
     let days = a.u64("days", cert::RECOMMENDED_LIFETIME / 86_400)?;
-    let mut c = DeviceCert::for_keys(&id, dev.public(), dev.public_enc(), now(), seconds(days)?)
+    let mut c = DeviceCert::for_keys(id, dev.public(), dev.public_enc(), now(), seconds(days)?)
         .map_err(|e| format!("--days: {e}"))?;
     c.name = Some(a.opt("device-name").unwrap_or("this machine").to_owned());
-    let cert_bytes = c.sign(&id);
+    let cert_bytes = c.sign(id);
     DeviceCert::parse(&cert_bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
     write_file(&home.join(CERT_FILE), &cert_bytes)?;
 
-    let card_bytes = Card::new(&id, name, now())
-        .sign(&id, Vec::new())
-        .map_err(|e| e.to_string())?;
+    let card_bytes = match card {
+        Some(card) => card.to_vec(),
+        None => Card::new(id, name, now())
+            .sign(id, Vec::new())
+            .map_err(|e| e.to_string())?,
+    };
     Card::parse(&card_bytes).map_err(|e| refuse_unreadable("card", e))?;
-    write_file(&home.join(CARD_FILE), &card_bytes)?;
-
-    println!(
-        "identity written to {}\n\
-         name:        {name}\n\
-         fingerprint: {}\n\
-         \n\
-         Every other hlid command falls back to these files, so --identity,\n\
-         --device, --cert and --card can be left off from here on.",
-        home.display(),
-        id.fingerprint()
-    );
-    Ok(())
+    write_file(&home.join(CARD_FILE), &card_bytes)
 }
 
 /// The directory holds private keys, so it is created 0700 rather than

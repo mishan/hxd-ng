@@ -74,6 +74,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+ "zeroize",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +259,15 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "block-buffer"
@@ -1237,13 +1259,16 @@ dependencies = [
 [[package]]
 name = "hl-identity"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 dependencies = [
+ "argon2",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hmac",
  "hpke",
  "sha2",
+ "unicode-normalization",
  "url",
  "x25519-dalek",
  "zeroize",
@@ -1392,7 +1417,7 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 [[package]]
 name = "hxcrypto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 dependencies = [
  "blowfish",
  "chacha20poly1305",
@@ -1733,7 +1758,7 @@ dependencies = [
 [[package]]
 name = "hxfiles-xfer"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 dependencies = [
  "sha2",
 ]
@@ -1741,12 +1766,12 @@ dependencies = [
 [[package]]
 name = "hxhfs"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 
 [[package]]
 name = "hxhope"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 dependencies = [
  "flate2",
  "hxcrypto",
@@ -1757,7 +1782,7 @@ dependencies = [
 [[package]]
 name = "hxproto"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=7db72a2fa7c5592a9dee5a158693f30c16a0ef94#7db72a2fa7c5592a9dee5a158693f30c16a0ef94"
+source = "git+https://github.com/mishan/hx-libs.git?rev=8cb5063c644972051492b1e1eab55e636f18a77d#8cb5063c644972051492b1e1eab55e636f18a77d"
 
 [[package]]
 name = "hybrid-array"
@@ -2445,6 +2470,17 @@ dependencies = [
  "elliptic-curve",
  "primeorder",
  "sha2",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
@@ -3446,7 +3482,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3875,6 +3911,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "universal-hash"

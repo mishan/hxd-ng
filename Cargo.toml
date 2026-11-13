@@ -39,12 +39,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Shared with GtkHx (see the note at the top of this file).
-hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
-hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
-hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
-hxhope = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
-hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
-hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "7db72a2fa7c5592a9dee5a158693f30c16a0ef94" }
+hxproto = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hxhope = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
 
 # Internal.
 hl-private-file = { path = "crates/hl-private-file" }
@@ -85,6 +85,13 @@ toml = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Argon2id at key backup's parameters (`docs/identity-registrar.md` §9.1)
+# is slow enough unoptimized to matter to the tests and a debug `hlid`.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 # Release, with line tables: what `perf record` and a flamegraph need to
 # name a frame (`docs/metrics.md`). `cargo build --profile profiling`.

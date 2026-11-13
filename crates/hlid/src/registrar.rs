@@ -1,6 +1,6 @@
 //! Talking to a registrar (`docs/identity-registrar.md` §11's user
 //! tools): register a handle, revoke a device or the identity, rotate to
-//! a successor key.
+//! a successor key, and keep the identity key there sealed (§9).
 //!
 //! `--registrar` is a host, reached over HTTPS as every verifier reaches
 //! it, or a full `http(s)://` URL for a test rig. Either way the
@@ -13,10 +13,11 @@
 
 use std::path::Path;
 
+use hl_identity::envelope::{Kdf, Keys, Kind, Secret};
 use hl_identity::registrar::{device_reason, identity_reason};
 use hl_identity::{
-    cbor, Attestation, Card, DeviceCert, DeviceKey, DeviceRevocation, Fingerprint, IdentityKey,
-    IdentityRevocation, Record, RegisterRequest, Rotation,
+    cbor, Attestation, Card, DeviceCert, DeviceKey, DeviceRevocation, EnvelopePut, Fingerprint,
+    IdentityKey, IdentityRevocation, KeyEnvelope, Record, RecoveryCode, RegisterRequest, Rotation,
 };
 use serde_json::{json, Value};
 
@@ -37,6 +38,7 @@ struct Registrar {
     retiring: Vec<[u8; 32]>,
     register: String,
     records: String,
+    envelopes: Option<String>,
 }
 
 fn agent() -> ureq::Agent {
@@ -92,25 +94,35 @@ fn discover(a: &Args) -> R<Registrar> {
             .unwrap_or_default(),
         register: endpoint("register")?,
         records: endpoint("records")?,
+        envelopes: endpoint("envelopes").ok(),
         base,
     })
 }
 
-/// POST `{ field: b64 }` and return the JSON reply, or the registrar's
-/// refusal as a sentence.
-fn post(url: &str, field: &str, bytes: &[u8]) -> R<Value> {
-    match agent().post(url).send_json(json!({ field: b64(bytes) })) {
-        Ok(resp) => resp.into_json().map_err(|e| format!("{url}: {e}")),
+/// Send a JSON body and return the JSON reply, or the registrar's
+/// refusal: its code, and a sentence.
+fn send(req: ureq::Request, body: Value) -> Result<Value, (String, String)> {
+    let url = req.url().to_owned();
+    match req.send_json(body) {
+        Ok(resp) => resp
+            .into_json()
+            .map_err(|e| (String::new(), format!("{url}: {e}"))),
         Err(ureq::Error::Status(code, resp)) => {
             let body: Value = resp.into_json().unwrap_or(Value::Null);
-            Err(format!(
-                "refused ({code} {}): {}",
-                body["error"].as_str().unwrap_or("?"),
+            let error = body["error"].as_str().unwrap_or("?").to_owned();
+            let sentence = format!(
+                "refused ({code} {error}): {}",
                 body["text"].as_str().unwrap_or("")
-            ))
+            );
+            Err((error, sentence))
         }
-        Err(e) => Err(format!("{url}: {e}")),
+        Err(e) => Err((String::new(), format!("{url}: {e}"))),
     }
+}
+
+/// POST `{ field: b64 }`.
+fn post(url: &str, field: &str, bytes: &[u8]) -> R<Value> {
+    send(agent().post(url), json!({ field: b64(bytes) })).map_err(|(_, e)| e)
 }
 
 fn identity(a: &Args) -> R<IdentityKey> {
@@ -492,4 +504,207 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<Value> {
         Record::Freeze(_) | Record::RevokeAttestation(_) => {}
     }
     Some(v)
+}
+
+// --- backup and restore ----------------------------------------------------
+
+fn envelopes(reg: &Registrar) -> R<&str> {
+    reg.envelopes
+        .as_deref()
+        .ok_or_else(|| format!("{} keeps no key backups", reg.host))
+}
+
+fn kind(a: &Args) -> Kind {
+    match a.has("recovery") {
+        true => Kind::RecoveryCode,
+        false => Kind::Passphrase,
+    }
+}
+
+/// Never from `--password`: a passphrase in `ps` is one anybody on the
+/// machine can fetch the identity key with.
+fn read_secret(a: &Args, what: &str) -> R<String> {
+    if a.has("password") {
+        return Err(format!(
+            "--password would put {what} where `ps` shows it; use --password-file or \
+             --password-stdin"
+        ));
+    }
+    a.password()?
+        .ok_or_else(|| format!("{what} is read from --password-file or --password-stdin"))
+}
+
+/// `hlid backup --registrar HOST [--recovery] [--delete]`: seal the
+/// identity key and put the envelope at the registrar (§9.2), under a
+/// passphrase, or under a recovery code made here and shown once.
+pub(crate) fn backup_cmd(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let reg = discover(&a)?;
+    let url = envelopes(&reg)?.to_owned();
+    let id = identity(&a)?;
+    let kind = kind(&a);
+    if a.has("delete") {
+        put_envelope(&url, |time| EnvelopePut::delete(&id, &reg.host, kind, time))?;
+        println!("the {} envelope is deleted at {}", noun(kind), reg.host);
+        return Ok(());
+    }
+    let code = RecoveryCode::generate();
+    let passphrase;
+    let secret = match kind {
+        Kind::RecoveryCode => Secret::RecoveryCode(&code),
+        Kind::Passphrase => {
+            passphrase = read_secret(&a, "the passphrase")?;
+            if passphrase.chars().count() < 12 {
+                eprintln!(
+                    "hlid: a short passphrase is a weak one, and whoever holds the envelope \
+                     can guess at it offline"
+                );
+            }
+            Secret::Passphrase(&passphrase)
+        }
+    };
+    let (envelope, keys) = KeyEnvelope::seal(&id, &secret).map_err(|e| format!("sealing: {e}"))?;
+    put_envelope(&url, |time| {
+        EnvelopePut::store(&id, &reg.host, time, &envelope, &keys)
+    })?;
+    println!(
+        "the identity key is kept at {}, sealed under {}",
+        reg.host,
+        match kind {
+            Kind::RecoveryCode => "a recovery code",
+            Kind::Passphrase => "your passphrase",
+        }
+    );
+    if kind == Kind::RecoveryCode {
+        println!(
+            "recovery code: {}\n\
+             write it down; it is shown this once and kept nowhere, and it replaces \
+             any code made before",
+            code.display().as_str()
+        );
+    }
+    Ok(())
+}
+
+/// A put must be later than the last of its kind, to the second, so one
+/// refused as no newer is signed again once the second has turned.
+fn put_envelope(url: &str, sign: impl Fn(u64) -> Result<Vec<u8>, hl_identity::Error>) -> R<()> {
+    let send_at = |time| -> Result<Value, (String, String)> {
+        let put = sign(time).map_err(|e| (String::new(), refuse_unreadable("envelope put", e)))?;
+        send(agent().put(url), json!({ "request": b64(&put) }))
+    };
+    let first = now();
+    match send_at(first) {
+        Err((code, _)) if code == "bad_time" => {
+            let wait = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| 1_000_000_000 - d.subsec_nanos())
+                .unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_nanos(wait.into()));
+            send_at(now().max(first + 1)).map_err(|(_, e)| e)?;
+        }
+        other => {
+            other.map_err(|(_, e)| e)?;
+        }
+    }
+    Ok(())
+}
+
+fn noun(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Passphrase => "passphrase",
+        Kind::RecoveryCode => "recovery code",
+    }
+}
+
+/// `hlid restore --registrar HOST --handle NAME [--recovery]`: the salt,
+/// the keys derived from it, the envelope they fetch, and the identity
+/// it opens to, laid out in `$HLID_HOME` as `hlid init` lays one out —
+/// with a new device, and the card the registrar keeps when it has one.
+pub(crate) fn restore_cmd(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let reg = discover(&a)?;
+    let url = envelopes(&reg)?.to_owned();
+    let handle = a.one("handle")?;
+    let kind = kind(&a);
+    let typed = read_secret(&a, &format!("the {}", noun(kind)))?;
+    let code;
+    let secret = match kind {
+        Kind::RecoveryCode => {
+            code = RecoveryCode::parse(&typed)
+                .ok_or("a recovery code is 20 characters, as four groups of five")?;
+            Secret::RecoveryCode(&code)
+        }
+        Kind::Passphrase => Secret::Passphrase(&typed),
+    };
+    // Before the fetch, which the handle's counts are charged for.
+    let home = crate::hlid_home()?;
+    crate::laid_out_already(&home)?;
+
+    let reply = send(
+        agent().post(&format!("{url}/params")),
+        json!({ "handle": handle, "kind": kind as u8 }),
+    )
+    .map_err(|(_, e)| e)?;
+    let kdf = Kdf::parse(&unb64(reply["kdf"].as_str().ok_or("reply has no kdf")?)?)
+        .map_err(|e| format!("the registrar's salt: {e}"))?;
+    let keys = Keys::derive(&secret, kdf).map_err(|e| format!("deriving: {e}"))?;
+    let reply = match send(
+        agent().post(&format!("{url}/fetch")),
+        json!({ "handle": handle, "kind": kind as u8, "auth": b64(keys.auth()) }),
+    ) {
+        Ok(reply) => reply,
+        Err((code, _)) if code == "not_found" => {
+            return Err(format!(
+                "{} has no {} envelope for {handle} that this {} opens",
+                reg.host,
+                noun(kind),
+                noun(kind)
+            ))
+        }
+        Err((_, e)) => return Err(e),
+    };
+    let identity: [u8; 32] = unb64(reply["identity"].as_str().ok_or("reply has no identity")?)?
+        .try_into()
+        .map_err(|_| "the reply's identity is not 32 bytes".to_string())?;
+    let envelope = KeyEnvelope::parse(&unb64(
+        reply["envelope"].as_str().ok_or("reply has no envelope")?,
+    )?)
+    .map_err(|e| format!("the envelope: {e}"))?;
+    let id = envelope
+        .open(&identity, &keys)
+        .map_err(|e| format!("the envelope did not open: {e}"))?;
+
+    let card = agent()
+        .get(&format!("{}/identity/card/{}", reg.base, id.fingerprint()))
+        .call()
+        .ok()
+        .and_then(|resp| {
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(resp.into_reader(), 64 * 1024),
+                &mut body,
+            )
+            .ok()?;
+            Some(body)
+        })
+        .filter(|b| Card::parse(b).is_ok_and(|c| c.identity == id.public()));
+    crate::lay_out(
+        &home,
+        &id,
+        card.as_deref(),
+        a.opt("name").unwrap_or(handle),
+        &a,
+    )?;
+    println!(
+        "identity {} restored to {}{}",
+        id.fingerprint(),
+        home.display(),
+        if card.is_some() {
+            ", with the card the registrar keeps"
+        } else {
+            ", with a new card"
+        }
+    );
+    Ok(())
 }

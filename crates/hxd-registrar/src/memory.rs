@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::store::{
-    entry_cost, Counts, Effect, HandleRow, IdentityRow, Issue, Issued, Key, NewRecord, Page,
-    Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore, StoreError,
+    entry_cost, Counts, Effect, EnvelopeRow, HandleRow, IdentityRow, Issue, Issued, Key, Lockout,
+    NewRecord, Page, Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore,
+    StoreError,
 };
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,14 @@ struct LogEntry {
     expires: u64,
     first: bool,
     bytes: Vec<u8>,
+}
+
+/// An envelope, or the tombstone of a deleted one.
+#[derive(Debug, Clone)]
+struct Envelope {
+    row: Option<EnvelopeRow>,
+    updated: u64,
+    guesses: Lockout,
 }
 
 #[derive(Debug, Default)]
@@ -35,6 +44,9 @@ struct State {
     recoveries: HashMap<String, Recovery>,
     /// Invite hash → spent.
     invites: HashMap<[u8; 32], bool>,
+    envelopes: HashMap<(Key, u8), Envelope>,
+    slots: HashMap<u32, ([u8; 32], Lockout)>,
+    epochs: HashMap<(String, u8), u64>,
     next_log: u64,
     next_record: u64,
 }
@@ -123,6 +135,9 @@ impl State {
             }
             Effect::DropPending(key) => {
                 self.pending.remove(key);
+            }
+            Effect::DeleteEnvelopes(key) => {
+                self.envelopes.retain(|(identity, _), _| identity != key);
             }
         }
     }
@@ -374,6 +389,89 @@ impl RegistrarStore for MemoryStore {
             }
         }
         Ok(added)
+    }
+
+    fn envelope(&self, identity: &Key, kind: u8) -> Result<Option<EnvelopeRow>, StoreError> {
+        let s = self.state.lock().unwrap();
+        Ok(s.envelopes
+            .get(&(*identity, kind))
+            .and_then(|e| e.row.clone()))
+    }
+
+    fn last_put(&self, identity: &Key, kind: u8) -> Result<Option<u64>, StoreError> {
+        let s = self.state.lock().unwrap();
+        Ok(s.envelopes.get(&(*identity, kind)).map(|e| e.updated))
+    }
+
+    fn put_envelope(&self, row: &EnvelopeRow) -> Result<(), StoreError> {
+        let mut s = self.state.lock().unwrap();
+        let e = s
+            .envelopes
+            .entry((row.identity, row.kind))
+            .or_insert(Envelope {
+                row: None,
+                updated: 0,
+                guesses: Lockout::default(),
+            });
+        e.row = Some(row.clone());
+        e.updated = row.updated;
+        Ok(())
+    }
+
+    fn delete_envelope(&self, identity: &Key, kind: u8, at: u64) -> Result<(), StoreError> {
+        let mut s = self.state.lock().unwrap();
+        let e = s.envelopes.entry((*identity, kind)).or_insert(Envelope {
+            row: None,
+            updated: 0,
+            guesses: Lockout::default(),
+        });
+        e.row = None;
+        e.updated = at;
+        Ok(())
+    }
+
+    fn envelope_guesses(&self, identity: &Key, kind: u8) -> Result<Lockout, StoreError> {
+        let s = self.state.lock().unwrap();
+        Ok(s.envelopes
+            .get(&(*identity, kind))
+            .map(|e| e.guesses)
+            .unwrap_or_default())
+    }
+
+    fn set_envelope_guesses(
+        &self,
+        identity: &Key,
+        kind: u8,
+        l: &Lockout,
+    ) -> Result<(), StoreError> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(e) = s.envelopes.get_mut(&(*identity, kind)) {
+            e.guesses = *l;
+        }
+        Ok(())
+    }
+
+    fn lockout_slot(&self, slot: u32) -> Result<Option<([u8; 32], Lockout)>, StoreError> {
+        Ok(self.state.lock().unwrap().slots.get(&slot).copied())
+    }
+
+    fn set_lockout_slot(&self, slot: u32, tag: &[u8; 32], l: &Lockout) -> Result<(), StoreError> {
+        self.state.lock().unwrap().slots.insert(slot, (*tag, *l));
+        Ok(())
+    }
+
+    fn unlock_epoch(&self, handle: &str, kind: u8) -> Result<u64, StoreError> {
+        let s = self.state.lock().unwrap();
+        Ok(s.epochs
+            .get(&(handle.to_owned(), kind))
+            .copied()
+            .unwrap_or(0))
+    }
+
+    fn bump_unlock_epoch(&self, handle: &str, kind: u8) -> Result<(), StoreError> {
+        let mut s = self.state.lock().unwrap();
+        *s.epochs.entry((handle.to_owned(), kind)).or_insert(0) += 1;
+        Ok(())
     }
 }
 

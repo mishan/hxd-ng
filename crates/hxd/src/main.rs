@@ -261,6 +261,11 @@ enum Command {
         identity: String,
         keep_age: bool,
     },
+    /// `registrar unlock <handle> [--kind K]`.
+    RegistrarUnlock {
+        handle: String,
+        kind: Option<String>,
+    },
     /// `registrar invites --add N`.
     RegistrarInvites {
         add: usize,
@@ -388,6 +393,7 @@ hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
 hxd [--config …] registrar revoke <handle> --reason abuse|lapsed|unspecified\n  \
 hxd [--config …] registrar recover <handle> --identity <fingerprint> [--keep-age]\n  \
 hxd [--config …] registrar invites --add N\n  \
+hxd [--config …] registrar unlock <handle> [--kind passphrase|recovery]\n  \
 hxd registrar inspect <host>\n  \
 hxd [--config …] history redact <line-id> --reason R\n  \
 hxd [--config …] media revoke <handle> --reason R [--no-block]\n  \
@@ -445,7 +451,8 @@ registrar attests (--lift publishes the lift); `revoke` withdraws the\n\
 attestations of a handle, and with --reason abuse keeps its holder from\n\
 reissuing it; `recover` gives a handle to a new key after the holder\n\
 proved themselves out of band; `invites --add` prints new invite codes\n\
-and appends them to the invites file. All of them act on the running\n\
+and appends them to the invites file; `unlock` forgets a handle's\n\
+envelope fetch counts, so its owner can restore at once. All of them act on the running\n\
 server's store directly. `inspect` fetches another registrar's log and\n\
 stats, verifies them, and prints the shape of the last month.\n\n\
 `inbox purge` takes an account's mail, news subscriptions and push\n\
@@ -522,6 +529,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut since = None;
     let mut no_block = false;
     let mut all = false;
+    let mut kind = None;
     let mut outcome = None;
     let mut note = None;
     let mut of = None;
@@ -639,6 +647,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             "--from" => from = Some(PathBuf::from(args.next().ok_or("--from needs a path")?)),
             "--next" => next = Some(PathBuf::from(args.next().ok_or("--next needs a path")?)),
             "--all" => all = true,
+            "--kind" => kind = Some(args.next().ok_or("--kind needs passphrase or recovery")?),
             "--outcome" => {
                 outcome = Some(
                     args.next()
@@ -780,6 +789,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if next.is_some() && !matches!(words[..], ["identity", "handover", _]) {
         return Err("--next belongs to `identity handover`".into());
     }
+    if kind.is_some() && !matches!(words[..], ["registrar", "unlock", _]) {
+        return Err("--kind belongs to `registrar unlock`".to_string());
+    }
     if add.is_some() && !matches!(words[..], ["registrar", "invites"]) {
         return Err("--add belongs to `registrar invites`".to_string());
     }
@@ -876,6 +888,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             identity: identity
                 .ok_or("`registrar recover` needs --identity <the new key's fingerprint>")?,
             keep_age,
+        },
+        ["registrar", "unlock", handle] => Command::RegistrarUnlock {
+            handle: handle.to_string(),
+            kind,
         },
         ["registrar", "invites"] => Command::RegistrarInvites {
             add: add.ok_or("`registrar invites` needs --add N")?,
@@ -1109,6 +1125,11 @@ async fn main() {
                         " with a fresh age"
                     }
                 );
+                return Ok(());
+            }
+            Command::RegistrarUnlock { handle, kind } => {
+                hxd::registrar::unlock(&config, handle, kind.as_deref())?;
+                println!("{handle}'s envelope fetch counts are forgotten");
                 return Ok(());
             }
             Command::RegistrarInvites { add } => {

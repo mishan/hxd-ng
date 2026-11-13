@@ -459,7 +459,9 @@ async fn route(
 
     if path == crate::registrar::PREFIX || path.starts_with("/registrar/") {
         let resp = match ctx.registrar.clone() {
-            Some(reg) => boxed(crate::registrar::route(req, client.ip(), reg).await),
+            Some(reg) => boxed(
+                crate::registrar::route(req, client.ip(), reg, ctx.core.clock().clone()).await,
+            ),
             None => plain(StatusCode::NOT_FOUND, "this server is not a registrar"),
         };
         return cors(resp);
