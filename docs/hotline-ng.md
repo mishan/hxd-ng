@@ -104,7 +104,8 @@ resumes it within the **grace window**, the server MUST end it.
 - A server SHOULD cap detached sessions per source address, ending the
   oldest when the cap is exceeded. It SHOULD count each account apart
   within that cap: many people share one address behind carrier-grade
-  NAT or a home router, and one person's detach must not end another's.
+  NAT or a home router, and one person's detach should not end another's
+  short of the address's own cap.
   *hxd-ng:* `[ng] max_detached_per_login`, default 2, for one login at
   one address, and `[ng] max_detached_per_addr`, default 32, for every
   login there together; an IPv6 address counts as its /64.
