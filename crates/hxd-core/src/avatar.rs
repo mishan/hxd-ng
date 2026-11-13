@@ -565,10 +565,7 @@ impl Core {
     /// A session's avatar with its bytes.
     pub fn avatar_of(&self, uid: Uid) -> Option<Avatar> {
         let r = self.roster.lock().unwrap();
-        r.users
-            .get(&uid)
-            .filter(|s| s.live())
-            .and_then(|s| s.avatar.clone())
+        r.named(uid).and_then(|s| s.avatar.clone())
     }
 
     /// Every visible session's avatar, in uid order.

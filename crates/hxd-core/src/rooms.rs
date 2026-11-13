@@ -615,7 +615,7 @@ impl RosterInner {
         target: Uid,
     ) -> Result<(), crate::ChatError> {
         use crate::ChatError;
-        let invitee = self.users.get(&target).filter(|s| s.live());
+        let invitee = self.named(target);
         let (Some(inviter), Some(invitee)) = (self.users.get(&by), invitee) else {
             return Err(ChatError::NoSuchUser);
         };

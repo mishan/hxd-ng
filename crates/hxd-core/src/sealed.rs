@@ -141,11 +141,7 @@ impl Core {
                     .map_err(SealedError::RateLimited)?;
             }
             let asker = sess.mailbox();
-            let target = r
-                .users
-                .get(&of)
-                .filter(|s| s.live())
-                .ok_or(SealedError::NoSuchUser)?;
+            let target = r.named(of).ok_or(SealedError::NoSuchUser)?;
             (target.mailbox(), asker)
         };
         self.blocks(&owner, &other)?;
@@ -177,11 +173,7 @@ impl Core {
             if sealed_of(sender).is_none() {
                 return Err(SealedError::SelfNotSealed);
             }
-            let target = r
-                .users
-                .get(&to)
-                .filter(|s| s.live())
-                .ok_or(SealedError::NoSuchUser)?;
+            let target = r.named(to).ok_or(SealedError::NoSuchUser)?;
             self.sealed_to(target, &sealed_to)?;
             (target.mailbox(), sender.mailbox(), target.serial)
         };
