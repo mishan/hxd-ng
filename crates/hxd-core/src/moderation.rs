@@ -925,7 +925,7 @@ impl Core {
             let r = self.roster.lock().unwrap();
             r.users
                 .values()
-                .find(|s| s.visible && s.is_person && s.login == login)
+                .find(|s| s.live() && s.is_person && s.login == login)
                 .map(|s| s.mailbox())
         };
         on_roster.or_else(|| Some(self.directory.as_ref()?.account(login)?.0))
@@ -937,7 +937,7 @@ impl Core {
         let r = self.roster.lock().unwrap();
         r.users
             .iter()
-            .filter(|(_, s)| s.visible && s.moderate)
+            .filter(|(_, s)| s.live() && s.moderate)
             .map(|(uid, s)| {
                 let mut who = vec![Principal::Session {
                     uid: *uid,
@@ -1065,7 +1065,7 @@ impl Core {
                 let sess = r
                     .users
                     .get(uid)
-                    .filter(|s| s.visible && !s.system)
+                    .filter(|s| s.live() && !s.system)
                     .ok_or(ModError::NoSuchUser)?;
                 if !(sess.is_person || sess.identity.is_some()) {
                     return Err(ModError::NoIdentity);
@@ -1096,7 +1096,7 @@ impl Core {
                     let r = self.roster.lock().unwrap();
                     r.users
                         .values()
-                        .find(|s| s.visible && s.identity == Some(*fp))
+                        .find(|s| s.live() && s.identity == Some(*fp))
                         .map(|s| (s.is_person.then(|| s.login.clone()), s.info.nick.clone()))
                 };
                 // Not here: the account the key links, for a name.
@@ -1678,7 +1678,7 @@ impl Core {
                         let sess = r
                             .users
                             .get(uid)
-                            .filter(|s| s.visible && !s.system)
+                            .filter(|s| s.live() && !s.system)
                             .ok_or(ModError::NoSuchTarget)?;
                         Subject {
                             login: sess.is_person.then(|| sess.login.clone()),
@@ -1997,7 +1997,7 @@ impl Core {
         let moderators: Vec<Uid> = r
             .users
             .iter()
-            .filter(|(uid, s)| s.visible && s.moderate && !reporter.contains(uid))
+            .filter(|(uid, s)| s.live() && s.moderate && !reporter.contains(uid))
             .map(|(uid, _)| *uid)
             .collect();
         for uid in reporter {

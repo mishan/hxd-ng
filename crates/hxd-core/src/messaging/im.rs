@@ -30,7 +30,7 @@ use crate::inbox::{
 use crate::reaction::{ReactError, ReactionKey};
 use crate::relationships::{RelationId, Requester, SentOn};
 use crate::reply::{ImTarget, Reply};
-use crate::roster::{is_live, Event, RosterInner, Uid, UserSession};
+use crate::roster::{is_live, Announced, Event, RosterInner, Uid, UserSession};
 use crate::Core;
 
 /// An instant message as it reaches a messenger session (IM Deliver,
@@ -121,11 +121,11 @@ pub(crate) fn understands_requests(s: &UserSession) -> bool {
 /// (`Transport::messenger_session`), which the friend family alone does.
 fn im_sessions(r: &RosterInner, to: &Mailbox) -> Vec<Uid> {
     let mut uids = sessions_of(r, to);
-    uids.extend(
-        r.taking_part(to)
-            .into_iter()
-            .filter(|u| r.users.get(u).is_some_and(|s| !s.visible)),
-    );
+    uids.extend(r.taking_part(to).into_iter().filter(|u| {
+        r.users
+            .get(u)
+            .is_some_and(|s| s.announced == Announced::Messenger)
+    }));
     uids
 }
 

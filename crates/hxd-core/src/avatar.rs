@@ -360,7 +360,7 @@ impl Core {
         }
         sess.info.avatar = avatar.as_ref().map(|a| a.meta.clone());
         sess.avatar = avatar;
-        if sess.visible {
+        if sess.live() {
             let ev = Event::AvatarChanged(sess.info.clone());
             r.broadcast_where(&ev, None, |_| true);
         }
@@ -552,7 +552,7 @@ impl Core {
             }
             sess.avatar = avatar.clone();
             sess.info.avatar = meta.clone();
-            if sess.visible {
+            if sess.live() {
                 changed.push(sess.info.clone());
             }
         }
@@ -567,7 +567,7 @@ impl Core {
         let r = self.roster.lock().unwrap();
         r.users
             .get(&uid)
-            .filter(|s| s.visible)
+            .filter(|s| s.live())
             .and_then(|s| s.avatar.clone())
     }
 
@@ -577,7 +577,7 @@ impl Core {
         let mut all: Vec<_> = r
             .users
             .iter()
-            .filter(|(_, s)| s.visible)
+            .filter(|(_, s)| s.live())
             .filter_map(|(uid, s)| s.avatar.clone().map(|a| (*uid, a)))
             .collect();
         all.sort_by_key(|(uid, _)| *uid);
