@@ -1798,7 +1798,7 @@ fn whole(signed: &Value, text: &str, home: u8) -> bool {
     }
     let line = Signed::<ChatLine>::parse_detached(&form, [text], now()).unwrap();
     assert_eq!(
-        (line.message.server, line.message.room),
+        (line.message().server, line.message().room),
         (discovery_key(home), 0)
     );
     true
@@ -2097,7 +2097,7 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
         if link_cert_sha256(&form).is_err() {
             let m =
                 Signed::<PrivateMessage>::parse_detached(&form, [text.as_str()], now()).unwrap();
-            assert_eq!(m.message.to, fingerprint(&bob));
+            assert_eq!(m.message().to, fingerprint(&bob));
             break;
         }
         assert!(n < 100, "never whole");
@@ -2170,7 +2170,7 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
     let Opened::Verified { message, .. } = opened else {
         panic!("not verified: {opened:?}");
     };
-    assert_eq!(message.message.text, "only you");
+    assert_eq!(message.message().text, "only you");
     let wrong = on_a
         .request(
             "msg",
