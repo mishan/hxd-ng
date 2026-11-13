@@ -1273,9 +1273,9 @@ impl Core {
         let r = self.roster.lock().unwrap();
         let mut rows: Vec<UserInfo> = r
             .users
-            .values()
-            .filter(|s| s.live())
-            .map(|s| s.info.clone())
+            .iter()
+            .filter(|(uid, s)| s.live() && r.listed(**uid, s))
+            .map(|(_, s)| r.row_view(s))
             .chain(
                 r.ghosts
                     .values()

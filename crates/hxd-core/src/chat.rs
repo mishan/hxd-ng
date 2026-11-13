@@ -220,6 +220,14 @@ fn holds(r: &RosterInner, mailbox: &Mailbox, uid: &Uid) -> bool {
 /// attached, else the lowest attached of [`attached_sessions_of`]; and
 /// all of them for a message that named the account.
 fn named_sessions(r: &RosterInner, mailbox: &Mailbox, named: Option<Uid>, sender: Uid) -> Vec<Uid> {
+    // A person's row names every one of its sessions, and no other.
+    if let Some(members) = named.and_then(|row| r.person_members(row)) {
+        return members
+            .iter()
+            .copied()
+            .filter(|uid| *uid != sender && r.users.get(uid).is_some_and(is_live))
+            .collect();
+    }
     match named {
         Some(uid) if holds(r, mailbox, &uid) => vec![uid],
         Some(_) => attached_sessions_of(r, mailbox, sender)
@@ -1371,7 +1379,7 @@ impl Core {
             let mut r = self.roster.lock().unwrap();
             let ev = Event::Chat {
                 cid: room,
-                from: s.info,
+                from: r.shown_info(s.info),
                 text: s.text,
                 style: s.style,
                 id,
@@ -1520,7 +1528,7 @@ impl Core {
         };
         let ev = Event::Chat {
             cid,
-            from: info,
+            from: r.shown_info(info),
             text,
             style,
             id: None,
@@ -2501,7 +2509,10 @@ impl Core {
                     _ => uids,
                 }
             } else {
-                to.uid.into_iter().collect()
+                match to.uid.and_then(|row| r.person_members(row)) {
+                    Some(members) => members.iter().copied().filter(|u| *u != from).collect(),
+                    None => to.uid.into_iter().collect(),
+                }
             };
             if uids.is_empty() {
                 return Err(ChatError::NoSuchUser);
@@ -2514,7 +2525,7 @@ impl Core {
                 self.media_capture(handle, audience.clone());
             }
             let ev = Event::Msg {
-                from: sender.uid,
+                from: r.row_uid(sender.uid),
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
@@ -2604,7 +2615,7 @@ impl Core {
                 self.media_capture(handle, audience.clone());
             }
             let ev = Event::Msg {
-                from: sender.uid,
+                from: r.row_uid(sender.uid),
                 from_nick: sender.nick,
                 from_login: sender.reply_login,
                 text,
@@ -3114,6 +3125,8 @@ impl Core {
                     // the recipient's own uid, which is what mail between
                     // two sessions of one account would otherwise name,
                     // and a reply to it is to oneself.
+                    // Compared as rows: a person's other device is the
+                    // recipient itself.
                     let from = sending
                         .filter(|s| Some(m.id) == fresh && r.users.contains_key(s))
                         .or_else(|| {
@@ -3123,9 +3136,11 @@ impl Core {
                                 .sender
                                 .as_ref()
                                 .filter(|s| s.fingerprint.is_some() || s.login != "guest")?;
-                            sessions_of(&r, s).into_iter().find(|u| *u != uid)
+                            sessions_of(&r, s)
+                                .into_iter()
+                                .find(|u| r.row_uid(*u) != r.row_uid(uid))
                         })
-                        .unwrap_or(0);
+                        .map_or(0, |s| r.row_uid(s));
                     let from_login = m
                         .sender
                         .as_ref()

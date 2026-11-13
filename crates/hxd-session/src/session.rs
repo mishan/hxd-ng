@@ -2909,6 +2909,10 @@ async fn complete_login(
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
+    // Told again as the person it joined, whose row it is shown as.
+    if ctx.core.row_uid(sess.uid) != sess.uid {
+        push_self_info(tx, ctx, sess);
+    }
     drop(permit);
     // A pure messenger takes no private messages (bit 8), so its
     // account's mail waits for a session that does.
@@ -5385,7 +5389,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .unwrap_or(0);
             // Self-info is always allowed (the reference server's
             // options.self_info default); other users need the bit.
-            if target != sess.uid && !sess.can(bit::GET_USER_INFO) {
+            if target != ctx.core.row_uid(sess.uid) && !sess.can(bit::GET_USER_INFO) {
                 reply_error(tx, f.trans, "You are not allowed to get user information.");
                 return;
             }
@@ -5424,7 +5428,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // moderator alone, where mhxd shows them to anyone with the
             // bit: the bootstrap guest holds it, and an address locates a
             // person while a login is half of a password guess.
-            let full = target == sess.uid || sess.can(bit::DISCONNECT_USERS);
+            let full = target == ctx.core.row_uid(sess.uid) || sess.can(bit::DISCONNECT_USERS);
             let info = format!(
                 "    name: {}\r   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
                 d.info.nick,

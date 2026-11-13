@@ -15,6 +15,7 @@ pub mod ban;
 pub mod budget;
 pub mod chat;
 pub mod clock;
+mod coalesce;
 pub mod emoji;
 pub mod files;
 pub mod history;

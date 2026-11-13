@@ -1214,6 +1214,8 @@ pub(crate) struct UserSession {
     pub(crate) search_tokens: f64,
     /// Where the session is between its login and the roster.
     pub(crate) announced: Announced,
+    /// One of a person's sessions sharing its row (`crate::coalesce`).
+    pub(crate) grouped: bool,
     /// The avatar `info.avatar` describes, with its bytes.
     pub(crate) avatar: Option<crate::avatar::Avatar>,
     pub(crate) outbox: Outbox,
@@ -1377,7 +1379,7 @@ impl UidQuarantine {
 #[derive(Default)]
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
-    last_uid: Uid,
+    pub(crate) last_uid: Uid,
     pub(crate) freed_uids: UidQuarantine,
     /// Other servers' users shown here, apart from the sessions so that
     /// nothing that acts on a session finds one (`crate::server_link`).
@@ -1402,6 +1404,7 @@ pub(crate) struct RosterInner {
     /// Who takes part in instant messaging, and what their friends were
     /// last told of them (`crate::messaging`).
     pub(crate) presences: crate::messaging::Presences,
+    pub(crate) persons: crate::coalesce::Persons,
 }
 
 impl RosterInner {
@@ -1410,21 +1413,42 @@ impl RosterInner {
     /// `_mut` twin, so that what a uid names is decided in one place, and
     /// changes there when a person's sessions share one row.
     pub(crate) fn named(&self, uid: Uid) -> Option<&UserSession> {
-        self.users.get(&uid).filter(|s| s.live())
+        let session = self.named_session(uid)?;
+        self.users.get(&session)
     }
 
     pub(crate) fn named_mut(&mut self, uid: Uid) -> Option<&mut UserSession> {
-        self.users.get_mut(&uid).filter(|s| s.live())
+        let session = self.named_session(uid)?;
+        self.users.get_mut(&session)
+    }
+
+    /// The session a named uid stands for: a person's row its first live
+    /// member, a session alone itself, and a grouped session's own uid,
+    /// which no list shows, nobody.
+    fn named_session(&self, uid: Uid) -> Option<Uid> {
+        if let Some(members) = self.person_members(uid) {
+            return members.first().copied();
+        }
+        self.users
+            .get(&uid)
+            .filter(|s| s.live() && !s.grouped)
+            .map(|_| uid)
     }
 
     /// The row a session is shown as.
     pub(crate) fn row_of(&self, session: Uid) -> RowId {
-        RowId(session)
+        RowId(self.row_uid(session))
     }
 
     /// The sessions a row stands for, as far as the roster still holds them.
     pub(crate) fn row_sessions(&self, row: RowId) -> impl Iterator<Item = Uid> + '_ {
-        self.users.contains_key(&row.0).then_some(row.0).into_iter()
+        let person = self.person_members(row.0);
+        let alone = person.is_none() && self.users.contains_key(&row.0);
+        person
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(alone.then_some(row.0))
     }
 
     /// Every session a membership list's rows stand for.
@@ -1482,11 +1506,12 @@ impl RosterInner {
 
     /// `uid`'s row changed: told to everyone who sees it, and the links.
     pub(crate) fn row_changed(&mut self, uid: Uid) {
-        let Some(sess) = self.users.get(&uid).filter(|s| s.live()) else {
+        if !self.users.get(&uid).is_some_and(|s| s.live()) {
             return;
-        };
-        let ev = Event::Changed(sess.info.clone());
-        self.broadcast(&ev, None);
+        }
+        if let Some(ev) = self.changed_event(uid) {
+            self.broadcast(&ev, None);
+        }
         self.export_changed(uid);
     }
 
@@ -1499,7 +1524,13 @@ impl RosterInner {
         // ones — stable ids for the lifetime of a session, no reuse while
         // alive or for UID_QUARANTINE after.
         self.freed_uids.release_expired(now);
-        if self.users.len() + self.ghosts.len() + self.freed_uids.held.len()
+        let rows_alone = self
+            .persons
+            .rows
+            .keys()
+            .filter(|row| !self.users.contains_key(row))
+            .count();
+        if self.users.len() + self.ghosts.len() + self.freed_uids.held.len() + rows_alone
             >= usize::from(u16::MAX)
         {
             // A uid is never both in use and held, so this is every uid:
@@ -1515,6 +1546,7 @@ impl RosterInner {
             if !self.users.contains_key(&uid)
                 && !self.ghosts.contains_key(&uid)
                 && !self.freed_uids.holds(uid)
+                && !self.is_row(uid)
             {
                 return Some(self.last_uid);
             }
@@ -1635,8 +1667,12 @@ impl RosterInner {
         // room it leaves has to be renegotiated and re-announced, and
         // that has nothing to do with the chat rooms below.
         self.voice_part(uid);
-        crate::Core::leave_all_chats(self, uid);
-        self.room_leave_all(uid);
+        // Rooms and chats are the person's, and a device's end leaves
+        // them only if it is the person's last.
+        if !self.person_stays(uid) {
+            crate::Core::leave_all_chats(self, uid);
+            self.room_leave_all(uid);
+        }
         let Some(sess) = self.users.remove(&uid) else {
             return;
         };
@@ -1644,14 +1680,32 @@ impl RosterInner {
             self.presence_leave(uid, &sess.mailbox());
         }
         self.export_gone(&sess);
-        self.freed_uids.hold(uid, Instant::now());
-        if sess.live() {
-            self.broadcast(&Event::Parted(uid), Some(uid));
+        match self.coalesce_leave(uid, &sess) {
+            crate::coalesce::Left::Alone => {
+                self.freed_uids.hold(uid, Instant::now());
+                if sess.live() {
+                    self.broadcast(&Event::Parted(uid), Some(uid));
+                }
+            }
+            crate::coalesce::Left::Last { row } => {
+                self.freed_uids.hold(uid, Instant::now());
+                self.freed_uids.hold(row, Instant::now());
+                self.broadcast(&Event::Parted(row), Some(uid));
+            }
+            // The row stays the person's, held until its last session ends.
+            crate::coalesce::Left::Stays { row, changed } => {
+                if uid != row {
+                    self.freed_uids.hold(uid, Instant::now());
+                }
+                if let Some(ev) = changed {
+                    self.broadcast(&ev, None);
+                }
+            }
         }
     }
 
     /// Flip status and tell the roster (a status change is a user change).
-    fn set_status(&mut self, uid: Uid, status: SessionStatus) {
+    pub(crate) fn set_status(&mut self, uid: Uid, status: SessionStatus) {
         let Some(sess) = self.users.get_mut(&uid) else {
             return;
         };
@@ -1661,8 +1715,9 @@ impl RosterInner {
         sess.info.status = status;
         let messaging = sess.messaging.is_some().then(|| sess.mailbox());
         if sess.live() {
-            let ev = Event::Changed(sess.info.clone());
-            self.broadcast(&ev, None);
+            if let Some(ev) = self.changed_event(uid) {
+                self.broadcast(&ev, None);
+            }
             self.export_changed(uid);
         }
         if let Some(m) = messaging {
@@ -2137,6 +2192,13 @@ impl Core {
         self
     }
 
+    /// Show a person's sessions as one row of the roster
+    /// (`crate::coalesce`).
+    pub fn with_coalesce(self, on: bool) -> Self {
+        self.roster.lock().unwrap().persons.on = on;
+        self
+    }
+
     /// Let one login hold at most `n` detached sessions at one network
     /// rather than [`DETACHED_PER_LOGIN`].
     pub fn with_detached_per_login(mut self, n: usize) -> Self {
@@ -2479,6 +2541,7 @@ impl Core {
                 search_refill: Instant::now(),
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 announced: Announced::Pending,
+                grouped: false,
                 avatar: None,
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
@@ -2507,8 +2570,17 @@ impl Core {
                 sess.announced = Announced::Messenger;
             } else {
                 sess.announced = Announced::Live;
-                let ev = Event::Joined(sess.info.clone());
-                r.broadcast(&ev, Some(uid));
+                match r.coalesce_join(uid) {
+                    crate::coalesce::Joined::Another(changed) => {
+                        if let Some(ev) = changed {
+                            r.broadcast(&ev, None);
+                        }
+                    }
+                    _ => {
+                        let ev = Event::Joined(r.row_view(&r.users[&uid]));
+                        r.broadcast(&ev, Some(uid));
+                    }
+                }
                 r.export_shown(uid);
             }
             if let Some(load) = load.as_mut() {
@@ -2564,8 +2636,9 @@ impl Core {
             }
         }
         if changed && sess.live() {
-            let ev = Event::Changed(sess.info.clone());
-            r.broadcast(&ev, None);
+            if let Some(ev) = r.changed_event(uid) {
+                r.broadcast(&ev, None);
+            }
             r.export_changed(uid);
         }
         changed
@@ -2612,8 +2685,7 @@ impl Core {
             return true;
         }
         sess.proved_late = true;
-        if sess.live() {
-            let ev = Event::Changed(sess.info.clone());
+        if let Some(ev) = r.changed_event(uid) {
             r.broadcast(&ev, None);
         }
         true
@@ -2888,9 +2960,9 @@ impl Core {
         let r = self.roster.lock().unwrap();
         let mut v: Vec<_> = r
             .users
-            .values()
-            .filter(|s| s.live())
-            .map(|s| s.info.clone())
+            .iter()
+            .filter(|(uid, s)| s.live() && r.listed(**uid, s))
+            .map(|(_, s)| r.row_view(s))
             .collect();
         v.sort_by_key(|u| u.uid);
         v
@@ -2901,14 +2973,39 @@ impl Core {
     /// [`Core::user_details`] when visibility must gate the answer.)
     pub fn user(&self, uid: Uid) -> Option<UserInfo> {
         let r = self.roster.lock().unwrap();
-        r.users.get(&uid).map(|s| s.info.clone())
+        r.users.get(&uid).map(|s| UserInfo {
+            uid: r.row_uid(uid),
+            ..s.info.clone()
+        })
+    }
+
+    /// The uid `uid`'s session is shown as: its person's row, or its own.
+    pub fn row_uid(&self, uid: Uid) -> Uid {
+        self.roster.lock().unwrap().row_uid(uid)
+    }
+
+    /// [`Core::user_details`] for a session asking about itself: by its
+    /// own uid, which names nobody to anyone else once it is one of a
+    /// person's.
+    pub fn own_details(&self, uid: Uid) -> Option<UserDetails> {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).filter(|s| s.live()).map(|s| UserDetails {
+            info: r.row_view(s),
+            login: s.login.clone(),
+            addr: s.addr,
+            connected_at: s.connected_at,
+            roles: s
+                .account
+                .as_ref()
+                .map_or_else(Vec::new, |a| a.roles.clone()),
+        })
     }
 
     /// The fuller view of a *visible* user (the user-info op).
     pub fn user_details(&self, uid: Uid) -> Option<UserDetails> {
         let r = self.roster.lock().unwrap();
         r.named(uid).map(|s| UserDetails {
-            info: s.info.clone(),
+            info: r.row_view(s),
             login: s.login.clone(),
             addr: s.addr,
             connected_at: s.connected_at,

@@ -706,12 +706,17 @@ impl Core {
     fn uid_of_nick(&self, nick: &str) -> Option<Uid> {
         let r = self.roster.lock().unwrap();
         let mut found = None;
+        // By row: a person's sessions are one name, not several.
         for (uid, sess) in r.users.iter() {
-            if sess.live() && !sess.system && sess.info.nick.eq_ignore_ascii_case(nick) {
+            if sess.live()
+                && r.listed(*uid, sess)
+                && !sess.system
+                && sess.info.nick.eq_ignore_ascii_case(nick)
+            {
                 if found.is_some() {
                     return None;
                 }
-                found = Some(*uid);
+                found = Some(r.row_uid(*uid));
             }
         }
         found

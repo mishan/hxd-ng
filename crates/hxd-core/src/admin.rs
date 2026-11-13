@@ -630,7 +630,9 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     if stale {
         r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
     }
-    for (info, only_roles) in rows {
+    // A person's sessions are one row, told once.
+    let mut told = std::collections::HashSet::new();
+    for (info, only_roles) in rows.into_iter().filter(|(info, _)| told.insert(info.uid)) {
         r.broadcast_where(&Event::Changed(info), None, |s| {
             let syncs = s.info.transport.roles;
             !(stale && syncs) && (!only_roles || syncs)
@@ -705,7 +707,7 @@ fn give_account(
     shown |= renamed;
     // A change to its roles alone, to the wires that can show one.
     let only_roles = !shown && roles_changed;
-    let shown = ((shown || roles_changed) && s.live()).then(|| s.info.clone());
+    let shown = ((shown || roles_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
     // The admin bit never crosses a link; only the name does.
     if shown.is_some() && renamed {

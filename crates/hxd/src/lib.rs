@@ -2287,6 +2287,11 @@ pub struct ServerSection {
     /// is a plaintext equivalent, is not offered anywhere.
     #[serde(default = "default_true")]
     pub classic: bool,
+    /// Show a person's sessions as one row of the roster. Being built:
+    /// rooms, voice, kicks and links do not know of it yet, so it stays
+    /// off, and out of the operator's docs, until they do.
+    #[serde(default)]
+    pub coalesce: bool,
     /// Advertised server name.
     #[serde(default = "default_name")]
     pub name: String,
@@ -2763,6 +2768,7 @@ impl Default for ServerSection {
         ServerSection {
             bind: default_bind(),
             classic: true,
+            coalesce: false,
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),
@@ -4817,7 +4823,9 @@ pub fn build_ctx(
             .with_logins_in_flight(config.server.logins_in_flight),
     };
 
-    let core = core.with_bulk_rows(config.roles.bulk_rows);
+    let core = core
+        .with_bulk_rows(config.roles.bulk_rows)
+        .with_coalesce(config.server.coalesce);
     let core = match &config.ng {
         Some(ng) => core.with_detached_per_login(ng.max_detached_per_login),
         None => core,

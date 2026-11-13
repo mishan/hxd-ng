@@ -141,7 +141,12 @@ impl Core {
                     .map_err(SealedError::RateLimited)?;
             }
             let asker = sess.mailbox();
-            let target = r.named(of).ok_or(SealedError::NoSuchUser)?;
+            // A person's sessions are sealed to by device, which a client
+            // names once it is told a person's devices; until then none.
+            let target = r
+                .named(of)
+                .filter(|s| !s.grouped)
+                .ok_or(SealedError::NoSuchUser)?;
             (target.mailbox(), asker)
         };
         self.blocks(&owner, &other)?;
@@ -173,7 +178,12 @@ impl Core {
             if sealed_of(sender).is_none() {
                 return Err(SealedError::SelfNotSealed);
             }
-            let target = r.named(to).ok_or(SealedError::NoSuchUser)?;
+            // A person's sessions are sealed to by device, which a client
+            // names once it is told a person's devices; until then none.
+            let target = r
+                .named(to)
+                .filter(|s| !s.grouped)
+                .ok_or(SealedError::NoSuchUser)?;
             self.sealed_to(target, &sealed_to)?;
             (target.mailbox(), sender.mailbox(), target.serial)
         };
