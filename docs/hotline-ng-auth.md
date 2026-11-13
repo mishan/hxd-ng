@@ -145,7 +145,7 @@ sig = Ed25519.sign(key, domain || 0x00 || cbor_bytes_without_sig)
   exactly `n` bytes.
 
 `hotline-ng-identity.md` §3.1 restates these rules so that it stands
-alone; the two MUST NOT drift. *hxd-ng:* `crates/hl-identity` implements
+alone; the two MUST NOT drift. *hxd-ng:* hx-libs' `hl-identity` implements
 both.
 
 ### 4.2 Fingerprint
