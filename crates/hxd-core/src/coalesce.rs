@@ -991,6 +991,75 @@ pub(crate) mod tests {
         assert_eq!(admins(&mut rx2), [false]);
     }
 
+    /// An account backend whose roles, once armed, wait for a release.
+    #[derive(Default)]
+    struct GatedRoles {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicBool,
+        held: std::sync::Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    impl crate::account::AccountAdmin for GatedRoles {
+        fn read_account(&self, _: &str) -> Result<Account, crate::AdminError> {
+            Err(crate::AdminError::NoSuchAccount)
+        }
+        fn list_accounts(&self) -> Result<Vec<Account>, crate::AdminError> {
+            Ok(Vec::new())
+        }
+        fn write_account(
+            &self,
+            _: &crate::AccountEdit,
+            _: crate::account::WriteCheck<'_>,
+        ) -> Result<Account, crate::AdminError> {
+            Err(crate::AdminError::NotAllowed)
+        }
+        fn delete_account(
+            &self,
+            _: &str,
+            _: &dyn Fn(&Account) -> Result<(), crate::AdminError>,
+        ) -> Result<(), crate::AdminError> {
+            Err(crate::AdminError::NotAllowed)
+        }
+        fn roles(&self) -> Vec<crate::RoleView> {
+            use std::sync::atomic::Ordering;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                *self.held.lock().unwrap() = true;
+                self.entered.store(true, Ordering::SeqCst);
+                let held = self.held.lock().unwrap();
+                drop(self.release.wait_while(held, |h| *h).unwrap());
+            }
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_device_joining_while_its_person_is_masked_is_masked() {
+        use std::sync::atomic::Ordering;
+        let admin = std::sync::Arc::new(GatedRoles::default());
+        let core = std::sync::Arc::new(Core::new().with_admin(admin.clone()).with_coalesce(true));
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        admin.armed.store(true, Ordering::SeqCst);
+        let masking = {
+            let core = core.clone();
+            std::thread::spawn(move || core.set_session_mask(a1, muted()))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !admin.entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never asked the roles"
+            );
+            std::thread::yield_now();
+        }
+        // Joins while the mask is being set.
+        let (a2, _rx2) = alice(&core, true, |_| {});
+        *admin.held.lock().unwrap() = false;
+        admin.release.notify_all();
+        assert!(masking.join().unwrap());
+        assert_eq!(core.mask_of(a2), muted());
+    }
+
     #[test]
     fn a_mask_set_on_a_row_whose_own_device_left_masks_the_person() {
         let core = Core::new().with_coalesce(true);

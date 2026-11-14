@@ -562,7 +562,11 @@ impl Core {
     /// `false` when there is no such session, or no account behind it to
     /// derive what is left from.
     pub fn set_session_mask(&self, uid: Uid, mask: DenyMask) -> bool {
-        let r = self.roster.lock().unwrap();
+        // Before the roster, which is then held throughout: a device
+        // joining the person meanwhile is either masked here or takes the
+        // mask as it joins.
+        let roles = self.roles_shown();
+        let mut r = self.roster.lock().unwrap();
         // A person's mask is every device's, as its account is; a row is
         // its person's even once the device that held it has gone.
         let uids: Vec<Uid> = r
@@ -576,9 +580,6 @@ impl Core {
         else {
             return false;
         };
-        drop(r);
-        let roles = self.roles_shown();
-        let mut r = self.roster.lock().unwrap();
         let listed_before = r.room_shown(None, Some(&uids));
         let mut rows = Vec::new();
         for &m in &uids {

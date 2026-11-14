@@ -1729,9 +1729,17 @@ impl Core {
     }
 
     fn chat_flood_kick(&self, uid: Uid, cid: u32) -> ChatError {
-        let nick = match kick_person(&mut self.roster.lock().unwrap(), uid) {
-            Ok(nick) => nick,
-            Err(_) => return ChatError::Flooding,
+        let nick = {
+            let _serial = self.person_serial();
+            let mut r = self.roster.lock().unwrap();
+            // Kicked whole meanwhile, and told so.
+            if r.ending(uid) {
+                return ChatError::Flooding;
+            }
+            match kick_person(&mut r, uid) {
+                Ok(nick) => nick,
+                Err(_) => return ChatError::Flooding,
+            }
         };
         warn!(uid, nick = %nick, "kicked for chat spamming");
         crate::instrument::flood_kick("chat");
@@ -1802,7 +1810,23 @@ impl Core {
             if under {
                 return Ok(());
             }
-            let sess = &r.users[&uid];
+            // A person is kicked between two of the lobby's commits, as
+            // any kick of one is, so taken again after the lobby's serial,
+            // and asked again.
+            let (_serial, mut r) = if r.persons.on {
+                drop(r);
+                let serial = self.log_serial.lock().unwrap();
+                (Some(serial), self.roster.lock().unwrap())
+            } else {
+                (None, r)
+            };
+            let ending = r.ending(uid);
+            let Some(sess) = r.users.get(&uid) else {
+                return Err(Flooded { ban: None });
+            };
+            if sess.kicked || ending {
+                return Err(Flooded { ban: None });
+            }
             let targets = if limits.ban_for.is_zero() {
                 Vec::new()
             } else {
@@ -3726,13 +3750,20 @@ impl Core {
         (begun.map(|begun| self.kick_end(begun, ban)), purged)
     }
 
+    /// The lobby's serial, taken where persons are kept: what a kick of
+    /// one waits for, so a line already being logged is heard first.
+    /// Never taken while the roster is held.
+    fn person_serial(&self) -> Option<crate::instrument::TimedGuard<'_, crate::roster::LogSerial>> {
+        let coalescing = self.roster.lock().unwrap().persons.on;
+        coalescing.then(|| self.log_serial.lock().unwrap())
+    }
+
     /// A kick's first step, under the roster lock: what it ends, and
     /// what its ban would ban.
     pub(crate) fn kick_begin(&self, target: Uid, banning: bool) -> Result<KickBegun, ChatError> {
         // Between two of the lobby's commits: a line its person sent is
         // heard before the kick, or refused (`RosterInner::ending`).
-        let coalescing = self.roster.lock().unwrap().persons.on;
-        let _serial = coalescing.then(|| self.log_serial.lock().unwrap());
+        let _serial = self.person_serial();
         {
             let mut r = self.roster.lock().unwrap();
             // A session no list shows is nobody to kick by uid, as it is
@@ -4212,6 +4243,70 @@ mod tests {
             })
             .collect();
         assert_eq!(heard, ["first"]);
+    }
+
+    /// A person kicked for flooding or for spam from one device, while
+    /// another's line is being logged, is heard kicked after that line.
+    #[test]
+    fn a_flood_kick_is_heard_after_a_line_its_person_already_had_in_the_log() {
+        use crate::coalesce::tests::{alice, at};
+        for spam in [false, true] {
+            let log = Arc::new(SlowLog::default());
+            *log.held.0.lock().unwrap() = true;
+            let core = Arc::new(
+                Core::new()
+                    .with_history(log.clone(), Default::default())
+                    .with_coalesce(true)
+                    .with_flood_limits(crate::FloodLimits {
+                        chat_lines: 1,
+                        chat_per: Duration::from_secs(60),
+                        spam_points: 1,
+                        spam_per: Duration::from_secs(60),
+                        ban_for: Duration::ZERO,
+                    }),
+            );
+            let (_reader, mut rx) = test_attach(&core, "reader", chatter());
+            let (a1, _rx1) = alice(&core, true, at("192.0.2.1"));
+            let (a2, _rx2) = alice(&core, true, at("198.51.100.1"));
+            drain(&mut rx);
+            let line = {
+                let core = core.clone();
+                std::thread::spawn(move || core.chat_public(a2, "in the log".into(), 0, None))
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while log.reached.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never reached the log"
+                );
+                std::thread::yield_now();
+            }
+            let kick = {
+                let core = core.clone();
+                std::thread::spawn(move || {
+                    if spam {
+                        let _ = core.spend_spam(a1, 1, 105);
+                    } else {
+                        let _ = core.chat_public(a1, "one\rtwo".into(), 0, None);
+                    }
+                })
+            };
+            // Long enough for a kick that does not wait for the log to be
+            // heard first; one that waits is heard after whatever this is.
+            std::thread::sleep(Duration::from_millis(200));
+            log.release();
+            assert!(line.join().unwrap().is_ok());
+            kick.join().unwrap();
+            let heard: Vec<&'static str> = drain(&mut rx)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Chat { .. } => Some("line"),
+                    Event::Notice { .. } => Some("kick"),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(heard, ["line", "kick"], "spam {spam}");
+        }
     }
 
     /// Lines sent at once share commits, and are still logged and heard in
