@@ -545,7 +545,7 @@ impl Core {
         let listed_before = r.room_shown(None, Some(&uids));
         let rows: Vec<Row> = told
             .iter()
-            .filter_map(|&(uid, account)| give_account(&mut r, uid, account, &roles))
+            .filter_map(|&(uid, account)| give_account(&mut r, uid, account, Some(&roles)))
             .collect();
         announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         // What it may read may have narrowed (docs/chat-rooms.md §5).
@@ -556,26 +556,50 @@ impl Core {
 
     /// Deny session `uid` what `mask` names, whatever its account says,
     /// and tell it as an account edit is told; an empty mask lifts it.
+    /// With `[server] coalesce`, a mask is its person's: it is set on
+    /// every device of the person `uid` is, or whose row it is, and
+    /// replaces whatever mask a device of it had before it joined.
     /// `false` when there is no such session, or no account behind it to
     /// derive what is left from.
     pub fn set_session_mask(&self, uid: Uid, mask: DenyMask) -> bool {
+        let r = self.roster.lock().unwrap();
+        // A person's mask is every device's, as its account is; a row is
+        // its person's even once the device that held it has gone.
+        let uids: Vec<Uid> = r
+            .person_members(uid)
+            .or_else(|| r.person_members(r.row_uid(uid)))
+            .map_or_else(|| vec![uid], <[Uid]>::to_vec);
+        let Some(account) = uids
+            .first()
+            .and_then(|m| r.users.get(m))
+            .and_then(|s| s.account.clone())
+        else {
+            return false;
+        };
+        drop(r);
         let roles = self.roles_shown();
         let mut r = self.roster.lock().unwrap();
-        let Some(s) = r.users.get_mut(&uid) else {
-            return false;
-        };
-        let Some(account) = s.account.clone() else {
-            return false;
-        };
-        s.mask = mask;
-        let listed_before = r.room_shown(None, Some(&[uid]));
-        let rows = give_account(&mut r, uid, &account, &roles)
-            .into_iter()
-            .collect();
+        let listed_before = r.room_shown(None, Some(&uids));
+        let mut rows = Vec::new();
+        for &m in &uids {
+            let Some(s) = r.users.get_mut(&m) else {
+                continue;
+            };
+            s.mask = mask;
+            rows.extend(give_account(&mut r, m, &account, Some(&roles)));
+        }
         announce(&mut r, rows, self.bulk_rows.unwrap_or(BULK_ROWS));
         r.room_reconcile();
-        r.room_announce(listed_before, None, Some(&[uid]));
+        r.room_announce(listed_before, None, Some(&uids));
         true
+    }
+
+    /// Session `uid`'s account as it has it now, its mask applied: what
+    /// [`Event::AccountChanged`] would carry.
+    pub fn session_account(&self, uid: Uid) -> Option<Account> {
+        let r = self.roster.lock().unwrap();
+        let s = r.users.get(&uid)?;
+        s.account.as_ref().map(|a| a.masked(&s.mask))
     }
 
     /// Session `uid`'s mask, for a frontend that reads its account again.
@@ -626,10 +650,6 @@ type Row = (crate::UserInfo, bool);
 /// sync that its roster is stale rather than send it each one: one change
 /// may not push a session near its queue's cap.
 fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
-    let stale = rows.len() > bulk;
-    if stale {
-        r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
-    }
     // A person's sessions are one row, told once, as it stands once every
     // session's account is changed, and only to the roles wires if no
     // session of it changed more than its roles.
@@ -639,6 +659,10 @@ fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
             Some((_, only)) => *only &= only_roles,
             None => once.push((info, only_roles)),
         }
+    }
+    let stale = once.len() > bulk;
+    if stale {
+        r.broadcast_where(&Event::RosterStale, None, |s| s.info.transport.roles);
     }
     for (info, only_roles) in once {
         let info = r.row_now(info);
@@ -660,11 +684,14 @@ pub(crate) fn role_color(roles: &[RoleView], listed: &[String]) -> Option<u32> {
 
 /// Give session `uid` `account` as its mask leaves it, and tell it.
 /// Answers its roster row if that changed, for the caller to announce.
-fn give_account(
+/// Give session `uid` `account` under its mask, and tell it. `roles`
+/// draw its role color; without them it keeps the one it has, for a
+/// change, a mask's, that cannot alter it.
+pub(crate) fn give_account(
     r: &mut RosterInner,
     uid: Uid,
     account: &Account,
-    roles: &[RoleView],
+    roles: Option<&[RoleView]>,
 ) -> Option<Row> {
     let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
     let s = r.users.get_mut(&uid)?;
@@ -702,7 +729,7 @@ fn give_account(
     s.manage_rooms = effective.manage_rooms;
     s.set_subject = effective.set_subject;
     s.is_person = effective.is_person();
-    let role_color = role_color(roles, &account.roles);
+    let role_color = roles.map_or(s.info.role_color, |roles| role_color(roles, &account.roles));
     // A color a classic client draws, so not a change of roles alone.
     let mut shown = s.info.admin != admin || s.info.role_color != role_color;
     let roles_changed = s.info.roles != account.roles;

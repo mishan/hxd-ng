@@ -80,7 +80,8 @@ pub use messaging::{
 };
 pub use moderation::{
     Act, ActKind, Actor, Filed, MemoryModeration, ModError, ModerationPolicy, ModerationStore,
-    Outcome, PersonRef, Purged, Report, ReportFilter, ReportRequest, ReportTarget, Subject,
+    Outcome, PersonRef, PurgeCheck, Purged, Report, ReportFilter, ReportRequest, ReportTarget,
+    Subject,
 };
 pub use news::{
     Article, ArticleId, ArticlePage, Attachment, AttachmentFetch, AttachmentPolicy, Author,

@@ -12,21 +12,28 @@ use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserInfo, UserSessio
 
 /// One person on the roster.
 pub(crate) struct Coalesced {
-    /// The uid every wire shows for the person.
-    pub(crate) row: Uid,
+    login: String,
     /// Live members, in the order they joined; the first is the one listed.
     pub(crate) members: Vec<Uid>,
     /// The row as the roster was last told it, so a member's coming or
     /// going tells nobody anything unless the row changed.
     told: UserInfo,
+    /// Being kicked: every member is on its way out, and a login of its
+    /// own forms a person of its own.
+    ending: bool,
+    /// Its chat lines and spam points, spent by every member.
+    pub(crate) flood: crate::limits::Flood,
 }
 
-/// The people on the roster, by login, and the logins their rows are for.
+/// The people on the roster, by row.
 #[derive(Default)]
 pub(crate) struct Persons {
     pub(crate) on: bool,
-    pub(crate) by_login: HashMap<String, Coalesced>,
-    pub(crate) rows: HashMap<Uid, String>,
+    by_row: HashMap<Uid, Coalesced>,
+    /// The person a login's sessions join as they announce.
+    forming: HashMap<String, Uid>,
+    /// Each grouped session's row.
+    of: HashMap<Uid, Uid>,
 }
 
 /// What a session last sent of itself.
@@ -92,13 +99,13 @@ fn rank(status: SessionStatus) -> u8 {
 impl RosterInner {
     /// Whether `sess` shares a row with its account's other sessions: a
     /// person's own account, logged in to as the identity linked to it,
-    /// and not the system account, a messenger session or one masked apart.
+    /// and not the system account or a messenger session. A mask does not
+    /// set a session apart: it is the person's (`Core::set_session_mask`).
     fn coalesces(&self, sess: &UserSession) -> bool {
         self.persons.on
             && sess.is_person
             && !sess.system
             && !sess.info.transport.messenger_session
-            && sess.mask == crate::DenyMask::default()
             && sess.account.as_ref().is_some_and(|a| {
                 a.identity.fingerprint.is_some() && a.identity.fingerprint == sess.identity
             })
@@ -117,22 +124,23 @@ impl RosterInner {
         // A person is one identity: a session of the login under another
         // (its link changed while the first was on) stands apart.
         let identity = sess.identity;
-        let other_identity = self.persons.by_login.get(&login).is_some_and(|p| {
-            p.members
-                .first()
-                .and_then(|m| self.users.get(m))
-                .is_some_and(|front| front.identity != identity)
-        });
+        let forming = self.persons.forming.get(&login).copied();
+        let other_identity = forming
+            .and_then(|row| self.persons.by_row.get(&row))
+            .is_some_and(|p| {
+                p.members
+                    .first()
+                    .and_then(|m| self.users.get(m))
+                    .is_some_and(|front| front.identity != identity)
+            });
         if other_identity {
             return Joined::Alone;
         }
         self.users.get_mut(&uid).expect("got above").grouped = true;
         // The person's name and look, written through: what the joiner
         // logged in with is its own to send, not the person's.
-        let front = self
-            .persons
-            .by_login
-            .get(&login)
+        let front = forming
+            .and_then(|row| self.persons.by_row.get(&row))
             .and_then(|p| p.members.first())
             .and_then(|m| self.users.get(m))
             .map(|f| (f.info.nick.clone(), f.info.icon, f.info.color));
@@ -140,24 +148,30 @@ impl RosterInner {
             let joiner = &mut self.users.get_mut(&uid).expect("got above").info;
             (joiner.nick, joiner.icon, joiner.color) = (nick, icon, color);
         }
-        match self.persons.by_login.get_mut(&login) {
-            Some(p) => {
-                p.members.push(uid);
-                Joined::Another(self.retell(&login).map(Box::new))
+        match forming {
+            Some(row) => {
+                self.persons.of.insert(uid, row);
+                if let Some(p) = self.persons.by_row.get_mut(&row) {
+                    p.members.push(uid);
+                }
+                Joined::Another(self.retell(row).map(Box::new))
             }
             None => {
-                self.persons.rows.insert(uid, login.clone());
-                self.persons.by_login.insert(
-                    login.clone(),
+                self.persons.forming.insert(login.clone(), uid);
+                self.persons.of.insert(uid, uid);
+                self.persons.by_row.insert(
+                    uid,
                     Coalesced {
-                        row: uid,
+                        login,
                         members: vec![uid],
                         told: info,
+                        ending: false,
+                        flood: Default::default(),
                     },
                 );
                 // As the roster is told it: the row, not the raw session.
-                if let Some(view) = self.person_view(&login) {
-                    if let Some(p) = self.persons.by_login.get_mut(&login) {
+                if let Some(view) = self.person_view(uid) {
+                    if let Some(p) = self.persons.by_row.get_mut(&uid) {
                         p.told = view;
                     }
                 }
@@ -171,41 +185,46 @@ impl RosterInner {
         if !sess.grouped {
             return Left::Alone;
         }
-        let Some(p) = self.persons.by_login.get_mut(&sess.login) else {
+        let Some(row) = self.persons.of.remove(&uid) else {
+            return Left::Alone;
+        };
+        let Some(p) = self.persons.by_row.get_mut(&row) else {
             return Left::Alone;
         };
         p.members.retain(|m| *m != uid);
-        let row = p.row;
         if p.members.is_empty() {
-            self.persons.by_login.remove(&sess.login);
-            self.persons.rows.remove(&row);
+            let p = self.persons.by_row.remove(&row).expect("got above");
+            if self.persons.forming.get(&p.login) == Some(&row) {
+                self.persons.forming.remove(&p.login);
+            }
             return Left::Last { row };
         }
         Left::Stays {
             row,
-            changed: self.retell(&sess.login.clone()).map(Box::new),
+            changed: self.retell(row).map(Box::new),
         }
     }
 
     /// `info`, a row about to be told: a person's as it stands now, and
     /// noted as told, so a later change compares with what was sent.
     pub(crate) fn row_now(&mut self, info: UserInfo) -> UserInfo {
-        let Some(login) = self.persons.rows.get(&info.uid).cloned() else {
+        let Some(view) = self.person_view(info.uid) else {
             return info;
         };
-        let Some(view) = self.person_view(&login) else {
-            return info;
-        };
-        if let Some(p) = self.persons.by_login.get_mut(&login) {
+        if let Some(p) = self.persons.by_row.get_mut(&info.uid) {
             p.told = view.clone();
         }
         view
     }
 
     /// The person's row as it stands, if it is not as the roster was told.
-    fn retell(&mut self, login: &str) -> Option<Event> {
-        let view = self.person_view(login)?;
-        let p = self.persons.by_login.get_mut(login)?;
+    fn retell(&mut self, row: Uid) -> Option<Event> {
+        // A person being kicked is told once, as it parts.
+        if self.persons.by_row.get(&row)?.ending {
+            return None;
+        }
+        let view = self.person_view(row)?;
+        let p = self.persons.by_row.get_mut(&row)?;
         (p.told != view).then(|| {
             p.told = view.clone();
             Event::Changed(view)
@@ -214,11 +233,11 @@ impl RosterInner {
 
     /// The row a person is shown as: its first member's, under its uid,
     /// as present as any of them.
-    fn person_view(&self, login: &str) -> Option<UserInfo> {
-        let p = self.persons.by_login.get(login)?;
+    fn person_view(&self, row: Uid) -> Option<UserInfo> {
+        let p = self.persons.by_row.get(&row)?;
         let front = self.users.get(p.members.first()?)?;
         let mut info = front.info.clone();
-        info.uid = p.row;
+        info.uid = row;
         // As safe as its least safe device, and signing only if all do.
         let members: Vec<&UserSession> =
             p.members.iter().filter_map(|m| self.users.get(m)).collect();
@@ -265,12 +284,10 @@ impl RosterInner {
         let icon = icon.filter(|i| *i != sess.sent.icon);
         let color = color.filter(|c| *c != sess.sent.color);
         sess.sent.note(nick.as_deref(), icon, color);
-        let login = sess.login.clone();
+        let row = self.row_uid(uid);
         let members = self
-            .persons
-            .by_login
-            .get(&login)
-            .map(|p| p.members.clone())
+            .person_members(row)
+            .map(<[Uid]>::to_vec)
             .unwrap_or_default();
         for m in members {
             let Some(info) = self.users.get_mut(&m).map(|s| &mut s.info) else {
@@ -286,7 +303,7 @@ impl RosterInner {
                 info.color = c;
             }
         }
-        self.retell(&login)
+        self.retell(row)
     }
 
     /// Tell the roster of a change to a row: a person's to everyone else
@@ -330,7 +347,7 @@ impl RosterInner {
     /// `sess` as the wire shows it: its person's row, or its own.
     pub(crate) fn row_view(&self, sess: &UserSession) -> UserInfo {
         if sess.grouped {
-            if let Some(view) = self.person_view(&sess.login) {
+            if let Some(view) = self.person_view(self.row_uid(sess.info.uid)) {
                 return view;
             }
         }
@@ -349,10 +366,8 @@ impl RosterInner {
     pub(crate) fn listed(&self, uid: Uid, sess: &UserSession) -> bool {
         !sess.grouped
             || self
-                .persons
-                .by_login
-                .get(&sess.login)
-                .is_none_or(|p| p.members.first() == Some(&uid))
+                .person_members(self.row_uid(uid))
+                .is_none_or(|m| m.first() == Some(&uid))
     }
 
     /// What to tell the roster of a change to `uid`: its own row, or its
@@ -360,47 +375,115 @@ impl RosterInner {
     pub(crate) fn changed_event(&mut self, uid: Uid) -> Option<Event> {
         let sess = self.users.get(&uid).filter(|s| s.live())?;
         if sess.grouped {
-            let login = sess.login.clone();
-            return self.retell(&login);
+            return self.retell(self.row_uid(uid));
         }
         Some(Event::Changed(sess.info.clone()))
     }
 
     /// The person a row uid stands for, and its members.
     pub(crate) fn person_members(&self, row: Uid) -> Option<&[Uid]> {
-        let login = self.persons.rows.get(&row)?;
-        self.persons
-            .by_login
-            .get(login)
-            .map(|p| p.members.as_slice())
+        self.persons.by_row.get(&row).map(|p| p.members.as_slice())
     }
 
     /// The row `session` is shown under.
     pub(crate) fn row_uid(&self, session: Uid) -> Uid {
-        self.users
-            .get(&session)
-            .filter(|s| s.grouped)
-            .and_then(|s| self.persons.by_login.get(&s.login))
-            .map_or(session, |p| p.row)
+        self.persons.of.get(&session).copied().unwrap_or(session)
     }
 
     /// Whether `uid` is one of a person's sessions and not its last.
     pub(crate) fn person_stays(&self, uid: Uid) -> bool {
-        self.users
+        self.person_members(self.row_uid(uid))
+            .is_some_and(|m| m.len() > 1)
+    }
+
+    /// Whether `uid` is a device of a person being kicked.
+    pub(crate) fn ending(&self, uid: Uid) -> bool {
+        self.persons
+            .of
             .get(&uid)
-            .filter(|s| s.grouped)
-            .and_then(|s| self.persons.by_login.get(&s.login))
-            .is_some_and(|p| p.members.len() > 1)
+            .and_then(|row| self.persons.by_row.get(row))
+            .is_some_and(|p| p.ending)
+    }
+
+    /// Mark `uid`'s person as being kicked: from here every member is on
+    /// its way out, and a login of the account forms a person of its own.
+    /// The sessions to end: every member, or `uid` alone for a session
+    /// alone.
+    pub(crate) fn person_ending(&mut self, uid: Uid) -> Vec<Uid> {
+        let Some(row) = self.persons.of.get(&uid).copied() else {
+            return vec![uid];
+        };
+        let Some(p) = self.persons.by_row.get_mut(&row) else {
+            return vec![uid];
+        };
+        p.ending = true;
+        if self.persons.forming.get(&p.login) == Some(&row) {
+            self.persons.forming.remove(&p.login);
+        }
+        p.members.clone()
+    }
+
+    /// Give `uid`, just joined to its person, the person's mask, told as
+    /// a mask set on it is. Taken rather than required: a session logs in
+    /// with no mask, and a mask set on the person is the new device's too.
+    pub(crate) fn take_persons_mask(&mut self, uid: Uid) {
+        let Some(front) = self
+            .person_members(self.row_uid(uid))
+            .and_then(|m| m.first())
+        else {
+            return;
+        };
+        let Some(mask) = self.users.get(front).map(|s| s.mask) else {
+            return;
+        };
+        let Some(account) = self
+            .users
+            .get_mut(&uid)
+            .filter(|s| s.mask != mask)
+            .and_then(|s| {
+                s.mask = mask;
+                s.account.clone()
+            })
+        else {
+            return;
+        };
+        // The person's row is its first device's, which this mask
+        // already shows; nor does a mask change a role color.
+        let _ = crate::admin::give_account(self, uid, &account, None);
+    }
+
+    /// The budgets `uid` spends: its person's, or its own.
+    pub(crate) fn flood_of(&mut self, uid: Uid) -> Option<&mut crate::limits::Flood> {
+        if let Some(row) = self.persons.of.get(&uid).copied() {
+            if let Some(p) = self.persons.by_row.get_mut(&row) {
+                return Some(&mut p.flood);
+            }
+        }
+        self.users.get_mut(&uid).map(|s| &mut s.flood)
+    }
+
+    /// Whether `target`, a uid a client names, is `kicker`'s own person.
+    pub(crate) fn is_own_row(&self, kicker: Uid, target: Uid) -> bool {
+        self.persons.of.get(&kicker) == Some(&target)
+    }
+
+    /// The rows whose own sessions have ended, which no session holds.
+    pub(crate) fn rows_alone(&self) -> usize {
+        self.persons
+            .by_row
+            .keys()
+            .filter(|row| !self.users.contains_key(row))
+            .count()
     }
 
     /// Whether `uid` is a person's row, held while the person lives.
     pub(crate) fn is_row(&self, uid: Uid) -> bool {
-        self.persons.rows.contains_key(&uid)
+        self.persons.by_row.contains_key(&uid)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::access::{bit, AccessBits};
     use crate::account::{Account, AccountConfig, IdentityLink};
     use crate::roster::{drain, AttachInfo, Core, Event, Events, SessionStatus, Transport, Uid};
@@ -424,6 +507,47 @@ mod tests {
         linked: Option<[u8; 32]>,
         transport: Transport,
     ) -> (Uid, Events) {
+        let (uid, rx) = core
+            .attach(session(login, identity, linked, transport))
+            .unwrap();
+        core.announce(uid);
+        (uid, rx)
+    }
+
+    /// One of alice's devices, as `f` makes it, announced or not.
+    pub(crate) fn alice(
+        core: &Core,
+        announce: bool,
+        f: impl FnOnce(&mut AttachInfo),
+    ) -> (Uid, Events) {
+        let mut info = session("alice", Some(ALICE), Some(ALICE), Transport::default());
+        f(&mut info);
+        let (uid, rx) = core.attach(info).unwrap();
+        if announce {
+            core.announce(uid);
+        }
+        (uid, rx)
+    }
+
+    pub(crate) fn at(addr: &str) -> impl FnOnce(&mut AttachInfo) + '_ {
+        move |i| i.addr = Some(addr.parse().unwrap())
+    }
+
+    fn moderated() -> Core {
+        Core::new()
+            .with_moderation(
+                std::sync::Arc::new(crate::moderation::MemoryModeration::default()),
+                crate::moderation::ModerationPolicy::default(),
+            )
+            .with_coalesce(true)
+    }
+
+    pub(crate) fn session(
+        login: &str,
+        identity: Option<[u8; 32]>,
+        linked: Option<[u8; 32]>,
+        transport: Transport,
+    ) -> AttachInfo {
         let link = IdentityLink {
             fingerprint: linked,
             ..IdentityLink::default()
@@ -433,36 +557,35 @@ mod tests {
             login.into(),
             true,
             link,
-            AccountConfig::default(),
+            AccountConfig {
+                access: chatting(),
+                ..AccountConfig::default()
+            },
         );
-        let (uid, rx) = core
-            .attach(AttachInfo {
-                account: Some(Box::new(account)),
-                nick: login.to_string(),
-                icon: 1,
-                admin: false,
-                access: AccessBits::empty()
-                    .with(bit::READ_CHAT)
-                    .with(bit::SEND_CHAT),
-                login: login.to_string(),
-                addr: None,
-                can_detach: true,
-                transport,
-                has_inbox: false,
-                attach_news: false,
-                set_avatar: false,
-                moderate: false,
-                can_spam: false,
-                manage_rooms: false,
-                set_subject: false,
-                is_person: true,
-                reads_on_delivery: false,
-                identity,
-                system: false,
-            })
-            .unwrap();
-        core.announce(uid);
-        (uid, rx)
+        AttachInfo {
+            account: Some(Box::new(account)),
+            nick: login.to_string(),
+            icon: 1,
+            admin: false,
+            access: AccessBits::empty()
+                .with(bit::READ_CHAT)
+                .with(bit::SEND_CHAT),
+            login: login.to_string(),
+            addr: None,
+            can_detach: true,
+            transport,
+            has_inbox: false,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
+            is_person: true,
+            reads_on_delivery: false,
+            identity,
+            system: false,
+        }
     }
 
     fn rows(core: &Core) -> Vec<(Uid, String, SessionStatus)> {
@@ -745,6 +868,674 @@ mod tests {
         }
         renamed.sort();
         assert_eq!(renamed, [(a1, "Ally".into()), (a2, "Ally".into())]);
+    }
+
+    #[test]
+    fn a_kick_ends_every_device_and_tells_the_roster_once() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, mut rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let tls = Transport {
+            encrypted: true,
+            ..Transport::default()
+        };
+        let (a2, mut rx2) = attach_on(&core, "alice", Some(ALICE), Some(ALICE), tls);
+        drain(&mut watching);
+        core.kick(a1, None).unwrap();
+        assert!(drain(&mut rx1).contains(&Event::Kicked));
+        assert!(drain(&mut rx2).contains(&Event::Kicked));
+        // Its devices go as their connections close: the safer one left
+        // alone for a moment is no change worth telling.
+        core.end_session(a1);
+        core.end_session(a2);
+        assert_eq!(told(&mut watching), [("parted", a1)]);
+    }
+
+    #[test]
+    fn a_login_while_its_person_is_kicked_is_a_person_of_its_own() {
+        let core = Core::new().with_coalesce(true);
+        let (bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut watching);
+        let begun = core.kick_begin(a1, false).unwrap();
+        let (a3, mut rx3) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        core.kick_end(begun, None);
+        assert!(!drain(&mut rx3).contains(&Event::Kicked));
+        core.end_session(a1);
+        core.end_session(a2);
+        assert_eq!(told(&mut watching), [("joined", a3), ("parted", a1)]);
+        let listed: Vec<Uid> = rows(&core).into_iter().map(|r| r.0).collect();
+        assert_eq!(listed, [bob, a3]);
+    }
+
+    fn chatting() -> AccessBits {
+        AccessBits::empty()
+            .with(bit::READ_CHAT)
+            .with(bit::SEND_CHAT)
+    }
+
+    /// The mask the tests set: no sending to public chat, and no
+    /// disconnecting users, which the row shows as its admin flag.
+    fn muted() -> crate::DenyMask {
+        crate::DenyMask {
+            access: AccessBits::empty()
+                .with(bit::SEND_CHAT)
+                .with(bit::DISCONNECT_USERS),
+            ..Default::default()
+        }
+    }
+
+    /// One of alice's devices whose account may disconnect users.
+    fn admin(i: &mut AttachInfo) {
+        let access = chatting().with(bit::DISCONNECT_USERS);
+        let link = IdentityLink {
+            fingerprint: Some(ALICE),
+            ..IdentityLink::default()
+        };
+        let config = AccountConfig {
+            access,
+            ..AccountConfig::default()
+        };
+        let account = Account::new("alice".into(), "alice".into(), true, link, config);
+        i.account = Some(Box::new(account));
+        i.access = access;
+        i.admin = true;
+    }
+
+    /// The admin flag of the rows `rx` was told changed, in order.
+    fn admins(rx: &mut Events) -> Vec<bool> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Changed(u) => Some(u.admin),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sends(core: &Core, uid: Uid) -> bool {
+        core.access_of(uid).is_some_and(|a| a.has(bit::SEND_CHAT))
+    }
+
+    fn told_account(rx: &mut Events) -> Option<bool> {
+        drain(rx).into_iter().rev().find_map(|e| match e {
+            Event::AccountChanged(a) => Some(a.access.has(bit::SEND_CHAT)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_masked_session_still_joins_its_person() {
+        let core = Core::new().with_coalesce(true);
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        let (a2, _rx2) = alice(&core, false, |_| {});
+        assert!(core.set_session_mask(a2, muted()));
+        core.announce(a2);
+        assert_eq!(core.row_uid(a2), a1);
+        // A mask is the person's, so the person's replaces its own.
+        assert_eq!(core.mask_of(a2), crate::DenyMask::default());
+    }
+
+    #[test]
+    fn a_device_joining_a_masked_person_is_told_its_row_as_masked() {
+        let core = Core::new().with_coalesce(true);
+        let tls = |i: &mut AttachInfo| {
+            admin(i);
+            i.transport.encrypted = true;
+        };
+        let (a1, _rx1) = alice(&core, true, tls);
+        assert!(core.set_session_mask(a1, muted()));
+        // A plain device makes the row less safe: it is told the row.
+        let (_a2, mut rx2) = alice(&core, true, admin);
+        assert_eq!(admins(&mut rx2), [false]);
+    }
+
+    #[test]
+    fn a_mask_set_on_a_row_whose_own_device_left_masks_the_person() {
+        let core = Core::new().with_coalesce(true);
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        let (a2, _rx2) = alice(&core, true, |_| {});
+        core.end_session(a1);
+        assert!(core.set_session_mask(a1, muted()));
+        assert_eq!(core.mask_of(a2), muted());
+        assert!(!sends(&core, a2));
+    }
+
+    #[test]
+    fn a_mask_on_one_device_is_its_persons_and_lifts_from_every_device() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, mut rx1) = alice(&core, true, admin);
+        let (a2, mut rx2) = alice(&core, true, admin);
+        drain(&mut watching);
+        assert!(core.set_session_mask(a2, muted()));
+        assert_eq!(admins(&mut watching), [false], "one change, the row's");
+        assert_eq!((sends(&core, a1), sends(&core, a2)), (false, false));
+        assert_eq!(core.mask_of(a1), muted());
+        assert_eq!(
+            told_account(&mut rx1),
+            Some(false),
+            "the other device is told"
+        );
+        assert_eq!(told_account(&mut rx2), Some(false));
+        assert!(core.set_session_mask(a1, crate::DenyMask::default()));
+        assert_eq!((sends(&core, a1), sends(&core, a2)), (true, true));
+        assert_eq!(told_account(&mut rx2), Some(true));
+        assert_eq!(admins(&mut watching), [true], "one change, the row's");
+    }
+
+    #[test]
+    fn a_device_joining_a_masked_person_is_masked() {
+        let core = Core::new().with_coalesce(true);
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        assert!(core.set_session_mask(a1, muted()));
+        let (a2, mut rx2) = alice(&core, true, |_| {});
+        assert_eq!(core.mask_of(a2), muted());
+        assert!(!sends(&core, a2));
+        assert_eq!(told_account(&mut rx2), Some(false));
+    }
+
+    #[test]
+    fn with_coalescing_off_a_mask_is_one_sessions() {
+        let core = Core::new();
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        assert!(core.set_session_mask(a1, muted()));
+        let (a2, _rx2) = alice(&core, true, |_| {});
+        assert_eq!((sends(&core, a1), sends(&core, a2)), (false, true));
+        assert_eq!(core.mask_of(a2), crate::DenyMask::default());
+    }
+
+    /// Accounts whose identity is linked: every login names one, linked
+    /// to alice's identity.
+    struct Linked;
+
+    impl crate::AccountDirectory for Linked {
+        fn inbox_account(&self, login: &str) -> Option<crate::inbox::Mailbox> {
+            Some(crate::inbox::Mailbox::identified(login, ALICE))
+        }
+
+        fn mailbox_access(&self, _: &crate::inbox::Mailbox) -> Option<AccessBits> {
+            Some(AccessBits::empty())
+        }
+    }
+
+    #[test]
+    fn a_kick_ban_ends_another_account_of_the_identity_at_the_agreement() {
+        let core = moderated().with_accounts(std::sync::Arc::new(Linked));
+        let (a1, _rx1) = alice(&core, true, at("192.0.2.1"));
+        let (_other, mut waiting) = core
+            .attach(session(
+                "ally",
+                Some(ALICE),
+                Some(ALICE),
+                Transport::default(),
+            ))
+            .unwrap();
+        let ban = crate::KickBan {
+            by: crate::Actor::Operator,
+            for_: std::time::Duration::from_secs(60),
+            reason: "spam".into(),
+        };
+        assert!(core.kick_by(a1, Some(ban)).unwrap().banned);
+        assert!(
+            drain(&mut waiting).contains(&Event::Kicked),
+            "the identity is banned with the login"
+        );
+    }
+
+    #[test]
+    fn a_person_being_kicked_is_told_no_change() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut watching);
+        let begun = core.kick_begin(a1, false).unwrap();
+        core.update(a2, Some("Ally".into()), None);
+        core.kick_end(begun, None);
+        assert_eq!(told(&mut watching), []);
+    }
+
+    #[test]
+    fn a_person_already_being_kicked_is_not_kicked_again() {
+        for flood_first in [false, true] {
+            let core = Core::new()
+                .with_coalesce(true)
+                .with_flood_limits(crate::FloodLimits {
+                    chat_lines: 1,
+                    chat_per: std::time::Duration::from_secs(60),
+                    spam_points: 0,
+                    spam_per: std::time::Duration::from_secs(60),
+                    ban_for: std::time::Duration::ZERO,
+                });
+            let (_bob, mut watching) = attach(&core, "bob", None, None);
+            let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+            let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+            drain(&mut watching);
+            if flood_first {
+                let _ = core.chat_public(a2, "one\rtwo".into(), 0, None);
+            } else {
+                core.kick(a1, None).unwrap();
+            }
+            assert_eq!(
+                core.kick(a1, None),
+                Err(crate::ChatError::NoSuchUser),
+                "flood first {flood_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kick_purging_hears_no_device_from_its_first_step_on() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, mut rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut watching);
+        let kicked = core.kick_with(a1, None, |c| {
+            c.chat_public(a2, "between the purge and the kick".into(), 0, None)
+        });
+        let (kicked, between) = kicked;
+        assert!(kicked.is_ok());
+        assert_eq!(between, Some(Err(crate::ChatError::Flooding)));
+        assert!(drain(&mut rx1).contains(&Event::Kicked));
+        assert!(!drain(&mut watching)
+            .iter()
+            .any(|e| matches!(e, Event::Chat { .. })));
+    }
+
+    #[test]
+    fn a_kick_whose_purge_fails_or_panics_still_ends_every_device() {
+        for panics in [false, true] {
+            let core = Core::new().with_coalesce(true);
+            let (a1, mut rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+            let (_a2, mut rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+            let kicked = core.kick_with(a1, None, |_| -> Result<(), &str> {
+                assert!(!panics, "a purge that panics");
+                Err("the store failed")
+            });
+            let (kicked, purged) = kicked;
+            assert!(kicked.is_ok(), "panics {panics}");
+            let expected = (!panics).then_some(Err("the store failed"));
+            assert_eq!(purged, expected, "panics {panics}");
+            for rx in [&mut rx1, &mut rx2] {
+                assert!(drain(rx).contains(&Event::Kicked), "panics {panics}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_purge_asked_of_a_target_that_left_is_still_made() {
+        let core = moderated().with_coalesce(false).with_history(
+            std::sync::Arc::new(crate::history::MemoryLog::default()),
+            Default::default(),
+        );
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        let line = core
+            .chat_public(a1, "buy now".into(), 0, None)
+            .unwrap()
+            .expect("logged");
+        let check = core
+            .purge_check(crate::Actor::Operator, &crate::PersonRef::Uid(a1), "spam")
+            .unwrap();
+        core.end_session(a1);
+        let within = std::time::Duration::from_secs(3600);
+        let (kicked, purged) = core.kick_purging(a1, None, Some((check, within)));
+        assert_eq!(kicked, Err(crate::ChatError::NoSuchUser));
+        assert_eq!(purged, Some(true));
+        let line = core.history.as_ref().unwrap().line(line).unwrap().unwrap();
+        assert!(line.flags.contains(crate::history::LineFlags::DELETED));
+    }
+
+    #[test]
+    fn a_purge_of_a_persons_row_kicks_it_once_its_first_device_is_gone() {
+        let core = moderated();
+        let (a1, _rx1) = alice(&core, true, |_| {});
+        let (_a2, mut rx2) = alice(&core, true, |_| {});
+        let check = core
+            .purge_check(crate::Actor::Operator, &crate::PersonRef::Uid(a1), "spam")
+            .unwrap();
+        core.end_session(a1);
+        let within = std::time::Duration::from_secs(3600);
+        let (kicked, _) = core.kick_purging(a1, None, Some((check, within)));
+        assert!(kicked.is_ok());
+        assert!(drain(&mut rx2).contains(&Event::Kicked));
+    }
+
+    #[test]
+    fn a_purge_the_store_fails_still_kicks_every_device() {
+        let store = std::sync::Arc::new(crate::moderation::faulty::FaultyModeration::default());
+        let core = Core::new()
+            .with_moderation(
+                store.clone(),
+                crate::moderation::ModerationPolicy::default(),
+            )
+            .with_coalesce(true);
+        let (a1, mut rx1) = alice(&core, true, |_| {});
+        let (_a2, mut rx2) = alice(&core, true, |_| {});
+        let check = core
+            .purge_check(crate::Actor::Operator, &crate::PersonRef::Uid(a1), "spam")
+            .unwrap();
+        store.fail("record");
+        let within = std::time::Duration::from_secs(3600);
+        let (kicked, purged) = core.kick_purging(a1, None, Some((check, within)));
+        assert!(kicked.is_ok());
+        assert_eq!(purged, Some(false));
+        for rx in [&mut rx1, &mut rx2] {
+            assert!(drain(rx).contains(&Event::Kicked));
+        }
+    }
+
+    #[test]
+    fn a_kick_ban_never_ends_its_kicker_who_shares_the_identity() {
+        let core = moderated().with_accounts(std::sync::Arc::new(Linked));
+        let (a1, mut rx1) = alice(&core, true, at("192.0.2.1"));
+        let mut kicker = session("mod", Some(ALICE), Some(ALICE), Transport::default());
+        kicker.moderate = true;
+        let (moderator, mut rx_mod) = core.attach(kicker).unwrap();
+        core.announce(moderator);
+        let ban = crate::KickBan {
+            by: crate::Actor::Session(moderator),
+            for_: std::time::Duration::from_secs(60),
+            reason: "spam".into(),
+        };
+        assert!(core.kick_by(a1, Some(ban)).unwrap().banned);
+        assert!(drain(&mut rx1).contains(&Event::Kicked));
+        assert!(!drain(&mut rx_mod).contains(&Event::Kicked), "the kicker");
+        let bans = core.list_bans(true, None, 10).unwrap();
+        assert!(
+            !bans
+                .iter()
+                .any(|b| b.target == crate::ban::BanTarget::Identity(ALICE)),
+            "the kicker's own identity, banned: {bans:?}"
+        );
+    }
+
+    #[test]
+    fn a_person_being_kicked_says_nothing_more() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        drain(&mut watching);
+        let begun = core.kick_begin(a1, false).unwrap();
+        assert_eq!(
+            core.chat_public(a2, "a last word".into(), 0, None),
+            Err(crate::ChatError::Flooding)
+        );
+        core.kick_end(begun, None);
+        assert!(!drain(&mut watching)
+            .iter()
+            .any(|e| matches!(e, Event::Chat { .. })));
+    }
+
+    #[test]
+    fn a_person_is_protected_whichever_device_holds_its_row() {
+        let protected = |i: &mut AttachInfo| i.access = i.access.with(bit::CANT_BE_DISCONNECTED);
+        for ended in [None, Some(0), Some(1)] {
+            let core = Core::new().with_coalesce(true);
+            let (a1, _rx1) = alice(&core, true, protected);
+            let (a2, _rx2) = alice(&core, true, protected);
+            let devices = [a1, a2];
+            if let Some(i) = ended {
+                core.end_session(devices[i]);
+            }
+            assert!(
+                core.access_of(a1)
+                    .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED)),
+                "the row, with device {ended:?} ended"
+            );
+        }
+    }
+
+    /// How a test ends a person: a moderator's kick, with or without its
+    /// ban, or a spam kick and the ban it asks for.
+    #[derive(Debug, Clone, Copy)]
+    enum Kick {
+        Plain,
+        Banned,
+        Spam,
+    }
+
+    #[test]
+    fn a_kick_ends_every_live_device_and_its_ban_one_still_at_the_agreement() {
+        use Kick::*;
+        // Each device: announced (live) or still at the agreement, and
+        // whether the kick ends it.
+        for (devices, how) in [
+            (&[(true, true)][..], Plain),
+            (&[(true, true)][..], Banned),
+            (&[(true, true)][..], Spam),
+            (&[(true, true), (true, true)][..], Plain),
+            (&[(true, true), (true, true)][..], Banned),
+            (&[(true, true), (true, true)][..], Spam),
+            (&[(true, true), (false, false)][..], Plain),
+            (&[(true, true), (false, true)][..], Banned),
+            (&[(true, true), (false, true)][..], Spam),
+        ] {
+            let core = moderated().with_flood_limits(crate::FloodLimits {
+                spam_points: 1,
+                ..crate::FloodLimits::MHXD
+            });
+            let (_bob, mut watching) = attach(&core, "bob", None, None);
+            let mut sessions: Vec<(Uid, Events)> = devices
+                .iter()
+                .enumerate()
+                .map(|(i, (live, _))| alice(&core, *live, at(["192.0.2.1", "198.51.100.1"][i])))
+                .collect();
+            drain(&mut watching);
+            let first = sessions[0].0;
+            match how {
+                Plain => drop(core.kick(first, None).unwrap()),
+                Banned => {
+                    let ban = crate::KickBan {
+                        by: crate::Actor::Operator,
+                        for_: std::time::Duration::from_secs(60),
+                        reason: "spam".into(),
+                    };
+                    assert!(core.kick_by(first, Some(ban)).unwrap().banned);
+                }
+                Spam => {
+                    let flooded = core.spend_spam(first, 1, 105).unwrap_err();
+                    core.place_spam_ban(flooded.ban.expect("a ban to place"));
+                }
+            }
+            for (i, ((_, ends), (uid, rx))) in devices.iter().zip(&mut sessions).enumerate() {
+                assert_eq!(
+                    drain(rx).contains(&Event::Kicked),
+                    *ends,
+                    "{how:?} of {devices:?}: device {i}"
+                );
+                if *ends {
+                    core.end_session(*uid);
+                }
+            }
+            let parted = told(&mut watching)
+                .into_iter()
+                .filter(|(kind, _)| *kind == "parted")
+                .collect::<Vec<_>>();
+            assert_eq!(parted, [("parted", first)], "{how:?} of {devices:?}");
+        }
+    }
+
+    #[test]
+    fn a_kicked_persons_row_is_held_and_its_next_login_is_a_row_of_its_own() {
+        let core = Core::new().with_coalesce(true);
+        let (bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        core.kick(a1, None).unwrap();
+        core.end_session(a1);
+        core.end_session(a2);
+        assert!(core.roster.lock().unwrap().freed_uids.holds(a1));
+        drain(&mut watching);
+        let (a3, _rx3) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        assert!(![a1, a2].contains(&a3), "a held uid given out: {a3}");
+        assert_eq!(told(&mut watching), [("joined", a3)]);
+        let listed: Vec<Uid> = rows(&core).into_iter().map(|r| r.0).collect();
+        assert_eq!(listed, [bob, a3]);
+    }
+
+    #[test]
+    fn a_ban_ends_the_devices_it_names_and_the_row_parts_with_the_last() {
+        use crate::ban::BanTarget;
+        let address = || BanTarget::address("192.0.2.1".parse().unwrap(), 32).unwrap();
+        let one = ["192.0.2.1", "192.0.2.1"];
+        let two = ["192.0.2.1", "198.51.100.1"];
+        for (target, addrs, ended) in [
+            (BanTarget::Login("alice".into()), one, [true, true]),
+            (BanTarget::Login("alice".into()), two, [true, true]),
+            (BanTarget::Identity(ALICE), one, [true, true]),
+            (BanTarget::Identity(ALICE), two, [true, true]),
+            (address(), one, [true, true]),
+            (address(), two, [true, false]),
+        ] {
+            let core = moderated();
+            let (_bob, mut watching) = attach(&core, "bob", None, None);
+            let mut devices: Vec<(Uid, Events)> =
+                addrs.iter().map(|a| alice(&core, true, at(a))).collect();
+            let row = devices[0].0;
+            drain(&mut watching);
+            core.place_ban(
+                crate::Actor::Operator,
+                crate::ban::NewBan {
+                    target: target.clone(),
+                    reason: "spam".into(),
+                    note: None,
+                    expires_at: None,
+                    source: crate::ban::BanSource::Cli,
+                },
+            )
+            .unwrap();
+            for ((uid, rx), ends) in devices.iter_mut().zip(ended) {
+                assert_eq!(
+                    drain(rx).contains(&Event::Kicked),
+                    ends,
+                    "{target:?} at {addrs:?}: {uid}"
+                );
+                if ends {
+                    core.end_session(*uid);
+                }
+            }
+            let parts = ended.iter().all(|e| *e);
+            let expected: &[(&str, Uid)] = if parts { &[("parted", row)] } else { &[] };
+            assert_eq!(told(&mut watching), expected, "{target:?} at {addrs:?}");
+        }
+    }
+
+    #[test]
+    fn a_person_floods_as_one_and_is_kicked_once() {
+        for (spam, can_spam) in [(false, false), (true, false), (false, true), (true, true)] {
+            let core = Core::new()
+                .with_coalesce(true)
+                .with_flood_limits(crate::FloodLimits {
+                    chat_lines: 4,
+                    chat_per: std::time::Duration::from_secs(60),
+                    spam_points: 4,
+                    spam_per: std::time::Duration::from_secs(60),
+                    ban_for: std::time::Duration::ZERO,
+                });
+            let case = format!("spam {spam}, can_spam {can_spam}");
+            let (_bob, mut watching) = attach(&core, "bob", None, None);
+            let exempt = |i: &mut AttachInfo| i.can_spam = can_spam;
+            let (a1, mut rx1) = alice(&core, true, exempt);
+            let (a2, mut rx2) = alice(&core, true, exempt);
+            drain(&mut watching);
+            // Each device alone stays inside its budget.
+            for _ in 0..3 {
+                for uid in [a1, a2] {
+                    if spam {
+                        let _ = core.spend_spam(uid, 1, 105);
+                    } else {
+                        let _ = core.chat_public(uid, "hi".into(), 0, None);
+                    }
+                }
+            }
+            let notices = drain(&mut watching)
+                .into_iter()
+                .filter(|e| matches!(e, Event::Notice { .. }))
+                .count();
+            assert_eq!(notices, usize::from(!can_spam), "{case}");
+            for rx in [&mut rx1, &mut rx2] {
+                assert_eq!(drain(rx).contains(&Event::Kicked), !can_spam, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_coalescing_off_every_act_is_one_sessions_as_before() {
+        let core = moderated()
+            .with_coalesce(false)
+            .with_flood_limits(crate::FloodLimits {
+                chat_lines: 4,
+                chat_per: std::time::Duration::from_secs(60),
+                spam_points: 4,
+                spam_per: std::time::Duration::from_secs(60),
+                ban_for: std::time::Duration::ZERO,
+            });
+        let (_bob, mut watching) = attach(&core, "bob", None, None);
+        let (a1, mut rx1) = alice(&core, true, at("192.0.2.1"));
+        let (a2, mut rx2) = alice(&core, true, at("198.51.100.1"));
+        assert_eq!(told(&mut watching), [("joined", a1), ("joined", a2)]);
+        // Three lines and three points each: neither is past its own.
+        for _ in 0..3 {
+            for uid in [a1, a2] {
+                let _ = core.chat_public(uid, "hi".into(), 0, None);
+                let _ = core.spend_spam(uid, 1, 105);
+            }
+        }
+        assert!(
+            !core.kicks_own_row(a2, a1),
+            "a session of one's own is anyone"
+        );
+        assert!(!drain(&mut rx1).contains(&Event::Kicked));
+        let begun = core.kick_begin(a1, false).unwrap();
+        assert!(
+            core.chat_public(a2, "still here".into(), 0, None).is_ok(),
+            "another session of the login is not being kicked"
+        );
+        core.kick_end(begun, None);
+        assert!(drain(&mut rx1).contains(&Event::Kicked));
+        assert!(!drain(&mut rx2).contains(&Event::Kicked));
+        core.end_session(a1);
+        drain(&mut watching);
+        let (a3, mut rx3) = alice(&core, true, at("203.0.113.1"));
+        let ban = crate::KickBan {
+            by: crate::Actor::Operator,
+            for_: std::time::Duration::from_secs(60),
+            reason: "spam".into(),
+        };
+        assert!(core.kick_by(a2, Some(ban)).unwrap().banned);
+        assert!(drain(&mut rx2).contains(&Event::Kicked));
+        assert!(
+            !drain(&mut rx3).contains(&Event::Kicked),
+            "a kick's ban ends the session the kick does, and no other"
+        );
+        core.end_session(a2);
+        assert_eq!(told(&mut watching), [("joined", a3), ("parted", a2)]);
+    }
+
+    #[test]
+    fn a_kick_of_ones_own_row_is_refused_and_of_anyone_else_is_not() {
+        let core = Core::new().with_coalesce(true);
+        let (bob, _rxb) = attach(&core, "bob", None, None);
+        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        for (kicker, target, own) in [
+            (a2, a1, true),
+            (a1, a1, true),
+            (bob, a1, false),
+            (a1, bob, false),
+            // A session alone kicks itself as it always could.
+            (bob, bob, false),
+        ] {
+            assert_eq!(
+                core.kicks_own_row(kicker, target),
+                own,
+                "{kicker} kicking {target}"
+            );
+        }
     }
 
     #[test]

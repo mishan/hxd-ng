@@ -449,7 +449,7 @@ Requests, all `access_denied` without `moderate` except `report`:
 | `redact` | `id` (line), `reason` | `{}` | `no_such_line`, `protected` |
 | `revoke` | `media` (handle), `reason`, `block?` (default true) | `{}` | `no_such_media`, `protected` |
 | `purge` | `login` \| `fingerprint` \| `uid`, `since?` (seconds, default 3600), `reason` | `{ "lines": n, "media": n, "articles": n }` | `no_such_user`, `protected` |
-| `kick` | `uid`, `ban?` (seconds, at most a year), `purge?` (seconds), `reason?` (required with `purge`) | `{}`; for a user of a linked server `{ "hidden_here": true, "network": bool, "banned": bool }`: hidden here at once, and whether their home server carried out the kick or ban; `ban` of 0 is a kick, and `purge` takes their lines on this server only (server-link.md §6.3) | `no_such_user`, `protected` |
+| `kick` | `uid`, `ban?` (seconds, at most a year), `purge?` (seconds), `reason?` (required with `purge`) | `{}`; `{ "purged": false }` when the kick was made but its purge was not: its record or the lines it took could not be written, or the user became protected meanwhile; for a user of a linked server `{ "hidden_here": true, "network": bool, "banned": bool }`: hidden here at once, and whether their home server carried out the kick or ban; `ban` of 0 is a kick, and `purge` takes their lines on this server only (server-link.md §6.3) | `no_such_user`, `protected` |
 | `moderation_log` | `before?`, `limit?` | `{ "entries": [ … ], "has_more" }` | |
 
 An act of a kind this server has no name for, one a newer server

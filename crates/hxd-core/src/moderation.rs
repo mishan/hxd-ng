@@ -705,6 +705,15 @@ pub struct Purged {
     pub articles: Vec<ArticleId>,
 }
 
+/// A purge [`Core::purge_check`] allowed, for [`Core::purge_checked`].
+pub struct PurgeCheck {
+    acting: Acting,
+    why: String,
+    store: Arc<dyn ModerationStore>,
+    subject: Subject,
+    mailbox: Mailbox,
+}
+
 /// The acting principal, copied out of the roster.
 #[derive(Debug, Clone)]
 pub(crate) struct Acting {
@@ -1164,11 +1173,48 @@ impl Core {
         within: Duration,
         why: &str,
     ) -> Result<Purged, ModError> {
+        let check = self.purge_check(by, who, why)?;
+        self.purge_checked(check, within)
+    }
+
+    /// Whether `by` may purge `who` for `why`, as [`Core::purge_sender`]
+    /// asks before it touches anything: the purge to make, or why not. A
+    /// kick that purges asks this first, so a purge it may not make
+    /// refuses the kick with nothing done.
+    pub fn purge_check(
+        &self,
+        by: Actor,
+        who: &PersonRef,
+        why: &str,
+    ) -> Result<PurgeCheck, ModError> {
         let acting = self.acting(by)?;
         let why = reason(why, MAX_ACT_REASON)?;
         let store = self.moderation_store()?.clone();
         let subject = self.resolve_person(who)?;
         let mailbox = subject.mailbox().ok_or(ModError::NoSuchUser)?;
+        if self.protected(acting.overrides, Some(&mailbox)) {
+            return Err(ModError::Protected);
+        }
+        Ok(PurgeCheck {
+            acting,
+            why,
+            store,
+            subject,
+            mailbox,
+        })
+    }
+
+    /// The purge [`Core::purge_check`] allowed, of what `who` sent within
+    /// `within`.
+    pub fn purge_checked(&self, check: PurgeCheck, within: Duration) -> Result<Purged, ModError> {
+        let PurgeCheck {
+            acting,
+            why,
+            store,
+            subject,
+            mailbox,
+        } = check;
+        // Asked again: the ladder may have moved since the check.
         if self.protected(acting.overrides, Some(&mailbox)) {
             return Err(ModError::Protected);
         }
