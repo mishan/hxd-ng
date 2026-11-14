@@ -350,6 +350,19 @@ pub struct SpamBan {
     /// Never empty: [`Core::kick_ban_targets`], one act.
     targets: Vec<crate::ban::BanTarget>,
     for_: Duration,
+    /// A person's, whose every session the ban ends.
+    person: bool,
+}
+
+/// A kick begun ([`Core::kick_begin`]).
+pub(crate) struct KickBegun {
+    /// The session the kick named.
+    session: Uid,
+    nick: String,
+    targets: Vec<crate::ban::BanTarget>,
+    /// Every session it ends, with its serial.
+    members: Vec<(Uid, u64)>,
+    person: bool,
 }
 
 /// A kick made ([`Core::kick_by`]).
@@ -1232,6 +1245,8 @@ impl Core {
                     continue;
                 };
                 match r.users.get(&uid) {
+                    // Its person kicked meanwhile.
+                    Some(_) if r.ending(uid) => *result = Some(Err(ChatError::Flooding)),
                     Some(sess) if sess.serial == serial => {
                         // Parted from the room meanwhile, or no longer let
                         // post there: not heard there.
@@ -1696,25 +1711,25 @@ impl Core {
     /// [`Core::chat_flood_kick`].
     fn chat_flood_count(&self, uid: Uid, text: &str) -> Result<bool, ChatError> {
         let mut r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get_mut(&uid) else {
+        let ending = r.ending(uid);
+        let Some(sess) = r.users.get(&uid) else {
             return Ok(true);
         };
         // On its way out: every line it had in flight would kick it
         // again and tell the room again.
-        if sess.kicked {
+        if sess.kicked || ending {
             return Err(ChatError::Flooding);
         }
         if sess.can_spam || sess.info.system {
             return Ok(true);
         }
         let lines = crate::limits::chat_lines(text);
-        Ok(sess
-            .flood
-            .chat(lines, &self.flood_limits, std::time::Instant::now()))
+        let flood = r.flood_of(uid).expect("on the roster");
+        Ok(flood.chat(lines, &self.flood_limits, std::time::Instant::now()))
     }
 
     fn chat_flood_kick(&self, uid: Uid, cid: u32) -> ChatError {
-        let nick = match kick_in(&mut self.roster.lock().unwrap(), uid) {
+        let nick = match kick_person(&mut self.roster.lock().unwrap(), uid) {
             Ok(nick) => nick,
             Err(_) => return ChatError::Flooding,
         };
@@ -1735,17 +1750,19 @@ impl Core {
     pub fn spam_room(&self, uid: Uid) -> u32 {
         let limits = self.flood_limits;
         let mut r = self.roster.lock().unwrap();
-        let Some(sess) = r.users.get_mut(&uid) else {
+        let ending = r.ending(uid);
+        let Some(sess) = r.users.get(&uid) else {
             return u32::MAX;
         };
-        if sess.kicked {
+        if sess.kicked || ending {
             return 0;
         }
         if sess.can_spam || sess.info.system || limits.spam_points == 0 || limits.spam_per.is_zero()
         {
             return u32::MAX;
         }
-        let (spent, _) = sess.flood.spam(0, &limits, std::time::Instant::now());
+        let flood = r.flood_of(uid).expect("on the roster");
+        let (spent, _) = flood.spam(0, &limits, std::time::Instant::now());
         limits.spam_points.saturating_sub(spent).saturating_sub(1)
     }
 
@@ -1768,31 +1785,34 @@ impl Core {
     /// chosen now, while the session is on the roster to be read.
     pub fn spend_spam(&self, uid: Uid, points: u32, trans: u32) -> Result<(), Flooded> {
         let limits = self.flood_limits;
-        let (nick, total, targets, shown) = {
+        let (nick, total, targets, shown, person) = {
             let mut r = self.roster.lock().unwrap();
-            let Some(sess) = r.users.get_mut(&uid) else {
+            let ending = r.ending(uid);
+            let Some(sess) = r.users.get(&uid) else {
                 return Ok(());
             };
-            if sess.kicked {
+            if sess.kicked || ending {
                 return Err(Flooded { ban: None });
             }
             if sess.can_spam || sess.info.system {
                 return Ok(());
             }
-            let (total, under) = sess.flood.spam(points, &limits, std::time::Instant::now());
+            let flood = r.flood_of(uid).expect("on the roster");
+            let (total, under) = flood.spam(points, &limits, std::time::Instant::now());
             if under {
                 return Ok(());
             }
+            let sess = &r.users[&uid];
             let targets = if limits.ban_for.is_zero() {
                 Vec::new()
             } else {
                 self.kick_ban_targets(sess)
             };
-            let shown = sess.live();
+            let (shown, person) = (sess.live(), sess.grouped);
             // Kicked under the lock that found it over, so a burst in
             // flight kicks it once; banned once the lock is let go.
-            match kick_in(&mut r, uid) {
-                Ok(nick) => (nick, total, targets, shown),
+            match kick_person(&mut r, uid) {
+                Ok(nick) => (nick, total, targets, shown, person),
                 Err(_) => return Err(Flooded { ban: None }),
             }
         };
@@ -1822,6 +1842,7 @@ impl Core {
                 uid,
                 targets,
                 for_: limits.ban_for,
+                person,
             }),
         })
     }
@@ -1868,7 +1889,7 @@ impl Core {
     /// store write: called off the reactor. Said in the log when it
     /// cannot be placed; the kick stands either way.
     pub fn place_spam_ban(&self, ban: SpamBan) {
-        self.place_kick_ban(
+        let placed = self.place_kick_ban(
             ban.uid,
             ban.targets,
             KickBan {
@@ -1877,6 +1898,9 @@ impl Core {
                 reason: "spam_max exceeded".into(),
             },
         );
+        if ban.person {
+            self.end_person_banned(&placed);
+        }
     }
 
     /// A server notice into a chat (kick announcements and the like).
@@ -3625,8 +3649,9 @@ impl Core {
         .map(|k| k.nick)
     }
 
-    /// Kick `target`, and with `ban` ban it too. The target session
-    /// receives [`Event::Kicked`] and its transport closes; the
+    /// Kick `target`, and with `ban` ban it too. The target session, and
+    /// every other device of a person (`[server] coalesce`), receives
+    /// [`Event::Kicked`] and its transport closes; the
     /// public-chat announcement is the caller's job (it owns the
     /// wording, and [`Kicked::banned`] says which verb). The
     /// cant-be-disconnected check is policy and lives in the caller,
@@ -3637,9 +3662,78 @@ impl Core {
     /// IPv4 address alone, an IPv6 one with its `[moderation]
     /// ban_v6_prefix` block), not on an exempt address. It ends no other
     /// session, as the reference server's kick-with-ban does not: they
-    /// are refused at their next connection.
+    /// are refused at their next connection. A person's is the
+    /// exception: its ban ends every session it refuses as the person,
+    /// one still at the agreement included, which would otherwise join
+    /// past it.
     pub fn kick_by(&self, target: Uid, ban: Option<KickBan>) -> Result<Kicked, ChatError> {
-        let (nick, targets, serial) = {
+        self.kick_with(target, ban, |_| ()).0
+    }
+
+    /// [`Core::kick_by`], with the purge [`Core::purge_check`] allowed,
+    /// of what the target sent within its window, made after the kick's
+    /// first step: a person's devices are refused from then, so no line
+    /// of theirs is logged between the purge and the kick. Begun, a kick
+    /// is made whatever the purge does. Whether a purge was made whole,
+    /// when one was asked; a failure is said in the log.
+    pub fn kick_purging(
+        &self,
+        target: Uid,
+        ban: Option<KickBan>,
+        purge: Option<(crate::PurgeCheck, Duration)>,
+    ) -> (Result<Kicked, ChatError>, Option<bool>) {
+        let asked = purge.is_some();
+        let (kicked, purged) = self.kick_with(target, ban, |c| {
+            purge.map(|(check, within)| c.purge_checked(check, within))
+        });
+        let purged = match purged {
+            Some(None) => None,
+            Some(Some(Ok(_))) => Some(true),
+            // The ladder moved after the purge was allowed.
+            Some(Some(Err(crate::ModError::Protected))) => {
+                debug!(target, "the kick's purge was refused: protected");
+                Some(false)
+            }
+            Some(Some(Err(e))) => {
+                warn!(target, "the kick's purge failed: {e:?}");
+                Some(false)
+            }
+            None => {
+                warn!(target, "the kick's purge panicked");
+                asked.then_some(false)
+            }
+        };
+        (kicked, purged)
+    }
+
+    /// A kick of `target`, with `purge` run after its first step, and
+    /// nothing held while it runs, as a purge takes the serials itself:
+    /// what the purge answered, or `None` if it panicked.
+    pub(crate) fn kick_with<T>(
+        &self,
+        target: Uid,
+        ban: Option<KickBan>,
+        purge: impl FnOnce(&Core) -> T,
+    ) -> (Result<Kicked, ChatError>, Option<T>) {
+        let begun = self.kick_begin(target, ban.is_some());
+        // Made even when there is no kick to make, so someone who left as
+        // it came keeps no lines. A panic is caught so a kick begun is
+        // still made, and that is all it buys: what the purge left half
+        // done is the stores', and a panic while it held the roster or a
+        // serial poisons that lock, as anywhere, and the kick panics on
+        // it too.
+        let purged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| purge(self))).ok();
+        (begun.map(|begun| self.kick_end(begun, ban)), purged)
+    }
+
+    /// A kick's first step, under the roster lock: what it ends, and
+    /// what its ban would ban.
+    pub(crate) fn kick_begin(&self, target: Uid, banning: bool) -> Result<KickBegun, ChatError> {
+        // Between two of the lobby's commits: a line its person sent is
+        // heard before the kick, or refused (`RosterInner::ending`).
+        let coalescing = self.roster.lock().unwrap().persons.on;
+        let _serial = coalescing.then(|| self.log_serial.lock().unwrap());
+        {
             let mut r = self.roster.lock().unwrap();
             // A session no list shows is nobody to kick by uid, as it is
             // nobody to message or ask about: a messenger session
@@ -3652,24 +3746,88 @@ impl Core {
             if sess.system {
                 return Err(ChatError::NoSuchUser);
             }
-            let targets = match ban {
-                Some(_) => self.kick_ban_targets(sess),
-                None => Vec::new(),
+            let (session, nick, person) = (sess.info.uid, sess.info.nick.clone(), sess.grouped);
+            // Kicked already, and on its way out: the lobby is told once.
+            if r.ending(session) {
+                return Err(ChatError::NoSuchUser);
+            }
+            let sess = r.users.get_mut(&session).expect("named above");
+            let targets = match banning {
+                true => self.kick_ban_targets(sess),
+                false => Vec::new(),
             };
-            // So its leaving crosses links as a ban; the session ends
-            // either way, so an unplaced ban leaves nothing stale.
-            sess.banned |= !targets.is_empty();
-            (sess.info.nick.clone(), targets, sess.serial)
-        };
-        let banned = ban.is_some_and(|ban| self.place_kick_ban(target, targets, ban));
+            // A person is kicked whole: every device of it.
+            let members: Vec<(Uid, u64)> = r
+                .person_ending(session)
+                .into_iter()
+                .filter_map(|m| {
+                    let sess = r.users.get_mut(&m)?;
+                    // So its leaving crosses links as a ban: once begun,
+                    // every member is ended, so an unplaced ban leaves
+                    // nothing stale.
+                    sess.banned |= !targets.is_empty();
+                    Some((m, sess.serial))
+                })
+                .collect();
+            Ok(KickBegun {
+                session,
+                nick,
+                targets,
+                members,
+                person,
+            })
+        }
+    }
+
+    /// The rest of a kick [`Core::kick_begin`] began: its ban written,
+    /// then the kick.
+    pub(crate) fn kick_end(&self, begun: KickBegun, ban: Option<KickBan>) -> Kicked {
+        let KickBegun {
+            session,
+            nick,
+            targets,
+            members,
+            person,
+        } = begun;
+        let placed = ban.map_or_else(Vec::new, |ban| self.place_kick_ban(session, targets, ban));
+        let banned = !placed.is_empty();
         let mut r = self.roster.lock().unwrap();
         // The roster lock was let go while the ban was written. A target
         // that left meanwhile is gone, and its uid, if it has been given
         // out again, is somebody else's.
-        if r.users.get(&target).map(|s| s.serial) != Some(serial) {
-            return Ok(Kicked { nick, banned });
+        let mut nick = nick;
+        for (m, serial) in members {
+            if r.users.get(&m).map(|s| s.serial) == Some(serial) {
+                if let Ok(n) = kick_in(&mut r, m) {
+                    if m == session {
+                        nick = n;
+                    }
+                }
+            }
         }
-        kick_in(&mut r, target).map(|nick| Kicked { nick, banned })
+        drop(r);
+        if person {
+            self.end_person_banned(&placed);
+        }
+        Kicked { nick, banned }
+    }
+
+    /// End every session a person's kick-with-ban refuses as the person,
+    /// one still at the agreement included: it would otherwise join past
+    /// the ban. Not by the address, which others may share.
+    fn end_person_banned(&self, placed: &[crate::ban::BanTarget]) {
+        use crate::ban::BanTarget;
+        for t in placed {
+            if matches!(t, BanTarget::Login(_) | BanTarget::Identity(_)) {
+                self.end_refused(t, None);
+            }
+        }
+    }
+
+    /// Whether `target`, a uid a kick names, is `kicker`'s own person,
+    /// which a classic kick would end whole, `kicker` included.
+    pub fn kicks_own_row(&self, kicker: Uid, target: Uid) -> bool {
+        self.roster.lock().unwrap().is_own_row(kicker, target)
     }
 
     /// The address block a kick-with-ban from `addr` bans: the address
@@ -3689,12 +3847,17 @@ impl Core {
 
     /// Place a kick's ban on `targets` ([`Core::kick_ban_targets`]), as
     /// one act. Said in the log when it cannot be placed, and the kick
-    /// goes ahead either way. Whether any of it was placed.
-    fn place_kick_ban(&self, uid: Uid, targets: Vec<crate::ban::BanTarget>, ban: KickBan) -> bool {
+    /// goes ahead either way. What of it was placed.
+    fn place_kick_ban(
+        &self,
+        uid: Uid,
+        targets: Vec<crate::ban::BanTarget>,
+        ban: KickBan,
+    ) -> Vec<crate::ban::BanTarget> {
         use crate::ban::BanTarget;
         if targets.is_empty() {
             debug!(target = uid, "kicked: nothing of theirs alone to ban");
-            return false;
+            return Vec::new();
         }
         let placed = self.acting_kicker(ban.by).and_then(|acting| {
             // A moderator kicking another session of their own does not
@@ -3732,24 +3895,43 @@ impl Core {
             )
             .map_err(|e| warn!("kick: the ban was not placed: {e:?}"))
             .ok()
+            // The rows written, the identity a login links among them.
+            .map(|bans| bans.into_iter().map(|b| b.target).collect())
         });
         if placed.is_none() {
             warn!(target = uid, "kicked without the ban it asked for");
         }
-        placed.is_some()
+        placed.unwrap_or_default()
     }
 
     /// A user's access bits (for policy checks against a *target*, e.g.
     /// cant-be-disconnected).
     pub fn access_of(&self, uid: Uid) -> Option<crate::AccessBits> {
         let r = self.roster.lock().unwrap();
-        r.users.get(&uid).map(|s| s.access)
+        // A person's row, whichever device holds it now.
+        r.users.get(&uid).or_else(|| r.named(uid)).map(|s| s.access)
     }
 
     /// Is this address banned (`crate::ban`)?
     pub fn is_banned(&self, addr: IpAddr) -> bool {
         self.address_banned(addr).is_some()
     }
+}
+
+/// [`kick_in`] for `target` and, when it is a person's, every other
+/// device of it: a flood or spam kick is the person's, as its budgets are.
+pub(crate) fn kick_person(r: &mut RosterInner, target: Uid) -> Result<String, ChatError> {
+    if r.users.get(&target).is_none_or(|s| s.system) {
+        return kick_in(r, target);
+    }
+    // Before any is kicked: a detached one ends at once, and takes its
+    // place in the person with it.
+    let members = r.person_ending(target);
+    let nick = kick_in(r, target);
+    for m in members.into_iter().filter(|m| *m != target) {
+        let _ = kick_in(r, m);
+    }
+    nick
 }
 
 /// [`Core::kick`], without its ban, under a roster lock the caller
@@ -3795,10 +3977,21 @@ mod tests {
     }
 
     /// A log whose commits take a while and that says how many lines each
-    /// one carried.
+    /// one carried, and that holds every commit while `held` says so.
+    #[derive(Default)]
     struct SlowLog {
         inner: crate::history::MemoryLog,
         commits: Mutex<Vec<usize>>,
+        held: (Mutex<bool>, std::sync::Condvar),
+        /// Commits that have reached the log.
+        reached: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowLog {
+        fn release(&self) {
+            *self.held.0.lock().unwrap() = false;
+            self.held.1.notify_all();
+        }
     }
 
     impl crate::history::ChatLog for SlowLog {
@@ -3821,6 +4014,10 @@ mod tests {
             &self,
             lines: &[NewLine],
         ) -> Result<Vec<crate::history::Appended>, StoreError> {
+            self.reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let held = self.held.0.lock().unwrap();
+            drop(self.held.1.wait_while(held, |h| *h).unwrap());
             std::thread::sleep(Duration::from_millis(5));
             self.commits.lock().unwrap().push(lines.len());
             self.inner.append_all(lines)
@@ -3962,15 +4159,67 @@ mod tests {
         }
     }
 
+    /// A line staged before its person was marked as being kicked, and
+    /// queued behind a commit that held the lobby meanwhile, is refused
+    /// when its own commit asks again, and heard by nobody.
+    #[test]
+    fn a_line_queued_before_its_person_was_kicked_is_refused_at_its_commit() {
+        use crate::coalesce::tests::{alice, at};
+        let log = Arc::new(SlowLog::default());
+        *log.held.0.lock().unwrap() = true;
+        let core = Arc::new(
+            Core::new()
+                .with_history(log.clone(), Default::default())
+                .with_coalesce(true),
+        );
+        let (reader, mut rx) = test_attach(&core, "reader", chatter());
+        let (a1, _rx1) = alice(&core, true, at("192.0.2.1"));
+        let (a2, _rx2) = alice(&core, true, at("198.51.100.1"));
+        drain(&mut rx);
+        let say = |uid: Uid, text: &str| {
+            let (core, text) = (core.clone(), text.to_string());
+            std::thread::spawn(move || core.chat_public(uid, text, 0, None))
+        };
+        // The reader's line leads, and its commit is held at the log.
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "never {what}");
+                std::thread::yield_now();
+            }
+        };
+        let first = say(reader, "first");
+        until("reached the log", &|| {
+            log.reached.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+        // Alice's is let in, and waits behind it.
+        let second = say(a2, "second");
+        until("queued", &|| {
+            !core.chat_commit.state.lock().unwrap().queue.is_empty()
+        });
+        // The kick's first step, which the lobby's serial would make
+        // wait for the held commit: taken without it, as the step is
+        // what the commit's refresh must see.
+        core.roster.lock().unwrap().person_ending(a1);
+        log.release();
+        assert!(first.join().unwrap().is_ok());
+        assert_eq!(second.join().unwrap(), Err(ChatError::Flooding));
+        let heard: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Chat { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heard, ["first"]);
+    }
+
     /// Lines sent at once share commits, and are still logged and heard in
     /// one order: every reader hears every line once, ids rising, and every
     /// sender is told its own lines' ids.
     #[test]
     fn lines_sent_at_once_share_commits_and_keep_one_order() {
-        let log = Arc::new(SlowLog {
-            inner: Default::default(),
-            commits: Default::default(),
-        });
+        let log = Arc::new(SlowLog::default());
         let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
         let (_reader, mut rx) = test_attach(&core, "reader", chatter());
         let senders: Vec<Uid> = (0..8)
@@ -4017,10 +4266,7 @@ mod tests {
 
     #[test]
     fn one_callers_lines_share_commits_beside_others_and_keep_their_order() {
-        let log = Arc::new(SlowLog {
-            inner: Default::default(),
-            commits: Default::default(),
-        });
+        let log = Arc::new(SlowLog::default());
         let core = Arc::new(Core::new().with_history(log.clone(), Default::default()));
         let (_reader, mut rx) = test_attach(&core, "reader", chatter());
         let (sender, _) = test_attach(&core, "local", chatter());
@@ -4063,10 +4309,7 @@ mod tests {
 
     #[test]
     fn a_senders_run_is_one_commit_and_its_flood_heard_after_the_lines_before() {
-        let log = Arc::new(SlowLog {
-            inner: Default::default(),
-            commits: Default::default(),
-        });
+        let log = Arc::new(SlowLog::default());
         let core = Arc::new(
             Core::new()
                 .with_history(log.clone(), Default::default())

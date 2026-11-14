@@ -2909,8 +2909,12 @@ async fn complete_login(
     }
     ctx.core.announce(sess.uid);
     sess.announced = true;
-    // Told again as the person it joined, whose row it is shown as.
+    // Told again as the person it joined, whose row it is shown as and
+    // whose mask it took.
     if ctx.core.row_uid(sess.uid) != sess.uid {
+        if let Some(account) = ctx.core.session_account(sess.uid) {
+            sess.account = account;
+        }
         push_self_info(tx, ctx, sess);
     }
     drop(permit);
@@ -5474,6 +5478,11 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 reply_error(tx, f.trans, "That user cannot be disconnected.");
                 return;
             }
+            // Every device of a person is kicked together, this one too.
+            if ctx.core.kicks_own_row(sess.uid, target) {
+                reply_error(tx, f.trans, "You cannot disconnect yourself.");
+                return;
+            }
             let ban_for = ban.then_some(ctx.cfg.ban_time);
             // A user of another server: hidden here at once, then purged
             // here if `kick_purges` asks, by the key taken before the kick,
@@ -5529,32 +5538,34 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // and only for a kicker who may purge, since that is the
             // question the ng request asks too (moderation.md §6). Off
             // by default: a kick over this wire has meant one thing for
-            // twenty-five years. Before the kick, while the target's
-            // session still says who they are.
+            // twenty-five years. Asked before the kick, while the target's
+            // session still says who they are, and made after its first
+            // step, so a person's other devices say nothing between the
+            // two. A purge it may not make is skipped, and one that fails
+            // said in the log, and the kick made all the same.
             let window = ctx.core.moderation_policy().kick_purges;
-            if !window.is_zero() && ctx.core.is_moderator(sess.uid) {
-                let who = hxd_core::PersonRef::Uid(target);
-                let by = hxd_core::Actor::Session(sess.uid);
-                let why = if ban { "banned" } else { "kicked" };
-                let core = ctx.core.clone();
-                let purged =
-                    tokio::task::spawn_blocking(instrument::blocking("purge", move || {
-                        core.purge_sender(by, &who, window, why)
-                    }))
-                    .await;
-                if let Ok(Err(e)) = purged {
-                    debug!(target, "kick purge skipped: {e:?}");
-                }
-            }
+            let purges = !window.is_zero() && ctx.core.is_moderator(sess.uid);
+            let by = hxd_core::Actor::Session(sess.uid);
+            let why = if ban { "banned" } else { "kicked" };
             let kick_ban = ban_for.map(|for_| hxd_core::KickBan {
-                by: hxd_core::Actor::Session(sess.uid),
+                by,
                 for_,
                 reason: "banned by a moderator".into(),
             });
-            // A ban is written to the store: off the reactor.
-            let kicked = off_reactor(&ctx.core, move |c| c.kick_by(target, kick_ban))
-                .await
-                .unwrap_or(Err(ChatError::ServerError));
+            // A purge and a ban are store writes: off the reactor.
+            let kicked = off_reactor(&ctx.core, move |c| {
+                let check = purges
+                    .then(|| c.purge_check(by, &hxd_core::PersonRef::Uid(target), why))
+                    .and_then(|checked| {
+                        checked
+                            .map_err(|e| debug!(target, "kick purge skipped: {e:?}"))
+                            .ok()
+                    });
+                c.kick_purging(target, kick_ban, check.map(|check| (check, window)))
+                    .0
+            })
+            .await
+            .unwrap_or(Err(ChatError::ServerError));
             match kicked {
                 Ok(hxd_core::Kicked { nick, banned }) => {
                     reply(tx, f.trans, vec![]);

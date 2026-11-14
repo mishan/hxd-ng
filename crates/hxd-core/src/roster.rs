@@ -1368,7 +1368,7 @@ impl UidQuarantine {
         }
     }
 
-    fn holds(&self, uid: Uid) -> bool {
+    pub(crate) fn holds(&self, uid: Uid) -> bool {
         self.held.contains(&uid)
     }
 
@@ -1534,12 +1534,7 @@ impl RosterInner {
         // ones — stable ids for the lifetime of a session, no reuse while
         // alive or for UID_QUARANTINE after.
         self.freed_uids.release_expired(now);
-        let rows_alone = self
-            .persons
-            .rows
-            .keys()
-            .filter(|row| !self.users.contains_key(row))
-            .count();
+        let rows_alone = self.rows_alone();
         if self.users.len() + self.ghosts.len() + self.freed_uids.held.len() + rows_alone
             >= usize::from(u16::MAX)
         {
@@ -2583,6 +2578,9 @@ impl Core {
                 sess.announced = Announced::Live;
                 match r.coalesce_join(uid) {
                     crate::coalesce::Joined::Another(changed) => {
+                        // Before the row is told: its own view of it is
+                        // the person's, masked.
+                        r.take_persons_mask(uid);
                         if let Some(ev) = changed {
                             r.tell_row(*ev);
                         }
