@@ -3033,14 +3033,20 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                     room,
                     &format!("you were removed from {name}"),
                 );
-                push(
-                    tx,
-                    hdr::CHAT_USER_PART,
-                    vec![
-                        (tag::CHAT_ID, room.to_be_bytes().to_vec()),
-                        (tag::UID, uid.to_be_bytes().to_vec()),
-                    ],
-                );
+                // The part takes the session out of the window's list. A
+                // device of a person is listed as its person's row, and
+                // told by the line alone, as its person's other devices
+                // are told a part on another device.
+                if uid == sess.uid && !ctx.core.grouped(sess.uid) {
+                    push(
+                        tx,
+                        hdr::CHAT_USER_PART,
+                        vec![
+                            (tag::CHAT_ID, room.to_be_bytes().to_vec()),
+                            (tag::UID, uid.to_be_bytes().to_vec()),
+                        ],
+                    );
+                }
                 return true;
             }
             event => event,
@@ -3257,6 +3263,21 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                         .then(|| (tag::COLOR, nick_color(&user).to_vec())),
                 )
                 .collect(),
+            );
+        }
+        // Its own person's part: the chat was left on another device, and
+        // 1.5 has no message that closes a window, so a line says it.
+        Event::ChatUserParted { cid, uid } if uid == ctx.core.row_uid(sess.uid) => {
+            let what = ctx
+                .core
+                .room_name(cid)
+                .map_or_else(|| "this chat".to_string(), |n| format!("#{n}"));
+            server_line(
+                tx,
+                ctx,
+                sess,
+                cid,
+                &format!("you left {what} on another device"),
             );
         }
         Event::ChatUserParted { cid, uid } => {

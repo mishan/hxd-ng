@@ -925,13 +925,15 @@ fn rename(w: &mut Waiting, old: &Key, to: &Mailbox) {
 
 /// Does `s` hear `room`'s reactions as they change: a session that
 /// declared them, reading the lobby, or a member of the room able to
-/// see it.
+/// see it, with the room open.
 fn hears(r: &RosterInner, room: u32, uid: Uid, s: &UserSession) -> bool {
     s.info.transport.reactions
         && match room {
             0 => s.live() && reads_public_chat(s),
             _ => r.rooms.get(&room).is_some_and(|e| {
-                e.members.contains(&r.row_of(uid)) && crate::rooms::sees(s, &e.room)
+                e.members.contains(&r.row_of(uid))
+                    && s.heard_from.contains_key(&room)
+                    && crate::rooms::sees(s, &e.room)
             }),
         }
 }

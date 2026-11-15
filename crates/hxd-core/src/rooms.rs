@@ -496,15 +496,16 @@ impl RosterInner {
             room,
             event: Box::new(event),
         };
-        for uid in self.members_sessions(&members) {
+        for uid in self.window_sessions(room, &members) {
             if self.users.get(&uid).is_some_and(&pred) {
                 self.send_to(uid, ev.clone());
             }
         }
     }
 
-    /// Part `uid` from `room` and its voice room, telling the members
-    /// left.
+    /// Part `uid`'s person from `room` and its voice room, telling the
+    /// members left, and the person's other devices that had the room
+    /// open: one leaving it leaves it for all.
     pub(crate) fn room_part(&mut self, room: u32, uid: Uid) -> bool {
         self.room_part_where(room, uid, |_| true)
     }
@@ -516,7 +517,6 @@ impl RosterInner {
         uid: Uid,
         pred: impl Fn(&UserSession) -> bool,
     ) -> bool {
-        self.voice_part_room(uid, room);
         let row = self.row_of(uid);
         let Some(entry) = self.rooms.get_mut(&room) else {
             return false;
@@ -525,10 +525,24 @@ impl RosterInner {
             return false;
         };
         entry.members.remove(pos);
-        if let Some(sess) = self.users.get_mut(&uid) {
-            sess.heard_from.remove(&room);
+        for session in self.row_sessions(row).collect::<Vec<_>>() {
+            self.voice_part_room(session, room);
         }
-        self.room_send_where(room, Event::ChatUserParted { cid: room, uid }, pred);
+        let others = self.close_windows(row, room, uid);
+        let part = Event::ChatUserParted {
+            cid: room,
+            uid: row.uid(),
+        };
+        self.room_send_where(room, part.clone(), pred);
+        for other in others {
+            self.send_to(
+                other,
+                Event::InRoom {
+                    room,
+                    event: Box::new(part.clone()),
+                },
+            );
+        }
         true
     }
 
@@ -566,15 +580,15 @@ impl RosterInner {
                 room,
                 event: Box::new(event),
             };
-            let staying = self.members_sessions(&stay);
+            let staying = self.window_sessions(room, &stay);
             for &row in &lost {
                 let uid = row.uid();
                 for session in self.members_sessions(&[row]) {
                     self.voice_part_room(session, room);
-                    if let Some(sess) = self.users.get_mut(&session) {
-                        sess.heard_from.remove(&room);
-                    }
-                    // Why is the parted session's business alone.
+                }
+                // Why is the parted session's business alone, and only
+                // a device that had the room open is told it.
+                for session in self.close_windows(row, room, 0) {
                     self.send_to(session, about(Event::RoomParted { uid, reason }));
                 }
                 for &member in &staying {
@@ -598,7 +612,9 @@ impl RosterInner {
             .get(&room)
             .filter(|e| sees(sess, &e.room))
             .ok_or(crate::ChatError::NoSuchChat)?;
-        if !entry.members.contains(&self.row_of(uid)) {
+        // A device of a person in the room that has not joined it itself
+        // is not in it to send there.
+        if !entry.members.contains(&self.row_of(uid)) || !self.window_open(uid, room) {
             return Err(crate::ChatError::NotAMember);
         }
         // The gates alone: one they let post that cannot sign is told a
@@ -628,7 +644,7 @@ impl RosterInner {
         if !sees(inviter, &entry.room) {
             return Err(ChatError::NoSuchChat);
         }
-        if !entry.members.contains(&self.row_of(by)) {
+        if !entry.members.contains(&self.row_of(by)) || !self.window_open(by, room) {
             return Err(ChatError::NotAMember);
         }
         if !sees(invitee, &entry.room) {
@@ -639,10 +655,12 @@ impl RosterInner {
         }
         let ev = Event::ChatInvite {
             cid: room,
-            from: by,
+            from: self.row_uid(by),
             from_nick: inviter.info.nick.clone(),
         };
-        self.send_to(target, ev);
+        for session in self.row_sessions(self.row_of(target)).collect::<Vec<_>>() {
+            self.send_to(session, ev.clone());
+        }
         Ok(())
     }
 
@@ -675,7 +693,9 @@ impl RosterInner {
             .filter(|(uid, s)| {
                 s.info.transport.redactions
                     && sees(s, &entry.room)
-                    && (s.rooms_aware || entry.members.contains(&self.row_of(**uid)))
+                    && (s.rooms_aware
+                        || (entry.members.contains(&self.row_of(**uid))
+                            && s.heard_from.contains_key(&room)))
             })
             .map(|(uid, _)| *uid)
             .collect();
@@ -728,7 +748,7 @@ impl RosterInner {
             .iter()
             .filter(|(id, _)| rooms.is_none_or(|ids| ids.contains(id)))
             .flat_map(|(id, e)| {
-                self.members_sessions(&e.members)
+                self.window_sessions(*id, &e.members)
                     .into_iter()
                     .map(move |uid| (*id, uid))
             })
@@ -1281,7 +1301,8 @@ impl Core {
 
     /// Join a room: who is in it, the joiner included, and its topic. A
     /// join of a room the session is already in is answered as the first
-    /// was, and tells nobody again.
+    /// was, and tells nobody again; so is a device's of a room its person
+    /// is in, which opens that device's window on it.
     pub fn room_join(&self, uid: Uid, id: u32) -> Result<(Vec<UserInfo>, Topic), RoomError> {
         let mut r = self.roster.lock().unwrap();
         let sess = r.users.get(&uid).ok_or(RoomError::NoSuchRoom)?;
@@ -1290,10 +1311,14 @@ impl Core {
             .get(&id)
             .filter(|e| admits(sess, &e.room))
             .ok_or(RoomError::NoSuchRoom)?;
-        let me = sess.info.clone();
+        let me = r.row_view(sess);
         let topic = entry.room.topic.clone();
         let row = r.row_of(uid);
-        if !entry.members.contains(&row) {
+        if entry.members.contains(&row) {
+            if !r.window_open(uid, id) {
+                r.open_window(uid, id);
+            }
+        } else {
             let joined = r
                 .rooms
                 .values()
@@ -1304,15 +1329,12 @@ impl Core {
             }
             r.room_send_where(id, Event::ChatUserJoined { cid: id, user: me }, |_| true);
             r.rooms.get_mut(&id).expect("found above").members.push(row);
-            let from = r.last_ids.get(&id).copied().unwrap_or(0);
-            if let Some(sess) = r.users.get_mut(&uid) {
-                sess.heard_from.insert(id, from);
-            }
+            r.open_window(uid, id);
         }
         let members = r.rooms[&id]
             .members
             .iter()
-            .filter_map(|m| r.row_user(*m).map(|s| s.info.clone()))
+            .filter_map(|m| r.row_info(*m))
             .collect();
         Ok((members, topic))
     }
@@ -1324,7 +1346,9 @@ impl Core {
         if !r.rooms.get(&id).is_some_and(|e| sees(sess, &e.room)) {
             return Err(RoomError::NoSuchRoom);
         }
-        if !r.room_part(id, uid) {
+        // A device that does not have the room open is not in it to
+        // leave: its person may have joined again on another device.
+        if !r.window_open(uid, id) || !r.room_part(id, uid) {
             return Err(RoomError::NotAMember);
         }
         Ok(())
@@ -1370,13 +1394,14 @@ impl Core {
         Ok(())
     }
 
-    /// The rooms `uid` is in, lowest id first.
+    /// The rooms `uid` is in, lowest id first: those it has open, which a
+    /// device of a person need not have of every room its person is in.
     pub fn rooms_of(&self, uid: Uid) -> Vec<u32> {
         let r = self.roster.lock().unwrap();
         let mut ids: Vec<u32> = r
             .rooms
             .iter()
-            .filter(|(_, e)| e.members.contains(&r.row_of(uid)))
+            .filter(|(id, e)| e.members.contains(&r.row_of(uid)) && r.window_open(uid, **id))
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();

@@ -1173,9 +1173,12 @@ pub(crate) struct UserSession {
     /// (`Core::rooms_aware`)? Until then it is told nothing about one.
     pub(crate) rooms_aware: bool,
     /// The newest line relayed in each channel it hears, the lobby and
-    /// the rooms it has joined, when it began to: lines after it reached
-    /// it live, and any line before it it can only have read in history
-    /// (`crate::reaction`).
+    /// the rooms and private chats it has joined, when it began to: lines
+    /// after it reached it live, and any line before it it can only have
+    /// read in history (`crate::reaction`). A room or chat here is one
+    /// whose window this session has open: its person may be in one that
+    /// this device never joined itself, and that device hears nothing of
+    /// it ([`RosterInner::window_sessions`]).
     pub(crate) heard_from: HashMap<u32, crate::history::LineId>,
     /// What this session has spent of its flood allowances.
     pub(crate) flood: crate::limits::Flood,
@@ -1461,6 +1464,78 @@ impl RosterInner {
             .collect()
     }
 
+    /// The sessions of `rows` with their window on room or chat `cid`
+    /// open: what a room's or a chat's events go to. A person is in a
+    /// room as one row, but a device of it that has not joined the room
+    /// itself is shown nothing of it, and authorized for none of its
+    /// images.
+    pub(crate) fn window_sessions(&self, cid: u32, rows: &[RowId]) -> Vec<Uid> {
+        self.members_sessions(rows)
+            .into_iter()
+            .filter(|uid| self.window_open(*uid, cid))
+            .collect()
+    }
+
+    pub(crate) fn window_open(&self, uid: Uid, cid: u32) -> bool {
+        self.users
+            .get(&uid)
+            .is_some_and(|s| s.heard_from.contains_key(&cid))
+    }
+
+    /// Open `uid`'s window on `cid`: it hears what is said there from now.
+    pub(crate) fn open_window(&mut self, uid: Uid, cid: u32) {
+        let from = self.last_ids.get(&cid).copied().unwrap_or(0);
+        if let Some(sess) = self.users.get_mut(&uid) {
+            sess.heard_from.insert(cid, from);
+        }
+    }
+
+    /// Close every window `row` has on `cid`, its person having left it.
+    /// The sessions that had one open, `except` aside.
+    pub(crate) fn close_windows(&mut self, row: RowId, cid: u32, except: Uid) -> Vec<Uid> {
+        let mut open = Vec::new();
+        for uid in self.row_sessions(row).collect::<Vec<_>>() {
+            let Some(sess) = self.users.get_mut(&uid) else {
+                continue;
+            };
+            if sess.heard_from.remove(&cid).is_some() && uid != except {
+                open.push(uid);
+            }
+        }
+        open
+    }
+
+    /// The rooms and private chats only `uid`, ending, had open of its
+    /// person's, left as a session alone leaves them: its person's other
+    /// devices never opened them, and a member nobody hears is nobody's.
+    fn leave_unheard(&mut self, uid: Uid) {
+        let row = self.row_of(uid);
+        let others: Vec<Uid> = self.row_sessions(row).filter(|s| *s != uid).collect();
+        let unheard = |cid: u32, r: &Self| {
+            r.window_open(uid, cid) && !others.iter().any(|o| r.window_open(*o, cid))
+        };
+        let chats: Vec<u32> = (self.chats.iter())
+            .filter(|(cid, c)| c.members.contains(&row) && unheard(**cid, self))
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in chats {
+            crate::Core::part_one(self, cid, uid);
+        }
+        let rooms: Vec<u32> = (self.rooms.iter())
+            .filter(|(id, e)| e.members.contains(&row) && unheard(**id, self))
+            .map(|(id, _)| *id)
+            .collect();
+        for room in rooms {
+            self.room_part(room, uid);
+        }
+    }
+
+    /// A row as a member list shows it: its person's merged row, or a
+    /// lone session's own.
+    pub(crate) fn row_info(&self, row: RowId) -> Option<UserInfo> {
+        self.row_user(row).map(|s| self.row_view(s))
+    }
+
     /// The session a row is shown as, for its line in a member list.
     pub(crate) fn row_user(&self, row: RowId) -> Option<&UserSession> {
         self.row_sessions(row)
@@ -1653,9 +1728,13 @@ impl RosterInner {
             .collect()
     }
 
-    /// The same, for a named set of sessions (a private room's members).
-    pub(crate) fn media_audience_of(&self, rows: &[RowId]) -> Vec<crate::media::Principal> {
-        self.members_sessions(rows)
+    /// The same, for the members of room or chat `cid` who hear it.
+    pub(crate) fn media_audience_of(
+        &self,
+        cid: u32,
+        rows: &[RowId],
+    ) -> Vec<crate::media::Principal> {
+        self.window_sessions(cid, rows)
             .into_iter()
             .filter_map(|uid| self.users.get(&uid).map(|s| (uid, s)))
             .filter(|(_, sess)| sess.info.transport.inline_media)
@@ -1677,6 +1756,12 @@ impl RosterInner {
         if !self.person_stays(uid) {
             crate::Core::leave_all_chats(self, uid);
             self.room_leave_all(uid);
+        } else {
+            // A uid recycled later declines nothing of this one's.
+            for chat in self.chats.values_mut() {
+                chat.declined.retain(|d| *d != uid);
+            }
+            self.leave_unheard(uid);
         }
         let Some(sess) = self.users.remove(&uid) else {
             return;
@@ -2564,6 +2649,7 @@ impl Core {
     /// only take its place in presence. Idempotent.
     pub fn announce(&self, uid: Uid) {
         let mut load = self.presence_load(uid);
+        let mut chats = Vec::new();
         {
             let mut r = self.roster.lock().unwrap();
             let Some(sess) = r.users.get_mut(&uid) else {
@@ -2584,6 +2670,7 @@ impl Core {
                         if let Some(ev) = changed {
                             r.tell_row(*ev);
                         }
+                        chats = crate::Core::persons_chats(&r, uid);
                     }
                     _ => {
                         let ev = Event::Joined(r.row_view(&r.users[&uid]));
@@ -2594,6 +2681,26 @@ impl Core {
             }
             if let Some(load) = load.as_mut() {
                 r.presence_join(uid, load);
+            }
+        }
+        // A device joining its person after the person joined private
+        // chats is invited to them, by the server or with no system
+        // account by its person, so a classic one can open them.
+        if !chats.is_empty() {
+            let server = self.invites_from();
+            let mut r = self.roster.lock().unwrap();
+            if let Some((from, nick)) = server.or_else(|| crate::Core::self_invite(&r, uid)) {
+                for cid in chats {
+                    let from_nick = nick.clone();
+                    r.send_to(
+                        uid,
+                        Event::ChatInvite {
+                            cid,
+                            from,
+                            from_nick,
+                        },
+                    );
+                }
             }
         }
         if let Some(load) = load {
@@ -3002,6 +3109,12 @@ impl Core {
             uid: r.row_uid(uid),
             ..s.info.clone()
         })
+    }
+
+    /// Whether session `uid` is one of a person's devices.
+    pub fn grouped(&self, uid: Uid) -> bool {
+        let r = self.roster.lock().unwrap();
+        r.users.get(&uid).is_some_and(|s| s.grouped)
     }
 
     /// The uid `uid`'s session is shown as: its person's row, or its own.
