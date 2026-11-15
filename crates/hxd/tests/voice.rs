@@ -1423,8 +1423,10 @@ async fn a_moved_persons_camera_ends_and_so_does_watching_it() {
         json!({ "cid": 0, "streams": [{ "uid": row, "kind": "camera" }] }),
     )
     .await;
-    bob.publishers_for(&json!([{ "uid": row, "kind": "camera", "paused": false }]))
-        .await;
+    let camera = json!([{ "uid": row, "kind": "camera", "paused": false }]);
+    bob.publishers_for(&camera).await;
+    // Read up to the camera, so the next one a1 reads is the move's.
+    a1.publishers_for(&camera).await;
     media.take_calls();
 
     let mut a2 = Client::login(legacy, "alice", true).await;
