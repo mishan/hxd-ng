@@ -604,6 +604,15 @@ async fn ng_told_in(c: &mut ng::Client, room: u32) -> Vec<String> {
         .collect()
 }
 
+/// The next frame of type `ty` `c` is told of chat or room `cid`, waited
+/// for: what an act with no reply tells it, which a ping of `c`'s own
+/// connection does not wait for.
+async fn told_next(c: &mut Client, cid: u32, ty: u32) -> Frame {
+    c.recv_where(|f| f.ty == ty && f.uint(tag::CHAT_ID) == Some(cid))
+        .await
+        .unwrap()
+}
+
 fn line(nick: &str, text: &str) -> String {
     format!("\r{nick:>13}:  {text}")
 }
@@ -649,13 +658,18 @@ async fn a_persons_devices_are_one_member_of_a_private_chat_and_one_leaving_leav
     a1.send(HDR_CHAT_PART, &[(tag::CHAT_ID, cid.to_be_bytes().to_vec())])
         .await
         .unwrap();
-    assert_eq!(told_in(&mut bob, cid).await, [format!("part {row}")]);
-    let told = told_in(&mut a2, cid).await;
-    assert_eq!(told.len(), 1, "{told:?}");
+    // A 116 has no reply: each watcher waits to be told, then nothing
+    // more may have come.
+    let part = told_next(&mut bob, cid, HDR_CHAT_USER_PART).await;
+    assert_eq!(part.uint(tag::UID), Some(row));
+    assert_eq!(told_in(&mut bob, cid).await, Vec::<String>::new(), "once");
+    let said = told_next(&mut a2, cid, HDR_CHAT_PUSH).await;
+    let said = String::from_utf8_lossy(&said.bytes(tag::BODY).unwrap()).into_owned();
     assert!(
-        told[0].contains("you left this chat on another device"),
-        "{told:?}"
+        said.contains("you left this chat on another device"),
+        "{said:?}"
     );
+    assert_eq!(told_in(&mut a2, cid).await, Vec::<String>::new(), "no 118");
     say_in(&mut bob, cid, "gone?").await;
     assert_eq!(told_in(&mut a1, cid).await, Vec::<String>::new());
     assert_eq!(told_in(&mut a2, cid).await, Vec::<String>::new());
@@ -817,7 +831,9 @@ async fn with_coalescing_off_each_device_is_a_member_of_its_own() {
     )
     .await
     .unwrap();
-    assert_eq!(told_in(&mut a2, lounge).await, [format!("part {first}")]);
+    let part = told_next(&mut a2, lounge, HDR_CHAT_USER_PART).await;
+    assert_eq!(part.uint(tag::UID), Some(first));
+    assert_eq!(told_in(&mut a2, lounge).await, Vec::<String>::new(), "once");
     say_in(&mut bob, lounge, "still here").await;
     assert_eq!(told_in(&mut a2, lounge).await, [line("bob", "still here")]);
 }
