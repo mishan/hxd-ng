@@ -723,7 +723,17 @@ Three layers, all `cargo test --workspace`:
   it only over WebSockets logs in, chats with one on the TCP port, and
   downloads over `/htxf`), `ng_only.rs` (the binary run with `[server]
   classic = false` and the classic ports held: it starts, offers no
-  tunnel, and serves an ng login), `slow_consumer.rs` (a room flooded while one
+  tunnel, and serves an ng login), `coalescing.rs` (`[server] coalesce`
+  on, devices of an account whose identity is linked on either wire, and
+  a classic watcher: three devices joining once and leaving once, a kick
+  and a ban from either wire ending a person on both and told once, a
+  flood from two devices kicking the person once, an address ban ending
+  the device at that address alone, a protected person still protected
+  once the device holding its row is gone and a moderator refused a kick
+  of their own person, on each wire with its reason, no line heard after
+  the kick it raced, a kick with a ban racing a login leaving nothing of
+  the person, a mask set on one device told to the other, and with
+  coalescing off each device a user of its own), `slow_consumer.rs` (a room flooded while one
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the

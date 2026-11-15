@@ -504,8 +504,8 @@ impl crate::Core {
     /// placed: a login ban also bans the identity its account links, in
     /// the same act, so relinking the identity elsewhere does not evade
     /// it. Every session the ban now refuses is ended, detached ones
-    /// included — except for a kick's ban, which ends only the session
-    /// the kick does.
+    /// included, except by a kick's ban, which ends nothing itself: the
+    /// kick ends what it ends ([`Core::kick_by`]).
     pub fn place_ban(
         &self,
         by: crate::moderation::Actor,
@@ -587,6 +587,10 @@ impl crate::Core {
                         .as_ref()
                         .and_then(|d| d.account(l))
                         .and_then(|(m, _)| m.fingerprint)
+                        // A kick's ban of a login whose account links
+                        // the kicker's own identity does not ban the
+                        // kicker with it.
+                        .filter(|fp| ban.source != BanSource::Kick || own_fp.as_ref() != Some(fp))
                         .map(BanTarget::Identity);
                 }
                 BanTarget::Identity(fp) => {
@@ -839,6 +843,7 @@ impl crate::Core {
             .iter()
             .filter(|(uid, s)| {
                 !s.info.system
+                    && !s.kicked
                     && Some(**uid) != spare
                     && !s.access.has(crate::access::bit::CANT_BE_DISCONNECTED)
             })

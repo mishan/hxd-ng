@@ -600,21 +600,17 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
             {
                 return refused(ModError::Protected);
             }
-            if let Some(secs) = p.purge {
-                let why = p.reason.clone().unwrap_or_default();
-                let who = PersonRef::Uid(p.uid);
-                let within = Duration::from_secs(secs);
-                let purged =
-                    off_reactor(core, move |c| c.purge_sender(by, &who, within, &why)).await;
-                match purged {
-                    // A guest has nothing to purge by, and is exactly who
-                    // this button is pressed on: the kick still happens,
-                    // as the legacy `kick_purges` path does.
-                    Some(Ok(_)) | Some(Err(ModError::NoIdentity)) => {}
-                    Some(Err(e)) => return refused(e),
-                    None => return reply_err(id, "server_error", "Server error."),
-                }
+            // Every device of a person is kicked together, this one too.
+            if core.kicks_own_row(uid, p.uid) {
+                return refused(ModError::BadRequest("You cannot kick yourself."));
             }
+            let purge = p.purge.map(|secs| {
+                (
+                    PersonRef::Uid(p.uid),
+                    Duration::from_secs(secs),
+                    p.reason.clone().unwrap_or_default(),
+                )
+            });
             let ban = p.ban.map(|s| Duration::from_secs(s).min(MAX_BAN));
             let kick_ban = ban.map(|for_| hxd_core::KickBan {
                 by,
@@ -626,10 +622,30 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     .unwrap_or_else(|| "banned by a moderator".into()),
             });
             let target = p.uid;
-            // A ban is written to the store: off the reactor.
-            let kicked = off_reactor(core, move |c| c.kick_by(target, kick_ban))
-                .await
-                .unwrap_or(Err(hxd_core::ChatError::ServerError));
+            // A purge and a ban are store writes: off the reactor. Whether
+            // the purge may be made is asked before the kick, which it
+            // refuses with nothing done; it is made after the kick's first
+            // step, so a person's other devices say nothing between the two.
+            let kicked = off_reactor(core, move |c| {
+                let check = match purge {
+                    Some((who, within, why)) => match c.purge_check(by, &who, &why) {
+                        Ok(check) => Some((check, within)),
+                        // A guest has nothing to purge by, and is exactly
+                        // who this button is pressed on: the kick still
+                        // happens, as the legacy `kick_purges` path does.
+                        Err(ModError::NoIdentity) => None,
+                        Err(e) => return Err(e),
+                    },
+                    None => None,
+                };
+                Ok(c.kick_purging(target, kick_ban, check))
+            })
+            .await;
+            let (kicked, purged) = match kicked {
+                Some(Ok(kicked)) => kicked,
+                Some(Err(e)) => return refused(e),
+                None => return reply_err(id, "server_error", "Server error."),
+            };
             match kicked {
                 Ok(hxd_core::Kicked { nick, banned }) => {
                     // The reference server's wording, which the legacy
@@ -638,7 +654,12 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     let by_nick = core.user(uid).map(|u| u.nick).unwrap_or_default();
                     let verb = if banned { "banned" } else { "kicked" };
                     core.chat_notice(0, uid, format!("{nick} has been {verb} by {by_nick}"));
-                    reply_ok(id, json!({}))
+                    // Made, whatever became of the purge: an error would
+                    // invite a retry, of a uid someone else may hold next.
+                    match purged {
+                        Some(false) => reply_ok(id, json!({ "purged": false })),
+                        _ => reply_ok(id, json!({})),
+                    }
                 }
                 Err(_) => refused(ModError::NoSuchUser),
             }
