@@ -1441,6 +1441,15 @@ impl RosterInner {
             .map(|_| uid)
     }
 
+    /// Every session a uid a client names stands for: a person's row
+    /// each of its devices, a session alone itself, and nobody else.
+    pub(crate) fn named_sessions(&self, uid: Uid) -> Vec<Uid> {
+        match self.person_members(uid) {
+            Some(members) => members.to_vec(),
+            None => self.named_session(uid).into_iter().collect(),
+        }
+    }
+
     /// The row a session is shown as.
     pub(crate) fn row_of(&self, session: Uid) -> RowId {
         RowId(self.row_uid(session))
@@ -1769,7 +1778,10 @@ impl RosterInner {
         if sess.messaging.is_some() {
             self.presence_leave(uid, &sess.mailbox());
         }
-        self.export_gone(&sess);
+        // A person crosses the links as one user: gone at its last device.
+        if !sess.grouped {
+            self.export_gone(&sess);
+        }
         match self.coalesce_leave(uid, &sess) {
             crate::coalesce::Left::Alone => {
                 self.freed_uids.hold(uid, Instant::now());
@@ -1777,7 +1789,8 @@ impl RosterInner {
                     self.broadcast(&Event::Parted(uid), Some(uid));
                 }
             }
-            crate::coalesce::Left::Last { row } => {
+            crate::coalesce::Left::Last { row, banned } => {
+                self.export_row_gone(row, banned);
                 self.freed_uids.hold(uid, Instant::now());
                 self.freed_uids.hold(row, Instant::now());
                 self.broadcast(&Event::Parted(row), Some(uid));
@@ -1790,6 +1803,7 @@ impl RosterInner {
                 if let Some(ev) = changed {
                     self.tell_row(*ev);
                 }
+                self.export_changed(row);
             }
         }
     }
@@ -2735,13 +2749,7 @@ impl Core {
                 return false;
             };
             r.tell_row(ev);
-            // Each member is its own user to a link, and each was renamed.
-            let members = r
-                .person_members(r.row_uid(uid))
-                .map_or_else(|| vec![uid], <[Uid]>::to_vec);
-            for m in members {
-                r.export_changed(m);
-            }
+            r.export_changed(uid);
             return true;
         }
         let Some(sess) = r.users.get_mut(&uid) else {

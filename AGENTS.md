@@ -712,7 +712,13 @@ Three layers, all `cargo test --workspace`:
   text alone; a classic reaction on a ghost's line counted on its
   server alone, a classic reply to one heard at its home as its
   text alone, and a private message to or from a ghost carrying no
-  reference),
+  reference; and with `[server] coalesce` on both, a person's devices
+  one user at the peer until the last leaves, a network kick hiding
+  every device and one that comes later, a network ban ending every
+  device even once its row's own has left, each signing device's lines
+  verified there, and a person whose first device logged in with a
+  password shown with no identity, its key device's signed line kept
+  here and its signed message not sent),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: Blowfish carrying both
   ways, an ng client seeing the session encrypted and a guest's not, the
@@ -742,11 +748,11 @@ Three layers, all `cargo test --workspace`:
   hearing them only once it joined them itself, the 112 reply naming the
   row and the person's other devices invited by the server, a line from
   any device the row's on both wires, and one device leaving taking the
-  person out
-  with its other devices told by a line, a room the person may no longer
-  be in a removal line to each device and no part, and with coalescing
-  off each device a user and a member of its own; `voice.rs` has a
-  person in voice), `slow_consumer.rs` (a room flooded while one
+  person out with its other devices told by a line, a room the person
+  may no longer be in a removal line to each device and no part, and
+  with coalescing off each device a user and a member of its own;
+  `voice.rs` has a person in voice, and `link.rs` a person across a
+  link), `slow_consumer.rs` (a room flooded while one
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the

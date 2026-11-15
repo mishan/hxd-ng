@@ -42,14 +42,15 @@ fn discovery_key(seed: u8) -> [u8; 32] {
     ServerKey::from_seed(&identity_seed(seed)).public()
 }
 
-/// A server whose link key is `seed` repeated, with `link` as more keys
-/// of its `[link]` section and `peers` as its `[[link.peer]]` entries. Its
-/// TLS listener is `tls`, bound by the caller so a peer's config can name
-/// it first.
+/// A server whose link key is `seed` repeated, with `server` as more keys
+/// of its `[server]` section, `link` as more of its `[link]` section and
+/// `peers` as its `[[link.peer]]` entries. Its TLS listener is `tls`,
+/// bound by the caller so a peer's config can name it first.
 async fn start(
     dir: &Path,
     seed: u8,
     tag: &str,
+    server: &str,
     link: &str,
     peers: &str,
     tls: tokio::net::TcpListener,
@@ -88,7 +89,7 @@ async fn start(
     let ngl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = ngl.local_addr().unwrap();
     let text = format!(
-        "[server]\nname = \"{tag} server\"\n[paths]\naccounts = \"{d}/accounts\"\n\
+        "[server]\nname = \"{tag} server\"\n{server}\n[paths]\naccounts = \"{d}/accounts\"\n\
          [inbox]\ndb = \"{d}/hx.db\"\n[history]\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [identity]\nkey = \"{d}/identity.key\"\nsuccessors = \"\"\nhosts = [\"{ng}\"]\n\
@@ -175,6 +176,19 @@ async fn pair_with(
     a_extra: &str,
     b_extra: &str,
 ) -> (Server, Server, [tempfile::TempDir; 2]) {
+    pair_full(a_holds, b_holds, "", a_link, a_offers, a_extra, b_extra).await
+}
+
+/// [`pair_with`], with `server` as more keys of both `[server]` sections.
+async fn pair_full(
+    a_holds: u8,
+    b_holds: u8,
+    server: &str,
+    a_link: &str,
+    a_offers: &str,
+    a_extra: &str,
+    b_extra: &str,
+) -> (Server, Server, [tempfile::TempDir; 2]) {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = bind().await;
     let a_addr = a_tls.local_addr().unwrap();
@@ -182,6 +196,7 @@ async fn pair_with(
         da.path(),
         1,
         "aa",
+        server,
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
@@ -195,6 +210,7 @@ async fn pair_with(
         db.path(),
         2,
         "bb",
+        server,
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
@@ -1409,14 +1425,14 @@ async fn chain_trying(
         )
     };
     let peers = accept("aa", 1, drafts) + &accept("cc", 3, cc_drafts);
-    let b = start(dirs[1].path(), 2, "bb", "", &peers, b_tls).await;
+    let b = start(dirs[1].path(), 2, "bb", "", "", &peers, b_tls).await;
     let a_peer = dial("aa", drafts);
-    let a = start(dirs[0].path(), 1, "aa", "", &a_peer, bind().await).await;
+    let a = start(dirs[0].path(), 1, "aa", "", "", &a_peer, bind().await).await;
     let c_peer = dial("cc", cc_drafts).replace(
         &format!("features = {TRANSIT}"),
         &format!("features = {cc_offers}"),
     );
-    let c = start(dirs[2].path(), 3, "cc", "", &c_peer, bind().await).await;
+    let c = start(dirs[2].path(), 3, "cc", "", "", &c_peer, bind().await).await;
     assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&c.hub, 2, Duration::from_secs(10)).await);
     (a, b, c, dirs)
@@ -1687,6 +1703,21 @@ async fn keyed(server: &Server, p: &Person) -> (ng::Client, Value) {
 }
 
 async fn keyed_saying(server: &Server, p: &Person, login: Value) -> (ng::Client, Value) {
+    let (c, hello) = keyed_login_saying(server, p, login).await.unwrap();
+    assert!(hello["caps"].as_array().unwrap().contains(&json!("signed")));
+    (c, hello)
+}
+
+/// `p` logging in with their key, as far as the server lets them.
+async fn keyed_login(server: &Server, p: &Person) -> Result<(ng::Client, Value), String> {
+    keyed_login_saying(server, p, json!({})).await
+}
+
+async fn keyed_login_saying(
+    server: &Server,
+    p: &Person,
+    login: Value,
+) -> Result<(ng::Client, Value), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let addr = server.ng;
     let ch = http_json(addr, "/identity/challenge").await;
@@ -1710,14 +1741,13 @@ async fn keyed_saying(server: &Server, p: &Person, login: Value) -> (ng::Client,
     s.read_to_end(&mut raw).await.unwrap();
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let auth: Value = serde_json::from_slice(&raw[split + 4..]).unwrap();
-    let token = auth["token"].as_str().expect("a transport token");
+    let token = auth["token"].as_str().ok_or_else(|| auth.to_string())?;
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut c = ng::Client::over(Box::new(tcp), &format!("ws://{addr}/ng?token={token}"))
         .await
-        .unwrap();
-    let hello = c.login(login).await.unwrap();
-    assert!(hello["caps"].as_array().unwrap().contains(&json!("signed")));
-    (c, hello)
+        .map_err(|e| format!("{e:?}"))?;
+    let hello = c.login(login).await.map_err(|e| format!("{e:?}"))?;
+    Ok((c, hello))
 }
 
 /// The row of a ghost `is` picks out, from `hello` or once `c` hears of
@@ -2290,4 +2320,257 @@ async fn an_expired_certificate_takes_its_sessions_key_flags_with_it() {
     let (r, id) = (&resumed, &resumed["self"]["identity"]);
     let flags = [&r["sealed"], &r["signs"], &id["sealed"], &id["signs"]];
     assert!(flags.iter().all(|v| v.is_null()), "{resumed}");
+}
+
+/// Alice's `n`th device: her identity, under a device key of its own.
+fn alice_on(n: u8) -> Person {
+    let id = IdentityKey::from_seed(&[1; 32]);
+    let dev = DeviceKey::from_seed(&[200 + n; 32]);
+    let card = Card::new(&id, "alice", now()).sign(&id, vec![]).unwrap();
+    let cert = DeviceCert::for_device(&id, &dev, now() - 3600, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(&id);
+    Person {
+        id,
+        dev,
+        card,
+        cert,
+    }
+}
+
+/// Two servers linked, each showing a person's devices as one user, with
+/// `drafts` in each one's entry for the other.
+async fn coalescing(drafts: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
+    let servers = pair_full(2, 1, "coalesce = true", "", EVERY_FEATURE, drafts, drafts).await;
+    assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
+    servers
+}
+
+/// `c` hears `text` from `uid`: what a link sent before the line, it
+/// sent before.
+async fn hears_from(c: &mut legacy::Client, uid: u16, text: &str) {
+    let heard =
+        c.rx.recv_where(|f| {
+            f.ty == push::CHAT
+                && f.uint(tag::UID) == Some(uid.into())
+                && f.bytes(tag::BODY)
+                    .is_some_and(|b| b.ends_with(text.as_bytes()))
+        })
+        .await;
+    assert!(heard.is_ok(), "{text}: {heard:?}");
+}
+
+fn alice_rows(rows: &[UserRow]) -> Vec<u16> {
+    rows.iter()
+        .filter(|r| r.nick == b"alice")
+        .map(|r| r.uid)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_persons_devices_are_one_user_at_the_peer_until_the_last_leaves() {
+    let (a, b, _dirs) = coalescing("").await;
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+        .await
+        .unwrap();
+    let (d1, _) = keyed(&b, &alice_on(1)).await;
+    let ghost = row(&mut admin, "alice").await.uid;
+    let (mut d2, _) = keyed(&b, &alice_on(2)).await;
+    // A line from the second device: heard as the person, after anything
+    // its joining told the link.
+    d2.chat("from the phone").await.unwrap();
+    hears_from(&mut admin, ghost, "from the phone").await;
+    assert_eq!(alice_rows(&admin.user_list().await.unwrap()), [ghost]);
+    assert_eq!(a.core.ghost_count(), 1);
+
+    // User info about the person, by its row.
+    let info = admin
+        .call(
+            ClientHdr::UserGetInfo.as_u32(),
+            &[(tag::UID, ghost.to_be_bytes().to_vec())],
+        )
+        .await
+        .unwrap();
+    let text = String::from_utf8(info.bytes(tag::BODY).unwrap()).unwrap();
+    assert!(text.contains("name: alice\r"), "{text:?}");
+
+    // The device whose uid is the row's leaves: the person stays, the
+    // same user, and still speaks.
+    d1.logout().await.unwrap();
+    d2.chat("still here").await.unwrap();
+    hears_from(&mut admin, ghost, "still here").await;
+    assert_eq!(alice_rows(&admin.user_list().await.unwrap()), [ghost]);
+    let parted = admin
+        .rx
+        .take_backlog()
+        .iter()
+        .any(|f| f.ty == push::USER_PART);
+    assert!(!parted, "a part for a person still here");
+
+    // Its last device gone, the person is.
+    d2.logout().await.unwrap();
+    let part = admin
+        .rx
+        .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(ghost.into()))
+        .await;
+    assert!(part.is_ok(), "{part:?}");
+}
+
+#[tokio::test]
+async fn a_network_ban_of_a_person_ends_every_device_even_once_its_row_has_left() {
+    for row_own_left in [false, true] {
+        let (a, b, _dirs) = coalescing("").await;
+        let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+            .await
+            .unwrap();
+        let (d1, _) = keyed(&b, &alice_on(1)).await;
+        let ghost = row(&mut admin, "alice").await.uid;
+        let (mut d2, _) = keyed(&b, &alice_on(2)).await;
+        let (mut d3, _) = keyed(&b, &alice_on(3)).await;
+        // Logged out, the row's own device has left; held, it is still
+        // there to ban.
+        let _held = if row_own_left {
+            d1.logout().await.unwrap();
+            None
+        } else {
+            Some(d1)
+        };
+        // Once the link has said all it will of the devices' coming and
+        // going.
+        d3.chat("ready").await.unwrap();
+        hears_from(&mut admin, ghost, "ready").await;
+        let ban = [
+            (tag::UID, ghost.to_be_bytes().to_vec()),
+            (tag::BAN, vec![0, 1]),
+        ];
+        let banned = admin.call(ClientHdr::UserKick.as_u32(), &ban).await;
+        assert!(banned.is_ok(), "{row_own_left}: {banned:?}");
+        for d in [&mut d2, &mut d3] {
+            assert!(d.event("kicked").await.is_ok(), "{row_own_left}");
+        }
+        let part = admin
+            .rx
+            .recv_where(|f| f.ty == push::USER_PART && f.uint(tag::UID) == Some(ghost.into()))
+            .await;
+        assert!(part.is_ok(), "{row_own_left}: {part:?}");
+        let again = keyed_login(&b, &alice_on(4)).await;
+        assert!(again.is_err(), "{row_own_left}: banned");
+    }
+}
+
+#[tokio::test]
+async fn a_network_kick_of_a_person_hides_every_device_and_one_that_comes_later() {
+    let (a, b, _dirs) = coalescing("").await;
+    let mut admin = legacy::Client::login_at(a.legacy, &Login::account("ann", "admin", "pw"))
+        .await
+        .unwrap();
+    let (mut d1, _) = keyed(&b, &alice_on(1)).await;
+    let ghost = row(&mut admin, "alice").await.uid;
+    let (mut d2, _) = keyed(&b, &alice_on(2)).await;
+    d2.chat("ready").await.unwrap();
+    hears_from(&mut admin, ghost, "ready").await;
+    let kick = [(tag::UID, ghost.to_be_bytes().to_vec())];
+    let kicked = admin.call(ClientHdr::UserKick.as_u32(), &kick).await;
+    assert!(kicked.is_ok(), "{kicked:?}");
+    // Each device is told why the other server's users went, and stays.
+    for d in [&mut d1, &mut d2] {
+        let told = d
+            .event_where("broadcast", |e| {
+                e["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("aa server (aa)"))
+            })
+            .await;
+        assert!(told.is_ok(), "{told:?}");
+    }
+    // A device that comes later, and the row's own device leaving, show
+    // the person there no more.
+    let (mut d3, _) = keyed(&b, &alice_on(3)).await;
+    d1.logout().await.unwrap();
+    d3.chat("hidden").await.unwrap();
+    let (mut d4, _) = ng::Client::guest(b.ng, "marker").await.unwrap();
+    let marker_line = "after alice";
+    d4.chat(marker_line).await.unwrap();
+    let marker = row(&mut admin, "marker").await.uid;
+    hears_from(&mut admin, marker, marker_line).await;
+    assert!(alice_rows(&admin.user_list().await.unwrap()).is_empty());
+    let heard_alice = admin
+        .rx
+        .take_backlog()
+        .iter()
+        .any(|f| f.ty == push::CHAT && f.uint(tag::UID) == Some(ghost.into()));
+    assert!(!heard_alice, "a hidden person's line");
+    drop((d2, d3));
+}
+
+#[tokio::test]
+async fn a_persons_signing_devices_are_each_verified_at_the_peer() {
+    let (a, b, _dirs) = coalescing(USER_KEYS).await;
+    let (mut reader, _) = ng::Client::guest(a.ng, "reader").await.unwrap();
+    let (phone, laptop) = (alice_on(1), alice_on(2));
+    let (mut d1, _) = keyed(&b, &phone).await;
+    let (mut d2, _) = keyed(&b, &laptop).await;
+    // Each device's lines under its own certificate: the first fetched
+    // and then held, the second fetched in its turn.
+    signed_lines_cross(&mut d1, &phone, 2, &mut reader, 1).await;
+    signed_lines_cross(&mut d2, &laptop, 2, &mut reader, 3).await;
+}
+
+#[tokio::test]
+async fn a_person_whose_first_device_logged_in_with_a_password_is_shown_with_no_identity() {
+    let (a, b, _dirs) = coalescing(USER_KEYS).await;
+    let bob = person(2);
+    let (mut watcher, _) = keyed(&a, &bob).await;
+    let (_pw, _) = ng::Client::account(b.ng, "alice", "pw", "alice")
+        .await
+        .unwrap();
+    let phone = alice_on(1);
+    let (mut key, hello) = keyed(&b, &phone).await;
+    key.chat("ready").await.unwrap();
+    watcher
+        .event_where("chat", |d| d["text"] == "ready")
+        .await
+        .unwrap();
+    let (_late, late) = ng::Client::guest(a.ng, "late").await.unwrap();
+    let alice: Vec<&Value> = late["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["nick"] == "alice")
+        .collect();
+    assert_eq!(alice.len(), 1, "{alice:?}");
+    assert!(alice[0].get("identity").is_none(), "{}", alice[0]);
+
+    // Its key device's signatures would name the identity the link was
+    // never told: a signed line stays here, and a signed message is not
+    // sent.
+    let (guid, signed) = signed_line(&phone, 2, 1, "signed here");
+    key.request(
+        "chat",
+        json!({ "text": "signed here", "guid": guid, "signed": signed }),
+    )
+    .await
+    .unwrap();
+    key.chat("after it").await.unwrap();
+    let heard = watcher
+        .event_where("chat", |d| {
+            d["text"] == "after it" || d["text"] == "signed here"
+        })
+        .await
+        .unwrap()
+        .data;
+    assert_eq!(heard["text"], "after it", "{heard}");
+    let bob_there = identity_row(&mut key, &hello, &bob).await["uid"].clone();
+    let (guid, signed) = signed_msg(&phone, 2, &bob, "hi");
+    let refused = key
+        .request(
+            "msg",
+            json!({ "to": bob_there, "text": "hi", "guid": guid, "signed": signed }),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(hxd_testclient::Error::Refused { code, .. }) if code == "not_delivered"),
+        "{refused:?}"
+    );
 }

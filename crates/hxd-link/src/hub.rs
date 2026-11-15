@@ -1659,19 +1659,23 @@ impl Hub {
 
     /// A server's own Link Device Keys over `peer`'s link: the certificate
     /// local user `uid` signed with, only where it signed (a lobby line,
-    /// or a private message over this link), its fingerprint is said, and
-    /// the certificate is still unexpired. Only the requester goes
-    /// unchecked: a `uid` no user exported is `UnknownUser`.
+    /// or a private message over this link), its fingerprint is said, a
+    /// device of it here proves that certificate now, and it is still
+    /// unexpired. Only the requester goes unchecked: a `uid` no user
+    /// exported is `UnknownUser`.
     pub(crate) fn own_device_cert(&self, peer: &str, uid: Uid) -> Result<Vec<u8>, Reason> {
         if !self.0.core.is_exported(uid) {
             return Err(Reason::UnknownUser);
         }
-        let cert = self.0.state.lock().unwrap().seen.cert_for(uid, peer);
-        let cert = cert
-            .filter(|_| self.0.export_keys)
-            .ok_or(Reason::NoDeviceKeys)?;
-        sendable(&cert, self.0.core.clock().unix())
-            .then(|| cert.to_vec())
+        if !self.0.export_keys {
+            return Err(Reason::NoDeviceKeys);
+        }
+        let certs = self.0.state.lock().unwrap().seen.certs_for(uid, peer);
+        let now = self.0.core.clock().unix();
+        certs
+            .into_iter()
+            .find(|cert| sendable(cert, now) && self.0.core.answers_device_cert(uid, cert))
+            .map(|cert| cert.to_vec())
             .ok_or(Reason::NoDeviceKeys)
     }
 
