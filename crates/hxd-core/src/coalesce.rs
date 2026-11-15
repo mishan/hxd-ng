@@ -483,12 +483,15 @@ impl RosterInner {
 }
 
 #[cfg(test)]
+mod chats;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use crate::access::{bit, AccessBits};
     use crate::account::{Account, AccountConfig, IdentityLink};
     use crate::roster::{drain, AttachInfo, Core, Event, Events, SessionStatus, Transport, Uid};
 
-    const ALICE: [u8; 32] = [7; 32];
+    pub(crate) const ALICE: [u8; 32] = [7; 32];
 
     /// A session of `login`, its account linking `linked`, proved as `identity`.
     fn attach(
@@ -728,6 +731,7 @@ pub(crate) mod tests {
         let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
         let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
         let (cid, _) = core.chat_create(a1, bob).unwrap();
+        core.chat_join(cid, a2, "").unwrap();
         core.end_session(a1);
         assert_eq!(core.chats_of(a2), [cid]);
     }

@@ -732,8 +732,15 @@ Three layers, all `cargo test --workspace`:
   once the device holding its row is gone and a moderator refused a kick
   of their own person, on each wire with its reason, no line heard after
   the kick it raced, a kick with a ban racing a login leaving nothing of
-  the person, a mask set on one device told to the other, and with
-  coalescing off each device a user of its own), `slow_consumer.rs` (a room flooded while one
+  the person, a mask set on one device told to the other, a private chat
+  and a room with the person listed once and joined once, a device
+  hearing them only once it joined them itself, the 112 reply naming the
+  row and the person's other devices invited by the server, a line from
+  any device the row's on both wires, and one device leaving taking the
+  person out
+  with its other devices told by a line, a room the person may no longer
+  be in a removal line to each device and no part, and with coalescing
+  off each device a user and a member of its own), `slow_consumer.rs` (a room flooded while one
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the

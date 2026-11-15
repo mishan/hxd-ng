@@ -287,6 +287,9 @@ pub(crate) struct PrivateChat {
     pub(crate) creator: Option<RowId>,
     pub(crate) members: Vec<RowId>,
     pub(crate) invited: Vec<RowId>,
+    /// The devices of an invited person that declined: each closes its
+    /// own invitation, and the person's goes with the last of them.
+    pub(crate) declined: Vec<Uid>,
     pub(crate) subject: String,
     pub(crate) password: String,
 }
@@ -1489,7 +1492,7 @@ impl Core {
                 let members = r.rooms.get(&room).map(|e| e.members.clone());
                 s.media
                     .as_ref()
-                    .map(|_| r.media_audience_of(&members.unwrap_or_default()))
+                    .map(|_| r.media_audience_of(room, &members.unwrap_or_default()))
             };
             if let (Some((handle, _)), Some(audience)) = (&s.media, audience) {
                 self.media_capture(handle, audience.into_iter().chain(s.principal));
@@ -1527,7 +1530,7 @@ impl Core {
             let Some(chat) = r.chats.get(&cid) else {
                 return Err(ChatError::NoSuchChat);
             };
-            if !chat.members.contains(&r.row_of(from)) {
+            if !chat.members.contains(&r.row_of(from)) || !r.window_open(from, cid) {
                 return Err(ChatError::NotAMember);
             }
             let Some(sess) = r.users.get(&from) else {
@@ -1558,8 +1561,13 @@ impl Core {
         let Some(chat) = r.chats.get(&cid) else {
             return Err(ChatError::NoSuchChat);
         };
-        if !chat.members.contains(&r.row_of(from)) {
+        if !chat.members.contains(&r.row_of(from)) || !r.window_open(from, cid) {
             return Err(ChatError::NotAMember);
+        }
+        // Its person kicked since its flood check: nothing more of it is
+        // heard, as in public chat.
+        if r.ending(from) {
+            return Err(ChatError::Flooding);
         }
         let members = chat.members.clone();
         let Some(info) = r.users.get(&from).map(|s| s.info.clone()) else {
@@ -1579,14 +1587,14 @@ impl Core {
             re: re.map(Box::new),
             emoji,
         };
-        for uid in r.members_sessions(&members) {
+        for uid in r.window_sessions(cid, &members) {
             r.send_to(uid, ev.clone());
         }
         // A room's set is its membership at this moment, media-capable
         // members only, and nothing is added to it afterwards — someone
         // who joins the room later did not receive this line.
         if let Some((handle, _)) = &media {
-            let audience = r.media_audience_of(&members);
+            let audience = r.media_audience_of(cid, &members);
             self.media_capture(handle, audience.into_iter().chain([principal]));
         }
         Ok(())
@@ -1950,7 +1958,7 @@ impl Core {
         } else if r.rooms.contains_key(&cid) {
             r.room_send_where(cid, ev, |_| true);
         } else if let Some(members) = r.chats.get(&cid).map(|c| c.members.clone()) {
-            for uid in r.members_sessions(&members) {
+            for uid in r.window_sessions(cid, &members) {
                 r.send_to(uid, ev.clone());
             }
         }
@@ -1962,6 +1970,7 @@ impl Core {
     /// `invitee` (unless it's the creator). Returns the new chat id and the
     /// creator's row (the reply carries it).
     pub fn chat_create(&self, creator: Uid, invitee: Uid) -> Result<(u32, UserInfo), ChatError> {
+        let server = self.invites_from();
         let mut r = self.roster.lock().unwrap();
         // A session no list shows is nobody to invite.
         if r.named(invitee).is_none() {
@@ -1970,7 +1979,7 @@ impl Core {
         let me = r
             .users
             .get(&creator)
-            .map(|s| s.info.clone())
+            .map(|s| r.row_view(s))
             .ok_or(ChatError::NoSuchUser)?;
         // Counted as they stand, under the lock that creates: a chat
         // stays open, and counted against whoever opened it, until its
@@ -1987,24 +1996,75 @@ impl Core {
             return Err(ChatError::TooManyChats);
         }
         let cid = r.next_chat_id().ok_or(ChatError::ServerError)?;
+        let (row, invited) = (r.row_of(creator), r.row_of(invitee));
         let mut chat = PrivateChat {
-            creator: Some(r.row_of(creator)),
-            members: vec![r.row_of(creator)],
+            creator: Some(row),
+            members: vec![row],
             ..Default::default()
         };
-        if invitee != creator {
-            chat.invited.push(r.row_of(invitee));
+        if invited != row {
+            chat.invited.push(invited);
         }
         r.chats.insert(cid, chat);
-        if invitee != creator {
-            let ev = Event::ChatInvite {
-                cid,
-                from: creator,
-                from_nick: me.nick.clone(),
-            };
-            r.send_to(invitee, ev);
+        r.open_window(creator, cid);
+        let ev = Event::ChatInvite {
+            cid,
+            from: me.uid,
+            from_nick: me.nick.clone(),
+        };
+        if invited != row {
+            for session in r.row_sessions(invited).collect::<Vec<_>>() {
+                r.send_to(session, ev.clone());
+            }
         }
+        Self::invite_own(&mut r, cid, creator, server.as_ref());
         Ok((cid, me))
+    }
+
+    /// Who invites a person's own devices to its chats: the server, by
+    /// the system account, as `/join` invites a classic client to a room.
+    /// Asked before the roster is taken, which the system account's uid
+    /// is read under.
+    pub(crate) fn invites_from(&self) -> Option<(Uid, String)> {
+        let uid = self.system_uid()?;
+        Some((uid, self.system.as_ref()?.policy.nick.clone()))
+    }
+
+    /// Invite the other devices of `uid`'s person to `cid`, a chat it is
+    /// now in, which they did not join: a classic window opens on a chat
+    /// only by an invitation. From the server, or with no system account
+    /// from the person itself.
+    fn invite_own(r: &mut RosterInner, cid: u32, uid: Uid, server: Option<&(Uid, String)>) {
+        let Some((from, from_nick)) = server.cloned().or_else(|| Self::self_invite(r, uid)) else {
+            return;
+        };
+        let row = r.row_of(uid);
+        let others: Vec<Uid> = r.row_sessions(row).filter(|s| *s != uid).collect();
+        let ev = Event::ChatInvite {
+            cid,
+            from,
+            from_nick,
+        };
+        for other in others {
+            r.send_to(other, ev.clone());
+        }
+    }
+
+    /// An invitation from `uid`'s person to its own devices: its row and
+    /// nick.
+    pub(crate) fn self_invite(r: &RosterInner, uid: Uid) -> Option<(Uid, String)> {
+        let sess = r.users.get(&uid)?;
+        Some((r.row_uid(uid), sess.info.nick.clone()))
+    }
+
+    /// The private chats `uid`'s person is in, for a device that joined
+    /// the person after it joined them, to be invited to.
+    pub(crate) fn persons_chats(r: &RosterInner, uid: Uid) -> Vec<u32> {
+        let row = r.row_of(uid);
+        (r.chats.iter())
+            .filter(|(_, c)| c.members.contains(&row))
+            .map(|(cid, _)| *cid)
+            .collect()
     }
 
     /// Invite `target` to a chat the inviter is in, or to a room.
@@ -2022,8 +2082,10 @@ impl Core {
             return Err(ChatError::NoSuchUser);
         }
         let (by_row, target_row) = (r.row_of(by), r.row_of(target));
+        let open = r.window_open(by, cid);
+        let devices: Vec<Uid> = r.row_sessions(target_row).collect();
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&by_row) {
+        if !chat.members.contains(&by_row) || !open {
             return Err(ChatError::NotAMember);
         }
         if chat.members.contains(&target_row) {
@@ -2032,71 +2094,113 @@ impl Core {
         if !chat.invited.contains(&target_row) {
             chat.invited.push(target_row);
         }
+        // Invited again: a device that declined before may take it.
+        chat.declined.retain(|d| !devices.contains(d));
         let ev = Event::ChatInvite {
             cid,
-            from: by,
+            from: by_row.uid(),
             from_nick: by_nick,
         };
-        r.send_to(target, ev);
+        for session in r.row_sessions(target_row).collect::<Vec<_>>() {
+            r.send_to(session, ev.clone());
+        }
         Ok(())
     }
 
-    /// Decline an invitation (or quietly drop a stale one).
+    /// Decline an invitation (or quietly drop a stale one). A device of a
+    /// person declines its own: the person's other devices may still
+    /// take it, and the person's invitation goes with the last of them.
     pub fn chat_decline(&self, cid: u32, uid: Uid) {
         let mut r = self.roster.lock().unwrap();
         let row = r.row_of(uid);
-        if let Some(chat) = r.chats.get_mut(&cid) {
+        let devices: Vec<Uid> = r.row_sessions(row).collect();
+        let Some(chat) = r.chats.get_mut(&cid) else {
+            return;
+        };
+        if !chat.invited.contains(&row) {
+            return;
+        }
+        if !chat.declined.contains(&uid) {
+            chat.declined.push(uid);
+        }
+        if devices.iter().all(|d| chat.declined.contains(d)) {
             chat.invited.retain(|u| *u != row);
+            chat.declined.retain(|d| !devices.contains(d));
         }
     }
 
     /// Join a chat. An invitation bypasses the password; without one, a
     /// passworded chat requires the password. Returns the member rows
     /// (joiner included) and the subject, for the reply; other members get
-    /// the join push.
+    /// the join push. A device of a person already in the chat joins it
+    /// as a window of its own: answered with the list, and nobody is told.
     pub fn chat_join(
         &self,
         cid: u32,
         uid: Uid,
         password: &str,
     ) -> Result<(Vec<UserInfo>, String), ChatError> {
+        let server = self.invites_from();
         let mut r = self.roster.lock().unwrap();
         let me = r
             .users
             .get(&uid)
-            .map(|s| s.info.clone())
+            .map(|s| r.row_view(s))
             .ok_or(ChatError::NoSuchUser)?;
         let row = r.row_of(uid);
+        let devices: Vec<Uid> = r.row_sessions(row).collect();
+        let open = r.window_open(uid, cid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if chat.members.contains(&row) {
+        let joined = chat.members.contains(&row);
+        if joined && open {
             return Err(ChatError::AlreadyThere);
         }
-        if let Some(pos) = chat.invited.iter().position(|u| *u == row) {
-            chat.invited.remove(pos);
-        } else if !chat.password.is_empty() && chat.password != password {
-            return Err(ChatError::WrongPassword);
+        let invited = chat.invited.contains(&row);
+        if !joined {
+            if !(invited && !chat.declined.contains(&uid))
+                && !chat.password.is_empty()
+                && chat.password != password
+            {
+                return Err(ChatError::WrongPassword);
+            }
+            chat.invited.retain(|u| *u != row);
+            chat.declined.retain(|d| !devices.contains(d));
+            chat.members.push(row);
         }
-        chat.members.push(row);
         let members = chat.members.clone();
         let subject = chat.subject.clone();
-        let ev = Event::ChatUserJoined { cid, user: me };
-        let mut rows = Vec::with_capacity(members.len());
-        for m in &members {
-            if *m != row {
-                for s in r.members_sessions(&[*m]) {
-                    r.send_to(s, ev.clone());
-                }
+        if !joined {
+            let ev = Event::ChatUserJoined {
+                cid,
+                user: me.clone(),
+            };
+            let others: Vec<RowId> = members.iter().copied().filter(|m| *m != row).collect();
+            for s in r.window_sessions(cid, &others) {
+                r.send_to(s, ev.clone());
             }
-            if let Some(s) = r.row_user(*m) {
-                rows.push(s.info.clone());
+            // An invitation went to every device already.
+            if !invited {
+                Self::invite_own(&mut r, cid, uid, server.as_ref());
             }
         }
+        r.open_window(uid, cid);
+        let rows = members.iter().filter_map(|m| r.row_info(*m)).collect();
         Ok((rows, subject))
     }
 
-    /// Leave a chat; the last member out deletes it.
+    /// Leave a chat; the last member out deletes it. A device of a person
+    /// leaving it leaves it for the person, if it has the chat open: a
+    /// window its person left on another device, closed late, is not
+    /// the person's leaving one it has since joined again.
     pub fn chat_part(&self, cid: u32, uid: Uid) {
         let mut r = self.roster.lock().unwrap();
+        let member = r
+            .chats
+            .get(&cid)
+            .is_some_and(|c| c.members.contains(&r.row_of(uid)));
+        if member && !r.window_open(uid, cid) {
+            return;
+        }
         Self::part_one(&mut r, cid, uid);
     }
 
@@ -2125,13 +2229,14 @@ impl Core {
             return Ok(());
         }
         let row = r.row_of(uid);
+        let open = r.window_open(uid, cid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&row) {
+        if !chat.members.contains(&row) || !open {
             return Err(ChatError::NotAMember);
         }
         chat.subject = subject;
         let members = chat.members.clone();
-        for m in r.members_sessions(&members) {
+        for m in r.window_sessions(cid, &members) {
             r.send_to(m, ev.clone());
         }
         Ok(())
@@ -2142,21 +2247,23 @@ impl Core {
     pub fn chat_password(&self, cid: u32, uid: Uid, password: String) -> Result<(), ChatError> {
         let mut r = self.roster.lock().unwrap();
         let row = r.row_of(uid);
+        let open = r.window_open(uid, cid);
         let chat = r.chats.get_mut(&cid).ok_or(ChatError::NoSuchChat)?;
-        if !chat.members.contains(&row) {
+        if !chat.members.contains(&row) || !open {
             return Err(ChatError::NotAMember);
         }
         chat.password = password.clone();
         let ev = Event::ChatPassword { cid, password };
         let members = chat.members.clone();
-        for m in r.members_sessions(&members) {
+        for m in r.window_sessions(cid, &members) {
             r.send_to(m, ev.clone());
         }
         Ok(())
     }
 
-    /// The private chats `uid` is currently in (used by tests and, later,
-    /// the info views).
+    /// The private chats `uid`'s row is in, open on this session or not
+    /// (used by tests and, later, the info views); [`Core::rooms_of`] is
+    /// by the session's windows.
     pub fn chats_of(&self, uid: Uid) -> Vec<u32> {
         let r = self.roster.lock().unwrap();
         let mut v: Vec<u32> = r
@@ -2187,30 +2294,41 @@ impl Core {
         }
     }
 
-    fn part_one(r: &mut RosterInner, cid: u32, uid: Uid) {
+    pub(crate) fn part_one(r: &mut RosterInner, cid: u32, uid: Uid) {
+        let row = r.row_of(uid);
         // Leaving a chat leaves its voice room — the spec's "if a user is
         // kicked from a chat room, their voice session MUST also be
         // terminated", and the same is true of walking out voluntarily.
         // Ahead of the early returns below: voice outlives a chat whose
         // membership has already been torn up.
-        r.voice_part_room(uid, cid);
-        let row = r.row_of(uid);
+        for session in r.row_sessions(row).collect::<Vec<_>>() {
+            r.voice_part_room(session, cid);
+        }
+        let devices: Vec<Uid> = r.row_sessions(row).collect();
         let Some(chat) = r.chats.get_mut(&cid) else {
             return;
         };
         chat.invited.retain(|u| *u != row);
+        chat.declined.retain(|d| *d != uid && !devices.contains(d));
         let Some(pos) = chat.members.iter().position(|u| *u == row) else {
             return;
         };
         chat.members.remove(pos);
-        if chat.members.is_empty() {
+        let members = chat.members.clone();
+        let others = r.close_windows(row, cid, uid);
+        if members.is_empty() {
             r.chats.remove(&cid);
             r.line_counters.remove(&cid);
-            return;
         }
-        let members = chat.members.clone();
-        let ev = Event::ChatUserParted { cid, uid };
-        for m in r.members_sessions(&members) {
+        let ev = Event::ChatUserParted {
+            cid,
+            uid: row.uid(),
+        };
+        // The person's other devices that had it open hear their own
+        // part: it was left on another device.
+        let mut told = r.window_sessions(cid, &members);
+        told.extend(others);
+        for m in told {
             r.send_to(m, ev.clone());
         }
     }
