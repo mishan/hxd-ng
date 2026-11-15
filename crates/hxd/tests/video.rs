@@ -1349,6 +1349,7 @@ async fn a_publication_whose_media_dies_takes_neither_the_call_nor_the_room() {
     s.core.voice_media_event(MediaEvent::VideoFailed {
         uid: old.uid,
         cid: 0,
+        session: s.media.session(old.uid),
         kind: VideoKind::Camera,
     });
 

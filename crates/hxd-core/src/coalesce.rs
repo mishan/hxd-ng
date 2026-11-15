@@ -484,6 +484,8 @@ impl RosterInner {
 
 #[cfg(test)]
 mod chats;
+#[cfg(test)]
+mod voice;
 
 #[cfg(test)]
 pub(crate) mod tests {

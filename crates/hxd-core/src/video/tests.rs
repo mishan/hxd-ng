@@ -913,6 +913,7 @@ fn a_failed_publication_costs_the_publication_and_not_the_call() {
     core.voice_media_event(crate::voice::MediaEvent::VideoFailed {
         uid: a,
         cid: 0,
+        session: media.session(a),
         kind: VideoKind::Camera,
     });
 
@@ -1047,7 +1048,11 @@ fn a_media_timeout_ends_the_publication_and_frees_the_slot() {
     let (b, mut rx_b) = quiet(&core, "bob");
     watched_share(&core, &media, 0, a, &mut rx_a, b, &mut rx_b);
 
-    core.voice_media_event(crate::voice::MediaEvent::Failed { uid: a, cid: 0 });
+    core.voice_media_event(crate::voice::MediaEvent::Failed {
+        uid: a,
+        cid: 0,
+        session: media.session(a),
+    });
 
     assert_eq!(core.voice_room_of(a), None);
     assert!(core.video_publications(0).is_empty());

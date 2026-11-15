@@ -295,7 +295,7 @@ impl RosterInner {
                             .publications
                             .iter()
                             .map(move |(kind, paused)| VideoPublication {
-                                uid: p.uid,
+                                uid: p.row,
                                 kind: *kind,
                                 paused: *paused,
                             })
@@ -372,7 +372,7 @@ impl RosterInner {
                 if active != p.video.active {
                     p.video.active = active.clone();
                     changed.push(p.uid);
-                    updates.push((p.uid, active));
+                    updates.push((p.row, active));
                 }
             }
         }
@@ -482,7 +482,8 @@ impl Core {
         if let Some(p) = r.voice.peer_mut(cid, uid) {
             p.video.publications.push((kind, false));
         }
-        if let Err(refusal) = media.publish(uid, cid, kind) {
+        let key = r.voice.key(cid, uid);
+        if let Err(refusal) = media.publish(key, cid, kind) {
             // The media layer could not seat it. Give the slot back
             // rather than announcing a publication that can never carry
             // a frame and that only the publisher could ever clear.
@@ -544,8 +545,9 @@ impl Core {
         if stopped.is_empty() {
             return Ok(());
         }
+        let key = r.voice.key(cid, uid);
         for k in stopped {
-            media.unpublish(uid, cid, k);
+            media.unpublish(key, cid, k);
         }
 
         // The publisher loses a send section; every subscriber to the
@@ -603,7 +605,7 @@ impl Core {
         // The media layer requests a keyframe of its own on resume: a
         // decoder cannot start mid-stream, so a resumed publication is
         // invisible until the next one.
-        media.set_paused(uid, cid, kind, paused);
+        media.set_paused(r.voice.key(cid, uid), cid, kind, paused);
         // Forwarding stops or starts now; the room is told once the
         // debounce window closes, so a client mashing the camera button
         // costs its room one status per window rather than one a press.
@@ -646,6 +648,8 @@ impl Core {
         // subscription to a publication that does not exist yet" only
         // needs room for the streams a room could actually hold, and this
         // leaves an order of magnitude over that.
+        // Streams are named by row, as every status shows them.
+        let own = r.voice.key(cid, uid);
         let mut seen: std::collections::HashSet<VideoStream> = std::collections::HashSet::new();
         let mut wanted: Vec<VideoStream> = Vec::with_capacity(streams.len().min(MAX_SUBSCRIPTIONS));
         for s in streams {
@@ -654,7 +658,7 @@ impl Core {
             // keeps a participant's own audio out of its offer — and a
             // client renders its camera from the local capture, which
             // costs nothing and has no round trip in it.
-            if s.uid == uid || !seen.insert(*s) {
+            if s.uid == own || !seen.insert(*s) {
                 continue;
             }
             wanted.push(*s);

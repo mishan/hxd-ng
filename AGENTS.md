@@ -573,8 +573,13 @@ Three layers, all `cargo test --workspace`:
   (voice signaling on both wires against a recording media layer: the
   capability and privilege gates, the chunk and JSON shapes, one room
   shared by a classic and an ng client, joins past a session's
-  allowance refused on each wire while leaves never are, and a burst of
-  mute flips announced once with its final state),
+  allowance refused on each wire while leaves never are, a burst of
+  mute flips announced once with its final state, and with
+  `[server] coalesce` a person's second device on either wire taking
+  its place in voice under its row: the leaver told it is out, the
+  watcher renegotiated and told nothing else, the mute kept, a camera
+  ended with the watching of it, and a move whose join fails taking the
+  person out),
   `friends.rs` (the friend family on the ng wire: two clients made
   friends, presence through the binary's flusher, instant messages
   with receipts and typing, one sent while away handed over at the
@@ -740,7 +745,8 @@ Three layers, all `cargo test --workspace`:
   person out
   with its other devices told by a line, a room the person may no longer
   be in a removal line to each device and no part, and with coalescing
-  off each device a user and a member of its own), `slow_consumer.rs` (a room flooded while one
+  off each device a user and a member of its own; `voice.rs` has a
+  person in voice), `slow_consumer.rs` (a room flooded while one
   client reads
   nothing: on each wire it is dropped, the ng one while still silent
   and well inside the pong deadline; the reader hears every line; the

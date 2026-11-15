@@ -432,9 +432,9 @@ impl Inner {
         let Some(peer) = self.peers.get(&uid) else {
             return;
         };
-        let cid = peer.cid;
+        let (cid, session) = (peer.cid, peer.session());
         self.remove(uid);
-        self.emit(MediaEvent::Failed { uid, cid });
+        self.emit(MediaEvent::Failed { uid, cid, session });
     }
 
     fn remove(&mut self, uid: Uid) {
@@ -518,16 +518,21 @@ impl Inner {
                     .last_media
                     .is_some_and(|t| now.duration_since(t) >= timeouts::VIDEO)
                 {
-                    stalled.push((*uid, p.cid, pubn.kind));
+                    stalled.push((*uid, p.cid, p.session(), pubn.kind));
                 }
             }
         }
-        for (uid, cid, kind) in stalled {
+        for (uid, cid, session, kind) in stalled {
             info!(uid, cid, ?kind, "video publication stalled; dropping it");
             if let Some(peer) = self.peers.get_mut(&uid) {
                 peer.undeclare_video_send(kind);
             }
-            self.emit(MediaEvent::VideoFailed { uid, cid, kind });
+            self.emit(MediaEvent::VideoFailed {
+                uid,
+                cid,
+                session,
+                kind,
+            });
         }
     }
 
@@ -718,7 +723,7 @@ impl Inner {
         let Some(peer) = self.peers.get_mut(&uid) else {
             return;
         };
-        let cid = peer.cid;
+        let (cid, session) = (peer.cid, peer.session());
         forwards.retain(|f| !(f.from == uid && (stream == Stream::Audio || f.stream == stream)));
         hxd_core::instrument::voice_policed_end(stream.label());
         match stream {
@@ -734,7 +739,12 @@ impl Inner {
                     "video publication ended: far over its rate"
                 );
                 if peer.undeclare_video_send(kind) {
-                    self.emit(MediaEvent::VideoFailed { uid, cid, kind });
+                    self.emit(MediaEvent::VideoFailed {
+                        uid,
+                        cid,
+                        session,
+                        kind,
+                    });
                 }
             }
         }
@@ -871,7 +881,7 @@ impl VoiceMedia for Sfu {
         "PCMU"
     }
 
-    fn join(&self, uid: Uid, cid: u32) {
+    fn join(&self, uid: Uid, cid: u32) -> u64 {
         let now = self.now();
         let mut inner = self.inner.lock().unwrap();
         // A rejoin arrives here as leave-then-join from the domain, but
@@ -902,6 +912,7 @@ impl VoiceMedia for Sfu {
         inner.peers.insert(uid, peer);
         inner.rooms.entry(cid).or_default().push(uid);
         info!(uid, cid, "voice session created");
+        session_id
     }
 
     fn leave(&self, uid: Uid, cid: u32) {
@@ -988,6 +999,7 @@ impl VoiceMedia for Sfu {
         let Some(peer) = inner.peers.get_mut(&uid) else {
             return Err(VoiceError::NotInVoice);
         };
+        let session = peer.session();
         let unbindable = match peer.apply_answer(&answer, now) {
             Ok(u) => u,
             Err(e) => {
@@ -1007,7 +1019,12 @@ impl VoiceMedia for Sfu {
             if let Some(peer) = inner.peers.get_mut(&uid) {
                 peer.undeclare_video_send(kind);
             }
-            inner.emit(MediaEvent::VideoFailed { uid, cid, kind });
+            inner.emit(MediaEvent::VideoFailed {
+                uid,
+                cid,
+                session,
+                kind,
+            });
         }
         // The renegotiation this answer completes is the moment a
         // receiver's newly-active sections actually have a decoder behind
@@ -1032,6 +1049,7 @@ impl VoiceMedia for Sfu {
         inner.emit(MediaEvent::Ice {
             uid,
             cid,
+            session,
             candidate: IceCandidate::end_of_candidates(MIC_MID),
         });
         Ok(())
