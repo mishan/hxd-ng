@@ -51,7 +51,13 @@ async fn start_server(dir: &Path, voice: bool) -> (SocketAddr, Arc<RecordingMedi
 
 /// A server on both wires, sharing one core — which is the whole point.
 async fn start_both(dir: &Path, voice: bool) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
-    start_with(dir, voice, None).await
+    start_with(dir, voice, None, false).await
+}
+
+/// A server with voice and video coalescing persons, where alice's
+/// account is linked to an identity, so her sessions are one person.
+async fn start_coalescing(dir: &Path) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
+    start_with(dir, true, None, true).await
 }
 
 /// The same, holding sessions to `limits` — which no address is exempt
@@ -61,13 +67,14 @@ async fn start_limited(
     dir: &Path,
     limits: VoiceLimits,
 ) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
-    start_with(dir, true, Some(limits)).await
+    start_with(dir, true, Some(limits), false).await
 }
 
 async fn start_with(
     dir: &Path,
     voice: bool,
     limits: Option<VoiceLimits>,
+    coalesce: bool,
 ) -> (SocketAddr, SocketAddr, Arc<RecordingMedia>) {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -85,11 +92,27 @@ async fn start_with(
     )
     .unwrap();
 
+    let fp = hl_identity::Fingerprint([7; 32]);
+    std::fs::write(
+        accounts.join("alice.toml"),
+        format!(
+            "name = \"alice\"\npassword = \"pw\"\n[access]\nread_chat = true\nsend_chat = true\n\
+             voice_chat = true\nvideo_chat = true\n[identity]\nfingerprint = \"{fp}\"\n"
+        ),
+    )
+    .unwrap();
+
     let media = Arc::new(RecordingMedia::new());
     let core = if voice {
-        Core::new().with_voice(media.clone(), 2)
+        Core::new().with_voice(media.clone(), if coalesce { 4 } else { 2 })
     } else {
         Core::new()
+    };
+    let core = if coalesce {
+        core.with_video(hxd_core::video::VideoConfig::default())
+            .with_coalesce(true)
+    } else {
+        core
     };
     let core = match limits {
         Some(limits) => core.with_voice_limits(limits),
@@ -132,7 +155,9 @@ async fn start_with(
             login_timeout: Duration::from_secs(5),
             grace: Duration::from_secs(60),
             max_detached_per_addr: 2,
-            caps: if voice {
+            caps: if coalesce {
+                vec!["voice".to_string(), "video".to_string()]
+            } else if voice {
                 vec!["voice".to_string()]
             } else {
                 Vec::new()
@@ -310,6 +335,16 @@ impl Ng {
             }
         }
         panic!("no ng room status matching {want:?}");
+    }
+
+    /// Wait for a video status listing exactly these publishers.
+    async fn publishers_for(&mut self, want: &Value) {
+        for _ in 0..16 {
+            if self.event("video_status").await["data"]["publishers"] == *want {
+                return;
+            }
+        }
+        panic!("no ng video status listing {want}");
     }
 
     /// Join and answer, as a real client does the moment it has an offer.
@@ -1211,4 +1246,226 @@ async fn a_transport_this_server_does_not_offer_is_refused_and_changes_nothing()
     // A is still in the room it was in: the next joiner sees it there.
     let reply = b.join_voice(0).await;
     assert_eq!(participants(&reply), vec![(a.uid, false)]);
+}
+
+// --- A person in voice (`[server] coalesce`) ------------------------------
+
+/// One of alice's devices, on either wire.
+enum Device {
+    Classic(Client),
+    Ng(Box<Ng>),
+}
+
+impl Device {
+    async fn on(classic: bool, legacy: SocketAddr, ng: SocketAddr) -> Device {
+        if classic {
+            Device::Classic(Client::login(legacy, "alice", true).await)
+        } else {
+            Device::Ng(Box::new(Ng::login(ng, "alice").await))
+        }
+    }
+
+    /// Join the lobby's voice, answer, and say whom the reply listed.
+    async fn join(&mut self) -> Vec<(u16, bool)> {
+        match self {
+            Device::Classic(c) => participants(&c.join_voice(0).await),
+            Device::Ng(n) => {
+                let ok = n.join_voice(0).await;
+                ng_participants(&json!({ "data": ok }))
+            }
+        }
+    }
+
+    /// A join refused, and the wire's own words for why.
+    async fn join_refused(&mut self) -> String {
+        match self {
+            Device::Classic(c) => {
+                c.send(REQ_VOICE_JOIN, &[chat_id(0)]).await;
+                let reply = c.recv_type(HDR_TASK).await;
+                assert_ne!(reply.flag, 0, "the join was not refused");
+                task_error(&reply)
+            }
+            Device::Ng(n) => n.refused("voice_join", json!({ "cid": 0 })).await["code"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        }
+    }
+
+    async fn mute(&mut self) {
+        match self {
+            Device::Classic(c) => {
+                c.send(
+                    REQ_VOICE_MUTE,
+                    &[chat_id(0), (tag::VOICE_MUTED, 1u16.to_be_bytes().to_vec())],
+                )
+                .await;
+                c.recv_type(HDR_TASK).await;
+            }
+            Device::Ng(n) => {
+                n.ok("voice_mute", json!({ "cid": 0, "muted": true })).await;
+            }
+        }
+    }
+
+    async fn status_for(&mut self, want: &[(u16, bool)]) {
+        match self {
+            Device::Classic(c) => {
+                c.status_for(want).await;
+            }
+            Device::Ng(n) => {
+                n.status_for(want).await;
+            }
+        }
+    }
+}
+
+/// Bob, in the lobby's voice on the classic wire, every offer answered.
+async fn watcher(legacy: SocketAddr) -> Client {
+    let mut bob = Client::login(legacy, "talker", true).await;
+    bob.join_voice(0).await;
+    bob.recv_type(NOTIFY_VOICE_STATUS).await;
+    bob
+}
+
+/// Answer the renegotiation `c` is owed.
+async fn answer_offer(c: &mut Client) {
+    let offer = c.recv_type(NOTIFY_VOICE_OFFER).await;
+    let sdp = String::from_utf8(chunk(&offer, tag::VOICE_SDP).unwrap()).unwrap();
+    c.answer_voice(0, &format!("answer to {sdp}")).await;
+}
+
+/// No room status arrives within a short window, whatever else does.
+async fn no_status(c: &mut Client) {
+    assert!(
+        !c.pending.iter().any(|f| f.ty == NOTIFY_VOICE_STATUS),
+        "a status was already buffered"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while let Ok(Ok(f)) = tokio::time::timeout_at(deadline, read_frame(&mut c.stream)).await {
+        assert_ne!(f.ty, NOTIFY_VOICE_STATUS, "the room was told a status");
+        c.pending.push(f);
+    }
+}
+
+#[tokio::test]
+async fn a_persons_second_device_joining_voice_moves_it_there_on_either_wire() {
+    for (first, second) in [(true, false), (false, true), (true, true), (false, false)] {
+        let td = tempfile::tempdir().unwrap();
+        let (legacy, ng, _media) = start_coalescing(td.path()).await;
+        let mut bob = watcher(legacy).await;
+        let b = bob.uid;
+        let mut a1 = Device::on(first, legacy, ng).await;
+        let row = a1.join().await;
+        assert_eq!(row, [(b, false)]);
+        let mut a2 = Device::on(second, legacy, ng).await;
+        answer_offer(&mut bob).await;
+        bob.pending.clear();
+        let row = match &a1 {
+            Device::Classic(c) => c.uid,
+            Device::Ng(n) => n.uid,
+        };
+        a1.status_for(&[(b, false), (row, false)]).await;
+
+        let found = a2.join().await;
+        assert_eq!(
+            found,
+            [(b, false)],
+            "{first}/{second}: the room without its person"
+        );
+        a2.status_for(&[(b, false), (row, false)]).await;
+        a1.status_for(&[(b, false)]).await;
+        // Bob hears the person's audio come from somewhere new, and
+        // nothing about anyone leaving or arriving.
+        answer_offer(&mut bob).await;
+        no_status(&mut bob).await;
+    }
+}
+
+#[tokio::test]
+async fn a_moved_person_is_muted_still() {
+    for (first, second) in [(true, false), (false, true)] {
+        let td = tempfile::tempdir().unwrap();
+        let (legacy, ng, _media) = start_coalescing(td.path()).await;
+        let mut bob = watcher(legacy).await;
+        let b = bob.uid;
+        let mut a1 = Device::on(first, legacy, ng).await;
+        a1.join().await;
+        let row = match &a1 {
+            Device::Classic(c) => c.uid,
+            Device::Ng(n) => n.uid,
+        };
+        a1.mute().await;
+        bob.status_for(&[(b, false), (row, true)]).await;
+        answer_offer(&mut bob).await;
+
+        let mut a2 = Device::on(second, legacy, ng).await;
+        a2.join().await;
+        a2.status_for(&[(b, false), (row, true)]).await;
+        answer_offer(&mut bob).await;
+        no_status(&mut bob).await;
+    }
+}
+
+#[tokio::test]
+async fn a_moved_persons_camera_ends_and_so_does_watching_it() {
+    let td = tempfile::tempdir().unwrap();
+    let (legacy, ng, media) = start_coalescing(td.path()).await;
+    let mut bob = Ng::login(ng, "talker").await;
+    bob.join_voice(0).await;
+    let mut a1 = Ng::login(ng, "alice").await;
+    a1.join_voice(0).await;
+    let row = a1.uid;
+    a1.ok("video_start", json!({ "cid": 0, "kind": "camera" }))
+        .await;
+    bob.ok(
+        "video_subscribe",
+        json!({ "cid": 0, "streams": [{ "uid": row, "kind": "camera" }] }),
+    )
+    .await;
+    bob.publishers_for(&json!([{ "uid": row, "kind": "camera", "paused": false }]))
+        .await;
+    media.take_calls();
+
+    let mut a2 = Client::login(legacy, "alice", true).await;
+    a2.join_voice(0).await;
+    bob.publishers_for(&json!([])).await;
+    let calls = media.take_calls();
+    assert!(
+        calls.contains(&hxd_core::voice::fake::MediaCall::SetSubscriptions {
+            uid: bob.uid,
+            cid: 0,
+            streams: vec![],
+        }),
+        "bob stops being sent the camera that went: {calls:?}"
+    );
+    // The leaver is told it is out and shows nothing.
+    a1.status_for(&[(bob.uid, false)]).await;
+    assert_eq!(
+        a1.event("video_status").await["data"]["publishers"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn a_move_whose_join_fails_takes_the_person_out_of_voice_on_both_wires() {
+    for (first, second) in [(true, false), (false, true)] {
+        let td = tempfile::tempdir().unwrap();
+        let (legacy, ng, media) = start_coalescing(td.path()).await;
+        let mut bob = watcher(legacy).await;
+        let b = bob.uid;
+        let mut a1 = Device::on(first, legacy, ng).await;
+        a1.join().await;
+        answer_offer(&mut bob).await;
+
+        let mut a2 = Device::on(second, legacy, ng).await;
+        media.no_next_offer();
+        let why = a2.join_refused().await;
+        assert!(
+            why == "voice_full" || why == "That voice chat is full.",
+            "{why}"
+        );
+        bob.status_for(&[(b, false)]).await;
+        a1.status_for(&[(b, false)]).await;
+    }
 }

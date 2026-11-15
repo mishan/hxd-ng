@@ -244,8 +244,11 @@ pub trait VoiceMedia: Send + Sync + 'static {
     /// `PCMU` unless the spec grows another.
     fn codec(&self) -> &'static str;
 
-    /// Create this peer's media session in `cid`.
-    fn join(&self, uid: Uid, cid: u32);
+    /// Create this peer's media session in `cid`, and say which session
+    /// it is: every [`MediaEvent`] about it carries the same number, so
+    /// an event a session it replaced left queued is told apart from
+    /// one about this.
+    fn join(&self, uid: Uid, cid: u32) -> u64;
 
     /// Tear this peer's media session down. Idempotent — cleanup paths
     /// overlap on purpose.
@@ -349,7 +352,7 @@ impl VoiceMedia for TimedVoice {
     fn codec(&self) -> &'static str {
         self.0.codec()
     }
-    fn join(&self, uid: Uid, cid: u32) {
+    fn join(&self, uid: Uid, cid: u32) -> u64 {
         self.time("join", |m| m.join(uid, cid))
     }
     fn leave(&self, uid: Uid, cid: u32) {
@@ -398,24 +401,37 @@ pub enum MediaEvent {
     Ice {
         uid: Uid,
         cid: u32,
+        session: u64,
         candidate: IceCandidate,
     },
     /// The peer's media session failed one of the spec's timeouts (no
     /// answer, ICE, DTLS, or no RTP). It is a leave, with the room
     /// status that any leave produces; the user's control connection is
     /// untouched.
-    Failed { uid: Uid, cid: u32 },
+    Failed { uid: Uid, cid: u32, session: u64 },
     /// One publication's media stopped arriving while the peer's session
     /// stayed alive. The publication is dropped and its slot released;
     /// the call is not touched. **Losing video is a degradation; losing
     /// the call is a failure**, and the spec is explicit that a failed
     /// publication must never tear down the voice session.
-    VideoFailed { uid: Uid, cid: u32, kind: VideoKind },
+    VideoFailed {
+        uid: Uid,
+        cid: u32,
+        session: u64,
+        kind: VideoKind,
+    },
 }
 
 /// A peer's voice state within its room.
 pub(crate) struct Peer {
     pub(crate) uid: Uid,
+    /// The row this peer is shown as, and what the media layer and every
+    /// mid know it by: a person is in voice on one device at a time, so
+    /// the row names it there, and a device moving in takes the row's
+    /// sections over as a rejoin rather than as somebody new.
+    pub(crate) row: Uid,
+    /// The media session [`VoiceMedia::join`] made for this peer.
+    session: u64,
     muted: bool,
     /// An offer has been sent and not yet answered. **No second offer
     /// may go out while this is set** — most WebRTC stacks treat
@@ -433,13 +449,15 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
-    fn new(uid: Uid) -> Self {
+    fn new(uid: Uid, row: Uid, session: u64) -> Self {
         // Joins land unmuted: the spec asks *clients* to join muted, and
         // a client that wants that sends its own mute the moment it has
         // a session. A server that mutes on its owner's behalf makes a
         // silent room the normal case and every silence ambiguous.
         Peer {
             uid,
+            row,
+            session,
             muted: false,
             offer_outstanding: false,
             dirty: false,
@@ -500,6 +518,24 @@ impl VoiceState {
         self.rooms.get_mut(&cid)?.iter_mut().find(|p| p.uid == uid)
     }
 
+    /// What the media layer knows the session `uid` in `cid` by: its row.
+    pub(crate) fn key(&self, cid: u32, uid: Uid) -> Uid {
+        self.rooms
+            .get(&cid)
+            .and_then(|peers| peers.iter().find(|p| p.uid == uid))
+            .map_or(uid, |p| p.row)
+    }
+
+    /// The session the media layer's `key` in `cid` stands for, if its
+    /// media session is still `session`.
+    fn session_of(&self, cid: u32, key: Uid, session: u64) -> Option<Uid> {
+        self.rooms
+            .get(&cid)?
+            .iter()
+            .find(|p| p.row == key && p.session == session)
+            .map(|p| p.uid)
+    }
+
     /// A status for `cid` has just gone out, so the part of it the
     /// debounce was holding back is no longer owed.
     pub(crate) fn settled(&mut self, cid: u32, video: bool) {
@@ -522,7 +558,7 @@ impl VoiceState {
                 peers
                     .iter()
                     .map(|p| VoiceParticipant {
-                        uid: p.uid,
+                        uid: p.row,
                         muted: p.muted,
                         camera: p.video.publishes(VideoKind::Camera),
                         screen: p.video.publishes(VideoKind::Screen),
@@ -545,8 +581,9 @@ impl RosterInner {
         let Some(cid) = self.voice.room_of.remove(&uid) else {
             return;
         };
+        let key = self.voice.key(cid, uid);
         if let Some(media) = self.voice_media() {
-            media.leave(uid, cid);
+            media.leave(key, cid);
         }
         let Some(peers) = self.voice.rooms.get_mut(&cid) else {
             return;
@@ -574,18 +611,20 @@ impl RosterInner {
         // It is also what makes `docs/voice.md` §8's promise true — that
         // a resuming ng session finds the status saying it is out of
         // voice waiting in its replay tail.
-        let participants = self.voice.participants(cid);
-        self.send_to(
-            uid,
-            Event::VoiceStatus {
-                cid,
-                participants: participants.clone(),
-            },
-        );
+        self.voice_told_out(uid, key, cid);
         self.voice_status(cid);
         // The same courtesy for video: the leaver's own publications are
         // gone, and the room needs to stop drawing their tile.
-        //
+        self.video_status(cid);
+    }
+
+    /// Tell `uid`, just out of voice in `cid`, the room as it now stands
+    /// without the row it was there as (which a device that took its
+    /// place may still hold), and that it shows nothing there.
+    fn voice_told_out(&mut self, uid: Uid, row: Uid, cid: u32) {
+        let mut participants = self.voice.participants(cid);
+        participants.retain(|p| p.uid != row);
+        self.send_to(uid, Event::VoiceStatus { cid, participants });
         // Gated exactly as `video_status` is. Without the guard this was
         // the one video event a server with no video configured could
         // still emit, and the ng wire — which has no per-session
@@ -601,7 +640,6 @@ impl RosterInner {
                 },
             );
         }
-        self.video_status(cid);
     }
 
     /// The same, but only if the user's voice room is `cid` — for a chat
@@ -634,7 +672,7 @@ impl RosterInner {
                 // arrive: it is about to be parted from the room anyway,
                 // and marking an offer outstanding would only leave a
                 // dead peer looking like it owes us an answer.
-                let Some(sdp) = media.offer(p.uid, cid) else {
+                let Some(sdp) = media.offer(p.row, cid) else {
                     continue;
                 };
                 p.offer_outstanding = true;
@@ -667,7 +705,7 @@ impl RosterInner {
                 }
                 // See `voice_renegotiate`: no offer is a peer the media
                 // layer has already torn down.
-                let Some(sdp) = media.offer(p.uid, cid) else {
+                let Some(sdp) = media.offer(p.row, cid) else {
                     continue;
                 };
                 p.offer_outstanding = true;
@@ -682,9 +720,16 @@ impl RosterInner {
     /// Announce the room's participant list to everyone in it.
     pub(crate) fn voice_status(&mut self, cid: u32) {
         let participants = self.voice.participants(cid);
-        for p in participants.clone() {
+        // To the sessions in voice, which a participant's row is not.
+        let uids: Vec<Uid> = self
+            .voice
+            .rooms
+            .get(&cid)
+            .map(|peers| peers.iter().map(|p| p.uid).collect())
+            .unwrap_or_default();
+        for uid in uids {
             self.send_to(
-                p.uid,
+                uid,
                 Event::VoiceStatus {
                     cid,
                     participants: participants.clone(),
@@ -874,6 +919,13 @@ impl Core {
         if !r.users.contains_key(&uid) {
             return Err(VoiceError::NotAMember);
         }
+        // Coalescing decides a session's row when it is announced, so one
+        // still at the agreement would be in voice under a uid that is
+        // not the row it is about to be shown as. With coalescing off its
+        // row is its uid whenever it asks, so it may ask as before.
+        if r.persons.on && !r.users[&uid].live() {
+            return Err(VoiceError::NotAMember);
+        }
         // Room membership, which the access bit does not cover: the
         // public chat is open to anyone, a room's voice room and a private
         // chat's only to its current members, and a room the user may not
@@ -904,6 +956,22 @@ impl Core {
             return Err(VoiceError::RateLimited { retry_after });
         }
 
+        // A person is in voice on one device at a time. In this room the
+        // device takes its person's place; anywhere else, the person
+        // leaves that room as one session switching rooms would.
+        let row = r.row_uid(uid);
+        let holder = r.person_members(row).and_then(|members| {
+            members
+                .iter()
+                .copied()
+                .find(|m| *m != uid && r.voice.room_of.contains_key(m))
+        });
+        if let Some(from) = holder {
+            if r.voice.room_of.get(&from) == Some(&cid) {
+                return self.voice_move(&mut r, &media, from, uid, cid);
+            }
+            r.voice_part(from);
+        }
         r.voice_part(uid);
 
         let occupancy = r.voice.rooms.get(&cid).map_or(0, |p| p.len());
@@ -916,10 +984,14 @@ impl Core {
         // joiner appears in the status that goes out below.
         let participants = r.voice.participants(cid);
 
-        media.join(uid, cid);
-        r.voice.rooms.entry(cid).or_default().push(Peer::new(uid));
+        let session = media.join(row, cid);
+        r.voice
+            .rooms
+            .entry(cid)
+            .or_default()
+            .push(Peer::new(uid, row, session));
         r.voice.room_of.insert(uid, cid);
-        let Some(sdp) = media.offer(uid, cid) else {
+        let Some(sdp) = media.offer(row, cid) else {
             // The media layer took the join and then had no offer to
             // give, so this peer has no session (see `VoiceMedia::offer`)
             // and never will. Unwind the domain-side join by hand rather
@@ -928,7 +1000,7 @@ impl Core {
             // room to renegotiate — and the peers already in the room
             // must not be handed an offer describing a joiner that isn't
             // going to exist.
-            media.leave(uid, cid);
+            media.leave(row, cid);
             r.voice.room_of.remove(&uid);
             if let Some(peers) = r.voice.rooms.get_mut(&cid) {
                 peers.retain(|p| p.uid != uid);
@@ -958,6 +1030,108 @@ impl Core {
             sdp,
             codec: media.codec(),
             participants,
+        })
+    }
+
+    /// `to`, a device of the person `from` is in voice for, takes its
+    /// place in `cid`: the person moves, and is never in voice twice.
+    ///
+    /// The row's media session is made again for the new device, which
+    /// the rest of the room's offers describe as a rejoin of the same
+    /// user: a fresh SSRC on the sections they already have. So the room
+    /// is shown no part and no join, only the renegotiation, and a status
+    /// only if the move ended a publication. The person's mute goes with
+    /// it, since it is the person who is in voice; its publications and
+    /// the subscriptions it held stay with the device that made them.
+    fn voice_move(
+        &self,
+        r: &mut RosterInner,
+        media: &Arc<dyn VoiceMedia>,
+        from: Uid,
+        to: Uid,
+        cid: u32,
+    ) -> Result<VoiceJoin, VoiceError> {
+        let before = r.voice.participants(cid);
+        let videos = r.video_publications(cid);
+        let row = r.row_uid(to);
+        let Some(old) = r.voice.peer_mut(cid, from) else {
+            return Err(VoiceError::NotAMember);
+        };
+        // Both are the person's devices, and the row was announced before
+        // either could join; a device in voice under any other uid would
+        // carry that uid to this one.
+        assert_eq!(old.row, row, "a person is in voice under its row");
+        let muted = old.muted;
+        let ended = !old.video.publications.is_empty();
+        media.leave(row, cid);
+        r.voice.room_of.remove(&from);
+        // In the leaver's place, so the room's list keeps its order and a
+        // move that ends nothing changes nothing anyone is shown.
+        let session = media.join(row, cid);
+        if let Some(p) = r.voice.peer_mut(cid, from) {
+            *p = Peer::new(to, row, session);
+            p.muted = muted;
+        }
+        if muted {
+            media.set_muted(row, cid, true);
+        }
+        let Some(sdp) = media.offer(row, cid) else {
+            // The new device has no session to give it, and the old one's
+            // is gone: the person is out of voice, and the room is told
+            // so as for any leave, the leaver with it.
+            media.leave(row, cid);
+            if let Some(peers) = r.voice.rooms.get_mut(&cid) {
+                peers.retain(|p| p.uid != to);
+                if peers.is_empty() {
+                    r.voice.rooms.remove(&cid);
+                }
+            }
+            self.voice_refund(r, to, Spend::Join);
+            if r.voice.rooms.contains_key(&cid) {
+                r.video_resync(cid);
+                r.voice_renegotiate(cid, None);
+            }
+            r.voice_told_out(from, row, cid);
+            r.voice_status(cid);
+            r.video_status(cid);
+            return Err(VoiceError::RoomFull);
+        };
+        r.voice.room_of.insert(to, cid);
+        if let Some(p) = r.voice.peer_mut(cid, to) {
+            p.offer_outstanding = true;
+        }
+        // Anyone watching the leaver's camera stops: the publication is
+        // the device's, and that device is no longer here.
+        r.video_resync(cid);
+        r.voice_renegotiate(cid, Some(to));
+        r.voice_told_out(from, row, cid);
+        let after = r.voice.participants(cid);
+        if after == before {
+            r.send_to(
+                to,
+                Event::VoiceStatus {
+                    cid,
+                    participants: after.clone(),
+                },
+            );
+        } else {
+            r.voice_status(cid);
+        }
+        if ended {
+            r.video_status(cid);
+        } else if r.voice.video_enabled {
+            r.send_to(
+                to,
+                Event::VideoStatus {
+                    cid,
+                    publications: videos,
+                },
+            );
+        }
+        Ok(VoiceJoin {
+            sdp,
+            codec: media.codec(),
+            participants: after.into_iter().filter(|p| p.uid != row).collect(),
         })
     }
 
@@ -1016,7 +1190,8 @@ impl Core {
         // or a `NotInVoice` from a session that died under us, and a
         // reason this layer grows tomorrow should not arrive as a lie
         // about the client's SDP.
-        if let Err(e) = media.answer(uid, cid, &sdp) {
+        let key = r.voice.key(cid, uid);
+        if let Err(e) = media.answer(key, cid, &sdp) {
             r.voice_part(uid);
             return Err(e);
         }
@@ -1032,7 +1207,7 @@ impl Core {
             None => false,
         };
         if follow_up {
-            match media.offer(uid, cid) {
+            match media.offer(key, cid) {
                 Some(sdp) => r.send_to(uid, Event::VoiceOffer { cid, sdp }),
                 // See `voice_renegotiate`: a peer with no session left,
                 // whose failure we haven't been handed yet. Clear the
@@ -1066,7 +1241,7 @@ impl Core {
         let Some(media) = r.voice_media() else {
             return Err(VoiceError::NotInVoice);
         };
-        media.remote_ice(uid, cid, &candidate);
+        media.remote_ice(r.voice.key(cid, uid), cid, &candidate);
         Ok(())
     }
 
@@ -1089,7 +1264,7 @@ impl Core {
             _ => false,
         };
         if changed {
-            media.set_muted(uid, cid, muted);
+            media.set_muted(r.voice.key(cid, uid), cid, muted);
             r.status_soon(cid, false);
         }
         // A toggle that changes nothing is acked and nothing else, and
@@ -1117,21 +1292,27 @@ impl Core {
             MediaEvent::Ice {
                 uid,
                 cid,
+                session,
                 candidate,
             } => {
-                if r.voice.room_of.get(&uid) == Some(&cid) {
+                if let Some(uid) = r.voice.session_of(cid, uid, session) {
                     r.send_to(uid, Event::VoiceIce { cid, candidate });
                 }
             }
-            MediaEvent::Failed { uid, cid } => {
-                if r.voice.room_of.get(&uid) == Some(&cid) {
+            MediaEvent::Failed { uid, cid, session } => {
+                if let Some(uid) = r.voice.session_of(cid, uid, session) {
                     r.voice_part(uid);
                 }
             }
-            MediaEvent::VideoFailed { uid, cid, kind } => {
-                if r.voice.room_of.get(&uid) != Some(&cid) {
+            MediaEvent::VideoFailed {
+                uid,
+                cid,
+                session,
+                kind,
+            } => {
+                let Some(uid) = r.voice.session_of(cid, uid, session) else {
                     return;
-                }
+                };
                 let mut stopped = false;
                 if let Some(p) = r.voice.peer_mut(cid, uid) {
                     let before = p.video.publications.len();

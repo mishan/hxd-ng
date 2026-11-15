@@ -91,6 +91,9 @@ struct Inner {
     refuse_publish: Option<PublishRefusal>,
     /// What a rejected answer is rejected with.
     answer_error: VoiceError,
+    /// The last media session made, and each uid's latest.
+    sessions: u64,
+    session_of: std::collections::HashMap<Uid, u64>,
 }
 
 impl Default for Inner {
@@ -102,6 +105,8 @@ impl Default for Inner {
             no_next_offer: false,
             refuse_publish: None,
             answer_error: VoiceError::BadAnswer,
+            sessions: 0,
+            session_of: std::collections::HashMap::new(),
         }
     }
 }
@@ -120,6 +125,11 @@ impl RecordingMedia {
     /// Everything asked of it so far.
     pub fn calls(&self) -> Vec<MediaCall> {
         self.inner.lock().unwrap().calls.clone()
+    }
+
+    /// The media session it last made for `uid`, as its events name it.
+    pub fn session(&self, uid: Uid) -> u64 {
+        self.inner.lock().unwrap().session_of[&uid]
     }
 
     /// Everything asked of it since the last take.
@@ -164,12 +174,13 @@ impl VoiceMedia for RecordingMedia {
         "PCMU"
     }
 
-    fn join(&self, uid: Uid, cid: u32) {
-        self.inner
-            .lock()
-            .unwrap()
-            .calls
-            .push(MediaCall::Join { uid, cid });
+    fn join(&self, uid: Uid, cid: u32) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(MediaCall::Join { uid, cid });
+        inner.sessions += 1;
+        let session = inner.sessions;
+        inner.session_of.insert(uid, session);
+        session
     }
 
     fn leave(&self, uid: Uid, cid: u32) {

@@ -868,10 +868,10 @@ fn a_peer_that_never_answers_is_torn_down() {
 
     sfu.poll(t0 + Duration::from_secs(11));
     assert_eq!(sfu.peer_count(), 0);
-    assert_eq!(
+    assert!(matches!(
         events.try_recv().ok(),
-        Some(MediaEvent::Failed { uid: 1, cid: 0 })
-    );
+        Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+    ));
 }
 
 #[test]
@@ -923,10 +923,10 @@ fn a_peer_whose_dtls_stalls_gets_the_dtls_deadline_not_the_ice_one() {
         0,
         "gone at eleven seconds — not carried to thirty by the ICE budget"
     );
-    assert_eq!(
+    assert!(matches!(
         events.try_recv().ok(),
-        Some(MediaEvent::Failed { uid: 1, cid: 0 })
-    );
+        Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+    ));
 }
 
 #[test]
@@ -982,10 +982,10 @@ fn a_forged_datagram_cannot_hold_a_dead_session_open() {
         0,
         "reaped on schedule, whatever the forger sent"
     );
-    assert_eq!(
+    assert!(matches!(
         events.try_recv().ok(),
-        Some(MediaEvent::Failed { uid: 1, cid: 0 })
-    );
+        Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+    ));
 }
 
 #[test]
@@ -1006,10 +1006,10 @@ fn a_peer_that_answers_but_never_connects_is_torn_down() {
     assert_eq!(sfu.peer_count(), 1);
     sfu.poll(t0 + Duration::from_secs(31));
     assert_eq!(sfu.peer_count(), 0);
-    assert_eq!(
+    assert!(matches!(
         events.try_recv().ok(),
-        Some(MediaEvent::Failed { uid: 1, cid: 0 })
-    );
+        Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+    ));
 }
 
 #[test]
@@ -1041,9 +1041,11 @@ fn a_session_whose_offer_outgrows_its_byte_budget_is_ended() {
             // the visitor that didn't fit and belongs to a session that
             // no longer exists, so what comes back is the sentinel and
             // not a truncated description of the room.
-            assert_eq!(
-                events.try_recv().ok(),
-                Some(MediaEvent::Failed { uid: 1, cid: 0 }),
+            assert!(
+                matches!(
+                    events.try_recv().ok(),
+                    Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+                ),
                 "and the domain is told, in the same breath"
             );
             sfu.leave(visitor, 0);
@@ -1087,10 +1089,10 @@ fn fill_offer(
         let alive = sfu.offer(1, 0).is_some();
         sfu.leave(n + 1, 0);
         if !alive {
-            assert_eq!(
+            assert!(matches!(
                 events.try_recv().ok(),
-                Some(MediaEvent::Failed { uid: 1, cid: 0 })
-            );
+                Some(MediaEvent::Failed { uid: 1, cid: 0, .. })
+            ));
             return Err(n);
         }
     }
@@ -1352,7 +1354,8 @@ fn a_video_send_section_without_an_ssrc_costs_the_publication_not_the_call() {
             Some(MediaEvent::VideoFailed {
                 uid: 1,
                 cid: 0,
-                kind: VideoKind::Camera
+                kind: VideoKind::Camera,
+                ..
             })
         ),
         "the domain is told to release the slot"
@@ -1792,14 +1795,17 @@ fn one_ssrc_declared_for_two_publications_costs_the_second_one() {
     let failed: Vec<MediaEvent> = std::iter::from_fn(|| events.try_recv().ok())
         .filter(|e| matches!(e, MediaEvent::VideoFailed { .. }))
         .collect();
-    assert_eq!(
-        failed,
-        vec![MediaEvent::VideoFailed {
-            uid: 1,
-            cid: 0,
-            kind: VideoKind::Screen
-        }],
-        "the camera was seated first, so the screen is the one with nothing to bind to"
+    assert!(
+        matches!(
+            failed[..],
+            [MediaEvent::VideoFailed {
+                uid: 1,
+                cid: 0,
+                kind: VideoKind::Screen,
+                ..
+            }]
+        ),
+        "the camera was seated first, so the screen is the one with nothing to bind to: {failed:?}"
     );
 
     // The camera keeps its section live; the screen's keeps its mid and
@@ -2059,7 +2065,10 @@ fn a_speaker_far_over_its_rate_for_long_enough_is_ended() {
     for _ in 0..2400 {
         b.speak(&[0x55; 1000], clock.now());
         pump(&sfu, &mut [&mut a, &mut b], &clock, 1);
-        if events_now(&mut events).contains(&MediaEvent::Failed { uid: 2, cid: 0 }) {
+        if events_now(&mut events)
+            .iter()
+            .any(|e| matches!(e, MediaEvent::Failed { uid: 2, cid: 0, .. }))
+        {
             ended = true;
             break;
         }

@@ -536,6 +536,7 @@ fn ice_crosses_in_both_directions_and_only_for_the_users_own_room() {
     core.voice_media_event(MediaEvent::Ice {
         uid: a,
         cid: 0,
+        session: media.session(a),
         candidate: eoc.clone(),
     });
     assert_eq!(
@@ -549,7 +550,7 @@ fn ice_crosses_in_both_directions_and_only_for_the_users_own_room() {
 
 #[test]
 fn a_media_failure_is_a_leave() {
-    let (core, _media) = voiced(DEFAULT_MAX_PER_ROOM);
+    let (core, media) = voiced(DEFAULT_MAX_PER_ROOM);
     let (a, mut rx_a) = quiet(&core, "alice");
     let (b, _rx_b) = quiet(&core, "bob");
     let sdp = core.voice_join(a, 0).unwrap().sdp;
@@ -558,14 +559,22 @@ fn a_media_failure_is_a_leave() {
     drain(&mut rx_a);
 
     // B's ICE never completes; the SFU gives up on it.
-    core.voice_media_event(MediaEvent::Failed { uid: b, cid: 0 });
+    core.voice_media_event(MediaEvent::Failed {
+        uid: b,
+        cid: 0,
+        session: media.session(b),
+    });
     assert_eq!(core.voice_room_of(b), None);
     assert_eq!(
         statuses(&drain(&mut rx_a)).last().map(|p| uids(p)),
         Some(vec![a])
     );
     // A stale failure for a room the peer already left changes nothing.
-    core.voice_media_event(MediaEvent::Failed { uid: b, cid: 0 });
+    core.voice_media_event(MediaEvent::Failed {
+        uid: b,
+        cid: 0,
+        session: media.session(b),
+    });
     assert_eq!(uids(&core.voice_participants(0)), vec![a]);
 }
 
@@ -576,7 +585,7 @@ fn a_user_removed_from_voice_is_told_even_with_no_reply_to_carry_it() {
     // An explicit leave has its own reply for an ack. A media timeout, a
     // kick from the chat and a lost connection have none, and a client
     // whose voice UI is still live needs to hear about it somehow.
-    let (core, _media) = voiced(DEFAULT_MAX_PER_ROOM);
+    let (core, media) = voiced(DEFAULT_MAX_PER_ROOM);
     let (a, mut rx_a) = quiet(&core, "alice");
     let (b, mut rx_b) = quiet(&core, "bob");
     let sdp = core.voice_join(a, 0).unwrap().sdp;
@@ -585,7 +594,11 @@ fn a_user_removed_from_voice_is_told_even_with_no_reply_to_carry_it() {
     drain(&mut rx_a);
     drain(&mut rx_b);
 
-    core.voice_media_event(MediaEvent::Failed { uid: b, cid: 0 });
+    core.voice_media_event(MediaEvent::Failed {
+        uid: b,
+        cid: 0,
+        session: media.session(b),
+    });
     assert_eq!(
         statuses(&drain(&mut rx_b)).last().map(|p| uids(p)),
         Some(vec![a]),

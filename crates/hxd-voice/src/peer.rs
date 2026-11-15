@@ -351,6 +351,12 @@ impl Peer {
     /// SFU's lock. Past the cap a candidate is ignored rather than
     /// refused: a client with that many has plenty for ICE to work with
     /// already, and the session goes on.
+    /// The number this session was made under, which every event about
+    /// it carries ([`hxd_core::voice::VoiceMedia::join`]).
+    pub(crate) fn session(&self) -> u64 {
+        self.session_id
+    }
+
     pub(crate) fn add_remote_candidate(&mut self, c: Candidate) -> bool {
         let key = (c.addr(), c.proto());
         if !self.remote_candidates.contains(&key) {
