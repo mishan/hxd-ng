@@ -225,8 +225,8 @@ and the enrollee has not yet collected. The holder is finished the
 moment it has answered; the enrollee is still parked on the §5.5 long
 poll, and a rotating holder closes within milliseconds of answering, so
 discarding those would tell a browser its request expired seconds after
-a human approved it. The session goes when the last of them is fetched,
-or at its deadline, whichever comes first.
+a human approved it. The session goes a minute after the last of them
+is fetched (§5.5), or at its deadline, whichever comes first.
 
 ### 5.2 The enrollee posts a request
 
@@ -244,6 +244,9 @@ Response 201:
 ```jsonc
 { "request": "…secret…", "expires_in": 300 }
 ```
+
+`expires_in` is at most 300, and never past the end of the holder's
+session, which takes its requests with it when it ends.
 
 The mailbox decodes the request only far enough to enforce the size
 limit and, when no code is given, to read `prev` for routing. It does
@@ -339,10 +342,19 @@ session secret never leaves the holder's process.
 
 | status | body | |
 |---|---|---|
-| 200 | `{ "bundle": "…" }` | approved; the request is consumed |
+| 200 | `{ "bundle": "…" }` | approved |
 | 202 | `{ "expires_in": n }` | still pending at the deadline; poll again |
-| 403 | `{ "denied": "reason" }` | the holder said no; the request is consumed |
-| 410 | | expired, or already fetched |
+| 403 | `{ "denied": "reason" }` | the holder said no |
+| 410 | | expired, or fetched more than a minute ago |
+
+An answer, approval or denial, is the request's last word, and it is
+handed out again on every fetch with the same request secret for a
+minute after the first, then the request is gone. A long poll whose
+connection died after the mailbox answered it took the answer as surely
+as one whose reply arrived, so a device that lost its connection and
+polls again must find the answer rather than a 410; a one-shot fetch
+would leave an approved enrollment lost and the holder's certificate
+minted for nothing. Only the request secret fetches, as before.
 
 The enrollee then does what hx-ng `identity-keys.md` §7.1 step 4 does
 with a paste: `cert.device` equals its own signing key, `cert.device_enc`

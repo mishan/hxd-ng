@@ -3740,8 +3740,8 @@ async fn a_device_enrolls_through_the_mailbox_end_to_end() {
         b"a bundle"
     );
 
-    // Consumed. A second fetch cannot tell "already taken" from "never
-    // existed", which is deliberate (§5.5).
+    // Fetched again by the same secret: a device whose connection died
+    // after the mailbox answered its poll must find it on the next (§5.5).
     let again = http(
         ng,
         "GET",
@@ -3750,7 +3750,7 @@ async fn a_device_enrolls_through_the_mailbox_end_to_end() {
         b"",
     )
     .await;
-    assert_eq!(again.status, 410);
+    assert_eq!(again.status, 200);
 }
 
 #[tokio::test]

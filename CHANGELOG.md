@@ -102,6 +102,12 @@ as AGENTS.md's "Releasing" describes it.
   as the login, and `[system] nick` like that is refused. A linked
   user with no name is shown as `unnamed`, and an update without one
   keeps the name it was shown by.
+- The enrollment mailbox (docs/identity-enrollment.md §5): an answer,
+  approval or denial, is handed out again to its request's secret for a
+  minute after the first fetch, so an enrollee whose connection dropped
+  mid-poll finds it on its next poll instead of a 410 and an approved
+  enrollment lost. A request's `expires_in` is never past the end of
+  the holder's session, which takes its requests with it.
 
 ## [0.3.0] - 2026-11-05
 

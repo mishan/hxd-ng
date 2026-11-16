@@ -1715,7 +1715,7 @@ async fn enroll_fetch(secret: &str, mb: &crate::enroll::Mailbox) -> Resp {
         Fetched::Pending { expires_in } => {
             json_resp(StatusCode::ACCEPTED, json!({ "expires_in": expires_in }))
         }
-        Fetched::Gone => plain(StatusCode::GONE, "expired, or already fetched"),
+        Fetched::Gone => plain(StatusCode::GONE, "expired, or fetched a while ago"),
     }
 }
 
