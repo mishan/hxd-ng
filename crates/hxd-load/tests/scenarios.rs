@@ -219,6 +219,50 @@ async fn a_login_storm_of_persons_is_heard_to_join_once_a_person_where_devices_a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persons_ending_out_of_order_never_share_an_account() {
+    // As many accounts as arrivals in flight, arriving faster than they
+    // stay, each staying a time of its own, so arrivals end out of order
+    // and taking account `i % count` would put a later arrival's devices
+    // on an earlier person still there.
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "[server]\ncoalesce = true\n").await;
+    let accounts = Accounts {
+        prefix: "few".into(),
+        count: 4,
+        password: "load-test".into(),
+    };
+    hxd_load::accounts::write(
+        &td.path().join("accounts"),
+        &accounts.prefix,
+        accounts.count,
+        &accounts.password,
+        None,
+        true,
+    )
+    .unwrap();
+    let mut s = scenario(&server, Kind::LoginStorm, 2.0);
+    s.target.accounts = Some(accounts);
+    s.login_storm.accounts = true;
+    s.login_storm.devices = 2;
+    s.login_storm.grouped = true;
+    s.login_storm.max_in_flight = 4;
+    s.login_storm.rate = 60.0;
+    s.login_storm.ramp_step = 0.0;
+    s.login_storm.linger = 0.02;
+    s.login_storm.linger_spread = 0.3;
+    let report = hxd_load::run(s).await.unwrap();
+    assert_clean(&report);
+    let persons = &report.ops["login.person"];
+    assert!(persons.count > 4, "{}", report.summary());
+    assert_eq!(
+        report.checks["login.person_joins"].held,
+        persons.count,
+        "{}",
+        report.summary()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn churn_keeps_seqs_gapless_across_drops_resumes_and_kicks() {
     let td = tempfile::tempdir().unwrap();
     // Every churner detaches from one address, and the server must let

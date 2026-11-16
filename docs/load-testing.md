@@ -114,7 +114,8 @@ Arrivals at `rate` a second, rising by `ramp_step` every `ramp_every`
 seconds, each on a wire picked by weight (`legacy`, `legacy_tls`,
 `ng`). An arrival connects, logs in (as a guest, or to `[target]
 accounts` with `accounts = true`), agrees to the agreement and fetches
-the user list; it stays `linger` seconds and leaves. Each step is
+the user list; it stays `linger` seconds, and up to `linger_spread`
+more picked at random, and leaves. Each step is
 reported on its own, and the knee is the first step whose p99 is twice
 the first step's or whose failures pass one in a hundred. An arrival
 refused as busy is retried like any other login, and its latency, timed
@@ -145,9 +146,11 @@ With `devices` above one, an arrival is a person on that many devices:
 it logs in to its account once a device, each on a wire picked by
 weight and under one nick, each device after the last has its user
 list, and is timed until the last has it (`login.person`); then every
-device lingers and leaves. It needs `accounts = true`, more accounts
-than arrivals are on at once, and accounts linked to identities of
-their own (`hxd-load accounts --linked`), since a password login of an
+device lingers and leaves. Each person holds an account no other
+person in flight holds until its devices have left, so it needs
+`accounts = true`, `max_in_flight` no more than the accounts, and
+accounts linked to identities of their own (`hxd-load accounts
+--linked`), since a password login of an
 account linked to an identity is that person's. An ng watcher counts
 the joins it hears of each person: on a server that makes one row of a
 person's devices, set `grouped = true`, and each person must be heard

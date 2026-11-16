@@ -84,6 +84,7 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
         None
     };
     let in_flight = Arc::new(Semaphore::new(s.max_in_flight));
+    let free = Arc::new(Free::new(ctx));
     let steps: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
     let start = ctx.t0.elapsed() + Duration::from_millis(100);
     let end = start + ctx.duration();
@@ -146,11 +147,25 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
             due += Duration::from_secs_f64(1.0 / rate);
             continue;
         };
+        // A person holds an account of its own until its devices have
+        // left. With no more in flight than accounts one is always free;
+        // were none, the arrival is the generator's to shed, as above.
+        let lease = if wires.len() > 1 {
+            let Some(lease) = Free::take(&free) else {
+                steps.lock().unwrap()[step].shed += 1;
+                ctx.stats.error("login.shed", "no_free_account");
+                due += Duration::from_secs_f64(1.0 / rate);
+                continue;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         let (ctx2, steps2, arrivals2) = (ctx.clone(), steps.clone(), arrivals.clone());
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            if wires.len() > 1 {
-                arrive_person(&ctx2, &wires, i, due, step, &steps2, &arrivals2).await;
+            if let Some(lease) = lease {
+                arrive_person(&ctx2, &wires, i, lease, due, step, &steps2, &arrivals2).await;
             } else {
                 arrive(&ctx2, wire, i, due, step, &steps2, &arrivals2).await;
             }
@@ -257,7 +272,7 @@ async fn arrive(
                 a.1 = true;
             }
             ctx.stats.record(&op, took);
-            let linger = tokio::time::sleep(Duration::from_secs_f64(s.linger));
+            let linger = tokio::time::sleep(lingers(ctx));
             let first_login = ctx
                 .scenario
                 .target
@@ -305,27 +320,67 @@ async fn arrive(
     }
 }
 
+/// How long an arrival stays: `linger`, and up to `linger_spread` more
+/// picked at random, so arrivals that came in order can end out of it.
+fn lingers(ctx: &Ctx) -> Duration {
+    let s = &ctx.scenario.login_storm;
+    Duration::from_secs_f64(s.linger + ctx.random() * s.linger_spread)
+}
+
+/// The accounts no person in flight holds. Arrivals end out of order, so
+/// taking account `i % count` could hand a later arrival one an earlier
+/// still holds, and its devices would join that person.
+struct Free(Mutex<Vec<usize>>);
+
+impl Free {
+    fn new(ctx: &Ctx) -> Free {
+        let count = ctx.scenario.target.accounts.as_ref().map_or(0, |a| a.count);
+        Free(Mutex::new((0..count).rev().collect()))
+    }
+
+    fn take(free: &Arc<Free>) -> Option<Lease> {
+        let account = free.0.lock().unwrap().pop()?;
+        Some(Lease {
+            account,
+            free: free.clone(),
+        })
+    }
+}
+
+/// An account a person holds, back in the pool when it is dropped.
+struct Lease {
+    account: usize,
+    free: Arc<Free>,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.free.0.lock().unwrap().push(self.account);
+    }
+}
+
 /// A person: one connection to its account for each of `wires`, each
 /// logged in once the one before has its user list, all under one nick
 /// so no device renames it. Timed until the last device is in, then all
 /// linger and leave together.
+#[allow(clippy::too_many_arguments)]
 async fn arrive_person(
     ctx: &Ctx,
     wires: &[Wire],
     i: usize,
+    lease: Lease,
     due: Duration,
     step: usize,
     steps: &Mutex<Vec<Step>>,
     arrivals: &Arrivals,
 ) {
-    let s = &ctx.scenario.login_storm;
     let accounts = ctx
         .scenario
         .target
         .accounts
         .as_ref()
         .expect("checked by the scenario");
-    let creds = (accounts.login(i), accounts.password.clone());
+    let creds = (accounts.login(lease.account), accounts.password.clone());
     let nick = ctx.nick('D', i);
     arrivals
         .0
@@ -367,7 +422,7 @@ async fn arrive_person(
         }
         Some(e) => ctx.stats.error("login.person", e),
     }
-    tokio::time::sleep(Duration::from_secs_f64(s.linger)).await;
+    tokio::time::sleep(lingers(ctx)).await;
     for m in devices {
         if let Err(e) = m.leave().await {
             ctx.stats.error("leave", &e.to_string());

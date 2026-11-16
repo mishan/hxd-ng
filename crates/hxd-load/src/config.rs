@@ -74,6 +74,10 @@ impl Scenario {
             ("[run] settle", self.run.settle),
             ("[run] teardown", self.run.teardown),
             ("[login_storm] linger", self.login_storm.linger),
+            (
+                "[login_storm] linger_spread",
+                self.login_storm.linger_spread,
+            ),
             ("[login_storm] ramp_step", self.login_storm.ramp_step),
             ("[login_storm] msg_rate", self.login_storm.msg_rate),
             ("[churn] away", self.churn.away),
@@ -831,6 +835,9 @@ pub struct LoginStorm {
     pub ramp_every: f64,
     /// Seconds each client stays after its user list, then leaves.
     pub linger: f64,
+    /// Seconds more, up to, each arrival stays, picked at random: with
+    /// it arrivals end in another order than they came.
+    pub linger_spread: f64,
     /// The mix, by weight.
     pub legacy: u32,
     pub legacy_tls: u32,
@@ -873,6 +880,7 @@ impl Default for LoginStorm {
             ramp_step: 20.0,
             ramp_every: 5.0,
             linger: 1.0,
+            linger_spread: 0.0,
             legacy: 1,
             legacy_tls: 0,
             ng: 1,
