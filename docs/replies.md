@@ -133,13 +133,14 @@ message to them.
   cannot tell what was asked before it refuses for permission or rate:
   the text unchanged and `DATA_CHAT_REASON` beside it: `NotAllowed` (2)
   without bit 56,
-  `RateLimited` (6) past the history rate, `InvalidTarget` (12) for an
-  id not 8 bytes and `TooManyTargets` (13) for more than 50. A request
-  malformed in its channel or cursors, a channel that is not 0, a
-  session without bit 4, and the server's own failures have no code of
-  the family's that describes them, and carry none. Bit 17 alone sends
-  no request of the family's, so every other session, bit 17's too, is
-  refused with the text alone, the bytes it always was.
+  `RateLimited` (6) past the history rate, `NoSuchTarget` (1) for a
+  channel that is not 0, `InvalidTarget` (12) for an id not 8 bytes and
+  `TooManyTargets` (13) for more than 50. A request malformed in its
+  channel or cursors, a session without bit 4, and the server's own
+  failures have no code of the family's that describes them, and carry
+  none. Bit 17 alone sends no request of the family's, so every other
+  session, bit 17's too, is refused with the text alone, the bytes it
+  always was.
 
 ## 5. Private messages' references
 
