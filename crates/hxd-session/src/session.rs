@@ -3517,9 +3517,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
         | Event::NewsNode(_)
         | Event::NewsNodeDeleted { .. }
         | Event::NewsNotify(_) => {}
-        // Sent only where the transport shows roles, which this one does
-        // not.
-        Event::RolesChanged(_) | Event::RosterStale => {}
+        // Sent only where the transport shows roles, or to an ng session
+        // that declared `persons`, which this one is neither.
+        Event::RolesChanged(_) | Event::RosterStale | Event::PersonRow { .. } => {}
         // Sent only to a session that negotiated bit 19, with task id 0.
         Event::ReactionsChanged(changes) => {
             if sess.has_cap(cap::REACTIONS) {

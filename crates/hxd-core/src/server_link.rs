@@ -1479,14 +1479,20 @@ impl Core {
     /// For the lists a client is shown (300, the ng roster) and nothing
     /// else; counts and every act on a user stay with the sessions.
     pub fn roster_rows(&self) -> Vec<UserInfo> {
-        let r = self.roster.lock().unwrap();
-        let mut rows: Vec<UserInfo> = r
+        self.roster.lock().unwrap().roster_rows_locked()
+    }
+}
+
+impl RosterInner {
+    /// [`Core::roster_rows`], under a lock already held.
+    pub(crate) fn roster_rows_locked(&self) -> Vec<UserInfo> {
+        let mut rows: Vec<UserInfo> = self
             .users
             .iter()
-            .filter(|(uid, s)| s.live() && r.listed(**uid, s))
-            .map(|(_, s)| r.row_view(s))
+            .filter(|(uid, s)| s.live() && self.listed(**uid, s))
+            .map(|(_, s)| self.row_view(s))
             .chain(
-                r.ghosts
+                self.ghosts
                     .values()
                     .filter(|g| g.visible)
                     .map(|g| g.info.clone()),

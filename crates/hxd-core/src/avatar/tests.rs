@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
 use crate::access::AccessBits;
-use crate::roster::{AttachInfo, Transport};
+use crate::roster::{AttachInfo, Event, Transport};
 use crate::Events;
 
 /// Accepts anything non-empty. Its canonical bytes are the input

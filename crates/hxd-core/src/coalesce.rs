@@ -7,8 +7,52 @@
 //! uid, serial and outbox, and hears what the row hears.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use unicode_normalization::UnicodeNormalization;
+
+use crate::access::bit;
 use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserInfo, UserSession};
+
+/// One device under a person's row, as a viewer that may see it is shown
+/// it: the server's facts about it first, and the client's label, a hint
+/// that decides nothing, last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub device: u64,
+    /// The ng wire, or the classic one.
+    pub ng: bool,
+    /// It proved the identity with its device key; otherwise it logged
+    /// in with the account's password.
+    pub proved: bool,
+    pub encrypted: bool,
+    pub status: SessionStatus,
+    /// When it attached, as unix seconds.
+    pub since: u64,
+    pub label: Option<String>,
+    pub sealed: bool,
+    pub signs: bool,
+}
+
+/// The longest label kept, in characters.
+pub const LABEL_MAX_CHARS: usize = 32;
+
+/// What a client calls its device, as it may be shown: NFC, at most
+/// [`LABEL_MAX_CHARS`], and held to hl-identity's rule for a name shown
+/// beside a fingerprint, which is where a label sits too: something in
+/// it, no space around it, nothing that renders as nothing or as
+/// something else. A label that fails is dropped rather than refused: it
+/// is a hint, so a login never fails over one.
+pub fn device_label(raw: &str) -> Option<String> {
+    // Far past what NFC could bring back under the bound: not worth
+    // normalizing.
+    if raw.chars().nth(4 * LABEL_MAX_CHARS).is_some() {
+        return None;
+    }
+    let label: String = raw.nfc().collect();
+    (label.chars().count() <= LABEL_MAX_CHARS && hl_identity::names::is_shown_name(&label))
+        .then_some(label)
+}
 
 /// One person on the roster.
 pub(crate) struct Coalesced {
@@ -25,6 +69,13 @@ pub(crate) struct Coalesced {
     pub(crate) flood: crate::limits::Flood,
     /// What the links know of it: one user, whichever devices it has.
     link: crate::server_link::PersonLink,
+    /// Its devices as last told to the viewers that see them all, and to
+    /// its password devices, which see only each other: a password of a
+    /// linked account is enough to be grouped, so it is not enough to see
+    /// or end the devices that proved the identity. A change neither saw
+    /// tells nobody.
+    told_all: Vec<Device>,
+    told_password: Vec<Device>,
 }
 
 /// The people on the roster, by row.
@@ -186,6 +237,8 @@ impl RosterInner {
                         ending: false,
                         flood: Default::default(),
                         link: Default::default(),
+                        told_all: Vec::new(),
+                        told_password: Vec::new(),
                     },
                 );
                 // As the roster is told it: the row, not the raw session.
@@ -262,6 +315,10 @@ impl RosterInner {
         let front = self.users.get(p.members.first()?)?;
         let mut info = front.info.clone();
         info.uid = row;
+        // What the front's wire declared is the device's, never shown on
+        // a row, so a change of front between wires is no change to it.
+        info.transport.ng = false;
+        info.transport.persons = false;
         // As safe as its least safe device, and signing only if all do.
         let members: Vec<&UserSession> =
             p.members.iter().filter_map(|m| self.users.get(m)).collect();
@@ -333,7 +390,9 @@ impl RosterInner {
 
     /// Tell the roster of a change to a row: a person's to everyone else
     /// as its row, and to each of its own sessions as that session's own
-    /// view of it (its status, transport and identity), once.
+    /// view of it (its status, transport and identity), once. A session
+    /// that may see the person's devices is told the row with them
+    /// instead.
     pub(crate) fn tell_row(&mut self, ev: Event) {
         self.tell_row_where(ev, |_| true);
     }
@@ -344,12 +403,21 @@ impl RosterInner {
             Event::Changed(info) => self.person_members(info.uid).map(<[Uid]>::to_vec),
             _ => None,
         };
-        let Some(members) = members else {
+        let (Some(members), Event::Changed(info)) = (members, &ev) else {
             self.broadcast_where(&ev, None, pred);
             return;
         };
-        self.broadcast_where(&ev, None, |s| !members.contains(&s.info.uid) && pred(s));
+        let row = info.uid;
+        let seers = self.seers(row, |s| pred(s));
+        self.broadcast_where(&ev, None, |s| {
+            !members.contains(&s.info.uid)
+                && !seers.iter().any(|(u, _)| *u == s.info.uid)
+                && pred(s)
+        });
         for m in members {
+            if seers.iter().any(|(u, _)| *u == m) {
+                continue;
+            }
             let own = self
                 .own_row(m)
                 .filter(|_| self.users.get(&m).is_some_and(&pred));
@@ -357,6 +425,166 @@ impl RosterInner {
                 self.send_to(m, Event::Changed(own));
             }
         }
+        self.tell_seers(row, info.clone(), &seers, false);
+    }
+
+    /// The sessions `pred` admits that may see `row`'s devices, with
+    /// whether they see them all or its password devices alone.
+    fn seers(&self, row: Uid, pred: impl Fn(&UserSession) -> bool) -> Vec<(Uid, bool)> {
+        if !self.persons.by_row.contains_key(&row) {
+            return Vec::new();
+        }
+        self.users
+            .iter()
+            .filter(|(_, s)| pred(s))
+            .filter_map(|(uid, s)| self.devices_seen(s, row).map(|all| (*uid, all)))
+            .collect()
+    }
+
+    /// Tell `seers` the row `user` with its devices as they stand, and
+    /// note them as told.
+    fn tell_seers(&mut self, row: Uid, user: UserInfo, seers: &[(Uid, bool)], joined: bool) {
+        let all = self.devices_of(row);
+        let password: Vec<Device> = all.iter().filter(|d| !d.proved).cloned().collect();
+        let (all_arc, password_arc): (Arc<[Device]>, Arc<[Device]>) =
+            (all.clone().into(), password.clone().into());
+        for (uid, sees_all) in seers {
+            let devices = if *sees_all {
+                all_arc.clone()
+            } else {
+                password_arc.clone()
+            };
+            self.send_to(
+                *uid,
+                Event::PersonRow {
+                    joined,
+                    user: user.clone(),
+                    devices,
+                },
+            );
+        }
+        if let Some(p) = self.persons.by_row.get_mut(&row) {
+            p.told_all = all;
+            p.told_password = password;
+        }
+    }
+
+    /// Tell the sessions that see `row`'s devices of a change to them
+    /// alone: a device came, went, or changed. Nobody else hears of it,
+    /// so it costs no other session a seq.
+    pub(crate) fn tell_devices(&mut self, row: Uid) {
+        let Some(p) = self.persons.by_row.get(&row) else {
+            return;
+        };
+        // A person being kicked is told once, as it parts.
+        if p.ending {
+            return;
+        }
+        let all = self.devices_of(row);
+        let all_changed = p.told_all != all;
+        let password_changed = p.told_password.iter().ne(all.iter().filter(|d| !d.proved));
+        if !all_changed && !password_changed {
+            return;
+        }
+        let Some(view) = self.person_view(row) else {
+            return;
+        };
+        let seers: Vec<(Uid, bool)> = self
+            .seers(row, |_| true)
+            .into_iter()
+            .filter(|(_, sees_all)| {
+                if *sees_all {
+                    all_changed
+                } else {
+                    password_changed
+                }
+            })
+            .collect();
+        self.tell_seers(row, view, &seers, false);
+    }
+
+    /// Tell the roster that `info`'s avatar changed: as
+    /// [`Self::tell_row`] does a change, so a session that sees the
+    /// devices under a person's row is told the row with them.
+    pub(crate) fn tell_avatar(&mut self, info: UserInfo) {
+        let row = info.uid;
+        let seers = self.seers(row, |_| true);
+        self.broadcast_where(&Event::AvatarChanged(info.clone()), None, |s| {
+            !seers.iter().any(|(u, _)| *u == s.info.uid)
+        });
+        if !seers.is_empty() {
+            self.tell_seers(row, info, &seers, false);
+        }
+    }
+
+    /// Tell the roster that `uid`, just announced, joined: its own row,
+    /// or its person's first, which the sessions that may see devices
+    /// are told with its one device.
+    pub(crate) fn tell_joined(&mut self, uid: Uid) {
+        let view = self.row_view(&self.users[&uid]);
+        let row = view.uid;
+        let seers: Vec<(Uid, bool)> = self
+            .seers(row, |_| true)
+            .into_iter()
+            .filter(|(u, _)| *u != uid)
+            .collect();
+        self.broadcast_where(&Event::Joined(view.clone()), Some(uid), |s| {
+            !seers.iter().any(|(u, _)| *u == s.info.uid)
+        });
+        if self.persons.by_row.contains_key(&row) {
+            self.tell_seers(row, view, &seers, true);
+        }
+    }
+
+    /// Whether `viewer` may see the devices under `row`, and if so
+    /// whether all of them or its password devices alone: its own
+    /// person's, all of them where it proved the identity, and any
+    /// person's, all of them, where it has the kick bit. Only for a
+    /// session that declared `persons`, and only for a person's row.
+    pub(crate) fn devices_seen(&self, viewer: &UserSession, row: Uid) -> Option<bool> {
+        if !viewer.info.transport.persons || !viewer.live() {
+            return None;
+        }
+        if !self.persons.by_row.contains_key(&row) {
+            return None;
+        }
+        if self.persons.of.get(&viewer.info.uid) == Some(&row) {
+            return Some(viewer.info.transport.identity.is_some());
+        }
+        viewer.access.has(bit::DISCONNECT_USERS).then_some(true)
+    }
+
+    /// The devices under `row`, in the order they joined it.
+    pub(crate) fn devices_of(&self, row: Uid) -> Vec<Device> {
+        self.person_members(row)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| self.users.get(m))
+            .map(|s| {
+                let identity = s.info.transport.identity.as_ref();
+                Device {
+                    device: s.device,
+                    ng: s.info.transport.ng,
+                    proved: identity.is_some(),
+                    encrypted: s.info.transport.encrypted,
+                    status: s.info.status,
+                    since: s.since,
+                    label: s.label.clone(),
+                    sealed: identity.is_some_and(|i| i.sealed.is_some()),
+                    signs: identity.is_some_and(|i| i.signs),
+                }
+            })
+            .collect()
+    }
+
+    /// The devices `viewer` is shown under `row`, if any.
+    pub(crate) fn devices_for(&self, viewer: Uid, row: Uid) -> Option<Vec<Device>> {
+        let all = self.devices_seen(self.users.get(&viewer)?, row)?;
+        let mut devices = self.devices_of(row);
+        if !all {
+            devices.retain(|d| !d.proved);
+        }
+        Some(devices)
     }
 
     /// `uid`'s own view of its row, a grouped session's: its person's,
@@ -522,6 +750,72 @@ impl RosterInner {
     pub(crate) fn is_row(&self, uid: Uid) -> bool {
         self.persons.by_row.contains_key(&uid)
     }
+}
+
+impl crate::roster::Core {
+    /// Whether this server makes one row of a person's devices
+    /// (`[server] coalesce`).
+    pub fn groups_persons(&self) -> bool {
+        self.roster.lock().unwrap().persons.on
+    }
+
+    /// Keep what `uid`'s client calls its device, as [`device_label`]
+    /// lets it be shown; at login, before the device is announced.
+    pub fn label_device(&self, uid: Uid, raw: &str) {
+        let label = device_label(raw);
+        let mut r = self.roster.lock().unwrap();
+        if let Some(sess) = r.users.get_mut(&uid) {
+            sess.label = label;
+        }
+    }
+
+    /// `uid` as its own session is shown itself: the row the roster
+    /// shows it under, with its device id, and for a session that
+    /// declared `persons` and is one of a person's devices, the merged
+    /// row and the devices it may see under it.
+    pub fn self_view(&self, uid: Uid) -> Option<SelfView> {
+        let r = self.roster.lock().unwrap();
+        let sess = r.users.get(&uid)?;
+        let row = r.row_uid(uid);
+        let persons = sess.info.transport.persons;
+        let info = match r.person_view(row) {
+            Some(view) if persons && sess.grouped => view,
+            _ => UserInfo {
+                uid: row,
+                ..sess.info.clone()
+            },
+        };
+        Some(SelfView {
+            info,
+            device: persons.then_some(sess.device),
+            devices: r.devices_for(uid, row),
+        })
+    }
+
+    /// The user list as `viewer` is shown it: the rows, and the devices
+    /// under each person's row that it may see.
+    pub fn roster_for(&self, viewer: Uid) -> (Vec<UserInfo>, HashMap<Uid, Vec<Device>>) {
+        let mut r = self.roster.lock().unwrap();
+        if let Some(s) = r.users.get_mut(&viewer) {
+            s.told_roster = true;
+        }
+        let rows = r.roster_rows_locked();
+        let devices = rows
+            .iter()
+            .filter_map(|u| r.devices_for(viewer, u.uid).map(|d| (u.uid, d)))
+            .collect();
+        (rows, devices)
+    }
+}
+
+/// What [`crate::roster::Core::self_view`] answers.
+#[derive(Debug, Clone)]
+pub struct SelfView {
+    pub info: UserInfo,
+    /// Its device id, for a session that declared `persons`.
+    pub device: Option<u64>,
+    /// The devices under its person's row it may see.
+    pub devices: Option<Vec<Device>>,
 }
 
 #[cfg(test)]

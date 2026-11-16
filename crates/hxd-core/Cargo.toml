@@ -21,6 +21,8 @@ tracing = "0.1"
 # The OS CSPRNG, for chat ids (which are also voice-room addresses) and
 # for media handles.
 getrandom = "0.2"
+# A device label, normalized as a name is before it is shown.
+unicode-normalization = "0.1.26"
 # Canonical media hashes, which is what a moderator's re-upload block is
 # keyed on. Same version the identity crates use.
 sha2 = "0.10"

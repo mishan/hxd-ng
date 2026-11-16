@@ -695,6 +695,7 @@ pub(crate) fn give_account(
     roles: Option<&[RoleView]>,
 ) -> Option<Row> {
     let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
+    let row = r.row_uid(uid);
     let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
     s.account = Some(Box::new(account.clone()));
@@ -719,6 +720,19 @@ pub(crate) fn give_account(
             s.heard_from.insert(0, lobby);
         }
         _ => {}
+    }
+    // The kick bit is what lets a session see the devices under other
+    // people's rows (`crate::coalesce`): gained or lost, its user list is
+    // fetched again, once it has one: a session not yet sent its list
+    // (pending, or a device joining its person) reads it as it now is.
+    let kicks = s.access.has(bit::DISCONNECT_USERS);
+    let devices_seen = s.told_roster
+        && s.info.transport.persons
+        && kicks != effective.access.has(bit::DISCONNECT_USERS);
+    // What it holds for a resume of other people's devices is no longer
+    // its to see (what a live channel already carried, it saw).
+    if devices_seen && kicks {
+        s.outbox.lose_devices(row);
     }
     s.access = effective.access;
     s.can_detach = effective.can_detach;
@@ -746,6 +760,9 @@ pub(crate) fn give_account(
     let only_roles = !shown && roles_changed;
     let shown = ((shown || roles_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
+    if devices_seen {
+        r.send_to(uid, Event::RosterStale);
+    }
     // The admin bit never crosses a link; only the name does.
     if shown.is_some() && renamed {
         r.export_changed(uid);

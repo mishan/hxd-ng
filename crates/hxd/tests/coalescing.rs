@@ -510,6 +510,181 @@ async fn a_device_joining_a_masked_person_is_told_it_is_masked_as_it_joins() {
     assert_eq!(told.get(1), Some(&false), "{told:?}");
 }
 
+/// `login` on an ng device that declared `persons`, calling itself
+/// `label`, and the login reply.
+async fn persons_device(
+    server: &Server,
+    login: &str,
+    label: Option<&str>,
+) -> (ng::Client, serde_json::Value) {
+    let mut c = ng::Client::connect(server.ng).await.unwrap();
+    let mut params = json!({ "login": login, "password": "pw", "nick": login, "persons": true });
+    if let Some(label) = label {
+        params["device_label"] = json!(label);
+    }
+    let hello = c.login(params).await.unwrap();
+    (c, hello)
+}
+
+/// The devices a `user` object carries, as (wire, label), if any.
+fn devices_in(user: &serde_json::Value) -> Option<Vec<(String, Option<String>)>> {
+    Some(
+        user.get("devices")?
+            .as_array()?
+            .iter()
+            .map(|d| {
+                (
+                    d["wire"].as_str().unwrap().to_owned(),
+                    d["label"].as_str().map(str::to_owned),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// `uid`'s row in a reply's `users`.
+fn row_in(ok: &serde_json::Value, uid: u64) -> serde_json::Value {
+    ok["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["uid"] == uid)
+        .unwrap()
+        .clone()
+}
+
+/// A `user_joined` or `user_changed` of `row` carrying `n` devices.
+async fn devices_told(c: &mut ng::Client, ev: &str, row: u64, n: usize) -> serde_json::Value {
+    c.event_where(ev, |d| {
+        d["user"]["uid"] == row && devices_in(&d["user"]).is_some_and(|v| v.len() == n)
+    })
+    .await
+    .unwrap()
+    .data
+}
+
+/// What `c` has been told of `row` until now, as (event, user object).
+async fn told_of_row(c: &mut ng::Client, row: u64) -> Vec<(String, serde_json::Value)> {
+    c.request("ping", json!({})).await.unwrap();
+    c.rx.take_backlog()
+        .into_iter()
+        .filter(|e| e.data["user"]["uid"] == row || e.data["uid"] == row)
+        .map(|e| (e.ev, e.data))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_persons_own_devices_come_and_go_on_its_persons_client_and_nobody_else_hears_of_them() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let mut watcher = device(&server, "bob").await;
+    let (mut stranger, _) = persons_device(&server, "bob", None).await;
+    let mut plain = ng_device(&server, "keeper").await;
+    let (mut moderator, _) = persons_device(&server, "dave", None).await;
+    let (mut phone, hello) = persons_device(&server, "alice", Some("Phone")).await;
+    assert!(hello["caps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "persons"));
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    assert!(hello["self"]["device"]
+        .as_u64()
+        .is_some_and(|d| d > 0 && d < 1 << 53));
+    let me = &hello["self"]["devices"][0];
+    assert_eq!(
+        (
+            me["device"].clone(),
+            me["wire"].clone(),
+            me["proved"].clone(),
+            me["label"].clone()
+        ),
+        (
+            hello["self"]["device"].clone(),
+            json!("ng"),
+            json!(false),
+            json!("Phone")
+        ),
+        "{hello}"
+    );
+    assert_eq!(
+        devices_in(&row_in(&hello, row)),
+        Some(vec![("ng".into(), Some("Phone".into()))]),
+        "its own row in its user list"
+    );
+    devices_told(&mut moderator, "user_joined", row, 1).await;
+
+    let mut desktop = device(&server, "alice").await;
+    let both = vec![
+        ("ng".to_owned(), Some("Phone".to_owned())),
+        ("classic".to_owned(), None),
+    ];
+    let told = devices_told(&mut phone, "user_changed", row, 2).await;
+    assert_eq!(devices_in(&told["user"]), Some(both.clone()));
+    let told = devices_told(&mut moderator, "user_changed", row, 2).await;
+    assert_eq!(devices_in(&told["user"]), Some(both));
+    let listed = watcher.user_list().await.unwrap();
+    assert_eq!(listed.iter().filter(|u| u.nick == b"alice").count(), 1);
+
+    desktop.shutdown().await.unwrap();
+    assert!(closed(&mut desktop).await);
+    devices_told(&mut phone, "user_changed", row, 1).await;
+    devices_told(&mut moderator, "user_changed", row, 1).await;
+
+    let heard = told_of_row(&mut stranger, row).await;
+    assert!(!heard.is_empty(), "the stranger heard alice join");
+    assert!(
+        heard
+            .iter()
+            .all(|(_, d)| d["user"].get("devices").is_none()),
+        "{heard:?}"
+    );
+    assert_eq!(
+        heard,
+        told_of_row(&mut plain, row).await,
+        "as a client without persons"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_and_a_sync_carry_the_devices_its_client_may_see() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let (mut phone, hello) = persons_device(&server, "alice", Some("Phone")).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let device = hello["self"]["device"].clone();
+    let (_tablet, _) = persons_device(&server, "alice", Some("Tablet")).await;
+    let mut plain = ng_device(&server, "alice").await;
+    devices_told(&mut phone, "user_changed", row, 3).await;
+
+    // Taken over by a connection of its own, from what it last heard.
+    let session = phone.session.clone().unwrap();
+    let last_seq = phone.rx.last_seq;
+    let mut back = ng::Client::connect(server.ng).await.unwrap();
+    let ok = back
+        .request(
+            "resume",
+            json!({ "session": session.0, "token": session.1, "last_seq": last_seq }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok["self"]["device"], device, "the same device, resumed");
+    assert_eq!(ok["self"]["devices"].as_array().unwrap().len(), 3);
+    let synced = back.sync().await.unwrap();
+    let labels: Vec<Option<String>> = devices_in(&row_in(&synced, row))
+        .unwrap()
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect();
+    assert_eq!(labels, [Some("Phone".into()), Some("Tablet".into()), None]);
+    let theirs = plain.sync().await.unwrap();
+    assert!(
+        row_in(&theirs, row).get("devices").is_none(),
+        "a device without persons"
+    );
+    assert!(theirs["self"].is_null() || theirs["self"].get("device").is_none());
+}
+
 #[tokio::test]
 async fn with_coalescing_off_each_device_is_a_user_of_its_own() {
     let td = tempfile::tempdir().unwrap();

@@ -1,4 +1,5 @@
 mod chats;
+mod devices;
 mod link;
 mod voice;
 

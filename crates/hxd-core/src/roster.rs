@@ -282,6 +282,14 @@ pub struct Transport {
     /// lobby: classic capability bit 17, Structured Chat, whose echo is
     /// how a sender learns its line's id.
     pub echoes_own_lines: bool,
+    /// The ng wire, as a device entry says it (`crate::coalesce::Device`).
+    /// The ng frontend sets it.
+    pub ng: bool,
+    /// It declared the ng wire's `persons`, on a server that groups a
+    /// person's devices: it may be shown the devices under a row, and is
+    /// shown its own person as the merged row with its devices
+    /// (`crate::coalesce`). Kept, as `replies`.
+    pub persons: bool,
 }
 
 /// The public part of a transport identity: enough for a roster row and
@@ -394,6 +402,17 @@ pub enum Event {
     Changed(UserInfo),
     /// A visible session left. Not delivered to the leaver.
     Parted(Uid),
+    /// A person's row with the devices under it, to a session that may
+    /// see them (`crate::coalesce`): its own devices, or a viewer with
+    /// the kick bit, and on the ng wire alone. `joined` for the row's
+    /// first appearance, as [`Event::Joined`] is; otherwise as
+    /// [`Event::Changed`]. The list is complete, as it stood when the
+    /// event was made.
+    PersonRow {
+        joined: bool,
+        user: UserInfo,
+        devices: Arc<[crate::coalesce::Device]>,
+    },
     /// A visible session's avatar was set, replaced or cleared. Delivered
     /// to everyone, the changer included. Its own event rather than a
     /// [`Event::Changed`], because the legacy wire says it with a
@@ -834,6 +853,17 @@ impl Event {
             Event::NewsPosted {
                 subject, from_nick, ..
             } => subject.len() + from_nick.len(),
+            Event::PersonRow { user, devices, .. } => {
+                user.nick.len()
+                    + user.roles.iter().map(String::len).sum::<usize>()
+                    + devices
+                        .iter()
+                        .map(|d| {
+                            std::mem::size_of::<crate::coalesce::Device>()
+                                + d.label.as_ref().map_or(0, String::len)
+                        })
+                        .sum::<usize>()
+            }
             Event::Joined(u) | Event::Changed(u) | Event::AvatarChanged(u) => {
                 u.nick.len()
                     + u.remote
@@ -900,6 +930,7 @@ impl Event {
             Event::Joined(..) => "joined",
             Event::Changed(..) => "changed",
             Event::Parted(..) => "parted",
+            Event::PersonRow { .. } => "person_row",
             Event::AvatarChanged(..) => "avatar_changed",
             Event::TransferQueue { .. } => "transfer_queue",
             Event::Chat { .. } => "chat",
@@ -1018,6 +1049,30 @@ impl Outbox {
         Some(held.fold((0, 0), |(mine, all), (theirs, n)| {
             (mine + if theirs { n } else { 0 }, all + n)
         }))
+    }
+
+    /// Every row with devices held for a session that may no longer see
+    /// them becomes the row alone, keeping its seq: all but its own
+    /// person's, `own`, which it still sees.
+    pub(crate) fn lose_devices(&mut self, own: Uid) {
+        let Sink::Buffering { buf, share, .. } = &mut self.sink else {
+            return;
+        };
+        for se in buf.iter_mut() {
+            let Event::PersonRow { joined, user, .. } = &se.event else {
+                continue;
+            };
+            if user.uid == own {
+                continue;
+            }
+            let row = if *joined {
+                Event::Joined(user.clone())
+            } else {
+                Event::Changed(user.clone())
+            };
+            share.give(se.event.weight().saturating_sub(row.weight()));
+            se.event = row;
+        }
     }
 
     /// Every sealed message held for a session that can no longer open
@@ -1217,6 +1272,9 @@ pub(crate) struct UserSession {
     pub(crate) search_tokens: f64,
     /// Where the session is between its login and the roster.
     pub(crate) announced: Announced,
+    /// Whether it has been sent the user list ([`Core::roster_for`]), so
+    /// a change to what it may see of it makes that list stale.
+    pub(crate) told_roster: bool,
     /// One of a person's sessions sharing its row (`crate::coalesce`).
     pub(crate) grouped: bool,
     /// The nick, icon and color this session last sent of itself: one it
@@ -1235,6 +1293,15 @@ pub(crate) struct UserSession {
     pub(crate) messaging: Option<crate::messaging::SessionState>,
     /// For a guest, who it asked and who let it in.
     pub(crate) guest: crate::messaging::GuestRequests,
+    /// What a device entry calls it: random, so it says nothing of how
+    /// many logins came before it, unique among live sessions, and kept
+    /// by a resume or a takeover, which reattach this session.
+    pub(crate) device: u64,
+    /// When it logged in, as unix seconds, for its device entry.
+    pub(crate) since: u64,
+    /// What its client calls it, a hint and nothing more
+    /// (`crate::coalesce::device_label`).
+    pub(crate) label: Option<String>,
 }
 
 impl UserSession {
@@ -1599,14 +1666,31 @@ impl RosterInner {
         match self.changed_event(uid) {
             Some(ev) => self.tell_row(ev),
             // A change to this device alone, its signs say, that leaves
-            // the row others see as it was: told to the device itself.
+            // the row others see as it was: told to the device itself,
+            // where it reads its own in the devices under its row
+            // instead.
             None => {
-                if let Some(own) = self.own_row(uid) {
+                let persons = self.users[&uid].info.transport.persons;
+                if let Some(own) = self.own_row(uid).filter(|_| !persons) {
                     self.send_to(uid, Event::Changed(own));
                 }
             }
         }
+        self.tell_devices(self.row_uid(uid));
         self.export_changed(uid);
+    }
+
+    /// A device id no live session has: below 2^53, so a JSON reader
+    /// that keeps numbers as doubles reads it exactly.
+    fn new_device(&self) -> u64 {
+        loop {
+            let mut raw = [0u8; 8];
+            getrandom::getrandom(&mut raw).expect("the OS CSPRNG");
+            let id = u64::from_le_bytes(raw) & ((1 << 53) - 1);
+            if id != 0 && !self.users.values().any(|s| s.device == id) {
+                return id;
+            }
+        }
     }
 
     pub(crate) fn next_uid(&mut self) -> Option<Uid> {
@@ -1803,6 +1887,7 @@ impl RosterInner {
                 if let Some(ev) = changed {
                     self.tell_row(*ev);
                 }
+                self.tell_devices(row);
                 self.export_changed(row);
             }
         }
@@ -2586,6 +2671,7 @@ impl Core {
         let uid = r.next_uid()?;
         r.last_serial += 1;
         let serial = r.last_serial;
+        let device = r.new_device();
         let (tx, conn, rx) = Events::channel(&self.queue_budget);
         let roles = info
             .account
@@ -2650,6 +2736,7 @@ impl Core {
                 search_refill: Instant::now(),
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 announced: Announced::Pending,
+                told_roster: false,
                 grouped: false,
                 sent: crate::coalesce::Sent {
                     nick: sent_nick,
@@ -2662,6 +2749,9 @@ impl Core {
                 mask: Default::default(),
                 messaging: None,
                 guest: Default::default(),
+                device,
+                since: self.clock.unix(),
+                label: None,
             },
         );
         Some((uid, rx))
@@ -2693,12 +2783,11 @@ impl Core {
                         if let Some(ev) = changed {
                             r.tell_row(*ev);
                         }
+                        let row = r.row_uid(uid);
+                        r.tell_devices(row);
                         chats = crate::Core::persons_chats(&r, uid);
                     }
-                    _ => {
-                        let ev = Event::Joined(r.row_view(&r.users[&uid]));
-                        r.broadcast(&ev, Some(uid));
-                    }
+                    _ => r.tell_joined(uid),
                 }
                 r.export_shown(uid);
             }
@@ -2837,6 +2926,8 @@ impl Core {
         if let Some(ev) = r.changed_event(uid) {
             r.tell_row(ev);
         }
+        let row = r.row_uid(uid);
+        r.tell_devices(row);
         true
     }
 

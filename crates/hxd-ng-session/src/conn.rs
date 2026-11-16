@@ -31,12 +31,12 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     b64url, blocked_json, event_json, history_line_json, parse_streams, participants_json,
-    reply_err, reply_err_account, reply_err_banned, reply_err_retry, reply_ok, reply_ok_with_users,
-    stored_msg_json, user_json, video_limits_json, video_reply_err, voice_reply_err, BlockParams,
-    ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams, MsgReadParams, NickParams,
-    ReqEnvelope, ResumeParams, Signs, SignsParams, VideoStartParams, VideoStateParams,
-    VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams, VoiceMuteParams,
-    VoiceRoomParams,
+    reply_err, reply_err_account, reply_err_banned, reply_err_retry, reply_ok,
+    reply_ok_with_roster, stored_msg_json, user_json, video_limits_json, video_reply_err,
+    voice_reply_err, BlockParams, ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams,
+    MsgReadParams, NickParams, ReqEnvelope, ResumeParams, Signs, SignsParams, VideoStartParams,
+    VideoStateParams, VideoStopParams, VideoSubscribeParams, VoiceAnswerParams, VoiceIceParams,
+    VoiceMuteParams, VoiceRoomParams,
 };
 use crate::NgCtx;
 
@@ -860,6 +860,8 @@ async fn handle_login(
             replies: p.replies && !crate::replies::targets(ctx).is_empty(),
             reactions: p.reactions && !crate::reactions::targets(ctx).is_empty(),
             emoji: p.emoji && ctx.core.emoji_policy().is_some(),
+            ng: true,
+            persons: p.persons && ctx.core.groups_persons(),
         },
         has_inbox: account.has_inbox,
         is_person: account.is_person(),
@@ -894,6 +896,12 @@ async fn handle_login(
     let replies = attach.transport.replies;
     let reactions = attach.transport.reactions;
     let emoji = attach.transport.emoji;
+    let persons = attach.transport.persons;
+    let label = p
+        .device_label
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let attached = if revoked {
         None
     } else {
@@ -930,6 +938,10 @@ async fn handle_login(
         .await;
         return None;
     }
+    // Before it is announced, so its first device entry carries it.
+    if let Some(label) = &label {
+        ctx.core.label_device(uid, label);
+    }
     // ng has no agreement dance: announce immediately (the snapshot below
     // then includes self), with the owner's avatar already on it.
     if ctx.core.avatar_policy().is_some() {
@@ -948,7 +960,7 @@ async fn handle_login(
         return None;
     };
 
-    let Some(me) = ctx.core.user(uid) else {
+    let Some(me) = ctx.core.self_view(uid) else {
         ctx.core.end_session(uid);
         ctx.registry.remove(&session_id);
         let _ = send_frame(
@@ -963,7 +975,7 @@ async fn handle_login(
     // the domain's own records and made JSON only at the end: a login
     // storm holding a JSON tree of every user for each login waiting on
     // the blocking pool below held gigabytes.
-    let users = ctx.core.roster_rows();
+    let (users, devices) = ctx.core.roster_for(uid);
     let detach = if account.can_detach {
         json!({ "grace": ctx.cfg.grace.as_secs() })
     } else {
@@ -976,7 +988,7 @@ async fn handle_login(
     if let Some(agreement) = &ctx.cfg.agreement {
         server["agreement"] = json!(agreement);
     }
-    let mut me_json = user_json(&me);
+    let mut me_json = self_json(&me);
     // A fact about this session, not a bitmap position: the client shows
     // the moderation controls (docs/moderation.md §2).
     if account.moderate {
@@ -1088,6 +1100,9 @@ async fn handle_login(
     }
     if emoji {
         caps.push("emoji".into());
+    }
+    if persons {
+        caps.push("persons".into());
     }
     let mut ok = json!({
         "session": session_id,
@@ -1214,8 +1229,8 @@ async fn handle_login(
     if let Some(block) = emoji.then(|| crate::emoji::login_json(&ctx.core)).flatten() {
         ok["emoji"] = block;
     }
-    let reply = reply_ok_with_users(req.id, ok, &users);
-    drop(users);
+    let reply = reply_ok_with_roster(req.id, ok, &users, &devices);
+    drop((users, devices));
     drop(permit);
     if !send_frame(ws_tx, Message::Text(reply)).await {
         // The client never learned it was logged in; a ghost session with
@@ -1373,11 +1388,11 @@ async fn handle_resume(
     };
     match replay {
         Some(replay) => {
-            let Some(me) = ctx.core.user(uid) else {
+            let Some(me) = ctx.core.self_view(uid) else {
                 lost(ctx);
                 return None;
             };
-            let mut ok = json!({ "replay": replay.len(), "self": user_json(&me) });
+            let mut ok = json!({ "replay": replay.len(), "self": self_json(&me) });
             if let Some(signs) = signs {
                 ok["signs"] = json!(signs.as_str());
             }
@@ -1707,7 +1722,8 @@ async fn handle_sync(
     if let Some(messaging) = messaging {
         ok["messaging"] = messaging;
     }
-    let out = reply_ok_with_users(req.id, ok, &ctx.core.roster_rows());
+    let (users, devices) = ctx.core.roster_for(state.uid);
+    let out = reply_ok_with_roster(req.id, ok, &users, &devices);
     if !send_frame(ws_tx, Message::Text(out)).await {
         return Flow::Dead;
     }
@@ -2863,6 +2879,23 @@ impl TruncateToCharBoundary for String {
             self.truncate(end);
         }
     }
+}
+
+/// A session's own `user` object: the row it is shown under, its device
+/// id where it declared `persons`, and the devices it may see under its
+/// person's row.
+fn self_json(me: &hxd_core::coalesce::SelfView) -> Value {
+    let mut v = user_json(&me.info);
+    if let Some(device) = me.device {
+        v["device"] = json!(device);
+    }
+    if let Some(devices) = &me.devices {
+        v["devices"] = json!(devices
+            .iter()
+            .map(crate::proto::device_json)
+            .collect::<Vec<_>>());
+    }
+    v
 }
 
 #[cfg(test)]
