@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::tests::{session, ALICE};
+use super::{session, ALICE};
 use crate::roster::{drain, AttachInfo, Core, Event, Events, IdentityTag, Transport, Uid};
 use crate::server_link::{
     GhostBan, GhostInfo, GoneReason, LinkForm, LocalUser, PeerEvent, PeerRefusal, PeerRouter,

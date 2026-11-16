@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::tests::{session, ALICE};
+use super::{session, ALICE};
 use crate::roster::{drain, Core, Event, Events, Transport, Uid};
 use crate::video::{VideoConfig, VideoKind, VideoPublication, VideoStream};
 use crate::voice::fake::{MediaCall, RecordingMedia};
