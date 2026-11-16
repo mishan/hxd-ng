@@ -2,6 +2,9 @@
 //! encoding. The normative description is `docs/hotline-ng.md` §5–§7; this
 //! module is its executable form.
 
+use std::collections::HashMap;
+
+use hxd_core::coalesce::Device;
 use hxd_core::media::MediaRef;
 use hxd_core::server_link::RemoteTransport;
 use hxd_core::video::{
@@ -53,6 +56,14 @@ pub struct LoginParams {
     /// Whether it knows the server's own emoji (`docs/server-emoji.md`).
     #[serde(default)]
     pub emoji: bool,
+    /// Whether it may be shown the devices under a person's row.
+    #[serde(default)]
+    pub persons: bool,
+    /// What it calls this device: a hint, kept only if it is a string a
+    /// label may be (`hxd_core::coalesce::device_label`), and dropped
+    /// otherwise rather than refusing the login.
+    #[serde(default)]
+    pub device_label: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,7 +549,18 @@ pub fn reply_ok(id: u64, ok: Value) -> String {
 
 /// [`reply_ok`] for a reply that carries the roster as `users`, written
 /// from the domain's records rather than built as a tree first.
-pub fn reply_ok_with_users(id: u64, mut ok: Value, users: &[UserInfo]) -> String {
+pub fn reply_ok_with_users(id: u64, ok: Value, users: &[UserInfo]) -> String {
+    reply_ok_with_roster(id, ok, users, &HashMap::new())
+}
+
+/// [`reply_ok_with_users`], each person's row the viewer may see the
+/// devices under carrying them.
+pub fn reply_ok_with_roster(
+    id: u64,
+    mut ok: Value,
+    users: &[UserInfo],
+    devices: &HashMap<hxd_core::Uid, Vec<Device>>,
+) -> String {
     // `users` is this function's to write: one in `ok` would be written
     // twice, and a reply that is not an object has nowhere to put it.
     assert!(ok.is_object(), "a reply carrying the roster is an object");
@@ -549,7 +571,7 @@ pub fn reply_ok_with_users(id: u64, mut ok: Value, users: &[UserInfo]) -> String
     struct Ok<'a> {
         #[serde(flatten)]
         rest: Value,
-        users: Vec<UserOut<'a>>,
+        users: Vec<RowOut<'a>>,
     }
     #[derive(serde::Serialize)]
     struct Reply<'a> {
@@ -560,7 +582,10 @@ pub fn reply_ok_with_users(id: u64, mut ok: Value, users: &[UserInfo]) -> String
         reply: id,
         ok: Ok {
             rest: ok,
-            users: users.iter().map(UserOut).collect(),
+            users: users
+                .iter()
+                .map(|u| RowOut(u, devices.get(&u.uid).map(Vec::as_slice)))
+                .collect(),
         },
     })
     .expect("these types always serialize")
@@ -623,6 +648,51 @@ pub fn user_json(u: &UserInfo) -> Value {
     serde_json::to_value(UserOut(u)).unwrap_or(Value::Null)
 }
 
+/// A device entry (`hxd_core::coalesce::Device`): the server's facts,
+/// then the client's label, and `identity` only where there is something
+/// true to say in it.
+pub fn device_json(d: &Device) -> Value {
+    let mut v = json!({
+        "device": d.device,
+        "wire": if d.ng { "ng" } else { "classic" },
+        "proved": d.proved,
+        "transport": if d.encrypted { "encrypted" } else { "cleartext" },
+        "status": status_str(d.status),
+        "since": d.since,
+    });
+    if let Some(label) = &d.label {
+        v["label"] = json!(label);
+    }
+    if d.sealed || d.signs {
+        let mut identity = json!({});
+        if d.sealed {
+            identity["sealed"] = json!(true);
+        }
+        if d.signs {
+            identity["signs"] = json!(true);
+        }
+        v["identity"] = identity;
+    }
+    v
+}
+
+/// A `user` object with the devices under it, for a viewer that may see
+/// them; with none, a [`UserOut`].
+pub struct RowOut<'a>(pub &'a UserInfo, pub Option<&'a [Device]>);
+
+impl serde::Serialize for RowOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        write_user(&mut m, self.0)?;
+        if let Some(devices) = self.1 {
+            let devices: Vec<Value> = devices.iter().map(device_json).collect();
+            m.serialize_entry("devices", &devices)?;
+        }
+        m.end()
+    }
+}
+
 /// A `user` object as it is written, without building it as a
 /// [`Value`] first. The roster in every login reply and every join goes
 /// through here: once per login for everyone present, and once per
@@ -632,75 +702,78 @@ pub struct UserOut<'a>(pub &'a UserInfo);
 impl serde::Serialize for UserOut<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let u = self.0;
         let mut m = s.serialize_map(None)?;
-        m.serialize_entry("uid", &u.uid)?;
-        m.serialize_entry("nick", &u.nick)?;
-        m.serialize_entry("icon", &u.icon)?;
-        m.serialize_entry("admin", &u.admin)?;
-        m.serialize_entry("status", status_str(u.status))?;
-        // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
-        // know about this session's link.
-        // A ghost's connection is another server's, which this one knows
-        // only as that server said, over a link trying the user transport
-        // draft.
-        let transport = if let Some(remote) = &u.remote {
-            match remote.transport {
-                Some(RemoteTransport::Encrypted) => "encrypted",
-                Some(RemoteTransport::Cleartext) => "cleartext",
-                Some(RemoteTransport::Weak) => "weak",
-                None => "unknown",
-            }
-        } else if u.transport.encrypted {
-            "encrypted"
-        } else {
-            "cleartext"
-        };
-        m.serialize_entry("transport", transport)?;
-        // Present only where it is true, so a roster row costs nothing for
-        // the 65,534 sessions that are people.
-        if u.system {
-            m.serialize_entry("system", &true)?;
+        write_user(&mut m, self.0)?;
+        m.end()
+    }
+}
+
+fn write_user<M: serde::ser::SerializeMap>(m: &mut M, u: &UserInfo) -> Result<(), M::Error> {
+    m.serialize_entry("uid", &u.uid)?;
+    m.serialize_entry("nick", &u.nick)?;
+    m.serialize_entry("icon", &u.icon)?;
+    m.serialize_entry("admin", &u.admin)?;
+    m.serialize_entry("status", status_str(u.status))?;
+    // `docs/hotline-ng-auth.md` §7.2, §8: what other users may
+    // know about this session's link.
+    // A ghost's connection is another server's, which this one knows
+    // only as that server said, over a link trying the user transport
+    // draft.
+    let transport = if let Some(remote) = &u.remote {
+        match remote.transport {
+            Some(RemoteTransport::Encrypted) => "encrypted",
+            Some(RemoteTransport::Cleartext) => "cleartext",
+            Some(RemoteTransport::Weak) => "weak",
+            None => "unknown",
         }
-        // Present only when there is one, like `identity`: a change that
-        // clears it is a `user_changed` without the key (`docs/avatars.md`).
-        if let Some(avatar) = &u.avatar {
-            m.serialize_entry("avatar", &crate::avatar::avatar_json(avatar))?;
-        }
-        if let Some(color) = u.color {
-            m.serialize_entry("color", &color)?;
-        }
-        if !u.roles.is_empty() {
-            m.serialize_entry("roles", &u.roles)?;
-        }
-        if let Some(r) = &u.remote {
-            m.serialize_entry("remote", &remote_json(r))?;
-            // As its home server says, over a link trying the user keys
-            // draft; nothing more of an identity is shown.
-            if let Some(fp) = r.fingerprint {
-                let mut identity =
-                    json!({ "fingerprint": hl_identity::Fingerprint(fp).to_string() });
-                if r.signs {
-                    identity["signs"] = json!(true);
-                }
-                m.serialize_entry("identity", &identity)?;
-            }
-        }
-        if let Some(id) = &u.transport.identity {
-            let mut identity = json!({
-                "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
-                "handle": id.handle,
-            });
-            if id.signs {
+    } else if u.transport.encrypted {
+        "encrypted"
+    } else {
+        "cleartext"
+    };
+    m.serialize_entry("transport", transport)?;
+    // Present only where it is true, so a roster row costs nothing for
+    // the 65,534 sessions that are people.
+    if u.system {
+        m.serialize_entry("system", &true)?;
+    }
+    // Present only when there is one, like `identity`: a change that
+    // clears it is a `user_changed` without the key (`docs/avatars.md`).
+    if let Some(avatar) = &u.avatar {
+        m.serialize_entry("avatar", &crate::avatar::avatar_json(avatar))?;
+    }
+    if let Some(color) = u.color {
+        m.serialize_entry("color", &color)?;
+    }
+    if !u.roles.is_empty() {
+        m.serialize_entry("roles", &u.roles)?;
+    }
+    if let Some(r) = &u.remote {
+        m.serialize_entry("remote", &remote_json(r))?;
+        // As its home server says, over a link trying the user keys
+        // draft; nothing more of an identity is shown.
+        if let Some(fp) = r.fingerprint {
+            let mut identity = json!({ "fingerprint": hl_identity::Fingerprint(fp).to_string() });
+            if r.signs {
                 identity["signs"] = json!(true);
-            }
-            if id.sealed.is_some() {
-                identity["sealed"] = json!(true);
             }
             m.serialize_entry("identity", &identity)?;
         }
-        m.end()
     }
+    if let Some(id) = &u.transport.identity {
+        let mut identity = json!({
+            "fingerprint": hl_identity::Fingerprint(id.fingerprint).to_string(),
+            "handle": id.handle,
+        });
+        if id.signs {
+            identity["signs"] = json!(true);
+        }
+        if id.sealed.is_some() {
+            identity["sealed"] = json!(true);
+        }
+        m.serialize_entry("identity", &identity)?;
+    }
+    Ok(())
 }
 
 /// Where a ghost is from (`docs/server-link.md` §5), with its home
@@ -787,6 +860,29 @@ pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
     };
     match &se.event {
         Event::Joined(u) => return out("user_joined", UserData { user: UserOut(u) }),
+        Event::PersonRow {
+            joined,
+            user,
+            devices,
+        } => {
+            #[derive(serde::Serialize)]
+            struct RowData<'a> {
+                user: RowOut<'a>,
+            }
+            let ev = if *joined {
+                "user_joined"
+            } else {
+                "user_changed"
+            };
+            return serde_json::to_string(&EventOut {
+                seq: se.seq,
+                ev,
+                data: RowData {
+                    user: RowOut(user, Some(devices)),
+                },
+            })
+            .expect("these types always serialize");
+        }
         // An avatar change is a change to the user object on this wire;
         // only the legacy one says it with a transaction of its own.
         Event::Changed(u) | Event::AvatarChanged(u) => {

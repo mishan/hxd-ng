@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::inbox::StoreError;
 use crate::media::{Canonical, MediaCodec, MediaReject, MediaType};
-use crate::roster::{Event, Uid, UserSession};
+use crate::roster::{Uid, UserSession};
 use crate::Core;
 
 /// SHA-256 of an avatar's canonical bytes. Content-addressed, so a given
@@ -361,8 +361,8 @@ impl Core {
         sess.info.avatar = avatar.as_ref().map(|a| a.meta.clone());
         sess.avatar = avatar;
         if sess.live() {
-            let ev = Event::AvatarChanged(sess.info.clone());
-            r.broadcast_where(&ev, None, |_| true);
+            let info = sess.info.clone();
+            r.tell_avatar(info);
         }
     }
 
@@ -561,7 +561,7 @@ impl Core {
         for uid in changed {
             let info = r.row_view(&r.users[&uid]);
             if told.insert(info.uid) {
-                r.broadcast_where(&Event::AvatarChanged(info), None, |_| true);
+                r.tell_avatar(info);
             }
         }
         Ok(())

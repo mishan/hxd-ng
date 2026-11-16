@@ -749,8 +749,12 @@ Three layers, all `cargo test --workspace`:
   row and the person's other devices invited by the server, a line from
   any device the row's on both wires, and one device leaving taking the
   person out with its other devices told by a line, a room the person
-  may no longer be in a removal line to each device and no part, and
-  with coalescing off each device a user and a member of its own;
+  may no longer be in a removal line to each device and no part, an ng
+  client that declared `persons` told its own devices coming and going
+  with their labels, and a viewer with the kick bit told them too, while
+  a stranger hears what a client without `persons` hears, a resume and a
+  sync carrying the devices and the device id kept, and with coalescing
+  off each device a user and a member of its own;
   `voice.rs` has a person in voice, and `link.rs` a person across a
   link), `slow_consumer.rs` (a room flooded while one
   client reads
