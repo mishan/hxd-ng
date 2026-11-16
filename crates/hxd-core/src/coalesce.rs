@@ -14,6 +14,9 @@ use unicode_normalization::UnicodeNormalization;
 use crate::access::bit;
 use crate::roster::{Event, RosterInner, SessionStatus, Uid, UserInfo, UserSession};
 
+mod acts;
+pub use acts::{DeviceKick, DeviceRefusal};
+
 /// One device under a person's row, as a viewer that may see it is shown
 /// it: the server's facts about it first, and the client's label, a hint
 /// that decides nothing, last.
@@ -32,6 +35,22 @@ pub struct Device {
     pub label: Option<String>,
     pub sealed: bool,
     pub signs: bool,
+    /// Its login and address, for a viewer with the kick bit alone: a
+    /// moderator sees each device as the classic user info shows one,
+    /// and a person's own devices see none of it about each other.
+    pub login: Option<String>,
+    pub addr: Option<std::net::IpAddr>,
+}
+
+impl Device {
+    /// As `viewer` is shown it.
+    fn shown_to(mut self, viewer: &UserSession) -> Device {
+        if !viewer.access.has(bit::DISCONNECT_USERS) {
+            self.login = None;
+            self.addr = None;
+        }
+        self
+    }
 }
 
 /// The longest label kept, in characters.
@@ -446,14 +465,23 @@ impl RosterInner {
     fn tell_seers(&mut self, row: Uid, user: UserInfo, seers: &[(Uid, bool)], joined: bool) {
         let all = self.devices_of(row);
         let password: Vec<Device> = all.iter().filter(|d| !d.proved).cloned().collect();
-        let (all_arc, password_arc): (Arc<[Device]>, Arc<[Device]>) =
-            (all.clone().into(), password.clone().into());
+        // Each of the four ways a seer may be shown them, made once.
+        let mut shown: HashMap<(bool, bool), Arc<[Device]>> = HashMap::new();
         for (uid, sees_all) in seers {
-            let devices = if *sees_all {
-                all_arc.clone()
-            } else {
-                password_arc.clone()
+            let Some(viewer) = self.users.get(uid) else {
+                continue;
             };
+            let details = viewer.access.has(bit::DISCONNECT_USERS);
+            let devices = shown
+                .entry((*sees_all, details))
+                .or_insert_with(|| {
+                    let from = if *sees_all { &all } else { &password };
+                    from.iter()
+                        .map(|d| d.clone().shown_to(viewer))
+                        .collect::<Vec<_>>()
+                        .into()
+                })
+                .clone();
             self.send_to(
                 *uid,
                 Event::PersonRow {
@@ -572,6 +600,8 @@ impl RosterInner {
                     label: s.label.clone(),
                     sealed: identity.is_some_and(|i| i.sealed.is_some()),
                     signs: identity.is_some_and(|i| i.signs),
+                    login: Some(s.login.clone()),
+                    addr: s.addr,
                 }
             })
             .collect()
@@ -579,12 +609,13 @@ impl RosterInner {
 
     /// The devices `viewer` is shown under `row`, if any.
     pub(crate) fn devices_for(&self, viewer: Uid, row: Uid) -> Option<Vec<Device>> {
-        let all = self.devices_seen(self.users.get(&viewer)?, row)?;
+        let viewer = self.users.get(&viewer)?;
+        let all = self.devices_seen(viewer, row)?;
         let mut devices = self.devices_of(row);
         if !all {
             devices.retain(|d| !d.proved);
         }
-        Some(devices)
+        Some(devices.into_iter().map(|d| d.shown_to(viewer)).collect())
     }
 
     /// `uid`'s own view of its row, a grouped session's: its person's,

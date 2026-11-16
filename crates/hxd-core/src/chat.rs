@@ -348,6 +348,14 @@ pub struct Flooded {
     told: Option<(Uid, String)>,
 }
 
+impl Flooded {
+    /// The session was already kicked or ended, and is on its way out
+    /// for that: this request is no flood of its own to answer as one.
+    pub fn already_out(&self) -> bool {
+        self.ban.is_none() && self.told.is_none()
+    }
+}
+
 /// The ban a spam kick places, chosen when the kick was made
 /// (`Core::spend_spam`).
 #[derive(Debug, PartialEq, Eq)]

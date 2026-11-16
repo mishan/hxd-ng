@@ -577,6 +577,10 @@ pub enum Event {
     },
     /// The recipient has been kicked; its transport should close.
     Kicked,
+    /// Another device of the recipient's person ended it, or it ended
+    /// itself (`Core::device_end`): its transport should close, and its
+    /// client must not take that for a takeover and log back in.
+    Ended,
     /// An administrator changed the account this session is logged in
     /// as (`Core::account_write`), or its mask changed
     /// (`Core::set_session_mask`): the account as the session now has
@@ -944,6 +948,7 @@ impl Event {
             Event::Sealed { .. } => "sealed",
             Event::Broadcast { .. } => "broadcast",
             Event::Kicked => "kicked",
+            Event::Ended => "ended",
             Event::AccountChanged(..) => "account_changed",
             Event::RolesChanged(..) => "roles_changed",
             Event::RosterStale => "roster_stale",

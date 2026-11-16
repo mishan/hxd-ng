@@ -102,6 +102,8 @@ pub struct Receiver {
     /// answered `resync_required`): the next event may jump ahead, once,
     /// until a `sync` accounts for it.
     pub gap_expected: bool,
+    /// The reason the server's close frame gave, once it has sent one.
+    pub closed_with: Option<String>,
 }
 
 impl Receiver {
@@ -186,7 +188,10 @@ impl Receiver {
                 .map_err(ws_error)?;
             let text = match msg {
                 Message::Text(t) => t,
-                Message::Close(_) => return Err(Error::Closed),
+                Message::Close(frame) => {
+                    self.closed_with = frame.map(|f| f.reason.to_string());
+                    return Err(Error::Closed);
+                }
                 _ => continue,
             };
             let v: Value = serde_json::from_str(&text)
@@ -289,6 +294,7 @@ impl Client {
                 last_seq: 0,
                 seq_faults: Vec::new(),
                 gap_expected: false,
+                closed_with: None,
             },
             session: None,
             uid: None,

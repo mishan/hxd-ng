@@ -660,6 +660,12 @@ pub fn device_json(d: &Device) -> Value {
         "status": status_str(d.status),
         "since": d.since,
     });
+    if let Some(login) = &d.login {
+        v["login"] = json!(login);
+    }
+    if let Some(addr) = d.addr {
+        v["addr"] = json!(addr.to_string());
+    }
     if let Some(label) = &d.label {
         v["label"] = json!(label);
     }
@@ -1038,6 +1044,7 @@ pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
             json!({ "from": { "uid": from, "nick": from_nick }, "text": text }),
         ),
         Event::Kicked => ("kicked", json!({})),
+        Event::Ended => ("ended", json!({})),
         Event::AccountChanged(account) => {
             let mut data = crate::accounts::access_json(account.access);
             // Not bits, so the bitmap cannot say they were lost; as the

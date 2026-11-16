@@ -453,3 +453,37 @@ fn the_media_layers_word_about_a_person_reaches_the_device_in_voice_and_only_its
         }
     }
 }
+
+#[test]
+fn the_device_in_voice_ended_or_kicked_takes_its_person_out_of_voice() {
+    for kick in [false, true] {
+        let (core, media) = voiced(true);
+        let (a1, _rx1) = device(&core);
+        let (a2, mut rx2) = device(&core);
+        let (b, mut rx_b) = bob(&core);
+        in_voice(&core, &media, b);
+        in_voice(&core, &media, a2);
+        drain(&mut rx_b);
+        drain(&mut rx2);
+        let device = core.roster.lock().unwrap().users[&a2].device;
+        if kick {
+            core.kick_device(a1, device).unwrap();
+        } else {
+            core.device_end(a1, device).unwrap();
+        }
+        let told = drain(&mut rx2);
+        assert!(
+            told.iter()
+                .any(|e| matches!(e, Event::Kicked | Event::Ended)),
+            "kick {kick}: {told:?}"
+        );
+        // Its connection ends it, having told it.
+        core.end_session(a2);
+        assert_eq!(
+            statuses(&drain(&mut rx_b)),
+            [vec![(b, false, false)]],
+            "kick {kick}"
+        );
+        assert_eq!(core.voice_room_of(a1), None, "kick {kick}");
+    }
+}
