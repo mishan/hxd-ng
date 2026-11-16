@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use super::tests::{session, ALICE};
+use super::{session, ALICE};
 use crate::history::{HistoryPolicy, LineId, MemoryLog};
 use crate::rooms::{MemoryRooms, RoomEdit, RoomPolicy};
 use crate::roster::{drain, Core, Event, Events, Transport, Uid};
