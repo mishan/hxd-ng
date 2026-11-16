@@ -134,6 +134,9 @@ struct ExtraTable {
     /// May this account manage rooms (`docs/chat-rooms.md` §5)? Default:
     /// false, even for an administrator.
     manage_rooms: Option<bool>,
+    /// Are this account's sessions one person's, grouped as one row
+    /// without a linked identity to say so? Default: false.
+    personal: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,7 +166,9 @@ impl AccountFile {
             .as_deref()
             .and_then(hl_identity::Fingerprint::parse)
             .map(|fp| fp.0);
-        let config = self.configure(roles);
+        let mut config = self.configure(roles);
+        // A shared password must never merge strangers into one row.
+        config.personal &= !is_reserved_login(&login);
         let identity = IdentityLink {
             fingerprint,
             // Derived true on an account with no password, whatever
@@ -245,7 +250,18 @@ impl AccountFile {
                 .filter(|r| r.name != EVERYONE)
                 .map(|r| r.name.clone())
                 .collect(),
+            personal: self.extra.personal == Some(true),
         }
+    }
+
+    /// Does this file say `personal` where it cannot apply: on the guest,
+    /// whose password, if it has one, is shared, or on an account that is
+    /// not one person at all?
+    fn personal_ignored(&self, login: &str) -> bool {
+        self.extra.personal == Some(true)
+            && (is_reserved_login(login)
+                || (self.password.as_deref().unwrap_or("").is_empty()
+                    && self.identity.fingerprint.is_none()))
     }
 
     /// Is this a combination an operator should be told about at
@@ -496,6 +512,14 @@ impl FileAuth {
                         let complaint = format!(
                             "{login}.toml: identity.fingerprint is not a valid fingerprint; \
                              identity login will ignore it"
+                        );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
+                    if f.personal_ignored(&login) {
+                        let complaint = format!(
+                            "{login}.toml: extra.personal is ignored on the guest account and on \
+                             one with neither a password nor an identity, which is not one person"
                         );
                         tracing::warn!("{complaint}");
                         found.push(complaint);
@@ -2749,6 +2773,7 @@ mod tests {
         let rows = [
             ("[role.r]\nextra = { can_detach = true }\n", "one person"),
             ("[role.r]\nextra = { inbox = true }\n", "one person"),
+            ("[role.r]\nextra = { personal = true }\n", "one person"),
             ("[role.r]\nextra = { flying = true }\n", "no [extra] key"),
             ("[role.Mods]\n", "lowercase"),
             ("[role.-mods]\n", "starting with"),
@@ -2768,6 +2793,36 @@ mod tests {
         for (text, said) in rows {
             let e = Roles::parse(text).unwrap_err();
             assert!(e.contains(said), "{text:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn personal_is_the_accounts_word_and_never_the_guests() {
+        let td = tempfile::tempdir().unwrap();
+        let p = "[extra]\npersonal = true\n";
+        write(td.path(), "carol.toml", &format!("password = \"pw\"\n{p}"));
+        write(td.path(), "guest.toml", &format!("password = \"pw\"\n{p}"));
+        write(td.path(), "door.toml", p);
+        let auth = FileAuth::new(td.path());
+        let personal = |login: &str| {
+            auth.authenticate(login, Proof::Plain(b"pw"))
+                .unwrap()
+                .config
+                .personal
+        };
+        assert!(personal("carol"));
+        assert!(
+            !personal("guest"),
+            "a shared password never merges strangers"
+        );
+        let said = auth.audit();
+        for (login, told) in [("carol", false), ("guest", true), ("door", true)] {
+            let ignored = format!("{login}.toml: extra.personal is ignored");
+            assert_eq!(
+                said.iter().any(|c| c.contains(&ignored)),
+                told,
+                "{login}: {said:?}"
+            );
         }
     }
 

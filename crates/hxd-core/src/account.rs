@@ -221,6 +221,11 @@ pub struct AccountConfig {
     /// `@role` asks (`docs/roles.md` §10). A name an account file lists
     /// with no role behind it grants nothing, and passes no gate either.
     pub roles: Vec<String>,
+    /// Does the account's own file say it is one person, its sessions one
+    /// row though no identity is linked to say so (`[extra] personal`)?
+    /// Not an `Extras` key: nothing derives it, and a mask or restriction
+    /// that seemed to deny it would deny nothing.
+    pub personal: bool,
 }
 
 /// What a session is denied whatever its account says: probation's and
