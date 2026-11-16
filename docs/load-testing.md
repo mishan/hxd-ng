@@ -141,6 +141,21 @@ server needs an `[inbox]` with `max_sent_per_day` at 0 and
 one account, and `[target] accounts` needs at least as many accounts
 as the storm has arrivals for every one of them to find its mail.
 
+With `devices` above one, an arrival is a person on that many devices:
+it logs in to its account once a device, each on a wire picked by
+weight and under one nick, each device after the last has its user
+list, and is timed until the last has it (`login.person`); then every
+device lingers and leaves. It needs `accounts = true`, more accounts
+than arrivals are on at once, and accounts linked to identities of
+their own (`hxd-load accounts --linked`), since a password login of an
+account linked to an identity is that person's. An ng watcher counts
+the joins it hears of each person: on a server that makes one row of a
+person's devices, set `grouped = true`, and each person must be heard
+to join once (`login.person_joins`), half the joins of the same storm
+on a server that shows every device, where `grouped = false` holds
+each to one join a device. `login-storm-persons.toml` is the two-device
+storm.
+
 ### Public chat (`chat`)
 
 `readers_*` and `talkers_*` on each wire, joined before the first line
@@ -245,6 +260,7 @@ storm stops, the readers read on for two batches and `settle`.
 | `reactions.converged` | Once the storm has passed, every client's last summary of each line is the line's reactions as `history` shows them, or for a classic reader as 712 answers them. |
 | `reactions.backlog_bounded` | A stalled client was owed at most one batch a batch window over the run, read back once the run is over: what waits for a reader that stops grows with time, never with the reaction rate. |
 | `reactions.stayed` | No reader lost its connection. |
+| `login.person_joins` | In a storm of persons, the watcher heard each person that logged in join once with `grouped`, or once a device without it. |
 
 ## 5. Its own tests
 

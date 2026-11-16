@@ -87,6 +87,10 @@ as AGENTS.md's "Releasing" describes it.
   `DATA_CHAT_REASON` beside its text, so a client tells a rate refusal
   (6) from a refused permission (2), a malformed id (12) or too many
   (13) without reading the text.
+- Metrics: `hxd_roster_rows` counts the rows the user list shows,
+  beside `hxd_sessions` (docs/metrics.md).
+- `hxd-load accounts --linked` links each account it writes to an
+  identity of its own (docs/load-testing.md).
 
 ### Fixed
 

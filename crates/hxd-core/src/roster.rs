@@ -2136,6 +2136,10 @@ pub struct Census {
     pub live: usize,
     pub live_bytes: usize,
     pub live_bytes_max: usize,
+    /// Rows the user list shows ([`Core::roster_rows`]): a person's
+    /// sessions are one row, and the server account and other servers'
+    /// visible users are a row each.
+    pub rows: usize,
 }
 
 /// How many logins the server works on at once, by default.
@@ -2995,9 +2999,11 @@ impl Core {
             chats: r.chats.len(),
             rooms: r.room_count(),
             ghosts: r.ghosts.len(),
+            rows: r.ghosts.values().filter(|g| g.visible).count(),
             ..Census::default()
         };
-        for sess in r.users.values() {
+        for (&uid, sess) in &r.users {
+            c.rows += usize::from(sess.live() && r.listed(uid, sess));
             if sess.info.system {
                 c.system += 1;
                 continue;

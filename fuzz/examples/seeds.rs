@@ -219,6 +219,19 @@ fn main() {
         all.extend(fields);
         im_replying.push(pack_frame(810, im_replying.len() as u32 + 2, 0, &all));
     }
+    // The fuzzed login's other device holds uid 1, the person's row: a
+    // connection of the same account joins it, and names it as its own.
+    let login_person = login_as(b"fuzz", b"fuzz", vec![0, 0x1f]);
+    let person = [
+        pack_frame(0x79, 2, 0, &[(0x66, b"fuzz".to_vec()), (0x68, vec![0, 1])]),
+        pack_frame(0x130, 3, 0, &[(0x66, b"other".to_vec())]),
+        pack_frame(0x130, 4, 0, &[(0x66, b"fuzz".to_vec())]),
+        pack_frame(0x12c, 5, 0, &[]),
+        pack_frame(0x12f, 6, 0, &[(0x67, vec![0, 1])]),
+        pack_frame(0x6c, 7, 0, &[(0x67, vec![0, 1]), (0x65, b"me".to_vec())]),
+        pack_frame(0x70, 8, 0, &[(0x67, vec![0, 1])]),
+        pack_frame(0x69, 9, 0, &[(0x65, b"both".to_vec())]),
+    ];
     for dir in ["corpus/frame", "corpus/session"] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -255,4 +268,10 @@ fn main() {
         session.extend_from_slice(r);
     }
     std::fs::write("corpus/session/im-replies", &session).unwrap();
+    let mut session = b"TRTPHOTL\x00\x01\x00\x02".to_vec();
+    session.extend_from_slice(&login_person);
+    for r in &person {
+        session.extend_from_slice(r);
+    }
+    std::fs::write("corpus/session/person", &session).unwrap();
 }

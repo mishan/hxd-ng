@@ -130,6 +130,7 @@ async fn a_login_storm_hears_the_mail_waiting_for_it_while_more_is_sent() {
         accounts.count,
         &accounts.password,
         Some("sender"),
+        false,
     )
     .unwrap();
     let mut s = scenario(&server, Kind::LoginStorm, 2.0);
@@ -169,6 +170,55 @@ async fn a_login_storm_hears_the_mail_waiting_for_it_while_more_is_sent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_storm_of_persons_is_heard_to_join_once_a_person_where_devices_are_one_row() {
+    // Grouped or not, every person is heard to join as often as the
+    // server makes rows of its devices.
+    for grouped in [true, false] {
+        let td = tempfile::tempdir().unwrap();
+        let server = start(td.path(), &format!("[server]\ncoalesce = {grouped}\n")).await;
+        // More accounts than arrivals, so no two arrivals share one.
+        let accounts = Accounts {
+            prefix: "person".into(),
+            count: 100,
+            password: "load-test".into(),
+        };
+        let dir = td.path().join("accounts");
+        hxd_load::accounts::write(
+            &dir,
+            &accounts.prefix,
+            accounts.count,
+            &accounts.password,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut s = scenario(&server, Kind::LoginStorm, 2.0);
+        s.target.accounts = Some(accounts);
+        s.login_storm.accounts = true;
+        s.login_storm.devices = 2;
+        s.login_storm.max_in_flight = 100;
+        s.login_storm.grouped = grouped;
+        s.login_storm.rate = 10.0;
+        s.login_storm.ramp_step = 0.0;
+        s.login_storm.linger = 0.5;
+        let report = hxd_load::run(s).await.unwrap();
+        assert_clean(&report);
+        let persons = &report.ops["login.person"];
+        assert!(
+            persons.count > 0 && persons.errors.is_empty(),
+            "grouped {grouped}: {}",
+            report.summary()
+        );
+        assert_eq!(
+            report.checks["login.person_joins"].held,
+            persons.count,
+            "grouped {grouped}: {}",
+            report.summary()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn churn_keeps_seqs_gapless_across_drops_resumes_and_kicks() {
     let td = tempfile::tempdir().unwrap();
     // Every churner detaches from one address, and the server must let
@@ -185,6 +235,7 @@ async fn churn_keeps_seqs_gapless_across_drops_resumes_and_kicks() {
         accounts.count,
         &accounts.password,
         Some("moderator"),
+        false,
     )
     .unwrap();
     let mut s = scenario(&server, Kind::Churn, 3.0);
@@ -280,6 +331,7 @@ async fn a_reaction_storm_is_told_a_batch_a_window_and_converges() {
         accounts.count,
         &accounts.password,
         None,
+        false,
     )
     .unwrap();
     let mut s = scenario(&server, Kind::Reactions, 3.0);
@@ -635,6 +687,7 @@ async fn churn_on_one_server_is_mirrored_on_the_other_and_freed_uids_stay_freed(
         accounts.count,
         &accounts.password,
         Some("moderator"),
+        false,
     )
     .unwrap();
     let mut s = scenario(&a, Kind::Churn, 3.0);
@@ -802,6 +855,7 @@ async fn kicks_and_bans_across_a_link_are_carried_out_and_cost_the_room_nothing(
             accounts.count,
             &accounts.password,
             Some("moderator"),
+            false,
         )
         .unwrap();
     }

@@ -112,6 +112,43 @@ impl Scenario {
                  [target] accounts, admin and senders"
                 .into());
         }
+        if self.run.scenario == Kind::LoginStorm
+            && self.login_storm.devices != 1
+            && !(self.login_storm.devices > 1
+                && self.login_storm.accounts
+                && self.login_storm.mail == 0
+                && self.login_storm.msg_rate == 0.0
+                && self.target.ng.is_some())
+        {
+            return Err(
+                "[login_storm] devices is at least 1, and more than 1 needs \
+                 accounts = true, no mail or msg_rate, and [target] ng for its watcher"
+                    .into(),
+            );
+        }
+        // An arrival holds its place in flight through its linger, so no
+        // more than this many are on at once, each on an account of its
+        // own while it is.
+        if self.run.scenario == Kind::LoginStorm
+            && self.login_storm.devices > 1
+            && self
+                .target
+                .accounts
+                .as_ref()
+                .is_none_or(|a| self.login_storm.max_in_flight > a.count)
+        {
+            return Err(
+                "[login_storm] devices above 1 needs max_in_flight no more than \
+                 [target] accounts' count, so no two arrivals share an account"
+                    .into(),
+            );
+        }
+        if self.run.scenario == Kind::LoginStorm
+            && self.login_storm.grouped
+            && self.login_storm.devices < 2
+        {
+            return Err("[login_storm] grouped needs devices above 1".into());
+        }
         if self.run.scenario == Kind::Churn
             && self.target.admin.is_some()
             && self.target.ng.is_none()
@@ -818,6 +855,15 @@ pub struct LoginStorm {
     pub msg_rate: f64,
     /// Ng sessions of `[target] admin` that send `mail` and `msg_rate`.
     pub senders: usize,
+    /// Connections each arrival makes to its account, one after another,
+    /// each on a wire of its own picked by weight: a person on several
+    /// devices. Needs `accounts`, with more of them than arrivals are on
+    /// at once, so no two arrivals share one.
+    pub devices: usize,
+    /// The server makes one row of a person's devices: an ng watcher
+    /// there must hear each arrival join once, not once a device
+    /// (`login.person_joins`).
+    pub grouped: bool,
 }
 
 impl Default for LoginStorm {
@@ -837,6 +883,8 @@ impl Default for LoginStorm {
             mail: 0,
             msg_rate: 0.0,
             senders: 4,
+            devices: 1,
+            grouped: false,
         }
     }
 }
@@ -949,7 +997,23 @@ mod tests {
             Scenario::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             seen += 1;
         }
-        assert_eq!(seen, 13);
+        assert_eq!(seen, 14);
+    }
+
+    #[test]
+    fn a_storm_of_persons_is_refused_what_would_share_an_account_or_group_one_device() {
+        let base = "[target]\nng = \"127.0.0.1:1\"\n\
+                    [target.accounts]\nprefix = \"p\"\ncount = 10\npassword = \"w\"\n\
+                    [run]\nscenario = \"login_storm\"\n[login_storm]\naccounts = true\nlegacy = 0\n";
+        for (extra, ok) in [
+            ("devices = 2\nmax_in_flight = 10\n", true),
+            ("devices = 2\nmax_in_flight = 11\n", false),
+            ("devices = 1\ngrouped = true\n", false),
+            ("devices = 2\nmax_in_flight = 10\ngrouped = true\n", true),
+        ] {
+            let parsed = Scenario::parse(&format!("{base}{extra}"));
+            assert_eq!(parsed.is_ok(), ok, "{extra}: {parsed:?}");
+        }
     }
 
     #[test]

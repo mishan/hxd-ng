@@ -218,6 +218,38 @@ async fn a_scrape_accounts_for_both_wires_and_for_their_leaving() {
 }
 
 #[tokio::test]
+async fn a_scrape_counts_a_persons_devices_as_sessions_and_as_one_row() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start_with(td.path(), "[server]\ncoalesce = true\n", "[metrics]").await;
+    // A password login of an account linked to an identity is that
+    // person's: `[7; 32]`, as an account file spells it.
+    std::fs::write(
+        td.path().join("accounts/alice.toml"),
+        "name = \"alice\"\npassword = \"pw\"\n[access]\nread_chat = true\n\
+         [identity]\nfingerprint = \"0w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3g\"\n",
+    )
+    .unwrap();
+    let mut devices = Vec::new();
+    for _ in 0..2 {
+        let mut c =
+            legacy::Client::login_at(server.legacy, &Login::account("alice", "alice", "pw"))
+                .await
+                .unwrap();
+        c.user_list().await.unwrap();
+        devices.push(c);
+    }
+    let mut guest = legacy::Client::login_at(server.legacy, &Login::guest("guest"))
+        .await
+        .unwrap();
+    guest.user_list().await.unwrap();
+    let text = scrape_until(&server, |t| {
+        value(t, "hxd_sessions{state=\"attached\"}") == Some(3.0)
+    })
+    .await;
+    assert_eq!(value(&text, "hxd_roster_rows"), Some(2.0), "{text}");
+}
+
+#[tokio::test]
 async fn an_address_the_section_does_not_allow_is_refused() {
     let td = tempfile::tempdir().unwrap();
     let server = start(td.path(), "[metrics]\nallow = [\"192.0.2.1\"]").await;

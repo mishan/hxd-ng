@@ -1,10 +1,12 @@
 //! `hxd-load run <scenario.toml> [--out report.json]` runs a scenario
 //! and exits non-zero if any check was violated.
 //!
-//! `hxd-load accounts <dir> --prefix P --count N --password W [--admin LOGIN]`
+//! `hxd-load accounts <dir> --prefix P --count N --password W [--admin LOGIN] [--linked]`
 //! writes the account files a churn run logs in to, into a server's
 //! accounts directory: `P0` up to `P<N-1>`, each allowed to chat and to
-//! detach, and optionally one account allowed to disconnect users.
+//! detach, and optionally one account allowed to disconnect users. With
+//! `--linked`, each is linked to an identity of its own, so a person's
+//! devices can be one row.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,7 +15,7 @@ use hxd_load::config::Scenario;
 
 const USAGE: &str = "usage:
   hxd-load run <scenario.toml> [--out <report.json>]
-  hxd-load accounts <dir> --prefix <p> --count <n> --password <w> [--admin <login>]";
+  hxd-load accounts <dir> --prefix <p> --count <n> --password <w> [--admin <login>] [--linked]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,7 +71,8 @@ fn accounts(args: &[String]) -> Result<ExitCode, String> {
         .parse()
         .map_err(|e| format!("--count: {e}"))?;
     let password = flag(args, "--password").ok_or(USAGE)?;
-    hxd_load::accounts::write(&dir, prefix, count, password, flag(args, "--admin"))?;
+    let linked = args.iter().any(|a| a == "--linked");
+    hxd_load::accounts::write(&dir, prefix, count, password, flag(args, "--admin"), linked)?;
     eprintln!("hxd-load: wrote {count} accounts to {}", dir.display());
     Ok(ExitCode::SUCCESS)
 }

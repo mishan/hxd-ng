@@ -1,0 +1,33 @@
+# S1 with each arrival a person on two devices of one account, mixed
+# across the wires. On a server that makes one row of a person's
+# devices, each person is heard to join once: half the joins of the
+# same storm where every device is a row of its own. The accounts need
+# identities of their own:
+#   hxd-load accounts <dir> --prefix person --count 2000 --password load-test --linked
+
+[target]
+legacy = "127.0.0.1:5500"
+ng = "127.0.0.1:5700"
+metrics = true
+
+[target.accounts]
+prefix = "person"
+count = 2000
+password = "load-test"
+
+[run]
+scenario = "login_storm"
+duration = 60
+
+[login_storm]
+rate = 25
+ramp_step = 25
+ramp_every = 10
+linger = 1.0
+legacy = 1
+ng = 1
+accounts = true
+devices = 2
+# No more on at once than there are accounts, so none is shared.
+max_in_flight = 2000
+grouped = true

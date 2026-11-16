@@ -764,7 +764,8 @@ Three layers, all `cargo test --workspace`:
   `metrics.rs` (`GET
   /metrics` from a config's `[metrics]`:
   a scrape that accounts for a client on each wire and for their
-  leaving, and the scrapes it refuses — built only with
+  leaving, a person's two devices counted as two sessions and one row,
+  and the scrapes it refuses — built only with
   `--features metrics`).
 - The scripted legacy client packs and parses with the same pinned
   `hxproto` revision GtkHx uses, so e2e doubles as wire-compat
@@ -788,7 +789,9 @@ Three layers, all `cargo test --workspace`:
 - **Fuzzing**, in `fuzz/`, a workspace of its own on nightly: `frame`
   (the classic framer and the field decoders) and `session` (a whole
   classic connection, hello to dispatch, against a core keeping a log
-  and its reactions). `cargo run --example seeds`
+  and its reactions, its account linked to an identity and another of
+  its devices already on, so the connection is one device of a person).
+  `cargo run --example seeds`
   there writes a corpus of real frames, then `cargo +nightly fuzz run
   <target>`.
 - **End-to-end, out of process**, in `e2e/` — `cd e2e && npm test`.
