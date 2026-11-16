@@ -3757,9 +3757,9 @@ async fn spend(f: &Frame, ctx: &ServerCtx, sess: &Session) -> bool {
     match ctx.core.spend_spam(sess.uid, points, f.ty) {
         Ok(()) => true,
         Err(flooded) => {
-            if let Some(ban) = flooded.ban {
-                off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
-            }
+            // Told once the lines already under way are heard, and
+            // banned: both block, so off the reactor.
+            off_reactor(&ctx.core, move |c| c.spam_kicked(flooded)).await;
             false
         }
     }
@@ -4945,13 +4945,17 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 cid,
                 line: (body, style, media, re, refs),
             }) => {
-                match ctx
-                    .core
-                    .chat_private(cid, sess.uid, body, style, media, re, &refs)
-                {
-                    Err(ChatError::ReplyScope) => warn!(uid = sess.uid, cid, "reply out of scope"),
-                    Err(e) => debug!(uid = sess.uid, cid, "private chat dropped: {e:?}"),
-                    Ok(()) => {}
+                // Off the reactor, as public chat is: a line that floods
+                // kicks, and a kick waits out the commits under way.
+                let uid = sess.uid;
+                let sent = off_reactor(&ctx.core, move |c| {
+                    c.chat_private(cid, uid, body, style, media, re, &refs)
+                })
+                .await;
+                match sent {
+                    Some(Err(ChatError::ReplyScope)) => warn!(uid, cid, "reply out of scope"),
+                    Some(Err(e)) => debug!(uid, cid, "private chat dropped: {e:?}"),
+                    Some(Ok(())) | None => {}
                 }
             }
             None => {}

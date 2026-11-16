@@ -1828,12 +1828,11 @@ async fn dispatch(
     let send = |s: String| Message::Text(s);
     if let Some((trans, points)) = spam_charge(&req.req) {
         if let Err(flooded) = ctx.core.spend_spam(state.uid, points, trans) {
-            // The kick is made; its ban is a store write, so it is placed
-            // off the reactor, and before the reply, so it stands by the
+            // The kick is made; it is told once the lines already under
+            // way are heard, and its ban is a store write, so both are off
+            // the reactor, and before the reply, so the ban stands by the
             // time the client can be back.
-            if let Some(ban) = flooded.ban {
-                off_reactor(&ctx.core, move |c| c.place_spam_ban(ban)).await;
-            }
+            off_reactor(&ctx.core, move |c| c.spam_kicked(flooded)).await;
             // The kick that follows is the session's end; this says why.
             let out = reply_err(req.id, "flooding", "You were kicked for flooding.");
             return finish(ws_tx, out).await;

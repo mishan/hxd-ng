@@ -2068,6 +2068,11 @@ pub struct Core {
     pub(crate) chat_commit: crate::chat::ChatCommit,
     /// The rooms file, and each room's commit queue (`crate::rooms`).
     pub(crate) room_state: crate::rooms::RoomState,
+    /// How many times a kick has waited on a commit under way
+    /// (`Core::wait_out`): what a test waits on before letting the commit
+    /// go, so a kick that does not wait cannot pass for one that does.
+    #[cfg(test)]
+    pub(crate) waiting_out: std::sync::atomic::AtomicUsize,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,
