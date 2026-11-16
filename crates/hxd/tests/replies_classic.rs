@@ -1000,7 +1000,7 @@ async fn a_700_refusal_carries_its_reason_to_bit_18_alone() {
             "a room",
             vec![channel(LOUNGE)],
             "No such channel.",
-            None,
+            Some(structured::NO_SUCH_TARGET),
             &readers,
         ),
     ] {

@@ -85,8 +85,8 @@ as AGENTS.md's "Releasing" describes it.
   page holding such a line "Server error.". A 700 refused for a
   session with the bit carries the Structured Chat family's
   `DATA_CHAT_REASON` beside its text, so a client tells a rate refusal
-  (6) from a refused permission (2), a malformed id (12) or too many
-  (13) without reading the text.
+  (6) from a refused permission (2), a channel it does not serve (1), a
+  malformed id (12) or too many (13) without reading the text.
 - Metrics: `hxd_roster_rows` counts the rows the user list shows,
   beside `hxd_sessions` (docs/metrics.md).
 - `hxd-load accounts --linked` links each account it writes to an

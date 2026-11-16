@@ -5022,8 +5022,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 }
             };
             if channel != Some(0) {
-                reply_error(tx, f.trans, "No such channel.");
-                return;
+                return refuse("No such channel.", Some(structured::NO_SUCH_TARGET));
             }
             // The capability and the log come from the same config, but
             // `ServerConfig` is public and nothing makes the two agree,
