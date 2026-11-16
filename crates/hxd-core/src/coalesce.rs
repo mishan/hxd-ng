@@ -102,16 +102,21 @@ fn rank(status: SessionStatus) -> u8 {
 
 impl RosterInner {
     /// Whether `sess` shares a row with its account's other sessions: a
-    /// person's own account, logged in to as the identity linked to it,
-    /// and not the system account or a messenger session. A mask does not
-    /// set a session apart: it is the person's (`Core::set_session_mask`).
+    /// person's own account, logged in to as the identity linked to it
+    /// or, where its file says `personal`, with no identity at all, and
+    /// not the system account or a messenger session. Comparing with the
+    /// account's link keeps a session under a key it does not link apart
+    /// (a guest's identity login, or a snapshot taken before a link
+    /// changed). A mask does not set a session apart: it is the person's
+    /// (`Core::set_session_mask`).
     fn coalesces(&self, sess: &UserSession) -> bool {
         self.persons.on
             && sess.is_person
             && !sess.system
             && !sess.info.transport.messenger_session
             && sess.account.as_ref().is_some_and(|a| {
-                a.identity.fingerprint.is_some() && a.identity.fingerprint == sess.identity
+                a.identity.fingerprint == sess.identity
+                    && (a.identity.fingerprint.is_some() || a.config.personal)
             })
     }
 
@@ -128,6 +133,10 @@ impl RosterInner {
         // A person is one identity: a session of the login under another
         // (its link changed while the first was on) stands apart.
         let identity = sess.identity;
+        // A personal account linked while its row is on: the row's password
+        // devices carry no identity and the joiner the new link, and both
+        // are the account's, since `coalesces` refused any other key.
+        let personal = sess.account.as_ref().is_some_and(|a| a.config.personal);
         let forming = self.persons.forming.get(&login).copied();
         let other_identity = forming
             .and_then(|row| self.persons.by_row.get(&row))
@@ -135,7 +144,10 @@ impl RosterInner {
                 p.members
                     .first()
                     .and_then(|m| self.users.get(m))
-                    .is_some_and(|front| front.identity != identity)
+                    .is_some_and(|front| {
+                        front.identity != identity
+                            && !(personal && (front.identity.is_none() || identity.is_none()))
+                    })
             });
         if other_identity {
             return Joined::Alone;
@@ -258,7 +270,8 @@ impl RosterInner {
             .all(|s| s.info.transport.identity.as_ref().is_some_and(|i| i.signs));
         // Sealed to by device, which the row is not.
         // The person's identity, from whichever device shows one: a
-        // password session of a linked account shows none of its own.
+        // password session of a linked account shows none of its own, and
+        // a personal account's row shows the identity linked since (§12 J).
         info.transport.identity = members
             .iter()
             .find_map(|s| s.info.transport.identity.clone())
@@ -722,6 +735,109 @@ pub(crate) mod tests {
             attach(&core, "alice", identity, linked);
             assert_eq!(rows(&core).len(), 2, "{what}");
         }
+    }
+
+    /// A session of `login` whose account file says `personal`, with a
+    /// password or not, linking `linked` and proved as `identity`.
+    fn personal(
+        core: &Core,
+        login: &str,
+        personal: Option<bool>,
+        password: bool,
+        identity: Option<[u8; 32]>,
+        linked: Option<[u8; 32]>,
+    ) -> Uid {
+        let mut info = session(login, identity, linked, Transport::default());
+        let account = info.account.as_mut().unwrap();
+        account.config.personal = personal == Some(true);
+        account.has_password = password;
+        info.is_person = account.is_person();
+        let (uid, _rx) = core.attach(info).unwrap();
+        core.announce(uid);
+        uid
+    }
+
+    #[test]
+    fn a_personal_accounts_sessions_are_one_row_without_an_identity_to_say_so() {
+        let other = [8; 32];
+        for (what, on, says, password, identity, linked, rows_) in [
+            (
+                "its password sessions",
+                true,
+                Some(true),
+                true,
+                None,
+                None,
+                1,
+            ),
+            ("not said", true, None, true, None, None, 2),
+            ("said false", true, Some(false), true, None, None, 2),
+            ("coalescing off", false, Some(true), true, None, None, 2),
+            // No password and no identity: a login anyone may walk
+            // through, whatever its file says.
+            (
+                "an account that is no one",
+                true,
+                Some(true),
+                false,
+                None,
+                None,
+                2,
+            ),
+            (
+                "an identity it links and a password",
+                true,
+                Some(true),
+                true,
+                Some(ALICE),
+                Some(ALICE),
+                1,
+            ),
+            // A key it does not link is somebody's, not the account's.
+            (
+                "a key it does not link",
+                true,
+                Some(true),
+                true,
+                Some(other),
+                None,
+                2,
+            ),
+        ] {
+            let core = Core::new().with_coalesce(on);
+            // A password session of a linked account carries its identity.
+            personal(&core, "carol", says, password, linked, linked);
+            personal(&core, "carol", says, password, identity, linked);
+            assert_eq!(rows(&core).len(), rows_, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_key_a_personal_account_does_not_link_stays_apart_however_often_proved() {
+        let core = Core::new().with_coalesce(true);
+        let other = Some([8; 32]);
+        personal(&core, "carol", Some(true), true, other, None);
+        personal(&core, "carol", Some(true), true, other, None);
+        assert_eq!(rows(&core).len(), 2);
+    }
+
+    #[test]
+    fn a_personal_account_linked_while_its_row_is_on_keeps_one_row() {
+        let core = Core::new().with_coalesce(true);
+        personal(&core, "carol", Some(true), true, None, None);
+        personal(&core, "carol", Some(true), true, None, None);
+        // Linked meanwhile: its password sessions carry the link (§12 J).
+        personal(&core, "carol", Some(true), true, Some(ALICE), Some(ALICE));
+        assert_eq!(rows(&core).len(), 1);
+    }
+
+    #[test]
+    fn a_device_joining_a_masked_personal_account_is_masked() {
+        let core = Core::new().with_coalesce(true);
+        let a1 = personal(&core, "carol", Some(true), true, None, None);
+        assert!(core.set_session_mask(a1, muted()));
+        let a2 = personal(&core, "carol", Some(true), true, None, None);
+        assert_eq!(core.mask_of(a2), muted());
     }
 
     #[test]

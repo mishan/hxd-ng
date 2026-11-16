@@ -70,6 +70,7 @@ async fn start_with(dir: &Path, coalesce: bool, limits: &str) -> Server {
         ("boss", "cant_be_disconnected = true\n", Some(8)),
         ("dave", "disconnect_users = true\n", Some(9)),
         ("keeper", "[extra]\nmanage_rooms = true\n", None),
+        ("carol", "[extra]\npersonal = true\n", None),
     ] {
         let identity = linked
             .map(|b| {
@@ -236,6 +237,19 @@ async fn three_devices_join_as_one_user_and_leave_as_one() {
         Vec::<u32>::new(),
         "one leaving, with the last"
     );
+}
+
+#[tokio::test]
+async fn a_personal_accounts_password_devices_are_one_user() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let mut bob = device(&server, "bob").await;
+    let _c1 = device(&server, "carol").await;
+    let row = joined(&mut bob, "carol").await;
+    let _c2 = device(&server, "carol").await;
+    assert_eq!(told_of(&mut bob, row).await, Vec::<u32>::new(), "one join");
+    let listed = bob.user_list().await.unwrap();
+    assert_eq!(listed.iter().filter(|u| u.nick == b"carol").count(), 1);
 }
 
 #[tokio::test]
