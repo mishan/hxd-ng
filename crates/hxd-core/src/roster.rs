@@ -1272,6 +1272,9 @@ pub(crate) struct UserSession {
     pub(crate) search_tokens: f64,
     /// Where the session is between its login and the roster.
     pub(crate) announced: Announced,
+    /// Whether it has been sent the user list ([`Core::roster_for`]), so
+    /// a change to what it may see of it makes that list stale.
+    pub(crate) told_roster: bool,
     /// One of a person's sessions sharing its row (`crate::coalesce`).
     pub(crate) grouped: bool,
     /// The nick, icon and color this session last sent of itself: one it
@@ -2733,6 +2736,7 @@ impl Core {
                 search_refill: Instant::now(),
                 search_tokens: f64::from(self.news_policy.search_per_minute),
                 announced: Announced::Pending,
+                told_roster: false,
                 grouped: false,
                 sent: crate::coalesce::Sent {
                     nick: sent_nick,

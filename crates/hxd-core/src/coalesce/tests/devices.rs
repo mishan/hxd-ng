@@ -37,9 +37,12 @@ fn proved(t: Transport) -> Transport {
     }
 }
 
+/// A session attached and announced, then sent its user list, as an ng
+/// login is.
 fn on(core: &Core, info: AttachInfo) -> (Uid, Events) {
     let (uid, rx) = core.attach(info).unwrap();
     core.announce(uid);
+    core.roster_for(uid);
     (uid, rx)
 }
 
@@ -360,6 +363,25 @@ fn gaining_or_losing_the_kick_bit_tells_a_persons_viewer_its_user_list_is_stale(
             "{case}: regained, the next change"
         );
     }
+}
+
+#[test]
+fn an_edit_of_the_kick_bit_before_a_session_is_announced_sends_it_no_stale_list() {
+    let core = Core::new().with_coalesce(true);
+    let mut info = session("mod", None, None, ng(true));
+    info.access = info.access.with(bit::DISCONNECT_USERS);
+    info.account = Some(Box::new(mod_account(true)));
+    let (m, mut rm) = core.attach(info).unwrap();
+    assert_eq!(core.apply_account(&mod_account(false)), 1);
+    let told = drain(&mut rm);
+    assert!(!told.contains(&Event::RosterStale), "{told:?}");
+    core.announce(m);
+    core.roster_for(m);
+    assert_eq!(core.apply_account(&mod_account(true)), 1);
+    assert!(
+        drain(&mut rm).contains(&Event::RosterStale),
+        "once it has its list"
+    );
 }
 
 #[test]

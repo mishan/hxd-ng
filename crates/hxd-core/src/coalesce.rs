@@ -719,7 +719,7 @@ impl RosterInner {
         };
         // The person's row is its first device's, which this mask
         // already shows; nor does a mask change a role color.
-        let _ = crate::admin::give_account_as(self, uid, &account, None, false);
+        let _ = crate::admin::give_account(self, uid, &account, None);
     }
 
     /// The budgets `uid` spends: its person's, or its own.
@@ -795,7 +795,10 @@ impl crate::roster::Core {
     /// The user list as `viewer` is shown it: the rows, and the devices
     /// under each person's row that it may see.
     pub fn roster_for(&self, viewer: Uid) -> (Vec<UserInfo>, HashMap<Uid, Vec<Device>>) {
-        let r = self.roster.lock().unwrap();
+        let mut r = self.roster.lock().unwrap();
+        if let Some(s) = r.users.get_mut(&viewer) {
+            s.told_roster = true;
+        }
         let rows = r.roster_rows_locked();
         let devices = rows
             .iter()

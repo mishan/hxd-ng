@@ -694,19 +694,6 @@ pub(crate) fn give_account(
     account: &Account,
     roles: Option<&[RoleView]>,
 ) -> Option<Row> {
-    give_account_as(r, uid, account, roles, true)
-}
-
-/// [`give_account`], telling a session whose kick bit it changes that
-/// its user list is stale only where `told_roster`: a device joining its
-/// person has not been sent one yet.
-pub(crate) fn give_account_as(
-    r: &mut RosterInner,
-    uid: Uid,
-    account: &Account,
-    roles: Option<&[RoleView]>,
-    told_roster: bool,
-) -> Option<Row> {
     let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
     let row = r.row_uid(uid);
     let s = r.users.get_mut(&uid)?;
@@ -736,9 +723,10 @@ pub(crate) fn give_account_as(
     }
     // The kick bit is what lets a session see the devices under other
     // people's rows (`crate::coalesce`): gained or lost, its user list is
-    // fetched again.
+    // fetched again, once it has one: a session not yet sent its list
+    // (pending, or a device joining its person) reads it as it now is.
     let kicks = s.access.has(bit::DISCONNECT_USERS);
-    let devices_seen = told_roster
+    let devices_seen = s.told_roster
         && s.info.transport.persons
         && kicks != effective.access.has(bit::DISCONNECT_USERS);
     // What it holds for a resume of other people's devices is no longer
