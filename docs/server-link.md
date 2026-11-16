@@ -897,7 +897,13 @@ without `DATA_LINK_USER_ID` is a server's own, answered only for a
 session seen to sign (a lobby line, or a private message over that
 link; `keys.rs`'s `Seen`, in the hub), with the certificate it signed
 with, and `NoDeviceKeys` for one exported and not seen to sign, as the
-draft has it; a user's is answered by the draft's step 5 (a current
+draft has it. A person whose devices share a row is answered the
+newest certificate one of its devices here signed with where the
+asker could have seen it, and never one whose device has gone or a
+person shown with no fingerprint; as the request names the row and no
+certificate, two devices signing at once may leave one's lines
+unverified until the asker asks again. A user's is answered by the
+draft's step 5 (a current
 ghost of the link asking about a user exported over it and not blocking
 it, which can
 open sealed messages, its certificate unexpired), spending a line of the

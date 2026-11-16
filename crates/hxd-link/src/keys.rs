@@ -260,36 +260,52 @@ impl Certs {
     }
 }
 
-/// A local session this server has seen sign: the certificate it signed
-/// with, and where its signatures went.
-struct SeenSession {
+/// A certificate a local user was seen to sign with, and where those
+/// signatures went.
+struct SeenCert {
     cert: Arc<[u8]>,
     /// It signed a lobby line, which every link carried.
     lobby: bool,
-    /// The links it sent signed private messages over.
+    /// The links it signed private messages over.
     links: HashSet<String>,
 }
 
-/// Sessions seen to sign, the only ones a server's own Link Device Keys
-/// is answered for (the draft's Fetching the Certificate).
+/// The certificates one row's devices are kept by: a person signs with
+/// a certificate a device, so so many at most, the oldest dropped first.
+const CERTS_PER_ROW: usize = 8;
+
+/// Users seen to sign, by the uid the links know them by, the only ones
+/// a server's own Link Device Keys is answered for (the draft's Fetching
+/// the Certificate). A person's devices sign under one row, each with its
+/// own certificate; a request names the row and no certificate, so it is
+/// answered with the newest one signed with where the asker could have
+/// seen it, and two devices signing at once may leave the other's lines
+/// waiting until the asker asks again.
 #[derive(Default)]
-pub(crate) struct Seen(HashMap<Uid, SeenSession>);
+pub(crate) struct Seen(HashMap<Uid, Vec<SeenCert>>);
 
 impl Seen {
     /// `uid` signed with `cert`: a lobby line for `over` = `None`, a
     /// private message sent over that link otherwise.
     pub(crate) fn saw(&mut self, uid: Uid, cert: Arc<[u8]>, over: Option<&str>) {
-        let s = self.0.entry(uid).or_insert_with(|| SeenSession {
-            cert: cert.clone(),
-            lobby: false,
-            links: HashSet::new(),
-        });
-        s.cert = cert;
+        let certs = self.0.entry(uid).or_default();
+        let mut seen = match certs.iter().position(|c| c.cert == cert) {
+            Some(i) => certs.remove(i),
+            None => SeenCert {
+                cert,
+                lobby: false,
+                links: HashSet::new(),
+            },
+        };
         match over {
-            None => s.lobby = true,
+            None => seen.lobby = true,
             Some(link) => {
-                s.links.insert(link.to_owned());
+                seen.links.insert(link.to_owned());
             }
+        }
+        certs.push(seen);
+        if certs.len() > CERTS_PER_ROW {
+            certs.remove(0);
         }
     }
 
@@ -297,19 +313,24 @@ impl Seen {
         self.0.remove(&uid);
     }
 
-    /// Only `uids`, the sessions still there: what the export feed would
+    /// Only `uids`, the users still there: what the export feed would
     /// have said of the rest is lost when it falls behind.
     pub(crate) fn keep(&mut self, uids: &HashSet<Uid>) {
         self.0.retain(|uid, _| uids.contains(uid));
     }
 
-    /// The certificate `uid` signed with, for a server's own request over
-    /// `link`.
-    pub(crate) fn cert_for(&self, uid: Uid, link: &str) -> Option<Arc<[u8]>> {
+    /// The certificates `uid` signed with where a server's own request
+    /// over `link` could have seen it, newest first: each answers only
+    /// for its own signatures.
+    pub(crate) fn certs_for(&self, uid: Uid, link: &str) -> Vec<Arc<[u8]>> {
         self.0
             .get(&uid)
-            .filter(|s| s.lobby || s.links.contains(link))
-            .map(|s| s.cert.clone())
+            .into_iter()
+            .flatten()
+            .rev()
+            .filter(|c| c.lobby || c.links.contains(link))
+            .map(|c| c.cert.clone())
+            .collect()
     }
 }
 
@@ -496,16 +517,37 @@ mod tests {
     fn a_servers_own_request_is_answered_only_where_the_session_signed() {
         let mut seen = Seen::default();
         let cert: Arc<[u8]> = b"cert".to_vec().into();
-        assert!(seen.cert_for(5, "bb").is_none(), "never signed");
+        assert!(seen.certs_for(5, "bb").is_empty(), "never signed");
         seen.saw(5, cert.clone(), Some("bb"));
-        assert!(seen.cert_for(5, "bb").is_some());
-        assert!(seen.cert_for(5, "cc").is_none(), "not over that link");
-        seen.saw(5, cert, None);
-        assert!(
-            seen.cert_for(5, "cc").is_some(),
+        assert_eq!(seen.certs_for(5, "bb"), vec![cert.clone()]);
+        assert!(seen.certs_for(5, "cc").is_empty(), "not over that link");
+        seen.saw(5, cert.clone(), None);
+        assert_eq!(
+            seen.certs_for(5, "cc"),
+            [cert],
             "a lobby line goes everywhere"
         );
         seen.gone(5);
-        assert!(seen.cert_for(5, "bb").is_none());
+        assert!(seen.certs_for(5, "bb").is_empty());
+    }
+
+    #[test]
+    fn each_certificate_under_a_row_answers_only_where_it_signed() {
+        let mut seen = Seen::default();
+        let (phone, laptop): (Arc<[u8]>, Arc<[u8]>) =
+            (b"phone".to_vec().into(), b"laptop".to_vec().into());
+        seen.saw(5, phone.clone(), None);
+        seen.saw(5, laptop.clone(), Some("bb"));
+        // The laptop signed only over bb: cc is answered the phone's.
+        assert_eq!(seen.certs_for(5, "cc"), vec![phone.clone()]);
+        assert_eq!(seen.certs_for(5, "bb"), [laptop, phone.clone()]);
+        // Signing again makes a certificate the newest.
+        seen.saw(5, phone.clone(), None);
+        assert_eq!(seen.certs_for(5, "bb")[0], phone);
+        for n in 0..CERTS_PER_ROW as u8 {
+            seen.saw(5, vec![n].into(), None);
+        }
+        assert_eq!(seen.certs_for(5, "bb").len(), CERTS_PER_ROW);
+        assert!(!seen.certs_for(5, "bb").contains(&phone), "the oldest went");
     }
 }

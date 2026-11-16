@@ -369,6 +369,55 @@ impl LocalUser {
     }
 }
 
+/// What the links know of a person, one user whichever devices it has
+/// (`crate::coalesce`): kept on the person, so a device that joins later
+/// is what the others already are.
+#[derive(Debug, Default)]
+pub(crate) struct PersonLink {
+    /// Linked servers that kicked the person, which must not show it.
+    excluded_at: Vec<[u8; 8]>,
+    /// The person as last exported, `None` until it is shown: a change
+    /// that leaves it as it was tells the links nothing.
+    exported: Option<LocalUser>,
+    /// The identity it was shown with, decided as it is shown and never
+    /// added later, as a session's is ([`LocalUser::of`]).
+    fingerprint: Option<[u8; 32]>,
+    /// A device of it left banned.
+    pub(crate) banned: bool,
+}
+
+impl LocalUser {
+    /// Person `row` as it may cross a link: its row as the roster shows
+    /// it, under the row's uid. Never sealed to: a person's sealed keys
+    /// are its devices', which no link can name yet.
+    fn of_row(r: &RosterInner, row: Uid) -> Option<LocalUser> {
+        let info = r.person_view(row)?;
+        let link = r.person_link(row)?;
+        let fingerprint = match &link.exported {
+            Some(_) => link.fingerprint,
+            None => {
+                let front = r.users.get(r.person_members(row)?.first()?)?;
+                LocalUser::of(front).fingerprint
+            }
+        };
+        let signs =
+            fingerprint.is_some() && info.transport.identity.as_ref().is_some_and(|i| i.signs);
+        Some(LocalUser {
+            uid: row,
+            nick: info.nick,
+            icon: info.icon,
+            away: info.status != SessionStatus::Active,
+            color: info.color,
+            exclude: link.excluded_at.clone(),
+            encrypted: (!info.transport.assumed || !info.transport.encrypted)
+                .then_some(info.transport.encrypted),
+            fingerprint,
+            signs,
+            sealed: false,
+        })
+    }
+}
+
 /// Why a local user stopped being exported (Link User Gone's reasons).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoneReason {
@@ -412,6 +461,32 @@ fn exported(sess: &UserSession) -> bool {
     sess.live() && !sess.system
 }
 
+/// The session a uid a link names stands for, if a link shows it: a
+/// person's row its first device, as a uid a client names
+/// (`RosterInner::named`), and never a device's own uid, which no link
+/// was shown.
+fn exported_named(r: &RosterInner, uid: Uid) -> Option<&UserSession> {
+    r.named(uid).filter(|s| exported(s))
+}
+
+/// The identity the links were told `uid`, a row a link names, proved:
+/// a person's as it was shown, a session's own as [`LocalUser::of`] says.
+fn shown_fingerprint(r: &RosterInner, uid: Uid) -> Option<[u8; 32]> {
+    match r.person_link(uid) {
+        Some(link) => link.fingerprint,
+        None => LocalUser::of(exported_named(r, uid)?).fingerprint,
+    }
+}
+
+/// Whether any session `row` stands for refuses ghost `ghost`'s messages:
+/// a block on one device is the person's.
+fn blocks_ghost(r: &RosterInner, row: Uid, ghost: (Uid, [u8; 16])) -> bool {
+    r.named_sessions(row)
+        .iter()
+        .filter_map(|m| r.users.get(m))
+        .any(|s| s.blocked_ghosts.contains(&ghost))
+}
+
 impl RosterInner {
     /// Tell the feed about a local user, under the roster lock, so the
     /// feed's order is the roster's. A feed that cannot keep up is closed:
@@ -428,6 +503,10 @@ impl RosterInner {
     }
 
     pub(crate) fn export_shown(&mut self, uid: Uid) {
+        if self.users.get(&uid).is_some_and(|s| s.grouped) {
+            self.export_row(self.row_uid(uid));
+            return;
+        }
         if let Some(user) = self
             .users
             .get(&uid)
@@ -438,7 +517,13 @@ impl RosterInner {
         }
     }
 
+    /// A change to `uid`, a session or a person's row, for the links.
     pub(crate) fn export_changed(&mut self, uid: Uid) {
+        let row = self.row_uid(uid);
+        if self.person_link(row).is_some() {
+            self.export_row(row);
+            return;
+        }
         if let Some(user) = self
             .users
             .get(&uid)
@@ -447,6 +532,39 @@ impl RosterInner {
         {
             self.export(PeerEvent::Changed(user));
         }
+    }
+
+    /// Person `row` to the links: shown the first time, then changed
+    /// only when what crosses is not as it was.
+    fn export_row(&mut self, row: Uid) {
+        // A person being kicked is told once, as it goes.
+        if self.row_ending(row) {
+            return;
+        }
+        let Some(user) = LocalUser::of_row(self, row) else {
+            return;
+        };
+        let link = self.person_link_mut(row).expect("of_row found it");
+        let event = match &link.exported {
+            None => {
+                link.fingerprint = user.fingerprint;
+                PeerEvent::Shown(user.clone())
+            }
+            Some(was) if *was == user => return,
+            Some(_) => PeerEvent::Changed(user.clone()),
+        };
+        link.exported = Some(user);
+        self.export(event);
+    }
+
+    /// Person `row`'s last device gone.
+    pub(crate) fn export_row_gone(&mut self, row: Uid, banned: bool) {
+        let why = if banned {
+            GoneReason::Banned
+        } else {
+            GoneReason::Disconnected
+        };
+        self.export(PeerEvent::Gone(row, why));
     }
 
     pub(crate) fn linked(&self) -> bool {
@@ -460,11 +578,24 @@ impl RosterInner {
         style: u16,
         signed: Option<LinkForm>,
     ) {
-        if self.users.get(&uid).is_some_and(exported) {
+        // A person's line is from its row, which may be named after a
+        // device that has left.
+        let from = self.row_uid(uid);
+        // A signed line never crosses without its signature, nor with one
+        // naming an identity the links were never told (§4.11): a person
+        // shown with none keeps it here.
+        if signed.is_some()
+            && self
+                .person_link(from)
+                .is_some_and(|l| l.fingerprint.is_none())
+        {
+            return;
+        }
+        if self.person_link(from).is_some() || self.users.get(&uid).is_some_and(exported) {
             self.feed.lines = self.feed.lines.wrapping_add(1);
             let line = self.feed.lines;
             self.export(PeerEvent::Chat {
-                from: uid,
+                from,
                 text: text.into(),
                 style,
                 line,
@@ -527,8 +658,11 @@ impl Core {
         let mut users: Vec<LocalUser> = r
             .users
             .values()
-            .filter(|s| exported(s))
-            .map(LocalUser::of)
+            .filter(|s| exported(s) && r.listed(s.info.uid, s))
+            .filter_map(|s| match s.grouped {
+                true => r.person_link(r.row_uid(s.info.uid))?.exported.clone(),
+                false => Some(LocalUser::of(s)),
+            })
             .collect();
         users.sort_by_key(|u| u.uid);
         (r.feed.seq, users)
@@ -686,9 +820,15 @@ impl Core {
             Some(PeerRefusal::NotExported)
         } else if media || text.len() > MAX_LINK_TEXT {
             Some(PeerRefusal::CannotCross)
+        } else if signed.is_some() && shown_fingerprint(&r, r.row_uid(from)).is_none() {
+            // Its signature would name an identity the links were never
+            // told.
+            Some(PeerRefusal::SenderUnkeyed)
         } else {
             None
         };
+        // A link knows a person by its row.
+        let from = r.row_uid(from);
         drop(r);
         Some(match (refused, self.peer_router.get()) {
             (Some(why), _) => answered(Err(why)),
@@ -727,6 +867,7 @@ impl Core {
             Some(s) if !exported(s) || refuses => Some(SealedError::NotSealed),
             _ => None,
         };
+        let from = r.row_uid(from);
         drop(r);
         Some(match (refused, self.peer_router.get()) {
             (Some(why), _) => Err(why),
@@ -758,6 +899,7 @@ impl Core {
                 .and_then(|b| b.spend(1, Instant::now()).err())
                 .map(SealedError::RateLimited),
         };
+        let asker = r.row_uid(asker);
         drop(r);
         Some(match (refused, self.peer_router.get()) {
             (Some(why), _) => Err(why),
@@ -776,22 +918,31 @@ impl Core {
         let now = self.clock.unix();
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
-        let target = r
-            .users
-            .get(&of)
-            .filter(|s| exported(s))
+        let front = exported_named(r, of)
+            .ok_or(PeerRefusal::UnknownUser)?
+            .info
+            .uid;
+        let key = r
+            .ghosts
+            .get(&asker)
+            .map(|g| g.key)
             .ok_or(PeerRefusal::UnknownUser)?;
-        let g = r.ghosts.get_mut(&asker).ok_or(PeerRefusal::UnknownUser)?;
+        let blocked = blocks_ghost(r, of, (asker, key));
+        let target = &r.users[&front];
+        let g = r.ghosts.get_mut(&asker).expect("got above");
         if !g.visible {
             return Err(PeerRefusal::Excluded);
         }
-        if target.blocked_ghosts.contains(&(asker, g.key)) {
+        if blocked {
             return Err(PeerRefusal::RefusesMessages);
         }
         if !g.flood.chat(1, &limits, Instant::now()) {
             return Err(PeerRefusal::RateLimited);
         }
+        // A person's sealed keys are its devices', which a link cannot
+        // name: nobody seals to it across one yet.
         crate::sealed::sealed_of(target)
+            .filter(|_| !target.grouped)
             .filter(|d| d.expires > now)
             .map(|d| d.cert.clone())
             .ok_or(PeerRefusal::NoDeviceKeys)
@@ -813,17 +964,28 @@ impl Core {
         let now = self.clock.unix();
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
-        let target = r
-            .users
-            .get(&to)
-            .filter(|s| exported(s))
+        let named = to;
+        let to = exported_named(r, named)
+            .ok_or(PeerRefusal::UnknownUser)?
+            .info
+            .uid;
+        let key = r
+            .ghosts
+            .get(&from)
+            .map(|g| g.key)
             .ok_or(PeerRefusal::UnknownUser)?;
-        let g = r.ghosts.get_mut(&from).ok_or(PeerRefusal::UnknownUser)?;
+        let blocked = blocks_ghost(r, named, (from, key));
+        let target = &r.users[&to];
+        let g = r.ghosts.get_mut(&from).expect("got above");
         if !g.visible {
             return Err(PeerRefusal::Excluded);
         }
-        if target.blocked_ghosts.contains(&(from, g.key)) {
+        if blocked {
             return Err(PeerRefusal::RefusesMessages);
+        }
+        // Not to a person, whose devices a link cannot name.
+        if target.grouped {
+            return Err(PeerRefusal::NoDeviceKeys);
         }
         // Who sealed it is what the recipient checks the box against.
         // Before the device's checks: fetching the certificate again,
@@ -864,10 +1026,26 @@ impl Core {
         Ok(())
     }
 
+    /// Whether `cert` is one a server's own Link Device Keys may answer
+    /// for `uid`, a row a link names: the identity it shows was said to
+    /// the links, and a device of it here now proved that certificate,
+    /// so one that left or was revoked is never answered for it.
+    pub fn answers_device_cert(&self, uid: Uid, cert: &[u8]) -> bool {
+        let r = self.roster.lock().unwrap();
+        shown_fingerprint(&r, uid).is_some()
+            && r.named_sessions(uid).iter().any(|m| {
+                r.users
+                    .get(m)
+                    .and_then(|s| s.info.transport.identity.as_ref())
+                    .and_then(|i| i.device_cert.as_deref())
+                    .is_some_and(|c| c.as_slice() == cert)
+            })
+    }
+
     /// Whether local user `uid` is one a link shows.
     pub fn is_exported(&self, uid: Uid) -> bool {
         let r = self.roster.lock().unwrap();
-        r.users.get(&uid).is_some_and(exported)
+        exported_named(&r, uid).is_some()
     }
 
     /// The identity a local user's messages are signed to
@@ -875,8 +1053,7 @@ impl Core {
     /// it.
     pub fn peer_identity(&self, uid: Uid) -> Option<[u8; 32]> {
         let r = self.roster.lock().unwrap();
-        let sess = r.users.get(&uid).filter(|s| exported(s))?;
-        sess.mailbox().fingerprint
+        exported_named(&r, uid)?.mailbox().fingerprint
     }
 
     /// Whether `key` is a linked server's discovery key, or one a ghost's
@@ -945,14 +1122,20 @@ impl Core {
         let limits = self.flood_limits;
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
-        let Some(recipient) = r.users.get(&to).filter(|s| exported(s)) else {
+        if exported_named(r, to).is_none() {
             return Err(PeerRefusal::UnknownUser);
-        };
-        let g = r.ghosts.get_mut(&from).ok_or(PeerRefusal::UnknownUser)?;
+        }
+        let key = r
+            .ghosts
+            .get(&from)
+            .map(|g| g.key)
+            .ok_or(PeerRefusal::UnknownUser)?;
+        let blocked = blocks_ghost(r, to, (from, key));
+        let g = r.ghosts.get_mut(&from).expect("got above");
         if !g.visible {
             return Err(PeerRefusal::Excluded);
         }
-        if recipient.blocked_ghosts.contains(&(from, g.key)) {
+        if blocked {
             return Err(PeerRefusal::RefusesMessages);
         }
         // A message spends a line of the ghost's chat allowance: local
@@ -960,26 +1143,28 @@ impl Core {
         if !g.flood.chat(1, &limits, Instant::now()) {
             return Err(PeerRefusal::RateLimited);
         }
-        let from_nick = g.info.nick.clone();
-        r.send_to(
-            to,
-            Event::Msg {
-                from,
-                from_nick,
-                from_login: None,
-                text,
-                cursor: None,
-                reference: None,
-                sent_at: SystemTime::now(),
-                queued: false,
-                media: None,
-                signed,
-                re: None,
-                emoji: None,
-                im: None,
-                reactions: None,
-            },
-        );
+        let msg = Event::Msg {
+            from,
+            from_nick: g.info.nick.clone(),
+            from_login: None,
+            text,
+            cursor: None,
+            reference: None,
+            sent_at: SystemTime::now(),
+            queued: false,
+            media: None,
+            signed,
+            re: None,
+            emoji: None,
+            im: None,
+            reactions: None,
+        };
+        // A person hears it on every device, as a local message to its
+        // row is heard.
+        let sessions = r.named_sessions(to);
+        for m in sessions {
+            r.send_to(m, msg.clone());
+        }
         Ok(())
     }
 
@@ -1013,12 +1198,15 @@ impl Core {
     /// an unprivileged client here may, never a login or an address.
     pub fn info_text_for_peer(&self, uid: Uid) -> Result<String, PeerRefusal> {
         let r = self.roster.lock().unwrap();
-        let sess = r
-            .users
-            .get(&uid)
-            .filter(|s| exported(s))
-            .ok_or(PeerRefusal::UnknownUser)?;
-        let secs = sess.connected_at.elapsed().as_secs();
+        let sess = exported_named(&r, uid).ok_or(PeerRefusal::UnknownUser)?;
+        // A person has been online since its device here longest came.
+        let secs = r
+            .named_sessions(uid)
+            .iter()
+            .filter_map(|m| r.users.get(m))
+            .map(|s| s.connected_at.elapsed().as_secs())
+            .max()
+            .unwrap_or_else(|| sess.connected_at.elapsed().as_secs());
         Ok(format!(
             "    name: {}\r    icon: {}\r  online: {}h {}m {}s\r",
             sess.info.nick,
@@ -1033,27 +1221,36 @@ impl Core {
     /// for the rest of its session, and stays here and everywhere else.
     pub fn peer_kick(&self, uid: Uid, by: &Requester) -> Result<(), PeerRefusal> {
         let mut r = self.roster.lock().unwrap();
-        let sess = r
-            .users
-            .get_mut(&uid)
-            .filter(|s| exported(s))
-            .ok_or(PeerRefusal::UnknownUser)?;
-        if !sess.excluded_at.contains(&by.id) {
-            sess.excluded_at.push(by.id);
+        let session = exported_named(&r, uid)
+            .ok_or(PeerRefusal::UnknownUser)?
+            .info
+            .uid;
+        // A person is hidden whole, and so is a device of it that comes
+        // later: the exclusion is the person's.
+        let excluded = if r.person_link(uid).is_some() {
+            &mut r.person_link_mut(uid).expect("got above").excluded_at
+        } else {
+            &mut r.users.get_mut(&session).expect("named above").excluded_at
+        };
+        if !excluded.contains(&by.id) {
+            excluded.push(by.id);
         }
         // So its users vanishing is not a mystery.
         let text = format!(
             "{} ({}) has removed you: its users no longer see you.",
             by.name, by.tag
         );
-        r.send_to(
-            uid,
-            Event::Broadcast {
-                from: 0,
-                from_nick: String::new(),
-                text,
-            },
-        );
+        let sessions = r.named_sessions(uid);
+        for m in sessions {
+            r.send_to(
+                m,
+                Event::Broadcast {
+                    from: 0,
+                    from_nick: String::new(),
+                    text: text.clone(),
+                },
+            );
+        }
         r.export_changed(uid);
         Ok(())
     }
@@ -1070,33 +1267,41 @@ impl Core {
         for_: Option<Duration>,
         reason: &str,
     ) -> Result<Option<[u8; 16]>, PeerRefusal> {
-        let (targets, serial) = {
+        // The kick's first step: a person's every device is on its way
+        // out from here, and says nothing more, as a moderator's kick of
+        // it is.
+        if !self.is_exported(uid) {
+            return Err(PeerRefusal::UnknownUser);
+        }
+        let begun = self
+            .kick_begin(uid, true)
+            .map_err(|_| PeerRefusal::UnknownUser)?;
+        let targets = begun.targets().to_vec();
+        {
             let mut r = self.roster.lock().unwrap();
-            let sess = r
-                .users
-                .get_mut(&uid)
-                .filter(|s| exported(s))
-                .ok_or(PeerRefusal::UnknownUser)?;
             // Before the ban, which may end the session itself.
-            sess.banned = true;
-            let serial = sess.serial;
-            let targets = self.kick_ban_targets(sess);
+            for (m, serial) in begun.members() {
+                if let Some(sess) = r.users.get_mut(m).filter(|s| s.serial == *serial) {
+                    sess.banned = true;
+                }
+            }
             // Told first, while there is a session to tell: the ban may end
             // it, and `Kicked` says nothing.
             let text = format!(
                 "You have been banned from the network by {} ({}).",
                 by.name, by.tag
             );
-            r.send_to(
-                uid,
-                Event::Broadcast {
-                    from: 0,
-                    from_nick: String::new(),
-                    text,
-                },
-            );
-            (targets, serial)
-        };
+            for (m, _) in begun.members() {
+                r.send_to(
+                    *m,
+                    Event::Broadcast {
+                        from: 0,
+                        from_nick: String::new(),
+                        text: text.clone(),
+                    },
+                );
+            }
+        }
         // The person, where there is one, so their every session ends and
         // nobody else's; the address only for a shared login such as
         // guest, as the extension asks a home server to judge.
@@ -1108,15 +1313,25 @@ impl Core {
             }
             _ => targets,
         };
-        let unmark = |core: &Core| {
+        // A ban not placed: a session alone stays, as no ban holds it,
+        // and a person, its kick begun, ends all the same.
+        let unmark = |core: &Core, begun: &crate::chat::KickBegun| {
             let mut r = core.roster.lock().unwrap();
-            if let Some(sess) = r.users.get_mut(&uid).filter(|s| s.serial == serial) {
-                sess.banned = false;
+            for (m, serial) in begun.members() {
+                if let Some(sess) = r.users.get_mut(m).filter(|s| s.serial == *serial) {
+                    sess.banned = false;
+                }
+            }
+        };
+        let unplaced = |core: &Core, begun: crate::chat::KickBegun| {
+            unmark(core, &begun);
+            if begun.person() {
+                core.kick_end(begun, None);
             }
         };
         let mut handle = [0u8; 16];
         if getrandom::getrandom(&mut handle).is_err() {
-            unmark(self);
+            unplaced(self, begun);
             return Err(PeerRefusal::Unreachable);
         }
         let reason = match reason.trim() {
@@ -1127,11 +1342,8 @@ impl Core {
         // A guest on an address nobody may ban: thrown off, but nothing
         // holds them, so the requester is told no ban was placed.
         let Some((first, rest)) = targets.split_first() else {
-            unmark(self);
-            let mut r = self.roster.lock().unwrap();
-            if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
-                let _ = crate::chat::kick_in(&mut r, uid);
-            }
+            unmark(self, &begun);
+            self.kick_end(begun, None);
             return Err(PeerRefusal::UnknownUser);
         };
         {
@@ -1147,7 +1359,7 @@ impl Core {
                 Ok(placed) => placed,
                 Err(e) => {
                     tracing::warn!(target = uid, "network ban not placed: {e:?}");
-                    unmark(self);
+                    unplaced(self, begun);
                     return Err(PeerRefusal::Unreachable);
                 }
             };
@@ -1168,12 +1380,9 @@ impl Core {
                 _ => false,
             };
         }
-        let mut r = self.roster.lock().unwrap();
-        // Ended already, by the ban, or gone; and its uid, if given out
-        // again, somebody else's.
-        if r.users.get(&uid).is_some_and(|s| s.serial == serial) {
-            let _ = crate::chat::kick_in(&mut r, uid);
-        }
+        // Each device still the one it was: a session that left is gone,
+        // and its uid, if given out again, somebody else's.
+        self.kick_end(begun, None);
         Ok(kept.then_some(handle))
     }
 

@@ -368,6 +368,23 @@ pub(crate) struct KickBegun {
     person: bool,
 }
 
+impl KickBegun {
+    /// What its ban would ban.
+    pub(crate) fn targets(&self) -> &[crate::ban::BanTarget] {
+        &self.targets
+    }
+
+    /// Every session it ends, with its serial.
+    pub(crate) fn members(&self) -> &[(Uid, u64)] {
+        &self.members
+    }
+
+    /// Whether it is a person's, whose every device it ends once begun.
+    pub(crate) fn person(&self) -> bool {
+        self.person
+    }
+}
+
 /// A kick made ([`Core::kick_by`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kicked {

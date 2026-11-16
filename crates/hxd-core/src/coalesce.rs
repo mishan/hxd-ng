@@ -23,6 +23,8 @@ pub(crate) struct Coalesced {
     ending: bool,
     /// Its chat lines and spam points, spent by every member.
     pub(crate) flood: crate::limits::Flood,
+    /// What the links know of it: one user, whichever devices it has.
+    link: crate::server_link::PersonLink,
 }
 
 /// The people on the roster, by row.
@@ -79,6 +81,8 @@ pub(crate) enum Left {
     /// The person's last: its row parts.
     Last {
         row: Uid,
+        /// Its leaving crosses the links as a ban.
+        banned: bool,
     },
     /// Others of the person live on: the row changes, if at all.
     Stays {
@@ -167,6 +171,7 @@ impl RosterInner {
                         told: info,
                         ending: false,
                         flood: Default::default(),
+                        link: Default::default(),
                     },
                 );
                 // As the roster is told it: the row, not the raw session.
@@ -192,12 +197,17 @@ impl RosterInner {
             return Left::Alone;
         };
         p.members.retain(|m| *m != uid);
+        // Its leaving crosses the links as a ban if any device's did.
+        p.link.banned |= sess.banned;
         if p.members.is_empty() {
             let p = self.persons.by_row.remove(&row).expect("got above");
             if self.persons.forming.get(&p.login) == Some(&row) {
                 self.persons.forming.remove(&p.login);
             }
-            return Left::Last { row };
+            return Left::Last {
+                row,
+                banned: p.link.banned,
+            };
         }
         Left::Stays {
             row,
@@ -233,7 +243,7 @@ impl RosterInner {
 
     /// The row a person is shown as: its first member's, under its uid,
     /// as present as any of them.
-    fn person_view(&self, row: Uid) -> Option<UserInfo> {
+    pub(crate) fn person_view(&self, row: Uid) -> Option<UserInfo> {
         let p = self.persons.by_row.get(&row)?;
         let front = self.users.get(p.members.first()?)?;
         let mut info = front.info.clone();
@@ -396,6 +406,23 @@ impl RosterInner {
             .is_some_and(|m| m.len() > 1)
     }
 
+    /// The person a row uid names, for what the links know of it.
+    pub(crate) fn person_link(&self, row: Uid) -> Option<&crate::server_link::PersonLink> {
+        self.persons.by_row.get(&row).map(|p| &p.link)
+    }
+
+    pub(crate) fn person_link_mut(
+        &mut self,
+        row: Uid,
+    ) -> Option<&mut crate::server_link::PersonLink> {
+        self.persons.by_row.get_mut(&row).map(|p| &mut p.link)
+    }
+
+    /// Whether person `row` is being kicked.
+    pub(crate) fn row_ending(&self, row: Uid) -> bool {
+        self.persons.by_row.get(&row).is_some_and(|p| p.ending)
+    }
+
     /// Whether `uid` is a device of a person being kicked.
     pub(crate) fn ending(&self, uid: Uid) -> bool {
         self.persons
@@ -484,6 +511,8 @@ impl RosterInner {
 
 #[cfg(test)]
 mod chats;
+#[cfg(test)]
+mod link;
 #[cfg(test)]
 mod voice;
 
@@ -857,23 +886,6 @@ pub(crate) mod tests {
         assert!(drain(&mut rx2).iter().any(
             |e| matches!(e, Event::Changed(u) if u.uid == a1 && u.status == SessionStatus::Idle)
         ));
-    }
-
-    #[test]
-    fn a_rename_from_one_device_reaches_the_links_for_each() {
-        let core = Core::new().with_coalesce(true);
-        let mut feed = core.peer_feed(16);
-        let (a1, _rx1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
-        let (a2, _rx2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
-        assert!(core.update(a2, Some("Ally".into()), None));
-        let mut renamed = vec![];
-        while let Ok((_, e)) = feed.try_recv() {
-            if let crate::server_link::PeerEvent::Changed(u) = e {
-                renamed.push((u.uid, u.nick));
-            }
-        }
-        renamed.sort();
-        assert_eq!(renamed, [(a1, "Ally".into()), (a2, "Ally".into())]);
     }
 
     #[test]
