@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use hxd_core::{
-    AuthBackend, Core, HistoryPolicy, InboxPolicy, MemoryLog, MemoryStore, ReactionPolicy,
+    AttachInfo, AuthBackend, Core, HistoryPolicy, InboxPolicy, MemoryLog, MemoryStore,
+    ReactionPolicy, Transport,
 };
 use hxd_session::{cap, run_session, Caps, ServerConfig, ServerCtx};
 use libfuzzer_sys::fuzz_target;
@@ -25,11 +26,14 @@ fn env() -> &'static Env {
         let dir = tempfile::tempdir().unwrap();
         let accounts = dir.path().join("accounts");
         hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
-        // An account that may react and answer mail, which a guest may not.
+        // An account that may react and answer mail, which a guest may not,
+        // linked to an identity so its sessions are one person's.
         std::fs::write(
             accounts.join("fuzz.toml"),
-            "name = \"fuzz\"\npassword = \"fuzz\"\n[access]\nread_chat = true\nsend_chat = true\n\
-             send_msgs = true\n",
+            format!(
+                "name = \"fuzz\"\npassword = \"fuzz\"\n[access]\nread_chat = true\n\
+                 send_chat = true\nsend_msgs = true\n[identity]\nfingerprint = \"{FINGERPRINT}\"\n"
+            ),
         )
         .unwrap();
         Env {
@@ -53,6 +57,41 @@ fn env() -> &'static Env {
     })
 }
 
+/// `[7; 32]`, as the account file spells it.
+const FINGERPRINT: &str = "0w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3ge1r70w3g";
+
+/// Another device of the fuzzed login's person, there before it connects,
+/// so every row, kick and room the input reaches is a person's.
+fn other_device(core: &Core, auth: &dyn AuthBackend) -> hxd_core::Events {
+    let account = auth.lookup("fuzz").unwrap();
+    let (uid, events) = core
+        .attach(AttachInfo {
+            nick: "fuzz".into(),
+            icon: 1,
+            admin: false,
+            access: account.access,
+            login: "fuzz".into(),
+            addr: None,
+            can_detach: account.can_detach,
+            transport: Transport::default(),
+            has_inbox: account.has_inbox,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
+            is_person: account.is_person(),
+            reads_on_delivery: false,
+            identity: account.identity.fingerprint,
+            system: false,
+            account: Some(Box::new(account)),
+        })
+        .unwrap();
+    core.announce(uid);
+    events
+}
+
 fuzz_target!(|data: &[u8]| {
     let env = env();
     env.rt.block_on(async {
@@ -60,6 +99,7 @@ fuzz_target!(|data: &[u8]| {
         // with a log for its lines to be reacted to on and an inbox for
         // its messages to be answered by.
         let core = Core::new()
+            .with_coalesce(true)
             .with_history(Arc::new(MemoryLog::default()), HistoryPolicy::default())
             .with_reactions(ReactionPolicy::default())
             .with_inbox(
@@ -67,6 +107,8 @@ fuzz_target!(|data: &[u8]| {
                 env.auth.clone(),
                 InboxPolicy::default(),
             );
+        // Held for the input, so the device stays on while it runs.
+        let _device = other_device(&core, env.auth.as_ref());
         let ctx = ServerCtx {
             core: Arc::new(core),
             auth: env.auth.clone() as Arc<dyn AuthBackend>,

@@ -1542,6 +1542,11 @@ mod tests {
         assert!(core.user(g).is_none() && core.user_details(g).is_none());
         assert!(core.snapshot().iter().all(|u| u.uid != g));
         assert_eq!(core.census().attached, 1);
+        // The census counts the rows the list shows, the ghost among them,
+        // and not one a ghost hidden here.
+        core.ghost_attach(ghost("hidden", false)).unwrap();
+        assert_eq!(core.census().rows, core.roster_rows().len());
+        assert_eq!(core.census().rows, 2);
     }
 
     #[test]

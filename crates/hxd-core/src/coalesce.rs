@@ -667,6 +667,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_census_counts_a_persons_devices_as_sessions_and_as_one_row() {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, _rb) = attach(&core, "bob", None, None);
+        let (a1, _r1) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let (_a2, _r2) = attach(&core, "alice", Some(ALICE), Some(ALICE));
+        let c = core.census();
+        assert_eq!((c.attached, c.rows), (3, 2));
+        // The row holds while a device is on, whichever.
+        core.end_session(a1);
+        let c = core.census();
+        assert_eq!((c.attached, c.rows), (2, 2));
+    }
+
+    #[test]
     fn a_person_is_as_present_as_its_most_present_session() {
         let core = Core::new().with_coalesce(true);
         let (_bob, mut watching) = attach(&core, "bob", None, None);

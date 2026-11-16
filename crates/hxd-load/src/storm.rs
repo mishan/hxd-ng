@@ -20,6 +20,14 @@
 //! With linked servers, observers on each of them time when each arrival
 //! is heard to join there (`link.join`), from when it was due, and each
 //! must hear every arrival that logged in (`link.joins_heard`).
+//!
+//! With `devices` above one, an arrival is a person: that many
+//! connections to one account, each logged in after the last, timed until
+//! the last has its user list (`login.person`). An ng watcher on the
+//! server counts the joins it hears, and with `grouped` each person must
+//! be heard to join once, not once a device (`login.person_joins`): a
+//! server that makes one row of a person's devices tells everyone else
+//! half as many joins as there are logins.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -70,7 +78,13 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
     let (done_tx, done_rx) = watch::channel(None);
     let observers = observe(ctx, &arrivals, done_rx).await?;
     let senders = seed(ctx).await?;
+    let watcher = if s.devices > 1 {
+        Some(watch_persons(ctx, done_tx.subscribe()).await?)
+    } else {
+        None
+    };
     let in_flight = Arc::new(Semaphore::new(s.max_in_flight));
+    let free = Arc::new(Free::new(ctx));
     let steps: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
     let start = ctx.t0.elapsed() + Duration::from_millis(100);
     let end = start + ctx.duration();
@@ -109,16 +123,52 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
                 }
             })
             .map_or(Wire::Ng, |(w, _)| *w);
+        // A person's other devices, each on a wire of its own.
+        let mut wires = vec![wire];
+        for _ in 1..s.devices {
+            let mut pick = (ctx.random() * total as f64) as u32;
+            wires.push(
+                weights
+                    .iter()
+                    .find(|(_, w)| {
+                        if pick < *w {
+                            true
+                        } else {
+                            pick -= w;
+                            false
+                        }
+                    })
+                    .map_or(Wire::Ng, |(w, _)| *w),
+            );
+        }
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             steps.lock().unwrap()[step].shed += 1;
             ctx.stats.error("login.shed", "max_in_flight");
             due += Duration::from_secs_f64(1.0 / rate);
             continue;
         };
+        // A person holds an account of its own until its devices have
+        // left. With no more in flight than accounts one is always free;
+        // were none, the arrival is the generator's to shed, as above.
+        let lease = if wires.len() > 1 {
+            let Some(lease) = Free::take(&free) else {
+                steps.lock().unwrap()[step].shed += 1;
+                ctx.stats.error("login.shed", "no_free_account");
+                due += Duration::from_secs_f64(1.0 / rate);
+                continue;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         let (ctx2, steps2, arrivals2) = (ctx.clone(), steps.clone(), arrivals.clone());
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            arrive(&ctx2, wire, i, due, step, &steps2, &arrivals2).await;
+            if let Some(lease) = lease {
+                arrive_person(&ctx2, &wires, i, lease, due, step, &steps2, &arrivals2).await;
+            } else {
+                arrive(&ctx2, wire, i, due, step, &steps2, &arrivals2).await;
+            }
         }));
         i += 1;
         due += Duration::from_secs_f64(1.0 / rate);
@@ -141,6 +191,12 @@ pub async fn run(ctx: &Arc<Ctx>) -> Result<Value, String> {
         .map(|(nick, _)| nick.clone())
         .collect();
     let _ = done_tx.send(Some(Arc::new(logged_in)));
+    if let Some(w) = watcher {
+        let m = w.await.expect("the watcher's task does not panic");
+        if let Err(e) = m.leave().await {
+            ctx.stats.error("leave", &e.to_string());
+        }
+    }
     for o in observers {
         let (tx, rx, parts) = o.await.expect("an observer task does not panic");
         if let Err(e) = Member::rejoin(tx, rx, parts).leave().await {
@@ -216,7 +272,7 @@ async fn arrive(
                 a.1 = true;
             }
             ctx.stats.record(&op, took);
-            let linger = tokio::time::sleep(Duration::from_secs_f64(s.linger));
+            let linger = tokio::time::sleep(lingers(ctx));
             let first_login = ctx
                 .scenario
                 .target
@@ -262,6 +318,171 @@ async fn arrive(
         }
         Err(e) => ctx.stats.error(&op, &e.to_string()),
     }
+}
+
+/// How long an arrival stays: `linger`, and up to `linger_spread` more
+/// picked at random, so arrivals that came in order can end out of it.
+fn lingers(ctx: &Ctx) -> Duration {
+    let s = &ctx.scenario.login_storm;
+    Duration::from_secs_f64(s.linger + ctx.random() * s.linger_spread)
+}
+
+/// The accounts no person in flight holds. Arrivals end out of order, so
+/// taking account `i % count` could hand a later arrival one an earlier
+/// still holds, and its devices would join that person.
+struct Free(Mutex<Vec<usize>>);
+
+impl Free {
+    fn new(ctx: &Ctx) -> Free {
+        let count = ctx.scenario.target.accounts.as_ref().map_or(0, |a| a.count);
+        Free(Mutex::new((0..count).rev().collect()))
+    }
+
+    fn take(free: &Arc<Free>) -> Option<Lease> {
+        let account = free.0.lock().unwrap().pop()?;
+        Some(Lease {
+            account,
+            free: free.clone(),
+        })
+    }
+}
+
+/// An account a person holds, back in the pool when it is dropped.
+struct Lease {
+    account: usize,
+    free: Arc<Free>,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.free.0.lock().unwrap().push(self.account);
+    }
+}
+
+/// A person: one connection to its account for each of `wires`, each
+/// logged in once the one before has its user list, all under one nick
+/// so no device renames it. Timed until the last device is in, then all
+/// linger and leave together.
+#[allow(clippy::too_many_arguments)]
+async fn arrive_person(
+    ctx: &Ctx,
+    wires: &[Wire],
+    i: usize,
+    lease: Lease,
+    due: Duration,
+    step: usize,
+    steps: &Mutex<Vec<Step>>,
+    arrivals: &Arrivals,
+) {
+    let accounts = ctx
+        .scenario
+        .target
+        .accounts
+        .as_ref()
+        .expect("checked by the scenario");
+    let creds = (accounts.login(lease.account), accounts.password.clone());
+    let nick = ctx.nick('D', i);
+    arrivals
+        .0
+        .lock()
+        .unwrap()
+        .insert(nick.clone(), (due, false));
+    let mut devices = Vec::new();
+    let mut failed = None;
+    for wire in wires {
+        let joined = async {
+            let mut m = Member::join_as(ctx, *wire, nick.clone(), Some(creds.clone())).await?;
+            m.nicks().await?;
+            Ok::<_, hxd_testclient::Error>(m)
+        }
+        .await;
+        match joined {
+            Ok(m) => devices.push(m),
+            Err(e) => {
+                failed = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let took = ctx.t0.elapsed().saturating_sub(due);
+    {
+        let mut st = steps.lock().unwrap();
+        st[step].attempted += 1;
+        match failed {
+            None => stats::sample(&mut st[step].latency, took),
+            Some(_) => st[step].errors += 1,
+        }
+    }
+    match &failed {
+        None => {
+            if let Some(a) = arrivals.0.lock().unwrap().get_mut(&nick) {
+                a.1 = true;
+            }
+            ctx.stats.record("login.person", took);
+        }
+        Some(e) => ctx.stats.error("login.person", e),
+    }
+    tokio::time::sleep(lingers(ctx)).await;
+    for m in devices {
+        if let Err(e) = m.leave().await {
+            ctx.stats.error("leave", &e.to_string());
+        }
+    }
+}
+
+/// An ng watcher on the server, counting the joins it hears of each
+/// person until `settle` has passed since the last arrival ended, so a
+/// late join is heard too; then `login.person_joins` holds each person
+/// that logged in to one join with `grouped`, or one a device without it.
+async fn watch_persons(ctx: &Arc<Ctx>, mut done: Done) -> Result<JoinHandle<Member>, String> {
+    let m = Member::join_as(ctx, Wire::Ng, ctx.nick('V', 0), None)
+        .await
+        .map_err(|e| format!("the persons' watcher could not join: {e}"))?;
+    let ctx = ctx.clone();
+    Ok(tokio::spawn(async move {
+        let (tx, mut rx, parts) = m.split();
+        let settle = Duration::from_secs_f64(ctx.scenario.run.settle);
+        let mut joins: HashMap<String, u64> = HashMap::new();
+        let mut deadline = None::<tokio::time::Instant>;
+        loop {
+            let logged_in = done.borrow().clone();
+            if logged_in.is_some() {
+                let d = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + settle);
+                if tokio::time::Instant::now() >= d {
+                    break;
+                }
+            }
+            let wait = deadline.unwrap_or_else(|| tokio::time::Instant::now() + settle);
+            tokio::select! {
+                changed = done.changed(), if logged_in.is_none() => if changed.is_err() { break },
+                _ = tokio::time::sleep_until(wait) => {}
+                got = rx.next() => match got {
+                    Ok(Got::Joined { nick, .. }) => *joins.entry(nick).or_default() += 1,
+                    Ok(_) => {}
+                    Err(e) => {
+                        ctx.checks.violated(
+                            "login.person_joins",
+                            format!("the persons' watcher lost its connection: {e}"),
+                        );
+                        break;
+                    }
+                },
+            }
+        }
+        let s = &ctx.scenario.login_storm;
+        let each = if s.grouped { 1 } else { s.devices as u64 };
+        let all = done.borrow().clone().unwrap_or_default();
+        for nick in all.iter() {
+            let heard = joins.get(nick).copied().unwrap_or(0);
+            ctx.checks.check("login.person_joins", heard == each, || {
+                format!(
+                    "{nick} on {} devices was heard to join {heard} times, not {each}",
+                    s.devices
+                )
+            });
+        }
+        Member::rejoin(tx, rx, parts)
+    }))
 }
 
 /// The senders, logged in to `[target] admin`, once they have sent

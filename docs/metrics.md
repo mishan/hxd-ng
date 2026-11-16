@@ -226,6 +226,7 @@ writer's queue in `hxd_write_queued_*`.
 | Metric | Labels | |
 |---|---|---|
 | `hxd_sessions` | `state` | `attached`, `detached`, `hidden` (on the roster, not yet announced), and `system` for the server account; each session is in exactly one |
+| `hxd_roster_rows` | | rows the user list shows: the server account, other servers' users shown here, and this server's sessions, where one person on several devices is one row |
 | `hxd_detached_buffered_events` | `of` | events held for detached sessions, `sum` and `max` |
 | `hxd_detached_broken` | | detached sessions whose buffer has broken |
 | `hxd_sessions_lagging` | | attached sessions cut off for falling behind, not yet gone (counted in `attached` too) |
