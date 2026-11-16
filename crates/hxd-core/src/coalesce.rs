@@ -133,21 +133,23 @@ impl RosterInner {
         // A person is one identity: a session of the login under another
         // (its link changed while the first was on) stands apart.
         let identity = sess.identity;
-        // A personal account linked while its row is on: the row's password
-        // devices carry no identity and the joiner the new link, and both
-        // are the account's, since `coalesces` refused any other key.
+        // A personal account's row may hold password devices with no
+        // identity beside ones carrying the link made since: those agree.
+        // Any two identities that differ do not, whichever member has one.
         let personal = sess.account.as_ref().is_some_and(|a| a.config.personal);
         let forming = self.persons.forming.get(&login).copied();
         let other_identity = forming
             .and_then(|row| self.persons.by_row.get(&row))
             .is_some_and(|p| {
-                p.members
-                    .first()
-                    .and_then(|m| self.users.get(m))
-                    .is_some_and(|front| {
-                        front.identity != identity
-                            && !(personal && (front.identity.is_none() || identity.is_none()))
-                    })
+                let mut members = p.members.iter().filter_map(|m| self.users.get(m));
+                if personal {
+                    identity.is_some()
+                        && members.any(|m| m.identity.is_some() && m.identity != identity)
+                } else {
+                    members
+                        .next()
+                        .is_some_and(|front| front.identity != identity)
+                }
             });
         if other_identity {
             return Joined::Alone;
@@ -829,6 +831,17 @@ pub(crate) mod tests {
         // Linked meanwhile: its password sessions carry the link (§12 J).
         personal(&core, "carol", Some(true), true, Some(ALICE), Some(ALICE));
         assert_eq!(rows(&core).len(), 1);
+    }
+
+    #[test]
+    fn a_personal_row_holds_one_identity_whichever_device_carries_it() {
+        let core = Core::new().with_coalesce(true);
+        let relinked = Some([9; 32]);
+        personal(&core, "carol", Some(true), true, None, None);
+        personal(&core, "carol", Some(true), true, Some(ALICE), Some(ALICE));
+        // Its link changed while the row is on: another person's key.
+        personal(&core, "carol", Some(true), true, relinked, relinked);
+        assert_eq!(rows(&core).len(), 2);
     }
 
     #[test]
