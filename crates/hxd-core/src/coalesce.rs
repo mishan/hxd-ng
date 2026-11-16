@@ -1425,7 +1425,8 @@ pub(crate) mod tests {
                 }
                 Spam => {
                     let flooded = core.spend_spam(first, 1, 105).unwrap_err();
-                    core.place_spam_ban(flooded.ban.expect("a ban to place"));
+                    assert!(flooded.ban.is_some(), "a ban to place");
+                    core.spam_kicked(flooded);
                 }
             }
             for (i, ((_, ends), (uid, rx))) in devices.iter().zip(&mut sessions).enumerate() {
@@ -1533,7 +1534,9 @@ pub(crate) mod tests {
             for _ in 0..3 {
                 for uid in [a1, a2] {
                     if spam {
-                        let _ = core.spend_spam(uid, 1, 105);
+                        if let Err(flooded) = core.spend_spam(uid, 1, 105) {
+                            core.spam_kicked(flooded);
+                        }
                     } else {
                         let _ = core.chat_public(uid, "hi".into(), 0, None);
                     }
