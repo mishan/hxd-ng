@@ -32,6 +32,10 @@ use tokio::sync::Notify;
 /// different servers should see the same clock.
 pub const SESSION_TTL: Duration = Duration::from_secs(600);
 pub const REQUEST_TTL: Duration = Duration::from_secs(300);
+/// How long an answer stays fetchable once fetched (§5.5). A long poll
+/// left on a connection that died takes the answer as surely as a live
+/// one, so a device that re-polls must find it again rather than a 410.
+pub const ANSWER_GRACE: Duration = Duration::from_secs(60);
 pub const LONG_POLL: Duration = Duration::from_secs(30);
 
 /// Pending requests per session (§11). A holder enrolling one device
@@ -126,15 +130,14 @@ pub struct PendingView {
 
 /// What `GET <enroll>/requests/<secret>` found (§5.5).
 pub enum Fetched {
-    /// Approved; the request is consumed.
+    /// Approved.
     Bundle(Vec<u8>),
-    /// The holder said no; the request is consumed.
+    /// The holder said no.
     Denied(String),
     /// Still waiting at the long-poll deadline.
     Pending { expires_in: u64 },
-    /// Expired, or already fetched. Deliberately the same answer for
-    /// both: a caller that fetched an answer has no business asking
-    /// again, and telling it which of the two happened would let anyone
+    /// Expired, or fetched more than [`ANSWER_GRACE`] ago. Deliberately
+    /// the same answer for both: telling them apart would let anyone
     /// holding a stale secret learn whether it was ever used.
     Gone,
 }
@@ -418,7 +421,8 @@ impl Mailbox {
         //
         // So closing stops the session receiving anything new and stops
         // it counting against the address, and leaves answers already
-        // made to be collected. `sweep` removes it once they have been.
+        // made to be collected. `sweep` removes it once the last of them
+        // has been fetched and its grace is over, or at its deadline.
         session.closed = true;
         session.code = None;
         session.identity = None;
@@ -461,7 +465,12 @@ impl Mailbox {
             .sessions
             .values()
             .flat_map(|s| s.pending.values())
-            .filter(|p| p.addr == addr)
+            // An answered request stays only for its enrollee to collect,
+            // to its deadline or a grace after its first fetch; charging
+            // it would hold an enrollee that just finished to a limit it
+            // is done with. Each session still holds at most MAX_PENDING,
+            // answered or not, which is what bounds them.
+            .filter(|p| p.addr == addr && p.answer.is_none())
             .count();
         if mine >= self.cfg.per_address {
             return Err(Refused::RateLimited);
@@ -521,6 +530,9 @@ impl Mailbox {
         }
         let session = inner.sessions.get_mut(&key).expect("checked just above");
 
+        // Never promised past its session's own end: the sweep drops a
+        // session with every request on it, answered or not.
+        let expires = (now + REQUEST_TTL).min(session.expires);
         let secret = random32();
         let rkey = hash(secret.as_bytes());
         let id = format!("r{}", session.next_id);
@@ -532,7 +544,7 @@ impl Mailbox {
                 addr,
                 request: request.to_vec(),
                 received: unix_now(),
-                expires: now + REQUEST_TTL,
+                expires,
                 answer: None,
                 notify: Arc::new(Notify::new()),
             },
@@ -545,7 +557,7 @@ impl Mailbox {
         notify.notify_waiters();
         Ok(Posted {
             request: secret,
-            expires_in: REQUEST_TTL.as_secs(),
+            expires_in: expires.saturating_duration_since(now).as_secs(),
         })
     }
 
@@ -646,8 +658,10 @@ impl Mailbox {
         Ok(())
     }
 
-    /// §5.5, long-polled. An approved or denied answer consumes the
-    /// request.
+    /// §5.5, long-polled. An approved or denied answer is the request's
+    /// last word: it is handed to whoever holds the request secret, again
+    /// on each fetch, for [`ANSWER_GRACE`] after the first, and then the
+    /// request is gone.
     pub async fn fetch_answer(&self, secret: &str, wait: Duration) -> Fetched {
         let key = hash(secret.as_bytes());
         let deadline = Instant::now() + wait;
@@ -682,10 +696,9 @@ impl Mailbox {
                 let Some(pending) = session.pending.get_mut(&key) else {
                     return Fetched::Gone;
                 };
-                match pending.answer.take() {
+                match pending.answer.clone() {
                     Some(a) => {
-                        session.pending.remove(&key);
-                        inner.by_request.remove(&key);
+                        pending.expires = pending.expires.min(Instant::now() + ANSWER_GRACE);
                         return match a {
                             Answer::Bundle(b) => Fetched::Bundle(b),
                             Answer::Denied(r) => Fetched::Denied(r),
@@ -954,12 +967,6 @@ mod tests {
             Fetched::Bundle(b) => assert_eq!(b, b"the bundle"),
             _ => panic!("expected the bundle"),
         }
-        // Consumed: an answer is fetched once, and a second ask cannot
-        // tell "already fetched" from "never existed" (§5.5).
-        assert!(matches!(
-            m.fetch_answer(&posted.request, QUICK).await,
-            Fetched::Gone
-        ));
     }
 
     #[tokio::test]
@@ -983,6 +990,174 @@ mod tests {
         match m.fetch_answer(&posted.request, QUICK).await {
             Fetched::Denied(r) => assert_eq!(r, "not_mine"),
             _ => panic!("expected a denial"),
+        }
+    }
+
+    /// A request answered by `answer` and fetched once, as a poll whose
+    /// reply never reached the device would have fetched it.
+    async fn fetched_once(m: &Mailbox, answer: Answered) -> (Opened, Posted) {
+        let opened = m.open_session(addr(1)).unwrap();
+        let posted = m
+            .post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        let pending = m
+            .poll_session(&opened.session, QUICK)
+            .await
+            .unwrap()
+            .pending;
+        m.answer(&opened.session, &pending[0].id, answer).unwrap();
+        assert!(!matches!(
+            m.fetch_answer(&posted.request, QUICK).await,
+            Fetched::Gone | Fetched::Pending { .. }
+        ));
+        (opened, posted)
+    }
+
+    #[tokio::test]
+    async fn an_answer_whose_fetch_was_lost_is_fetched_again_by_its_request_alone() {
+        for answer in [
+            Answered::Bundle(b"the bundle".to_vec()),
+            Answered::Denied("not_mine".into()),
+        ] {
+            let m = mailbox();
+            let bundle = matches!(answer, Answered::Bundle(_));
+            let (_, posted) = fetched_once(&m, answer).await;
+            match m.fetch_answer(&posted.request, QUICK).await {
+                Fetched::Bundle(b) if bundle => assert_eq!(b, b"the bundle"),
+                Fetched::Denied(r) if !bundle => assert_eq!(r, "not_mine"),
+                _ => panic!("the answer, again, for its own request"),
+            }
+            assert!(
+                matches!(m.fetch_answer(&random32(), QUICK).await, Fetched::Gone),
+                "and to nobody without the request's secret"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fetched_answer_is_kept_for_its_grace_and_then_gone() {
+        let m = mailbox();
+        let (_, posted) = fetched_once(&m, Answered::Bundle(b"b".to_vec())).await;
+        let key = hash(posted.request.as_bytes());
+        {
+            let mut inner = m.inner.lock().unwrap();
+            let skey = inner.by_request[&key];
+            let pending = inner
+                .sessions
+                .get_mut(&skey)
+                .unwrap()
+                .pending
+                .get_mut(&key)
+                .unwrap();
+            assert!(
+                pending.expires <= Instant::now() + ANSWER_GRACE,
+                "kept no longer than the grace once fetched"
+            );
+            pending.expires = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(matches!(
+            m.fetch_answer(&posted.request, QUICK).await,
+            Fetched::Gone
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_session_holds_so_many_requests_answered_or_not() {
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let opened = standing(&m, addr(1), &id);
+        for n in 0..MAX_PENDING {
+            // Each from an address of its own, so only the session's
+            // bound can refuse.
+            m.post_request(addr(10 + n as u8), None, &renewal(2, &id))
+                .unwrap();
+            let pending = m
+                .poll_session(&opened.session, QUICK)
+                .await
+                .unwrap()
+                .pending;
+            m.answer(
+                &opened.session,
+                &pending[0].id,
+                Answered::Denied("no".into()),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            m.post_request(addr(99), None, &renewal(2, &id)),
+            Err(Refused::RateLimited)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_answered_request_is_not_charged_to_its_enrollees_address() {
+        let m = mailbox();
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let per_address = MailboxConfig::default().per_address;
+        for _ in 0..=per_address {
+            let opened = standing(&m, addr(1), &id);
+            m.post_request(addr(2), None, &renewal(2, &id)).unwrap();
+            let pending = m
+                .poll_session(&opened.session, QUICK)
+                .await
+                .unwrap()
+                .pending;
+            m.answer(
+                &opened.session,
+                &pending[0].id,
+                Answered::Denied("no".into()),
+            )
+            .unwrap();
+            m.close_session(&opened.session).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn fetching_again_never_lengthens_an_answers_grace() {
+        let m = mailbox();
+        let (_, posted) = fetched_once(&m, Answered::Bundle(b"b".to_vec())).await;
+        let key = hash(posted.request.as_bytes());
+        let expires = |m: &Mailbox| {
+            let inner = m.inner.lock().unwrap();
+            let skey = inner.by_request[&key];
+            inner.sessions[&skey].pending[&key].expires
+        };
+        let first = expires(&m);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            m.fetch_answer(&posted.request, QUICK).await,
+            Fetched::Bundle(_)
+        ));
+        assert!(expires(&m) <= first, "a refetch kept it longer");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_request_is_promised_the_whole_of_its_life() {
+        let m = mailbox();
+        let opened = m.open_session(addr(1)).unwrap();
+        let posted = m
+            .post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        assert_eq!(posted.expires_in, REQUEST_TTL.as_secs());
+    }
+
+    #[tokio::test]
+    async fn a_request_is_promised_no_longer_than_its_session_has_left() {
+        let m = mailbox();
+        let opened = m.open_session(addr(1)).unwrap();
+        {
+            let mut inner = m.inner.lock().unwrap();
+            let key = hash(opened.session.as_bytes());
+            inner.sessions.get_mut(&key).unwrap().expires =
+                Instant::now() + Duration::from_secs(40);
+        }
+        let posted = m
+            .post_request(addr(2), Some(&opened.code), &request(2))
+            .unwrap();
+        assert!(posted.expires_in <= 40, "{}", posted.expires_in);
+        match m.fetch_answer(&posted.request, Duration::ZERO).await {
+            Fetched::Pending { expires_in } => assert!(expires_in <= 40, "{expires_in}"),
+            _ => panic!("still pending"),
         }
     }
 
@@ -1445,7 +1620,15 @@ mod tests {
             Fetched::Bundle(b) => assert_eq!(b, b"the bundle"),
             _ => panic!("closing the session lost an answered request"),
         }
-        // And once collected, the session really is gone.
+        // And once its answer's grace is over, the session really is gone.
+        {
+            let mut inner = m.inner.lock().unwrap();
+            for s in inner.sessions.values_mut() {
+                for p in s.pending.values_mut() {
+                    p.expires = Instant::now() - Duration::from_secs(1);
+                }
+            }
+        }
         m.sweep();
         assert_eq!(m.session_count(), 0);
     }
