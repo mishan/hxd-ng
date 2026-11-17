@@ -115,6 +115,7 @@ resumes it within the **grace window**, the server MUST end it.
 **Moderating detached sessions.** A detached session is on the roster and
 MUST be subject to kick and ban like any other. Kicking or banning one
 MUST end it immediately; there is no connection to deliver `kicked` to.
+Its resume is answered `kicked`, or `banned` (§6.2).
 
 **Takeover.** A `resume` of a session that already has a connection
 attached MUST succeed if the token is valid (last device wins, rationale
@@ -410,12 +411,26 @@ Errors:
 |---|---|
 | `bad_request` | `params` malformed. |
 | `session_expired` | No such session, the token is wrong, or the grace window lapsed. Log in again. |
+| `ended` | The session was ended by a device of its own person (`device_end`, §7.6). Do not log in again on your own. |
+| `kicked` | The session was kicked, or its key revoked (hotline-ng-auth.md). Do not log in again on your own. |
+| `banned` | As for `login` (§6.1), with `reason` and `expires_at`: the session was kicked with a ban, or banned, and the ban stands. |
 | `too_many_connections` | As for `login` (§6.1): the session's account holds as many connections as it may. The session is left as it was, and a resume after one of the others has closed finds it. A resume that takes the session over from a connection not yet known to be dead is not refused for that connection. |
 | `rate_limited` | As for `login` (§6.1): the session's account has been connecting too often. The session is left as it was; retry after `retry_after` seconds. |
 | `resync_required` | The session is alive and **this connection is now attached to it**, but the events after `last_seq` cannot be replayed. Follow with `sync` (§6.3) on this same connection. |
 
 `resync_required` is the one handshake error that does not close the
 connection.
+
+`ended`, `kicked` and `banned` are answered whether the session was
+attached or detached when it ended, only to the session's own token,
+and only within the grace window it could have resumed in; a server MAY
+forget them sooner, past a bound on how many it keeps, and answer
+`session_expired`. A session ended detached heard nothing of it, and
+one attached may lose its connection before its client reads the
+event; told only that its session expired, a client logs in again,
+undoing the end, the kick or the ban (rationale §9). A session ended
+because its key was rotated away from is `session_expired`: its
+successor logging in is the point.
 
 ### 6.3 Sync
 
@@ -1642,9 +1657,9 @@ e2e-messages.md §4.14, a session that declared `persons` is one that
 asked for it and was granted it, `caps` listing it. A client that
 declares it handles `user_changed` carrying `devices`, `roster_stale`
 and `ended`, with or without the `roles` capability. On a server that
-does not group persons, `device_end` is `unknown_method`, `device` on
-`device_cert` and `boxes` on `msg` are `bad_request`, and `device` on
-`kick` is ignored.
+does not group persons, `device_end` is `unknown_method`, and `device`
+on `device_cert`, `boxes` on `msg` and `device` on `kick` are
+`bad_request`.
 
 **Device ids.** Every session on a server that groups persons has a
 device id: an integer from 1 to 2^53 - 1, so a reader that keeps
@@ -1653,7 +1668,9 @@ be unique among live sessions, and MUST be kept by every resume and
 takeover of the session. It is not the session's serial, and says
 nothing of how many logins came before it. A client MUST treat it as
 opaque and MUST NOT take it for a uid. `self.device` carries it to a
-session with `persons`, grouped or not.
+session with `persons`, grouped or not, in the login and resume
+replies. A client MUST keep it from there: `user_changed` carries the
+row, whose `self` it is not, and never says which entry is its own.
 
 **Who sees devices.** Only a session that declared `persons`:
 
@@ -1760,13 +1777,15 @@ end itself the same way:
   `no_such_device`. A person being kicked is `no_such_user`, as a
   second kick of it is.
 - An ended device that declared `persons` is sent `ended`, and its
-  connection closed with 1000 `ended` (§5). One that did not is sent
+  connection closed with 1000 `ended` (§5). A device ending itself is
+  sent the `{}` reply first, then `ended`, then the close. One that did not is sent
   `kicked` and closed with `kicked`, so that it does not take the close
   for a lost connection. A detached device is ended at once. A classic
   device's connection is closed.
-- Its session is over: a `resume` of it is `session_expired`. A client
-  sent `ended` MUST NOT resume or log in again on its own; it is
-  neither a takeover (`replaced`) nor a lost connection.
+- Its session is over. A `resume` of it is `ended`, or `kicked` for one
+  that did not declare `persons` (§6.2). A client sent
+  `ended`, or answered it, MUST NOT resume or log in again on its own;
+  it is neither a takeover (`replaced`) nor a lost connection.
 - The person's devices that see devices see it gone from `devices`.
   Nobody is told whether it ended itself, was ended, or was kicked. The
   last device ending is the person's end, a `user_parted` to everyone.
@@ -1785,7 +1804,8 @@ of the row `uid` names, leaving the rest of the person here:
 
 - It is asked as `kick` is: the kick bit, `no_such_user`, `protected`
   for a row that cannot be disconnected, and `bad_request` for the
-  kicker's own person, whose devices are `device_end`'s.
+  kicker's own person or the kicker itself, whose devices are
+  `device_end`'s.
 - `ban` or `purge` beside `device`, or `device` for a linked server's
   user, is `bad_request`. A `device` that is not a live device of that
   row is `no_such_device`.
@@ -1795,8 +1815,8 @@ of the row `uid` names, leaving the rest of the person here:
   the person is still here.
 - A row's last device not already on its way out is kicked as the
   person: a kick with its notice and its reply.
-- From a session without `persons`, `device` is ignored and the whole
-  row is kicked.
+- From a session without `persons`, `device` is `bad_request`: read as
+  a kick of the whole row, it would end more than was asked.
 
 **Resume and sync.** A session's device id, label and `persons` are
 kept by every resume and takeover. A resume's `self` carries `device`
@@ -1985,10 +2005,12 @@ news body is different: it declares its own type (news.md §5).
 | `login_failed` | `login` | Wrong account or password. |
 | `denied` | `login` | Identity policy refused this socket. |
 | `revoked` | `login` | This identity or device key is revoked here. |
-| `banned` | `login` | Banned (§6.1). |
+| `banned` | `login`, `resume` | Banned (§6.1). |
 | `server_full` | `login` | No uid free. |
 | `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
 | `session_expired` | `resume` | Log in again. |
+| `ended` | `resume` | Ended by a device of its person; do not log in again on your own. |
+| `kicked` | `resume` | Kicked, or its key revoked; do not log in again on your own. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, `react`, `reactions`, `emoji_list`, family requests | The server does not offer this. |
 | `no_such_target` | `react` | No such line, or one this session may not react to, or an instant message's party it may not message: one answer for all (§7.3). Never for a `pm` target, which is answered `{}`. |

@@ -45,9 +45,14 @@ impl RosterInner {
     /// may not detach, resume or be taken over on its way out; a detached
     /// one has no connection to see the event, and ends here.
     fn end_device(&mut self, uid: Uid, why: Event) {
+        let by = match why {
+            Event::Ended => crate::ending::EndedBy::Ended,
+            _ => crate::ending::EndedBy::Kicked,
+        };
         if let Some(s) = self.users.get_mut(&uid) {
             s.kicked = true;
         }
+        self.remember_end(uid, by);
         self.send_to(uid, why);
         self.export_leaving(uid);
         if self

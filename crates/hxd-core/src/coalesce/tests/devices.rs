@@ -919,3 +919,92 @@ fn a_detached_device_that_loses_the_kick_bit_replays_its_own_devices_without_the
         "{own:?}"
     );
 }
+
+/// A device that proved identity `fingerprint` with device key `device`.
+fn proved_as(fingerprint: [u8; 32], device: u8) -> Transport {
+    let mut t = proved(ng(false));
+    if let Some(id) = t.identity.as_mut() {
+        id.fingerprint = fingerprint;
+        id.device = [device; 32];
+    }
+    t
+}
+
+#[test]
+fn a_session_ended_or_kicked_is_remembered_so_and_one_that_lapsed_or_rotated_is_not() {
+    use crate::ending::EndedBy;
+    let hour = std::time::Duration::from_secs(3600);
+    for (case, coalesce) in [("coalescing", true), ("not coalescing", false)] {
+        let core = Core::new().with_coalesce(coalesce);
+        let away = |core: &Core, uid: Uid| {
+            assert!(core.connection_lost(uid, usize::MAX));
+            (uid, core.session_serial(uid).unwrap())
+        };
+        let (a1, _r1) = alice(&core, proved(ng(true)));
+        let (a2, _r2) = alice(&core, proved(ng(true)));
+        let (b, _rb) = other(&core, "bob", ng(false), false);
+        let (c, _rc) = other(&core, "carol", ng(false), false);
+
+        let kicked = away(&core, b);
+        core.kick(b, None).unwrap();
+        assert_eq!(
+            core.ended_by(kicked.0, kicked.1, hour),
+            Some(EndedBy::Kicked),
+            "{case}"
+        );
+
+        let lapsed = away(&core, c);
+        core.sweep_detached(std::time::Duration::ZERO);
+        assert_eq!(
+            core.ended_by(lapsed.0, lapsed.1, hour),
+            None,
+            "{case}: lapsed"
+        );
+
+        // Kicked while connected, and refused by a revocation, as told;
+        // a key rotated away from is its successor's to log in with.
+        let (d, _rd) = other(&core, "dave", ng(false), false);
+        let live = (d, core.session_serial(d).unwrap());
+        core.kick(d, None).unwrap();
+        assert_eq!(
+            core.ended_by(live.0, live.1, hour),
+            Some(EndedBy::Kicked),
+            "{case}: live"
+        );
+        let (e, _re) = on(
+            &core,
+            session("erin", Some([5; 32]), None, proved_as([5; 32], 5)),
+        );
+        let revoked = (e, core.session_serial(e).unwrap());
+        core.set_revocations(crate::Revocations {
+            devices: [[5; 32]].into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            core.ended_by(revoked.0, revoked.1, hour),
+            Some(EndedBy::Kicked),
+            "{case}: revoked"
+        );
+        let (f, _rf) = on(
+            &core,
+            session("fay", Some([6; 32]), None, proved_as([6; 32], 6)),
+        );
+        let rotated = (f, core.session_serial(f).unwrap());
+        core.refuse_rotated([6; 32]);
+        assert_eq!(
+            core.ended_by(rotated.0, rotated.1, hour),
+            None,
+            "{case}: rotated"
+        );
+
+        if coalesce {
+            let ended = away(&core, a2);
+            core.device_end(a1, device_of(&core, a2)).unwrap();
+            assert_eq!(
+                core.ended_by(ended.0, ended.1, hour),
+                Some(EndedBy::Ended),
+                "{case}"
+            );
+        }
+    }
+}

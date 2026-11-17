@@ -556,9 +556,17 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     "You are not allowed to disconnect users.",
                 );
             }
-            // One device of a person, for a client that knows its devices;
-            // any other kicks whom `uid` names, as it always has.
-            if let Some(device) = p.device.filter(|_| state.persons) {
+            // One device of a person, for a client that knows its devices.
+            // From any other it is refused: read as a kick of the whole
+            // row, it would be an escalation the client never asked for.
+            if p.device.is_some() && !state.persons {
+                return reply_err(
+                    id,
+                    "bad_request",
+                    "`device` is for a client that declared `persons`.",
+                );
+            }
+            if let Some(device) = p.device {
                 // The person stays, so there is nothing a ban or a purge
                 // of one device could mean.
                 if p.ban.is_some() || p.purge.is_some() {
@@ -584,8 +592,9 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 {
                     return refused(ModError::Protected);
                 }
-                // A moderator's own stale device is `device_end`'s.
-                if core.kicks_own_row(uid, p.uid) {
+                // A moderator's own stale device is `device_end`'s, a
+                // session alone's own row among them.
+                if p.uid == uid || core.kicks_own_row(uid, p.uid) {
                     return refused(ModError::BadRequest("You cannot kick yourself."));
                 }
                 match core.kick_device(p.uid, device) {

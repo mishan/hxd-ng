@@ -4201,6 +4201,7 @@ pub(crate) fn kick_in(r: &mut RosterInner, target: Uid) -> Result<String, ChatEr
     if let Some(sess) = r.users.get_mut(&target) {
         sess.kicked = true;
     }
+    r.remember_end(target, crate::ending::EndedBy::Kicked);
     r.send_to(target, Event::Kicked);
     r.export_leaving(target);
     // A detached session has no connection to observe the event; the

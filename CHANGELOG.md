@@ -101,7 +101,16 @@ as AGENTS.md's "Releasing" describes it.
   own, up to `[limits] connections_per_account` of its newest devices
   and never more than 11, which is also the limit where it is 0
   (docs/operating.md, Persons; docs/hotline-ng.md §7.6). A client
-  that does not declare it sees one user per person.
+  that does not declare it sees one user per person. `kick` with
+  `device` from a client that did not declare `persons` is refused
+  `bad_request` rather than kicking the whole person.
+- An ng session kicked, banned, refused by a revocation or ended by
+  another of its person's devices answers its `resume` with `kicked`,
+  `banned` (with the ban's reason and end) or `ended` rather than
+  `session_expired`, whether it was attached or detached, so a client
+  that missed the event stops instead of logging in again and undoing
+  it, coalescing on or off (docs/hotline-ng.md §6.2). A client that
+  knows none of the codes takes it as any other refused resume.
 - Metrics: `hxd_roster_rows` counts the rows the user list shows,
   beside `hxd_sessions` (docs/metrics.md).
 - `hxd-load accounts --linked` links each account it writes to an

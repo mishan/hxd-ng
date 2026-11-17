@@ -17,6 +17,7 @@ pub mod chat;
 pub mod clock;
 pub mod coalesce;
 pub mod emoji;
+pub mod ending;
 pub mod files;
 pub mod history;
 pub mod identity_records;
@@ -54,6 +55,7 @@ pub use avatar::{
 };
 pub use budget::{Over, QueueBudget, Share, QUEUE_BUDGET};
 pub use chat::{ChatError, Flooded, KickBan, Kicked, MsgOutcome, SignedLine, SignedMsg, SpamBan};
+pub use ending::EndedBy;
 pub use files::{
     FileBody, FileEntry, FileError, FileFuture, FileInfo, FileKind, FilePath, FilePrincipal,
     FileSource,

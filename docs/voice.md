@@ -426,6 +426,15 @@ This is the mobile-honest answer: a phone that dropped its WebSocket
 dropped its UDP path too, and a fresh ICE/DTLS handshake is faster than
 pretending the old one survived.
 
+**Persons.** On a server that groups a person's sessions
+(hotline-ng.md §7.6) the person is in voice on one device at a time,
+under its row: participants list the row's uid, and a second device's
+`voice_join` moves the person to it. In the same room the room is
+renegotiated with no part and no join and the mute kept, the device
+moved from is sent `voice_status` without the row and tears down its
+media, and its camera and screen publications end; in another room it
+is a room switch. hotline-ng.md §7.6 has the rest.
+
 **Mobile clients** use the platform `RTCPeerConnection` (browser,
 libwebrtc on iOS/Android). PCMU is mandatory-to-implement in all of them
 (RFC 7874), so no codec work on the client. They get a server host

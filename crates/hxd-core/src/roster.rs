@@ -1521,6 +1521,8 @@ pub(crate) struct RosterInner {
     /// last told of them (`crate::messaging`).
     pub(crate) presences: crate::messaging::Presences,
     pub(crate) persons: crate::coalesce::Persons,
+    /// Detached sessions ended before their grace ran out, and why.
+    pub(crate) endings: crate::ending::Endings,
 }
 
 impl RosterInner {

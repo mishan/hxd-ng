@@ -868,6 +868,7 @@ impl crate::Core {
             if let Some(sess) = r.users.get_mut(&uid) {
                 sess.kicked = true;
             }
+            r.remember_end(uid, crate::ending::EndedBy::Kicked);
             r.send_to(uid, crate::Event::Kicked);
             r.export_leaving(uid);
             if r.users.get(&uid).is_some_and(crate::roster::is_buffering) {
