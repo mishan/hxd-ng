@@ -1461,13 +1461,21 @@ and `msg {to, sealed, cert}` go to that device. To a person with any
 other number, both are `not_sealed`. A client with `persons` may use the
 single form the same way.
 
-**Across a link.** No link names a device yet (§11), so nothing is
-sealed between a person and a linked server's user, either way, a person
-of one device included. A grouped session's `device_cert` or sealed
-`msg` to a linked server's user is `not_sealed`, and so is a `msg` with
-`boxes` to one, from any session. For sealing, a linked server asking
-a person's certificate by Link Device Keys for one of its users, or
-sending a sealed 905 to a person, is answered `NoDeviceKeys` (§5). A
+**Across a link.** No link names a device yet (§11), so a person is
+sealed with across a link only while it has exactly one device it can
+be sealed to, by the rule above but counted before the newest are
+chosen, shown to the link and proving the identity the link was shown:
+that device seals to a linked server's user and asks its
+certificate as a session alone does, and the link shows the person as
+able to open sealed messages, answers its certificate by Link Device
+Keys and delivers a sealed 905 to it (§5). The link is told as that
+count crosses one, as the row is. With two or more, nothing is sealed
+between the person and a linked server's user, either way: a grouped
+session's `device_cert` or sealed `msg` to one is `not_sealed`, and
+Link Device Keys and a sealed 905 for the person are answered
+`NoDeviceKeys`, so a conversation sealed while it had one device stops
+being sealable once a second joins, as it does here. A `msg` with
+`boxes` to a linked server's user is `not_sealed`, from any session. A
 server's own Link Device Keys, which checks a signed line or message,
 is answered for a person as `server-link.md` §7.7 has it: the newest
 certificate one of its devices here signed with and still proves,

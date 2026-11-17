@@ -362,38 +362,6 @@ fn a_ghosts_message_to_a_person_reaches_every_device() {
     );
 }
 
-#[test]
-fn nothing_is_sealed_to_a_person_across_a_link() {
-    let (core, _feed) = linked();
-    // A device that could open sealed messages, were it alone.
-    let mut sealing = proved(1, false);
-    if let Some(id) = sealing.identity.as_mut() {
-        id.sealed = Some(
-            crate::SealedDevice {
-                cert: vec![1],
-                enc: [0; 32],
-                expires: u64::MAX,
-            }
-            .into(),
-        );
-    }
-    let (a1, _rx1) = device(&core, sealing);
-    let gus = ghost(&core);
-    assert_eq!(
-        core.ghost_device_cert(gus, a1),
-        Err(PeerRefusal::NoDeviceKeys)
-    );
-    assert_eq!(
-        core.ghost_sealed(
-            gus,
-            a1,
-            vec![1],
-            Some(<sha2::Sha256 as sha2::Digest>::digest([0u8; 32]).into())
-        ),
-        Err(PeerRefusal::NoDeviceKeys)
-    );
-}
-
 /// A router that keeps who each message is from.
 #[derive(Default)]
 struct Router(Mutex<Vec<Uid>>);
@@ -595,63 +563,211 @@ fn a_block_on_any_device_refuses_a_ghosts_sealed_message_to_its_person() {
     );
 }
 
+/// A device of alice's that can open sealed messages until `expires`.
+fn sealing_until(device: u8, expires: u64) -> Transport {
+    let mut t = proved(device, false);
+    if let Some(id) = t.identity.as_mut() {
+        id.device_expires = expires;
+        id.sealed = Some(
+            crate::SealedDevice {
+                cert: vec![device],
+                enc: [device; 32],
+                expires,
+            }
+            .into(),
+        );
+    }
+    t
+}
+
+fn sealing(device: u8) -> Transport {
+    sealing_until(device, u64::MAX)
+}
+
+/// The SHA-256 of the `device_enc` key `sealing` gives device `byte`.
+fn key(byte: u8) -> [u8; 32] {
+    <sha2::Sha256 as sha2::Digest>::digest([byte; 32]).into()
+}
+
+/// Whether the links were last told `row` can open sealed messages.
+fn shown_sealed(feed: &mut mpsc::Receiver<(u64, PeerEvent)>, row: Uid) -> Option<bool> {
+    users(feed)
+        .into_iter()
+        .find(|u| u.uid == row)
+        .map(|u| u.sealed)
+}
+
+fn sealed_from(rx: &mut Events, ghost: Uid) -> bool {
+    drain(rx)
+        .iter()
+        .any(|e| matches!(e, Event::Sealed { from, .. } if *from == ghost))
+}
+
+/// Which of the four go across a link, each tried: `from` sealing to
+/// the ghost and asking its certificate, and the ghost sealing to
+/// `row` by `device`'s key and asking `row`'s certificate.
+fn four_ways(core: &Core, gus: Uid, from: Uid, row: Uid, device: u8) -> [bool; 4] {
+    [
+        matches!(core.peer_sealed(from, gus, vec![1], key(1)), Some(Ok(_))),
+        matches!(core.peer_device_cert(from, gus), Some(Ok(_))),
+        core.ghost_sealed(gus, row, vec![1], Some(key(device)))
+            .is_ok(),
+        core.ghost_device_cert(gus, row) == Ok(vec![device]),
+    ]
+}
+
 #[test]
-fn nothing_is_sealed_between_a_person_and_a_ghost_either_way() {
-    let (core, _feed) = linked();
+fn a_person_of_one_sealable_device_seals_across_a_link_both_ways_and_of_two_does_not() {
+    let (core, mut feed) = linked();
     let router = Arc::new(Router::default());
     core.set_peer_router(router.clone());
-    let sealing = |device: u8| {
-        let mut t = proved(device, false);
-        if let Some(id) = t.identity.as_mut() {
-            id.sealed = Some(
-                crate::SealedDevice {
-                    cert: vec![device],
-                    enc: [device; 32],
-                    expires: u64::MAX,
-                }
-                .into(),
-            );
-        }
-        t
-    };
     let gus = ghost(&core);
-    let key = <sha2::Sha256 as sha2::Digest>::digest([1u8; 32]).into();
-    // A session alone may, its account linking no identity: the ghost
-    // could seal back to it.
+    let (a1, mut rx1) = device(&core, sealing(1));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(true), "one device");
+    drain(&mut rx1);
+    assert_eq!(four_ways(&core, gus, a1, a1, 1), [true; 4], "one device");
+    assert!(sealed_from(&mut rx1, gus), "delivered to it");
+
+    // A second device mid-conversation: neither way, and the links told.
+    let (a2, mut rx2) = device(&core, sealing(2));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(false), "two: told");
+    for from in [a1, a2] {
+        assert_eq!(
+            four_ways(&core, gus, from, a1, 1),
+            [false; 4],
+            "two, from {from}"
+        );
+    }
+
+    // The first goes: the one left is sealed with, under the row.
+    core.end_session(a1);
+    assert_eq!(shown_sealed(&mut feed, a1), Some(true), "one again: told");
+    drain(&mut rx2);
+    assert_eq!(four_ways(&core, gus, a2, a1, 2), [true; 4], "one again");
+    assert!(sealed_from(&mut rx2, gus), "delivered to the one left");
+
+    // A session alone, its account linking no identity, as ever.
     let (bob, _rb) = core
-        .attach(session("bob", Some(ALICE), None, sealing(1)))
+        .attach(session("bob", Some(ALICE), None, sealing(3)))
         .unwrap();
     core.announce(bob);
     assert!(matches!(
-        core.peer_sealed(bob, gus, vec![1], key),
+        core.peer_sealed(bob, gus, vec![1], key(1)),
         Some(Ok(_))
     ));
-    // A person may not, even of one device.
-    let (a1, _rx1) = device(&core, sealing(1));
-    let (a2, _rx2) = device(&core, sealing(2));
-    for from in [a1, a2] {
-        assert!(
-            matches!(
-                core.peer_sealed(from, gus, vec![1], key),
-                Some(Err(crate::SealedError::NotSealed))
-            ),
-            "to a ghost from {from}"
-        );
-        assert!(
-            matches!(
-                core.peer_device_cert(from, gus),
-                Some(Err(crate::SealedError::NotSealed))
-            ),
-            "a ghost's certificate for {from}"
+    assert_eq!(
+        *router.0.lock().unwrap(),
+        [a1, a1, a1, a1, bob],
+        "each allowed, under the row"
+    );
+}
+
+#[test]
+fn a_persons_one_sealable_device_is_the_one_sealed_with_not_its_front() {
+    let (core, mut feed) = linked();
+    core.set_peer_router(Arc::new(Router::default()));
+    let gus = ghost(&core);
+    let (a1, mut rx1) = device(&core, proved(1, false));
+    let (a2, mut rx2) = device(&core, sealing(2));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(true));
+    drain(&mut rx1);
+    drain(&mut rx2);
+    assert_eq!(core.ghost_device_cert(gus, a1), Ok(vec![2]));
+    assert_eq!(core.ghost_sealed(gus, a1, vec![1], Some(key(2))), Ok(()));
+    assert!(sealed_from(&mut rx2, gus), "to the device it was sealed to");
+    assert!(!sealed_from(&mut rx1, gus), "not to the row's front");
+    assert!(matches!(
+        core.peer_sealed(a1, gus, vec![1], key(1)),
+        Some(Err(crate::SealedError::SelfNotSealed))
+    ));
+    assert!(matches!(core.peer_device_cert(a1, gus), Some(Err(_))));
+    assert!(matches!(
+        core.peer_sealed(a2, gus, vec![1], key(1)),
+        Some(Ok(_))
+    ));
+    assert!(matches!(core.peer_device_cert(a2, gus), Some(Ok(_))));
+}
+
+#[test]
+fn a_person_sealed_with_across_a_link_is_told_so_as_its_devices_change() {
+    // How its sole sealable device stops being one, its socket open.
+    type End = fn(&Core, Uid);
+    let ends: [(&str, End); 3] = [
+        ("expired", |core, _| {
+            core.clock().advance(std::time::Duration::from_secs(120));
+            core.expire_device_keys();
+        }),
+        ("kicked", |core, a2| {
+            let device = core.roster.lock().unwrap().users[&a2].device;
+            core.kick_device(core.row_uid(a2), device).unwrap();
+        }),
+        ("revoked", |core, _| {
+            core.set_revocations(crate::Revocations {
+                devices: [[2; 32]].into(),
+                ..Default::default()
+            });
+        }),
+    ];
+    for (case, end) in ends {
+        let (core, mut feed) = linked();
+        let (a1, _rx1) = device(&core, proved(1, false));
+        let expires = core.clock().unix() + 60;
+        let (a2, _rx2) = device(&core, sealing_until(2, expires));
+        assert_eq!(shown_sealed(&mut feed, a1), Some(true), "{case}");
+        end(&core, a2);
+        assert_eq!(
+            shown_sealed(&mut feed, a1),
+            Some(false),
+            "{case}: told at once, its socket still open"
         );
     }
-    assert_eq!(*router.0.lock().unwrap(), [bob], "only the session alone's");
+}
+
+#[test]
+fn a_person_shown_with_no_identity_is_sealed_with_across_no_link() {
+    let (core, mut feed) = linked();
+    core.set_peer_router(Arc::new(Router::default()));
+    let gus = ghost(&core);
+    // Its first device logged in with the password.
+    let (a1, _rx1) = device(&core, Transport::default());
+    let (a2, _rx2) = device(&core, sealing(2));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(false));
+    assert_eq!(four_ways(&core, gus, a2, a1, 2), [false; 4]);
+}
+
+#[test]
+fn a_person_with_more_sealable_devices_than_its_account_may_connect_is_sealed_with_across_no_link()
+{
+    let (core, mut feed) = linked();
+    let core = core.with_conn_limits(crate::ConnLimits {
+        per_account: 1,
+        ..crate::ConnLimits::default()
+    });
+    core.set_peer_router(Arc::new(Router::default()));
+    let gus = ghost(&core);
+    let (a1, _rx1) = device(&core, sealing(1));
+    let (a2, _rx2) = device(&core, sealing(2));
+    // Detached, it holds no connection, so the account is within its cap,
+    // and only its newest device is sealed to here.
+    assert!(core.connection_lost(a1, usize::MAX));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(false));
+    assert_eq!(four_ways(&core, gus, a2, a1, 2), [false; 4]);
+}
+
+#[test]
+fn a_box_from_a_ghost_its_device_cannot_hold_is_refused() {
+    let (core, _feed) = linked();
+    let gus = ghost(&core);
+    let (a1, _rx1) = device(&core, sealing(1));
+    assert!(core.connection_lost(a1, usize::MAX));
+    {
+        let mut r = core.roster.lock().unwrap();
+        for _ in 0..=crate::roster::OUTBOX_BUFFER_CAP {
+            r.send_to(a1, Event::RosterStale);
+        }
+    }
     assert_eq!(
-        core.ghost_sealed(gus, a1, vec![1], Some(key)),
-        Err(PeerRefusal::NoDeviceKeys)
-    );
-    assert_eq!(
-        core.ghost_device_cert(gus, a1),
-        Err(PeerRefusal::NoDeviceKeys)
+        core.ghost_sealed(gus, a1, vec![1], Some(key(1))),
+        Err(PeerRefusal::RateLimited)
     );
 }

@@ -1402,6 +1402,16 @@ async fn chain_trying(
     drafts: &str,
     cc_drafts: &str,
 ) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
+    chain_full(cc_offers, drafts, cc_drafts, "").await
+}
+
+/// [`chain_trying`], each server's `[server]` section holding `server`.
+async fn chain_full(
+    cc_offers: &str,
+    drafts: &str,
+    cc_drafts: &str,
+    server: &str,
+) -> (Server, Server, Server, [tempfile::TempDir; 3]) {
     const TRANSIT: &str = r#"["chat", "msgs", "info", "transit"]"#;
     let dirs = [
         tempfile::tempdir().unwrap(),
@@ -1425,14 +1435,14 @@ async fn chain_trying(
         )
     };
     let peers = accept("aa", 1, drafts) + &accept("cc", 3, cc_drafts);
-    let b = start(dirs[1].path(), 2, "bb", "", "", &peers, b_tls).await;
+    let b = start(dirs[1].path(), 2, "bb", server, "", &peers, b_tls).await;
     let a_peer = dial("aa", drafts);
-    let a = start(dirs[0].path(), 1, "aa", "", "", &a_peer, bind().await).await;
+    let a = start(dirs[0].path(), 1, "aa", server, "", &a_peer, bind().await).await;
     let c_peer = dial("cc", cc_drafts).replace(
         &format!("features = {TRANSIT}"),
         &format!("features = {cc_offers}"),
     );
-    let c = start(dirs[2].path(), 3, "cc", "", "", &c_peer, bind().await).await;
+    let c = start(dirs[2].path(), 3, "cc", server, "", &c_peer, bind().await).await;
     assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&c.hub, 2, Duration::from_secs(10)).await);
     (a, b, c, dirs)
@@ -2029,7 +2039,14 @@ async fn a_server_in_the_middle_passes_signed_lines_and_their_fetches_on() {
 /// neither a signed message nor a certificate crosses to it.
 #[tokio::test]
 async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature() {
-    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, "", "").await;
+    // A person of one device seals across a link as a session alone does.
+    for server in ["", "coalesce = true"] {
+        a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature_on(server).await;
+    }
+}
+
+async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature_on(server: &str) {
+    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, "", "").await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob) = (person(1), person(2));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2099,7 +2116,14 @@ fn key_hash(cert: &[u8]) -> String {
 
 #[tokio::test]
 async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
-    let (a, b, _dirs) = pair_with(2, 1, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    // A person of one device seals across a link as a session alone does.
+    for server in ["", "coalesce = true"] {
+        private_messages_cross_signed_and_sealed_to_a_ghosts_device_on(server).await;
+    }
+}
+
+async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device_on(server: &str) {
+    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob, carol) = (person(1), person(2), person(3));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2220,8 +2244,20 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
 /// with.
 #[tokio::test]
 async fn a_sealed_message_from_a_sender_unkeyed_where_it_arrives_is_refused() {
-    let (a, _b, c, _dirs) =
-        chain_trying(r#"["chat", "msgs", "info", "transit"]"#, USER_KEYS, "").await;
+    // A person of one device seals across a link as a session alone does.
+    for server in ["", "coalesce = true"] {
+        a_sealed_message_from_a_sender_unkeyed_where_it_arrives_is_refused_on(server).await;
+    }
+}
+
+async fn a_sealed_message_from_a_sender_unkeyed_where_it_arrives_is_refused_on(server: &str) {
+    let (a, _b, c, _dirs) = chain_full(
+        r#"["chat", "msgs", "info", "transit"]"#,
+        USER_KEYS,
+        "",
+        server,
+    )
+    .await;
     let (alice, carol) = (person(1), person(3));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
     let (_on_c, _) = keyed(&c, &carol).await;

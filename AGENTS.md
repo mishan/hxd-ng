@@ -725,7 +725,8 @@ Three layers, all `cargo test --workspace`:
   device even once its row's own has left, each signing device's lines
   verified there, and a person whose first device logged in with a
   password shown with no identity, its key device's signed line kept
-  here and its signed message not sent),
+  here and its signed message not sent, and a person of one device
+  sealing and sealed to across the link as a session alone is),
   `hope.rs` (HOPE logins through `hxhope`'s client against a server built
   from a real config: Blowfish carrying both
   ways, an ng client seeing the session encrypted and a guest's not, the

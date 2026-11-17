@@ -49,6 +49,7 @@ impl RosterInner {
             s.kicked = true;
         }
         self.send_to(uid, why);
+        self.export_leaving(uid);
         if self
             .users
             .get(&uid)

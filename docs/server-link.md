@@ -934,8 +934,12 @@ target cannot open sealed messages; one from a ghost with no fingerprint
 here is refused `SenderUnkeyed` (15) before any of those, since fetching
 the certificate again would not help, and one whose size is not a box's
 is `RefusedFields`. It is delivered as a local sealed message is, held
-for a detached session within `[sealed]` and never stored. Nothing is
-sealed to or from a person across a link, either way: its certificate is
+for a detached session within `[sealed]` and never stored. A person is
+sealed to and from across a link only while it has exactly one device
+that can be, however many one message may be sealed to, and that
+device is shown to the link and proves the fingerprint the link was
+shown for the person: its user is shown sealed, its certificate is that device's and a
+sealed 905 goes to that device; with two or more, its certificate is
 `NoDeviceKeys` and a sealed 905 to it is refused `NoDeviceKeys`
 (`e2e-messages.md` §4.14). A signed 905
 that fails its check,

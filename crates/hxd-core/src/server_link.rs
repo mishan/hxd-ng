@@ -388,18 +388,12 @@ pub(crate) struct PersonLink {
 
 impl LocalUser {
     /// Person `row` as it may cross a link: its row as the roster shows
-    /// it, under the row's uid. Never sealed to: a person's sealed keys
-    /// are its devices', which no link can name yet.
+    /// it, under the row's uid, sealed to while it has one device that
+    /// can be ([`link_sealable`]).
     fn of_row(r: &RosterInner, row: Uid) -> Option<LocalUser> {
         let info = r.person_view(row)?;
         let link = r.person_link(row)?;
-        let fingerprint = match &link.exported {
-            Some(_) => link.fingerprint,
-            None => {
-                let front = r.users.get(r.person_members(row)?.first()?)?;
-                LocalUser::of(front).fingerprint
-            }
-        };
+        let fingerprint = person_fingerprint(r, row);
         let signs =
             fingerprint.is_some() && info.transport.identity.as_ref().is_some_and(|i| i.signs);
         Some(LocalUser {
@@ -413,7 +407,7 @@ impl LocalUser {
                 .then_some(info.transport.encrypted),
             fingerprint,
             signs,
-            sealed: false,
+            sealed: link_sealable(r, row).is_some(),
         })
     }
 }
@@ -467,6 +461,52 @@ fn exported(sess: &UserSession) -> bool {
 /// was shown.
 fn exported_named(r: &RosterInner, uid: Uid) -> Option<&UserSession> {
     r.named(uid).filter(|s| exported(s))
+}
+
+/// The one device a link seals `named`, a row a link names, to and from:
+/// a session alone that can be sealed to, or a person's when it has
+/// exactly one that can ([`RosterInner::sealable_devices`]), shown to
+/// the links and proving the identity they were shown. Counted before
+/// the newest are chosen for one message: a person past its account's
+/// cap by its detached sessions has two, and a link names no device,
+/// so of two or more there is none.
+fn link_sealable(r: &RosterInner, named: Uid) -> Option<(&UserSession, &crate::SealedDevice)> {
+    let Some(members) = r.person_members(named) else {
+        let s = exported_named(r, named)?;
+        return r.sealable(s).map(|d| (s, d));
+    };
+    let shown = person_fingerprint(r, named)?;
+    match r.sealable_devices(members).as_slice() {
+        [(s, d)]
+            if exported(s)
+                && s.info.transport.identity.as_ref().map(|i| i.fingerprint) == Some(shown) =>
+        {
+            Some((*s, *d))
+        }
+        _ => None,
+    }
+}
+
+/// The identity person `row` is shown to the links with: the one it was
+/// shown with, or before it is, its first device's own.
+fn person_fingerprint(r: &RosterInner, row: Uid) -> Option<[u8; 32]> {
+    let link = r.person_link(row)?;
+    match &link.exported {
+        Some(_) => link.fingerprint,
+        None => LocalUser::of(r.users.get(r.person_members(row)?.first()?)?).fingerprint,
+    }
+}
+
+/// Whether `uid` may seal to a ghost, or ask for its certificate, in its
+/// own name: a ghost seals back to what the link shows of it.
+fn link_seals_from(r: &RosterInner, uid: Uid) -> bool {
+    let Some(s) = r.users.get(&uid) else {
+        return false;
+    };
+    if !s.grouped {
+        return exported(s);
+    }
+    link_sealable(r, r.row_uid(uid)).is_some_and(|(d, _)| d.info.uid == uid)
 }
 
 /// The identity the links were told `uid`, a row a link names, proved:
@@ -531,6 +571,15 @@ impl RosterInner {
             .map(LocalUser::of)
         {
             self.export(PeerEvent::Changed(user));
+        }
+    }
+
+    /// A device of a person kicked or refused, still on the roster until
+    /// its socket closes: no longer sealed to, which may change what the
+    /// links show of the person now.
+    pub(crate) fn export_leaving(&mut self, uid: Uid) {
+        if self.users.get(&uid).is_some_and(|s| s.grouped) {
+            self.export_changed(uid);
         }
     }
 
@@ -864,9 +913,9 @@ impl Core {
         let refused = match r.users.get(&from) {
             None => Some(SealedError::NoSuchUser),
             Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
-            // A person's devices are what a ghost would answer, and a link
-            // cannot name them: nothing is sealed between the two either way.
-            Some(s) if s.grouped || !exported(s) || refuses => Some(SealedError::NotSealed),
+            // A ghost seals back to the one device a link shows; of a
+            // person's two or more, it could name none.
+            Some(_) if !link_seals_from(&r, from) || refuses => Some(SealedError::NotSealed),
             _ => None,
         };
         let from = r.row_uid(from);
@@ -890,18 +939,20 @@ impl Core {
         use crate::SealedError;
         let mut r = self.roster.lock().unwrap();
         r.ghosts.get(&of).filter(|g| g.visible)?;
-        let refused = match r.users.get_mut(&asker) {
+        let refused = match r.users.get(&asker) {
             None => Some(SealedError::NoSuchUser),
             Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
-            // Asked in its name, so only for a session a link shows, and
-            // not for a person, whom a ghost could not seal back to.
-            Some(s) if s.grouped || !exported(s) => Some(SealedError::NotSealed),
-            Some(s) => s
-                .device_certs
-                .as_mut()
-                .and_then(|b| b.spend(1, Instant::now()).err())
-                .map(SealedError::RateLimited),
+            // Asked in its name, so only for what a ghost could seal back to.
+            Some(_) if !link_seals_from(&r, asker) => Some(SealedError::NotSealed),
+            Some(_) => None,
         };
+        let refused = refused.or_else(|| {
+            r.users
+                .get_mut(&asker)
+                .and_then(|s| s.device_certs.as_mut())
+                .and_then(|b| b.spend(1, Instant::now()).err())
+                .map(SealedError::RateLimited)
+        });
         let asker = r.row_uid(asker);
         drop(r);
         Some(match (refused, self.peer_router.get()) {
@@ -918,20 +969,16 @@ impl Core {
     /// ghost's chat allowance, as a private message does.
     pub fn ghost_device_cert(&self, asker: Uid, of: Uid) -> Result<Vec<u8>, PeerRefusal> {
         let limits = self.flood_limits;
-        let now = self.clock.unix();
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
-        let front = exported_named(r, of)
-            .ok_or(PeerRefusal::UnknownUser)?
-            .info
-            .uid;
+        exported_named(r, of).ok_or(PeerRefusal::UnknownUser)?;
         let key = r
             .ghosts
             .get(&asker)
             .map(|g| g.key)
             .ok_or(PeerRefusal::UnknownUser)?;
         let blocked = blocks_ghost(r, of, (asker, key));
-        let target = &r.users[&front];
+        let cert = link_sealable(r, of).map(|(_, d)| d.cert.clone());
         let g = r.ghosts.get_mut(&asker).expect("got above");
         if !g.visible {
             return Err(PeerRefusal::Excluded);
@@ -942,12 +989,7 @@ impl Core {
         if !g.flood.chat(1, &limits, Instant::now()) {
             return Err(PeerRefusal::RateLimited);
         }
-        // A person's sealed keys are its devices', which a link cannot
-        // name: nobody seals to it across one yet.
-        crate::sealed::sealable_at(target, now, &r.revoked)
-            .filter(|_| !target.grouped)
-            .map(|d| d.cert.clone())
-            .ok_or(PeerRefusal::NoDeviceKeys)
+        cert.ok_or(PeerRefusal::NoDeviceKeys)
     }
 
     /// A sealed message from ghost `from` to local user `to`, sealed to
@@ -963,31 +1005,23 @@ impl Core {
         sealed_to: Option<[u8; 32]>,
     ) -> Result<(), PeerRefusal> {
         let limits = self.flood_limits;
-        let now = self.clock.unix();
         let mut r = self.roster.lock().unwrap();
         let r = &mut *r;
         let named = to;
-        let to = exported_named(r, named)
-            .ok_or(PeerRefusal::UnknownUser)?
-            .info
-            .uid;
+        exported_named(r, named).ok_or(PeerRefusal::UnknownUser)?;
         let key = r
             .ghosts
             .get(&from)
             .map(|g| g.key)
             .ok_or(PeerRefusal::UnknownUser)?;
         let blocked = blocks_ghost(r, named, (from, key));
-        let target = &r.users[&to];
+        let device = link_sealable(r, named).map(|(s, d)| (s.info.uid, d.enc));
         let g = r.ghosts.get_mut(&from).expect("got above");
         if !g.visible {
             return Err(PeerRefusal::Excluded);
         }
         if blocked {
             return Err(PeerRefusal::RefusesMessages);
-        }
-        // Not to a person, whose devices a link cannot name.
-        if target.grouped {
-            return Err(PeerRefusal::NoDeviceKeys);
         }
         // Who sealed it is what the recipient checks the box against.
         // Before the device's checks: fetching the certificate again,
@@ -998,12 +1032,15 @@ impl Core {
             .as_ref()
             .and_then(|r| r.fingerprint)
             .ok_or(PeerRefusal::SenderUnkeyed)?;
-        let device =
-            crate::sealed::sealable_at(target, now, &r.revoked).ok_or(PeerRefusal::NoDeviceKeys)?;
-        if Some(<[u8; 32]>::from(sha2::Sha256::digest(device.enc))) != sealed_to {
+        let (to, enc) = device.ok_or(PeerRefusal::NoDeviceKeys)?;
+        if Some(<[u8; 32]>::from(sha2::Sha256::digest(enc))) != sealed_to {
             return Err(PeerRefusal::NoDeviceKeys);
         }
-        if let Some((mine, all)) = target.outbox.sealed_held(&from_fingerprint) {
+        let held = r
+            .users
+            .get(&to)
+            .and_then(|t| t.outbox.sealed_held(&from_fingerprint));
+        if let Some((mine, all)) = held {
             let holds = self.sealed_holds;
             if mine + sealed.len() > holds.per_sender || all + sealed.len() > holds.all {
                 return Err(PeerRefusal::RateLimited);
@@ -1013,7 +1050,7 @@ impl Core {
             return Err(PeerRefusal::RateLimited);
         }
         let from_nick = g.info.nick.clone();
-        r.send_to(
+        let landed = r.send_landed(
             to,
             Event::Sealed {
                 from,
@@ -1025,6 +1062,10 @@ impl Core {
                 at: SystemTime::now(),
             },
         );
+        // A buffer that overflowed holds it no more than a full one would.
+        if !landed {
+            return Err(PeerRefusal::RateLimited);
+        }
         Ok(())
     }
 
