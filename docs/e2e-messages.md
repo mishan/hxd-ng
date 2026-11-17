@@ -1314,7 +1314,9 @@ message is sealed to, the most a `boxes` holds, only that many are,
 the ones that logged in most recently (`hotline-ng-rationale.md` §9).
 It is judged as it is asked, so a revocation counts from the moment it
 lands, before the session it ends is gone. A device sealing to its own
-person leaves itself out; a session alone may still seal to itself.
+person leaves itself out of those, after they are chosen, so the
+devices it seals to are the ones every viewer is shown `sealed`; a
+session alone may still seal to itself.
 
 **Fetching the certificates.**
 

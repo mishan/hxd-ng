@@ -1491,8 +1491,10 @@ pub(crate) struct RosterInner {
     /// decided under this lock against them ([`RosterInner::sealable`]).
     pub(crate) clock: crate::clock::Clock,
     pub(crate) revoked: Arc<std::sync::RwLock<crate::revoked::Refused>>,
-    /// [`crate::sealed::box_limit`] of the connection limits.
-    pub(crate) max_boxes: usize,
+    /// `[limits] connections_per_account`, whose
+    /// [`crate::sealed::box_limit`] is read where it is used, so a roster
+    /// built by `Default` has the ceiling rather than no devices at all.
+    pub(crate) per_account: usize,
     pub(crate) last_uid: Uid,
     pub(crate) freed_uids: UidQuarantine,
     /// Other servers' users shown here, apart from the sessions so that
@@ -2388,7 +2390,7 @@ impl Core {
         let mut r = core.roster.lock().unwrap();
         r.clock = core.clock.clone();
         r.revoked = core.revoked.clone();
-        r.max_boxes = crate::sealed::box_limit(crate::limits::CONNECTIONS_PER_ACCOUNT);
+        r.per_account = crate::limits::CONNECTIONS_PER_ACCOUNT;
         drop(r);
         core
     }
@@ -2506,7 +2508,7 @@ impl Core {
     /// Hold connections from one address to `limits` rather than
     /// [`crate::ConnLimits::default`].
     pub fn with_conn_limits(mut self, limits: crate::ConnLimits) -> Self {
-        self.roster.lock().unwrap().max_boxes = crate::sealed::box_limit(limits.per_account);
+        self.roster.lock().unwrap().per_account = limits.per_account;
         self.conn_gate = crate::limits::ConnGate::new(limits);
         self
     }

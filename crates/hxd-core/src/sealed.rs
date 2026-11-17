@@ -120,8 +120,8 @@ impl From<SealedError> for BoxesError {
 }
 
 /// A device a sealed message may go to, as a sender is given it.
-struct SealingTo {
-    uid: Uid,
+pub(crate) struct SealingTo {
+    pub(crate) uid: Uid,
     device: u64,
     cert: Vec<u8>,
     enc: [u8; 32],
@@ -382,18 +382,26 @@ impl Core {
     /// the sender's own when `named` is its person: one rule behind every
     /// list a sender is given and every box delivered, so the two cannot
     /// disagree. A session alone may seal to itself.
-    fn sealing_set(
+    pub(crate) fn sealing_set(
         &self,
         r: &crate::roster::RosterInner,
         named: Uid,
         row: &[Uid],
         from: Uid,
     ) -> Vec<SealingTo> {
-        let except = r.person_members(named).map(|_| from);
-        r.sealing_devices(&r.named_sessions(named))
+        // Only the row's devices, which the blocks were checked for, may
+        // take the newest places. The sender's own is left out after
+        // them: which devices those are is what every viewer is shown,
+        // the sender's own entry among them.
+        let cleared: Vec<Uid> = r
+            .named_sessions(named)
             .into_iter()
-            .filter(|(s, _)| row.contains(&s.info.uid) && Some(s.info.uid) != except)
-            .filter(|(s, _)| s.live())
+            .filter(|m| row.contains(m))
+            .collect();
+        let except = r.person_members(named).map(|_| from);
+        r.sealing_devices(&cleared)
+            .into_iter()
+            .filter(|(s, _)| Some(s.info.uid) != except)
             .map(|(s, d)| SealingTo {
                 uid: s.info.uid,
                 device: s.device,
@@ -406,7 +414,7 @@ impl Core {
     /// How many devices of a person a message may be sealed to
     /// ([`box_limit`]).
     pub fn max_boxes(&self) -> usize {
-        self.roster.lock().unwrap().max_boxes
+        box_limit(self.roster.lock().unwrap().per_account)
     }
 
     /// The sender as a sealed message names it, under the lock it is
@@ -624,8 +632,9 @@ impl crate::roster::RosterInner {
     }
 
     /// Those of `members`, in the order they joined, that can be sealed
-    /// to: each [`Self::sealable`], and of more than `max_boxes` the
-    /// newest that many, so that one message's boxes reach them all. The
+    /// to: each live and [`Self::sealable`], and of more than
+    /// [`box_limit`] the newest that many, so that one message's boxes
+    /// reach them all. The
     /// order is the person's own, kept by a resume or a takeover, which
     /// reattach the same session; `since` is whole seconds, and two
     /// logins in one would tie.
@@ -636,9 +645,10 @@ impl crate::roster::RosterInner {
         let all: Vec<_> = members
             .iter()
             .filter_map(|m| self.users.get(m))
+            .filter(|s| s.live())
             .filter_map(|s| self.sealable(s).map(|d| (s, d)))
             .collect();
-        let older = all.len().saturating_sub(self.max_boxes);
+        let older = all.len().saturating_sub(box_limit(self.per_account));
         all.into_iter().skip(older).collect()
     }
 }

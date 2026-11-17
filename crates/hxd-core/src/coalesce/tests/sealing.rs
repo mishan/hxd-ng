@@ -415,6 +415,49 @@ fn a_message_reaches_as_many_devices_as_an_account_may_connect_up_to_one_request
 }
 
 #[test]
+fn a_core_built_by_default_seals_to_a_session_alone() {
+    let core = Core::default();
+    let (a1, _r1) = alice(&core, 1, true, Some(u64::MAX));
+    let (bob, _rb) = bob(&core, false);
+    assert_eq!(
+        core.device_cert(a1, bob, None),
+        Ok(DeviceCerts::One(vec![50]))
+    );
+}
+
+#[test]
+fn a_device_not_cleared_for_takes_none_of_the_newest_places() {
+    let core = holding(2);
+    let (bob, _rb) = bob(&core, true);
+    let (a1, _r1) = alice(&core, 1, true, Some(u64::MAX));
+    let (a2, _r2) = alice(&core, 2, true, Some(u64::MAX));
+    // Logged in after the sender's blocks were checked, so not in the
+    // row the hold delivers to.
+    let (_a3, _r3) = alice(&core, 3, true, Some(u64::MAX));
+    let r = core.roster.lock().unwrap();
+    let set: Vec<Uid> = core
+        .sealing_set(&r, a1, &[a1, a2], bob)
+        .iter()
+        .map(|d| d.uid)
+        .collect();
+    assert_eq!(set, [a1, a2]);
+}
+
+#[test]
+fn a_device_sealing_to_its_own_person_past_the_limit_seals_to_the_rest_of_the_newest() {
+    let core = holding(2);
+    let (a1, _r1) = alice(&core, 1, true, Some(u64::MAX));
+    let (a2, _r2) = alice(&core, 2, true, Some(u64::MAX));
+    let (a3, _r3) = alice(&core, 3, true, Some(u64::MAX));
+    // The newest are shown sealed to everyone, the sender among them;
+    // what it seals to is those, less itself.
+    assert_eq!(
+        core.msg_boxes(a3, a1, vec![box_for(&core, a1, 1), box_for(&core, a2, 2)]),
+        Err(BoxesError::DevicesChanged(listed(&core, &[(a2, 2)])))
+    );
+}
+
+#[test]
 fn a_device_seals_to_its_own_person_as_its_row_and_by_its_device() {
     for (case, reader_persons) in [("persons", true), ("not persons", false)] {
         let core = persons();
