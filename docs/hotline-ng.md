@@ -1580,10 +1580,11 @@ proving an identity its account does not link.
 **What every client sees.** With or without `persons`, and on the
 classic wire alike:
 
-- The row's uid is its first device's, kept while any device lives and
-  given to nobody else meanwhile. `self.uid` is the row's. A device's
-  own uid names nobody: a request naming it is answered as one naming a
-  uid nobody holds.
+- The row's uid is its first device's, kept while any device lives,
+  that first device's leaving included, and given to nobody else
+  meanwhile. `self.uid` is the row's. The row's uid names the person
+  while any device lives; any other device's own uid names nobody: a
+  request naming it is answered as one naming a uid nobody holds.
 - The roster is told of a person once as its first device joins
   (`user_joined`) and once as its last leaves (`user_parted`). A device
   coming, going or changing in between is a `user_changed` only where
@@ -1602,7 +1603,11 @@ classic wire alike:
   show it the merged row, as everyone else is shown it.
 - A line, a private message and a sealed message from any device are
   from the row. A `msg` to the row reaches each of its devices but the
-  sender. One from a device to its own row arrives from uid 0.
+  sender. A private message from a device to its own row arrives from
+  uid 0, since a reply to it would be to oneself. A sealed message
+  between a person's own devices arrives from the row, so a reply
+  seals back to it by device, and its recipient checks it against its
+  own fingerprint (e2e-messages.md §4.14).
 - In a room or a private chat the person is one member. A device hears
   one only once it has joined it itself. Any device leaving it takes the
   person out: its other devices that had the room open are sent

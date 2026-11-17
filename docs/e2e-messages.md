@@ -1418,8 +1418,11 @@ message.
 **Sealing to your own person.** A device may seal to its own person's
 row, and the devices that can be sealed to leave the sending device out:
 its boxes are one for each of its other devices. The `msg` each of
-those devices receives is from the row, with `from.device` naming the
-sender.
+those devices receives is from the row's uid, not uid 0 as a private
+message between them is (`hotline-ng.md` §7.6), with `from.device`
+naming the sender, so a reply seals back to the row by device. The
+recipient checks the box against the fingerprint the roster shows for
+the row, which is its own.
 
 **Receiving.** Each device is sent its own box alone, as §4.4's `msg`.
 `from.uid` is the sealer's row, even to its own person, and
@@ -1454,10 +1457,14 @@ single form the same way.
 sealed between a person and a linked server's user, either way, a person
 of one device included. A grouped session's `device_cert` or sealed
 `msg` to a linked server's user is `not_sealed`, and so is a `msg` with
-`boxes` to one, from any session. A linked server asking a person's
-certificate by Link Device Keys, or sending a sealed 905 to a person, is
-answered `NoDeviceKeys` (§5). A session alone seals across a link as §5
-has it.
+`boxes` to one, from any session. For sealing, a linked server asking
+a person's certificate by Link Device Keys for one of its users, or
+sending a sealed 905 to a person, is answered `NoDeviceKeys` (§5). A
+server's own Link Device Keys, which checks a signed line or message,
+is answered for a person as `server-link.md` §7.7 has it: the newest
+certificate one of its devices here signed with and still proves,
+where the row's fingerprint was said. A session alone seals across a
+link as §5 has it.
 
 ## 5. Across server links
 
