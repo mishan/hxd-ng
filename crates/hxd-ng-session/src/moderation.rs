@@ -592,8 +592,9 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                 {
                     return refused(ModError::Protected);
                 }
-                // A moderator's own stale device is `device_end`'s.
-                if core.kicks_own_row(uid, p.uid) {
+                // A moderator's own stale device is `device_end`'s, a
+                // session alone's own row among them.
+                if p.uid == uid || core.kicks_own_row(uid, p.uid) {
                     return refused(ModError::BadRequest("You cannot kick yourself."));
                 }
                 match core.kick_device(p.uid, device) {

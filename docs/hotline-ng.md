@@ -1804,7 +1804,8 @@ of the row `uid` names, leaving the rest of the person here:
 
 - It is asked as `kick` is: the kick bit, `no_such_user`, `protected`
   for a row that cannot be disconnected, and `bad_request` for the
-  kicker's own person, whose devices are `device_end`'s.
+  kicker's own person or the kicker itself, whose devices are
+  `device_end`'s.
 - `ban` or `purge` beside `device`, or `device` for a linked server's
   user, is `bad_request`. A `device` that is not a live device of that
   row is `no_such_device`.

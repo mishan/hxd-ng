@@ -71,6 +71,7 @@ async fn start_with(dir: &Path, coalesce: bool, limits: &str) -> Server {
         ("bob", "", None),
         ("boss", "cant_be_disconnected = true\n", Some(8)),
         ("dave", "disconnect_users = true\n", Some(9)),
+        ("mod", "disconnect_users = true\n", None),
         ("keeper", "[extra]\nmanage_rooms = true\n", None),
         ("carol", "[extra]\npersonal = true\n", None),
     ] {
@@ -1323,6 +1324,13 @@ async fn a_device_kick_is_refused_of_a_ghost_a_protected_person_and_ones_own() {
             "{case}"
         );
     }
+    // A moderator alone is its own row, whose one device is its own to end.
+    let (mut alone, own) = persons_device(&server, "mod", None).await;
+    let params = json!({ "uid": own["self"]["uid"], "device": own["self"]["device"] });
+    assert_eq!(
+        refused_with(&mut alone, "kick", params).await,
+        "bad_request"
+    );
 }
 
 /// Wait until more than `n` sessions are detached.
