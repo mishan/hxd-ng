@@ -642,13 +642,22 @@ impl crate::roster::RosterInner {
         &'a self,
         members: &[Uid],
     ) -> Vec<(&'a crate::roster::UserSession, &'a SealedDevice)> {
-        let all: Vec<_> = members
+        let all = self.sealable_devices(members);
+        let older = all.len().saturating_sub(box_limit(self.per_account));
+        all.into_iter().skip(older).collect()
+    }
+
+    /// [`Self::sealing_devices`] before the newest are chosen: every one
+    /// of `members` that can be sealed to.
+    pub(crate) fn sealable_devices<'a>(
+        &'a self,
+        members: &[Uid],
+    ) -> Vec<(&'a crate::roster::UserSession, &'a SealedDevice)> {
+        members
             .iter()
             .filter_map(|m| self.users.get(m))
             .filter(|s| s.live())
             .filter_map(|s| self.sealable(s).map(|d| (s, d)))
-            .collect();
-        let older = all.len().saturating_sub(box_limit(self.per_account));
-        all.into_iter().skip(older).collect()
+            .collect()
     }
 }

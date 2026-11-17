@@ -1463,8 +1463,9 @@ single form the same way.
 
 **Across a link.** No link names a device yet (§11), so a person is
 sealed with across a link only while it has exactly one device it can
-be sealed to, by the rule above, proving the identity the link was
-shown: that device seals to a linked server's user and asks its
+be sealed to, by the rule above but counted before the newest are
+chosen, shown to the link and proving the identity the link was shown:
+that device seals to a linked server's user and asks its
 certificate as a session alone does, and the link shows the person as
 able to open sealed messages, answers its certificate by Link Device
 Keys and delivers a sealed 905 to it (§5). The link is told as that

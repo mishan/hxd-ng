@@ -465,17 +465,18 @@ fn exported_named(r: &RosterInner, uid: Uid) -> Option<&UserSession> {
 
 /// The one device a link seals `named`, a row a link names, to and from:
 /// a session alone that can be sealed to, or a person's when it has
-/// exactly one in [`RosterInner::sealing_devices`], proving the identity
-/// the links were shown, as a person of one device is shown locally
-/// (`hotline-ng.md` §7.6). A link names no device, so of two or more
-/// there is none.
+/// exactly one that can ([`RosterInner::sealable_devices`]), shown to
+/// the links and proving the identity they were shown. Counted before
+/// the newest are chosen for one message: a person past its account's
+/// cap by its detached sessions has two, and a link names no device,
+/// so of two or more there is none.
 fn link_sealable(r: &RosterInner, named: Uid) -> Option<(&UserSession, &crate::SealedDevice)> {
     let Some(members) = r.person_members(named) else {
         let s = exported_named(r, named)?;
         return r.sealable(s).map(|d| (s, d));
     };
     let shown = person_fingerprint(r, named)?;
-    match r.sealing_devices(members).as_slice() {
+    match r.sealable_devices(members).as_slice() {
         [(s, d)]
             if exported(s)
                 && s.info.transport.identity.as_ref().map(|i| i.fingerprint) == Some(shown) =>

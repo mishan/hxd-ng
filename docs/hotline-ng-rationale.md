@@ -389,9 +389,12 @@ is delivered.
 A link names a user by its row and a certificate by that user alone, so
 it cannot say which device of a person a box is for, nor answer a
 person's devices. With one device it can be sealed to there is nothing
-to choose, and it is sealed with both ways as a session alone is, which
+to choose, provided it is one the link was shown and proves the
+identity the link was told, and it is sealed with both ways as a
+session alone is, which
 keeps sealed messages across links for everyone with a linked identity
-on a server that groups persons. With two or more it is neither way:
+on a server that groups persons. With two or more, counted before the
+newest are chosen for a message, it is neither way:
 sealing one way only, from a person to a peer's user who could not seal
 back, would make a conversation that cannot be answered. A conversation
 that stops when a second device joins is the price, the same one a

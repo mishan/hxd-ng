@@ -726,10 +726,30 @@ fn a_person_sealed_with_across_a_link_is_told_so_as_its_devices_change() {
 #[test]
 fn a_person_shown_with_no_identity_is_sealed_with_across_no_link() {
     let (core, mut feed) = linked();
+    core.set_peer_router(Arc::new(Router::default()));
     let gus = ghost(&core);
     // Its first device logged in with the password.
     let (a1, _rx1) = device(&core, Transport::default());
     let (a2, _rx2) = device(&core, sealing(2));
+    assert_eq!(shown_sealed(&mut feed, a1), Some(false));
+    assert_eq!(four_ways(&core, gus, a2, a1, 2), [false; 4]);
+}
+
+#[test]
+fn a_person_with_more_sealable_devices_than_its_account_may_connect_is_sealed_with_across_no_link()
+{
+    let (core, mut feed) = linked();
+    let core = core.with_conn_limits(crate::ConnLimits {
+        per_account: 1,
+        ..crate::ConnLimits::default()
+    });
+    core.set_peer_router(Arc::new(Router::default()));
+    let gus = ghost(&core);
+    let (a1, _rx1) = device(&core, sealing(1));
+    let (a2, _rx2) = device(&core, sealing(2));
+    // Detached, it holds no connection, so the account is within its cap,
+    // and only its newest device is sealed to here.
+    assert!(core.connection_lost(a1, usize::MAX));
     assert_eq!(shown_sealed(&mut feed, a1), Some(false));
     assert_eq!(four_ways(&core, gus, a2, a1, 2), [false; 4]);
 }
