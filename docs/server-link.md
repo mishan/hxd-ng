@@ -934,7 +934,10 @@ target cannot open sealed messages; one from a ghost with no fingerprint
 here is refused `SenderUnkeyed` (15) before any of those, since fetching
 the certificate again would not help, and one whose size is not a box's
 is `RefusedFields`. It is delivered as a local sealed message is, held
-for a detached session within `[sealed]` and never stored. A signed 905
+for a detached session within `[sealed]` and never stored. Nothing is
+sealed to or from a person across a link, either way: its certificate is
+`NoDeviceKeys` and a sealed 905 to it is refused `NoDeviceKeys`
+(`e2e-messages.md` §4.14). A signed 905
 that fails its check,
 carries `FieldQuotingMsg`, or whose `FieldOptions` says otherwise than
 its signature whether it is an automatic response, is refused

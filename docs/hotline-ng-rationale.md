@@ -320,3 +320,59 @@ Each landed separately with tests, roughly a branch apiece:
 - **Convergence.** The hotline-rs org's protocol work, if it converges
   here: hotline-ng.md is the artifact to share — it is
   implementation-independent and another server could adopt it wholesale.
+
+## 9. Persons
+
+Notes against spec §7.6 and e2e-messages.md §4.14.
+
+**Strangers are not shown devices.** A device list on every row would
+be the scrape `device_cert`'s ration exists to stop (e2e-messages.md
+§4.2): it would tell anyone who logs in on which device, and when each
+one comes and goes. It would also bring back the join and part traffic
+of every device that grouping a person into one row took away. So a
+person's devices are shown to its own devices, which need them to tell
+themselves apart and end a stale one, and to whoever may kick, who needs
+them to kick one; anyone else learns them only by asking to seal, at
+the ration's pace.
+
+**A password device sees only password devices.** A linked account's
+password is enough to be grouped, since its sessions are the account's,
+but a password is weaker than a device key and may be shared or stolen.
+Letting it see, or end, the devices that proved the identity would let
+whoever holds the password log those devices out and watch them.
+
+**The device id is its own number.** Not the serial, which counts
+logins server-wide and would publish the login rate, and not the
+session id, which is a resume credential's handle. Random below 2^53
+reads exactly in every JSON reader, and kept across resume and takeover
+it names the device rather than the connection.
+
+**`ended` is not `replaced`.** A connection closed `replaced` lost its
+session to a takeover, and its client resumes or logs in again. A device
+ended by its own person must stay out, so it needs a reason of its own,
+and a client that never declared `persons` is told `kicked`, the one it
+already knows not to come back from.
+
+**A wrong set of boxes refuses the whole message.** Delivering the
+boxes that match and dropping the rest would let one device miss a
+message without anyone knowing, which is worse for a conversation than
+a refusal the sender can act on at once: the refusal carries the
+devices as they are, so sealing again costs one round trip. Delivery is
+checked and made in one hold of the roster, so a device that joins or
+leaves in between cannot split the message either.
+
+**A full device gets its box skipped, and the rest delivered.** Unlike
+a wrong set, a device that holds as much sealed mail as it may is a
+state the sender cannot fix, and refusing the whole message would let a
+person's one detached device block every message to its others. The
+sender is told which devices were skipped, so nothing is lost silently.
+A box whose key changed is different again: the sender can fix it, and
+a box sealed to an old key is one its device could not open, so nothing
+is delivered.
+
+**Nothing is sealed between a person and a linked server's user.** A
+link names a user by its row and a certificate by that user alone, so
+it cannot say which device of a person a box is for, nor answer a
+person's devices. Sealing one way only, from a person to a peer's user
+who could not seal back, would make a conversation that cannot be
+answered. Both directions wait for a link wire that names devices.

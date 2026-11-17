@@ -534,6 +534,51 @@ the next start, which every client warns of. The server refuses to
 start with handovers that do not end at its key and at the successor
 it commits to, and on SIGHUP keeps serving what it served.
 
+### Persons
+
+With `[server] coalesce = true`, the sessions of one person are one user
+on the list: a phone, a laptop and a 1.5 client on a desktop, all logged
+in as `alice`, are one `alice`, joining once and leaving with the last
+of them. It is off by default. An account's sessions are grouped when
+they are one person's for certain: the account links an identity
+(Portable identity, above) and each session logged in as that identity
+or with the account's password, or the account's file says `personal =
+true` under `[extra]` ([access-bits.md](access-bits.md) §4), which
+groups its password sessions with no identity linked. A role cannot
+grant `personal`. The guest account, the system account and a classic
+messenger session are never grouped, and neither is a session proving
+an identity the account does not link.
+
+What changes for everyone, classic clients included:
+
+- The person is one row under its first session's uid, and keeps it
+  while any session lives. Its name, icon and color are the person's: a
+  rename from any device renames it. It is shown as present as its most
+  present device, and as safe as its least safe one.
+- Its lines and private messages come from that row, and a private
+  message to it reaches every device. In a room or a private chat it is
+  one member, and leaving on one device leaves on all.
+- It is in voice on one device at a time; joining from another moves it.
+- A kick or ban of it, on either wire, ends every device, and a flood
+  from any device counts against the person. An address ban ends only
+  the devices at that address. A moderator cannot kick their own person.
+- Across a server link it is one user.
+
+An ng client that asks for it ([hotline-ng.md](hotline-ng.md) §7.6)
+is also shown its own person's devices and can end one, as a logout of
+a stale device; one that may kick sees every person's devices, with
+each one's login and address, and can kick one device alone. A device ended this way on
+the classic wire sees its connection close, which a 1.5 client shows as
+a lost connection. Clients that do not ask see none of this, and
+sealed messages to a person of more than one device need a client that
+does ([e2e-messages.md](e2e-messages.md) §4.14). Give moderators
+linked identities and have them log in with one: a moderator account
+that logs in with a password, if its password is stolen, shows whoever
+holds it every person's devices with their addresses, and lets them end
+those devices. `hxd_roster_rows`
+counts the rows the list shows, beside `hxd_sessions`
+([metrics.md](metrics.md)).
+
 ### The registrar
 
 A server can also be an identity registrar: it lends keys handles like
@@ -810,6 +855,7 @@ change or leave out, and its comment says what absent means.
 bind = "0.0.0.0:5500"
 classic = true          # false: ng clients only, nothing of the classic
                         # wire listened for (Ports and the network)
+coalesce = false        # true: a person's sessions are one user (Persons)
 name = "hxd-ng"
 version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10

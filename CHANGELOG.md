@@ -87,6 +87,19 @@ as AGENTS.md's "Releasing" describes it.
   `DATA_CHAT_REASON` beside its text, so a client tells a rate refusal
   (6) from a refused permission (2), a channel it does not serve (1), a
   malformed id (12) or too many (13) without reading the text.
+- Persons: `[server] coalesce = true`, off by default, shows the
+  sessions of one person as one user on both wires: an account linked
+  to an identity, for its sessions that logged in as that identity or
+  with the account's password, and an account whose file says `[extra]
+  personal = true`, for its password sessions. The person joins once,
+  leaves with its last device, is one member of each room and private
+  chat, is in voice on one device at a time, is kicked and banned whole,
+  and crosses a link as one user. An ng client that declares `persons`
+  sees its own devices and may end one, and a moderator's sees every
+  person's devices, with each one's login and address, and may kick one
+  alone; sealed messages reach each device of a person with a box of its
+  own (docs/operating.md, Persons; docs/hotline-ng.md §7.6). A client
+  that does not declare it sees one user per person.
 - Metrics: `hxd_roster_rows` counts the rows the user list shows,
   beside `hxd_sessions` (docs/metrics.md).
 - `hxd-load accounts --linked` links each account it writes to an

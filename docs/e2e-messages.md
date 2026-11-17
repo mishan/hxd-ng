@@ -13,8 +13,9 @@ classic wire getting the text alone (§6); and sealed private messages:
 `sealed` at login and resume and on the roster, `device_cert`, `msg`
 carrying a box to the session of the device it was sealed to, held for a
 detached one within `[sealed]` and lost with `sealed_lost` by a resume
-without `sealed`, never stored (§4.1 to §4.5), and a sealed message's
-report (§4.12); and both across server links, to and from peers that
+without `sealed`, never stored (§4.1 to §4.5), a person's devices each
+sealed to with a box of its own (§4.14), and a sealed message's report
+(§4.12); and both across server links, to and from peers that
 try the server linking user keys draft (§5, `server-link.md` §7.7):
 signed lobby lines and signed private messages in their link form,
 checked where they arrive once the certificate a server fetches by Link
@@ -762,7 +763,11 @@ never shared, and an index of signed articles by `(signer, id)` (§4.10);
 `server_key` in a ghost line's `from.remote` and an index of signed
 lines by `(signer, id)` (§4.7, §5); and `server-link.md` and
 `hotline-ng.md` `server_key` in a live `chat` event's `from.remote`
-(§5). §4.1 to §4.5 are sealing; §4.6 onward, signing.
+(§5). §4.1 to §4.5 are sealing; §4.6 to §4.13, signing; and §4.14,
+sealing to a person, adds to `hotline-ng.md` §7.6's `persons` the
+`device` on `device_cert`, `boxes` and `held_full` on `msg`,
+`from.device`, and the error codes `devices_changed` and
+`no_such_device`.
 
 ### 4.1 Saying a client can open them
 
@@ -811,7 +816,7 @@ client would scrape to watch who logs in with which device (*hxd-ng:*
 
 A client checks the certificate exactly as §3.9 step 5 checks the
 sender's, against the fingerprint the roster shows for `uid`, and seals
-only to one that passes.
+only to one that passes. A `uid` naming a person is §4.14's.
 
 ### 4.3 Sending
 
@@ -1291,6 +1296,169 @@ signed, pre-committed handover that carries the old key forward as an
 alias is specified separately, in
 [server-key-handover.md](server-key-handover.md).
 
+### 4.14 Sealing to a person
+
+On a server that groups persons (`hotline-ng.md` §7.6), one row stands
+for several devices, each with a certificate and a `device_enc` key of
+its own, so a message to a person is sealed once for each device. `uid`
+names the person, and `device` one of its devices, by the device id of
+`hotline-ng.md` §7.6.
+
+**Which devices.** One rule says which devices can be sealed to, and it
+is behind the `sealed` in each device entry and on the row, every list
+the server gives a sender, and every box it delivers, so they cannot
+disagree: a live device that said `sealed` (§4.1), whose certificate
+allows messages, is at most 512 bytes, unexpired and not revoked, and
+whose session is not being kicked. It is judged as it is asked, so a
+revocation counts from the moment it lands, before the session it ends
+is gone. A device sealing to its own person leaves itself out; a
+session alone may still seal to itself.
+
+**Fetching the certificates.**
+
+```jsonc
+{ "id": 11, "req": "device_cert", "params": { "uid": 3 } }
+{ "reply": 11, "ok": { "devices": [
+    { "device": 4519832211, "cert": "<base64url>" },
+    { "device": 6602381947, "cert": "<base64url>" } ] } }
+{ "id": 12, "req": "device_cert", "params": { "uid": 3, "device": 6602381947 } }
+{ "reply": 12, "ok": { "cert": "<base64url>" } }
+```
+
+- From a session that declared `persons`, `uid` naming a person answers
+  `devices`, one `{device, cert}` for each device it can be sealed to,
+  and nothing else, even when there is one; a person with none is
+  `not_sealed`. A `uid` naming a session alone is answered `{cert}`, as
+  §4.2 has it.
+- `device` beside `uid` fetches that one device's certificate, to seal
+  again after `cert_changed`. A device not the row's is
+  `no_such_device`, and one of the row's that cannot be sealed to is
+  `not_sealed`. `device` from a session without `persons`, or naming a
+  linked server's user, is `bad_request`.
+- To a session without `persons`, a person with exactly one device it
+  can be sealed to is answered that device's `cert`, and one with any
+  other number `not_sealed`.
+- Every answer about the target, a refusal too, spends one of §4.2's
+  ration (*hxd-ng:* 20 a minute), and a `devices` list one more for
+  each device past its first, so a client learns a person's devices no
+  faster than it would learn as many sessions' certificates. An asker
+  that is not `sealed`, and a `bad_request`, spend nothing. The rest of
+  §4.2 holds: the asker must be `sealed`, a block from any of the
+  person's mailboxes is `blocked`, and it weighs 4.
+
+**Sending.** `msg` takes `boxes` in place of `sealed` and `cert`, one box
+for each device:
+
+```jsonc
+{ "id": 13, "req": "msg", "params": { "to": 3, "boxes": [
+    { "device": 4519832211, "sealed": "AQ...", "cert": "q2..." },
+    { "device": 6602381947, "sealed": "AQ...", "cert": "x9..." } ] } }
+{ "reply": 13, "ok": { "queued": false } }
+```
+
+- Only a session that declared `persons` sends `boxes`; from any other
+  it is `bad_request`. `boxes` goes with `to` and nothing else: beside
+  `sealed`, `cert`, `to_login`, `text`, `signed`, `media`, `guid`, `re`
+  or `emoji`, or without `to`, it is `bad_request`. It holds from 1 to 8
+  boxes, and two for one device are `bad_request`.
+- Each box is held to what §4.3 holds a single `sealed` and `cert` to:
+  one of §3.7's sizes plus 49 bytes, `cert` the SHA-256 of a
+  `device_enc` key, and a deniable box's `pkS` the sender's own key. One
+  that fails is `bad_request`.
+- `to` names a person, or a session alone, which is one device.
+- The server checks blocks against every mailbox among the target's
+  devices, as `device_cert` does. Then, at once, it checks the boxes
+  against the devices that can be sealed to and delivers them, so no
+  device can come or go between the check and the delivery.
+- Unless the boxes are exactly one for each such device and none for
+  any other, the whole message is refused `devices_changed`, with
+  `devices` beside the code, as `retry_after` is, listing them as
+  `device_cert` would. No device silently misses a message
+  (`hotline-ng-rationale.md` §9).
+
+  ```jsonc
+  { "reply": 13, "error": { "code": "devices_changed", "text": "...",
+      "devices": [ { "device": 4519832211, "cert": "<base64url>" } ] } }
+  ```
+
+- A box whose `cert` names a key other than its device's now is
+  `cert_changed`, with `device` beside the code naming that box's
+  device. Nothing is delivered.
+
+  ```jsonc
+  { "reply": 13, "error": { "code": "cert_changed", "text": "...",
+      "device": 6602381947 } }
+  ```
+
+- Each of the two tells what `device_cert` would, so each spends the
+  ration as it does: `devices_changed` as a `devices` list, and
+  `cert_changed` one. Past the ration it is `rate_limited` instead. A
+  target with no device to seal to is `not_sealed`, and spends none.
+- Every box is then delivered to its own device, live or held as §4.3
+  holds one. A device that cannot take its box, detached and holding as
+  much as §4.3 lets it from this sender or in all, or whose held events
+  have overflowed, or whose connection is being dropped as too slow, is
+  skipped, and the rest are delivered (`hotline-ng-rationale.md` §9).
+  `ok` names the skipped devices in `held_full`. If no box could be
+  delivered, the message is `mailbox_full`.
+
+  ```jsonc
+  { "reply": 13, "ok": { "queued": false, "held_full": [ 6602381947 ] } }
+  ```
+
+- It is one message for spam points, and weighs 2 against the request
+  limit plus 1 for each 2048 bytes of its boxes together.
+
+A client told `devices_changed` seals to the devices it is given and
+sends again; told `cert_changed`, it fetches that device's certificate
+and does the same. Neither is a reason to fall back to cleartext. Told
+`held_full`, it MAY tell its user which devices will not see the
+message.
+
+**Sealing to your own person.** A device may seal to its own person's
+row, and the devices that can be sealed to leave the sending device out:
+its boxes are one for each of its other devices. The `msg` each of
+those devices receives is from the row, with `from.device` naming the
+sender.
+
+**Receiving.** Each device is sent its own box alone, as §4.4's `msg`.
+`from.uid` is the sealer's row, even to its own person, and
+`from.fingerprint` the person's. To a session that declared `persons`,
+a box sealed by a device of a person also carries `from.device`, that
+device's id; to any other session, and for a sealer alone, there is
+none:
+
+```jsonc
+{ "seq": 51, "ev": "msg", "data": {
+    "from": { "uid": 3, "nick": "Alice", "fingerprint": "6htgz65...",
+              "device": 4519832211 },
+    "text": "[Encrypted message]", "sealed": "AQ...",
+    "at": 1763251290, "queued": false } }
+```
+
+The reader checks the box as §3.9 does, against the fingerprint the
+roster shows for `from.uid`, which for a box from its own person is its
+own. A reply seals to the row by device, as any message to a person
+does.
+
+**A client that knows no devices** seals to one device, as §4.3 has it,
+and grouping changes one thing for it. A person with exactly one device
+it can be sealed to shows `identity.sealed` on its row on the ng wire
+(the classic row has no field for it), its ng viewers are sent
+`user_changed` each time that count crosses one, and `device_cert {uid}`
+and `msg {to, sealed, cert}` go to that device. To a person with any
+other number, both are `not_sealed`. A client with `persons` may use the
+single form the same way.
+
+**Across a link.** No link names a device yet (§11), so nothing is
+sealed between a person and a linked server's user, either way, a person
+of one device included. A grouped session's `device_cert` or sealed
+`msg` to a linked server's user is `not_sealed`, and so is a `msg` with
+`boxes` to one, from any session. A linked server asking a person's
+certificate by Link Device Keys, or sending a sealed 905 to a person, is
+answered `NoDeviceKeys` (§5). A session alone seals across a link as §5
+has it.
+
 ## 5. Across server links
 
 As the server linking user keys draft has it: a certificate crosses as
@@ -1531,7 +1699,9 @@ read-only to a classic client (§4.8).
   it (hxd-ng: one more).
 - A detached form is at most 1020 bytes (§3.1), and its link form 256
   (§5); signed text is refused over its limit, never cut (§4.7).
-- `device_cert` is rate-limited per session (§4.2).
+- `device_cert` is rate-limited per session (§4.2), and a person's
+  devices and the refusals that list them are counted against it
+  (§4.14).
 
 ## 8. What a client should do
 
@@ -1691,6 +1861,9 @@ device added after the mail was sent, which cannot read it.
   holds, at the price of making signing a commitment of the identity
   rather than a choice per line.
 - **Signed chat on the classic wire** (§6).
+- **Sealing to a person across a link** (§4.14): a Link Device Keys
+  that answers each device of a row, and a sealed 905 that names its
+  device.
 - **Private chat**, which needs a group construction this one is not,
   and an answer to §1.3 before it is signed.
 
