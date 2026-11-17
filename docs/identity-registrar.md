@@ -467,6 +467,63 @@ have never seen the user" gap is closed by the one party that has.
 
 ---
 
+### 5.5 Successor code
+
+The key a card commits to (§5.4) is kept nowhere but on paper until a
+rotation needs it, so a client writes it down as a **successor code**
+when it makes the commitment, and the user types it back to rotate. The
+code is the successor identity key's 32-byte seed:
+
+```
+S1-B9D5M-PJTB9-D5MPJ-TB9D5-MPJTB-9D5MP-JTB9D-5MPJT-B9D5M-PJTB9-D0EZ
+```
+
+`S1`, then 54 symbols of Crockford base32
+(`0123456789ABCDEFGHJKMNPQRSTVWXYZ`):
+
+- the first 52 are the seed's 256 bits, most significant bit first; the
+  last of them carries the seed's final bit and four zero bits;
+- the last 2 are the first 10 bits of
+  `SHA-256("hl-identity/successor-code/v1" || seed)`.
+
+It is shown as `S1-` and the 54 symbols in groups of five joined by
+hyphens, once, at the commitment, and never stored by the client.
+
+`S1` names the kind and the form. A fingerprint is of the same alphabet
+and nearly the same length, and without the prefix one would read as a
+successor code; with it, and the fixed length, neither a fingerprint nor
+a recovery code (§9.3) reads as one, and a later form (`S2`) can be told
+apart. Both of its symbols are of the alphabet, so the reading below
+reads them too.
+
+The code is typed back forgiving case, spaces, hyphens and Crockford's
+confusables (`O` for `0`, `I` and `L` for `1`), as a recovery code is,
+since it is read off paper. A client MUST read as no code at all
+anything else off the alphabet, a code without `S1`, a number of symbols
+other than 56 with it, and a last seed symbol with any of its four low
+bits set.
+
+What it checks next depends on whether it holds the card the code is
+for:
+
+- **Without the card**, the check symbols are all there is: a code
+  whose check symbols are not its seed's MUST be read as no code. A
+  misread seed is another key, and nothing about it looks wrong until
+  the rotation it signs is refused; ten bits miss about one random
+  misreading in a thousand.
+- **With the card**, the commitment decides instead of the check
+  symbols, which it outranks: the client MUST NOT sign with a code
+  unless `SHA-256` of its key's public key equals the card's
+  `successor`, whatever its check symbols say. A code that does not
+  match MAY be mended: read again with each seed symbol in turn taken
+  for each other symbol, or with its one symbol off the alphabet taken
+  for each, and the reading the commitment matches taken. A misread
+  check symbol leaves the seed as typed, so the commitment matches as
+  it stands. Two misread symbols are not mended.
+
+A code is one key's: a rotation (§4.6) uses it once, and the successor
+commits to a new one in its own card, written down the same way.
+
 ## 6. Endpoints
 
 All under the registrar's advertised paths, on the ng listener, HTTPS.
