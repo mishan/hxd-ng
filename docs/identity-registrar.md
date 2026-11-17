@@ -500,20 +500,26 @@ The code is typed back forgiving case, spaces, hyphens and Crockford's
 confusables (`O` for `0`, `I` and `L` for `1`), as a recovery code is,
 since it is read off paper. A client MUST read as no code at all
 anything else off the alphabet, a code without `S1`, a number of symbols
-other than 56 with it, a last seed symbol with any of its four low bits
-set, and check symbols other than the seed's.
+other than 56 with it, and a last seed symbol with any of its four low
+bits set.
 
-The check symbols catch a misread symbol where nothing else would: a
-misread seed is another key, and nothing about it looks wrong until the
-rotation it signs is refused. Ten bits miss about one random misreading
-in a thousand. A client that holds the card the code is for MUST also
-check the code against the card's commitment before signing with it,
-`SHA-256` of the key's public key equal to the card's `successor`, and
-MAY mend a code that fails: read it again with each seed symbol in turn
-taken for each other symbol, or with its one symbol off the alphabet
-taken for each, and take the reading the commitment matches. A misread
-check symbol leaves the seed as typed. Two misread symbols are not
-mended.
+What it checks next depends on whether it holds the card the code is
+for:
+
+- **Without the card**, the check symbols are all there is: a code
+  whose check symbols are not its seed's MUST be read as no code. A
+  misread seed is another key, and nothing about it looks wrong until
+  the rotation it signs is refused; ten bits miss about one random
+  misreading in a thousand.
+- **With the card**, the commitment decides instead of the check
+  symbols, which it outranks: the client MUST NOT sign with a code
+  unless `SHA-256` of its key's public key equals the card's
+  `successor`, whatever its check symbols say. A code that does not
+  match MAY be mended: read again with each seed symbol in turn taken
+  for each other symbol, or with its one symbol off the alphabet taken
+  for each, and the reading the commitment matches taken. A misread
+  check symbol leaves the seed as typed, so the commitment matches as
+  it stands. Two misread symbols are not mended.
 
 A code is one key's: a rotation (§4.6) uses it once, and the successor
 commits to a new one in its own card, written down the same way.
