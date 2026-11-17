@@ -256,10 +256,6 @@ pub(crate) async fn msg(ctx: &NgCtx, state: &SessState, id: u64, mut p: MsgParam
     }
 }
 
-/// The most boxes one message carries: past the devices one account may
-/// have on at once, and bounded so one request stays small.
-const MAX_BOXES: usize = 8;
-
 /// `msg` with `boxes`, from a client that declared `persons`: one box for
 /// each device the target can be sealed to (§4.3).
 async fn msg_boxes(
@@ -288,8 +284,13 @@ async fn msg_boxes(
     let Some(to) = p.to else {
         return bad("A sealed message is to a user, by `to`.");
     };
-    if boxes.is_empty() || boxes.len() > MAX_BOXES {
-        return bad("`boxes` holds from 1 to 8 boxes.");
+    let most = ctx.core.max_boxes();
+    if boxes.is_empty() || boxes.len() > most {
+        return reply_err(
+            id,
+            "bad_request",
+            &format!("`boxes` holds from 1 to {most} boxes."),
+        );
     }
     let own = state
         .device
@@ -340,5 +341,28 @@ async fn msg_boxes(
         }
         Some(Err(e)) => boxes_refused(id, e),
         None => reply_err(id, "server_error", "Server error."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_many_boxes_of_the_largest_size_as_fit_in_one_request_and_no_more() {
+        let largest =
+            hl_identity::message::PAD_SIZES.iter().max().unwrap() + hl_identity::sealed::OVERHEAD;
+        let request = |n: usize| {
+            let one = json!({
+                "device": (1u64 << 53) - 1,
+                "sealed": b64url(&vec![0; largest]),
+                "cert": b64url(&[0; 32]),
+            });
+            json!({ "req": "msg", "id": u64::MAX, "params": { "to": u16::MAX, "boxes": vec![one; n] } })
+                .to_string()
+                .len()
+        };
+        assert!(request(hxd_core::MAX_BOXES) <= crate::http::MAX_MESSAGE);
+        assert!(request(hxd_core::MAX_BOXES + 1) > crate::http::MAX_MESSAGE);
     }
 }

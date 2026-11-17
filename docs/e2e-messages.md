@@ -1309,10 +1309,12 @@ is behind the `sealed` in each device entry and on the row, every list
 the server gives a sender, and every box it delivers, so they cannot
 disagree: a live device that said `sealed` (§4.1), whose certificate
 allows messages, is at most 512 bytes, unexpired and not revoked, and
-whose session is not being kicked. It is judged as it is asked, so a
-revocation counts from the moment it lands, before the session it ends
-is gone. A device sealing to its own person leaves itself out; a
-session alone may still seal to itself.
+whose session is not being kicked. Of more such devices than one
+message is sealed to, the most a `boxes` holds, only that many are,
+the ones that logged in most recently (`hotline-ng-rationale.md` §9).
+It is judged as it is asked, so a revocation counts from the moment it
+lands, before the session it ends is gone. A device sealing to its own
+person leaves itself out; a session alone may still seal to itself.
 
 **Fetching the certificates.**
 
@@ -1359,8 +1361,12 @@ for each device:
 - Only a session that declared `persons` sends `boxes`; from any other
   it is `bad_request`. `boxes` goes with `to` and nothing else: beside
   `sealed`, `cert`, `to_login`, `text`, `signed`, `media`, `guid`, `re`
-  or `emoji`, or without `to`, it is `bad_request`. It holds from 1 to 8
-  boxes, and two for one device are `bad_request`.
+  or `emoji`, or without `to`, it is `bad_request`. It holds from 1 box
+  to as many as the connections one account may hold, and never more
+  than one request carries of boxes of the largest size (*hxd-ng:*
+  `[limits] connections_per_account`, 10 by default, and at most 11,
+  which is also the limit where it is 0); more, or two for one device,
+  are `bad_request`.
 - Each box is held to what §4.3 holds a single `sealed` and `cert` to:
   one of §3.7's sizes plus 49 bytes, `cert` the SHA-256 of a
   `device_enc` key, and a deniable box's `pkS` the sender's own key. One
@@ -1709,6 +1715,10 @@ read-only to a classic client (§4.8).
 - `device_cert` is rate-limited per session (§4.2), and a person's
   devices and the refusals that list them are counted against it
   (§4.14).
+- A message to a person is sealed to as many of its devices as one
+  account may connect at once, its newest, and to no more than one
+  request can carry a box of the largest size for (§4.14; *hxd-ng:* 11,
+  in its 256 KiB message).
 
 ## 8. What a client should do
 

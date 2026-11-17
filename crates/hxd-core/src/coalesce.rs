@@ -360,9 +360,9 @@ impl RosterInner {
         // Sealed to by device, which the row is not, but for a person
         // with one device it can be sealed to: a client that knows
         // nothing of devices can seal to that one, and is shown it can.
-        let sealable: Vec<_> = members.iter().filter_map(|s| self.sealable(s)).collect();
+        let sealable = self.sealing_devices(&p.members);
         let sealed = match sealable.as_slice() {
-            [one] => Some(std::sync::Arc::new((*one).clone())),
+            [(_, one)] => Some(std::sync::Arc::new((*one).clone())),
             _ => None,
         };
         // The person's identity, from whichever device shows one: a
@@ -608,8 +608,13 @@ impl RosterInner {
 
     /// The devices under `row`, in the order they joined it.
     pub(crate) fn devices_of(&self, row: Uid) -> Vec<Device> {
-        self.person_members(row)
-            .unwrap_or_default()
+        let members = self.person_members(row).unwrap_or_default();
+        let sealable: Vec<Uid> = self
+            .sealing_devices(members)
+            .iter()
+            .map(|(s, _)| s.info.uid)
+            .collect();
+        members
             .iter()
             .filter_map(|m| self.users.get(m))
             .map(|s| {
@@ -622,7 +627,7 @@ impl RosterInner {
                     status: s.info.status,
                     since: s.since,
                     label: s.label.clone(),
-                    sealed: self.sealable(s).is_some(),
+                    sealed: sealable.contains(&s.info.uid),
                     signs: identity.is_some_and(|i| i.signs),
                     login: Some(s.login.clone()),
                     addr: s.addr,

@@ -98,7 +98,9 @@ as AGENTS.md's "Releasing" describes it.
   sees its own devices and may end one, and a moderator's sees every
   person's devices, with each one's login and address, and may kick one
   alone; sealed messages reach each device of a person with a box of its
-  own (docs/operating.md, Persons; docs/hotline-ng.md §7.6). A client
+  own, up to `[limits] connections_per_account` of its newest devices
+  and never more than 11, which is also the limit where it is 0
+  (docs/operating.md, Persons; docs/hotline-ng.md §7.6). A client
   that does not declare it sees one user per person.
 - Metrics: `hxd_roster_rows` counts the rows the user list shows,
   beside `hxd_sessions` (docs/metrics.md).

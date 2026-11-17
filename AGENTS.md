@@ -575,7 +575,8 @@ Three layers, all `cargo test --workspace`:
   `devices_changed` with the devices as they are, a client knowing
   nothing of devices sealing to a person with one and answered, and a
   message of boxes refused as malformed but from a `persons` client
-  with one to eight), `voice.rs`
+  with one to as many as an account may connect, at most a request's
+  worth, cap 0 included), `voice.rs`
   (voice signaling on both wires against a recording media layer: the
   capability and privilege gates, the chunk and JSON shapes, one room
   shared by a classic and an ng client, joins past a session's

@@ -73,6 +73,11 @@ async fn start(dir: &Path) -> Server {
 
 /// With a person's devices one row when `coalesce` says so.
 async fn start_with(dir: &Path, coalesce: bool) -> Server {
+    start_holding(dir, coalesce, hxd_core::limits::CONNECTIONS_PER_ACCOUNT).await
+}
+
+/// [`start_with`], each account holding `per_account` connections.
+async fn start_holding(dir: &Path, coalesce: bool, per_account: usize) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n";
@@ -110,6 +115,10 @@ async fn start_with(dir: &Path, coalesce: bool) -> Server {
         )
         .with_moderation(store, ModerationPolicy::default())
         .with_coalesce(coalesce)
+        .with_conn_limits(hxd_core::ConnLimits {
+            per_account,
+            ..Default::default()
+        })
         // Small enough that two senders reach it inside their own shares.
         .with_sealed_holds(hxd_core::SealedHolds {
             per_sender: 64 * 1024,
@@ -916,7 +925,8 @@ async fn a_client_knowing_nothing_of_devices_seals_to_a_person_with_one_and_is_a
 }
 
 #[tokio::test]
-async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_with_one_to_eight() {
+async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_with_one_to_the_limit(
+) {
     let dir = tempfile::tempdir().unwrap();
     let server = start_with(dir.path(), true).await;
     let (alice, bob) = (person(1, 1, "alice"), person(2, 2, "bob"));
@@ -932,6 +942,15 @@ async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_wi
     let device = json!({ "device": 1, "cert": got["cert"] });
     let one = box_for(&device, &message(&bob, 1, &alice, "x"), &bob);
     let boxes = |n: usize| vec![one.clone(); n];
+    let distinct = |n: usize| -> Vec<Value> {
+        (1..=n as u64)
+            .map(|d| {
+                let mut b = one.clone();
+                b["device"] = json!(d);
+                b
+            })
+            .collect()
+    };
     assert_eq!(
         code(&mut plain, "msg", json!({ "to": row, "boxes": boxes(1) })).await,
         "bad_request",
@@ -951,7 +970,10 @@ async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_wi
     let (mut b, _) = login_as(server.ng, &bob, json!({ "sealed": true, "persons": true })).await;
     for (case, params) in [
         ("no box", json!({ "to": row, "boxes": [] })),
-        ("nine", json!({ "to": row, "boxes": boxes(9) })),
+        (
+            "past the limit",
+            json!({ "to": row, "boxes": distinct(11) }),
+        ),
         ("one device twice", json!({ "to": row, "boxes": boxes(2) })),
         (
             "beside text",
@@ -964,5 +986,46 @@ async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_wi
         ("to no one", json!({ "boxes": boxes(1) })),
     ] {
         assert_eq!(code(&mut b, "msg", params).await, "bad_request", "{case}");
+    }
+}
+
+#[tokio::test]
+async fn as_many_boxes_as_an_account_may_connect_are_taken_up_to_one_requests_worth() {
+    for (per_account, most) in [(2, 2), (0, hxd_core::MAX_BOXES)] {
+        let dir = tempfile::tempdir().unwrap();
+        let server = start_holding(dir.path(), true, per_account).await;
+        let (alice, bob) = (person(1, 1, "alice"), person(2, 2, "bob"));
+        let (_a, _) = login_as(
+            server.ng,
+            &alice,
+            json!({ "sealed": true, "persons": true }),
+        )
+        .await;
+        let (mut b, hello) =
+            login_as(server.ng, &bob, json!({ "sealed": true, "persons": true })).await;
+        let row = uid_of(&hello["users"], "alice");
+        let got = ok(&mut b, "device_cert", json!({ "uid": row })).await;
+        let device = got["devices"][0].clone();
+        let one = box_for(&device, &message(&bob, 1, &alice, "x"), &bob);
+        let boxes = |n: u64| -> Vec<Value> {
+            (1..=n)
+                .map(|d| {
+                    let mut b = one.clone();
+                    b["device"] = json!(d);
+                    b
+                })
+                .collect()
+        };
+        let n = most as u64;
+        assert_eq!(
+            code(&mut b, "msg", json!({ "to": row, "boxes": boxes(n) })).await,
+            "devices_changed",
+            "{per_account}: {most} taken"
+        );
+        assert_eq!(
+            code(&mut b, "msg", json!({ "to": row, "boxes": boxes(n + 1) })).await,
+            "bad_request",
+            "{per_account}: one more"
+        );
     }
 }

@@ -571,8 +571,10 @@ each one's login and address, and can kick one device alone. A device ended this
 the classic wire sees its connection close, which a 1.5 client shows as
 a lost connection. Clients that do not ask see none of this, and
 sealed messages to a person of more than one device need a client that
-does ([e2e-messages.md](e2e-messages.md) §4.14). Give moderators
-linked identities and have them log in with one: a moderator account
+does ([e2e-messages.md](e2e-messages.md) §4.14). A message is sealed
+to at most `connections_per_account` of a person's devices, its newest,
+and never to more than 11, which is also the limit where it is 0. Give
+moderators linked identities and have them log in with one: a moderator account
 that logs in with a password, if its password is stolen, shows whoever
 holds it every person's devices with their addresses, and lets them end
 those devices. `hxd_roster_rows`

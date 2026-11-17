@@ -361,6 +361,21 @@ devices as they are, so sealing again costs one round trip. Delivery is
 checked and made in one hold of the roster, so a device that joins or
 leaves in between cannot split the message either.
 
+**A person past the box limit is sealed to on its newest devices.** One
+message carries its boxes in one request, so a person can have more
+devices than one message reaches: where the server lets an account
+connect without limit, or from detached sessions, which hold no
+connection. Refusing such a person every sealed message would be worse
+than leaving some devices out, and the ones left out had better be the
+ones least likely to be read: the oldest logins, a laptop left open
+somewhere rather than the phone in hand. The rule picks them by the
+order the person's sessions logged in, which a resume and a takeover
+keep, and it is the same rule behind everything a sender is shown, so
+the list, the shown `sealed` and the delivery agree on which devices
+those are. The limit follows the connections an account may hold because
+that is how many devices a person normally has; the ceiling is what one
+request carries.
+
 **A full device gets its box skipped, and the rest delivered.** Unlike
 a wrong set, a device that holds as much sealed mail as it may is a
 state the sender cannot fix, and refusing the whole message would let a
