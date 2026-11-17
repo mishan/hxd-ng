@@ -883,3 +883,39 @@ fn a_request_from_a_device_already_ended_is_no_flood_of_its_own() {
     let refused = core.spend_spam(a2, 2, 0x69).unwrap_err();
     assert!(refused.already_out(), "{refused:?}");
 }
+
+#[test]
+fn a_detached_device_that_loses_the_kick_bit_replays_its_own_devices_without_their_details() {
+    let core = Core::new().with_coalesce(true);
+    let mut info = session("alice", Some(ALICE), Some(ALICE), proved(ng(true)));
+    info.access = info.access.with(bit::DISCONNECT_USERS);
+    info.addr = Some("192.0.2.7".parse().unwrap());
+    let (a1, mut r1) = on(&core, info);
+    drain(&mut r1);
+    let seq = core.current_seq(a1).unwrap();
+    assert!(core.connection_lost(a1, usize::MAX));
+    let (_a2, _r2) = alice(&core, proved(ng(true)));
+    assert!(core.set_session_mask(
+        a1,
+        crate::DenyMask {
+            access: AccessBits::empty().with(bit::DISCONNECT_USERS),
+            ..Default::default()
+        }
+    ));
+    let crate::Resume::Replayed(_, replay) = core.resume(a1, seq) else {
+        panic!("held for its resume");
+    };
+    let own: Vec<&Device> = replay
+        .iter()
+        .filter_map(|se| match &se.event {
+            Event::PersonRow { user, devices, .. } if user.uid == a1 => Some(devices.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(!own.is_empty(), "{replay:?}");
+    assert!(
+        own.iter().all(|d| d.login.is_none() && d.addr.is_none()),
+        "{own:?}"
+    );
+}

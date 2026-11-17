@@ -1058,16 +1058,43 @@ impl Outbox {
 
     /// Every row with devices held for a session that may no longer see
     /// them becomes the row alone, keeping its seq: all but its own
-    /// person's, `own`, which it still sees.
+    /// person's, `own`, which it still sees, without what a moderator is
+    /// shown of each.
     pub(crate) fn lose_devices(&mut self, own: Uid) {
         let Sink::Buffering { buf, share, .. } = &mut self.sink else {
             return;
         };
         for se in buf.iter_mut() {
-            let Event::PersonRow { joined, user, .. } = &se.event else {
+            let Event::PersonRow {
+                joined,
+                user,
+                devices,
+            } = &mut se.event
+            else {
                 continue;
             };
+            // Its own person's devices it still sees, but not as a
+            // moderator does: their logins and addresses go with the bit.
             if user.uid == own {
+                if devices
+                    .iter()
+                    .any(|d| d.login.is_some() || d.addr.is_some())
+                {
+                    let before = se.event.weight();
+                    let Event::PersonRow { devices, .. } = &mut se.event else {
+                        unreachable!("matched above");
+                    };
+                    *devices = devices
+                        .iter()
+                        .cloned()
+                        .map(|mut d| {
+                            d.login = None;
+                            d.addr = None;
+                            d
+                        })
+                        .collect();
+                    share.give(before.saturating_sub(se.event.weight()));
+                }
                 continue;
             }
             let row = if *joined {
