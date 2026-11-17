@@ -4202,6 +4202,7 @@ pub(crate) fn kick_in(r: &mut RosterInner, target: Uid) -> Result<String, ChatEr
         sess.kicked = true;
     }
     r.send_to(target, Event::Kicked);
+    r.export_leaving(target);
     // A detached session has no connection to observe the event; the
     // kick must end it here or it would linger on the roster.
     if r.users

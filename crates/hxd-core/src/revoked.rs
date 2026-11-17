@@ -242,6 +242,7 @@ impl Core {
         for (uid, nick) in &ended {
             info!(uid, nick = %nick, "ending a session whose key is revoked");
             r.send_to(*uid, Event::Kicked);
+            r.export_leaving(*uid);
             if r.users.get(uid).is_some_and(is_buffering) {
                 r.end_session(*uid);
             }

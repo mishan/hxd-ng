@@ -385,9 +385,15 @@ A box whose key changed is different again: the sender can fix it, and
 a box sealed to an old key is one its device could not open, so nothing
 is delivered.
 
-**Nothing is sealed between a person and a linked server's user.** A
-link names a user by its row and a certificate by that user alone, so
+**A person is sealed with across a link only while it has one device.**
+A link names a user by its row and a certificate by that user alone, so
 it cannot say which device of a person a box is for, nor answer a
-person's devices. Sealing one way only, from a person to a peer's user
-who could not seal back, would make a conversation that cannot be
-answered. Both directions wait for a link wire that names devices.
+person's devices. With one device it can be sealed to there is nothing
+to choose, and it is sealed with both ways as a session alone is, which
+keeps sealed messages across links for everyone with a linked identity
+on a server that groups persons. With two or more it is neither way:
+sealing one way only, from a person to a peer's user who could not seal
+back, would make a conversation that cannot be answered. A conversation
+that stops when a second device joins is the price, the same one a
+client that knows nothing of devices pays here; more waits for a link
+wire that names devices.

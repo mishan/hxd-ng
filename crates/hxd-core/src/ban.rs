@@ -869,6 +869,7 @@ impl crate::Core {
                 sess.kicked = true;
             }
             r.send_to(uid, crate::Event::Kicked);
+            r.export_leaving(uid);
             if r.users.get(&uid).is_some_and(crate::roster::is_buffering) {
                 r.end_session(uid);
             }
