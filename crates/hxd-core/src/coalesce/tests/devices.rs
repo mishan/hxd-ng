@@ -612,3 +612,310 @@ fn with_coalescing_off_nothing_is_shown_of_devices() {
     status(&core, a1, SessionStatus::Idle);
     assert!(rows_told(&mut r1).is_empty() && rows_told(&mut rm).is_empty());
 }
+
+/// What `rx` was told that ends it.
+fn ends(rx: &mut Events) -> Vec<Event> {
+    drain(rx)
+        .into_iter()
+        .filter(|e| matches!(e, Event::Kicked | Event::Ended))
+        .collect()
+}
+
+#[test]
+fn a_device_ends_another_of_its_person_or_itself_and_the_last_is_its_person() {
+    use crate::coalesce::DeviceRefusal;
+    // (case, devices besides the actor, the one ended: 0 the actor
+    // itself, 1 the next, and how that one is on).
+    #[derive(Clone, Copy, Debug)]
+    enum On {
+        Ng,
+        Detached,
+        Classic,
+    }
+    for (case, others, target, on) in [
+        ("itself", 1, 0, On::Ng),
+        ("another", 1, 1, On::Ng),
+        ("a detached one", 1, 1, On::Detached),
+        ("a classic one", 1, 1, On::Classic),
+        ("the last, itself", 0, 0, On::Ng),
+    ] {
+        let core = Core::new().with_coalesce(true);
+        let (_bob, mut rb) = other(&core, "bob", ng(false), false);
+        let (a1, r1) = alice(&core, proved(ng(true)));
+        let mut devices = vec![(a1, r1)];
+        for _ in 0..others {
+            let t = match on {
+                On::Classic => proved(Transport::default()),
+                _ => proved(ng(true)),
+            };
+            devices.push(alice(&core, t));
+        }
+        let ended = devices[target].0;
+        if matches!(on, On::Detached) {
+            assert!(core.connection_lost(ended, usize::MAX), "{case}");
+        }
+        drain(&mut rb);
+        for (_, rx) in devices.iter_mut() {
+            drain(rx);
+        }
+
+        assert_eq!(
+            core.device_end(a1, device_of(&core, ended)),
+            Ok(()),
+            "{case}"
+        );
+        if matches!(on, On::Detached) {
+            assert!(
+                core.user(ended).is_none(),
+                "{case}: no connection to end it"
+            );
+        } else {
+            let (_, rx) = devices.iter_mut().find(|(u, _)| *u == ended).unwrap();
+            // A classic device has no `ended` to hear.
+            let told = if matches!(on, On::Classic) {
+                Event::Kicked
+            } else {
+                Event::Ended
+            };
+            assert_eq!(ends(rx), [told], "{case}: the ended device is told so");
+            // Its connection ends it, having told it.
+            assert!(core.user(ended).is_some(), "{case}");
+            core.end_session(ended);
+        }
+        // The rest of the person stays; only the last parts.
+        let parted = presence(&mut rb)
+            .into_iter()
+            .any(|e| e == Event::Parted(a1));
+        assert_eq!(parted, others == 0, "{case}: bob sees the person go");
+        for (uid, rx) in devices.iter_mut().filter(|(u, _)| *u != ended) {
+            assert_eq!(ends(rx), [], "{case}: {uid} stays");
+        }
+        // Gone is gone.
+        assert_eq!(
+            core.device_end(a1, device_of_gone(&core, ended)),
+            Err(if ended == a1 {
+                DeviceRefusal::NoSuchUser
+            } else {
+                DeviceRefusal::NoSuchDevice
+            }),
+            "{case}"
+        );
+    }
+}
+
+/// A device id nobody holds once `uid` has gone, or its own while it is
+/// on its way.
+fn device_of_gone(core: &Core, uid: Uid) -> u64 {
+    core.roster
+        .lock()
+        .unwrap()
+        .users
+        .get(&uid)
+        .map_or(u64::MAX, |s| s.device)
+}
+
+#[test]
+fn a_password_device_ends_only_its_persons_password_devices() {
+    use crate::coalesce::DeviceRefusal;
+    let core = Core::new().with_coalesce(true);
+    let (keyed, mut rk) = alice(&core, proved(ng(true)));
+    let (pw, _rp) = alice(&core, ng(true));
+    let (pw2, mut rp2) = alice(&core, ng(true));
+    drain(&mut rk);
+    assert_eq!(
+        core.device_end(pw, device_of(&core, keyed)),
+        Err(DeviceRefusal::NoSuchDevice),
+        "a password does not reach the device that proved the identity"
+    );
+    assert_eq!(ends(&mut rk), []);
+    assert_eq!(core.device_end(pw, device_of(&core, pw2)), Ok(()));
+    assert_eq!(ends(&mut rp2), [Event::Ended]);
+    // And the device that proved it reaches every one.
+    core.end_session(pw2);
+    assert_eq!(core.device_end(keyed, device_of(&core, pw)), Ok(()));
+}
+
+#[test]
+fn a_device_kick_ends_one_device_and_leaves_its_last_to_a_kick() {
+    use crate::coalesce::{DeviceKick, DeviceRefusal};
+    let core = Core::new().with_coalesce(true);
+    let (_bob, mut rb) = other(&core, "bob", ng(false), false);
+    let (a1, mut r1) = alice(&core, proved(ng(true)));
+    let (a2, mut r2) = alice(&core, proved(ng(true)));
+    drain(&mut rb);
+    drain(&mut r1);
+    assert_eq!(
+        core.kick_device(a1, device_of(&core, a2)),
+        Ok(DeviceKick::Ended)
+    );
+    assert_eq!(ends(&mut r2), [Event::Kicked]);
+    assert_eq!(ends(&mut r1), [], "the rest of the person stays");
+    // Nobody is told the person went: it has not.
+    assert!(drain(&mut rb).iter().all(|e| !matches!(
+        e,
+        Event::Parted(_) | Event::Notice { .. } | Event::Chat { .. }
+    )));
+    // Its last device, while the kicked one is still on its way: a kick
+    // of the person, left to the caller, with nothing done yet.
+    assert_eq!(
+        core.kick_device(a1, device_of(&core, a1)),
+        Ok(DeviceKick::Last)
+    );
+    assert_eq!(ends(&mut r1), []);
+    assert_eq!(
+        core.kick_device(a1, u64::MAX),
+        Err(DeviceRefusal::NoSuchDevice)
+    );
+    assert_eq!(core.kick_device(999, 1), Err(DeviceRefusal::NoSuchUser));
+    // A person already being kicked is refused, as a second kick is.
+    core.end_session(a2);
+    let (a3, _r3) = alice(&core, proved(ng(true)));
+    core.kick_begin(a1, false).unwrap();
+    assert_eq!(
+        core.kick_device(a1, device_of(&core, a3)),
+        Err(DeviceRefusal::NoSuchUser)
+    );
+    assert_eq!(
+        core.device_end(a3, device_of(&core, a1)),
+        Err(DeviceRefusal::NoSuchUser)
+    );
+}
+
+#[test]
+fn a_devices_ending_is_told_to_its_persons_other_devices_as_its_going_and_not_why() {
+    let core = Core::new().with_coalesce(true);
+    let (a1, mut r1) = alice(&core, proved(ng(true)));
+    let (a2, _r2) = alice(&core, proved(ng(true)));
+    let (a3, _r3) = alice(&core, proved(ng(true)));
+    let row = a1;
+    let mut kinds = Vec::new();
+    for (ended, kick) in [(a2, false), (a3, true)] {
+        drain(&mut r1);
+        let device = device_of(&core, ended);
+        if kick {
+            core.kick_device(row, device).unwrap();
+        } else {
+            core.device_end(a1, device).unwrap();
+        }
+        core.end_session(ended);
+        let told = drain(&mut r1);
+        let Some(Event::PersonRow { devices, .. }) = told.last() else {
+            panic!("{told:?}");
+        };
+        assert!(devices.iter().all(|d| d.device != device), "{told:?}");
+        kinds.push(told.iter().map(Event::kind).collect::<Vec<_>>());
+    }
+    assert_eq!(kinds[0], kinds[1], "ended or kicked, it reads the same");
+}
+
+#[test]
+fn a_viewer_with_the_kick_bit_sees_each_devices_login_and_address_and_nobody_else_does() {
+    let core = Core::new().with_coalesce(true);
+    let mut info = session("alice", Some(ALICE), Some(ALICE), proved(ng(true)));
+    info.addr = Some("192.0.2.7".parse().unwrap());
+    let (a1, mut r1) = on(&core, info);
+    let (m, mut rm) = other(&core, "mod", ng(true), true);
+    drain(&mut r1);
+    drain(&mut rm);
+    let mut info = session("alice", Some(ALICE), Some(ALICE), proved(ng(true)));
+    info.addr = Some("198.51.100.9".parse().unwrap());
+    let (_a2, _r2) = on(&core, info);
+    let row = a1;
+    let details = |rx: &mut Events| -> Vec<(Option<String>, Option<String>)> {
+        drain(rx)
+            .into_iter()
+            .rev()
+            .find_map(|e| match e {
+                Event::PersonRow { devices, .. } => Some(devices),
+                _ => None,
+            })
+            .unwrap()
+            .iter()
+            .map(|d| (d.login.clone(), d.addr.map(|a| a.to_string())))
+            .collect()
+    };
+    assert_eq!(
+        details(&mut rm),
+        [
+            (Some("alice".into()), Some("192.0.2.7".into())),
+            (Some("alice".into()), Some("198.51.100.9".into())),
+        ],
+        "a moderator, told of the change"
+    );
+    assert_eq!(
+        details(&mut r1),
+        [(None, None), (None, None)],
+        "its own device, which may not kick"
+    );
+    let r = core.roster.lock().unwrap();
+    assert!(r
+        .devices_for(m, row)
+        .unwrap()
+        .iter()
+        .all(|d| d.login.is_some() && d.addr.is_some()));
+    assert!(r
+        .devices_for(a1, row)
+        .unwrap()
+        .iter()
+        .all(|d| d.login.is_none() && d.addr.is_none()));
+}
+
+#[test]
+fn a_device_that_never_declared_persons_is_ended_as_kicked() {
+    let core = Core::new().with_coalesce(true);
+    let (a1, _r1) = alice(&core, proved(ng(true)));
+    let (plain, mut rp) = alice(&core, proved(ng(false)));
+    let (classic, mut rc) = alice(&core, proved(Transport::default()));
+    drain(&mut rp);
+    drain(&mut rc);
+    for (uid, rx) in [(plain, &mut rp), (classic, &mut rc)] {
+        core.device_end(a1, device_of(&core, uid)).unwrap();
+        assert_eq!(ends(rx), [Event::Kicked], "{uid}");
+    }
+}
+
+#[test]
+fn a_request_from_a_device_already_ended_is_no_flood_of_its_own() {
+    let core = Core::new().with_coalesce(true);
+    let (a1, _r1) = alice(&core, proved(ng(true)));
+    let (a2, _r2) = alice(&core, proved(ng(true)));
+    core.device_end(a1, device_of(&core, a2)).unwrap();
+    let refused = core.spend_spam(a2, 2, 0x69).unwrap_err();
+    assert!(refused.already_out(), "{refused:?}");
+}
+
+#[test]
+fn a_detached_device_that_loses_the_kick_bit_replays_its_own_devices_without_their_details() {
+    let core = Core::new().with_coalesce(true);
+    let mut info = session("alice", Some(ALICE), Some(ALICE), proved(ng(true)));
+    info.access = info.access.with(bit::DISCONNECT_USERS);
+    info.addr = Some("192.0.2.7".parse().unwrap());
+    let (a1, mut r1) = on(&core, info);
+    drain(&mut r1);
+    let seq = core.current_seq(a1).unwrap();
+    assert!(core.connection_lost(a1, usize::MAX));
+    let (_a2, _r2) = alice(&core, proved(ng(true)));
+    assert!(core.set_session_mask(
+        a1,
+        crate::DenyMask {
+            access: AccessBits::empty().with(bit::DISCONNECT_USERS),
+            ..Default::default()
+        }
+    ));
+    let crate::Resume::Replayed(_, replay) = core.resume(a1, seq) else {
+        panic!("held for its resume");
+    };
+    let own: Vec<&Device> = replay
+        .iter()
+        .filter_map(|se| match &se.event {
+            Event::PersonRow { user, devices, .. } if user.uid == a1 => Some(devices.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(!own.is_empty(), "{replay:?}");
+    assert!(
+        own.iter().all(|d| d.login.is_none() && d.addr.is_none()),
+        "{own:?}"
+    );
+}

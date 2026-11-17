@@ -3560,7 +3560,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                 notify(tx, ty, chunks);
             }
         }
-        Event::Kicked => return false,
+        // A 1.5 client has nothing to say "another device ended you" with:
+        // it sees the connection go.
+        Event::Kicked | Event::Ended => return false,
         Event::AccountChanged(account) => {
             sess.account = *account;
             push_self_info(tx, ctx, sess);

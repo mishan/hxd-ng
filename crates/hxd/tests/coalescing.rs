@@ -1059,3 +1059,274 @@ async fn a_room_the_person_is_removed_from_is_a_line_to_each_device_and_no_part(
         );
     }
 }
+
+/// The code an ng request was refused with.
+async fn refused_with(c: &mut ng::Client, req: &str, params: serde_json::Value) -> String {
+    match c.request(req, params).await {
+        Err(hxd_testclient::Error::Refused { code, .. }) => code,
+        other => panic!("{req}: {other:?}"),
+    }
+}
+
+/// Wait for `c`'s connection to close, and the reason its close frame
+/// gave.
+async fn closed_with(c: &mut ng::Client) -> Option<String> {
+    loop {
+        match c.next().await {
+            Ok(_) => continue,
+            Err(hxd_testclient::Error::Closed) => return c.rx.closed_with.clone(),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_phone_ending_its_desktop_tells_it_ended_and_it_does_not_come_back() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let mut watcher = device(&server, "bob").await;
+    let (mut phone, hello) = persons_device(&server, "alice", Some("Phone")).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let (mut desktop, theirs) = persons_device(&server, "alice", Some("Desktop")).await;
+    devices_told(&mut phone, "user_changed", row, 2).await;
+    told_of(&mut watcher, row as u32).await;
+    let session = desktop.session.clone().unwrap();
+
+    let ended = theirs["self"]["device"].clone();
+    phone
+        .request("device_end", json!({ "device": ended }))
+        .await
+        .unwrap();
+    desktop.event("ended").await.unwrap();
+    assert_eq!(closed_with(&mut desktop).await.as_deref(), Some("ended"));
+    // Ended, not taken over: there is no session to take back up.
+    let mut back = ng::Client::connect(server.ng).await.unwrap();
+    let again = back
+        .request(
+            "resume",
+            json!({ "session": session.0, "token": session.1, "last_seq": 0 }),
+        )
+        .await;
+    assert!(
+        matches!(&again, Err(hxd_testclient::Error::Refused { code, .. }) if code == "session_expired"),
+        "{again:?}"
+    );
+    let told = devices_told(&mut phone, "user_changed", row, 1).await;
+    assert_eq!(
+        devices_in(&told["user"]),
+        Some(vec![("ng".into(), Some("Phone".into()))])
+    );
+    assert_eq!(
+        told_of(&mut watcher, row as u32).await,
+        Vec::<u32>::new(),
+        "alice is still here"
+    );
+
+    // Its own device, gone, is nobody's to end; and a client that never
+    // declared persons has no such request.
+    assert_eq!(
+        refused_with(&mut phone, "device_end", json!({ "device": ended })).await,
+        "no_such_device"
+    );
+    let mut plain = ng_device(&server, "alice").await;
+    assert_eq!(
+        refused_with(&mut plain, "device_end", json!({ "device": 1 })).await,
+        "unknown_method"
+    );
+
+    // And ending itself is a logout, the person's last.
+    let own = hello["self"]["device"].clone();
+    plain.logout().await.unwrap();
+    phone
+        .request("device_end", json!({ "device": own }))
+        .await
+        .unwrap();
+    assert_eq!(closed_with(&mut phone).await.as_deref(), Some("ended"));
+    assert!(told_of(&mut watcher, row as u32)
+        .await
+        .contains(&HDR_USER_LEFT));
+}
+
+#[tokio::test]
+async fn a_classic_device_ended_sees_its_connection_go() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let mut watcher = device(&server, "bob").await;
+    let (mut phone, hello) = persons_device(&server, "alice", None).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let mut desktop = device(&server, "alice").await;
+    let told = devices_told(&mut phone, "user_changed", row, 2).await;
+    let classic = told["user"]["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["wire"] == "classic")
+        .unwrap()["device"]
+        .clone();
+    told_of(&mut watcher, row as u32).await;
+
+    phone
+        .request("device_end", json!({ "device": classic }))
+        .await
+        .unwrap();
+    assert!(closed(&mut desktop).await);
+    devices_told(&mut phone, "user_changed", row, 1).await;
+    // The row may change back to the phone's alone; it does not leave.
+    assert!(!told_of(&mut watcher, row as u32)
+        .await
+        .contains(&HDR_USER_LEFT));
+}
+
+#[tokio::test]
+async fn a_moderator_kicks_one_device_of_a_person_and_its_last_as_the_person() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let mut watcher = device(&server, "bob").await;
+    let (mut phone, hello) = persons_device(&server, "alice", Some("Phone")).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let (mut tablet, theirs) = persons_device(&server, "alice", Some("Tablet")).await;
+    let (mut moderator, listed) = persons_device(&server, "dave", None).await;
+    assert_eq!(devices_in(&row_in(&listed, row)).map(|d| d.len()), Some(2));
+    told_of(&mut watcher, row as u32).await;
+    let tablet_device = theirs["self"]["device"].clone();
+    let phone_device = hello["self"]["device"].clone();
+
+    for (params, code) in [
+        (
+            json!({ "uid": row, "device": tablet_device, "ban": 60 }),
+            "bad_request",
+        ),
+        (
+            json!({ "uid": row, "device": tablet_device, "purge": 60, "reason": "x" }),
+            "bad_request",
+        ),
+        (json!({ "uid": row, "device": 1 }), "no_such_device"),
+    ] {
+        assert_eq!(
+            refused_with(&mut moderator, "kick", params.clone()).await,
+            code,
+            "{params}"
+        );
+    }
+    moderator
+        .request("kick", json!({ "uid": row, "device": tablet_device }))
+        .await
+        .unwrap();
+    tablet.event("kicked").await.unwrap();
+    assert_eq!(closed_with(&mut tablet).await.as_deref(), Some("kicked"));
+    devices_told(&mut moderator, "user_changed", row, 1).await;
+    devices_told(&mut phone, "user_changed", row, 1).await;
+    // The person is still here: nobody is told of a kick.
+    watcher.ping().await.unwrap();
+    let heard = watcher.rx.take_backlog();
+    assert!(
+        heard
+            .iter()
+            .all(|f| f.ty != HDR_USER_LEFT && f.ty != HDR_CHAT_PUSH),
+        "{heard:?}"
+    );
+
+    // Its last device is the person, kicked as one, with its notice.
+    moderator
+        .request("kick", json!({ "uid": row, "device": phone_device }))
+        .await
+        .unwrap();
+    assert_eq!(closed_with(&mut phone).await.as_deref(), Some("kicked"));
+    watcher
+        .recv_where(notice("\r<alice has been kicked by dave>"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_moderator_sees_each_device_of_a_person_by_its_login_and_address() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let (mut phone, hello) = persons_device(&server, "alice", None).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let _desktop = device(&server, "alice").await;
+    devices_told(&mut phone, "user_changed", row, 2).await;
+    let (_moderator, theirs) = persons_device(&server, "dave", None).await;
+    let (_stranger, strangers) = persons_device(&server, "bob", None).await;
+    let seen = |ok: &serde_json::Value| -> Vec<(Option<String>, Option<String>)> {
+        row_in(ok, row)["devices"]
+            .as_array()
+            .map(|ds| {
+                ds.iter()
+                    .map(|d| {
+                        (
+                            d["login"].as_str().map(str::to_owned),
+                            d["addr"].as_str().map(str::to_owned),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let at = (Some("alice".to_owned()), Some("127.0.0.1".to_owned()));
+    assert_eq!(seen(&theirs), [at.clone(), at], "a moderator");
+    let own = phone.sync().await.unwrap();
+    assert_eq!(seen(&own), [(None, None), (None, None)], "its own device");
+    assert!(
+        row_in(&strangers, row).get("devices").is_none(),
+        "a stranger"
+    );
+}
+
+#[tokio::test]
+async fn a_device_kick_is_refused_of_a_ghost_a_protected_person_and_ones_own() {
+    use hxd_core::server_link::{GhostInfo, RemoteRef};
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let (mut moderator, hello) = persons_device(&server, "dave", None).await;
+    let own_row = hello["self"]["uid"].as_u64().unwrap();
+    let (_own_other, theirs) = persons_device(&server, "dave", None).await;
+    let (_boss1, b) = persons_device(&server, "boss", None).await;
+    let (_boss2, _) = persons_device(&server, "boss", None).await;
+    let ghost = server
+        .core
+        .ghost_attach(GhostInfo {
+            nick: "far".into(),
+            icon: 1,
+            away: false,
+            color: 0,
+            remote: RemoteRef {
+                home_tag: "hl2".into(),
+                home_name: "Elsewhere".into(),
+                tagged: false,
+                refuses_msgs: true,
+                transport: None,
+                fingerprint: None,
+                signs: false,
+                server_key: None,
+            },
+            visible: true,
+        })
+        .unwrap();
+    for (case, uid, device, code) in [
+        ("a ghost", u64::from(ghost), json!(1), "bad_request"),
+        (
+            "a protected person",
+            b["self"]["uid"].as_u64().unwrap(),
+            b["self"]["device"].clone(),
+            "protected",
+        ),
+        (
+            "its own person",
+            own_row,
+            theirs["self"]["device"].clone(),
+            "bad_request",
+        ),
+    ] {
+        assert_eq!(
+            refused_with(
+                &mut moderator,
+                "kick",
+                json!({ "uid": uid, "device": device })
+            )
+            .await,
+            code,
+            "{case}"
+        );
+    }
+}

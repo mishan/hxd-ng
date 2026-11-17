@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use hxd_core::access::bit;
+use hxd_core::coalesce::DeviceRefusal;
 use hxd_core::inbox::MessageGuid;
 use hxd_core::instrument::{self, Dir, Kind};
 use hxd_core::video::VideoKind;
@@ -54,6 +55,7 @@ fn req_label(req: &str) -> &'static str {
         "blocks",
         "chat",
         "device_cert",
+        "device_end",
         "emoji_list",
         "history",
         "inbox",
@@ -120,11 +122,11 @@ fn request_weight(req: &str) -> u32 {
         | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
         | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
         | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
-        | "report_close" | "redact" | "revoke" | "kick" | "account_get" | "account_create"
-        | "account_update" | "account_delete" | "role_create" | "role_update" | "role_delete"
-        | "room_topic" | "room_join" | "room_part" | "friends" | "friend_respond"
-        | "friend_remove" | "friend_alias" | "presence" | "typing" | "requests"
-        | "request_answer" | "react" => 2,
+        | "report_close" | "redact" | "revoke" | "kick" | "device_end" | "account_get"
+        | "account_create" | "account_update" | "account_delete" | "role_create"
+        | "role_update" | "role_delete" | "room_topic" | "room_join" | "room_part" | "friends"
+        | "friend_respond" | "friend_remove" | "friend_alias" | "presence" | "typing"
+        | "requests" | "request_answer" | "react" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "news_timeline" | "voice_join" | "voice_leave"
         | "video_start" | "video_stop" | "video_subscribe" | "push_register" | "report"
@@ -200,6 +202,9 @@ pub(crate) struct SessState {
     pub(crate) reactions: bool,
     /// And `emoji`, likewise.
     pub(crate) emoji: bool,
+    /// And `persons`, likewise: the device acts are for a client that
+    /// knows the devices it would name.
+    pub(crate) persons: bool,
 }
 
 impl SessState {
@@ -435,7 +440,14 @@ pub(crate) async fn run(
                         && req.params.get("timeline") == Some(&Value::Bool(true));
                     let timeline = u32::from(timeline) * request_weight("news_timeline")
                         .saturating_sub(request_weight("news_seen"));
-                    let cost = request_weight(&req.req)
+                    // A request only a `persons` client has is, to any
+                        // other, one it never had, and costs what such does.
+                    let named = if req.req == "device_end" && !state.persons {
+                        "unknown"
+                    } else {
+                        req.req.as_str()
+                    };
+                    let cost = request_weight(named)
                         .saturating_add(signed + sealed)
                         .saturating_add(objects)
                         .saturating_add(timeline);
@@ -1261,6 +1273,7 @@ async fn handle_login(
             replies,
             reactions,
             emoji,
+            persons,
         },
         events,
     ))
@@ -1375,6 +1388,7 @@ async fn handle_resume(
         replies: ctx.core.user(uid).is_some_and(|u| u.transport.replies),
         reactions: ctx.core.user(uid).is_some_and(|u| u.transport.reactions),
         emoji: ctx.core.user(uid).is_some_and(|u| u.transport.emoji),
+        persons: ctx.core.user(uid).is_some_and(|u| u.transport.persons),
     };
 
     // From here the session is attached: any send failure means the new
@@ -1528,13 +1542,13 @@ async fn send_events(
     lag: &hxd_core::Lag,
 ) -> Option<Exit> {
     instrument::queue_depth(WIRE, events.len());
-    let mut kicked = matches!(first.event, hxd_core::Event::Kicked);
+    let mut kicked = ended_by(&first.event);
     state.note(&first.event);
     let mut batch = vec![event_json(&first, state.replies, state.emoji)];
     let mut bytes = batch[0].len();
-    while !kicked && bytes < WRITE_BATCH {
+    while kicked.is_none() && bytes < WRITE_BATCH {
         let Ok(se) = events.try_recv() else { break };
-        kicked = matches!(se.event, hxd_core::Event::Kicked);
+        kicked = ended_by(&se.event);
         state.note(&se.event);
         let text = event_json(&se, state.replies, state.emoji);
         bytes += text.len();
@@ -1551,9 +1565,9 @@ async fn send_events(
     };
     // A kick ends the session whether or not the client heard about it:
     // failing the send is no way to stay.
-    if kicked {
-        end_kicked(ctx, state, ws_tx).await;
-        return Some(Exit::SessionOver("kicked"));
+    if let Some(why) = kicked {
+        end_kicked(ctx, state, ws_tx, why).await;
+        return Some(Exit::SessionOver(why));
     }
     (!sent).then_some(Exit::ConnectionLost("send_failed"))
 }
@@ -1618,16 +1632,27 @@ async fn send_frame(ws_tx: &mut WsTx, msg: Message) -> bool {
     }
 }
 
-/// End a session the domain kicked: the event has already gone out, and
-/// this is the teardown that follows it.
-async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx) {
+/// Whether `ev` ends the session, and the close reason it goes with:
+/// `ended` apart from `kicked`, and both apart from a takeover's
+/// `replaced`, after which a client resumes or logs in again.
+fn ended_by(ev: &hxd_core::Event) -> Option<&'static str> {
+    match ev {
+        hxd_core::Event::Kicked => Some("kicked"),
+        hxd_core::Event::Ended => Some("ended"),
+        _ => None,
+    }
+}
+
+/// End a session the domain kicked or ended: the event has already gone
+/// out, and this is the teardown that follows it.
+async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx, why: &'static str) {
     ctx.core.end_session(state.uid);
     ctx.registry.remove(&state.session_id);
     let _ = send_frame(
         ws_tx,
         Message::Close(Some(CloseFrame {
             code: CloseCode::Normal,
-            reason: "kicked".into(),
+            reason: why.into(),
         })),
     )
     .await;
@@ -1656,12 +1681,12 @@ async fn handle_sync(
     // below this snapshot is already in `events`, and every later enqueue
     // has a higher seq. Moving that send outside the lock would reopen MS9.
     let mut seq = ctx.core.current_seq(state.uid).unwrap_or(0);
-    let mut kicked = false;
+    let mut kicked = None;
     loop {
         match events.try_recv() {
             Ok(se) => {
                 seq = seq.max(se.seq);
-                kicked |= matches!(se.event, hxd_core::Event::Kicked);
+                kicked = kicked.or(ended_by(&se.event));
                 state.note(&se.event);
                 if !send_frame(
                     ws_tx,
@@ -1682,8 +1707,8 @@ async fn handle_sync(
             }
         }
     }
-    if kicked {
-        end_kicked(ctx, state, ws_tx).await;
+    if let Some(why) = kicked {
+        end_kicked(ctx, state, ws_tx, why).await;
         return Flow::LoggedOut;
     }
     let mut ok = json!({
@@ -1814,6 +1839,8 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "room_join" => Some((0x73, 2)),
         "room_part" => Some((0x74, 1)),
         "nick" | "signs" => Some((0x130, 20)),
+        // Ending a device is a kick of it, at the classic kick's price.
+        "device_end" => Some((0x6e, 1)),
         "emoji_list" => Some((0x2c9, 0)),
         "news_post" => Some((0x19a, 10)),
         "news_delete" => Some((0x19b, 10)),
@@ -1842,8 +1869,14 @@ async fn dispatch(
     lag: &hxd_core::Lag,
 ) -> Flow {
     let send = |s: String| Message::Text(s);
-    if let Some((trans, points)) = spam_charge(&req.req) {
+    let charge = spam_charge(&req.req).filter(|_| req.req != "device_end" || state.persons);
+    if let Some((trans, points)) = charge {
         if let Err(flooded) = ctx.core.spend_spam(state.uid, points, trans) {
+            // Kicked or ended already: its connection is about to close
+            // with the real reason, which a flooding reply would belie.
+            if flooded.already_out() {
+                return Flow::Continue;
+            }
             // The kick is made; it is told once the lines already under
             // way are heard, and its ban is a store write, so both are off
             // the reactor, and before the reply, so the ban stands by the
@@ -1860,6 +1893,21 @@ async fn dispatch(
     }
     let out = match req.req.as_str() {
         "ping" => reply_ok(req.id, json!({})),
+
+        // Only a client that declared `persons` knows a device to name;
+        // to any other this is a request it never had.
+        "device_end" if state.persons => match req.params.get("device").and_then(Value::as_u64) {
+            None => reply_err(req.id, "bad_request", "`device` is a device id."),
+            Some(device) => match ctx.core.device_end(state.uid, device) {
+                Ok(()) => reply_ok(req.id, json!({})),
+                Err(DeviceRefusal::NoSuchUser) => {
+                    reply_err(req.id, "no_such_user", "No such user.")
+                }
+                Err(DeviceRefusal::NoSuchDevice) => {
+                    reply_err(req.id, "no_such_device", "No such device.")
+                }
+            },
+        },
 
         "chat" => match serde_json::from_value::<ChatParams>(req.params.clone()) {
             Ok(p) if !state.access.has(bit::SEND_CHAT) => {
@@ -2901,6 +2949,11 @@ fn self_json(me: &hxd_core::coalesce::SelfView) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ending_a_device_is_priced_as_kicking_one() {
+        assert_eq!(request_weight("device_end"), request_weight("kick"));
+    }
 
     #[test]
     fn a_nick_is_bounded_in_characters_not_utf8_bytes() {

@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use hxd_core::access::bit;
+use hxd_core::coalesce::{DeviceKick, DeviceRefusal};
 use hxd_core::moderation::{Act, Closed, Report, ReportTarget, Subject};
 use hxd_core::{Actor, ModError, Outcome, PersonRef, ReportFilter, ReportRequest};
 use serde::de::DeserializeOwned;
@@ -295,6 +296,9 @@ struct PurgeParams {
 #[derive(Debug, Deserialize)]
 struct KickParams {
     uid: hxd_core::Uid,
+    /// One device of the person `uid` names, kicked alone.
+    #[serde(default)]
+    device: Option<u64>,
     #[serde(default)]
     ban: Option<u64>,
     #[serde(default)]
@@ -551,6 +555,48 @@ pub(crate) async fn handle(ctx: &NgCtx, state: &SessState, req: &ReqEnvelope) ->
                     "access_denied",
                     "You are not allowed to disconnect users.",
                 );
+            }
+            // One device of a person, for a client that knows its devices;
+            // any other kicks whom `uid` names, as it always has.
+            if let Some(device) = p.device.filter(|_| state.persons) {
+                // The person stays, so there is nothing a ban or a purge
+                // of one device could mean.
+                if p.ban.is_some() || p.purge.is_some() {
+                    return reply_err(
+                        id,
+                        "bad_request",
+                        "A device is kicked alone, with no ban or purge.",
+                    );
+                }
+                if core.ghost_ref(p.uid).is_some() {
+                    return reply_err(
+                        id,
+                        "bad_request",
+                        "A user of another server has no devices here.",
+                    );
+                }
+                if core.user_details(p.uid).is_none() {
+                    return refused(ModError::NoSuchUser);
+                }
+                if core
+                    .access_of(p.uid)
+                    .is_some_and(|a| a.has(bit::CANT_BE_DISCONNECTED))
+                {
+                    return refused(ModError::Protected);
+                }
+                // A moderator's own stale device is `device_end`'s.
+                if core.kicks_own_row(uid, p.uid) {
+                    return refused(ModError::BadRequest("You cannot kick yourself."));
+                }
+                match core.kick_device(p.uid, device) {
+                    Ok(DeviceKick::Ended) => return reply_ok(id, json!({})),
+                    // Its last device: the person goes, kicked as below.
+                    Ok(DeviceKick::Last) => {}
+                    Err(DeviceRefusal::NoSuchUser) => return refused(ModError::NoSuchUser),
+                    Err(DeviceRefusal::NoSuchDevice) => {
+                        return reply_err(id, "no_such_device", "No such device.")
+                    }
+                }
             }
             // A user of another server: hidden here at once, and the kick
             // or ban asked of their server, whose answer is awaited in

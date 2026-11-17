@@ -753,8 +753,16 @@ Three layers, all `cargo test --workspace`:
   client that declared `persons` told its own devices coming and going
   with their labels, and a viewer with the kick bit told them too, while
   a stranger hears what a client without `persons` hears, a resume and a
-  sync carrying the devices and the device id kept, and with coalescing
-  off each device a user and a member of its own;
+  sync carrying the devices and the device id kept, a device ending
+  another of its person told `ended` and closed so, its session not
+  resumable, a classic device ended seeing its connection go, and itself
+  ended as the person's last, a moderator kicking one device with no
+  notice and refused a ban, a purge, a device that is not there, a user
+  of another server, a protected person and its own person, its last
+  kicked as the person with its notice, a moderator shown each device's
+  login and address while the person's own device and a stranger are
+  not, and with coalescing off each
+  device a user and a member of its own;
   `voice.rs` has a person in voice, and `link.rs` a person across a
   link), `slow_consumer.rs` (a room flooded while one
   client reads
