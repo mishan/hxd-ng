@@ -1804,11 +1804,23 @@ impl RosterInner {
     }
 
     pub(crate) fn send_to(&mut self, uid: Uid, ev: Event) {
-        if let Some(sess) = self.users.get_mut(&uid) {
-            let mut tally = instrument::Tally::default();
-            tally.add(sess.outbox.push(ev));
-            tally.record();
-        }
+        self.send_landed(uid, ev);
+    }
+
+    /// [`Self::send_to`], with whether the event reached a connection or
+    /// a detached session's buffer.
+    pub(crate) fn send_landed(&mut self, uid: Uid, ev: Event) -> bool {
+        let Some(sess) = self.users.get_mut(&uid) else {
+            return false;
+        };
+        let pushed = sess.outbox.push(ev);
+        let mut tally = instrument::Tally::default();
+        tally.add(pushed);
+        tally.record();
+        matches!(
+            pushed,
+            instrument::Pushed::Live | instrument::Pushed::Buffered
+        )
     }
 
     /// Deliver to every *visible* session matching `pred` (skipping `skip`).

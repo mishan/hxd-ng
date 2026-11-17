@@ -272,7 +272,9 @@ impl Core {
         if self.held_full(&r, target, &sender.fingerprint, sealed.len()) {
             return Err(SealedError::HeldFull);
         }
-        self.deliver_sealed(&mut r, &sender, target, sealed);
+        if !self.deliver_sealed(&mut r, &sender, target, sealed) {
+            return Err(SealedError::HeldFull);
+        }
         Ok(())
     }
 
@@ -328,11 +330,18 @@ impl Core {
             }
             !full
         });
-        if to_deliver.is_empty() {
-            return Err(BoxesError::Sealed(SealedError::HeldFull));
+        // A buffer that overflowed before or on this box holds it no
+        // more than a full one would.
+        let mut landed = false;
+        for (uid, device, sealed) in to_deliver {
+            if self.deliver_sealed(&mut r, &sender, uid, sealed) {
+                landed = true;
+            } else {
+                held_full.push(device);
+            }
         }
-        for (uid, _, sealed) in to_deliver {
-            self.deliver_sealed(&mut r, &sender, uid, sealed);
+        if !landed {
+            return Err(BoxesError::Sealed(SealedError::HeldFull));
         }
         Ok(held_full)
     }
@@ -428,9 +437,9 @@ impl Core {
         sender: &Sender,
         to: Uid,
         sealed: Vec<u8>,
-    ) {
+    ) -> bool {
         let persons = r.users.get(&to).is_some_and(|s| s.info.transport.persons);
-        r.send_to(
+        r.send_landed(
             to,
             Event::Sealed {
                 from: sender.uid,
@@ -441,7 +450,7 @@ impl Core {
                 sealed: Some(sealed),
                 at: SystemTime::now(),
             },
-        );
+        )
     }
 
     /// Whether any of `owners` refuses messages from `other`, with no

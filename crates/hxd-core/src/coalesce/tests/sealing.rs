@@ -284,6 +284,56 @@ fn a_device_holding_all_it_may_is_skipped_and_the_rest_delivered() {
 }
 
 #[test]
+fn a_device_whose_held_events_overflowed_is_skipped_as_one_holding_all_it_may() {
+    for (case, both) in [("one", false), ("both", true)] {
+        let core = persons();
+        let (bob, _rb) = bob(&core, true);
+        let (a1, mut r1) = alice(&core, 1, true, Some(u64::MAX));
+        let (a2, _r2) = alice(&core, 2, true, Some(u64::MAX));
+        let broken: &[Uid] = if both { &[a1, a2] } else { &[a2] };
+        for uid in broken {
+            assert!(core.connection_lost(*uid, usize::MAX));
+            let mut r = core.roster.lock().unwrap();
+            for _ in 0..=crate::roster::OUTBOX_BUFFER_CAP {
+                r.send_to(*uid, Event::RosterStale);
+            }
+        }
+        drain(&mut r1);
+        let sent = core.msg_boxes(bob, a1, vec![box_for(&core, a1, 1), box_for(&core, a2, 2)]);
+        if both {
+            assert_eq!(
+                sent,
+                Err(BoxesError::Sealed(SealedError::HeldFull)),
+                "{case}"
+            );
+        } else {
+            assert_eq!(sent, Ok(vec![device_of(&core, a2)]), "{case}");
+            assert_eq!(sealed_in(&mut r1).len(), 1, "{case}: the rest delivered");
+        }
+    }
+}
+
+#[test]
+fn a_sealed_message_to_a_session_whose_held_events_overflowed_is_refused() {
+    for (case, coalesce) in [("coalescing off", false), ("coalescing on", true)] {
+        let core = Core::new().with_coalesce(coalesce);
+        let (a1, _r1) = alice(&core, 1, true, Some(u64::MAX));
+        let (bob, _rb) = bob(&core, false);
+        assert!(core.connection_lost(bob, usize::MAX));
+        let mut r = core.roster.lock().unwrap();
+        for _ in 0..=crate::roster::OUTBOX_BUFFER_CAP {
+            r.send_to(bob, Event::RosterStale);
+        }
+        drop(r);
+        assert_eq!(
+            core.msg_sealed(a1, bob, vec![7; 5], key_of(50)),
+            Err(SealedError::HeldFull),
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn a_device_seals_to_its_own_person_as_its_row_and_by_its_device() {
     for (case, reader_persons) in [("persons", true), ("not persons", false)] {
         let core = persons();
