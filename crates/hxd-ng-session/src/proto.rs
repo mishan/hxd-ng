@@ -184,12 +184,25 @@ pub struct MsgParams {
     pub sealed: Option<String>,
     #[serde(default)]
     pub cert: Option<String>,
+    /// A box for each device of a person, from a `persons` client, in
+    /// place of `sealed` and `cert`.
+    #[serde(default)]
+    pub boxes: Option<Vec<BoxParams>>,
     /// What it answers, with `replies` (§7.3).
     #[serde(default)]
     pub re: Option<Value>,
     /// As on `chat`.
     #[serde(default)]
     pub emoji: Option<Value>,
+}
+
+/// One box of `msg`'s `boxes`: a sealed message for one device, and the
+/// SHA-256 of the `device_enc` key it was sealed to.
+#[derive(Debug, Deserialize)]
+pub struct BoxParams {
+    pub device: u64,
+    pub sealed: String,
+    pub cert: String,
 }
 
 /// Both fields are optional, so `inbox` with no `params` at all is a
@@ -1012,6 +1025,7 @@ pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
             from_nick,
             from_login,
             from_fingerprint,
+            from_device,
             sealed,
             at,
         } => {
@@ -1022,6 +1036,9 @@ pub fn event_json(se: &SeqEvent, replies: bool, emoji: bool) -> String {
             });
             if let Some(login) = from_login {
                 from_obj["login"] = json!(login);
+            }
+            if let Some(device) = from_device {
+                from_obj["device"] = json!(device);
             }
             let mut data = json!({
                 "from": from_obj,

@@ -81,6 +81,9 @@ pub(crate) struct Coalesced {
     /// The row as the roster was last told it, so a member's coming or
     /// going tells nobody anything unless the row changed.
     told: UserInfo,
+    /// The change last made to `told` was to `identity.sealed` alone,
+    /// which a classic row cannot show: told to the ng wire alone.
+    ng_only: bool,
     /// Being kicked: every member is on its way out, and a login of its
     /// own forms a person of its own.
     ending: bool,
@@ -253,6 +256,7 @@ impl RosterInner {
                         login,
                         members: vec![uid],
                         told: info,
+                        ng_only: false,
                         ending: false,
                         flood: Default::default(),
                         link: Default::default(),
@@ -309,6 +313,7 @@ impl RosterInner {
         };
         if let Some(p) = self.persons.by_row.get_mut(&info.uid) {
             p.told = view.clone();
+            p.ng_only = false;
         }
         view
     }
@@ -322,6 +327,12 @@ impl RosterInner {
         let view = self.person_view(row)?;
         let p = self.persons.by_row.get_mut(&row)?;
         (p.told != view).then(|| {
+            let mut was = p.told.clone();
+            if let (Some(was), Some(now)) = (&mut was.transport.identity, &view.transport.identity)
+            {
+                was.sealed.clone_from(&now.sealed);
+            }
+            p.ng_only = was == view;
             p.told = view.clone();
             Event::Changed(view)
         })
@@ -346,7 +357,14 @@ impl RosterInner {
         let signs = members
             .iter()
             .all(|s| s.info.transport.identity.as_ref().is_some_and(|i| i.signs));
-        // Sealed to by device, which the row is not.
+        // Sealed to by device, which the row is not, but for a person
+        // with one device it can be sealed to: a client that knows
+        // nothing of devices can seal to that one, and is shown it can.
+        let sealable: Vec<_> = members.iter().filter_map(|s| self.sealable(s)).collect();
+        let sealed = match sealable.as_slice() {
+            [one] => Some(std::sync::Arc::new((*one).clone())),
+            _ => None,
+        };
         // The person's identity, from whichever device shows one: a
         // password session of a linked account shows none of its own, and
         // a personal account's row shows the identity linked since (§12 J).
@@ -354,7 +372,7 @@ impl RosterInner {
             .iter()
             .find_map(|s| s.info.transport.identity.clone())
             .map(|mut identity| {
-                identity.sealed = None;
+                identity.sealed = sealed;
                 identity.device_cert = None;
                 identity.signs = signs;
                 identity
@@ -427,6 +445,12 @@ impl RosterInner {
             return;
         };
         let row = info.uid;
+        let ng_only = self
+            .persons
+            .by_row
+            .get_mut(&row)
+            .is_some_and(|p| std::mem::take(&mut p.ng_only));
+        let pred = |s: &UserSession| pred(s) && (!ng_only || s.info.transport.ng);
         let seers = self.seers(row, |s| pred(s));
         self.broadcast_where(&ev, None, |s| {
             !members.contains(&s.info.uid)
@@ -439,7 +463,7 @@ impl RosterInner {
             }
             let own = self
                 .own_row(m)
-                .filter(|_| self.users.get(&m).is_some_and(&pred));
+                .filter(|_| self.users.get(&m).is_some_and(pred));
             if let Some(own) = own {
                 self.send_to(m, Event::Changed(own));
             }
@@ -598,7 +622,7 @@ impl RosterInner {
                     status: s.info.status,
                     since: s.since,
                     label: s.label.clone(),
-                    sealed: identity.is_some_and(|i| i.sealed.is_some()),
+                    sealed: self.sealable(s).is_some(),
                     signs: identity.is_some_and(|i| i.signs),
                     login: Some(s.login.clone()),
                     addr: s.addr,

@@ -63,6 +63,61 @@ pub enum SealedError {
     /// `device_cert` past its ration; retry after this.
     RateLimited(Duration),
     ServerError,
+    /// The device named is not one of the user's.
+    NoSuchDevice,
+}
+
+/// What `device_cert` answers (§4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceCerts {
+    /// The one device: a session alone's, the one named, or a person's
+    /// only one.
+    One(Vec<u8>),
+    /// Each device of a person it can be sealed to, by its device id.
+    Devices(Vec<(u64, Vec<u8>)>),
+}
+
+/// One box of a sealed message to a person, for one of its devices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedBox {
+    pub device: u64,
+    pub sealed: Vec<u8>,
+    /// The SHA-256 of the `device_enc` key it was sealed to.
+    pub sealed_to: [u8; 32],
+}
+
+/// Why boxes to a person were refused (§4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxesError {
+    Sealed(SealedError),
+    /// The boxes are not one for each device it can be sealed to: those
+    /// devices now, to seal again.
+    DevicesChanged(Vec<(u64, Vec<u8>)>),
+    /// The box for this device names another key than the device's now.
+    CertChanged(u64),
+}
+
+impl From<SealedError> for BoxesError {
+    fn from(e: SealedError) -> Self {
+        BoxesError::Sealed(e)
+    }
+}
+
+/// A device a sealed message may go to, as a sender is given it.
+struct SealingTo {
+    uid: Uid,
+    device: u64,
+    cert: Vec<u8>,
+    enc: [u8; 32],
+}
+
+/// Who sealed a message, as its reader is told.
+struct Sender {
+    uid: Uid,
+    nick: String,
+    login: Option<String>,
+    fingerprint: [u8; 32],
+    device: Option<u64>,
 }
 
 impl Core {
@@ -126,10 +181,20 @@ impl Core {
         }
     }
 
-    /// The certificate of the device `of`'s session proves now, for a
-    /// session that can open sealed messages to seal to (§4.2).
-    pub fn device_cert(&self, asker: Uid, of: Uid) -> Result<Vec<u8>, SealedError> {
-        let (owner, other) = {
+    /// The certificate of the device `of` names, for a session that can
+    /// open sealed messages to seal to (§4.2): a session alone's, or one
+    /// device of a person's by `device`; for a person with no device
+    /// named, every device it can be sealed to, to an asker that declared
+    /// `persons`, and to any other the one device when it has exactly one.
+    /// Rationed per answer, and a person's list one more for each device
+    /// past its first.
+    pub fn device_cert(
+        &self,
+        asker: Uid,
+        of: Uid,
+        device: Option<u64>,
+    ) -> Result<DeviceCerts, SealedError> {
+        let (owners, other, persons) = {
             let mut r = self.roster.lock().unwrap();
             let sess = r.users.get_mut(&asker).ok_or(SealedError::NoSuchUser)?;
             if sealed_of(sess).is_none() {
@@ -140,31 +205,48 @@ impl Core {
                     .spend(1, Instant::now())
                     .map_err(SealedError::RateLimited)?;
             }
-            let asker = sess.mailbox();
-            // A person's sessions are sealed to by device, which a client
-            // names once it is told a person's devices; until then none.
-            let target = r
-                .named(of)
-                .filter(|s| !s.grouped)
-                .ok_or(SealedError::NoSuchUser)?;
-            (target.mailbox(), asker)
+            let (other, persons) = (sess.mailbox(), sess.info.transport.persons);
+            (mailboxes(&r, of)?, other, persons)
         };
-        self.blocks(&owner, &other)?;
-        let r = self.roster.lock().unwrap();
-        let target = r
-            .users
-            .get(&of)
-            .filter(|s| s.live() && s.mailbox() == owner)
-            .ok_or(SealedError::NoSuchUser)?;
-        let device = self.sealable(target).ok_or(SealedError::NotSealed)?;
-        Ok(device.cert.clone())
+        self.blocks(&owners, &other)?;
+        let mut r = self.roster.lock().unwrap();
+        let row = sealing_row(&r, of, &owners)?;
+        let set = self.sealing_set(&r, of, &row, asker);
+        if let Some(device) = device {
+            if !row
+                .iter()
+                .any(|m| r.users.get(m).is_some_and(|s| s.device == device))
+            {
+                return Err(SealedError::NoSuchDevice);
+            }
+            return set
+                .into_iter()
+                .find(|d| d.device == device)
+                .map(|d| DeviceCerts::One(d.cert))
+                .ok_or(SealedError::NotSealed);
+        }
+        match (r.person_members(of).is_some() && persons, set.len()) {
+            (_, 0) => Err(SealedError::NotSealed),
+            (true, n) => {
+                charge_devices(&mut r, asker, n - 1);
+                Ok(DeviceCerts::Devices(
+                    set.into_iter().map(|d| (d.device, d.cert)).collect(),
+                ))
+            }
+            (false, 1) => Ok(DeviceCerts::One(set.into_iter().next().expect("one").cert)),
+            // A person with more than one: only a client that knows of
+            // devices can seal to each.
+            (false, _) => Err(SealedError::NotSealed),
+        }
     }
 
-    /// A sealed message from `from` to the session `to`, sealed to the
-    /// `device_enc` key whose SHA-256 is `sealed_to` (§4.3). Its frontend
-    /// checked its size and, for a deniable box, its sender key. Delivered
-    /// to that session alone, live or into its outbox while it is
-    /// detached, and never stored, so there is no inbox to fall back on.
+    /// A sealed message from `from` to `to`, sealed to the `device_enc`
+    /// key whose SHA-256 is `sealed_to` (§4.3): a session alone, or a
+    /// person with exactly one device it can be sealed to. Its frontend
+    /// checked its size and, for a deniable box, its sender key.
+    /// Delivered to that session alone, live or into its outbox while it
+    /// is detached, and never stored, so there is no inbox to fall back
+    /// on.
     pub fn msg_sealed(
         &self,
         from: Uid,
@@ -172,32 +254,145 @@ impl Core {
         sealed: Vec<u8>,
         sealed_to: [u8; 32],
     ) -> Result<(), SealedError> {
-        let (owner, other, serial) = {
-            let r = self.roster.lock().unwrap();
-            let sender = r.users.get(&from).ok_or(SealedError::NoSuchUser)?;
-            // Nor from one, whose own uid its reader could not answer.
-            if sealed_of(sender).is_none() || sender.grouped {
-                return Err(SealedError::SelfNotSealed);
-            }
-            // A person's sessions are sealed to by device, which a client
-            // names once it is told a person's devices; until then none.
-            let target = r
-                .named(to)
-                .filter(|s| !s.grouped)
-                .ok_or(SealedError::NoSuchUser)?;
-            self.sealed_to(target, &sealed_to)?;
-            (target.mailbox(), sender.mailbox(), target.serial)
-        };
-        self.blocks(&owner, &other)?;
+        let (owners, other) = self.sealing_parties(from, to)?;
+        self.blocks(&owners, &other)?;
         // Again, under the lock it is delivered under: a resume in
         // between may have changed the device, or the uid its session.
         let mut r = self.roster.lock().unwrap();
+        let row = sealing_row(&r, to, &owners)?;
+        let set = self.sealing_set(&r, to, &row, from);
+        let [target] = set.as_slice() else {
+            return Err(SealedError::NotSealed);
+        };
+        if <[u8; 32]>::from(Sha256::digest(target.enc)) != sealed_to {
+            return Err(SealedError::CertChanged);
+        }
+        let target = target.uid;
+        let sender = self.sender(&r, from)?;
+        if self.held_full(&r, target, &sender.fingerprint, sealed.len()) {
+            return Err(SealedError::HeldFull);
+        }
+        if !self.deliver_sealed(&mut r, &sender, target, sealed) {
+            return Err(SealedError::HeldFull);
+        }
+        Ok(())
+    }
+
+    /// A box for each device `to` can be sealed to, from a session that
+    /// declared `persons` (§4.3): to a person, or to a session alone as
+    /// its one device. Refused whole unless the boxes are one for each
+    /// such device and no other, so no device silently misses a message,
+    /// and unless each names its device's key. A device holding as much
+    /// as it may is skipped and the rest delivered: the devices skipped.
+    pub fn msg_boxes(
+        &self,
+        from: Uid,
+        to: Uid,
+        boxes: Vec<SealedBox>,
+    ) -> Result<Vec<u64>, BoxesError> {
+        let (owners, other) = self.sealing_parties(from, to)?;
+        self.blocks(&owners, &other)?;
+        let mut r = self.roster.lock().unwrap();
+        let row = sealing_row(&r, to, &owners)?;
+        let set = self.sealing_set(&r, to, &row, from);
+        if set.is_empty() {
+            return Err(SealedError::NotSealed.into());
+        }
+        let mut asked: Vec<u64> = boxes.iter().map(|b| b.device).collect();
+        let mut have: Vec<u64> = set.iter().map(|d| d.device).collect();
+        asked.sort_unstable();
+        have.sort_unstable();
+        // Each refusal tells what `device_cert` would, so is rationed as
+        // that is: a sender cannot read a person's devices off refusals
+        // any faster.
+        if asked != have {
+            spend_device_cert(&mut r, from)?;
+            charge_devices(&mut r, from, set.len() - 1);
+            return Err(BoxesError::DevicesChanged(
+                set.into_iter().map(|d| (d.device, d.cert)).collect(),
+            ));
+        }
+        let mut to_deliver = Vec::new();
+        for b in boxes {
+            let d = set.iter().find(|d| d.device == b.device).expect("checked");
+            if <[u8; 32]>::from(Sha256::digest(d.enc)) != b.sealed_to {
+                spend_device_cert(&mut r, from)?;
+                return Err(BoxesError::CertChanged(b.device));
+            }
+            to_deliver.push((d.uid, d.device, b.sealed));
+        }
+        let sender = self.sender(&r, from).map_err(BoxesError::Sealed)?;
+        let mut held_full = Vec::new();
+        to_deliver.retain(|(uid, device, sealed)| {
+            let full = self.held_full(&r, *uid, &sender.fingerprint, sealed.len());
+            if full {
+                held_full.push(*device);
+            }
+            !full
+        });
+        // A buffer that overflowed before or on this box holds it no
+        // more than a full one would.
+        let mut landed = false;
+        for (uid, device, sealed) in to_deliver {
+            if self.deliver_sealed(&mut r, &sender, uid, sealed) {
+                landed = true;
+            } else {
+                held_full.push(device);
+            }
+        }
+        if !landed {
+            return Err(BoxesError::Sealed(SealedError::HeldFull));
+        }
+        Ok(held_full)
+    }
+
+    /// Who is sealing to whom, for the check of blocks with no lock held:
+    /// the target's mailboxes and the sender's.
+    fn sealing_parties(
+        &self,
+        from: Uid,
+        to: Uid,
+    ) -> Result<(Vec<crate::inbox::Mailbox>, crate::inbox::Mailbox), SealedError> {
+        let r = self.roster.lock().unwrap();
         let sender = r.users.get(&from).ok_or(SealedError::NoSuchUser)?;
-        let (from_nick, from_login) = (
-            sender.info.nick.clone(),
-            sender.has_inbox.then(|| sender.login.clone()),
-        );
-        let from_fingerprint = sender
+        if sealed_of(sender).is_none() {
+            return Err(SealedError::SelfNotSealed);
+        }
+        Ok((mailboxes(&r, to)?, sender.mailbox()))
+    }
+
+    /// The devices of `row` that can be sealed to now, but the sender's
+    /// own when `named` is its person: one predicate behind every list a
+    /// sender is given and every box delivered, so the two cannot
+    /// disagree. A session alone may seal to itself.
+    fn sealing_set(
+        &self,
+        r: &crate::roster::RosterInner,
+        named: Uid,
+        row: &[Uid],
+        from: Uid,
+    ) -> Vec<SealingTo> {
+        let except = r.person_members(named).map(|_| from);
+        row.iter()
+            .filter(|m| Some(**m) != except)
+            .filter_map(|m| r.users.get(m))
+            .filter(|s| s.live())
+            .filter_map(|s| {
+                r.sealable(s).map(|d| SealingTo {
+                    uid: s.info.uid,
+                    device: s.device,
+                    cert: d.cert.clone(),
+                    enc: d.enc,
+                })
+            })
+            .collect()
+    }
+
+    /// The sender as a sealed message names it, under the lock it is
+    /// delivered under.
+    fn sender(&self, r: &crate::roster::RosterInner, from: Uid) -> Result<Sender, SealedError> {
+        let sender = r.users.get(&from).ok_or(SealedError::NoSuchUser)?;
+        let fingerprint = sender
             .info
             .transport
             .identity
@@ -205,72 +400,154 @@ impl Core {
             .filter(|id| id.sealed.is_some())
             .ok_or(SealedError::SelfNotSealed)?
             .fingerprint;
-        let target = r
-            .users
+        Ok(Sender {
+            // A person's device seals as its row, the uid its reader
+            // knows and answers, even to its own person, where a plain
+            // message shows nobody: a reply to it seals to the row by
+            // device, and the box is checked against the row's key.
+            uid: r.row_uid(from),
+            nick: sender.info.nick.clone(),
+            login: sender.has_inbox.then(|| sender.login.clone()),
+            fingerprint,
+            device: sender.grouped.then_some(sender.device),
+        })
+    }
+
+    /// Whether `to`, detached, holds as much as it may of what this
+    /// sender sealed, or in all, to take `len` bytes more (§4.3).
+    fn held_full(
+        &self,
+        r: &crate::roster::RosterInner,
+        to: Uid,
+        fingerprint: &[u8; 32],
+        len: usize,
+    ) -> bool {
+        r.users
             .get(&to)
-            .filter(|s| s.live() && s.serial == serial)
-            .ok_or(SealedError::NoSuchUser)?;
-        self.sealed_to(target, &sealed_to)?;
-        if let Some((mine, all)) = target.outbox.sealed_held(&from_fingerprint) {
-            let holds = self.sealed_holds;
-            if mine + sealed.len() > holds.per_sender || all + sealed.len() > holds.all {
-                return Err(SealedError::HeldFull);
-            }
-        }
-        r.send_to(
+            .and_then(|s| s.outbox.sealed_held(fingerprint))
+            .is_some_and(|(mine, all)| {
+                let holds = self.sealed_holds;
+                mine + len > holds.per_sender || all + len > holds.all
+            })
+    }
+
+    fn deliver_sealed(
+        &self,
+        r: &mut crate::roster::RosterInner,
+        sender: &Sender,
+        to: Uid,
+        sealed: Vec<u8>,
+    ) -> bool {
+        let persons = r.users.get(&to).is_some_and(|s| s.info.transport.persons);
+        r.send_landed(
             to,
             Event::Sealed {
-                from,
-                from_nick,
-                from_login,
-                from_fingerprint,
+                from: sender.uid,
+                from_nick: sender.nick.clone(),
+                from_login: sender.login.clone(),
+                from_fingerprint: sender.fingerprint,
+                from_device: sender.device.filter(|_| persons),
                 sealed: Some(sealed),
                 at: SystemTime::now(),
             },
-        );
-        Ok(())
+        )
     }
 
-    /// Whether `target` can open a box sealed to the key `sealed_to` hashes.
-    fn sealed_to(
-        &self,
-        target: &crate::roster::UserSession,
-        sealed_to: &[u8; 32],
-    ) -> Result<(), SealedError> {
-        let device = self.sealable(target).ok_or(SealedError::NotSealed)?;
-        if <[u8; 32]>::from(Sha256::digest(device.enc)) != *sealed_to {
-            return Err(SealedError::CertChanged);
-        }
-        Ok(())
-    }
-
-    /// The device `target` can open sealed messages with now: unexpired,
-    /// and not a session a kick or a revocation has ended but whose
-    /// connection has yet to hear it (§4.2, §4.3).
-    fn sealable<'a>(&self, target: &'a crate::roster::UserSession) -> Option<&'a SealedDevice> {
-        if target.kicked || self.refuses_session(target) {
-            return None;
-        }
-        sealed_of(target).filter(|d| d.expires > self.clock.unix())
-    }
-
-    /// Whether `owner` refuses messages from `other`, with no lock held.
+    /// Whether any of `owners` refuses messages from `other`, with no
+    /// lock held.
     fn blocks(
         &self,
-        owner: &crate::inbox::Mailbox,
+        owners: &[crate::inbox::Mailbox],
         other: &crate::inbox::Mailbox,
     ) -> Result<(), SealedError> {
         let Some(store) = self.relationships.as_ref() else {
             return Ok(());
         };
-        match store.is_blocked(owner, other) {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(SealedError::Blocked),
-            Err(e) => {
-                tracing::warn!("inbox: {e}");
-                Err(SealedError::ServerError)
+        for owner in owners {
+            match store.is_blocked(owner, other) {
+                Ok(false) => {}
+                Ok(true) => return Err(SealedError::Blocked),
+                Err(e) => {
+                    tracing::warn!("inbox: {e}");
+                    return Err(SealedError::ServerError);
+                }
             }
         }
+        Ok(())
+    }
+}
+
+/// Every mailbox among the sessions `named` stands for: a personal
+/// account's person can hold password devices under its login alone
+/// beside linked ones under its identity, and a block made from either
+/// is the person's.
+fn mailboxes(
+    r: &crate::roster::RosterInner,
+    named: Uid,
+) -> Result<Vec<crate::inbox::Mailbox>, SealedError> {
+    let mut owners = Vec::new();
+    for s in r
+        .named_sessions(named)
+        .iter()
+        .filter_map(|m| r.users.get(m))
+    {
+        let mailbox = s.mailbox();
+        if s.live() && !owners.contains(&mailbox) {
+            owners.push(mailbox);
+        }
+    }
+    if owners.is_empty() {
+        return Err(SealedError::NoSuchUser);
+    }
+    Ok(owners)
+}
+
+/// The sessions `named` stands for now whose mailbox is one the blocks
+/// were checked against: a device under another, or a uid let go of and
+/// given out again in between, is no one the sender was cleared for.
+fn sealing_row(
+    r: &crate::roster::RosterInner,
+    named: Uid,
+    owners: &[crate::inbox::Mailbox],
+) -> Result<Vec<Uid>, SealedError> {
+    let row: Vec<Uid> = r
+        .named_sessions(named)
+        .into_iter()
+        .filter(|m| {
+            r.users
+                .get(m)
+                .is_some_and(|s| s.live() && owners.contains(&s.mailbox()))
+        })
+        .collect();
+    if row.is_empty() {
+        return Err(SealedError::NoSuchUser);
+    }
+    Ok(row)
+}
+
+/// One answer of `device_cert`'s, from `asker`'s ration.
+fn spend_device_cert(r: &mut crate::roster::RosterInner, asker: Uid) -> Result<(), BoxesError> {
+    match r
+        .users
+        .get_mut(&asker)
+        .and_then(|s| s.device_certs.as_mut())
+    {
+        Some(bucket) => bucket
+            .spend(1, Instant::now())
+            .map_err(|wait| SealedError::RateLimited(wait).into()),
+        None => Ok(()),
+    }
+}
+
+/// The devices of a list past its first, counted against `asker`'s
+/// ration once the list is given (§4.2).
+fn charge_devices(r: &mut crate::roster::RosterInner, asker: Uid, extra: usize) {
+    if let Some(bucket) = r
+        .users
+        .get_mut(&asker)
+        .and_then(|s| s.device_certs.as_mut())
+    {
+        bucket.charge(u32::try_from(extra).unwrap_or(u32::MAX), Instant::now());
     }
 }
 
@@ -295,4 +572,33 @@ fn set_sealed(r: &mut crate::roster::RosterInner, uid: Uid, sealed: Option<Seale
 
 pub(crate) fn sealed_of(sess: &crate::roster::UserSession) -> Option<&SealedDevice> {
     sess.info.transport.identity.as_ref()?.sealed.as_deref()
+}
+
+/// The device `sess` can be sealed to at `now`: it said `sealed` with a
+/// certificate that allowed it, the certificate is unexpired, and no
+/// kick or revocation (`refused`) has ended the session yet. What every
+/// shown `sealed`, every list a sender is given and every delivery asks.
+pub(crate) fn sealable_at<'a>(
+    sess: &'a crate::roster::UserSession,
+    now: u64,
+    refused: &std::sync::RwLock<crate::revoked::Refused>,
+) -> Option<&'a SealedDevice> {
+    if sess.kicked {
+        return None;
+    }
+    let tag = sess.info.transport.identity.as_ref()?;
+    if refused.read().unwrap().refuses(tag) {
+        return None;
+    }
+    sealed_of(sess).filter(|d| d.expires > now)
+}
+
+impl crate::roster::RosterInner {
+    /// [`sealable_at`] now.
+    pub(crate) fn sealable<'a>(
+        &self,
+        sess: &'a crate::roster::UserSession,
+    ) -> Option<&'a SealedDevice> {
+        sealable_at(sess, self.clock.unix(), &self.revoked)
+    }
 }

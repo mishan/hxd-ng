@@ -562,6 +562,9 @@ pub enum Event {
         from_login: Option<String>,
         /// The sender's identity, as the roster shows it.
         from_fingerprint: [u8; 32],
+        /// The device of a person that sealed it, for a reader that
+        /// declared `persons`: the row alone does not say which.
+        from_device: Option<u64>,
         /// The box exactly as it was sent; `None` once the session stopped
         /// saying it can open one while this was held for it (§4.1).
         sealed: Option<Vec<u8>>,
@@ -1484,6 +1487,10 @@ impl UidQuarantine {
 #[derive(Default)]
 pub(crate) struct RosterInner {
     pub(crate) users: HashMap<Uid, UserSession>,
+    /// The core's clock and its refused keys, shared, for what is
+    /// decided under this lock against them ([`RosterInner::sealable`]).
+    pub(crate) clock: crate::clock::Clock,
+    pub(crate) revoked: Arc<std::sync::RwLock<crate::revoked::Refused>>,
     pub(crate) last_uid: Uid,
     pub(crate) freed_uids: UidQuarantine,
     /// Other servers' users shown here, apart from the sessions so that
@@ -1797,11 +1804,23 @@ impl RosterInner {
     }
 
     pub(crate) fn send_to(&mut self, uid: Uid, ev: Event) {
-        if let Some(sess) = self.users.get_mut(&uid) {
-            let mut tally = instrument::Tally::default();
-            tally.add(sess.outbox.push(ev));
-            tally.record();
-        }
+        self.send_landed(uid, ev);
+    }
+
+    /// [`Self::send_to`], with whether the event reached a connection or
+    /// a detached session's buffer.
+    pub(crate) fn send_landed(&mut self, uid: Uid, ev: Event) -> bool {
+        let Some(sess) = self.users.get_mut(&uid) else {
+            return false;
+        };
+        let pushed = sess.outbox.push(ev);
+        let mut tally = instrument::Tally::default();
+        tally.add(pushed);
+        tally.record();
+        matches!(
+            pushed,
+            instrument::Pushed::Live | instrument::Pushed::Buffered
+        )
     }
 
     /// Deliver to every *visible* session matching `pred` (skipping `skip`).
@@ -2196,7 +2215,7 @@ pub struct Core {
     /// Keys refused by hand and by what registrars publish
     /// (`crate::revoked`). Read under the roster lock by `attach`, and
     /// written with nothing held, so the order is roster first, then this.
-    pub(crate) revoked: std::sync::RwLock<crate::revoked::Refused>,
+    pub(crate) revoked: Arc<std::sync::RwLock<crate::revoked::Refused>>,
     /// The time for whatever built on this core reads a clock
     /// (`crate::clock`).
     pub(crate) clock: crate::clock::Clock,
@@ -2361,7 +2380,14 @@ pub(crate) struct PmReactions;
 
 impl Core {
     pub fn new() -> Self {
-        Self::default()
+        let core = Self::default();
+        // One clock: a test that moves the core's moves what the roster
+        // judges by it. And one list of refused keys.
+        let mut r = core.roster.lock().unwrap();
+        r.clock = core.clock.clone();
+        r.revoked = core.revoked.clone();
+        drop(r);
+        core
     }
 
     pub fn clock(&self) -> &crate::clock::Clock {

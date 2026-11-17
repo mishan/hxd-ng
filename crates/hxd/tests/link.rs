@@ -2518,6 +2518,22 @@ async fn a_persons_signing_devices_are_each_verified_at_the_peer() {
 }
 
 #[tokio::test]
+async fn a_ghosts_device_is_not_asked_for() {
+    let (a, b, _dirs) = coalescing(USER_KEYS).await;
+    let (mut asker, hello) =
+        keyed_saying(&a, &person(2), json!({ "sealed": true, "persons": true })).await;
+    let (_phone, _) = keyed(&b, &alice_on(1)).await;
+    let ghost = ghost_row(&mut asker, &hello, |u| u["nick"] == "alice").await["uid"].clone();
+    match asker
+        .request("device_cert", json!({ "uid": ghost, "device": 1 }))
+        .await
+    {
+        Err(hxd_testclient::Error::Refused { code, .. }) => assert_eq!(code, "bad_request"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_person_whose_first_device_logged_in_with_a_password_is_shown_with_no_identity() {
     let (a, b, _dirs) = coalescing(USER_KEYS).await;
     let bob = person(2);

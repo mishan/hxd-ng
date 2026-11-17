@@ -129,6 +129,12 @@ impl Receiver {
     /// The reply to `id`; events meanwhile go to the backlog, and an
     /// error reply is `Err(Refused)`.
     pub async fn reply(&mut self, id: u64) -> Result<Value> {
+        self.reply_frame(id).await.and_then(reply_value)
+    }
+
+    /// The whole reply frame to request `id`, an error's fields beside
+    /// its code included.
+    pub async fn reply_frame(&mut self, id: u64) -> Result<Value> {
         // For the whole wait: steady events must not stretch it.
         let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
@@ -136,7 +142,7 @@ impl Receiver {
                 .await
                 .map_err(|_| Error::Timeout)??;
             match got {
-                Incoming::Reply(v) if v["reply"].as_u64() == Some(id) => return reply_value(v),
+                Incoming::Reply(v) if v["reply"].as_u64() == Some(id) => return Ok(v),
                 Incoming::Reply(v) => {
                     return Err(Error::Protocol(format!("reply to another request: {v}")));
                 }
@@ -377,6 +383,12 @@ impl Client {
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.tx.send(method, params).await?;
         self.rx.reply(id).await
+    }
+
+    /// A request whose whole reply frame is wanted, refusals included.
+    pub async fn request_frame(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.tx.send(method, params).await?;
+        self.rx.reply_frame(id).await
     }
 
     pub async fn next(&mut self) -> Result<Incoming> {

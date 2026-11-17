@@ -569,7 +569,13 @@ Three layers, all `cargo test --workspace`:
   its share and everyone to the whole, a certificate past its expiry
   sealed to no more, the placeholders a resume without `sealed`
   replays, the reports a deniable box and a signed one make at full
-  length, and nothing sealed in any file of the database), `voice.rs`
+  length, and nothing sealed in any file of the database; and with
+  persons on, a box for each device of a person opened by that device,
+  a device joining between the fetch and the send told as
+  `devices_changed` with the devices as they are, a client knowing
+  nothing of devices sealing to a person with one and answered, and a
+  message of boxes refused as malformed but from a `persons` client
+  with one to eight), `voice.rs`
   (voice signaling on both wires against a recording media layer: the
   capability and privilege gates, the chunk and JSON shapes, one room
   shared by a classic and an ng client, joins past a session's

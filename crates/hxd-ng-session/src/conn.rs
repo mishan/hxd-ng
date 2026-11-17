@@ -428,10 +428,7 @@ pub(crate) async fn run(
                     // A signature costs two verifications, its certificate's
                     // and its own (`docs/e2e-messages.md` §7).
                     let signed = u32::from(req.params.get("signed").is_some());
-                    // And a sealed message one for each 2048 bytes of its
-                    // box (§4.3), here as its base64url's length says.
-                    let sealed = req.params.get("sealed").and_then(Value::as_str);
-                    let sealed = sealed.map_or(0, |b| (b.len() * 3 / 4 / 2048) as u32);
+                    let sealed = sealed_weight(&req.params);
                     let objects = crate::friends::object_weight(&req)
                         .saturating_add(crate::reactions::targets_weight(&req));
                     // `news_seen`'s timeline form reads and moves every
@@ -2177,7 +2174,7 @@ async fn dispatch(
                 "access_denied",
                 "You are not allowed to send private messages.",
             ),
-            Ok(p) if p.sealed.is_some() || p.cert.is_some() => {
+            Ok(p) if p.sealed.is_some() || p.cert.is_some() || p.boxes.is_some() => {
                 crate::sealed::msg(ctx, state, req.id, p).await
             }
             Ok(mut p) => {
@@ -2946,9 +2943,41 @@ fn self_json(me: &hxd_core::coalesce::SelfView) -> Value {
     v
 }
 
+/// What a sealed message weighs beyond its request: one for each 2048
+/// bytes of its box (§4.3), or of a person's boxes together, each being
+/// delivered, here as their base64url's length says. The message is
+/// still one for its spam points.
+fn sealed_weight(params: &Value) -> u32 {
+    let boxes = params.get("boxes").and_then(Value::as_array);
+    let bytes: usize = params
+        .get("sealed")
+        .into_iter()
+        .chain(boxes.into_iter().flatten().map(|b| &b["sealed"]))
+        .filter_map(Value::as_str)
+        .map(|b| b.len() * 3 / 4)
+        .sum();
+    u32::try_from(bytes / 2048).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_message_weighs_its_boxes_bytes_together() {
+        // Of bytes a multiple of three, so its base64url says them exactly.
+        let b64 = |bytes: usize| "A".repeat(bytes * 4 / 3);
+        let boxes = |n: usize, bytes: usize| serde_json::json!({ "boxes": vec![serde_json::json!({ "sealed": b64(bytes) }); n] });
+        for (case, params, weight) in [
+            ("one box", serde_json::json!({ "sealed": b64(4098) }), 2),
+            ("boxes of over 2048 each", boxes(2, 2049), 2),
+            ("boxes of less than 2048 each", boxes(2, 1500), 1),
+            ("eight small boxes", boxes(8, 513), 2),
+            ("none", serde_json::json!({ "text": "hi" }), 0),
+        ] {
+            assert_eq!(sealed_weight(&params), weight, "{case}");
+        }
+    }
 
     #[test]
     fn ending_a_device_is_priced_as_kicking_one() {
