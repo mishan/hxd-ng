@@ -1,6 +1,7 @@
 mod chats;
 mod devices;
 mod link;
+mod sealing;
 mod voice;
 
 use crate::access::{bit, AccessBits};

@@ -6,12 +6,12 @@
 
 use hl_identity::sealed::{check_len, sender_enc};
 use hxd_core::server_link::PeerRefusal;
-use hxd_core::{SealedDevice, SealedError};
+use hxd_core::{BoxesError, DeviceCerts, SealedBox, SealedDevice, SealedError};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::conn::{off_reactor, retry_secs, SessState};
-use crate::proto::{b64url, reply_err, reply_err_retry, reply_ok, MsgParams};
+use crate::proto::{b64url, reply_err, reply_err_retry, reply_ok, BoxParams, MsgParams};
 use crate::push::DeviceOnSocket;
 use crate::NgCtx;
 
@@ -63,7 +63,37 @@ fn refused(id: u64, e: SealedError) -> String {
             retry_secs(wait),
         ),
         SealedError::ServerError => reply_err(id, "server_error", "Server error."),
+        SealedError::NoSuchDevice => {
+            reply_err(id, "no_such_device", "That user has no such device.")
+        }
     }
+}
+
+/// A refusal of a person's boxes: the devices to seal to, or the one
+/// whose key changed, beside the code as `retry_after` is (§4.3).
+fn boxes_refused(id: u64, e: BoxesError) -> String {
+    match e {
+        BoxesError::Sealed(e) => refused(id, e),
+        BoxesError::DevicesChanged(devices) => json!({ "reply": id, "error": {
+            "code": "devices_changed",
+            "text": "That user's devices have changed; seal to each of them again.",
+            "devices": devices_json(&devices),
+        } })
+        .to_string(),
+        BoxesError::CertChanged(device) => json!({ "reply": id, "error": {
+            "code": "cert_changed",
+            "text": "That device's key has changed; fetch its certificate and seal again.",
+            "device": device,
+        } })
+        .to_string(),
+    }
+}
+
+fn devices_json(devices: &[(u64, Vec<u8>)]) -> serde_json::Value {
+    devices
+        .iter()
+        .map(|(device, cert)| json!({ "device": device, "cert": b64url(cert) }))
+        .collect()
 }
 
 /// What a ghost's home server, or a link on the way, answered (§5).
@@ -104,6 +134,9 @@ fn unb64(s: &str) -> Option<Vec<u8>> {
 #[derive(Deserialize)]
 struct DeviceCertParams {
     uid: u16,
+    /// One device of a person, for a client that declared `persons`.
+    #[serde(default)]
+    device: Option<u64>,
 }
 
 /// `device_cert` (§4.2).
@@ -116,6 +149,20 @@ pub(crate) async fn device_cert(
     let Ok(p) = serde_json::from_value::<DeviceCertParams>(params.clone()) else {
         return reply_err(id, "bad_request", "Malformed device_cert.");
     };
+    if p.device.is_some() && !state.persons {
+        return reply_err(
+            id,
+            "bad_request",
+            "`device` is for a client that declared `persons`.",
+        );
+    }
+    if p.device.is_some() && ctx.core.ghost_ref(p.uid).is_some() {
+        return reply_err(
+            id,
+            "bad_request",
+            "A user of another server has no devices here.",
+        );
+    }
     let asker = state.uid;
     // A ghost's, through Link Device Keys to its home server (§5).
     match ctx.core.peer_device_cert(asker, p.uid) {
@@ -128,8 +175,11 @@ pub(crate) async fn device_cert(
             }
         }
     }
-    match off_reactor(&ctx.core, move |c| c.device_cert(asker, p.uid)).await {
-        Some(Ok(cert)) => reply_ok(id, json!({ "cert": b64url(&cert) })),
+    match off_reactor(&ctx.core, move |c| c.device_cert(asker, p.uid, p.device)).await {
+        Some(Ok(DeviceCerts::One(cert))) => reply_ok(id, json!({ "cert": b64url(&cert) })),
+        Some(Ok(DeviceCerts::Devices(devices))) => {
+            reply_ok(id, json!({ "devices": devices_json(&devices) }))
+        }
         Some(Err(e)) => refused(id, e),
         None => reply_err(id, "server_error", "Server error."),
     }
@@ -137,8 +187,11 @@ pub(crate) async fn device_cert(
 
 /// `msg` with `sealed` (§4.3): to one session, never stored, so always
 /// `queued: false`.
-pub(crate) async fn msg(ctx: &NgCtx, state: &SessState, id: u64, p: MsgParams) -> String {
+pub(crate) async fn msg(ctx: &NgCtx, state: &SessState, id: u64, mut p: MsgParams) -> String {
     let bad = |text: &str| reply_err(id, "bad_request", text);
+    if let Some(boxes) = p.boxes.take() {
+        return msg_boxes(ctx, state, id, p, boxes).await;
+    }
     let (Some(sealed), Some(cert)) = (p.sealed, p.cert) else {
         return bad("`sealed` and `cert` go together.");
     };
@@ -199,6 +252,93 @@ pub(crate) async fn msg(ctx: &NgCtx, state: &SessState, id: u64, p: MsgParams) -
             bad("This session did not say it can open sealed messages.")
         }
         Some(Err(e)) => refused(id, e),
+        None => reply_err(id, "server_error", "Server error."),
+    }
+}
+
+/// The most boxes one message carries: past the devices one account may
+/// have on at once, and bounded so one request stays small.
+const MAX_BOXES: usize = 8;
+
+/// `msg` with `boxes`, from a client that declared `persons`: one box for
+/// each device the target can be sealed to (§4.3).
+async fn msg_boxes(
+    ctx: &NgCtx,
+    state: &SessState,
+    id: u64,
+    p: MsgParams,
+    boxes: Vec<BoxParams>,
+) -> String {
+    let bad = |text: &str| reply_err(id, "bad_request", text);
+    if !state.persons {
+        return bad("`boxes` is for a client that declared `persons`.");
+    }
+    if p.sealed.is_some()
+        || p.cert.is_some()
+        || p.to_login.is_some()
+        || p.text.is_some()
+        || p.signed.is_some()
+        || p.media.is_some()
+        || p.guid.is_some()
+        || p.re.is_some()
+        || p.emoji.is_some()
+    {
+        return bad("A message of boxes carries `to` and `boxes` alone.");
+    }
+    let Some(to) = p.to else {
+        return bad("A sealed message is to a user, by `to`.");
+    };
+    if boxes.is_empty() || boxes.len() > MAX_BOXES {
+        return bad("`boxes` holds from 1 to 8 boxes.");
+    }
+    let own = state
+        .device
+        .as_ref()
+        .and_then(|d| d.sealable.as_ref())
+        .map(|d| d.enc);
+    let mut sealed_boxes = Vec::with_capacity(boxes.len());
+    for b in boxes {
+        if sealed_boxes
+            .iter()
+            .any(|s: &SealedBox| s.device == b.device)
+        {
+            return bad("Each device has one box.");
+        }
+        let Some(sealed) =
+            unb64(&b.sealed).filter(|s| s.first().is_some_and(|f| check_len(*f, s.len()).is_ok()))
+        else {
+            return bad("A box is not a sealed message of one of its sizes.");
+        };
+        let Some(sealed_to) = unb64(&b.cert).and_then(|c| <[u8; 32]>::try_from(c).ok()) else {
+            return bad("A box's `cert` is the SHA-256 of a `device_enc` key.");
+        };
+        if sender_enc(&sealed).is_some_and(|pk_s| own != Some(pk_s)) {
+            return bad("A deniable box is sealed under this session's own `device_enc` key.");
+        }
+        sealed_boxes.push(SealedBox {
+            device: b.device,
+            sealed,
+            sealed_to,
+        });
+    }
+    // A ghost's devices are its home server's to name, which no link
+    // does yet.
+    if ctx.core.is_ghost(to) {
+        return refused(id, SealedError::NotSealed);
+    }
+    let from = state.uid;
+    match off_reactor(&ctx.core, move |c| c.msg_boxes(from, to, sealed_boxes)).await {
+        Some(Ok(held_full)) => {
+            let mut ok = json!({ "queued": false });
+            if !held_full.is_empty() {
+                ok["held_full"] = json!(held_full);
+            }
+            reply_ok(id, ok)
+        }
+        Some(Err(BoxesError::Sealed(SealedError::SelfNotSealed))) => {
+            bad("This session did not say it can open sealed messages.")
+        }
+        Some(Err(e)) => boxes_refused(id, e),
         None => reply_err(id, "server_error", "Server error."),
     }
 }

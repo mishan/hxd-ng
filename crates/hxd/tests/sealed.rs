@@ -68,6 +68,11 @@ fn fingerprint(p: &Person) -> Fingerprint {
 }
 
 async fn start(dir: &Path) -> Server {
+    start_with(dir, false).await
+}
+
+/// With a person's devices one row when `coalesce` says so.
+async fn start_with(dir: &Path, coalesce: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nread_chat_history = true\n";
@@ -104,6 +109,7 @@ async fn start(dir: &Path) -> Server {
             },
         )
         .with_moderation(store, ModerationPolicy::default())
+        .with_coalesce(coalesce)
         // Small enough that two senders reach it inside their own shares.
         .with_sealed_holds(hxd_core::SealedHolds {
             per_sender: 64 * 1024,
@@ -768,4 +774,195 @@ async fn a_held_sealed_message_waits_for_its_resume_and_no_longer() {
     })
     .await
     .unwrap();
+}
+
+/// A box of `msg`'s `boxes`: `m` sealed by `from` to the device `cert`
+/// certifies, under the id the server gave it.
+fn box_for(device: &Value, m: &PrivateMessage, from: &Person) -> Value {
+    let cert = unb64(device["cert"].as_str().unwrap());
+    let sealed = seal_to(m, &from.dev, &DeviceCert::parse(&cert).unwrap(), false).unwrap();
+    json!({ "device": device["device"], "sealed": b64(&sealed), "cert": key_hash(&cert) })
+}
+
+/// The text of the sealed `msg` `c` is sent, opened as `reader` from
+/// `from`, and the `from` it names.
+async fn opened_text(c: &mut Client, reader: &Person, from: &Person) -> (String, Value) {
+    let ev = c
+        .event_where("msg", |d| d.get("sealed").is_some())
+        .await
+        .unwrap()
+        .data;
+    let Opened::Verified { message, .. } = opened(&ev, reader, from) else {
+        panic!("not verified: {ev}");
+    };
+    (message.message().text.clone(), ev["from"].clone())
+}
+
+#[tokio::test]
+async fn a_box_for_each_device_of_a_person_is_opened_by_that_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with(dir.path(), true).await;
+    let (alice, phone, bob) = (
+        person(1, 1, "alice"),
+        person(1, 11, "alice"),
+        person(2, 2, "bob"),
+    );
+    let both = json!({ "sealed": true, "persons": true });
+    let (mut a, _) = login_as(server.ng, &alice, both.clone()).await;
+    let (mut p, _) = login_as(server.ng, &phone, both.clone()).await;
+    let (mut b, hello) = login_as(server.ng, &bob, both).await;
+    let row = uid_of(&hello["users"], "alice");
+
+    let got = ok(&mut b, "device_cert", json!({ "uid": row })).await;
+    let devices = got["devices"].as_array().unwrap().clone();
+    let mut certs: Vec<Vec<u8>> = devices
+        .iter()
+        .map(|d| unb64(d["cert"].as_str().unwrap()))
+        .collect();
+    certs.sort();
+    let mut want = vec![alice.cert.clone(), phone.cert.clone()];
+    want.sort();
+    assert_eq!(certs, want, "each device's own certificate");
+
+    let m = message(&bob, 1, &alice, "to each of you");
+    let boxes: Vec<Value> = devices.iter().map(|d| box_for(d, &m, &bob)).collect();
+    let sent = ok(&mut b, "msg", json!({ "to": row, "boxes": boxes })).await;
+    assert_eq!(sent, json!({ "queued": false }));
+    for (c, reader) in [(&mut a, &alice), (&mut p, &phone)] {
+        let (text, from) = opened_text(c, reader, &bob).await;
+        assert_eq!(text, "to each of you");
+        assert_eq!(from["uid"], b.uid.unwrap(), "from bob's row");
+    }
+}
+
+#[tokio::test]
+async fn a_device_joining_between_the_fetch_and_the_send_is_told_as_devices_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with(dir.path(), true).await;
+    let (alice, phone, bob) = (
+        person(1, 1, "alice"),
+        person(1, 11, "alice"),
+        person(2, 2, "bob"),
+    );
+    let both = json!({ "sealed": true, "persons": true });
+    let (_a, _) = login_as(server.ng, &alice, both.clone()).await;
+    let (mut b, hello) = login_as(server.ng, &bob, both.clone()).await;
+    let row = uid_of(&hello["users"], "alice");
+    let got = ok(&mut b, "device_cert", json!({ "uid": row })).await;
+    let devices = got["devices"].as_array().unwrap().clone();
+    assert_eq!(devices.len(), 1);
+    let (_p, _) = login_as(server.ng, &phone, both).await;
+
+    let m = message(&bob, 1, &alice, "late");
+    let boxes: Vec<Value> = devices.iter().map(|d| box_for(d, &m, &bob)).collect();
+    let refused = b
+        .request_frame("msg", json!({ "to": row, "boxes": boxes }))
+        .await
+        .unwrap();
+    assert_eq!(refused["error"]["code"], "devices_changed", "{refused}");
+    let now = refused["error"]["devices"].as_array().unwrap();
+    assert_eq!(now.len(), 2, "the devices as they are: {refused}");
+    let boxes: Vec<Value> = now.iter().map(|d| box_for(d, &m, &bob)).collect();
+    let sent = ok(&mut b, "msg", json!({ "to": row, "boxes": boxes })).await;
+    assert_eq!(sent, json!({ "queued": false }));
+}
+
+#[tokio::test]
+async fn a_client_knowing_nothing_of_devices_seals_to_a_person_with_one_and_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with(dir.path(), true).await;
+    let (alice, bob) = (person(1, 1, "alice"), person(2, 2, "bob"));
+    let sealed = json!({ "sealed": true });
+    let (mut a, _) = login_as(server.ng, &alice, sealed.clone()).await;
+    let (mut b, hello_b) = login_as(server.ng, &bob, sealed).await;
+    let row = uid_of(&hello_b["users"], "alice");
+    let shown = hello_b["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["uid"] == row)
+        .unwrap()["identity"]["sealed"]
+        .clone();
+    assert_eq!(shown, true, "one device: the row says sealed");
+
+    let got = ok(&mut b, "device_cert", json!({ "uid": row })).await;
+    assert_eq!(unb64(got["cert"].as_str().unwrap()), alice.cert);
+    let m = message(&bob, 1, &alice, "hello alice");
+    let boxed = seal_to(
+        &m,
+        &bob.dev,
+        &DeviceCert::parse(&alice.cert).unwrap(),
+        false,
+    )
+    .unwrap();
+    ok(&mut b, "msg", sealed_msg(row, &boxed, &alice.cert)).await;
+    let (text, from) = opened_text(&mut a, &alice, &bob).await;
+    assert_eq!(text, "hello alice");
+    assert!(
+        from.get("device").is_none(),
+        "no devices to a client that knows none"
+    );
+
+    // And back, to bob as alice sees him.
+    let synced = ok(&mut a, "sync", json!({})).await;
+    let to_bob = uid_of(&synced["users"], "bob");
+    let got = ok(&mut a, "device_cert", json!({ "uid": to_bob })).await;
+    let cert = unb64(got["cert"].as_str().unwrap());
+    let m = message(&alice, 2, &bob, "hello bob");
+    let boxed = seal_to(&m, &alice.dev, &DeviceCert::parse(&cert).unwrap(), false).unwrap();
+    ok(&mut a, "msg", sealed_msg(to_bob, &boxed, &cert)).await;
+    let (text, _) = opened_text(&mut b, &bob, &alice).await;
+    assert_eq!(text, "hello bob");
+}
+
+#[tokio::test]
+async fn a_message_of_boxes_is_refused_as_malformed_but_from_a_persons_client_with_one_to_eight() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_with(dir.path(), true).await;
+    let (alice, bob) = (person(1, 1, "alice"), person(2, 2, "bob"));
+    let (_a, _) = login_as(
+        server.ng,
+        &alice,
+        json!({ "sealed": true, "persons": true }),
+    )
+    .await;
+    let (mut plain, hello) = login_as(server.ng, &bob, json!({ "sealed": true })).await;
+    let row = uid_of(&hello["users"], "alice");
+    let got = ok(&mut plain, "device_cert", json!({ "uid": row })).await;
+    let device = json!({ "device": 1, "cert": got["cert"] });
+    let one = box_for(&device, &message(&bob, 1, &alice, "x"), &bob);
+    let boxes = |n: usize| vec![one.clone(); n];
+    assert_eq!(
+        code(&mut plain, "msg", json!({ "to": row, "boxes": boxes(1) })).await,
+        "bad_request",
+        "from a client that did not declare persons"
+    );
+    assert_eq!(
+        code(
+            &mut plain,
+            "device_cert",
+            json!({ "uid": row, "device": 1 })
+        )
+        .await,
+        "bad_request",
+        "a device named by a client that did not declare persons"
+    );
+    plain.close().await.unwrap();
+    let (mut b, _) = login_as(server.ng, &bob, json!({ "sealed": true, "persons": true })).await;
+    for (case, params) in [
+        ("no box", json!({ "to": row, "boxes": [] })),
+        ("nine", json!({ "to": row, "boxes": boxes(9) })),
+        ("one device twice", json!({ "to": row, "boxes": boxes(2) })),
+        (
+            "beside text",
+            json!({ "to": row, "boxes": boxes(1), "text": "hi" }),
+        ),
+        (
+            "beside sealed",
+            json!({ "to": row, "boxes": boxes(1), "sealed": one["sealed"], "cert": one["cert"] }),
+        ),
+        ("to no one", json!({ "boxes": boxes(1) })),
+    ] {
+        assert_eq!(code(&mut b, "msg", params).await, "bad_request", "{case}");
+    }
 }

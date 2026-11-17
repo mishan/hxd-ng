@@ -413,15 +413,21 @@ impl PeerRouter for Router {
     }
     fn msg_sealed(
         &self,
-        _: Uid,
+        from: Uid,
         _: Uid,
         _: Vec<u8>,
         _: [u8; 32],
     ) -> oneshot::Receiver<Result<(), PeerRefusal>> {
-        unreachable!()
+        self.0.lock().unwrap().push(from);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
     }
-    fn device_cert(&self, _: Uid, _: Uid) -> oneshot::Receiver<Result<Vec<u8>, PeerRefusal>> {
-        unreachable!()
+    fn device_cert(&self, asker: Uid, _: Uid) -> oneshot::Receiver<Result<Vec<u8>, PeerRefusal>> {
+        self.0.lock().unwrap().push(asker);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(vec![]));
+        rx
     }
     fn knows_server_key(&self, _: &[u8; 32]) -> bool {
         false
@@ -586,5 +592,66 @@ fn a_block_on_any_device_refuses_a_ghosts_sealed_message_to_its_person() {
     assert_eq!(
         core.ghost_sealed(gus, a1, vec![1], None),
         Err(PeerRefusal::RefusesMessages)
+    );
+}
+
+#[test]
+fn nothing_is_sealed_between_a_person_and_a_ghost_either_way() {
+    let (core, _feed) = linked();
+    let router = Arc::new(Router::default());
+    core.set_peer_router(router.clone());
+    let sealing = |device: u8| {
+        let mut t = proved(device, false);
+        if let Some(id) = t.identity.as_mut() {
+            id.sealed = Some(
+                crate::SealedDevice {
+                    cert: vec![device],
+                    enc: [device; 32],
+                    expires: u64::MAX,
+                }
+                .into(),
+            );
+        }
+        t
+    };
+    let gus = ghost(&core);
+    let key = <sha2::Sha256 as sha2::Digest>::digest([1u8; 32]).into();
+    // A session alone may, its account linking no identity: the ghost
+    // could seal back to it.
+    let (bob, _rb) = core
+        .attach(session("bob", Some(ALICE), None, sealing(1)))
+        .unwrap();
+    core.announce(bob);
+    assert!(matches!(
+        core.peer_sealed(bob, gus, vec![1], key),
+        Some(Ok(_))
+    ));
+    // A person may not, even of one device.
+    let (a1, _rx1) = device(&core, sealing(1));
+    let (a2, _rx2) = device(&core, sealing(2));
+    for from in [a1, a2] {
+        assert!(
+            matches!(
+                core.peer_sealed(from, gus, vec![1], key),
+                Some(Err(crate::SealedError::NotSealed))
+            ),
+            "to a ghost from {from}"
+        );
+        assert!(
+            matches!(
+                core.peer_device_cert(from, gus),
+                Some(Err(crate::SealedError::NotSealed))
+            ),
+            "a ghost's certificate for {from}"
+        );
+    }
+    assert_eq!(*router.0.lock().unwrap(), [bob], "only the session alone's");
+    assert_eq!(
+        core.ghost_sealed(gus, a1, vec![1], Some(key)),
+        Err(PeerRefusal::NoDeviceKeys)
+    );
+    assert_eq!(
+        core.ghost_device_cert(gus, a1),
+        Err(PeerRefusal::NoDeviceKeys)
     );
 }

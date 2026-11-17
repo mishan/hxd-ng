@@ -76,7 +76,7 @@ impl Published {
 /// away from, which stay refused.
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
-    local: Revocations,
+    pub(crate) local: Revocations,
     published: Published,
     rotated: HashSet<[u8; 32]>,
 }

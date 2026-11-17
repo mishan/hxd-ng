@@ -864,7 +864,9 @@ impl Core {
         let refused = match r.users.get(&from) {
             None => Some(SealedError::NoSuchUser),
             Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
-            Some(s) if !exported(s) || refuses => Some(SealedError::NotSealed),
+            // A person's devices are what a ghost would answer, and a link
+            // cannot name them: nothing is sealed between the two either way.
+            Some(s) if s.grouped || !exported(s) || refuses => Some(SealedError::NotSealed),
             _ => None,
         };
         let from = r.row_uid(from);
@@ -891,8 +893,9 @@ impl Core {
         let refused = match r.users.get_mut(&asker) {
             None => Some(SealedError::NoSuchUser),
             Some(s) if crate::sealed::sealed_of(s).is_none() => Some(SealedError::SelfNotSealed),
-            // Asked in its name, so only for a session a link shows.
-            Some(s) if !exported(s) => Some(SealedError::NotSealed),
+            // Asked in its name, so only for a session a link shows, and
+            // not for a person, whom a ghost could not seal back to.
+            Some(s) if s.grouped || !exported(s) => Some(SealedError::NotSealed),
             Some(s) => s
                 .device_certs
                 .as_mut()
@@ -941,9 +944,8 @@ impl Core {
         }
         // A person's sealed keys are its devices', which a link cannot
         // name: nobody seals to it across one yet.
-        crate::sealed::sealed_of(target)
+        crate::sealed::sealable_at(target, now, &r.revoked)
             .filter(|_| !target.grouped)
-            .filter(|d| d.expires > now)
             .map(|d| d.cert.clone())
             .ok_or(PeerRefusal::NoDeviceKeys)
     }
@@ -996,9 +998,8 @@ impl Core {
             .as_ref()
             .and_then(|r| r.fingerprint)
             .ok_or(PeerRefusal::SenderUnkeyed)?;
-        let device = crate::sealed::sealed_of(target)
-            .filter(|d| d.expires > now)
-            .ok_or(PeerRefusal::NoDeviceKeys)?;
+        let device =
+            crate::sealed::sealable_at(target, now, &r.revoked).ok_or(PeerRefusal::NoDeviceKeys)?;
         if Some(<[u8; 32]>::from(sha2::Sha256::digest(device.enc))) != sealed_to {
             return Err(PeerRefusal::NoDeviceKeys);
         }
@@ -1019,6 +1020,7 @@ impl Core {
                 from_nick,
                 from_login: None,
                 from_fingerprint,
+                from_device: None,
                 sealed: Some(sealed),
                 at: SystemTime::now(),
             },

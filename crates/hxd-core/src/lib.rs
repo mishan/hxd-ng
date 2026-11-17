@@ -106,7 +106,7 @@ pub use roster::{
     LoginPermit, Resume, SeqEvent, SessionStatus, Transport, Uid, UserDetails, UserInfo,
     DETACHED_PER_LOGIN, LIVE_QUEUE_BYTES, LIVE_QUEUE_CAP, LOGINS_IN_FLIGHT, OUTBOX_BUFFER_CAP,
 };
-pub use sealed::{SealedDevice, SealedError, SealedHolds};
+pub use sealed::{BoxesError, DeviceCerts, SealedBox, SealedDevice, SealedError, SealedHolds};
 pub use system::SystemPolicy;
 pub use video::{
     PublishRefusal, VideoConfig, VideoError, VideoKind, VideoLimits, VideoPublication, VideoStream,
