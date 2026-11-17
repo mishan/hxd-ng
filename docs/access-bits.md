@@ -236,7 +236,7 @@ here and not in the bitmap. Every one of them is optional, and an absent
 key derives a default rather than being false: from the bits a session's
 mask leaves (§1), and never past a mask that denies the key or the bit
 it derives from. A role may grant any of them but `can_detach`, `inbox`,
-`set_avatar` and `vouch`, which say an account is one person
+`set_avatar`, `vouch` and `personal`, which say an account is one person
 (roles.md §5); a key a role grants is as good as `true` in the file.
 
 | `[extra]` key | Meaning | Default when absent |
@@ -251,6 +251,7 @@ it derives from. A role may grant any of them but `can_detach`, `inbox`,
 | `set_avatar` | May this account set an avatar, on either wire (`avatars.md` §2). GIF Icons has no bit for it and the bitmap should not grow one | The same rule as `can_detach`: a password *or* a linked identity. Every change is decoded by this server and announced to every session on it, so the bootstrap guest does not get one. Clearing is never refused |
 | `manage_roles` | May this account create and edit roles (roles.md §5). One of the keys an administrator must hold to give | `false` |
 | `manage_rooms` | May this account create, edit and archive rooms, and see, join and send in every one (`chat-rooms.md` §5) | `false`, even for an administrator: an operator usually wants one person reorganizing the rooms |
+| `personal` | With `[server] coalesce`, are this account's sessions one person's, shown as one user without a linked identity to say so (`hotline-ng.md` §7.6). Ignored, with a warning at startup, on the guest account and on an account with neither a password nor a linked identity | `false` |
 | `vouch` | May this account vouch for an identity key — `identity-vouch.md` §3.1, the requests in §3.2 there. *Design; not read by the server yet* | The same rule as `can_detach`: a password *or* a linked identity. An account that was itself created on the strength of a vouch derives `false` until the operator sets it |
 
 ---

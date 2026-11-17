@@ -5,7 +5,8 @@ inbox (private-messages.md), news (news.md), media (inline-media.md),
 voice and video (voice.md, capabilities-video.md), files (§7.2),
 identity (hotline-ng-identity.md), and signed lines, articles and
 private messages that are not sealed, rooms that require signing
-(e2e-messages.md §4.6 to §4.12), and instant messaging (§7.5). The vouch
+(e2e-messages.md §4.6 to §4.12), instant messaging (§7.5), and persons
+(§7.6), off by default. The vouch
 requests and the `*@host` ban entry are design not yet built in hxd-ng,
 and say so where they appear.
 
@@ -128,6 +129,11 @@ color field.
 populations: the two rosters are one roster. A uid identifies a session
 only while that session lives; uids are reused.
 
+**Persons.** A server MAY show several sessions of one person as one
+roster row, under one uid (§7.6). Each of them is still a session as
+this section and §3 have it, with its own token, outbox and seqs, and
+attaches, detaches and resumes on its own; what they share is the row.
+
 ## 3. Event sequencing
 
 Every server-to-client event carries `seq`, an unsigned integer scoped to
@@ -191,6 +197,7 @@ over them.
 | `replies` | `re` on `chat` and `msg`, on the events, listings and pages that carry them, and `ids` on `history`. Listed only to a login that asked for it (§7.3) | §7.3 here | `replies` |
 | `reactions` | `react`, a line's reactions on the `history` that shows it, `reactions`, and `reactions_changed`. Listed only to a login that asked for it (§7.3) | §7.3 here | `reactions` |
 | `emoji` | The server's own emoji: `emoji_list`, `emoji_changed`, `GET /emoji/{hash}` (which serves any session), `emoji` on `chat` and `msg` and on the events, listings and pages that carry them, and a catalog id as a reaction key. Listed only to a login that asked for it (§6.1) | server-emoji.md §8 | `emoji` |
+| `persons` | The devices under a person's row (§7.6), shown to its own devices and to moderators, `device_end`, `kick` by `device`, `ended`, and `device_cert` and `msg` by device. Listed only to a login that asked for it, on a server that groups persons (§7.6) | §7.6 here; e2e-messages.md §4.14 | `device` and `devices` in `self` |
 | `signed` | Signed lines, messages and articles: `signed` on `chat`, `msg`, `report` and, with `news`, `news_post`, and on the events, listings and articles that carry them; `signs` at login and its request; rooms that require signing (`signed` on the room object, chat-rooms.md §5.2). Only with `chat_guid`, a `server_key` and `[identity] hosts` | e2e-messages.md §4.6 | `signs`, echoed |
 
 - `video` MUST NOT appear without `voice`.
@@ -264,6 +271,7 @@ connection. Clients MUST answer pings (every WebSocket library does).
 |---|---|---|
 | 1000 | `logout` | After the `logout` reply. |
 | 1000 | `kicked` | After the `kicked` event. |
+| 1000 | `ended` | After the `ended` event: another of the person's devices, or this one, ended it (§7.6). |
 | 1008 | `replaced` | Another connection resumed this session (§2). |
 
 A connection closed for any other reason — a failed handshake, a dead
@@ -298,7 +306,9 @@ Starts a new session.
     "guest_identities": true, // optional: with messaging, identity guests' requests (§7.5)
     "replies": true,         // optional: it sends and reads `re` (§7.3)
     "reactions": true,       // optional: it reacts and reads reactions (§7.3)
-    "emoji": true            // optional: it knows the server's own emoji (server-emoji.md §8)
+    "emoji": true,           // optional: it knows the server's own emoji (server-emoji.md §8)
+    "persons": true,         // optional: it may be shown a person's devices (§7.6)
+    "device_label": "Pixel 8" // optional: what to call this device, a hint (§7.6)
 } }
 ```
 
@@ -340,6 +350,8 @@ hotline-ng-identity.md §8.1 says.
 | `reactions` | Not echoed: `caps` lists `reactions` when it is granted, which is whenever the server takes reactions on any kind of target, and the `reactions` block says which (§7.3). A resume keeps what the login was granted. |
 | `emoji` | Not echoed: `caps` lists `emoji` when it is granted, which is wherever the server keeps an emoji catalog (*hxd-ng:* `[emoji]`), and the `emoji` block carries the catalog's revision and limits (server-emoji.md §8). It also lets `react` and `reactions` take one of the server's own emoji as a key (§7.3). A resume keeps what the login was granted. |
 | `sealed` | `true`, echoed when the client sent it and the session proved a device whose certificate allows messages and is at most 512 bytes; absent otherwise. It puts `sealed: true` in the session's roster `identity`, and such a session alone is sent sealed messages and may send them or ask `device_cert` (e2e-messages.md §4.1–§4.3). |
+| `persons` | Not echoed: `caps` lists `persons` when it is granted, which is wherever the server groups persons (§7.6). `self` then carries `device`, and for a device of a person the merged row and `devices`. A resume keeps what the login was granted. |
+| `device_label` | Not echoed: a string this session's device entry shows to those who may see it (§7.6), whether or not this session asked for `persons`. Kept only as §7.6's label rules allow and dropped otherwise, never refused. A resume keeps it. |
 
 The roster is complete at the reply: the client needs no event to learn
 who is present, and every event that follows is a change to it.
@@ -388,6 +400,9 @@ Attaches this connection to an existing session.
   of those events were already sent to an earlier connection (before it
   was lost, or one this resume takes over) and are not in the buffer, or
   `last_seq` is not a seq this session has reached.
+- A session granted `persons` keeps it, its device id and its label
+  across every resume and takeover; its `self` carries `device` and
+  `devices` as the login reply's does (§7.6).
 
 Errors:
 
@@ -419,7 +434,8 @@ capability it also carries that family's block, as the login reply does
 (account-admin.md §5.1), since an `account_changed` may have been lost
 in the gap, and with the `rooms` capability that family's block, with
 the rooms this session is in and the newest line in each
-(chat-rooms.md §7.4).
+(chat-rooms.md §7.4). With `persons`, each row whose devices the session
+may see carries them as they stand (§7.6).
 
 - **The server MUST NOT send an event with a seq at or below `sync`'s
   `seq` after the `sync` reply** (rationale §5). A server that cannot keep
@@ -684,8 +700,9 @@ family document. Each family of §4 adds its own.
 | `chat` | `text`, `style?` (`"normal"` \| `"action"`), `media?`, `room?`, `guid?`, `signed?`, `re?`, `emoji?` | `{ "id"? }` | `no_such_room`, `not_a_member`, `read_only`, `signature_required`, `bad_signature`, `server_error` |
 | `nick` | `nick?`, `icon?` | `{}` | — |
 | `room_topic` | `room?`, `topic` | `{}` | `no_such_room` |
-| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; `emoji?`; or `to`, `sealed` and `cert` alone | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `not_friends`, `request_full`, `roster_full`, `server_error` |
-| `device_cert` | `uid` | `{ "cert" }` | `no_such_user`, `not_sealed`, `blocked`, `not_delivered` |
+| `msg` | exactly one of `to` (uid) / `to_login`; `text`; `guid?`; `media?`; `signed?`; `re?`; `emoji?`; or `to`, `sealed` and `cert` alone; or, with `persons`, `to` and `boxes` alone (e2e-messages.md §4.14) | `{ "queued": bool, "ref"?, "requested"?, "im"?, "guid"?, "held_full"? }` | `no_such_user`, `mailbox_full`, `quota_exceeded`, `blocked`, `not_delivered`, `unconfirmed`, `bad_signature`, `not_sealed`, `cert_changed`, `devices_changed`, `not_friends`, `request_full`, `roster_full`, `rate_limited`, `server_error` |
+| `device_cert` | `uid`, and with `persons` `device?` | `{ "cert" }`, or with `persons` for a person `{ "devices": [ { "device", "cert" } ] }` (e2e-messages.md §4.14) | `no_such_user`, `no_such_device`, `not_sealed`, `blocked`, `not_delivered` |
+| `device_end` | `device`, from a session with `persons` alone (§7.6) | `{}` | `no_such_device`, `no_such_user` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
 | `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `no_such_emoji`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
 | `reactions` | `targets` (1–50 `line` and `pm` targets), and `key` with exactly one (§7.3) | `{ "reactions": [ { "target", "keys", "mine"?, "from"? } ] }` | `not_available`, `bad_request`, `server_error` |
@@ -1063,15 +1080,16 @@ blind (identity-registrar.md §7.3).
 
 | `ev` | `data` | Sent when |
 |---|---|---|
-| `user_joined` | `{ "user": {…} }` | A session joins the roster. |
-| `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. |
+| `user_joined` | `{ "user": {…} }` | A session joins the roster. With `persons`, a person's row carries `devices` to a session that may see them (§7.6). |
+| `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. With `persons`, also when a device under a person's row comes, goes or changes, to the sessions that may see its devices alone, carrying `devices` (§7.6). |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
 | `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"?, "re"?, "emoji"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
 | `subject` | `{ "subject", "room"? }` | The public chat's subject, or a room's topic, changed. |
 | `broadcast` | `{ "from": { uid, nick }, "text" }` | An administrator's broadcast. |
-| `msg` | `{ "from": { uid, nick, login?, fingerprint? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"?, "re"?, "emoji"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). |
+| `msg` | `{ "from": { uid, nick, login?, fingerprint?, device? }, "text", "at", "queued", "id"?, "ref"?, "media"?, "signed"?, "sealed"?, "sealed_lost"?, "re"?, "emoji"? }` | A private message (§7.1). `signed` is a signed message's detached form as it was sent, and on its `inbox` row too (e2e-messages.md §4.9). `sealed` is a sealed message's box as it was sent, with `from.fingerprint`, `text` the placeholder `[Encrypted message]` and no `id` or `ref`; `sealed_lost` stands in its place for one held for a session that lost `sealed` (e2e-messages.md §4.1, §4.4). `from.device`, on a sealed message alone, to a session with `persons`, is the device of a person that sealed it (e2e-messages.md §4.14). |
 | `kicked` | `{}` | This session was kicked. The server then closes the connection (§5) and the session is over. |
+| `ended` | `{}` | With `persons`: another of this person's devices, or this one, ended this session (§7.6). The server then closes the connection with `ended` (§5) and the session is over. |
 
 Timestamps (`at`) are integer Unix seconds. Events of the extension
 families — `voice_*`, `video_status`, `news_*`, `room_*`, `emoji_changed` — are specified where §4
@@ -1107,9 +1125,10 @@ counts in §3's sequence.
 | `status` | §2. |
 | `transport` | Required. `"cleartext"` when any hop between this user's client and the server is unencrypted, as far as the server knows: a classic client on plain TCP, or a tunnel that declared its downstream hop cleartext (hotline-ng-auth.md §7.2, §8). A client MAY warn before sending a private message to a `cleartext` user. For a user of a linked server, whose connection is that server's: what that server said, where the two servers try the user transport draft (server-link.md §3.2), `"weak"` among it for a cipher that does not hold up (HOPE's RC4); `"unknown"` otherwise. Clients treat `"weak"`, `"unknown"` and any value they do not know as they would `cleartext`. |
 | `remote` | Present only for a user of a linked server (server-link.md): `{server, tag, tagged, server_key?}`, the home server's name and tag, whether this server puts the tag in its users' names, and the home server's discovery key, base64url, when it said one over a link trying the user keys draft (server-link.md §7.7), which its signed lines are scoped to (e2e-messages.md §5). A client MAY show the tag itself when `tagged` is false. Such a user's `color` is its home server's. |
-| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}`, and `signs` when that server says it, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs every lobby line (e2e-messages.md §4.6, §5), and `sealed: true` that it can open sealed messages (§4.1). |
+| `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}`, and `signs` when that server says it, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs every lobby line (e2e-messages.md §4.6, §5), and `sealed: true` that it can open sealed messages (§4.1). On a person's row, `signs` says every device signs, and `sealed` that exactly one device can be sealed to (§7.6). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
+| `devices` | With `persons`, on a person's row alone, to a session that may see its devices: §7.6. `self` also carries `device`, this session's own device id. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
 ### 7.5 Instant messaging
@@ -1545,6 +1564,250 @@ identity drops what the account presented under it, and its sessions
 that proved it make friendship acts no more, but its friends are told
 nothing until instant-messaging.md's IM2b tells them of an unlink.
 
+### 7.6 Persons
+
+A server MAY show the sessions of one person as one roster row. The
+row is a **person**, and each of its sessions a **device**. *hxd-ng:*
+`[server] coalesce`, off by default. A server MUST group only sessions
+it knows to be one person's, and MUST NOT group the sessions of a login
+several people share. *hxd-ng* groups the sessions of an account that
+links an identity, those that logged in as it or with the account's
+password, and the password sessions of an account whose file says
+`[extra] personal` (access-bits.md §4); never the guest account, the
+system account, a classic messenger session (§7.5), or a session
+proving an identity its account does not link.
+
+**What every client sees.** With or without `persons`, and on the
+classic wire alike:
+
+- The row's uid is its first device's, kept while any device lives,
+  that first device's leaving included, and given to nobody else
+  meanwhile. `self.uid` is the row's. The row's uid names the person
+  while any device lives; any other device's own uid names nobody: a
+  request naming it is answered as one naming a uid nobody holds.
+- The roster is told of a person once as its first device joins
+  (`user_joined`) and once as its last leaves (`user_parted`). A device
+  coming, going or changing in between is a `user_changed` only where
+  the row as shown changes.
+- The row is merged. Its nick, icon and color are the person's, and a
+  change sent from any device changes them for every device (*hxd-ng:*
+  what a device sends again of itself, as a classic client does at
+  every login, is no change). Its `status` is its most present
+  device's. Its `transport` is `cleartext` if any device's is. Its
+  `identity` is the person's fingerprint and handle, with `signs` only
+  if every device signs, and `sealed` only if exactly one device can be
+  sealed to (e2e-messages.md §4.14).
+- A device that did not declare `persons` is shown its own row, with
+  its own `status`, `transport` and `identity`, in `self` and in each
+  `user_changed` of it. The `users` of the login reply and of `sync`
+  show it the merged row, as everyone else is shown it.
+- A line, a private message and a sealed message from any device are
+  from the row. A `msg` to the row reaches each of its devices but the
+  sender. A private message from a device to its own row arrives from
+  uid 0, since a reply to it would be to oneself. A sealed message
+  between a person's own devices arrives from the row, so a reply
+  seals back to it by device, and its recipient checks it against its
+  own fingerprint (e2e-messages.md §4.14).
+- In a room or a private chat the person is one member. A device hears
+  one only once it has joined it itself. Any device leaving it takes the
+  person out: its other devices that had the room open are sent
+  `room_member_parted` naming the row (chat-rooms.md §7.3), their own
+  `self.uid`, which they read as being out of it themselves. The last
+  device with a room or chat open ending, while the person stays, takes
+  the person out of it too.
+- The person is in voice on one device at a time, under its row
+  (voice.md §8). A second device joining voice moves the person to it:
+  - In the same room, the room is renegotiated and shown no part and no
+    join, and the person's mute goes with it. The device moved from is
+    sent the room's `voice_status` without its row, and tears down its
+    media. Its camera and screen publications end, and the room is told
+    so by a status; anyone subscribed to them stops being sent them,
+    keeping the subscription for a publication the new device starts.
+    The subscriptions the old device held do not move.
+  - In another room, it is a room switch: the first room sees the
+    person leave its voice, and the person lands unmuted.
+- A kick or ban of the row ends every device, an address ban only the
+  devices at that address, and a moderator may not kick their own
+  person (`bad_request`). *hxd-ng:* a person's chat lines and spam
+  points are one budget (§9), and `[rooms] max_joined` counts the
+  person's rooms; its request limit, `history`, search, `device_cert`
+  and voice are each device's.
+- Across a server link a person is one user.
+
+**Declaring it.** A client that can show a person's devices sends
+`"persons": true` at login (§6.1). `caps` lists `persons` only to a
+login that asked for it, on a server that groups persons. The session
+keeps it for its life: a resume neither adds nor drops it. Here and in
+e2e-messages.md §4.14, a session that declared `persons` is one that
+asked for it and was granted it, `caps` listing it. A client that
+declares it handles `user_changed` carrying `devices`, `roster_stale`
+and `ended`, with or without the `roles` capability. On a server that
+does not group persons, `device_end` is `unknown_method`, `device` on
+`device_cert` and `boxes` on `msg` are `bad_request`, and `device` on
+`kick` is ignored.
+
+**Device ids.** Every session on a server that groups persons has a
+device id: an integer from 1 to 2^53 - 1, so a reader that keeps
+numbers as doubles reads it exactly. It MUST be chosen at random, MUST
+be unique among live sessions, and MUST be kept by every resume and
+takeover of the session. It is not the session's serial, and says
+nothing of how many logins came before it. A client MUST treat it as
+opaque and MUST NOT take it for a uid. `self.device` carries it to a
+session with `persons`, grouped or not.
+
+**Who sees devices.** Only a session that declared `persons`:
+
+| Viewer | Sees |
+|---|---|
+| A device of the person that proved its identity | every device of its own person |
+| A device of the person that logged in with the account's password | its own person's password devices alone |
+| A session with the kick bit (`disconnect_users`, bit 22) | every device of every other person on this server, and each device's `login` and `addr` |
+| Anyone else | no devices |
+
+A password device does not see or end the devices that proved the
+identity, since a password of a linked account is enough to be grouped
+and not enough to reach them (rationale §9). That rule holds within a
+person's own devices alone: a viewer with the kick bit sees, and may
+kick, every device of another person, whether the viewer logged in with
+a password or proved an identity. A device of a person that
+has the kick bit sees its own person's devices by the first two rows,
+with `login` and `addr`. A session without `persons`, a classic client
+and a linked server see no devices. Only a person's row carries
+`devices`: never a session alone's, nor a linked server's user's.
+
+**The row with devices.** A row the viewer may see the devices under
+carries `devices`, in the order they joined it, wherever the viewer is
+sent it: the login reply's and `sync`'s `users`, `self`, `user_joined`
+and `user_changed`.
+
+```jsonc
+{ "uid": 3, "nick": "Alice", "status": "active", /* ...the row... */
+  "devices": [
+    { "device": 4519832211, "wire": "ng", "proved": true,
+      "transport": "encrypted", "status": "active", "since": 1763251200,
+      "label": "Pixel 8", "identity": { "sealed": true, "signs": true } },
+    { "device": 80236155, "wire": "classic", "proved": false,
+      "transport": "cleartext", "status": "active", "since": 1763240000 }
+  ] }
+```
+
+| Field | Rule |
+|---|---|
+| `device` | Its device id. |
+| `wire` | `"ng"` or `"classic"`. |
+| `proved` | `true` when it proved the person's identity with its device key, `false` when it logged in with the account's password. |
+| `transport` | `"encrypted"` or `"cleartext"`: §7.4's rule, for this device alone. |
+| `status` | §2: this device's own. |
+| `since` | When it logged in, in Unix seconds, kept across resumes. |
+| `login`, `addr` | The account login it used and its address as the server holds it, to a viewer with the kick bit alone. |
+| `label` | What its client calls it, when a label was kept (below). |
+| `identity` | Present only when one of its fields is true: `sealed`, this device can be sealed to now (e2e-messages.md §4.14), and `signs`, it signs every lobby line (e2e-messages.md §4.6). |
+
+Every field but `label` is the server's own fact about the device.
+
+**Labels.** A client MAY name its device with `device_label` at login
+(§6.1). A label is a hint and never proof. The server normalizes it to
+NFC and keeps it only if it is then at most 32 characters and passes
+the rule a card's display name is held to (hotline-ng-identity.md §3.4):
+something in it, no space around it, and no control, invisible or
+bidirectional character. One that fails is dropped, never refused, and
+*hxd-ng* drops one of more than 128 characters before normalizing it. A
+label is shown only in device entries: never to a classic client, a
+session without `persons` or a linked server. A server MUST NOT decide
+anything by it, and a client SHOULD show it only beside the server's
+facts, `wire`, `proved`, `transport` and `since`.
+
+**Its own row.** To a device of a person that declared `persons`,
+`self` is the merged row everyone else is shown, with `device` and
+`devices` beside it; its own `status` is in its own entry, the one whose
+`device` is `self.device`. So `self.identity.signs` and `sealed` are the
+person's, and the login reply's `signs` and `sealed` are this device's:
+a client reads its own state from those and from its entry, and how
+others see it from `self`. A session with `persons` that is not a device
+of a person has its own row as `self`, with `device` and no `devices`.
+
+**Telling devices.** A device joining a row, leaving it, or changing a
+field of its entry is a `user_changed` carrying the whole row and the
+complete list, as it stood when the event was made, to the sessions
+that see that row's devices, and to nobody else: it costs no other
+session a seq. A person's first join is a `user_joined` with its one
+device to them, and every `user_joined` and `user_changed` of the row
+they are sent carries `devices`. A password device is told only when a
+password device changes.
+
+A session that declared `persons` and gains or loses the kick bit, by
+an account edit, a role or a mask, is sent `roster_stale` (roles.md §7.3)
+once it has been sent its user list, and SHOULD send `sync`, whose
+`users` carry the devices it may see now. What a detached session that
+lost the bit holds for its resume of other persons' devices becomes
+their rows alone, each with its seq kept, and its own person's entries
+lose `login` and `addr`.
+
+**Ending a device.** `device_end` ends one device of the session's own
+person, itself included, which is a logout of it. A session alone may
+end itself the same way:
+
+```jsonc
+{ "id": 9, "req": "device_end", "params": { "device": 4519832211 } }
+{ "reply": 9, "ok": {} }
+```
+
+- Only a session that declared `persons` has it; to any other it is
+  `unknown_method`. A `device` missing or not an integer is
+  `bad_request`.
+- A device that is not a live device of the session's own row, or one
+  it may not end (a proved device, to a password device), is
+  `no_such_device`. A person being kicked is `no_such_user`, as a
+  second kick of it is.
+- An ended device that declared `persons` is sent `ended`, and its
+  connection closed with 1000 `ended` (§5). One that did not is sent
+  `kicked` and closed with `kicked`, so that it does not take the close
+  for a lost connection. A detached device is ended at once. A classic
+  device's connection is closed.
+- Its session is over: a `resume` of it is `session_expired`. A client
+  sent `ended` MUST NOT resume or log in again on its own; it is
+  neither a takeover (`replaced`) nor a lost connection.
+- The person's devices that see devices see it gone from `devices`.
+  Nobody is told whether it ended itself, was ended, or was kicked. The
+  last device ending is the person's end, a `user_parted` to everyone.
+  The device in voice ending takes the person out of voice.
+- It weighs as `kick` against the request limit, and spends what
+  mhxd charges its Disconnect User in spam points (§9).
+
+**Kicking one device.** `kick` (moderation.md §5) takes `device` beside
+`uid` from a session that declared `persons`, and ends that one device
+of the row `uid` names, leaving the rest of the person here:
+
+```jsonc
+{ "id": 10, "req": "kick", "params": { "uid": 3, "device": 80236155 } }
+{ "reply": 10, "ok": {} }
+```
+
+- It is asked as `kick` is: the kick bit, `no_such_user`, `protected`
+  for a row that cannot be disconnected, and `bad_request` for the
+  kicker's own person, whose devices are `device_end`'s.
+- `ban` or `purge` beside `device`, or `device` for a linked server's
+  user, is `bad_request`. A `device` that is not a live device of that
+  row is `no_such_device`.
+- The device is sent `kicked` and closed with 1000 `kicked`, whether
+  or not it declared `persons`; a detached one is ended at once, and a
+  classic one's connection is closed. The room hears no notice, since
+  the person is still here.
+- A row's last device not already on its way out is kicked as the
+  person: a kick with its notice and its reply.
+- From a session without `persons`, `device` is ignored and the whole
+  row is kicked.
+
+**Resume and sync.** A session's device id, label and `persons` are
+kept by every resume and takeover. A resume's `self` carries `device`
+and `devices` as the login's does, and its replay holds the device
+events buffered for it. `sync`'s `users` carry the devices as they
+stand, which is how a session answered `resync_required` learns them.
+
+**Sealing to a person** is e2e-messages.md §4.14: `device_cert` and
+`msg` by device, with `devices_changed` and `held_full`, and `from.device`
+on what arrives.
+
 ## 8. Text and limits
 
 All text on this wire is UTF-8; JSON makes it so. A server that shares its
@@ -1608,7 +1871,7 @@ news body is different: it declares its own type (news.md §5).
   `news_unsubscribe`, `news_mute`, `push_unregister`, `files_download`,
   `files_mkdir`, `files_delete`, `files_move`, `files_comment`,
   `report_close`, `redact`, `revoke`,
-  `kick`, `friend_respond`, `friend_remove`, `friend_alias`,
+  `kick`, `device_end`, `friend_respond`, `friend_remove`, `friend_alias`,
   `presence`, `typing`, `request_answer` and `react`, and `friends` and
   `requests`, which read a row of the store for each one listed. What
   fans out, searches, reads every followed category, asks a stranger,
@@ -1623,7 +1886,8 @@ news body is different: it declares its own type (news.md §5).
   client sends for each `im` a `friends` read hands over, among them,
   costs 1, and only `logout`
   is free. `reactions` costs 1 more for each ten targets it names, or
-  part of ten. A request the bucket cannot pay for costs nothing, and is
+  part of ten, and a sealed `msg` 1 more for each 2048 bytes of its box,
+  or of its `boxes` together (e2e-messages.md §4.3, §4.14). A request the bucket cannot pay for costs nothing, and is
   answered `rate_limited` with `retry_after`, the whole seconds until it
   could be. The bucket is the session's rather than the connection's: it is
   filled at login and kept across a detach, so a resume finds it as the
@@ -1680,7 +1944,8 @@ news body is different: it declares its own type (news.md §5).
   multi-line `text` counted, and so many spam points, which a request
   that stands for a classic transaction spends at the price mhxd
   charges that one: `chat` and `msg` its Chat and Message, `nick` its
-  User Change, and `signs` too, being told as one, the news writes
+  User Change, and `signs` too, being told as one, `device_end` its
+  Disconnect User, the news writes
   their 1.5 transactions, `news_post` a threaded post, and the
   file-area changes their Delete File, New
   Folder, Set File Info and Move File. The friend family's requests
@@ -1737,15 +2002,17 @@ news body is different: it declares its own type (news.md §5).
 | `rooms_full` | `room_create` | The server holds as many rooms as it may. |
 | `name_taken` | `room_create`, `room_edit` | A room has that name already. |
 | `no_such_role` | `room_create`, `room_edit`, `account_create`, `account_update`, `role_get`, `role_update`, `role_delete` | A gate or an edit names a role there is none of. |
-| `no_such_user` | `msg`, `block`, `unblock`, `device_cert` | No such uid, no such account, or that account takes no offline mail — one answer for all three. |
+| `no_such_user` | `msg`, `block`, `unblock`, `device_cert`, `device_end` | No such uid, no such account, or that account takes no offline mail -- one answer for all three. From `device_end`, this session's person is being kicked (§7.6). |
+| `no_such_device` | `device_end`, `kick`, `device_cert` | Not a live device of that row, or one this session may not end (§7.6, e2e-messages.md §4.14). |
 | `no_inbox` | `inbox`, `msg_read`, `block`, `unblock`, `blocks` | *Your* account has no inbox, or the server has none: the `inbox` family's "not available" code. |
-| `mailbox_full` | `msg` | The recipient's inbox is at its cap, or for a sealed message, the detached recipient holds as many as it may (e2e-messages.md §4.3; *hxd-ng:* `[sealed]`). |
+| `mailbox_full` | `msg` | The recipient's inbox is at its cap, or for a sealed message, the detached recipient holds as many as it may, or could take no box at all (e2e-messages.md §4.3, §4.14; *hxd-ng:* `[sealed]`). |
 | `quota_exceeded` | `msg` | The recipient is not connected, and you have stored as much mail today as the server allows. To someone connected, the same message is delivered. *hxd-ng:* `[inbox] max_sent_per_day` and `max_sent_bytes_per_day`. |
 | `blocked` | `msg`, `device_cert` | The recipient blocks you. For a `msg` by `to_login`, only outside instant messaging: between two accounts that take part, a block reads as `no_such_user` (§7.5). |
 | `not_delivered` | `msg` | The recipient is a user of a linked server (`remote`), and the message did not reach them: that server refused it, or could not be reached, or there were already as many waiting on it as the link lets wait, or it carries media, which cannot cross. `text` says which. Nothing is queued, and `guid` does not apply. |
 | `unconfirmed` | `msg` | The recipient is a user of a linked server (`remote`), the message was sent to that server, and it did not answer in time: the message may still reach them. Sending it again may deliver it twice. Nothing is queued, and `guid` does not apply. |
-| `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3), or a user of a linked server behind a link that does not carry them, or whose server is not shown this session's key. |
-| `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). |
+| `not_sealed` | `msg`, `device_cert` | A sealed message, or a certificate to seal one to, that cannot be: `text` says whether this session or the target cannot open sealed messages, or the target's certificate has expired (e2e-messages.md §4.2, §4.3), or the target is a person with no device to seal to, or more than one to a session without `persons`, or the sender or the target is a person and the other a user of a linked server (§4.14 there), or a user of a linked server behind a link that does not carry them, or whose server is not shown this session's key. |
+| `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). For `boxes`, the error's `device` names the box (§4.14 there). |
+| `devices_changed` | `msg` | The `boxes` are not one for each device the target can be sealed to: the error's `devices` lists them as they are now, to seal to again. Nothing was delivered (e2e-messages.md §4.14). |
 | `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
 | `withdrawn`, `stale` | the `messaging` family | §7.5: a friendship object a withdrawal held here ends, or one out of the server's time. `bad_signature` is §7.5's too, for a friendship object that fails its checks. |
 
@@ -1765,7 +2032,8 @@ normative, this list is not.
 - detaches or ends a session whose connection is lost, ends a detached
   session when its grace lapses, and ends a kicked or banned detached
   session at once (§2);
-- closes a taken-over connection with 1008 `replaced` (§2);
+- closes a taken-over connection with 1008 `replaced` (§2), and an
+  ended device's with 1000 `ended` (§7.6);
 - answers `resync_required` rather than replay partially (§3, §6.2);
 - sends nothing at or below `sync`'s seq after its reply (§6.3);
 - delivers stored mail after the `login`, successful `resume` or `sync`
@@ -1791,6 +2059,9 @@ normative, this list is not.
   may send again, and reuse it on retry (§7.1, §7.3); retries a chat
   line only where the server offers `chat_guid` (§4);
 - reads an absent `system` as `false` (§7.4);
+- with `persons`, reads its own device's state from its entry and the
+  login reply rather than `self`, `sync`s on `roster_stale`, and after
+  `ended` neither resumes nor logs in again on its own (§7.6);
 - with `messaging`, acknowledges each `im` with `receipt`, shows an
   `im` it has shown before once, sends `friends` after each handshake
   and `sync` for what waited, and lets a typing flag lapse (§7.5);
@@ -1807,9 +2078,6 @@ normative, this list is not.
 - Idle: client-set (`{"req":"status"}`), server inactivity timer, or both;
   and whether legacy away toggling (the 0x0ea1 rider) should round-trip
   into ng `idle`.
-- Whether the roster should distinguish "same user, multiple sessions"
-  before the multi-device future arrives, or let each login be its own
-  roster row (as it does now).
 - Guest nick collisions: legacy servers allow duplicate nicks; mobile UX
   may want uniqueness. The protocol inherits the legacy answer
   (duplicates fine).

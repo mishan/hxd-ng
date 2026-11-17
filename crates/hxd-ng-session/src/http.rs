@@ -797,6 +797,10 @@ enum Consume {
     No,
 }
 
+/// The most one WebSocket message on the ng port carries, a request
+/// included.
+pub(crate) const MAX_MESSAGE: usize = 256 * 1024;
+
 /// Authenticate the upgrade (§6.1), then hand the socket to the
 /// application protocol. The upgrade itself completes in a spawned task
 /// once this response has gone out.
@@ -815,8 +819,8 @@ async fn upgrade(
     addr_place: SharedPlace,
 ) -> Resp {
     let config = WebSocketConfig {
-        max_message_size: Some(256 * 1024),
-        max_frame_size: Some(256 * 1024),
+        max_message_size: Some(MAX_MESSAGE),
+        max_frame_size: Some(MAX_MESSAGE),
         ..Default::default()
     };
     // The upgrade request is validated *before* the token is redeemed:

@@ -275,8 +275,8 @@ it compares:
 - **`manage_roles` and `manage_rooms` join `beyond()`'s keys.** So does
   every `[extra]` key a role may grant: a role's `extra` accepts only
   keys `beyond()` compares. That leaves out the keys that say an
-  account is one person, `can_detach`, `inbox`, `set_avatar` and
-  `vouch`: a role, `everyone` most of all, must never let a shared
+  account is one person, `can_detach`, `inbox`, `set_avatar`,
+  `vouch` and `personal`: a role, `everyone` most of all, must never let a shared
   login detach or receive mail.
 - **Holding a gated role is a privilege.** A role that a room's or a
   news node's `read` or `post` list names is something an account "may
@@ -494,7 +494,7 @@ does.
 |---|---|---|
 | `roles_changed` | `{ "list": […] }`, as in the login reply | A role was created or deleted, or its title, color, position or mentionability changed. To every session, coalesced (§4). Clients redraw names and colors from it |
 | `user_changed` | as now | The roles a user holds changed, or a role edit changed their roster row (§4) |
-| `roster_stale` | `{}` | One change, a role edit or a reload most often, changed more roster rows than `[roles] bulk_rows`. The client sends `sync` |
+| `roster_stale` | `{}` | One change, a role edit or a reload most often, changed more roster rows than `[roles] bulk_rows`; or, to a session that declared `persons`, its kick bit was gained or lost, which changes the devices it may see (`hotline-ng.md` §7.6). The client sends `sync` |
 | `account_changed` | as now | This session's effective access changed, by a role, the account, or the mask |
 
 A change to a role's grants alone is not `roles_changed`. It reaches
