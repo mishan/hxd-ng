@@ -10,9 +10,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use hxd_core::{Core, Uid};
+use hxd_core::{Core, EndedBy, Uid};
 use sha2::{Digest, Sha256};
 
 struct Entry {
@@ -100,23 +100,44 @@ impl Registry {
     /// never held together — no ordering to get wrong, no cross-lock
     /// contention, and immune by construction if the core ever grows a
     /// path back into the registry.
+    ///
+    /// An entry whose session was ended or kicked is left for
+    /// [`Registry::prune`], so its resume can still say so.
     pub fn validate(&self, core: &Core, session_id: &str, token: &str) -> Option<Uid> {
+        self.resume(core, session_id, token, Duration::MAX).ok()
+    }
+
+    /// [`Registry::validate`] for a resume: refused with what ended the
+    /// session when it was ended while detached within `grace`, and with
+    /// nothing otherwise. Only a token that matches learns why, so a
+    /// guess learns no more than it did.
+    pub fn resume(
+        &self,
+        core: &Core,
+        session_id: &str,
+        token: &str,
+        grace: Duration,
+    ) -> Result<Uid, Option<EndedBy>> {
         let (token_hash, uid, serial) = {
             let entries = self.entries.lock().unwrap();
-            let entry = entries.get(session_id)?;
+            let entry = entries.get(session_id).ok_or(None)?;
             (entry.token_hash, entry.uid, entry.serial)
         };
         if !constant_time_eq(&token_hash, &hash(token)) {
-            return None;
+            return Err(None);
         }
         if core.session_serial(uid) != Some(serial) {
             // Stale: the named session is gone (or its uid was recycled).
             // Session ids are never reused (monotonic counter), so the key
-            // can't have become valid again since the snapshot.
-            self.entries.lock().unwrap().remove(session_id);
-            return None;
+            // can't have become valid again since the snapshot. One ended
+            // while detached is kept to say so until `prune` lets it go.
+            let ended = core.ended_by(uid, serial, grace);
+            if ended.is_none() {
+                self.entries.lock().unwrap().remove(session_id);
+            }
+            return Err(ended);
         }
-        Some(uid)
+        Ok(uid)
     }
 
     /// The device certificate `session_id` logged in with, for a resume
@@ -160,13 +181,14 @@ impl Registry {
         self.entries.lock().unwrap().remove(session_id);
     }
 
-    /// Drop entries whose sessions no longer exist (sweeper hygiene).
+    /// Drop entries whose sessions no longer exist (sweeper hygiene), but
+    /// those ended while detached within `grace`, whose resume says so.
     ///
     /// Same lock discipline as [`Registry::validate`]: snapshot under the
     /// registry lock, consult the core with no lock held, remove under a
     /// reacquired lock. Session ids are never reused, so a key stale at
     /// snapshot time is stale forever — the deferred removal races nothing.
-    pub fn prune(&self, core: &Core) {
+    pub fn prune(&self, core: &Core, grace: Duration) {
         let snapshot: Vec<(String, Uid, u64)> = {
             let entries = self.entries.lock().unwrap();
             entries
@@ -176,7 +198,10 @@ impl Registry {
         };
         let stale: Vec<String> = snapshot
             .into_iter()
-            .filter(|(_, uid, serial)| core.session_serial(*uid) != Some(*serial))
+            .filter(|(_, uid, serial)| {
+                core.session_serial(*uid) != Some(*serial)
+                    && !core.remembers_end(*uid, *serial, grace)
+            })
             .map(|(k, _, _)| k)
             .collect();
         if stale.is_empty() {

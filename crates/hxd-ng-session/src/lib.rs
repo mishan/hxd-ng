@@ -367,7 +367,8 @@ pub async fn sweeper(
         if ended > 0 {
             info!(ended, "detached sessions swept");
         }
-        registry.prune(&core);
+        registry.prune(&core, grace);
+        core.forget_endings(grace);
         core.expire_device_keys();
         // Every mailbox call sweeps what it touches, so this is only for
         // a mailbox nobody is using — where the sessions would otherwise

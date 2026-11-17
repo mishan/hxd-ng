@@ -353,6 +353,14 @@ ended by its own person must stay out, so it needs a reason of its own,
 and a client that never declared `persons` is told `kicked`, the one it
 already knows not to come back from.
 
+**A resume says it was ended or kicked.** A device ended or kicked while
+detached is gone before it can hear so, and one attached may lose its
+socket before its client reads the event; a resume answered as if its
+grace had lapsed is a client's cue to log in again, which undoes the
+end or the kick. The server remembers why for as long as the session
+could have resumed, and for so many sessions, answering only the
+session's own token, so a guess learns nothing it did not before.
+
 **A wrong set of boxes refuses the whole message.** Delivering the
 boxes that match and dropping the rest would let one device miss a
 message without anyone knowing, which is worse for a conversation than

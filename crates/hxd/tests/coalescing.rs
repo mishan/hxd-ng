@@ -10,6 +10,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hxd_testclient::legacy::{self, Client, Frame, Login};
 use hxd_testclient::ng;
@@ -34,6 +35,7 @@ struct Server {
     legacy: SocketAddr,
     ng: SocketAddr,
     core: Arc<hxd_core::Core>,
+    registry: Arc<hxd_ng_session::Registry>,
 }
 
 /// A server coalescing persons, with `limits` in its `[limits]`.
@@ -90,6 +92,7 @@ async fn start_with(dir: &Path, coalesce: bool, limits: &str) -> Server {
         legacy: legacy.local_addr().unwrap(),
         ng: ng.local_addr().unwrap(),
         core: ctx.core.clone(),
+        registry: ng_ctx.registry.clone(),
     };
     tokio::spawn(hxd_session::serve(legacy, ctx));
     tokio::spawn(hxd_ng_session::serve(ng, ng_ctx));
@@ -1099,18 +1102,9 @@ async fn a_phone_ending_its_desktop_tells_it_ended_and_it_does_not_come_back() {
         .unwrap();
     desktop.event("ended").await.unwrap();
     assert_eq!(closed_with(&mut desktop).await.as_deref(), Some("ended"));
-    // Ended, not taken over: there is no session to take back up.
-    let mut back = ng::Client::connect(server.ng).await.unwrap();
-    let again = back
-        .request(
-            "resume",
-            json!({ "session": session.0, "token": session.1, "last_seq": 0 }),
-        )
-        .await;
-    assert!(
-        matches!(&again, Err(hxd_testclient::Error::Refused { code, .. }) if code == "session_expired"),
-        "{again:?}"
-    );
+    // Ended, not taken over: a client that missed hearing so, its socket
+    // gone first, is told again by its resume.
+    assert_eq!(resume_refused(&server, &session).await, "ended");
     let told = devices_told(&mut phone, "user_changed", row, 1).await;
     assert_eq!(
         devices_in(&told["user"]),
@@ -1329,4 +1323,136 @@ async fn a_device_kick_is_refused_of_a_ghost_a_protected_person_and_ones_own() {
             "{case}"
         );
     }
+}
+
+/// Wait until more than `n` sessions are detached.
+async fn detached(server: &Server, n: usize) {
+    for _ in 0..500 {
+        if server.core.census().detached > n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never detached");
+}
+
+/// The code a resume of `session` is refused with.
+async fn resume_refused(server: &Server, session: &(String, String)) -> String {
+    let mut c = ng::Client::connect(server.ng).await.unwrap();
+    let params = json!({ "session": session.0, "token": session.1, "last_seq": 0 });
+    refused_with(&mut c, "resume", params).await
+}
+
+/// `login`'s ng device, logged in and then dropped, detached: its row
+/// and its resume credential.
+async fn away(server: &Server, login: &str, persons: bool) -> (u64, u64, (String, String)) {
+    let (c, hello) = persons_device(server, login, None).await;
+    let session = c.session.clone().unwrap();
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let device = hello["self"]["device"].as_u64().unwrap_or(0);
+    assert!(persons || hello["self"].get("devices").is_none());
+    let before = server.core.census().detached;
+    c.close().await.unwrap();
+    detached(server, before).await;
+    (row, device, session)
+}
+
+#[tokio::test]
+async fn a_detached_session_ended_or_kicked_is_told_so_when_it_resumes() {
+    for coalesce in [true, false] {
+        let td = tempfile::tempdir().unwrap();
+        let server = start_with(td.path(), coalesce, "").await;
+        let (mut dave, _) = persons_device(&server, "dave", None).await;
+
+        let (row, _, session) = away(&server, "alice", coalesce).await;
+        dave.request("kick", json!({ "uid": row })).await.unwrap();
+        let guessed = (session.0.clone(), "00".repeat(32));
+        assert_eq!(
+            resume_refused(&server, &guessed).await,
+            "session_expired",
+            "{coalesce}: a token that is not its own learns nothing"
+        );
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "kicked",
+            "{coalesce}"
+        );
+        // The sweep keeps it to say so within the grace a resume had,
+        // and past it lets it go.
+        server
+            .registry
+            .prune(&server.core, Duration::from_secs(3600));
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "kicked",
+            "{coalesce}: again, after a sweep"
+        );
+        server.registry.prune(&server.core, Duration::ZERO);
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "session_expired",
+            "{coalesce}: past its grace"
+        );
+
+        // Kicked while connected, its client hears it; one whose socket
+        // died first is told by its resume.
+        let (mut live, hello) = persons_device(&server, "carol", None).await;
+        let session = live.session.clone().unwrap();
+        let row = hello["self"]["uid"].as_u64().unwrap();
+        dave.request("kick", json!({ "uid": row })).await.unwrap();
+        live.event("kicked").await.unwrap();
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "kicked",
+            "{coalesce}: live"
+        );
+
+        let (row, _, session) = away(&server, "keeper", false).await;
+        dave.request("kick", json!({ "uid": row, "ban": 60 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "banned",
+            "{coalesce}: banned, as a login would be told"
+        );
+
+        if coalesce {
+            let (mut phone, _) = persons_device(&server, "alice", Some("Phone")).await;
+            let (_, device, session) = away(&server, "alice", true).await;
+            phone
+                .request("device_end", json!({ "device": device }))
+                .await
+                .unwrap();
+            assert_eq!(resume_refused(&server, &session).await, "ended");
+        }
+
+        let (_, _, session) = away(&server, "bob", false).await;
+        server.core.sweep_detached(Duration::ZERO);
+        assert_eq!(
+            resume_refused(&server, &session).await,
+            "session_expired",
+            "{coalesce}: lapsed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_device_kick_from_a_client_without_persons_is_refused() {
+    let td = tempfile::tempdir().unwrap();
+    let server = start(td.path(), "").await;
+    let (_phone, hello) = persons_device(&server, "alice", None).await;
+    let row = hello["self"]["uid"].as_u64().unwrap();
+    let device = hello["self"]["device"].clone();
+    let mut moderator = ng_device(&server, "dave").await;
+    assert_eq!(
+        refused_with(
+            &mut moderator,
+            "kick",
+            json!({ "uid": row, "device": device })
+        )
+        .await,
+        "bad_request"
+    );
+    assert!(server.core.user(row as u16).is_some(), "nobody kicked");
 }

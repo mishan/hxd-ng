@@ -518,10 +518,9 @@ pub(crate) async fn run(
                 .connection_lost_from(&events, state.uid, ctx.cfg.max_detached_per_addr)
             {
                 Some(true) => info!(uid = state.uid, "ng session detached"),
-                Some(false) => {
-                    ctx.registry.remove(&state.session_id);
-                    info!(uid = state.uid, "ng session ended (no detach)");
-                }
+                // Its entry is left for `prune`: a kicked session ends
+                // here when its socket went before it heard so.
+                Some(false) => info!(uid = state.uid, "ng session ended (no detach)"),
                 None => info!(uid = state.uid, "ng connection lost after a takeover"),
             }
         }
@@ -1276,6 +1275,22 @@ async fn handle_login(
     ))
 }
 
+/// A resume of a session that is gone, told what ended it where that is
+/// known (§6.2): told only that it expired, a client would log in again
+/// and undo an end, a kick or a ban.
+fn resume_gone(id: u64, ended: Option<hxd_core::EndedBy>) -> String {
+    match ended {
+        Some(hxd_core::EndedBy::Ended) => reply_err(
+            id,
+            "ended",
+            "This device was ended by another of your devices.",
+        ),
+        Some(hxd_core::EndedBy::Kicked) => reply_err(id, "kicked", "You were disconnected."),
+        Some(hxd_core::EndedBy::Banned(hit)) => reply_err_banned(id, &hit),
+        None => reply_err(id, "session_expired", "Session expired; log in again."),
+    }
+}
+
 async fn handle_resume(
     ctx: &NgCtx,
     req: &ReqEnvelope,
@@ -1290,17 +1305,17 @@ async fn handle_resume(
         .await;
         return None;
     };
-    let Some(uid) = ctx.registry.validate(&ctx.core, &p.session, &p.token) else {
-        let _ = send_frame(
-            ws_tx,
-            Message::Text(reply_err(
-                req.id,
-                "session_expired",
-                "Session expired; log in again.",
-            )),
-        )
-        .await;
-        return None;
+    let uid = match ctx
+        .registry
+        .resume(&ctx.core, &p.session, &p.token, ctx.cfg.grace)
+    {
+        Ok(uid) => uid,
+        // Ended or kicked while away, a resume says so: told it lapsed, a
+        // client would log in again and undo it.
+        Err(ended) => {
+            let _ = send_frame(ws_tx, Message::Text(resume_gone(req.id, ended))).await;
+            return None;
+        }
     };
 
     // A ban on the person placed while the session was away: the token
@@ -1338,17 +1353,15 @@ async fn handle_resume(
     {
         Resume::Replayed(rx, replay) => (rx, Some(replay)),
         Resume::ResyncRequired(rx) => (rx, None),
+        // Ended between the token's check and here: asked again, it
+        // says why.
         Resume::Gone => {
-            ctx.registry.remove(&p.session);
-            let _ = send_frame(
-                ws_tx,
-                Message::Text(reply_err(
-                    req.id,
-                    "session_expired",
-                    "Session expired; log in again.",
-                )),
-            )
-            .await;
+            let ended = ctx
+                .registry
+                .resume(&ctx.core, &p.session, &p.token, ctx.cfg.grace)
+                .err()
+                .flatten();
+            let _ = send_frame(ws_tx, Message::Text(resume_gone(req.id, ended))).await;
             return None;
         }
     };
@@ -1643,8 +1656,9 @@ fn ended_by(ev: &hxd_core::Event) -> Option<&'static str> {
 /// End a session the domain kicked or ended: the event has already gone
 /// out, and this is the teardown that follows it.
 async fn end_kicked(ctx: &NgCtx, state: &SessState, ws_tx: &mut WsTx, why: &'static str) {
+    // Its entry stays for `prune`, so a resume from a client that missed
+    // the close is told why too.
     ctx.core.end_session(state.uid);
-    ctx.registry.remove(&state.session_id);
     let _ = send_frame(
         ws_tx,
         Message::Close(Some(CloseFrame {

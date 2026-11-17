@@ -189,7 +189,17 @@ impl Core {
         if !self.revoked.write().unwrap().rotated.insert(identity) {
             return Vec::new();
         }
-        self.end_revoked(|tag| tag.fingerprint == identity)
+        // Its successor logs in, so its resume is told only that it is gone.
+        self.end_sessions(
+            |s| {
+                s.info
+                    .transport
+                    .identity
+                    .as_ref()
+                    .is_some_and(|tag| tag.fingerprint == identity)
+            },
+            false,
+        )
     }
 
     /// How long `uid`'s key must wait to chat, message or post, as a key
@@ -214,24 +224,32 @@ impl Core {
     /// rotation has moved that account, what such a session writes
     /// under the old key would be stranded there.
     pub(crate) fn end_identity(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {
-        self.end_sessions(|s| {
-            s.identity == Some(identity)
-                || s.info
-                    .transport
-                    .identity
-                    .as_ref()
-                    .is_some_and(|t| t.fingerprint == identity)
-        })
+        self.end_sessions(
+            |s| {
+                s.identity == Some(identity)
+                    || s.info
+                        .transport
+                        .identity
+                        .as_ref()
+                        .is_some_and(|t| t.fingerprint == identity)
+            },
+            false,
+        )
     }
 
     /// The sessions `list` refuses, ended. Run after the list is written,
     /// and with nothing else held: an `attach` from then on is refused,
     /// and one that got in before is on the roster to be found here.
     fn end_revoked(&self, refuses: impl Fn(&IdentityTag) -> bool) -> Vec<(Uid, String)> {
-        self.end_sessions(|s| s.info.transport.identity.as_ref().is_some_and(&refuses))
+        self.end_sessions(
+            |s| s.info.transport.identity.as_ref().is_some_and(&refuses),
+            true,
+        )
     }
 
-    fn end_sessions(&self, ends: impl Fn(&UserSession) -> bool) -> Vec<(Uid, String)> {
+    /// End the sessions `ends` picks, as kicked; a resume of one is told
+    /// so where `told` (`docs/hotline-ng.md` §6.2).
+    fn end_sessions(&self, ends: impl Fn(&UserSession) -> bool, told: bool) -> Vec<(Uid, String)> {
         let mut r = self.roster.lock().unwrap();
         let ended: Vec<(Uid, String)> = r
             .users
@@ -241,6 +259,9 @@ impl Core {
             .collect();
         for (uid, nick) in &ended {
             info!(uid, nick = %nick, "ending a session whose key is revoked");
+            if told {
+                r.remember_end(*uid, crate::ending::EndedBy::Kicked);
+            }
             r.send_to(*uid, Event::Kicked);
             r.export_leaving(*uid);
             if r.users.get(uid).is_some_and(is_buffering) {

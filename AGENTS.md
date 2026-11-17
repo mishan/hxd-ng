@@ -769,7 +769,10 @@ Three layers, all `cargo test --workspace`:
   of another server, a protected person and its own person, its last
   kicked as the person with its notice, a moderator shown each device's
   login and address while the person's own device and a stranger are
-  not, and with coalescing off each
+  not, a device kick from a client without `persons` refused, a
+  detached session kicked, banned or ended told so by its resume,
+  coalescing on or off, while a guessed token, a lapsed session and
+  one forgotten by the sweep are told it expired, and with coalescing off each
   device a user and a member of its own;
   `voice.rs` has a person in voice, and `link.rs` a person across a
   link), `slow_consumer.rs` (a room flooded while one
