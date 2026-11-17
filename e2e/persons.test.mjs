@@ -376,11 +376,12 @@ describe('sealing to a person', () => {
     const to = fingerprintFromString(pat.laptop.fingerprint);
     const boxes = await sealBoxes(keysOf(sven), { cert: sven.cert, to, text: 'wrong key' }, deviceCertBytes(listed.devices));
     const [a, b] = boxes;
-    const since = phone.mark();
+    const since = [laptop, phone].map((c) => [c, c.mark()]);
     const refused = await writer.conn.msg({ to: uid, boxes: [a, { ...b, cert: a.cert }] }).catch((e) => e.wire);
     assert.equal(refused.code, 'cert_changed');
     assert.equal(refused.device, b.device);
-    await phone.expectNo('msg', (d) => d.sealed !== undefined, { since });
+    // Neither device, the one whose box was good included.
+    for (const [c, mark] of since) await c.expectNo('msg', (d) => d.sealed !== undefined, { since: mark });
     await Promise.all([laptop.close(), phone.close(), writer.close()]);
   });
 
