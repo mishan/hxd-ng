@@ -5193,11 +5193,17 @@ async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
     let phone = person(44, "Alice");
     drop(link_to_alice(ng, &phone).await);
     let web = another_device(&phone, 143, hl_identity::caps::WEB);
-    let (c, ok) = alices_device(ng, &web).await;
+    let (mut c, ok) = alices_device(ng, &web).await;
     let (session, token) = (
         ok["session"].as_str().unwrap().to_string(),
         ok["token"].as_str().unwrap().to_string(),
     );
+    // Joining its person, a device may hear its row change: it resumes
+    // past what it was sent.
+    let mut last_seq = 0;
+    while let Ok(ev) = timeout(Duration::from_millis(500), c.recv_json()).await {
+        last_seq = ev["seq"].as_u64().unwrap_or(last_seq);
+    }
     drop(c);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -5208,7 +5214,7 @@ async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
     let resumed = r
         .request(
             "resume",
-            json!({ "session": session, "token": token, "last_seq": 0 }),
+            json!({ "session": session, "token": token, "last_seq": last_seq }),
         )
         .await;
     assert!(resumed.get("ok").is_some(), "{resumed}");

@@ -2215,6 +2215,9 @@ fn default_clock_skew() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_coalesce() -> bool {
+    hxd_core::coalesce::COALESCE_DEFAULT
+}
 fn default_max_new_accounts() -> usize {
     60
 }
@@ -2287,10 +2290,10 @@ pub struct ServerSection {
     /// is a plaintext equivalent, is not offered anywhere.
     #[serde(default = "default_true")]
     pub classic: bool,
-    /// Show a person's sessions as one row of the roster. Being built:
-    /// rooms, voice, kicks and links do not know of it yet, so it stays
-    /// off, and out of the operator's docs, until they do.
-    #[serde(default)]
+    /// Show a person's sessions as one row of the roster
+    /// (docs/operating.md, Persons). Off unless built with
+    /// `coalesce-default`, until it becomes the default.
+    #[serde(default = "default_coalesce")]
     pub coalesce: bool,
     /// Advertised server name.
     #[serde(default = "default_name")]
@@ -2768,7 +2771,7 @@ impl Default for ServerSection {
         ServerSection {
             bind: default_bind(),
             classic: true,
-            coalesce: false,
+            coalesce: default_coalesce(),
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),

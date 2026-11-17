@@ -427,7 +427,7 @@ fn a_message_from_any_device_crosses_as_its_row() {
 
 #[test]
 fn with_coalescing_off_each_device_is_a_user_of_its_own_to_the_links() {
-    let core = Core::new();
+    let core = Core::new().with_coalesce(false);
     let mut feed = core.peer_feed(16);
     let (a1, _rx1) = device(&core, Transport::default());
     let (a2, _rx2) = device(&core, Transport::default());

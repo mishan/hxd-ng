@@ -602,7 +602,7 @@ fn a_device_id_is_its_own_and_below_two_to_the_53() {
 
 #[test]
 fn with_coalescing_off_nothing_is_shown_of_devices() {
-    let core = Core::new();
+    let core = Core::new().with_coalesce(false);
     let (a1, mut r1) = alice(&core, proved(ng(true)));
     let (_a2, _r2) = alice(&core, ng(true));
     let (m, mut rm) = other(&core, "mod", ng(true), true);

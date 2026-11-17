@@ -735,7 +735,7 @@ fn a_device_joining_a_masked_person_is_masked() {
 
 #[test]
 fn with_coalescing_off_a_mask_is_one_sessions() {
-    let core = Core::new();
+    let core = Core::new().with_coalesce(false);
     let (a1, _rx1) = alice(&core, true, |_| {});
     assert!(core.set_session_mask(a1, muted()));
     let (a2, _rx2) = alice(&core, true, |_| {});
