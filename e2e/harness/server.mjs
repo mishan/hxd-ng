@@ -175,6 +175,8 @@ function baseConfig(ports, name) {
       name,
       version: 254,
       login_timeout: 10,
+      // CI runs the suite once with a person's devices one user.
+      coalesce: process.env.HXD_E2E_COALESCE === '1',
     },
     paths: { accounts: 'accounts' },
     ng: {

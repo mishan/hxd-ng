@@ -12,6 +12,9 @@ publish = false
 # (`crate::instrument`). Off by default: without it every recording
 # call is an empty function.
 metrics = ["dep:metrics"]
+# `[server] coalesce` on unless a config or a `Core` says otherwise, so CI
+# can run every suite with it on before it becomes the default.
+coalesce-default = []
 
 [dependencies]
 # tokio::sync only — the domain layer schedules nothing itself.

@@ -79,6 +79,21 @@ jobs:
           cargo test --workspace --features hxd/metrics --lib
           cargo test -p hxd --features metrics --test metrics
 
+  # Every suite again with `[server] coalesce` on by default, which it
+  # must pass before it can become the default. A job of its own, beside
+  # `rust` rather than after it, and cached apart: the feature rebuilds
+  # every crate above hxd-core.
+  rust-coalesce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coalesce
+      - name: Tests with coalesce on
+        run: cargo test --workspace --features hxd/coalesce-default
+
   # The uniqush gateway against a real uniqush-push and Valkey
   # (docs/push-notifications.md §9 P3): what the Rust suites' mock would
   # only be agreeing with itself about. uniqush takes its token from its
@@ -172,6 +187,10 @@ jobs:
   # (main.rs, Config::load, the sweeper, the pruners).
   e2e:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        coalesce: ["off", "on"]
     steps:
       - uses: actions/checkout@v4
 
@@ -211,3 +230,5 @@ jobs:
       - name: Run the suite
         run: npm install && npm test
         working-directory: e2e
+        env:
+          HXD_E2E_COALESCE: ${{ matrix.coalesce == 'on' && '1' || '0' }}

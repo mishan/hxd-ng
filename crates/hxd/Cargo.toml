@@ -52,6 +52,8 @@ feeds = ["dep:hxd-feeds", "inbox"]
 # a load test or an operator who wants the numbers builds with it, and
 # without it a `[metrics]` section is a startup error.
 metrics = ["hxd-core/metrics", "dep:metrics", "dep:metrics-exporter-prometheus"]
+# `[server] coalesce` on by default (hxd-core's feature of the name).
+coalesce-default = ["hxd-core/coalesce-default"]
 # tokio-console. Needs `RUSTFLAGS="--cfg tokio_unstable"` as well, which
 # is why it is a feature of its own rather than part of `metrics`.
 console = ["dep:console-subscriber"]

@@ -53,6 +53,10 @@ impl Device {
     }
 }
 
+/// Whether a server groups a person's sessions when nothing says either
+/// way: `Core::new` and `[server] coalesce`.
+pub const COALESCE_DEFAULT: bool = cfg!(feature = "coalesce-default");
+
 /// The longest label kept, in characters.
 pub const LABEL_MAX_CHARS: usize = 32;
 

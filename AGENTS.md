@@ -861,8 +861,10 @@ cargo clippy -p hxd --features metrics --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace --features hxd/metrics --lib
 cargo test -p hxd --features metrics --test metrics
+cargo test --workspace --features hxd/coalesce-default   # [server] coalesce on
 node --check tools/ng-client.mjs
 cd e2e && npm install && npm test   # needs a sibling ../hx-ng; CI pins it
+cd e2e && HXD_E2E_COALESCE=1 npm test
 docker build -t hxd-ng . && docker/smoke-test.sh hxd-ng
 HXD_TEST_UNIQUSH=... cargo test -p hxd-push-uniqush --test uniqush  # needs a uniqush; CI's uniqush job
 ```

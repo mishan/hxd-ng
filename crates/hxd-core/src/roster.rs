@@ -2391,6 +2391,7 @@ impl Core {
         r.clock = core.clock.clone();
         r.revoked = core.revoked.clone();
         r.per_account = crate::limits::CONNECTIONS_PER_ACCOUNT;
+        r.persons.on = crate::coalesce::COALESCE_DEFAULT;
         drop(r);
         core
     }
