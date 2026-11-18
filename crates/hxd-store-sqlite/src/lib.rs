@@ -4314,6 +4314,11 @@ mod tests {
     /// being rewound, and the rewind gives up quickly rather than holding
     /// the write lock for as long as the reader likes: no commit waits
     /// long for it, however long the reader stays.
+    ///
+    /// Asked of SQLite's busy handler rather than of a commit's time: a
+    /// commit held behind a rewind is one that found the write lock taken
+    /// and waited for it, while a slow commit on a loaded runner may be
+    /// only the scheduler.
     #[test]
     fn a_reader_holding_the_log_never_stalls_a_commit() {
         use hxd_core::history::{ChatLog, NewLine};
@@ -4340,22 +4345,34 @@ mod tests {
             signed: None,
         };
         store.append(&line()).unwrap();
+        thread_local!(static WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+        fn waited(count: i32) -> bool {
+            if count == 0 {
+                WAITS.with(|w| w.set(w.get() + 1));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            count < 5000
+        }
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(waited))
+            .unwrap();
         // An operator's shell, say, in the middle of a read.
         let reader = Connection::open(&path).unwrap();
         reader.execute_batch("BEGIN").unwrap();
         let _: i64 = reader
             .query_row("SELECT count(*) FROM chat_line", [], |r| r.get(0))
             .unwrap();
-        let mut slowest = Duration::ZERO;
         let until = std::time::Instant::now() + 3 * CHECKPOINT_EVERY;
         while std::time::Instant::now() < until {
-            let took = std::time::Instant::now();
             store.append(&line()).unwrap();
-            slowest = slowest.max(took.elapsed());
             std::thread::sleep(Duration::from_millis(2));
         }
         reader.execute_batch("COMMIT").unwrap();
-        assert!(slowest < 5 * REWIND_WAIT, "a commit waited {slowest:?}");
+        let waits = WAITS.with(|w| w.get());
+        assert_eq!(waits, 0, "commits waited for a lock {waits} times");
     }
 
     /// A passive pass that meets another checkpoint in progress did
