@@ -174,6 +174,7 @@ generate() {
     echo "[server]"
     echo 'bind = "0.0.0.0:5500"'
     $classic || echo "classic = false"
+    on HXD_COALESCE off && echo "coalesce = true"
     str HXD_NAME name
     num HXD_BAN_TIME ban_time
     num HXD_LOGIN_TIMEOUT login_timeout

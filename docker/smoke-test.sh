@@ -67,6 +67,7 @@ docker run -d --name "$name" --network "$name" \
     -e HXD_TLS_CERT=/etc/hxd-ng/tls/cert.pem -e HXD_TLS_KEY=/etc/hxd-ng/tls/key.pem \
     -e HXD_NAME=smoke -e HXD_IDENTITY_HOSTS=localhost \
     -e HXD_ADMIN_LOGIN=Admin -e HXD_ADMIN_PASSWORD=smoke -e HXD_EMOJI=on \
+    -e HXD_COALESCE=on \
     "$image" >/dev/null
 
 legacy=$(docker port "$name" 5500/tcp | head -n1)
@@ -116,6 +117,10 @@ echo "smoke-test: discovery on $ng"
 health=$(docker inspect -f '{{index .Config.Healthcheck.Test 3}}' "$name")
 docker exec "$name" bash -c "$health" ||
     fail "the health check's probe fails"
+
+# On/off variables reach the config the server started with.
+docker exec "$name" grep -qx 'coalesce = true' /run/hxd-ng/hxd-ng.toml ||
+    fail "HXD_COALESCE=on wrote no coalesce = true"
 
 # The login is folded the way FileAuth folds it.
 docker exec "$name" test -f /var/lib/hxd-ng/accounts/admin.toml ||
