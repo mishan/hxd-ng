@@ -202,13 +202,19 @@ impl Registrars {
     }
 
     /// Fetch and keep `identity`'s lists from the trusted registrars that
-    /// `attestations` name, all at once and all within the configured
-    /// wait. What cannot be had in it is left to [`Self::lookup`] to call
-    /// stale. Asked only for an identity whose login has verified.
+    /// `attestations` name, and from those [`Self::held`] names, all at
+    /// once and all within the configured wait: a card shown without its
+    /// attestations, or with one under a key no longer published, still
+    /// has its registrars asked. What cannot be had in it is left to
+    /// [`Self::lookup`] to call stale. Asked only for an identity whose
+    /// login has verified.
     pub async fn refresh(&self, identity: &PublicKey, attestations: &[Attestation], now: u64) {
+        let fp = Fingerprint::of(identity);
+        let held = self.held(fp).await.unwrap_or_default();
         let mut hosts: Vec<(&str, Vec<PublicKey>)> = attestations
             .iter()
             .map(|a| a.registrar.as_str())
+            .chain(held.iter().map(String::as_str))
             .filter(|h| self.trusts(h))
             .map(|host| {
                 let named = attestations
@@ -221,21 +227,34 @@ impl Registrars {
             .collect();
         hosts.sort_unstable();
         hosts.dedup_by_key(|(host, _)| *host);
-        self.refresh_hosts(Fingerprint::of(identity), &hosts, now, None)
-            .await;
+        self.refresh_hosts(fp, &hosts, now, None).await;
     }
 
     /// Refresh, where they are due, the lists of the registrars that
     /// attested `fp` when it was admitted, whatever card it shows now,
-    /// which is what a sweep must keep asking: those it holds a list
-    /// from, and those it was admitted while unable to reach. A registrar
-    /// that has failed since `sweep` began is not asked again in it.
+    /// which is what a sweep must keep asking. A registrar that has
+    /// failed since `sweep` began is not asked again in it.
     pub async fn refresh_held(&self, fp: Fingerprint, now: u64, sweep: Instant) {
+        let Some(hosts) = self.held(fp).await else {
+            return;
+        };
+        let hosts: Vec<(&str, Vec<PublicKey>)> = hosts
+            .iter()
+            .filter(|h| self.trusts(h))
+            .map(|h| (h.as_str(), Vec::new()))
+            .collect();
+        self.refresh_hosts(fp, &hosts, now, Some(sweep)).await;
+    }
+
+    /// The registrars on file for `fp`: those it holds a list from, and
+    /// those it was admitted while unable to reach. `None` when the
+    /// store cannot be read.
+    async fn held(&self, fp: Fingerprint) -> Option<Vec<String>> {
         let cache = self.cache.clone();
         let held = crate::spawn_blocking("identity", move || cache.lists(&fp.0)).await;
         let mut hosts: Vec<String> = match held {
             Ok(Ok(held)) => held.into_iter().map(|l| l.registrar).collect(),
-            _ => return,
+            _ => return None,
         };
         hosts.extend(
             self.attested
@@ -248,12 +267,7 @@ impl Registrars {
         );
         hosts.sort_unstable();
         hosts.dedup();
-        let hosts: Vec<(&str, Vec<PublicKey>)> = hosts
-            .iter()
-            .filter(|h| self.trusts(h))
-            .map(|h| (h.as_str(), Vec::new()))
-            .collect();
-        self.refresh_hosts(fp, &hosts, now, Some(sweep)).await;
+        Some(hosts)
     }
 
     /// Forget the registrars that attested identities with no session
@@ -326,7 +340,8 @@ impl Registrars {
         .map_err(|e| e.0)?;
         // An attestation is anyone's to write: only one under a key the
         // registrar publishes sends this server to it, after asking once
-        // whether that key is one it has rotated to since.
+        // whether that key is one it has rotated to since. A list held
+        // from it is reason enough of the server's own.
         let published = |this: &Self| {
             let keys = this.keys_now(host, now);
             named.is_empty() || named.iter().any(|k| keys.contains(k))
@@ -334,9 +349,12 @@ impl Registrars {
         if !published(self) {
             // An operator's key is not one discovery can change.
             if !self.cfg.keys.contains_key(host) {
-                self.discover(host, true).await?;
+                let found = self.discover(host, true).await;
+                if held.is_none() {
+                    found?;
+                }
             }
-            if !published(self) {
+            if !published(self) && held.is_none() {
                 return Err("attested under a key the registrar does not publish".into());
             }
         }
@@ -600,8 +618,9 @@ impl Registrars {
     }
 
     /// What the cached lists of the trusted registrars say of `identity`,
-    /// and whether one of `hosts` (the registrars that attested it) has
-    /// none current. Reads the store: called off the reactor.
+    /// and whether one of `hosts` (the registrars that attested it), or
+    /// of those a list is held from, has none current. Reads the store:
+    /// called off the reactor.
     pub fn lookup(&self, identity: &PublicKey, hosts: &[String], now: u64) -> Lookup {
         self.lookup_fp(Fingerprint::of(identity), hosts, now)
     }
@@ -615,7 +634,8 @@ impl Registrars {
             }
         };
         let mut lookup = Lookup::default();
-        for host in hosts.iter().filter(|h| self.trusts(h)) {
+        let on_file = held.iter().map(|l| &l.registrar);
+        for host in hosts.iter().chain(on_file).filter(|h| self.trusts(h)) {
             if !held.iter().any(|l| {
                 &l.registrar == host
                     && self.under_configured_key(l)
