@@ -133,6 +133,18 @@ as AGENTS.md's "Releasing" describes it.
   mid-poll finds it on its next poll instead of a 410 and an approved
   enrollment lost. A request's `expires_in` is never past the end of
   the holder's session, which takes its requests with it.
+- An identity's registrar records are fetched by its fingerprint from
+  every trusted registrar this server holds a list from, not only from
+  those its card names (docs/identity-records.md §3). A stolen device
+  key shown with an older card that carries no attestation, or one
+  under a registrar key no longer published, no longer reaches its
+  linked account on `/identity/auth` or classic Prove Device past a
+  device or identity revocation published since the last fetch: it is
+  refused `revoked`, as with the current card. A held list past its
+  lifetime is stale for `revocation_stale` too, so `guest` and `deny`
+  now apply to any card of an identity with a list held, whichever
+  registrars the card names. An identity with no list on file, as one
+  an operator linked by hand, is admitted as before.
 
 ## [0.3.0] - 2026-11-05
 

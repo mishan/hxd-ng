@@ -759,10 +759,12 @@ and none of the rest of this section runs.
 
 ### 7.2 Fetching records
 
-For each registrar that attested the identity in front of it, the
-server fetches `GET <records>/<identity fingerprint>` and caches the
-signed list until its `expires`, or for `[identity] revocation_max_age`,
-whichever is sooner. The fetch happens at `auth`, at a certificate-only
+For each registrar that attested the identity in front of it, and each
+trusted registrar it holds a list from for that identity whatever the
+card now shows (`identity-records.md` §3), the server fetches
+`GET <records>/<identity fingerprint>` and caches the signed list until
+its `expires`, or for `[identity] revocation_max_age`, whichever is
+sooner. The fetch happens at `auth`, at a certificate-only
 re-admission (identity spec §5.5), and at the application login that
 re-reads the link — the same three points at which admission policy is
 re-decided — and is served from cache within its lifetime.
@@ -778,7 +780,7 @@ lifetime, `[identity] revocation_stale` decides:
 
 The default is the threat model's: "servers keep cached attestations
 with a staleness limit rather than failing closed." An unattested
-identity has no registrar to ask and is never stale.
+identity with no list held has no registrar to ask and is never stale.
 
 ### 7.3 Applying records
 

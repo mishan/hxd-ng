@@ -14,9 +14,14 @@ use std::time::Duration;
 
 use hl_identity::envelope::{Kdf, Keys, Kind, Secret};
 use hl_identity::{
-    cert, Attestation, Card, DeviceCert, DeviceKey, EnvelopePut, IdentityKey, KeyEnvelope,
-    ListKind, LoginProof, Record, RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
+    cert, Attestation, Card, DeviceCert, DeviceKey, DeviceProof, EnvelopePut, IdentityKey,
+    KeyEnvelope, ListKind, LoginProof, Record, RegisterRequest, RegistrarKeys, Rotation,
+    ServerChallenge, SignedList, Stats,
 };
+use hxd_testclient::device::{get_device_challenge, prove_device};
+use hxd_testclient::legacy::{Client, Login};
+use hxproto::messages::{tag, ClientHdr};
+use hxproto::messaging::CAP_DEVICE_PROOF;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -936,6 +941,18 @@ async fn verifier(
     url: &str,
     extra: &str,
 ) -> (SocketAddr, Arc<hxd_ng_session::IdentityState>) {
+    verifier_serving(dir, r, trust, url, extra, None).await
+}
+
+/// [`verifier`], serving the classic wire on `classic` too.
+async fn verifier_serving(
+    dir: &Path,
+    r: &Server,
+    trust: Trust,
+    url: &str,
+    extra: &str,
+    classic: Option<tokio::net::TcpListener>,
+) -> (SocketAddr, Arc<hxd_ng_session::IdentityState>) {
     let d = dir.display();
     let trust = match trust {
         Trust::Key => format!(
@@ -960,11 +977,15 @@ async fn verifier(
     std::fs::write(&config_path, &text).unwrap();
     let config = hxd::Config::load(&config_path).unwrap();
     hxd::check_config(&config).unwrap();
-    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let mut ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
         .unwrap()
         .unwrap();
     let identity = ng_ctx.identity.clone().unwrap();
+    if let Some(classic) = classic {
+        ctx.device_proof = hxd::device::prover(Some(&ng_ctx));
+        tokio::spawn(hxd_session::serve(classic, ctx));
+    }
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
     (ng, identity)
 }
@@ -1243,6 +1264,212 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
         (reply.status, reply.json()["error"].clone()),
         (403, json!("denied"))
     );
+
+    // An identity whose list is held is no stranger to it, though its
+    // card drops the attestation.
+    let bare = Card::new(&bob, "bobby", now()).sign(&bob, vec![]).unwrap();
+    let own = DeviceKey::from_seed(&[102; 32]);
+    let reply = auth_at(strict, &bob, &own, &bare).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("denied"))
+    );
+}
+
+/// A registrar, and a server trusting it on both wires whose accounts
+/// `alice` and `bob` are linked to those identities, seeds 1 and 2:
+/// the registrar, the ng port and the classic port.
+async fn linked_verifier(dir: &Path) -> (Server, SocketAddr, SocketAddr) {
+    let at = dir.join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let accounts = dir.join("verifier/accounts");
+    hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
+    for (login, seed) in [("alice", 1), ("bob", 2)] {
+        let fp = IdentityKey::from_seed(&[seed; 32]).fingerprint();
+        std::fs::write(
+            accounts.join(format!("{login}.toml")),
+            format!("name = \"{login}\"\npassword = \"pw\"\n[identity]\nfingerprint = \"{fp}\"\n"),
+        )
+        .unwrap();
+    }
+    let classic = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let plain = classic.local_addr().unwrap();
+    let (ng, _) = verifier_serving(
+        &dir.join("verifier"),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        &format!("classic_hosts = [\"{plain}\"]"),
+        Some(classic),
+    )
+    .await;
+    (r, ng, plain)
+}
+
+/// `device` of `id` revoked at `r`, and the verifier's list due again.
+async fn revoke_device(r: &Server, id: &IdentityKey, device: &DeviceKey) {
+    let revocation = hl_identity::DeviceRevocation {
+        identity: id.public(),
+        device: device.public(),
+        time: now(),
+        until: now() + 3600,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(id)
+    .unwrap();
+    let posted = post(
+        r,
+        "/registrar/records",
+        json!({ "record": b64(&revocation) }),
+    )
+    .await;
+    assert_eq!(posted.status, 200);
+    next_list().await;
+}
+
+/// `id`'s card with no attestation, from before its attested one: a
+/// thief's, as cards are public.
+fn bare(id: &IdentityKey) -> Vec<u8> {
+    Card::new(id, "old", now() - 60).sign(id, vec![]).unwrap()
+}
+
+/// [`bare`], attested at the registrar under a key it no longer
+/// publishes.
+fn retired(id: &IdentityKey) -> Vec<u8> {
+    let key = hl_identity::ServerKey::from_seed(&[9; 32]);
+    let att = Attestation {
+        identity: id.public(),
+        registrar: HOST.into(),
+        registrar_key: key.public(),
+        handle: "old".into(),
+        registered: now() - 120,
+        issued: now() - 120,
+        expires: now() + 3600,
+        level: None,
+    };
+    Card::new(id, "old", now() - 60)
+        .sign(id, vec![att.signed_value(&key)])
+        .unwrap()
+}
+
+/// Prove Device at `plain` logged in as `account`, `dev` of `id` showing
+/// `card`: `Ok`, or the refusal's text.
+async fn prove_at(
+    plain: SocketAddr,
+    account: &str,
+    id: &IdentityKey,
+    dev: &DeviceKey,
+    card: &[u8],
+) -> Result<(), String> {
+    let login = Login {
+        caps: Some(CAP_DEVICE_PROOF as u32),
+        ..Login::account(account, account, "pw")
+    };
+    let mut c = Client::connect(plain).await.unwrap();
+    c.login_unannounced(&login).await.unwrap();
+    let host = plain.to_string();
+    let reply = c
+        .ask(ClientHdr::GetDeviceChallenge, &get_device_challenge(&host))
+        .await
+        .unwrap();
+    let ch = ServerChallenge::parse_trtp(&reply.bytes(tag::SERVER_CHALLENGE).unwrap()).unwrap();
+    let proof = DeviceProof::sign(dev, &ch.challenge, &ch.server_key, &host, now(), None).unwrap();
+    let cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME)
+        .unwrap()
+        .sign(id);
+    let reply = c
+        .ask(
+            ClientHdr::ProveDevice,
+            &prove_device(&proof, &cert, Some(card)),
+        )
+        .await
+        .unwrap();
+    match reply.is_error() {
+        true => Err(reply.error_text().unwrap()),
+        false => Ok(()),
+    }
+}
+
+#[tokio::test]
+async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_ng() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r, v, _) = linked_verifier(dir.path()).await;
+    let (alice, bob) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let linked = |reply: Reply| (reply.status, reply.json()["outcome"].clone());
+    let card = attested(&r, &alice, "alice").await;
+    assert_eq!(
+        linked(auth_at(v, &alice, &phone, &card).await),
+        (200, json!("linked"))
+    );
+
+    // Her phone revoked at her registrar, a card naming none, or naming
+    // a key it no longer publishes, is no way around it; her laptop is
+    // still let in, with either card.
+    revoke_device(&r, &alice, &phone).await;
+    for old in [retired(&alice), bare(&alice)] {
+        let reply = auth_at(v, &alice, &phone, &old).await;
+        assert_eq!(
+            (reply.status, reply.json()["error"].clone()),
+            (403, json!("revoked"))
+        );
+    }
+    for card in [bare(&alice), card] {
+        assert_eq!(
+            linked(auth_at(v, &alice, &laptop, &card).await),
+            (200, json!("linked"))
+        );
+    }
+
+    // Linked by hand, never attested: nothing to ask, and let in.
+    assert_eq!(
+        linked(auth_at(v, &bob, &phone, &bare(&bob)).await),
+        (200, json!("linked"))
+    );
+}
+
+#[tokio::test]
+async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_classic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (r, _, plain) = linked_verifier(dir.path()).await;
+    let (alice, bob) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    prove_at(plain, "alice", &alice, &phone, &card)
+        .await
+        .unwrap();
+
+    revoke_device(&r, &alice, &phone).await;
+    for old in [retired(&alice), bare(&alice)] {
+        assert_eq!(
+            prove_at(plain, "alice", &alice, &phone, &old).await,
+            Err("The device could not be proved.".into())
+        );
+    }
+    for card in [bare(&alice), card] {
+        prove_at(plain, "alice", &alice, &laptop, &card)
+            .await
+            .unwrap();
+    }
+
+    prove_at(plain, "bob", &bob, &phone, &bare(&bob))
+        .await
+        .unwrap();
 }
 
 /// An ng session at `at` for `id`'s device, logged in with the token its

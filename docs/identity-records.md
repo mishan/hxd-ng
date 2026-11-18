@@ -96,14 +96,19 @@ computed, and an identity left with no attestation is unattested, which
 `unattested` (later `admission.unknown`) then decides. Every refusal is
 logged with the fingerprint.
 
-An identity's records are fetched from the registrars that attested it,
-so for a card shown without its attestations nothing is fetched: whoever
-holds a revoked identity key can drop the attestation and be admitted as
-the unattested key it then is. §7.2 says as much (an unattested
-identity "is never stale"); what refuses a stolen key everywhere is its
-holder revoking it, which every server that cached the list then
-applies, and the operator's own `revoked_identities`. A list held is
-applied whatever the card shows, and whether or not it is current.
+An identity's records are fetched, by its fingerprint, from the
+registrars that attested it and from every trusted registrar a list is
+held from for it, whatever the card shows: cards are public, so a thief
+holding a device key can show an older one that carries no attestation,
+or one under a key the registrar no longer publishes, and the account
+it reaches is linked by fingerprint, not by card. A list held is
+applied whether or not it is current, and one past its lifetime is
+stale for `revocation_stale`: `guest` and `deny` apply to any card of
+an identity with a list held, whichever registrars the card names. An
+identity with no list held here, as one an operator linked by hand, has
+no registrar to ask and is never stale. What refuses a stolen key at a
+server that never held its list is its holder revoking it, and the
+operator's own `revoked_identities`.
 
 ## 4. Rotation at the server
 
