@@ -1,8 +1,9 @@
-//! Pronouns on the classic wire, on a server built from a real config:
-//! set with the system account's `/pronouns`, kept in the account file's
-//! `[profile]`, and shown as a `pronouns:` line in Get User Info's text
-//! wherever the reader's encoding keeps them, with nothing else sent for
-//! a change.
+//! Pronouns on both wires, on a server built from a real config: set
+//! with the system account's `/pronouns` or the ng `pronouns` request,
+//! kept in the account file's `[profile]`, shown to a classic client as a
+//! `pronouns:` line in Get User Info's text wherever its encoding keeps
+//! them, with nothing else sent for a change, and to an ng client on the
+//! `user` object, a change told as `user_changed`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -327,6 +328,18 @@ async fn a_set_costs_what_a_user_change_costs() {
             Err(e) => panic!("{e}"),
         }
     }
+
+    // The ng request is a User Change too: the third reaches sixty.
+    let (mut dave, _) = ng_login(&s, "dave").await;
+    let mut codes = Vec::new();
+    for p in ["she/her", "they/them", "xe/xem"] {
+        let frame = dave
+            .request_frame("pronouns", json!({ "pronouns": p }))
+            .await
+            .unwrap();
+        codes.push(frame["error"]["code"].as_str().unwrap_or("ok").to_owned());
+    }
+    assert_eq!(codes, ["ok", "rate_limited", "flooding"]);
 }
 
 #[tokio::test]
@@ -369,4 +382,171 @@ async fn account_editors_leave_the_users_pronouns_as_they_are() {
         .await
         .windows(18)
         .any(|w| w == b"pronouns: she/her\r"));
+}
+
+/// An ng session of `login`, and its login reply.
+async fn ng_login(server: &Server, login: &str) -> (ng::Client, serde_json::Value) {
+    ng::Client::account(server.ng, login, "pw", login)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pronouns_set_on_either_wire_show_on_the_other() {
+    let td = tempfile::tempdir().unwrap();
+    let s = started(td.path()).await;
+    let mut bob = login(&s, "bob", None).await;
+    let mut dave = login(&s, "dave", None).await;
+    let _admin = login(&s, "admin", None).await;
+    let _carol = login(&s, "carol", None).await;
+    let (mut alice, _) = ng_login(&s, "alice").await;
+    let (mut watcher, hello) = ng_login(&s, "bob").await;
+    let alice_uid = alice.uid.unwrap();
+    let dave_uid = u64::from(dave.uid.unwrap());
+
+    // What an account's file holds is on its row from the start, and a
+    // row with none says nothing.
+    let users = hello["users"].as_array().unwrap();
+    let row = |nick: &str| users.iter().find(|u| u["nick"] == nick).unwrap().clone();
+    assert_eq!(row("admin")["pronouns"], "they/them");
+    assert!(row("dave").get("pronouns").is_none());
+    // Nor a value the server would not have written.
+    assert!(row("carol").get("pronouns").is_none());
+    assert!(hello["caps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "pronouns"));
+
+    // Set on ng: a change to the row, to the ng wire alone, and no
+    // account change for the setter.
+    unread(&mut bob).await;
+    alice
+        .request("pronouns", json!({ "pronouns": "she/her" }))
+        .await
+        .unwrap();
+    let changed = watcher
+        .event_where("user_changed", |d| d["user"]["uid"] == alice_uid)
+        .await
+        .unwrap();
+    assert_eq!(changed.data["user"]["pronouns"], "she/her");
+    alice
+        .event_where("user_changed", |d| d["user"]["uid"] == alice_uid)
+        .await
+        .unwrap();
+    assert!(!alice
+        .rx
+        .take_backlog()
+        .iter()
+        .any(|e| e.ev == "account_changed"));
+    assert!(unread(&mut bob).await.is_empty());
+    let text = info(&mut bob, alice_uid as u16).await;
+    assert!(
+        text.starts_with(b"    name: alice\rpronouns: she/her\r"),
+        "{text:?}"
+    );
+
+    // Set on classic: the same `user_changed`, then cleared from ng.
+    said(&mut dave, s.system(), "/pronouns he/him").await;
+    let changed = watcher
+        .event_where("user_changed", |d| d["user"]["uid"] == dave_uid)
+        .await
+        .unwrap();
+    assert_eq!(changed.data["user"]["pronouns"], "he/him");
+    // One `user_changed` a change: alice's was told once before dave's.
+    let told = |c: &mut ng::Client, uid: u64| {
+        c.rx.take_backlog()
+            .iter()
+            .filter(|e| e.ev == "user_changed" && e.data["user"]["uid"] == uid)
+            .count()
+    };
+    assert_eq!(told(&mut watcher, alice_uid), 0);
+    s.core.clock().advance(hxd_core::pronouns::INTERVAL);
+    alice
+        .request("pronouns", json!({ "pronouns": null }))
+        .await
+        .unwrap();
+    let changed = watcher
+        .event_where("user_changed", |d| d["user"]["uid"] == alice_uid)
+        .await
+        .unwrap();
+    assert!(changed.data["user"].get("pronouns").is_none());
+
+    // An operator's edit, applied by a reload, is told the same way.
+    let path = s.accounts.join("dave.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("he/him", "xe/xem")).unwrap();
+    s.core.reload_accounts();
+    let changed = watcher
+        .event_where("user_changed", |d| {
+            d["user"]["uid"] == dave_uid && d["user"]["pronouns"] == "xe/xem"
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed.data["user"]["nick"], "dave");
+    let synced = watcher.sync().await.unwrap();
+    assert_eq!(told(&mut watcher, dave_uid), 0);
+    let users = synced["users"].as_array().unwrap();
+    let carol = users.iter().find(|u| u["nick"] == "carol").unwrap();
+    assert!(carol.get("pronouns").is_none(), "{carol}");
+    // Every event an ng session was sent took the next seq.
+    for c in [&alice, &watcher] {
+        assert!(c.rx.seq_faults.is_empty(), "{:?}", c.rx.seq_faults);
+    }
+}
+
+#[tokio::test]
+async fn the_pronouns_request_is_refused_as_the_command_is() {
+    let td = tempfile::tempdir().unwrap();
+    let s = started(td.path()).await;
+    let (mut alice, _) = ng_login(&s, "alice").await;
+    let (mut bob, _) = ng_login(&s, "bob").await;
+    let (mut guest, _) = ng::Client::guest(s.ng, "guest").await.unwrap();
+    let refused = |r: hxd_testclient::Result<serde_json::Value>| match r {
+        Err(hxd_testclient::Error::Refused { code, .. }) => code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    for c in [&mut guest, &mut bob] {
+        let r = c
+            .request("pronouns", json!({ "pronouns": "she/her" }))
+            .await;
+        assert_eq!(refused(r), "access_denied");
+    }
+    for params in [
+        json!({ "pronouns": "she  her" }),
+        json!({ "pronouns": "she/her\r   login: admin" }),
+        json!({ "pronouns": "a".repeat(hxd_core::pronouns::MAX_CHARS + 1) }),
+        json!({ "pronouns": 3 }),
+        json!({}),
+    ] {
+        let r = alice.request("pronouns", params.clone()).await;
+        assert_eq!(refused(r), "bad_request", "{params}");
+    }
+    alice
+        .request("pronouns", json!({ "pronouns": "she/her" }))
+        .await
+        .unwrap();
+    let frame = alice
+        .request_frame("pronouns", json!({ "pronouns": "she/they" }))
+        .await
+        .unwrap();
+    assert_eq!(frame["error"]["code"], "rate_limited", "{frame}");
+    assert!(
+        frame["error"]["retry_after"].as_u64().unwrap() <= 10,
+        "{frame}"
+    );
+
+    // A server that shows none offers none to set.
+    let td = tempfile::tempdir().unwrap();
+    let s = start(td.path(), "pronouns = false", "spam_points = 0").await;
+    let (mut alice, hello) = ng_login(&s, "alice").await;
+    assert!(!hello["caps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c == "pronouns"));
+    let r = alice
+        .request("pronouns", json!({ "pronouns": "she/her" }))
+        .await;
+    assert_eq!(refused(r), "not_available");
 }

@@ -403,7 +403,11 @@ Three layers, all `cargo test --workspace`:
   else sent for a change; a value refused whole, a guest and `[extra]
   pronouns = false` refused, the interval spent by a change alone, a
   set priced as a User Change, and both account editors leaving
-  `[profile]` as it was; `link.rs` has a ghost's), `banner.rs` (the banner push after the agreement, and a
+  `[profile]` as it was; and on the ng wire, `pronouns` on the `user`
+  object from the login reply on, a value set on either wire heard on
+  the other, a change a `user_changed` with no `account_changed` and no
+  seq skipped, and the `pronouns` request refused as the command is,
+  `not_available` where none are shown; `link.rs` has a ghost's), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
   blocks, retention, the sender's daily quota refusing only

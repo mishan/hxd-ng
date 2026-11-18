@@ -187,6 +187,7 @@ over them.
 | `identity` | The server has the identity endpoints of hotline-ng-auth.md | hotline-ng-identity.md §6.1 | fields in `self`, on a socket that authenticated with one |
 | `push` | Push device registration | push-notifications.md §8; webpush-gateway.md §7 | `push` |
 | `avatars` | Users' pictures: `avatar` on the `user` object, `avatar_clear`, bytes over HTTP | avatars.md §4 | `avatars` |
+| `pronouns` | Users' pronouns: the `pronouns` request. `pronouns` on the `user` object needs no capability | §7.3, §7.4 here | — |
 | `banner` | The server banner: where its image is, where a click goes, and `GET /banner` | banner.md §3 | `banner` |
 | `accounts` | Account administration: `account_list`, `account_get`, `account_create`, `account_update`, `account_delete`, and `account_changed` | account-admin.md §5 | `accounts` |
 | `roles` | Roles: `roles` on the `user` and account objects, `role_list`, `role_get`, `role_create`, `role_update`, `role_delete`, `roles_changed` and `roster_stale` | roles.md §7 | `roles`, and in `sync`'s reply |
@@ -719,6 +720,7 @@ family document. Each family of §4 adds its own.
 | `device_cert` | `uid`, and with `persons` `device?` | `{ "cert" }`, or with `persons` for a person `{ "devices": [ { "device", "cert" } ] }` (e2e-messages.md §4.14) | `no_such_user`, `no_such_device`, `not_sealed`, `blocked`, `not_delivered` |
 | `device_end` | `device`, from a session with `persons` alone (§7.6) | `{}` | `no_such_device`, `no_such_user` |
 | `signs` | `signs` (`"default"` \| `"able"`) | `{}` | — |
+| `pronouns` | `pronouns` (a string, or `null` to clear) | `{}` | `not_available`, `access_denied`, `bad_request`, `rate_limited` |
 | `react` | `target` (a `line`, `im` or `pm`), `key`, `remove?`, and `with` for an `im` target; or `target`, `clear: true` and `reason` (§7.3) | `{ "count"? }` | `not_available`, `no_such_target`, `too_many_reactions`, `no_such_emoji`, `access_denied`, `protected`, `bad_request`, `rate_limited`, `server_error` |
 | `reactions` | `targets` (1–50 `line` and `pm` targets), and `key` with exactly one (§7.3) | `{ "reactions": [ { "target", "keys", "mine"?, "from"? } ] }` | `not_available`, `bad_request`, `server_error` |
 | `history` | `room?`, `before?`, `after?` (line ids), `limit?` (1–200, default 50); or `room?` and `ids` (§7.3) | `{ "lines": […], "has_more": bool }` | `not_available`, `no_such_room`, `server_error` |
@@ -786,6 +788,18 @@ family document. Each family of §4 adds its own.
   `signs` (§6.1) when its user turns signing every lobby line on or
   off, under the login's condition, which a session that does not meet
   it is refused `bad_request` for (e2e-messages.md §4.6).
+- **`pronouns`**, with the `pronouns` capability, sets or clears the
+  pronouns of this session's account, which every session of it then
+  shows (§7.4). A value is 1 to 32 characters held to a card name's
+  rules (hotline-ng-identity.md §3.4), never two spaces in a row, and
+  anything else is `bad_request`, never cut: a cut pronoun set
+  misstates its user. A session with no account of its own to keep
+  them, a guest's, is `access_denied`, and so is a set where the
+  account may not show them. *hxd-ng:* kept in the account file's
+  `[profile]` (account-admin.md §2), `[extra] pronouns`; one change an
+  account in 10 seconds, on either wire, counting only those made,
+  past which it is `rate_limited` with `retry_after`; the same as the
+  system account's `/pronouns` (system-account.md §3).
 - **`nick`** changes this session's nick and icon. A new nick needs the
   use-any-name privilege; without it the request is `access_denied` and
   changes nothing, icon included. An empty nick is ignored.
@@ -1096,7 +1110,7 @@ blind (identity-registrar.md §7.3).
 | `ev` | `data` | Sent when |
 |---|---|---|
 | `user_joined` | `{ "user": {…} }` | A session joins the roster. With `persons`, a person's row carries `devices` to a session that may see them (§7.6). |
-| `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag or status changes. With `persons`, also when a device under a person's row comes, goes or changes, to the sessions that may see its devices alone, carrying `devices` (§7.6). |
+| `user_changed` | `{ "user": {…} }` | A session's nick, icon, `admin` flag, status or pronouns changes. With `persons`, also when a device under a person's row comes, goes or changes, to the sessions that may see its devices alone, carrying `devices` (§7.6). |
 | `user_parted` | `{ "uid": n }` | A session leaves the roster. |
 | `chat` | `{ "from": { uid, nick, remote? }, "text", "style", "at", "id"?, "media"?, "room"?, "guid"?, "signed"?, "re"?, "emoji"? }` | A line of public chat. `from.remote` is the speaker's `remote` (§7.4) for a user of a linked server. `id` is present when the server kept the line (the `history` capability). `room` is present for a line in a room (chat-rooms.md §7.3), never for the lobby. `guid` is the one the line was sent with (§7.3), present on the sending session's own copy alone: never on another session's, the same account's included, and never in `history`. `signed` is a signed line's detached form as it was sent, on every copy and in `history` (e2e-messages.md §4.7), or for a linked server's user's line, as e2e-messages.md §5 restores it, or in its link form while its certificate is not held. A linked server's user's `history` line carries `from.remote` too, `tagged` as it was when the line was logged, and `server_key` only on a signed line, the key it was checked against; a line logged before its server kept the rest carries only that key, if any. |
 | `notice` | `{ "text", "room"? }` | A server notice, such as a kick announcement. |
@@ -1128,6 +1142,7 @@ counts in §3's sequence.
   "avatar": { "id": "9f86d081…", "type": "image/png",  // absent unless the user has one
               "width": 128, "height": 96 },
   "color": 16744448,               // absent unless the user set a nick color
+  "pronouns": "she/her",           // absent unless the user states some
   "system": true                   // only on the server's own account
 }
 ```
@@ -1143,6 +1158,7 @@ counts in §3's sequence.
 | `identity` | Present only when the session authenticated with an identity (hotline-ng-identity.md §6.1), or for a user of a linked server whose home server said the fingerprint it proved, over a link trying the user keys draft: then `{fingerprint}`, and `signs` when that server says it, as that server's word. It carries only what the roster may see: never `age`, `outcome` or anything that authorizes. `signs: true`, present only when true, says the client signs every lobby line (e2e-messages.md §4.6, §5), and `sealed: true` that it can open sealed messages (§4.1). On a person's row, `signs` says every device signs, and `sealed` that exactly one device can be sealed to (§7.6). |
 | `avatar` | Present only when the user has one, on a server with the `avatars` capability (avatars.md §4.2). Clients SHOULD show it in place of the icon when they can, and fall back to `icon`. |
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
+| `pronouns` | Present only when the user states some, on any server that shows them (*hxd-ng:* `[server] pronouns`), with no capability or declaration: the user's own claim, set with `pronouns` (§7.3) and never set or inferred by the server. Clients MUST show it exactly as sent, apart from the nick and in a style of its own, and isolated from the text around it for bidirectional layout (an HTML `<bdi>`, or FSI ... PDI); a client MAY decline to show it. On a person's row it is the person's (§7.6); device entries carry none. Absent for a user of a linked server. A change to it alone is a `user_changed` to this wire alone: a classic client sees pronouns only in Get User Info's text. |
 | `devices` | With `persons`, on a person's row alone, to a session that may see its devices: §7.6. `self` also carries `device`, this session's own device id. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
@@ -1885,7 +1901,7 @@ news body is different: it declares its own type (news.md §5).
   bucket (`[limits] ng_requests` in `ng_request_seconds`, a burst of 40
   and then 20 a second by default) that every request after the
   handshake spends its weight from. A write, or a request others hear
-  of, costs 2: `chat`, `msg`, `nick`, `signs`, `block`, `unblock`,
+  of, costs 2: `chat`, `msg`, `nick`, `pronouns`, `signs`, `block`, `unblock`,
   `msg_read`, `avatar_clear`, `voice_answer`, `voice_mute`, `video_state`,
   `news_seen` (not its timeline form, below), `news_subscribe`,
   `news_unsubscribe`, `news_mute`, `push_unregister`, `files_download`,
@@ -1964,7 +1980,8 @@ news body is different: it declares its own type (news.md §5).
   multi-line `text` counted, and so many spam points, which a request
   that stands for a classic transaction spends at the price mhxd
   charges that one: `chat` and `msg` its Chat and Message, `nick` its
-  User Change, and `signs` too, being told as one, `device_end` its
+  User Change, and `signs` too, being told as one, `pronouns` at the
+  same price as the system account's `/pronouns`, `device_end` its
   Disconnect User, the news writes
   their 1.5 transactions, `news_post` a threaded post, and the
   file-area changes their Delete File, New

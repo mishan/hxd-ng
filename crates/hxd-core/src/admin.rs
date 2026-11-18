@@ -644,13 +644,14 @@ fn role_may(
 }
 
 /// A roster row an account change altered, for [`announce`]: the row,
-/// and whether only its roles changed.
+/// and whether only what a classic row cannot show changed: its roles,
+/// its pronouns.
 type Row = (crate::UserInfo, bool);
 
 /// Tell everyone of `rows`, or, past `bulk` of them, tell a wire that can
 /// sync that its roster is stale rather than send it each one: one change
 /// may not push a session near its queue's cap.
-fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
+pub(crate) fn announce(r: &mut RosterInner, rows: Vec<Row>, bulk: usize) {
     // A person's sessions are one row, told once, as it stands once every
     // session's account is changed, and only to the roles wires if no
     // session of it changed more than its roles.
@@ -696,6 +697,7 @@ pub(crate) fn give_account(
 ) -> Option<Row> {
     let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
     let row = r.row_uid(uid);
+    let pronouns_off = r.pronouns_off;
     let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
     s.account = Some(Box::new(account.clone()));
@@ -747,7 +749,10 @@ pub(crate) fn give_account(
     let role_color = roles.map_or(s.info.role_color, |roles| role_color(roles, &account.roles));
     // A color a classic client draws, so not a change of roles alone.
     let mut shown = s.info.admin != admin || s.info.role_color != role_color;
-    let roles_changed = s.info.roles != account.roles;
+    let pronouns = crate::pronouns::shown(account, &s.mask).filter(|_| !pronouns_off);
+    // What only the ng wire shows on a row.
+    let ng_changed = s.info.roles != account.roles || s.info.pronouns != pronouns;
+    s.info.pronouns = pronouns;
     s.info.admin = admin;
     s.info.role_color = role_color;
     s.info.roles.clone_from(&account.roles);
@@ -756,9 +761,10 @@ pub(crate) fn give_account(
         s.info.nick = name;
     }
     shown |= renamed;
-    // A change to its roles alone, to the wires that can show one.
-    let only_roles = !shown && roles_changed;
-    let shown = ((shown || roles_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
+    // A change to its roles or pronouns alone, to the wires that can
+    // show one.
+    let only_roles = !shown && ng_changed;
+    let shown = ((shown || ng_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
     r.send_to(uid, Event::AccountChanged(Box::new(effective)));
     if devices_seen {
         r.send_to(uid, Event::RosterStale);

@@ -139,13 +139,34 @@ impl Core {
             .unwrap()
             .insert(login.clone(), now);
         // Only the value: what else the file says now reaches the
-        // account's sessions as an edit's would, on the next reload.
+        // account's sessions as an edit's would, on the next reload. And
+        // told as a change to the row alone, to the wire that shows it,
+        // so no session hears of an account change.
         let mut r = self.roster.lock().unwrap();
-        for s in r.users.values_mut().filter(|s| s.login == login) {
-            if let Some(a) = s.account.as_mut() {
-                a.pronouns.clone_from(&written.pronouns);
+        let mut rows = Vec::new();
+        let mine: Vec<Uid> = r
+            .users
+            .iter()
+            .filter(|(_, s)| s.login == login)
+            .map(|(u, _)| *u)
+            .collect();
+        for uid in mine {
+            let s = r.users.get_mut(&uid).expect("listed above");
+            let Some(a) = s.account.as_mut() else {
+                continue;
+            };
+            a.pronouns.clone_from(&written.pronouns);
+            let now = shown(a, &s.mask);
+            if s.info.pronouns == now {
+                continue;
+            }
+            s.info.pronouns = now;
+            if s.live() {
+                rows.push((r.row_view(&r.users[&uid]), true));
             }
         }
+        let bulk = self.bulk_rows.unwrap_or(crate::admin::BULK_ROWS);
+        crate::admin::announce(&mut r, rows, bulk);
         Ok(true)
     }
 }

@@ -6544,6 +6544,7 @@ mod tests {
             }),
             roles: Vec::new(),
             role_color: None,
+            pronouns: None,
         };
         let long = "\u{3042}".repeat(12);
         for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {

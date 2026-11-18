@@ -238,10 +238,11 @@ pub struct Transport {
     /// once where a classic client is sent an invite to answer
     /// (`docs/chat-rooms.md` §6.1). The ng frontend sets it.
     pub joins_rooms: bool,
-    /// This link shows the roles a user holds (`docs/roles.md` §7.1), so
-    /// a change to them alone is worth telling it, and can fetch the
-    /// roster again when told it is stale. A classic client's row has
-    /// nowhere to put them, and the frontend sets it only for ng.
+    /// This link shows the roles a user holds (`docs/roles.md` §7.1) and
+    /// their pronouns, so a change to either alone is worth telling it,
+    /// and can fetch the roster again when told it is stale. A classic
+    /// client's row has nowhere to put them, and the frontend sets it
+    /// only for ng.
     pub roles: bool,
     /// This link speaks the friend family (`docs/instant-messaging.md`
     /// §7): the ng wire's, or capability bit 6 on the classic one. A
@@ -371,6 +372,9 @@ pub struct UserInfo {
     /// nick color draws for a user who chose none (`docs/roles.md` §8).
     /// An ng client works it out from `roles` itself.
     pub role_color: Option<u32>,
+    /// The pronouns it shows (`crate::pronouns`), which only the ng wire
+    /// shows on a row.
+    pub pronouns: Option<String>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -2753,6 +2757,11 @@ impl Core {
             .as_ref()
             .map_or_else(Vec::new, |a| a.roles.clone());
         let lobby_heard_from = r.last_ids.get(&0).copied().unwrap_or(0);
+        let pronouns = info
+            .account
+            .as_deref()
+            .filter(|_| !r.pronouns_off)
+            .and_then(|a| crate::pronouns::shown(a, &Default::default()));
         r.users.insert(
             uid,
             UserSession {
@@ -2770,6 +2779,7 @@ impl Core {
                     remote: None,
                     roles,
                     role_color,
+                    pronouns,
                 },
                 access: info.access,
                 login: info.login,

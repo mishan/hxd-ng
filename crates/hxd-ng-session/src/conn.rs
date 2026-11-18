@@ -65,6 +65,7 @@ fn req_label(req: &str) -> &'static str {
         "msg_read",
         "nick",
         "ping",
+        "pronouns",
         "react",
         "reactions",
         "resume",
@@ -118,15 +119,15 @@ fn request_weight(req: &str) -> u32 {
     match req {
         "logout" => 0,
         "voice_ice" | "emoji_list" => 1,
-        "chat" | "msg" | "nick" | "signs" | "block" | "unblock" | "msg_read" | "avatar_clear"
-        | "voice_answer" | "voice_mute" | "video_state" | "news_seen" | "news_subscribe"
-        | "news_unsubscribe" | "news_mute" | "push_unregister" | "files_download"
-        | "files_upload" | "files_mkdir" | "files_delete" | "files_move" | "files_comment"
-        | "report_close" | "redact" | "revoke" | "kick" | "device_end" | "account_get"
-        | "account_create" | "account_update" | "account_delete" | "role_create"
-        | "role_update" | "role_delete" | "room_topic" | "room_join" | "room_part" | "friends"
-        | "friend_respond" | "friend_remove" | "friend_alias" | "presence" | "typing"
-        | "requests" | "request_answer" | "react" => 2,
+        "chat" | "msg" | "nick" | "pronouns" | "signs" | "block" | "unblock" | "msg_read"
+        | "avatar_clear" | "voice_answer" | "voice_mute" | "video_state" | "news_seen"
+        | "news_subscribe" | "news_unsubscribe" | "news_mute" | "push_unregister"
+        | "files_download" | "files_upload" | "files_mkdir" | "files_delete" | "files_move"
+        | "files_comment" | "report_close" | "redact" | "revoke" | "kick" | "device_end"
+        | "account_get" | "account_create" | "account_update" | "account_delete"
+        | "role_create" | "role_update" | "role_delete" | "room_topic" | "room_join"
+        | "room_part" | "friends" | "friend_respond" | "friend_remove" | "friend_alias"
+        | "presence" | "typing" | "requests" | "request_answer" | "react" => 2,
         "news_post" | "news_delete" | "news_node_create" | "news_node_rename"
         | "news_node_delete" | "news_search" | "news_timeline" | "voice_join" | "voice_leave"
         | "video_start" | "video_stop" | "video_subscribe" | "push_register" | "report"
@@ -1072,6 +1073,10 @@ async fn handle_login(
     if ctx.core.accounts_enabled() && !caps.iter().any(|c| c == "roles") {
         caps.push("roles".into());
     }
+    // And `pronouns`, wherever an account keeps some to show.
+    if ctx.core.pronouns_enabled() && !caps.iter().any(|c| c == "pronouns") {
+        caps.push("pronouns".into());
+    }
     // And `rooms`, unless `[rooms] enabled = false`.
     if ctx.core.rooms_enabled() && !caps.iter().any(|c| c == "rooms") {
         caps.push("rooms".into());
@@ -1824,7 +1829,8 @@ fn to_system(core: &hxd_core::Core, p: &MsgParams) -> bool {
 /// price and under its type: `chat` for its Chat and `msg` for its
 /// Message, 2 each; `room_topic` for Set Chat Subject, 2, and
 /// `room_join` and `room_part` for Join and Leave Chat, 2 and 1; `nick` for
-/// User Change, 20, and `signs` too, since it is told as one; and the
+/// User Change, 20, and `signs` too, since it is told as one, and
+/// `pronouns`, priced as the system account's `/pronouns` is; and the
 /// news writes for the 1.5 transactions they are, `news_post` a
 /// threaded post, 10 each as the table's default prices every one of
 /// them. (Its 20 for a post
@@ -1849,7 +1855,7 @@ fn spam_charge(req: &str) -> Option<(u32, u32)> {
         "room_topic" => Some((0x78, 2)),
         "room_join" => Some((0x73, 2)),
         "room_part" => Some((0x74, 1)),
-        "nick" | "signs" => Some((0x130, 20)),
+        "nick" | "signs" | "pronouns" => Some((0x130, 20)),
         // Ending a device is a kick of it, at the classic kick's price.
         "device_end" => Some((0x6e, 1)),
         "emoji_list" => Some((0x2c9, 0)),
@@ -2177,6 +2183,39 @@ async fn dispatch(
                 reply_ok(req.id, json!({}))
             }
             Err(_) => reply_err(req.id, "bad_request", "Malformed nick."),
+        },
+
+        // A string sets, `null` clears; a value is refused, never cut.
+        "pronouns" => match req.params.get("pronouns") {
+            Some(v @ (Value::String(_) | Value::Null)) => {
+                let (uid, value) = (state.uid, v.as_str().map(str::to_owned));
+                use hxd_core::pronouns::PronounsError as E;
+                match off_reactor(&ctx.core, move |c| c.set_pronouns(uid, value.as_deref())).await {
+                    Some(Ok(_)) => reply_ok(req.id, json!({})),
+                    Some(Err(E::Off)) => reply_err(
+                        req.id,
+                        "not_available",
+                        "This server does not show pronouns.",
+                    ),
+                    Some(Err(E::NotAllowed)) => reply_err(
+                        req.id,
+                        "access_denied",
+                        "Your account may not set pronouns.",
+                    ),
+                    Some(Err(E::BadValue)) => reply_err(
+                        req.id,
+                        "bad_request",
+                        "Pronouns are 1 to 32 characters, with no line breaks, invisible \
+                         characters, doubled spaces or space at either end.",
+                    ),
+                    Some(Err(E::RateLimited(wait))) => {
+                        instrument::rate_limited(WIRE, "pronouns");
+                        reply_err_retry(req.id, "rate_limited", "Slow down.", retry_secs(wait))
+                    }
+                    _ => reply_err(req.id, "server_error", "Server error."),
+                }
+            }
+            _ => reply_err(req.id, "bad_request", "Malformed pronouns."),
         },
 
         "msg" => match serde_json::from_value::<MsgParams>(req.params.clone()) {
