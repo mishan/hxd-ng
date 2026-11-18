@@ -217,6 +217,7 @@ is off (`HXD_VIDEO` without voice, say) is reported and ignored.
 |---|---|---|
 | `HXD_NAME` | `hxd-ng` | The server name clients show. |
 | `HXD_CLASSIC` | `on` | The classic wire: 5500, 5501, the TLS ports and the `/trtp` and `/htxf` tunnels. Off, the server serves ng clients only and never offers the classic login, whose password is a plaintext equivalent; it needs `HXD_NG`, and refuses `HXD_TLS_CERT`, `HXD_TLS_KEY`, `HXD_TLS_SELF_SIGNED` and `HXD_TRACKERS` ([operating.md](operating.md#ports-and-the-network)). |
+| `HXD_COALESCE` | `off` | One person's sessions as one user on both wires: an account's sessions logged in as its linked identity or with its password, or those of an account whose file says `personal` ([operating.md](operating.md#persons)). |
 | `HXD_AGREEMENT_FILE` | `/var/lib/hxd-ng/agreement.txt` when it exists | The agreement shown at login (UTF-8). |
 | `HXD_BANNER_FILE` | | A JPEG, GIF or PNG of at most 1 MiB, mounted into the container, shown to clients as the server banner. Publish 5501 for classic clients to fetch it; ng clients fetch it over 5700. `docker kill -s HUP hxd-ng` re-reads it. |
 | `HXD_BANNER_URL` | | With `HXD_BANNER_FILE`, where a click on the banner goes. Alone, where clients fetch the banner from. |

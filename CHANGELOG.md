@@ -101,7 +101,8 @@ as AGENTS.md's "Releasing" describes it.
   own, up to `[limits] connections_per_account` of its newest devices
   and never more than 11, which is also the limit where it is 0
   (docs/operating.md, Persons; docs/hotline-ng.md §7.6). A client
-  that does not declare it sees one user per person. `kick` with
+  that does not declare it sees one user per person. The Docker image
+  turns it on with `HXD_COALESCE`. `kick` with
   `device` from a client that did not declare `persons` is refused
   `bad_request` rather than kicking the whole person.
 - An ng session kicked, banned, refused by a revocation or ended by
