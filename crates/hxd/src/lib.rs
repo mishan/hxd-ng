@@ -2295,6 +2295,11 @@ pub struct ServerSection {
     /// `coalesce-default`, until it becomes the default.
     #[serde(default = "default_coalesce")]
     pub coalesce: bool,
+    /// Show the pronouns users set (`/pronouns`), and let them set some.
+    /// Off, none are shown or taken; a linked server's users still show
+    /// what their own server says of them.
+    #[serde(default = "default_true")]
+    pub pronouns: bool,
     /// Advertised server name.
     #[serde(default = "default_name")]
     pub name: String,
@@ -2772,6 +2777,7 @@ impl Default for ServerSection {
             bind: default_bind(),
             classic: true,
             coalesce: default_coalesce(),
+            pronouns: true,
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),
@@ -4828,7 +4834,8 @@ pub fn build_ctx(
 
     let core = core
         .with_bulk_rows(config.roles.bulk_rows)
-        .with_coalesce(config.server.coalesce);
+        .with_coalesce(config.server.coalesce)
+        .with_pronouns(config.server.pronouns);
     let core = match &config.ng {
         Some(ng) => core.with_detached_per_login(ng.max_detached_per_login),
         None => core,

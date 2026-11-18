@@ -29,6 +29,7 @@ pub mod messaging;
 pub mod moderation;
 pub mod news;
 pub mod notify;
+pub mod pronouns;
 pub mod push;
 pub mod reaction;
 pub mod relationships;

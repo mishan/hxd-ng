@@ -5430,7 +5430,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 tokio::spawn(async move {
                     let mut text = format!("  server: {}\r", info.home);
                     if let Ok(more) = peer_answer(info.answer).await {
-                        text.push_str(&more);
+                        // As a local user's: left out where they would
+                        // be shown as `?`.
+                        for line in more.split_inclusive('\r') {
+                            if !line
+                                .strip_prefix("pronouns: ")
+                                .is_some_and(|p| !enc.keeps(p.trim_end_matches('\r')))
+                            {
+                                text.push_str(line);
+                            }
+                        }
                     }
                     reply(
                         &tx,
@@ -5459,8 +5468,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // bit: the bootstrap guest holds it, and an address locates a
             // person while a login is half of a password guess.
             let full = target == ctx.core.row_uid(sess.uid) || sess.can(bit::DISCONNECT_USERS);
+            // Left out where this connection would show them as `?`: a
+            // misspelled pronoun misstates its user.
+            let pronouns = match d.pronouns {
+                Some(p) if sess.enc.keeps(&p) => format!("pronouns: {p}\r"),
+                _ => String::new(),
+            };
             let info = format!(
-                "    name: {}\r   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
+                "    name: {}\r{pronouns}   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
                 d.info.nick,
                 if full { d.login.as_str() } else { "-" },
                 d.addr

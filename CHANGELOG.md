@@ -9,6 +9,18 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Upgrading
 
+- Pronouns: a user sets their account's with `/pronouns <text>` to the
+  system account (`/pronouns clear` takes them down), and a classic
+  client's Get User Info shows them as a `pronouns:` line after `name:`,
+  here and on linked servers (docs/system-account.md §3). They are kept
+  in the account file under a new `[profile]` section, which a build
+  from before this release refuses to read: roll back only after taking
+  `[profile]` and `[extra] pronouns` out of the files that have them. New keys: `[server]
+  pronouns` (default `true`; `false` shows and takes none) and `[extra]
+  pronouns` (default: a password or a linked identity, as `set_avatar`;
+  no role may grant it). A value an account file holds that the server
+  would not have written is not shown, and said so at startup.
+
 - Key backup at the registrar (docs/identity-registrar.md §9):
   `[registrar] envelopes = true`, refused at startup until now, keeps
   each identity's key sealed under its holder's passphrase or recovery

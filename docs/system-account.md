@@ -111,6 +111,8 @@ has.
 | `/msg <login> <text…>` | Sends a private message to an account by login, whether or not it holds a session — the ng `msg { to_login }` request. The answer says `sent` or `queued`. To an account taking part in messaging, a plain guest's message is a request or refused, as anyone's is (`instant-messaging.md` §4.1), answered `queued` or `that account takes no messages from you`. This is the addressing mechanism `private-messages.md` §7 declined to invent as a pseudo-user; as a command to the account that already exists it costs nothing it was worried about | `send_msgs` |
 | `/block <who>`, `/unblock <who>`, `/blocks` | The three ng block requests | — |
 | `/stop [#article]` | Stops the news scope of the most recent notification this account sent the user, or the thread of the named article. A thread is **muted** rather than unfollowed, because a reply to your article or a citation of it reaches you with no subscription at all and only a mute silences it; a category is unfollowed. `news.md` §10.11 | — |
+| `/pronouns` | The pronouns this session's account shows: `ok: she/her`, or `ok: none` | - |
+| `/pronouns <text>`, `/pronouns clear` | Sets or clears them. The rest of the message is the value, a trailing line ending aside: 1 to 32 characters, held to a card name's rules (hotline-ng-identity.md §3.4) and never two spaces in a row, and refused rather than cut, since a cut pronoun set misstates its user. Free text, shown exactly as set: on the classic wire as a `pronouns:` line in Get User Info's text after `name:`, here and to a linked server's users, and left out for a connection whose encoding would show any of it as `?`. Nothing else is sent for a change. One change an account in 10 seconds, counting only those made; every set or clear asked for costs User Change's spam points. A server with `[server] pronouns = false` shows none and answers `error: this server does not show pronouns` | `[extra] pronouns`, and an account of the user's own: a shared login, `guest` among them, keeps none |
 | `/rooms [word]` | The rooms this session may join, one a line, its own first, or those whose name or topic holds the word: [chat-rooms.md](chat-rooms.md) §6.1 | — |
 | `/join <room>`, `/part <room>` | Invites this session into a room, which a period client joins with 115, or leaves one: chat-rooms.md §6.1–§6.2. A room it may not see is `error: no such room` | the room's gates |
 | `/roles`, `/role <login>`, `/role add <login> <role>`, `/role remove <login> <role>` | The roles and how many accounts hold each, an account's roles and overrides, and giving or taking a role, by login and never by nick: [roles.md](roles.md) §6.3 | `read_users`; giving and taking, `modify_users` under roles.md §5 |
@@ -124,7 +126,7 @@ check. A command an ng client could not make, this cannot make either.
 **Answers are one private message, one or two lines, plain words**:
 `ok: …` or `error: …` followed by what the equivalent ng error code
 means in English. Never a wall of text; `/help` and `/rooms` are the
-exceptions, `/help` under ten lines and `/rooms` one message cut to a
+exceptions, `/help` ten lines at most and `/rooms` one message cut to a
 private message's length. An ng client that sends commands here gets
 the same answers, and should not: it has requests, and the reply to a
 request is structured. The parser exists for wires that have nothing

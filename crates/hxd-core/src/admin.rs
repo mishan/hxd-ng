@@ -405,7 +405,7 @@ impl Core {
     }
 
     /// Hold account writes, and say one has begun.
-    fn begin_account_write(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn begin_account_write(&self) -> std::sync::MutexGuard<'_, ()> {
         let guard = self
             .account_writes
             .lock()

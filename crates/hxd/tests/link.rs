@@ -1131,6 +1131,66 @@ async fn private_messages_and_user_info_cross_the_link() {
 }
 
 #[tokio::test]
+async fn a_ghosts_user_info_carries_the_pronouns_its_home_shows() {
+    let (a, b, dirs) = linked("").await;
+    let cjk = "\u{5f7c}/\u{5979}";
+    let mut there = Vec::new();
+    for (login, pronouns) in [("bob", "he/him"), ("carol", cjk)] {
+        let path = dirs[1].path().join(format!("accounts/{login}.toml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{text}[profile]\npronouns = \"{pronouns}\"\n"),
+        )
+        .unwrap();
+        there.push(
+            legacy::Client::login_at(b.legacy, &Login::account(login, login, "pw"))
+                .await
+                .unwrap(),
+        );
+    }
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut utf8 = legacy::Client::login_at(
+        a.legacy,
+        &Login {
+            caps: Some(1 << 1),
+            ..Login::guest("utf8")
+        },
+    )
+    .await
+    .unwrap();
+    let (bob, carol) = (
+        row(&mut ann, "bob").await.uid,
+        row(&mut ann, "carol").await.uid,
+    );
+    async fn read(c: &mut legacy::Client, uid: u16) -> String {
+        let asked = [(tag::UID, uid.to_be_bytes().to_vec())];
+        let f = c
+            .call(ClientHdr::UserGetInfo.as_u32(), &asked)
+            .await
+            .unwrap();
+        String::from_utf8(f.bytes(tag::BODY).unwrap()).unwrap()
+    }
+
+    let text = read(&mut ann, bob).await;
+    assert!(text.contains("name: bob\rpronouns: he/him\r"), "{text:?}");
+    // Where the reader's encoding would show them as question marks,
+    // they are left out, as a local user's are.
+    let text = read(&mut ann, carol).await;
+    assert!(
+        text.contains("name: carol\r") && !text.contains("pronouns"),
+        "{text:?}"
+    );
+    let text = read(&mut utf8, carol).await;
+    assert!(
+        text.contains(&format!("name: carol\npronouns: {cjk}\n")),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_link_without_messages_refuses_them_and_names_the_server_for_info() {
     let (a, b, _dirs) = linked_offering("", r#"["chat"]"#).await;
     let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))

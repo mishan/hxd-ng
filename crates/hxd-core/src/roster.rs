@@ -382,6 +382,8 @@ pub struct UserDetails {
     pub connected_at: Instant,
     /// The roles its account lists.
     pub roles: Vec<String>,
+    /// The pronouns it shows (`crate::pronouns`).
+    pub pronouns: Option<String>,
 }
 
 /// A domain event, delivered on session channels. The session layer encodes
@@ -1521,6 +1523,8 @@ pub(crate) struct RosterInner {
     /// last told of them (`crate::messaging`).
     pub(crate) presences: crate::messaging::Presences,
     pub(crate) persons: crate::coalesce::Persons,
+    /// `[server] pronouns = false`: none shown, none taken.
+    pub(crate) pronouns_off: bool,
     /// Detached sessions ended before their grace ran out, and why.
     pub(crate) endings: crate::ending::Endings,
 }
@@ -2247,6 +2251,10 @@ pub struct Core {
     /// When each owner last changed its avatar (`AvatarPolicy`'s
     /// interval). Its own lock, taken with nothing else held.
     pub(crate) avatar_turns: Mutex<HashMap<crate::avatar::Turn, Instant>>,
+    /// When each login last changed its pronouns
+    /// ([`crate::pronouns::INTERVAL`]), by the core's clock. Taken under
+    /// `account_writes`, with nothing else held.
+    pub(crate) pronoun_turns: Mutex<HashMap<String, Instant>>,
     /// The server's emoji catalog, or `None` without `[emoji]`.
     pub(crate) emoji: Option<crate::emoji::EmojiState>,
 }
@@ -3313,6 +3321,7 @@ impl Core {
                 .account
                 .as_ref()
                 .map_or_else(Vec::new, |a| a.roles.clone()),
+            pronouns: r.pronouns_shown(s),
         })
     }
 
@@ -3328,6 +3337,7 @@ impl Core {
                 .account
                 .as_ref()
                 .map_or_else(Vec::new, |a| a.roles.clone()),
+            pronouns: r.pronouns_shown(s),
         })
     }
 
