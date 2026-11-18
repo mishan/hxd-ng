@@ -9,7 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1496,23 +1496,36 @@ async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_class
 }
 
 /// Carries every connection to `listener` on to `to`, but answers a
-/// request for the discovery document 503 while `down` is set.
-fn without_discovery(listener: tokio::net::TcpListener, to: SocketAddr, down: Arc<AtomicBool>) {
+/// request for the discovery document 503 while `down` is set, counting
+/// each in `refused`.
+fn without_discovery(
+    listener: tokio::net::TcpListener,
+    to: SocketAddr,
+    down: Arc<AtomicBool>,
+    refused: Arc<AtomicUsize>,
+) {
     tokio::spawn(async move {
         loop {
             let (mut a, _) = listener.accept().await.unwrap();
-            let down = down.clone();
+            let (down, refused) = (down.clone(), refused.clone());
             tokio::spawn(async move {
-                let mut head = vec![0; 4096];
-                let n = a.read(&mut head).await.unwrap_or(0);
-                if down.load(Ordering::SeqCst) && head[..n].starts_with(b"GET /.well-known/") {
+                // The request line whole, however the reads split it.
+                let (mut head, mut buf) = (Vec::new(), [0; 1024]);
+                while !head.windows(2).any(|w| w == b"\r\n") && head.len() < 4096 {
+                    match a.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if down.load(Ordering::SeqCst) && head.starts_with(b"GET /.well-known/") {
+                    refused.fetch_add(1, Ordering::SeqCst);
                     let _ = a
                         .write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
                     return;
                 }
                 let mut b = TcpStream::connect(to).await.unwrap();
-                b.write_all(&head[..n]).await.unwrap();
+                b.write_all(&head).await.unwrap();
                 let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
             });
         }
@@ -1525,8 +1538,11 @@ async fn a_held_list_is_fetched_for_a_retired_key_while_discovery_fails() {
     let r = open_registrar(dir.path()).await;
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", proxy.local_addr().unwrap());
-    let down = Arc::new(AtomicBool::new(false));
-    without_discovery(proxy, r.ng, down.clone());
+    let (down, refused) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    without_discovery(proxy, r.ng, down.clone(), refused.clone());
     let (v, _, identity) = linked_verifier(dir.path(), &r, Trust::Discovery, &url).await;
     let (alice, phone) = (
         IdentityKey::from_seed(&[1; 32]),
@@ -1548,6 +1564,10 @@ async fn a_held_list_is_fetched_for_a_retired_key_while_discovery_fails() {
     assert_eq!(
         (reply.status, reply.json()["error"].clone()),
         (403, json!("revoked"))
+    );
+    assert!(
+        refused.load(Ordering::SeqCst) > 0,
+        "discovery was asked for"
     );
 }
 
