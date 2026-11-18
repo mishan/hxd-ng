@@ -88,6 +88,22 @@ impl Refused {
             || self.rotated.contains(&tag.fingerprint)
     }
 
+    /// Is `key` still revoked, by either list?
+    pub(crate) fn still_revokes(&self, key: &crate::push::Unrevoked) -> bool {
+        use crate::push::Unrevoked;
+        match key {
+            Unrevoked::Device(Some(i), d) => self.is_revoked(i, d),
+            Unrevoked::Device(None, d) => {
+                self.local.devices.contains(d) || self.published.devices.iter().any(|(_, x)| x == d)
+            }
+            Unrevoked::Identity(i) => {
+                self.local.identities.contains(i)
+                    || self.published.identities.contains(i)
+                    || self.rotated.contains(i)
+            }
+        }
+    }
+
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
         self.local.is_revoked(identity, device)
             || self.published.is_revoked(identity, device)
@@ -144,12 +160,13 @@ impl Core {
             refused.local = list.clone();
             (ids, new)
         };
+        // Even an empty list: a key lifted is forgotten by a retry too.
+        self.devices_revoked(&identities, &devices);
         if list.is_empty() {
             return Vec::new();
         }
         let ended = self.end_revoked(|tag| list.refuses(tag));
         self.drop_revoked_presentations(&devices);
-        self.devices_revoked(&identities, &devices);
         ended
     }
 
@@ -187,12 +204,13 @@ impl Core {
             refused.published = list.clone();
             (ids, new)
         };
+        // Even an empty list: a key lifted is forgotten by a retry too.
+        self.devices_revoked(&identities, &devices);
         if list.is_empty() {
             return Vec::new();
         }
         let ended = self.end_revoked(|tag| list.refuses(tag));
         self.drop_revoked_presentations(&devices);
-        self.devices_revoked(&identities, &devices);
         ended
     }
 

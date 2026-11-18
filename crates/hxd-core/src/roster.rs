@@ -2160,13 +2160,10 @@ pub struct Core {
     /// section configured one. On `Core` because the three mailbox
     /// obligations are paid here, beside mail's and news's; the gateway
     /// holds its own handle to the same store and does the sending.
-    pub(crate) devices: Option<Arc<dyn crate::push::PushStore>>,
+    pub(crate) devices: Option<Arc<crate::push::revoking::Revoking>>,
     /// What a registration may do: how many devices a mailbox holds, and
     /// whether an endpoint on a private network is acceptable.
     pub(crate) push_policy: crate::push::PushPolicy,
-    /// Revoked keys whose rows a store error kept, taken again by the
-    /// next revocation installed and by the device sweep.
-    pub(crate) push_unrevoked: Mutex<Vec<crate::push::Unrevoked>>,
     /// The reserved server account, or `None` when `[system]` did not
     /// ask for one. See [`crate::system`].
     pub(crate) system: Option<crate::system::SystemState>,
@@ -2713,10 +2710,18 @@ impl Core {
     /// The domain keeps it for the obligations a mailbox owes — linking,
     /// deletion and rotation move or drop devices exactly as they move
     /// mail and subscriptions — and for the expiry sweep. Sending is the
-    /// gateway's, and a gateway is given the same `Arc`.
+    /// gateway's, and a gateway is given [`Self::push_store`].
     pub fn with_devices(mut self, devices: Arc<dyn crate::push::PushStore>) -> Self {
-        self.devices = Some(devices);
+        self.devices = Some(Arc::new(crate::push::revoking::Revoking::new(devices)));
         self
+    }
+
+    /// The registry as a gateway reads it: without the rows of a
+    /// revoked key that a store error kept.
+    pub fn push_store(&self) -> Option<Arc<dyn crate::push::PushStore>> {
+        self.devices
+            .clone()
+            .map(|d| d as Arc<dyn crate::push::PushStore>)
     }
 
     /// `[push]`'s limits on a registration (`docs/webpush-gateway.md` §2,

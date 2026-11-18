@@ -4953,10 +4953,11 @@ pub fn build_ctx(
     // with nothing to send from would take registrations and drop every
     // notification, which is worse than saying there is no push.
     let core = match (stores.devices, push) {
-        (Some(devices), Some(push)) => core
-            .with_devices(devices.clone())
-            .with_push_policy(push.policy())
-            .with_notifications(push.start(devices)?),
+        (Some(devices), Some(push)) => {
+            let core = core.with_devices(devices).with_push_policy(push.policy());
+            let devices = core.push_store().expect("given just now");
+            core.with_notifications(push.start(devices)?)
+        }
         (_, None) => core,
         (None, Some(_)) => return Err("[push] store was not opened".into()),
     };
