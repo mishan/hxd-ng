@@ -187,6 +187,24 @@ impl PushStore for MemoryDevices {
         }))
     }
 
+    fn devices_revoke_device(
+        &self,
+        identity: Option<&[u8; 32]>,
+        devid: &DeviceId,
+    ) -> Result<Vec<Device>, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            r.devid == *devid && identity.is_none_or(|i| r.owner.fingerprint.as_ref() == Some(i))
+        }))
+    }
+
+    fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            r.owner.fingerprint.as_ref() == Some(identity) && r.devid.is_device_fingerprint()
+        }))
+    }
+
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
         self.unregister_all(of)
     }

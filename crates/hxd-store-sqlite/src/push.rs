@@ -297,6 +297,45 @@ impl PushStore for SqliteStore {
         )
     }
 
+    fn devices_revoke_device(
+        &self,
+        identity: Option<&[u8; 32]>,
+        devid: &DeviceId,
+    ) -> Result<Vec<Device>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        // Two statements, so the scoped one is a lookup in `push_device_fp`.
+        match identity {
+            Some(fp) => collect(
+                &conn,
+                &format!(
+                    "DELETE FROM push_device WHERE owner_fp = ?2 AND devid = ?1 \
+                     RETURNING {COLUMNS}"
+                ),
+                params![devid.as_str(), fp_hex(fp)],
+            ),
+            None => collect(
+                &conn,
+                &format!("DELETE FROM push_device WHERE devid = ?1 RETURNING {COLUMNS}"),
+                params![devid.as_str()],
+            ),
+        }
+    }
+
+    fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
+        // `DeviceId::is_device_fingerprint` in SQL: the rows only an
+        // identity device's own certificate can have made.
+        let conn = self.conn.lock().unwrap();
+        collect(
+            &conn,
+            &format!(
+                "DELETE FROM push_device WHERE owner_fp = ?1 \
+                   AND length(devid) = 64 AND devid NOT GLOB '*[^0-9a-f]*' \
+                 RETURNING {COLUMNS}"
+            ),
+            params![fp_hex(identity)],
+        )
+    }
+
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
         self.unregister_all(of)
     }

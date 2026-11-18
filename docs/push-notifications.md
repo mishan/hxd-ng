@@ -578,8 +578,15 @@ above.
 **A device's registration lives as long as its certificate.** The index
 records the certificate's `expires`. Past it, the gateway skips the
 device on `/push` and unsubscribes it on the next pass; renewal
-(identity-enrollment.md) re-registers at the next login. A certificate the
-revocation list names is unsubscribed when the list is refreshed. Together
+(identity-enrollment.md) re-registers at the next login. A device key the
+server revokes, on the operator's list or in what a trusted registrar
+publishes, is unsubscribed when that list is applied, and every device of
+a revoked identity with it, or of one frozen under `[identity] frozen =
+deny`, which fails closed: its devices register again at their next login
+once the freeze lifts. A password device of the same account is not
+unsubscribed, since its password is not the key revoked, and if it
+registered the same subscription, that endpoint is still pushed through
+its row. Together
 these give the one thing a password account cannot have: **a lost phone
 stops buzzing when its key is revoked**, not when someone remembers to
 call `push_unregister` from another device.

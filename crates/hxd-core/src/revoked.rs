@@ -125,24 +125,31 @@ impl Core {
     /// one should not be able to come back through it.
     ///
     /// The presentations a newly revoked device made are dropped too
-    /// (`docs/proposals/portable-friends.md` §6): store work, so this is
-    /// called off the reactor.
+    /// (`docs/proposals/portable-friends.md` §6), and the push
+    /// registrations newly revoked keys made (push-notifications.md
+    /// §5.1): store work, so this is called off the reactor.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
-        let devices: Vec<_> = {
+        let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
                 .devices
                 .difference(&refused.local.devices)
                 .map(|d| (None, *d))
                 .collect();
+            let ids = list
+                .identities
+                .difference(&refused.local.identities)
+                .copied()
+                .collect();
             refused.local = list.clone();
-            new
+            (ids, new)
         };
         if list.is_empty() {
             return Vec::new();
         }
         let ended = self.end_revoked(|tag| list.refuses(tag));
         self.drop_revoked_presentations(&devices);
+        self.devices_revoked(&identities, &devices);
         ended
     }
 
@@ -165,21 +172,27 @@ impl Core {
     /// [`Self::set_revocations`] does for the operator's own list.
     /// Called off the reactor, as [`Self::set_revocations`] is.
     pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
-        let devices: Vec<_> = {
+        let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
                 .devices
                 .difference(&refused.published.devices)
                 .map(|(i, d)| (Some(*i), *d))
                 .collect();
+            let ids = list
+                .identities
+                .difference(&refused.published.identities)
+                .copied()
+                .collect();
             refused.published = list.clone();
-            new
+            (ids, new)
         };
         if list.is_empty() {
             return Vec::new();
         }
         let ended = self.end_revoked(|tag| list.refuses(tag));
         self.drop_revoked_presentations(&devices);
+        self.devices_revoked(&identities, &devices);
         ended
     }
 

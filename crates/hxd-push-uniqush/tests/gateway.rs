@@ -772,6 +772,42 @@ async fn a_row_deleted_is_unsubscribed_unless_another_holds_its_subscription() {
     .await;
 }
 
+/// A revocation the server applies takes the device's row through the
+/// core, and the sidecar is told its subscription went.
+#[tokio::test]
+async fn a_revoked_device_is_unsubscribed() {
+    let (uq, addr) = mock(|_| None).await;
+    let s = running(addr).await;
+    let core = hxd_core::Core::new()
+        .with_devices(s.devices.clone())
+        .with_notifications(Arc::new(s.gateway.clone()));
+    let (fp, phone) = ([7u8; 32], [10u8; 32]);
+    let alice = Mailbox::identified("alice", fp);
+    let phones = DeviceId::of_device(&phone);
+    register(
+        &s,
+        &device(&alice, phones.as_str(), "https://push.example/1"),
+    );
+    register(
+        &s,
+        &device(&alice, "alices-laptop", "https://push.example/2"),
+    );
+    eventually("subscribed", || {
+        dps(&s, &alice).len() == 2 && all_subscribed(&s, &alice)
+    })
+    .await;
+
+    core.set_published_revocations(hxd_core::Published {
+        devices: [(fp, phone)].into(),
+        ..Default::default()
+    });
+    eventually("unsubscribed", || !uq.seen("/unsubscribe").is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let unsubscribed = uq.seen("/unsubscribe");
+    assert_eq!(unsubscribed.len(), 1, "the laptop stays");
+    assert_eq!(unsubscribed[0].form["endpoint"], "https://push.example/1");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn over_a_unix_socket_no_token_is_needed() {

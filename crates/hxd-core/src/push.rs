@@ -36,7 +36,7 @@
 use std::time::SystemTime;
 
 use crate::inbox::{Mailbox, StoreError};
-use crate::roster::Uid;
+use crate::roster::{IdentityTag, Uid};
 
 /// How many devices a mailbox may hold when the configuration does not
 /// say (`[push] max_devices`).
@@ -254,6 +254,21 @@ pub trait PushStore: Send + Sync + 'static {
     /// push-notifications.md §5.1.
     fn devices_rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Vec<Device>, StoreError>;
 
+    /// A device key was revoked here: forget the rows it registered,
+    /// which are filed under its fingerprint (push-notifications.md
+    /// §5.1), answering with them. Only `identity`'s where one is named,
+    /// since a registrar's device revocation is that identity's to make.
+    fn devices_revoke_device(
+        &self,
+        identity: Option<&[u8; 32]>,
+        devid: &DeviceId,
+    ) -> Result<Vec<Device>, StoreError>;
+
+    /// An identity key was revoked here: forget every row its devices
+    /// registered, answering with them. A password device's row stays,
+    /// because a password is not the key that was revoked.
+    fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError>;
+
     /// An account went: take its devices with it, so a later holder of
     /// the freed login inherits nobody's phone.
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError>;
@@ -311,6 +326,9 @@ pub enum PushError {
     /// The subscription is not one: an endpoint that is not an `https`
     /// URL we may fetch, or keys of the wrong size.
     BadSubscription(&'static str),
+    /// The key the session's socket proved is revoked here, and the
+    /// session is being ended.
+    Revoked,
     /// A new device past the mailbox's cap (`docs/webpush-gateway.md`
     /// §2). A device it already has may always re-register.
     TooManyDevices,
@@ -380,17 +398,18 @@ impl crate::roster::Core {
     /// transport and the domain has never seen a certificate.
     pub fn push_register(&self, uid: Uid, r: Registration) -> Result<bool, PushError> {
         let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
-        let owner = self.push_mailbox(uid)?;
+        let (owner, key) = self.push_mailbox(uid)?;
         // The shape check a client can be told about. The address it
         // resolves to is the gateway's to check, before every send.
         let policy = self.push_policy;
+        let devid = r.devid;
         endpoint::registrable(&r.endpoint, policy.allow_private_endpoints)
             .map_err(|_| PushError::BadSubscription("That is not a push endpoint."))?;
         let registered = store
             .register(
                 &Device {
-                    owner,
-                    devid: r.devid,
+                    owner: owner.clone(),
+                    devid: devid.clone(),
                     endpoint: r.endpoint,
                     p256dh: r.p256dh,
                     auth: r.auth,
@@ -405,8 +424,20 @@ impl crate::roster::Core {
                 tracing::warn!("push: registering a device: {e}");
                 PushError::StoreFailed
             })?;
-        let (registered, taken) = registered;
-        self.devices_changed(registered != Registered::Full, &taken);
+        let (registered, mut taken) = registered;
+        // Asked once the row is stored, so a revocation either finds the
+        // row to take or is found here.
+        let revoked = key.is_some_and(|k| self.revoked.read().unwrap().refuses(&k));
+        if revoked && registered != Registered::Full {
+            match store.unregister(&owner, &devid) {
+                Ok(row) => taken.extend(row),
+                Err(e) => tracing::warn!("push: forgetting a revoked device: {e}"),
+            }
+        }
+        self.devices_changed(!revoked && registered != Registered::Full, &taken);
+        if revoked {
+            return Err(PushError::Revoked);
+        }
         match registered {
             Registered::Added => Ok(false),
             Registered::Replaced => Ok(true),
@@ -422,7 +453,7 @@ impl crate::roster::Core {
     /// take.
     pub fn push_unregister(&self, uid: Uid, devid: Option<DeviceId>) -> Result<(), PushError> {
         let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
-        let owner = self.push_mailbox(uid)?;
+        let (owner, _) = self.push_mailbox(uid)?;
         let taken = match devid {
             Some(devid) => store
                 .unregister(&owner, &devid)
@@ -448,14 +479,14 @@ impl crate::roster::Core {
     }
 
     /// The mailbox a registration belongs to: a session's own, and only
-    /// where it has one.
-    fn push_mailbox(&self, uid: Uid) -> Result<Mailbox, PushError> {
+    /// where it has one. With the key its socket proved, if it did.
+    fn push_mailbox(&self, uid: Uid) -> Result<(Mailbox, Option<IdentityTag>), PushError> {
         let r = self.roster.lock().unwrap();
         let sess = r.users.get(&uid).ok_or(PushError::NoSession)?;
         if !sess.has_inbox {
             return Err(PushError::NoMailbox);
         }
-        Ok(sess.mailbox())
+        Ok((sess.mailbox(), sess.info.transport.identity.clone()))
     }
 
     pub(crate) fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) {
@@ -472,6 +503,29 @@ impl crate::roster::Core {
             match store.devices_purge(of) {
                 Ok(taken) => self.devices_changed(false, &taken),
                 Err(e) => tracing::warn!("push: purging {}'s devices: {e}", of.login),
+            }
+        }
+    }
+
+    /// Forget the rows the keys now revoked here registered: each
+    /// device's, by device and, for a registrar's, its identity, and
+    /// each identity's devices'.
+    pub(crate) fn devices_revoked(
+        &self,
+        identities: &[[u8; 32]],
+        devices: &[(Option<[u8; 32]>, [u8; 32])],
+    ) {
+        let Some(store) = self.devices.as_ref() else {
+            return;
+        };
+        let by_device = devices
+            .iter()
+            .map(|(i, d)| store.devices_revoke_device(i.as_ref(), &DeviceId::of_device(d)));
+        let by_identity = identities.iter().map(|i| store.devices_revoke_identity(i));
+        for taken in by_device.chain(by_identity) {
+            match taken {
+                Ok(taken) => self.devices_changed(false, &taken),
+                Err(e) => tracing::warn!("push: forgetting a revoked key's devices: {e}"),
             }
         }
     }
@@ -615,6 +669,122 @@ mod tests {
         assert_eq!(last(), None, "nothing taken, nothing said");
     }
 
+    /// An account `bob` with a mailbox, its socket having proved
+    /// `identity` if given.
+    fn attach(core: &Core, identity: Option<IdentityTag>) -> (Uid, crate::Events) {
+        core.attach(crate::roster::AttachInfo {
+            account: None,
+            nick: "bob".into(),
+            icon: 1,
+            admin: false,
+            access: crate::access::AccessBits::empty(),
+            login: "bob".into(),
+            addr: None,
+            can_detach: true,
+            transport: crate::roster::Transport {
+                identity,
+                ..Default::default()
+            },
+            has_inbox: true,
+            attach_news: false,
+            set_avatar: false,
+            moderate: false,
+            can_spam: false,
+            manage_rooms: false,
+            set_subject: false,
+            is_person: true,
+            reads_on_delivery: false,
+            identity: None,
+            system: false,
+        })
+        .unwrap()
+    }
+
+    /// A key revoked here takes the rows its devices registered, and the
+    /// gateway hears each row go (push-notifications.md §5.1).
+    #[test]
+    fn a_revoked_key_takes_its_devices_and_the_gateway_hears() {
+        #[derive(Default)]
+        struct Heard(std::sync::Mutex<Vec<String>>);
+        impl crate::notify::NotificationGateway for Heard {
+            fn notify(&self, _: &crate::notify::Notification<'_>) {}
+            fn devices_changed(&self, _: bool, taken: &[Device]) {
+                let mut heard = self.0.lock().unwrap();
+                heard.extend(taken.iter().map(|d| d.devid.as_str().to_string()));
+            }
+        }
+        let devices = Arc::new(MemoryDevices::new());
+        let heard = Arc::new(Heard::default());
+        let core = Core::new()
+            .with_devices(devices.clone())
+            .with_notifications(heard.clone());
+        let (fp, phone, laptop) = ([7u8; 32], [10u8; 32], [11u8; 32]);
+        let alice = Mailbox::identified("alice", fp);
+        for id in [
+            DeviceId::of_device(&phone),
+            DeviceId::of_device(&laptop),
+            DeviceId::parse("alices-password").unwrap(),
+        ] {
+            devices
+                .register(&device(alice.clone(), id.as_str()), 8)
+                .unwrap();
+        }
+        let left = || devices.devices(&alice, SystemTime::now()).unwrap().len();
+
+        core.set_published_revocations(crate::Published {
+            devices: [(fp, phone)].into(),
+            ..Default::default()
+        });
+        assert_eq!(left(), 2, "the phone went");
+        assert_eq!(
+            *heard.0.lock().unwrap(),
+            [DeviceId::of_device(&phone).as_str()]
+        );
+
+        core.set_revocations(crate::Revocations {
+            identities: [fp].into(),
+            ..Default::default()
+        });
+        assert_eq!(left(), 1, "and the laptop, but not the password device");
+        assert_eq!(heard.0.lock().unwrap().len(), 2);
+    }
+
+    /// A revoked device whose session is not yet gone registers nothing.
+    #[test]
+    fn a_revoked_device_cannot_register() {
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let tag = IdentityTag {
+            fingerprint: [7; 32],
+            device: [10; 32],
+            handle: None,
+            quiet_until: None,
+            signs: false,
+            can_sign: false,
+            device_expires: u64::MAX,
+            sealed: None,
+            device_cert: None,
+        };
+        let (uid, _events) = attach(&core, Some(tag));
+        // The list is in, and the session's kick not yet acted on.
+        core.revoked.write().unwrap().local.devices.insert([10; 32]);
+        let registered = core.push_register(
+            uid,
+            Registration {
+                devid: DeviceId::of_device(&[10; 32]),
+                endpoint: "https://push.example/1".into(),
+                p256dh: [4; 65],
+                auth: [9; 16],
+                expires: None,
+            },
+        );
+        assert_eq!(registered, Err(PushError::Revoked));
+        assert!(devices
+            .devices(&Mailbox::login("bob"), SystemTime::now())
+            .unwrap()
+            .is_empty());
+    }
+
     /// A registration and an unregistration reach the gateway too: the
     /// subscription a re-registration replaced, and the row taken.
     #[test]
@@ -632,30 +802,7 @@ mod tests {
         let core = Core::new()
             .with_devices(Arc::new(MemoryDevices::new()))
             .with_notifications(heard.clone());
-        let (uid, _events) = core
-            .attach(crate::roster::AttachInfo {
-                account: None,
-                nick: "bob".into(),
-                icon: 1,
-                admin: false,
-                access: crate::access::AccessBits::empty(),
-                login: "bob".into(),
-                addr: None,
-                can_detach: true,
-                transport: crate::roster::Transport::default(),
-                has_inbox: true,
-                attach_news: false,
-                set_avatar: false,
-                moderate: false,
-                can_spam: false,
-                manage_rooms: false,
-                set_subject: false,
-                is_person: true,
-                reads_on_delivery: false,
-                identity: None,
-                system: false,
-            })
-            .unwrap();
+        let (uid, _events) = attach(&core, None);
         let registration = |endpoint: &str| Registration {
             devid: DeviceId::parse("phone-install").unwrap(),
             endpoint: endpoint.into(),
