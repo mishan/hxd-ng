@@ -172,6 +172,12 @@ async fn start_server_full(
     .await
 }
 
+/// A device registry, and the gateway sending to it if there is one.
+type Push = (
+    Arc<hxd_core::push::MemoryDevices>,
+    Option<Arc<dyn hxd_core::notify::NotificationGateway>>,
+);
+
 #[allow(clippy::too_many_arguments)]
 async fn start_server_inner(
     dir: &Path,
@@ -182,10 +188,7 @@ async fn start_server_inner(
     forwarded_header: hxd_ng_session::ForwardedHeader,
     enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
     web_client: Option<&str>,
-    push: Option<(
-        Arc<hxd_core::push::MemoryDevices>,
-        Arc<dyn hxd_core::notify::NotificationGateway>,
-    )>,
+    push: Option<Push>,
     banner: Option<Arc<hxd_session::Banner>>,
     login_limits: Option<hxd_core::LoginLimits>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
@@ -217,7 +220,8 @@ async fn start_server_inner(
         Core::new()
     };
     let core = match &push {
-        Some((devices, gateway)) => core
+        Some((devices, None)) => core.with_devices(devices.clone()),
+        Some((devices, Some(gateway))) => core
             .with_devices(devices.clone())
             .with_notifications(gateway.clone()),
         None => core,
@@ -5035,11 +5039,33 @@ async fn a_web_client_the_server_names_off_its_own_origin_gets_no_qr_code() {
 
 // --- Push devices on an identity session (docs/webpush-gateway.md §7) ----
 
+/// A server with a mailbox and a device registry, and the registry.
+async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::MemoryDevices>) {
+    let devices = Arc::new(hxd_core::push::MemoryDevices::new());
+    let (_legacy, ng, _ctx) = start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        true,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        Some((devices.clone(), None)),
+        None,
+        None,
+    )
+    .await;
+    (ng, devices)
+}
+
 /// A push service that takes every push, and remembers the endpoints
 /// it was asked to deliver to.
+#[cfg(feature = "push")]
 #[derive(Default)]
 struct PushService(std::sync::Mutex<Vec<String>>);
 
+#[cfg(feature = "push")]
 impl hxd_push_webpush::Transport for PushService {
     fn post(
         &self,
@@ -5051,15 +5077,16 @@ impl hxd_push_webpush::Transport for PushService {
     }
 }
 
+#[cfg(feature = "push")]
 struct Pushing {
     ng: SocketAddr,
     ctx: NgCtx,
-    devices: Arc<hxd_core::push::MemoryDevices>,
     sent: Arc<PushService>,
 }
 
 /// A server with a mailbox, a device registry and the in-process
 /// gateway, sending to a [`PushService`].
+#[cfg(feature = "push")]
 async fn start_server_pushing(dir: &Path) -> Pushing {
     let devices = Arc::new(hxd_core::push::MemoryDevices::new());
     let sent = Arc::new(PushService::default());
@@ -5084,23 +5111,12 @@ async fn start_server_pushing(dir: &Path) -> Pushing {
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         None,
-        Some((devices.clone(), Arc::new(gateway))),
+        Some((devices.clone(), Some(Arc::new(gateway)))),
         None,
         None,
     )
     .await;
-    Pushing {
-        ng,
-        ctx,
-        devices,
-        sent,
-    }
-}
-
-/// A server with a mailbox and a device registry, and the registry.
-async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::MemoryDevices>) {
-    let s = start_server_pushing(dir).await;
-    (s.ng, s.devices)
+    Pushing { ng, ctx, sent }
 }
 
 /// A subscription, as a browser hands it to a client: the RFC 8291
@@ -5299,6 +5315,7 @@ async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
 /// A device its identity revoked at a registrar stops buzzing once the
 /// server applies the revocation (push-notifications.md §5.1), and the
 /// identity's other device does not.
+#[cfg(feature = "push")]
 #[tokio::test]
 async fn a_revoked_device_is_sent_no_more_notifications() {
     let dir = tempfile::tempdir().unwrap();

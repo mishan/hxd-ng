@@ -312,6 +312,15 @@ pub trait PushStore: Send + Sync + 'static {
     fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError>;
 }
 
+/// A revoked key whose rows are still to be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unrevoked {
+    /// A device, and the identity whose mailboxes its rows are in, where
+    /// the revocation names one.
+    Device(Option<[u8; 32]>, [u8; 32]),
+    Identity([u8; 32]),
+}
+
 /// Why a device was not registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushError {
@@ -427,11 +436,19 @@ impl crate::roster::Core {
         let (registered, mut taken) = registered;
         // Asked once the row is stored, so a revocation either finds the
         // row to take or is found here.
-        let revoked = key.is_some_and(|k| self.revoked.read().unwrap().refuses(&k));
-        if revoked && registered != Registered::Full {
+        let revoked = key
+            .as_ref()
+            .is_some_and(|k| self.revoked.read().unwrap().refuses(k));
+        if let Some(k) = key.filter(|_| revoked && registered != Registered::Full) {
             match store.unregister(&owner, &devid) {
                 Ok(row) => taken.extend(row),
-                Err(e) => tracing::warn!("push: forgetting a revoked device: {e}"),
+                Err(e) => {
+                    tracing::warn!("push: forgetting a revoked device: {e}");
+                    self.push_unrevoked
+                        .lock()
+                        .unwrap()
+                        .push(Unrevoked::Device(owner.fingerprint, k.device));
+                }
             }
         }
         self.devices_changed(!revoked && registered != Registered::Full, &taken);
@@ -515,17 +532,34 @@ impl crate::roster::Core {
         identities: &[[u8; 32]],
         devices: &[(Option<[u8; 32]>, [u8; 32])],
     ) {
+        let keys = devices
+            .iter()
+            .map(|(i, d)| Unrevoked::Device(*i, *d))
+            .chain(identities.iter().map(|i| Unrevoked::Identity(*i)));
+        self.take_revoked(keys.collect());
+    }
+
+    /// Take the rows of `keys` and of every key a store error left, and
+    /// keep for next time the keys it fails for again: a revoked key's
+    /// row must not outlive one failed delete.
+    fn take_revoked(&self, mut keys: Vec<Unrevoked>) {
         let Some(store) = self.devices.as_ref() else {
             return;
         };
-        let by_device = devices
-            .iter()
-            .map(|(i, d)| store.devices_revoke_device(i.as_ref(), &DeviceId::of_device(d)));
-        let by_identity = identities.iter().map(|i| store.devices_revoke_identity(i));
-        for taken in by_device.chain(by_identity) {
+        keys.append(&mut self.push_unrevoked.lock().unwrap());
+        for key in keys {
+            let taken = match key {
+                Unrevoked::Device(i, d) => {
+                    store.devices_revoke_device(i.as_ref(), &DeviceId::of_device(&d))
+                }
+                Unrevoked::Identity(i) => store.devices_revoke_identity(&i),
+            };
             match taken {
                 Ok(taken) => self.devices_changed(false, &taken),
-                Err(e) => tracing::warn!("push: forgetting a revoked key's devices: {e}"),
+                Err(e) => {
+                    tracing::warn!("push: forgetting a revoked key's devices: {e}");
+                    self.push_unrevoked.lock().unwrap().push(key);
+                }
             }
         }
     }
@@ -533,11 +567,13 @@ impl crate::roster::Core {
     /// Delete the rows whose device certificates have expired. The
     /// binary runs this next to the inbox's retention pass; skipping it
     /// costs rows, never a wrong push, because [`PushStore::devices`]
-    /// compares expiry itself.
+    /// compares expiry itself. And take again what a store error left of
+    /// a revoked key's.
     pub fn sweep_devices(&self) -> usize {
         let Some(store) = self.devices.as_ref() else {
             return 0;
         };
+        self.take_revoked(Vec::new());
         match store.sweep_expired(SystemTime::now()) {
             Ok(taken) => {
                 self.devices_changed(false, &taken);
@@ -749,14 +785,11 @@ mod tests {
         assert_eq!(heard.0.lock().unwrap().len(), 2);
     }
 
-    /// A revoked device whose session is not yet gone registers nothing.
-    #[test]
-    fn a_revoked_device_cannot_register() {
-        let devices = Arc::new(MemoryDevices::new());
-        let core = Core::new().with_devices(devices.clone());
-        let tag = IdentityTag {
+    /// What a socket that proved `device` of identity `[7; 32]` carries.
+    fn tag(device: [u8; 32]) -> IdentityTag {
+        IdentityTag {
             fingerprint: [7; 32],
-            device: [10; 32],
+            device,
             handle: None,
             quiet_until: None,
             signs: false,
@@ -764,25 +797,68 @@ mod tests {
             device_expires: u64::MAX,
             sealed: None,
             device_cert: None,
-        };
-        let (uid, _events) = attach(&core, Some(tag));
+        }
+    }
+
+    fn registration(device: [u8; 32]) -> Registration {
+        Registration {
+            devid: DeviceId::of_device(&device),
+            endpoint: "https://push.example/1".into(),
+            p256dh: [4; 65],
+            auth: [9; 16],
+            expires: None,
+        }
+    }
+
+    /// A revoked device whose session is not yet gone registers nothing.
+    #[test]
+    fn a_revoked_device_cannot_register() {
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let (uid, _events) = attach(&core, Some(tag([10; 32])));
         // The list is in, and the session's kick not yet acted on.
         core.revoked.write().unwrap().local.devices.insert([10; 32]);
-        let registered = core.push_register(
-            uid,
-            Registration {
-                devid: DeviceId::of_device(&[10; 32]),
-                endpoint: "https://push.example/1".into(),
-                p256dh: [4; 65],
-                auth: [9; 16],
-                expires: None,
-            },
-        );
+        let registered = core.push_register(uid, registration([10; 32]));
         assert_eq!(registered, Err(PushError::Revoked));
         assert!(devices
             .devices(&Mailbox::login("bob"), SystemTime::now())
             .unwrap()
             .is_empty());
+    }
+
+    /// A delete that fails does not leave a revoked key's row for good:
+    /// the sweep takes it, whether the revocation's own delete failed or
+    /// a racing registration's taking itself back did.
+    #[test]
+    fn a_revoked_keys_row_outlives_no_store_error() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let rows = |m: &Mailbox| devices.devices(m, SystemTime::now()).unwrap().len();
+
+        let alice = Mailbox::identified("alice", [7; 32]);
+        let phone = DeviceId::of_device(&[10; 32]);
+        devices
+            .register(&device(alice.clone(), phone.as_str()), 8)
+            .unwrap();
+        devices.failing_deletes.store(1, SeqCst);
+        core.set_published_revocations(crate::Published {
+            devices: [([7; 32], [10; 32])].into(),
+            ..Default::default()
+        });
+        assert_eq!(rows(&alice), 1, "the revocation's delete failed");
+        core.sweep_devices();
+        assert_eq!(rows(&alice), 0, "and the sweep took the row");
+
+        let bob = Mailbox::login("bob");
+        let (uid, _events) = attach(&core, Some(tag([11; 32])));
+        core.revoked.write().unwrap().local.devices.insert([11; 32]);
+        devices.failing_deletes.store(1, SeqCst);
+        let registered = core.push_register(uid, registration([11; 32]));
+        assert_eq!(registered, Err(PushError::Revoked));
+        assert_eq!(rows(&bob), 1, "taking itself back failed");
+        core.sweep_devices();
+        assert_eq!(rows(&bob), 0, "and the sweep took the row");
     }
 
     /// A registration and an unregistration reach the gateway too: the

@@ -2164,6 +2164,9 @@ pub struct Core {
     /// What a registration may do: how many devices a mailbox holds, and
     /// whether an endpoint on a private network is acceptable.
     pub(crate) push_policy: crate::push::PushPolicy,
+    /// Revoked keys whose rows a store error kept, taken again by the
+    /// next revocation installed and by the device sweep.
+    pub(crate) push_unrevoked: Mutex<Vec<crate::push::Unrevoked>>,
     /// The reserved server account, or `None` when `[system]` did not
     /// ask for one. See [`crate::system`].
     pub(crate) system: Option<crate::system::SystemState>,
