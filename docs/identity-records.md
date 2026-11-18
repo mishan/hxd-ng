@@ -105,10 +105,11 @@ it reaches is linked by fingerprint, not by card. A list held is
 applied whether or not it is current, and one past its lifetime is
 stale for `revocation_stale`: `guest` and `deny` apply to any card of
 an identity with a list held, whichever registrars the card names. An
-identity with no list held here, as one an operator linked by hand, has
-no registrar to ask and is never stale. What refuses a stolen key at a
-server that never held its list is its holder revoking it, and the
-operator's own `revoked_identities`.
+identity with no list held here and no trusted registrar's attestation
+on its card, as one an operator linked by hand, has no registrar to ask
+and is never stale. What refuses a stolen key at a server that never
+held its list is its holder revoking it, and the operator's own
+`revoked_identities`.
 
 ## 4. Rotation at the server
 

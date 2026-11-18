@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1276,13 +1277,22 @@ async fn records_are_kept_for_when_the_registrar_cannot_be_reached() {
     );
 }
 
-/// A registrar, and a server trusting it on both wires whose accounts
-/// `alice` and `bob` are linked to those identities, seeds 1 and 2:
-/// the registrar, the ng port and the classic port.
-async fn linked_verifier(dir: &Path) -> (Server, SocketAddr, SocketAddr) {
+/// A registrar with open signup, in `dir`.
+async fn open_registrar(dir: &Path) -> Server {
     let at = dir.join("registrar");
     std::fs::create_dir_all(&at).unwrap();
-    let r = start(&at, "signup = \"open\"").await;
+    start(&at, "signup = \"open\"").await
+}
+
+/// A server trusting `r` and reaching it at `url`, on both wires, whose
+/// accounts `alice` and `bob` are linked to those identities, seeds 1
+/// and 2: the ng port, the classic port and the identity state.
+async fn linked_verifier(
+    dir: &Path,
+    r: &Server,
+    trust: Trust,
+    url: &str,
+) -> (SocketAddr, SocketAddr, Arc<hxd_ng_session::IdentityState>) {
     let accounts = dir.join("verifier/accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     for (login, seed) in [("alice", 1), ("bob", 2)] {
@@ -1295,16 +1305,36 @@ async fn linked_verifier(dir: &Path) -> (Server, SocketAddr, SocketAddr) {
     }
     let classic = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let plain = classic.local_addr().unwrap();
-    let (ng, _) = verifier_serving(
+    let (ng, identity) = verifier_serving(
         &dir.join("verifier"),
-        &r,
-        Trust::Key,
-        &format!("http://{}", r.ng),
+        r,
+        trust,
+        url,
         &format!("classic_hosts = [\"{plain}\"]"),
         Some(classic),
     )
     .await;
-    (r, ng, plain)
+    (ng, plain, identity)
+}
+
+/// Alice's phone, seed 101, admitted on her attested card at a fresh
+/// linked verifier, so that her list is held there, and then revoked at
+/// her registrar: the registrar, the ng port, the classic port and the
+/// card.
+async fn phone_revoked(dir: &Path) -> (Server, SocketAddr, SocketAddr, Vec<u8>) {
+    let r = open_registrar(dir).await;
+    let (v, plain, _) = linked_verifier(dir, &r, Trust::Key, &format!("http://{}", r.ng)).await;
+    let (alice, phone) = (
+        IdentityKey::from_seed(&[1; 32]),
+        DeviceKey::from_seed(&[101; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    assert_eq!(
+        auth_at(v, &alice, &phone, &card).await.json()["outcome"],
+        "linked"
+    );
+    revoke_device(&r, &alice, &phone).await;
+    (r, v, plain, card)
 }
 
 /// `device` of `id` revoked at `r`, and the verifier's list due again.
@@ -1395,8 +1425,6 @@ async fn prove_at(
 
 #[tokio::test]
 async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_ng() {
-    let dir = tempfile::tempdir().unwrap();
-    let (r, v, _) = linked_verifier(dir.path()).await;
     let (alice, bob) = (
         IdentityKey::from_seed(&[1; 32]),
         IdentityKey::from_seed(&[2; 32]),
@@ -1406,23 +1434,22 @@ async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_ng() 
         DeviceKey::from_seed(&[102; 32]),
     );
     let linked = |reply: Reply| (reply.status, reply.json()["outcome"].clone());
-    let card = attested(&r, &alice, "alice").await;
-    assert_eq!(
-        linked(auth_at(v, &alice, &phone, &card).await),
-        (200, json!("linked"))
-    );
 
     // Her phone revoked at her registrar, a card naming none, or naming
-    // a key it no longer publishes, is no way around it; her laptop is
-    // still let in, with either card.
-    revoke_device(&r, &alice, &phone).await;
-    for old in [retired(&alice), bare(&alice)] {
+    // a key it no longer publishes, is no way around it.
+    for old in [bare(&alice), retired(&alice)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_r, v, _, _) = phone_revoked(dir.path()).await;
         let reply = auth_at(v, &alice, &phone, &old).await;
         assert_eq!(
             (reply.status, reply.json()["error"].clone()),
             (403, json!("revoked"))
         );
     }
+
+    // Her laptop is still let in, with either card.
+    let dir = tempfile::tempdir().unwrap();
+    let (_r, v, _, card) = phone_revoked(dir.path()).await;
     for card in [bare(&alice), card] {
         assert_eq!(
             linked(auth_at(v, &alice, &laptop, &card).await),
@@ -1439,8 +1466,6 @@ async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_ng() 
 
 #[tokio::test]
 async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_classic() {
-    let dir = tempfile::tempdir().unwrap();
-    let (r, _, plain) = linked_verifier(dir.path()).await;
     let (alice, bob) = (
         IdentityKey::from_seed(&[1; 32]),
         IdentityKey::from_seed(&[2; 32]),
@@ -1449,27 +1474,81 @@ async fn a_linked_identitys_bare_card_is_held_to_its_registrars_records_on_class
         DeviceKey::from_seed(&[101; 32]),
         DeviceKey::from_seed(&[102; 32]),
     );
-    let card = attested(&r, &alice, "alice").await;
-    prove_at(plain, "alice", &alice, &phone, &card)
-        .await
-        .unwrap();
-
-    revoke_device(&r, &alice, &phone).await;
-    for old in [retired(&alice), bare(&alice)] {
+    for old in [bare(&alice), retired(&alice)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_r, _, plain, _) = phone_revoked(dir.path()).await;
         assert_eq!(
             prove_at(plain, "alice", &alice, &phone, &old).await,
             Err("The device could not be proved.".into())
         );
     }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_r, _, plain, card) = phone_revoked(dir.path()).await;
     for card in [bare(&alice), card] {
         prove_at(plain, "alice", &alice, &laptop, &card)
             .await
             .unwrap();
     }
-
     prove_at(plain, "bob", &bob, &phone, &bare(&bob))
         .await
         .unwrap();
+}
+
+/// Carries every connection to `listener` on to `to`, but answers a
+/// request for the discovery document 503 while `down` is set.
+fn without_discovery(listener: tokio::net::TcpListener, to: SocketAddr, down: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        loop {
+            let (mut a, _) = listener.accept().await.unwrap();
+            let down = down.clone();
+            tokio::spawn(async move {
+                let mut head = vec![0; 4096];
+                let n = a.read(&mut head).await.unwrap_or(0);
+                if down.load(Ordering::SeqCst) && head[..n].starts_with(b"GET /.well-known/") {
+                    let _ = a
+                        .write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+                let mut b = TcpStream::connect(to).await.unwrap();
+                b.write_all(&head[..n]).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            });
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_held_list_is_fetched_for_a_retired_key_while_discovery_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", proxy.local_addr().unwrap());
+    let down = Arc::new(AtomicBool::new(false));
+    without_discovery(proxy, r.ng, down.clone());
+    let (v, _, identity) = linked_verifier(dir.path(), &r, Trust::Discovery, &url).await;
+    let (alice, phone) = (
+        IdentityKey::from_seed(&[1; 32]),
+        DeviceKey::from_seed(&[101; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    assert_eq!(
+        auth_at(v, &alice, &phone, &card).await.json()["outcome"],
+        "linked"
+    );
+
+    // Her registrar's discovery document fails while its records still
+    // serve, and what the verifier read of it is past the minute after
+    // which a key it does not know sends it to ask again.
+    down.store(true, Ordering::SeqCst);
+    identity.clock().advance(Duration::from_secs(61));
+    revoke_device(&r, &alice, &phone).await;
+    let reply = auth_at(v, &alice, &phone, &retired(&alice)).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
 }
 
 /// An ng session at `at` for `id`'s device, logged in with the token its

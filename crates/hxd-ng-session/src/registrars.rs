@@ -349,7 +349,10 @@ impl Registrars {
         if !published(self) {
             // An operator's key is not one discovery can change.
             if !self.cfg.keys.contains_key(host) {
-                self.discover(host, true).await?;
+                let found = self.discover(host, true).await;
+                if held.is_none() {
+                    found?;
+                }
             }
             if !published(self) && held.is_none() {
                 return Err("attested under a key the registrar does not publish".into());
