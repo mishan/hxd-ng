@@ -19,7 +19,9 @@ as AGENTS.md's "Releasing" describes it.
   in the account file under a new `[profile]` section, which a build
   from before this release refuses to read: roll back only after taking
   `[profile]` and `[extra] pronouns` out of the files that have them. New keys: `[server]
-  pronouns` (default `true`; `false` shows and takes none) and `[extra]
+  pronouns` (default `true`; `false` shows none, a linked server's
+  users' included, and takes none, while a user may still clear what is
+  kept) and `[extra]
   pronouns` (default: a password or a linked identity, as `set_avatar`;
   no role may grant it). A value an account file holds that the server
   would not have written is not shown, and said so at startup.

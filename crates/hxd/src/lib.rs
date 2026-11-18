@@ -2296,8 +2296,8 @@ pub struct ServerSection {
     #[serde(default = "default_coalesce")]
     pub coalesce: bool,
     /// Show the pronouns users set (`/pronouns`), and let them set some.
-    /// Off, none are shown or taken; a linked server's users still show
-    /// what their own server says of them.
+    /// Off, none are shown, a linked server's users' included, and none
+    /// taken, though a user may still clear what is kept.
     #[serde(default = "default_true")]
     pub pronouns: bool,
     /// Advertised server name.

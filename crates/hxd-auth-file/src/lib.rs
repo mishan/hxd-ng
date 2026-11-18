@@ -1022,7 +1022,13 @@ impl AccountAdmin for FileAuth {
         self.edit_account(login, |doc| {
             match pronouns {
                 Some(p) => {
-                    doc["profile"].or_insert(toml_edit::table())["pronouns"] = toml_edit::value(p)
+                    let item = &mut doc["profile"].or_insert(toml_edit::table())["pronouns"];
+                    // A comment on the value it replaces stays.
+                    let decor = item.as_value().map(|v| v.decor().clone());
+                    *item = toml_edit::value(p);
+                    if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
+                        *v.decor_mut() = decor;
+                    }
                 }
                 None => {
                     if let Some(table) = doc.get_mut("profile").and_then(|t| t.as_table_like_mut())
@@ -1921,6 +1927,15 @@ mod tests {
             auth.lookup("alice").unwrap().pronouns.as_deref(),
             Some("she/her")
         );
+        // A comment on the value outlives a new one.
+        write(
+            td.path(),
+            "alice.toml",
+            &text.replace("\"she/her\"", "\"she/her\" # hers"),
+        );
+        auth.write_pronouns("alice", Some("they/them")).unwrap();
+        let text = read();
+        assert!(text.contains("pronouns = \"they/them\" # hers"), "{text}");
 
         let a = auth.write_pronouns("alice", None).unwrap();
         assert_eq!(a.pronouns, None);

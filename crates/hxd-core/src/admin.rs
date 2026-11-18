@@ -257,7 +257,9 @@ impl Core {
         let mut r = self.roster.lock().unwrap();
         for s in r.users.values_mut() {
             if let Some(account) = &s.account {
-                s.info.role_color = role_color(&roles, &account.roles);
+                let color = role_color(&roles, &account.roles);
+                s.recolored |= s.info.role_color != color;
+                s.info.role_color = color;
             }
         }
     }
@@ -700,6 +702,15 @@ pub(crate) fn give_account(
     let pronouns_off = r.pronouns_off;
     let s = r.users.get_mut(&uid)?;
     let effective = account.masked(&s.mask);
+    // A change to its pronouns alone is the row's, told as one, and no
+    // change to what the session may do.
+    let only_pronouns = s.account.as_deref().is_some_and(|was| {
+        was != account && {
+            let mut was = was.clone();
+            was.pronouns.clone_from(&account.pronouns);
+            was == *account
+        }
+    });
     s.account = Some(Box::new(account.clone()));
     let admin = effective.access.has(bit::DISCONNECT_USERS);
     let name = (!effective.access.has(bit::USE_ANY_NAME)).then(|| {
@@ -748,6 +759,7 @@ pub(crate) fn give_account(
     s.is_person = effective.is_person();
     let role_color = roles.map_or(s.info.role_color, |roles| role_color(roles, &account.roles));
     // A color a classic client draws, so not a change of roles alone.
+    let recolored = std::mem::take(&mut s.recolored) || s.info.role_color != role_color;
     let mut shown = s.info.admin != admin || s.info.role_color != role_color;
     let pronouns = crate::pronouns::shown(account, &s.mask).filter(|_| !pronouns_off);
     // What only the ng wire shows on a row.
@@ -765,7 +777,10 @@ pub(crate) fn give_account(
     // show one.
     let only_roles = !shown && ng_changed;
     let shown = ((shown || ng_changed) && s.live()).then(|| r.row_view(&r.users[&uid]));
-    r.send_to(uid, Event::AccountChanged(Box::new(effective)));
+    // Self-info carries the role color too.
+    if !only_pronouns || recolored {
+        r.send_to(uid, Event::AccountChanged(Box::new(effective)));
+    }
     if devices_seen {
         r.send_to(uid, Event::RosterStale);
     }

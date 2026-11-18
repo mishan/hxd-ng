@@ -360,6 +360,8 @@ impl Core {
         );
         if self.pronouns_enabled() {
             help.push_str("\n/pronouns [<text> | clear] - the pronouns your account shows");
+        } else if self.accounts_enabled() {
+            help.push_str("\n/pronouns clear - remove the pronouns your account keeps");
         }
         if self.rooms_enabled() {
             help.push_str(
@@ -381,6 +383,11 @@ impl Core {
         let rest = rest.strip_suffix('\n').unwrap_or(rest);
         let rest = rest.strip_suffix('\r').unwrap_or(rest);
         let value = match rest.trim_start_matches(' ') {
+            "" if !self.pronouns_enabled() => {
+                return "ok: this server shows no pronouns; /pronouns clear removes any your \
+                        account keeps"
+                    .into()
+            }
             "" => {
                 return match self.pronouns_of(from) {
                     Some(p) => format!("ok: {p}"),

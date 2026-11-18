@@ -1329,6 +1329,10 @@ pub(crate) struct UserSession {
     /// What this session is denied whatever its account says
     /// ([`Core::set_session_mask`]).
     pub(crate) mask: crate::DenyMask,
+    /// Its role color changed since its account was last told it: what
+    /// self-info carries, so an account change that alters nothing else
+    /// it shows is told all the same.
+    pub(crate) recolored: bool,
     /// Its part in instant messaging, from its announce, where it takes
     /// part (`crate::messaging`).
     pub(crate) messaging: Option<crate::messaging::SessionState>,
@@ -2832,6 +2836,7 @@ impl Core {
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
                 mask: Default::default(),
+                recolored: false,
                 messaging: None,
                 guest: Default::default(),
                 device,

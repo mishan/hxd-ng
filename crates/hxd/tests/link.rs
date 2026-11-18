@@ -176,14 +176,24 @@ async fn pair_with(
     a_extra: &str,
     b_extra: &str,
 ) -> (Server, Server, [tempfile::TempDir; 2]) {
-    pair_full(a_holds, b_holds, "", a_link, a_offers, a_extra, b_extra).await
+    pair_full(
+        a_holds,
+        b_holds,
+        ["", ""],
+        a_link,
+        a_offers,
+        a_extra,
+        b_extra,
+    )
+    .await
 }
 
-/// [`pair_with`], with `server` as more keys of both `[server]` sections.
+/// [`pair_with`], with `server` as more keys of `a`'s `[server]` section
+/// and `b`'s.
 async fn pair_full(
     a_holds: u8,
     b_holds: u8,
-    server: &str,
+    server: [&str; 2],
     a_link: &str,
     a_offers: &str,
     a_extra: &str,
@@ -196,7 +206,7 @@ async fn pair_full(
         da.path(),
         1,
         "aa",
-        server,
+        server[0],
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
@@ -210,7 +220,7 @@ async fn pair_full(
         db.path(),
         2,
         "bb",
-        server,
+        server[1],
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
@@ -1132,7 +1142,16 @@ async fn private_messages_and_user_info_cross_the_link() {
 
 #[tokio::test]
 async fn a_ghosts_user_info_carries_the_pronouns_its_home_shows() {
-    let (a, b, dirs) = linked("").await;
+    // And a server that shows none shows a ghost's none either.
+    for here in ["", "pronouns = false"] {
+        ghost_pronouns(here).await;
+    }
+}
+
+async fn ghost_pronouns(here: &str) {
+    let (a, b, dirs) = pair_full(2, 1, [here, ""], "", EVERY_FEATURE, "", "").await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let cjk = "\u{5f7c}/\u{5979}";
     let mut there = Vec::new();
     for (login, pronouns) in [("bob", "he/him"), ("carol", cjk)] {
@@ -1175,6 +1194,13 @@ async fn a_ghosts_user_info_carries_the_pronouns_its_home_shows() {
     }
 
     let text = read(&mut ann, bob).await;
+    if !here.is_empty() {
+        assert!(
+            text.contains("name: bob\r") && !text.contains("pronouns"),
+            "{text:?}"
+        );
+        return;
+    }
     assert!(text.contains("name: bob\rpronouns: he/him\r"), "{text:?}");
     // Where the reader's encoding would show them as question marks,
     // they are left out, as a local user's are.
@@ -2106,7 +2132,7 @@ async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature() {
 }
 
 async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature_on(server: &str) {
-    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, "", "").await;
+    let (a, b, _dirs) = pair_full(2, 1, [server; 2], "", EVERY_FEATURE, "", "").await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob) = (person(1), person(2));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2183,7 +2209,7 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
 }
 
 async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device_on(server: &str) {
-    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    let (a, b, _dirs) = pair_full(2, 1, [server; 2], "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob, carol) = (person(1), person(2), person(3));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2437,7 +2463,16 @@ fn alice_on(n: u8) -> Person {
 /// Two servers linked, each showing a person's devices as one user, with
 /// `drafts` in each one's entry for the other.
 async fn coalescing(drafts: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
-    let servers = pair_full(2, 1, "coalesce = true", "", EVERY_FEATURE, drafts, drafts).await;
+    let servers = pair_full(
+        2,
+        1,
+        ["coalesce = true"; 2],
+        "",
+        EVERY_FEATURE,
+        drafts,
+        drafts,
+    )
+    .await;
     assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
     servers

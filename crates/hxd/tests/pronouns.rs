@@ -47,7 +47,7 @@ async fn start(dir: &Path, server: &str, limits: &str) -> Server {
         &path,
         format!(
             "[server]\n{server}\n[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"127.0.0.1:0\"\n\
-             [system]\n[limits]\n{limits}\n"
+             [roles]\nfile = \"{d}/roles.toml\"\n[system]\n[limits]\n{limits}\n"
         ),
     )
     .unwrap();
@@ -177,7 +177,18 @@ async fn get_user_info_is_as_it_was_where_no_pronouns_are_shown() {
                 said(&mut alice, s.system(), "/pronouns she/her").await,
                 "error: this server does not show pronouns"
             );
-            assert_eq!(said(&mut shown, s.system(), "/pronouns").await, "ok: none");
+            assert_eq!(
+                said(&mut shown, s.system(), "/pronouns").await,
+                "ok: this server shows no pronouns; /pronouns clear removes any your account keeps"
+            );
+            let help = said(&mut shown, s.system(), "/help").await;
+            assert!(help.contains("/pronouns clear - remove"), "{help}");
+            // What is kept may still be taken down.
+            assert_eq!(
+                said(&mut shown, s.system(), "/pronouns clear").await,
+                "ok: cleared"
+            );
+            assert!(!s.file("admin").contains("profile"));
         }
     }
 }
@@ -290,13 +301,27 @@ async fn a_value_is_refused_whole_and_only_a_change_made_waits_its_turn() {
         .await
         .unwrap();
     let mut bob = login(&s, "bob", None).await;
-    for c in [&mut guest, &mut bob] {
+    // The guest's is shared even behind a password.
+    let path = s.accounts.join("guest.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("password = \"pw\"\n{text}")).unwrap();
+    let mut shared = login(&s, "guest", None).await;
+    for c in [&mut guest, &mut bob, &mut shared] {
         assert_eq!(
             said(c, s.system(), "/pronouns she/her").await,
             "error: your account may not set pronouns"
         );
     }
     assert!(!s.file("bob").contains("profile"));
+
+    // What the server would not have written, and so does not show, is
+    // still the user's to take down.
+    let mut carol = login(&s, "carol", None).await;
+    assert_eq!(
+        said(&mut carol, s.system(), "/pronouns clear").await,
+        "ok: cleared"
+    );
+    assert!(!s.file("carol").contains("profile"));
 }
 
 #[tokio::test]
@@ -473,6 +498,7 @@ async fn pronouns_set_on_either_wire_show_on_the_other() {
     assert!(changed.data["user"].get("pronouns").is_none());
 
     // An operator's edit, applied by a reload, is told the same way.
+    unread(&mut dave).await;
     let path = s.accounts.join("dave.toml");
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, text.replace("he/him", "xe/xem")).unwrap();
@@ -484,6 +510,9 @@ async fn pronouns_set_on_either_wire_show_on_the_other() {
         .await
         .unwrap();
     assert_eq!(changed.data["user"]["nick"], "dave");
+    // A row's change alone: dave's own session is told no account
+    // change.
+    assert!(!unread(&mut dave).await.contains(&push::SELFINFO));
     let synced = watcher.sync().await.unwrap();
     assert_eq!(told(&mut watcher, dave_uid), 0);
     let users = synced["users"].as_array().unwrap();
@@ -549,4 +578,26 @@ async fn the_pronouns_request_is_refused_as_the_command_is() {
         .request("pronouns", json!({ "pronouns": "she/her" }))
         .await;
     assert_eq!(refused(r), "not_available");
+}
+
+#[tokio::test]
+async fn a_reload_that_recolors_a_role_with_the_pronouns_still_tells_self_info() {
+    let td = tempfile::tempdir().unwrap();
+    let s = started(td.path()).await;
+    let roles = td.path().join("roles.toml");
+    std::fs::write(&roles, "[role.crew]\ncolor = 0x112233\n").unwrap();
+    let path = s.accounts.join("dave.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("roles = [\"crew\"]\n{text}")).unwrap();
+    s.core.reload_accounts();
+    let mut dave = login(&s, "dave", None).await;
+    unread(&mut dave).await;
+
+    // The role's color is a classic client's to redraw, whatever else
+    // the reload changed.
+    std::fs::write(&roles, "[role.crew]\ncolor = 0x445566\n").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}[profile]\npronouns = \"xe/xem\"\n")).unwrap();
+    s.core.reload_accounts();
+    assert!(unread(&mut dave).await.contains(&push::SELFINFO));
 }

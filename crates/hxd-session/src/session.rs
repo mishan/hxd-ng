@@ -5427,15 +5427,16 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             // what that server tells, or the line alone if it does not.
             if let Some(info) = ctx.core.peer_user_info(target) {
                 let (tx, trans, enc) = (tx.clone(), f.trans, sess.enc);
+                let pronouns = ctx.core.pronouns_enabled();
                 tokio::spawn(async move {
                     let mut text = format!("  server: {}\r", info.home);
                     if let Ok(more) = peer_answer(info.answer).await {
                         // As a local user's: left out where they would
-                        // be shown as `?`.
+                        // be shown as `?`, and on a server showing none.
                         for line in more.split_inclusive('\r') {
                             if !line
                                 .strip_prefix("pronouns: ")
-                                .is_some_and(|p| !enc.keeps(p.trim_end_matches('\r')))
+                                .is_some_and(|p| !pronouns || !enc.keeps(p.trim_end_matches('\r')))
                             {
                                 text.push_str(line);
                             }

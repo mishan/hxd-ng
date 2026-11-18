@@ -88,36 +88,47 @@ impl Core {
     /// Store I/O, so off the reactor.
     pub fn set_pronouns(&self, uid: Uid, value: Option<&str>) -> Result<bool, PronounsError> {
         let admin = self.admin.as_deref().ok_or(PronounsError::Off)?;
-        let (login, account, mask) = {
+        let (login, account, mask, serial) = {
             let r = self.roster.lock().unwrap();
-            if r.pronouns_off {
+            // What is kept may be taken down whether or not it is shown.
+            if r.pronouns_off && value.is_some() {
                 return Err(PronounsError::Off);
             }
             let s = r.users.get(&uid).ok_or(PronounsError::NotAllowed)?;
             let account = s.account.as_deref().filter(|_| !s.system);
             let account = account.ok_or(PronounsError::NotAllowed)?;
-            (s.login.clone(), account.clone(), s.mask)
+            (s.login.clone(), account.clone(), s.mask, s.serial)
         };
-        // A shared login keeps nothing of anyone's. Clearing is never
-        // refused to the account's own user: what is hidden may still
-        // be taken down.
+        // A shared login keeps nothing of anyone's, whatever its file
+        // says. Clearing is never refused to the account's own user: what
+        // is hidden may still be taken down.
         let (_, x) = account.config.derive(account.is_person(), &mask);
-        if !account.is_person() || (value.is_some() && !x.pronouns) {
+        if !account.is_person() || login == "guest" || (value.is_some() && !x.pronouns) {
             return Err(PronounsError::NotAllowed);
         }
         if value.is_some_and(|v| !valid(v)) {
             return Err(PronounsError::BadValue);
         }
         let _writing = self.begin_account_write();
-        // As it is now: another session of the account may have changed
-        // it while this one waited.
+        // As it is now, from the session that asked: another of the
+        // account may have changed it while this one waited.
         let now_set = {
             let r = self.roster.lock().unwrap();
-            r.users
-                .get(&uid)
-                .and_then(|s| s.account.as_ref()?.pronouns.clone())
+            let s = r.users.get(&uid).filter(|s| s.serial == serial);
+            s.ok_or(PronounsError::NotAllowed)?
+                .account
+                .as_ref()
+                .and_then(|a| a.pronouns.clone())
         };
         if now_set.as_deref() == value {
+            // A value kept but not shown, which the server would not have
+            // written, is still taken down; nothing shown changes.
+            if value.is_none() {
+                admin.write_pronouns(&login, None).map_err(|e| {
+                    tracing::warn!(login, "pronouns: {e}");
+                    PronounsError::Failed
+                })?;
+            }
             return Ok(false);
         }
         let now = self.clock.now();
@@ -143,6 +154,7 @@ impl Core {
         // told as a change to the row alone, to the wire that shows it,
         // so no session hears of an account change.
         let mut r = self.roster.lock().unwrap();
+        let off = r.pronouns_off;
         let mut rows = Vec::new();
         let mine: Vec<Uid> = r
             .users
@@ -156,7 +168,7 @@ impl Core {
                 continue;
             };
             a.pronouns.clone_from(&written.pronouns);
-            let now = shown(a, &s.mask);
+            let now = shown(a, &s.mask).filter(|_| !off);
             if s.info.pronouns == now {
                 continue;
             }

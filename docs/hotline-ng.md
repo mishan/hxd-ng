@@ -795,7 +795,9 @@ family document. Each family of §4 adds its own.
   anything else is `bad_request`, never cut: a cut pronoun set
   misstates its user. A session with no account of its own to keep
   them, a guest's, is `access_denied`, and so is a set where the
-  account may not show them. *hxd-ng:* kept in the account file's
+  account may not show them. A set on a server that shows none is
+  `not_available`; a clear is answered there too, so a user can always
+  take down what is kept. *hxd-ng:* kept in the account file's
   `[profile]` (account-admin.md §2), `[extra] pronouns`; one change an
   account in 10 seconds, on either wire, counting only those made,
   past which it is `rate_limited` with `retry_after`; the same as the
