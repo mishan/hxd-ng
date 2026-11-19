@@ -1276,6 +1276,47 @@ async fn hlid_rotate_signs_the_successors_commitment_and_the_successor_is_held_t
     assert!(out.contains("rotate published"), "{out}");
 }
 
+/// `-o` may be a pipe (`-o /dev/stdout | base64`), which the check for a
+/// key already there must not open for reading.
+#[cfg(unix)]
+#[test]
+fn hlid_card_writes_to_a_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let hlid = || {
+        let mut c = std::process::Command::new(&bin);
+        c.env("HLID_HOME", &home);
+        c
+    };
+    let init = hlid().args(["init", "--name", "Alice"]).status();
+    assert!(init.unwrap().success());
+    let fifo = dir.path().join("out");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+    let drain = std::thread::spawn({
+        let fifo = fifo.clone();
+        move || std::fs::read(fifo).unwrap()
+    });
+    let mut child = hlid()
+        .args(["card", "--name", "Alice", "-o"])
+        .arg(&fifo)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let Some(status) = child.try_wait().unwrap() else {
+        child.kill().unwrap();
+        // A writer lets the reader's open return, so the test ends.
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        panic!("hlid card -o <pipe> did not finish");
+    };
+    assert!(status.success());
+    Card::parse(&drain.join().unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn hlid_rotate_to_a_successor_holding_a_commitment_names_that_one() {
     let dir = tempfile::tempdir().unwrap();
