@@ -959,8 +959,23 @@ the predecessor's fingerprint move to the successor; the predecessor's fingerpri
 file as anchors (`[identity] successors`) as *rotated to X*; the
 predecessor's cached cards and certificates are dropped; both
 fingerprints are logged. A later `auth` by the predecessor is refused
-`rotated`. The successor's card `successor`, if present, is anchored as
-the next commitment.
+`rotated`. The rotation's `next`, if present, is anchored as the
+successor's commitment, in the same write as the rotation. From then
+on the successor's card must carry `successor` equal to `next`: one
+that carries another, or omits it, is refused `bad_card`.
+
+The successor's card is never its anchor. Its key's holder may not be
+its owner, and may sign in first: a card it shows, committing to a key
+of its own, would make that key the one a later rotation is taken to,
+which the registrars, holding `next`, would all refuse. A
+successor whose rotation carried no `next` has no anchor: a further
+rotation of it shown at `auth` is ignored, and one is accepted only
+from a trusted registrar's records. A rotation to a key already
+anchored to anything but its `next`, by a card shown while the key
+stood alone, is ignored, as that anchor cannot be taken back. hxd-ng
+writes a rotation's `next` in `[identity] successors` as a line of its
+own, and drops, with a warning at load, any other anchor a successor
+has there, such as one an older build took from its card.
 
 ### 7.5 Standing and probation
 

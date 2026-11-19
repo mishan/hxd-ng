@@ -22,7 +22,7 @@
 //! address, and the core's count of failed logins, which a password
 //! checked here shares with both wires' logins.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::StreamExt;
 use std::sync::{Arc, Mutex};
@@ -1710,6 +1710,7 @@ impl IdentityState {
                     self.accept_rotation(
                         from,
                         to,
+                        r.next,
                         "a registrar's records",
                         record.map(|(_, _, b)| b.as_slice()),
                     );
@@ -1836,7 +1837,10 @@ impl IdentityState {
         crate::spawn_blocking("identity", move || {
             let (mut refused, rotations) = registrars.refused(&live, frozen_refuses);
             for (from, to, record) in rotations {
-                this.accept_rotation(from, to, "a registrar's records", Some(&record));
+                let next = hl_identity::Rotation::parse(&record)
+                    .ok()
+                    .and_then(|r| r.next);
+                this.accept_rotation(from, to, next, "a registrar's records", Some(&record));
                 if this.anchors.is_none() {
                     refused.unrevoked.insert(from.0);
                 }
@@ -1990,10 +1994,17 @@ impl IdentityState {
     /// The successor this server has anchored for an identity, if any.
     /// Rotation (registrar spec) consults it: with a commitment on file,
     /// only a rotation to that key is accepted here. The on-disk anchor
-    /// outranks the cache, which a restart empties.
+    /// outranks the cache, which a restart empties. A rotation's
+    /// successor has only the commitment its rotation's `next` gave it:
+    /// whoever holds that key alone could have shown the card.
     pub fn committed_successor(&self, fp: &Fingerprint) -> Option<[u8; 32]> {
-        if let Some(s) = self.anchors.as_ref().and_then(|a| a.get(fp)) {
-            return Some(s);
+        if let Some(a) = &self.anchors {
+            if let Some(s) = a.get(fp) {
+                return Some(s);
+            }
+            if a.is_successor(fp) {
+                return None;
+            }
         }
         self.tables
             .lock()
@@ -2023,7 +2034,13 @@ impl IdentityState {
         // `committed_successor`: a card a thief showed after the cache
         // forgot the owner's would otherwise be the consent.
         if self.anchors.as_ref().and_then(|a| a.get(&from)) == Some(successor.0) {
-            self.accept_rotation(from, *successor, "the successor's auth", Some(bytes));
+            self.accept_rotation(
+                from,
+                *successor,
+                r.next,
+                "the successor's auth",
+                Some(bytes),
+            );
         } else {
             debug!(predecessor = %from.short(), "rotation shown for a key not anchored to it; ignored");
         }
@@ -2036,6 +2053,8 @@ impl IdentityState {
     /// server anchored for it is ignored: the commitment exists to beat a
     /// thief who signs a rotation with a stolen key, whoever publishes it.
     ///
+    /// `next`, signed by both keys, becomes `to`'s commitment (§7.4).
+    ///
     /// The rotation's `record`, where the caller has it, is kept with the
     /// core once the rotation stands here, for the friends of the identity
     /// to fetch and check it by (`docs/proposals/portable-friends.md` §10).
@@ -2043,6 +2062,7 @@ impl IdentityState {
         &self,
         from: Fingerprint,
         to: Fingerprint,
+        next: Option<[u8; 32]>,
         source: &str,
         record: Option<&[u8]>,
     ) {
@@ -2064,7 +2084,7 @@ impl IdentityState {
             tracing::warn!(predecessor = %from.short(), successor = %to.short(), source, "rotation to a key other than the one anchored; ignored");
             return;
         }
-        if !anchors.rotate(&from, &to) {
+        if !anchors.rotate(&from, &to, next) {
             return;
         }
         keep(record);
@@ -2244,6 +2264,8 @@ const ANCHORS_HEADER: &str = "\
 # Deleting a line un-anchors that identity; that is the attack.
 # A rotation accepted: <predecessor fingerprint> => <successor fingerprint>,
 # then again, ending in the word moved, once everything it moves has moved.
+# A successor's commitment is its rotation's: <fingerprint> = next <successor>,
+# beside the line above; any other line for a successor is not its anchor.
 ";
 
 impl Anchors {
@@ -2254,6 +2276,7 @@ impl Anchors {
     fn load(path: std::path::PathBuf) -> Anchors {
         use std::collections::hash_map::Entry;
         let mut map: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
+        let mut nexts: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
         let mut rotated: HashMap<Fingerprint, (Fingerprint, bool)> = HashMap::new();
         let mut writable = true;
         let mut compact = false;
@@ -2300,9 +2323,25 @@ impl Anchors {
                     }
                     let parsed = line.split_once('=').and_then(|(fp, s)| {
                         let fp = Fingerprint::parse(fp.trim())?;
+                        let (s, next) = match s.trim().strip_prefix("next ") {
+                            Some(s) => (s, true),
+                            None => (s, false),
+                        };
                         let s: [u8; 32] = unb64(s.trim())?.try_into().ok()?;
-                        Some((fp, s))
+                        Some((fp, s, next))
                     });
+                    let parsed = match parsed {
+                        Some((fp, s, true)) => {
+                            match nexts.entry(fp) {
+                                Entry::Occupied(_) => compact = true,
+                                Entry::Vacant(v) => {
+                                    v.insert(s);
+                                }
+                            }
+                            continue;
+                        }
+                        p => p.map(|(fp, s, _)| (fp, s)),
+                    };
                     match parsed {
                         // The first line for an identity wins: the
                         // commitment is immutable, so a later line is
@@ -2344,6 +2383,26 @@ impl Anchors {
                 writable = false;
             }
         }
+        // A rotation's successor is anchored by its rotation's `next`
+        // alone. An older build anchored the first card the successor
+        // key showed, which whoever holds that key alone could have shown.
+        let successors: HashSet<Fingerprint> = rotated.values().map(|(to, _)| *to).collect();
+        for to in &successors {
+            let next = nexts.get(to).copied();
+            if map.get(to).is_some_and(|a| Some(*a) != next) {
+                compact = true;
+                tracing::warn!(
+                    "{}: {} is a rotation's successor; its anchor is not that rotation's next, \
+                     and is dropped",
+                    path.display(),
+                    to.short()
+                );
+            }
+            match next {
+                Some(n) => map.insert(*to, n),
+                None => map.remove(to),
+            };
+        }
         info!(anchors = map.len(), path = %path.display(), "successor commitments loaded");
         if writable && compact {
             let mut text = String::from(ANCHORS_HEADER);
@@ -2351,6 +2410,9 @@ impl Anchors {
             lines.sort_by_key(|(fp, _)| fp.to_string());
             for (fp, s) in lines {
                 text.push_str(&format!("{fp} = {}\n", b64(s)));
+                if successors.contains(fp) {
+                    text.push_str(&format!("{fp} = next {}\n", b64(s)));
+                }
             }
             let mut lines: Vec<_> = rotated.iter().collect();
             lines.sort_by_key(|(fp, _)| fp.to_string());
@@ -2382,6 +2444,12 @@ impl Anchors {
     fn rotated_from(&self) -> Vec<Fingerprint> {
         let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
         rotated.keys().copied().collect()
+    }
+
+    /// Whether `fp` is the successor of a rotation accepted here.
+    fn is_successor(&self, fp: &Fingerprint) -> bool {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        rotated.values().any(|(to, _)| to == fp)
     }
 
     fn rotated(&self, fp: &Fingerprint) -> Option<Fingerprint> {
@@ -2424,26 +2492,51 @@ impl Anchors {
         }
     }
 
-    /// Record `from`'s rotation to `to`, unless one is on file for it
-    /// already. False when nothing was recorded.
+    /// Record `from`'s rotation to `to`, with `next` as `to`'s
+    /// commitment, unless one is on file for `from` already. False when
+    /// nothing was recorded.
     /// Kept in memory whether or not the file can take it: refusing the
     /// predecessor is the safe direction, as an anchor kept only in
     /// memory is.
-    fn rotate(&self, from: &Fingerprint, to: &Fingerprint) -> bool {
-        let full = {
+    ///
+    /// Refused when `to` is anchored already, to anything but `next`:
+    /// that anchor came from a card of `to`'s, which whoever holds that
+    /// key alone could have shown, and the append-only file cannot take
+    /// it back. Under the rotation lock, as `commit` checks it, so a card
+    /// cannot be anchored between the check and the rotation.
+    fn rotate(&self, from: &Fingerprint, to: &Fingerprint, next: Option<[u8; 32]>) -> bool {
+        let (full, next) = {
             let mut rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
             if rotated.contains_key(from) {
                 return false;
             }
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let next = match (map.get(to), next) {
+                (None, Some(n)) => {
+                    map.insert(*to, n);
+                    Some(n)
+                }
+                (None, None) => None,
+                (Some(a), Some(n)) if *a == n => Some(n),
+                (Some(_), _) => {
+                    tracing::warn!(predecessor = %from.short(), successor = %to.short(), "rotation to a key already anchored to another successor; ignored");
+                    return false;
+                }
+            };
             rotated.insert(*from, (*to, false));
-            rotated.len() > MAX_ANCHORS
+            (rotated.len() > MAX_ANCHORS, next)
         };
         if !self.writable || full {
             tracing::warn!(predecessor = %from.short(), "rotation kept for this run only: the successor file is unwritable or full");
             return true;
         }
         let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = append_private(&self.path, &format!("{from} => {to}\n")) {
+        // The plain line too, so a build that knows no `next` keeps it.
+        let mut lines = next.map_or(String::new(), |n| {
+            format!("{to} = {}\n{to} = next {}\n", b64(&n), b64(&n))
+        });
+        lines.push_str(&format!("{from} => {to}\n"));
+        if let Err(e) = append_private(&self.path, &lines) {
             tracing::error!("{}: {e}; rotation not persisted", self.path.display());
         }
         true
@@ -2454,13 +2547,18 @@ impl Anchors {
     /// already on file is dropped rather than replacing the anchor in
     /// memory — memory outranks disk in `committed_successor`, so the
     /// key holder could otherwise make their own card unusable until the
-    /// next restart.
+    /// next restart. Never for a rotation's successor, whose commitment
+    /// is its rotation's `next` or none (`rotate`), and never a card's.
     fn commit(&self, fp: &Fingerprint, successor: [u8; 32]) {
         if !self.writable {
             return;
         }
         {
             use std::collections::hash_map::Entry;
+            let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+            if rotated.values().any(|(to, _)| to == fp) {
+                return;
+            }
             let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             if map.len() >= MAX_ANCHORS && !map.contains_key(fp) {
                 tracing::warn!(
@@ -2758,8 +2856,8 @@ mod tests {
         );
         let anchors = Anchors::load(path.clone());
         anchors.commit(&old.fingerprint(), new.fingerprint().0);
-        assert!(anchors.rotate(&old.fingerprint(), &new.fingerprint()));
-        assert!(!anchors.rotate(&old.fingerprint(), &other.fingerprint()));
+        assert!(anchors.rotate(&old.fingerprint(), &new.fingerprint(), None));
+        assert!(!anchors.rotate(&old.fingerprint(), &other.fingerprint(), None));
 
         assert_eq!(anchors.unmoved(None).len(), 1);
 
@@ -2791,6 +2889,96 @@ mod tests {
                 successor: new.fingerprint()
             })
         );
+    }
+
+    #[test]
+    fn a_successor_is_anchored_by_its_rotations_next_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("successors");
+        let fp = |s: u8| IdentityKey::from_seed(&[s; 32]).fingerprint();
+        let (k0, k1, k2, thief, other) = (fp(1), fp(2), fp(3), fp(6), fp(7));
+        let anchors = Anchors::load(path.clone());
+        assert!(anchors.rotate(&k0, &k1, Some(k2.0)));
+        anchors.commit(&k1, thief.0);
+        assert!(anchors.rotate(&other, &thief, None));
+        anchors.commit(&thief, k2.0);
+        for anchors in [anchors, Anchors::load(path.clone())] {
+            assert_eq!(
+                (anchors.get(&k1), anchors.get(&thief)),
+                (Some(k2.0), None),
+                "a card's commitment for a successor is not taken, nor after a restart"
+            );
+        }
+        let anchors = Anchors::load(path.clone());
+
+        // A key anchored already, to anything but the rotation's `next`,
+        // is no successor.
+        let to = fp(8);
+        anchors.commit(&to, thief.0);
+        for (from, next) in [(fp(9), None), (fp(10), Some(k2.0))] {
+            assert!(!anchors.rotate(&from, &to, next), "{next:?}");
+        }
+        assert!(anchors.rotate(&fp(11), &to, Some(thief.0)));
+        assert_eq!(Anchors::load(path).get(&to), Some(thief.0));
+    }
+
+    #[test]
+    fn a_successors_anchor_from_an_older_build_is_not_the_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("successors");
+        let [k0, k1, k2, thief] = [1, 2, 3, 6].map(|s| IdentityKey::from_seed(&[s; 32]));
+        let (f0, f1, f2, ft) = (
+            k0.fingerprint(),
+            k1.fingerprint(),
+            k2.fingerprint(),
+            thief.fingerprint(),
+        );
+        // An older build anchored the first card the successor key showed.
+        std::fs::write(
+            &path,
+            format!(
+                "{ANCHORS_HEADER}{f0} => {f1}\n{f0} => {f1} moved\n{f1} = {}\n",
+                b64(&ft.0)
+            ),
+        )
+        .unwrap();
+        let st = state(IdentityConfig {
+            anchors: Some(path.clone()),
+            unattested: Unattested::Guest,
+            ..Default::default()
+        });
+        let dev = DeviceKey::from_seed(&[9; 32]);
+        let (card, cert) = objects(&thief, &dev);
+        let stolen = hl_identity::Rotation {
+            identity: k1.public(),
+            successor: thief.public(),
+            time: now_unix(),
+            next: None,
+        }
+        .sign(&k1, &thief)
+        .unwrap();
+        let ch = st.issue_challenge().unwrap();
+        let proof = LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
+        let req = AuthRequest {
+            rotation: Some(&stolen),
+            ..AuthRequest::default()
+        };
+        let _ = st.auth_with_proof(&card, &cert, &proof, Some(TEST_HOST), req);
+        assert_eq!(st.rotated_to(&f1), None, "the thief's rotation was taken");
+        assert_eq!(st.committed_successor(&f1), None);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&b64(&ft.0)));
+
+        // A rotation's `next` stands across a reload and a compaction.
+        std::fs::write(&path, "junk\n").unwrap();
+        let anchors = Anchors::load(path.clone());
+        assert!(anchors.rotate(&f0, &f1, Some(f2.0)));
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + "junk\n").unwrap();
+        for _ in 0..2 {
+            assert_eq!(Anchors::load(path.clone()).get(&f1), Some(f2.0));
+        }
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("junk"));
     }
 
     fn objects(id: &IdentityKey, dev: &DeviceKey) -> (Vec<u8>, Vec<u8>) {

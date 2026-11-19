@@ -175,7 +175,7 @@ encoded.
 | `attestations` | array | no | Attestation objects, each fully signed; at most 8. The size limit alone allows dozens, and each one an unauthenticated caller embeds is a signature the server verifies |
 | `vouches` | array | no | Portable vouches for this identity, at most 8, each fully signed (`identity-vouch.md` §4.2); ignored by servers that don't implement it |
 | `links` | array of tstr | no | URLs to display; servers never fetch them |
-| `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. A server persists the commitment for identities with standing on it — see §13. |
+| `successor` | bstr(32) | no | SHA-256 of a pre-committed successor identity key (threat model, "stolen identity key"). Once set, immutable: a later card for the same identity that changes or omits it is refused (`bad_card`) by any server that cached the earlier one, and rotation is accepted only to the committed key. A server persists the commitment for identities with standing on it — see §13. A rotation's successor is the exception: its commitment is its rotation's `next` or none, never a card's (`identity-registrar.md` §7.4). |
 | `sig` | bstr(64) | yes | |
 
 ### 3.5 Attestation
@@ -821,7 +821,9 @@ to run on a server that also serves the legacy port.
   way to move it, which is exactly the attack the commitment exists to
   stop. hxd-ng writes `[identity] successors`, one line per identity,
   appended and compacted at load rather than rewritten per insert; a
-  rotation it accepts is a line there too, `<predecessor> => <successor>`.
+  rotation it accepts is a line there too, `<predecessor> => <successor>`,
+  and its `next` a line `<successor> = next <commitment>`, the only line
+  a rotation's successor is anchored by.
 - **Who gets anchored.** Only an identity with *standing* on this server:
   one with an account here (linked or created) or an attestation the
   server accepted. Anchoring every card that ever authenticated
@@ -834,6 +836,9 @@ to run on a server that also serves the legacy port.
   bounds the table as well and says so in its log when it is full: a
   ceiling that only holds while the operator's policy is restrictive is
   not a bound.
+  A rotation's successor is the exception: its anchor is the
+  rotation's `next`, signed by both keys, or none, and never a card
+  (`identity-registrar.md` §7.4).
 - Registrar keys for attestation checks are resolved in the order of
   `identity-registrar.md` §7.1: a static `[identity.registrar_keys]`
   entry first, and only otherwise the registrar's `/.well-known/hotline`

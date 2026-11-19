@@ -2237,6 +2237,74 @@ async fn a_rotation_shown_at_auth_is_taken_only_to_the_anchored_key() {
 }
 
 #[tokio::test]
+async fn a_successor_rotates_on_only_to_its_rotations_next() {
+    for with_next in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("registrar");
+        std::fs::create_dir_all(&at).unwrap();
+        let r = start(&at, "signup = \"open\"").await;
+        let there = dir.path().join("verifier");
+        std::fs::create_dir_all(&there).unwrap();
+        let live = format!("http://{}", r.ng);
+        let (v, _) = verifier(&there, &r, Trust::Key, &live, "new_accounts = \"create\"").await;
+        let [old, new, next, thief] = [1, 2, 3, 6].map(|s| IdentityKey::from_seed(&[s; 32]));
+        let dev = DeviceKey::from_seed(&[101; 32]);
+        let old_card = attested_committing(&r, &old, "alice", &new, false).await;
+        let account = auth_at(v, &old, &dev, &old_card).await.json()["account"].clone();
+        assert!(account.is_string(), "{account}");
+        let card = |id: &IdentityKey, successor: Option<&IdentityKey>| {
+            let mut c = Card::new(id, "x", now());
+            c.successor = successor.map(commitment);
+            c.sign(id, vec![]).unwrap()
+        };
+        let rotate = |from: &IdentityKey, to: &IdentityKey, next: Option<&IdentityKey>| {
+            let r = Rotation {
+                identity: from.public(),
+                successor: to.public(),
+                time: now(),
+                next: next.map(commitment),
+            };
+            json!({ "rotation": b64(&r.sign(from, to).unwrap()) })
+        };
+
+        // A thief holding the successor key alone signs in first,
+        // replaying the owner's rotation on a card that commits to the
+        // thief's own key. The rotation stands; the card's commitment
+        // is anchored by neither, and with a `next` the card is refused.
+        let owners = rotate(&old, &new, with_next.then_some(&next));
+        let shown = auth_with(v, &new, &dev, &card(&new, Some(&thief)), owners).await;
+        assert_eq!(
+            shown.status,
+            if with_next { 401 } else { 200 },
+            "{with_next}"
+        );
+        assert_eq!(auth_at(v, &old, &dev, &old_card).await.status, 403);
+        let stolen = rotate(&new, &thief, None);
+        let taken = auth_with(v, &thief, &dev, &card(&thief, None), stolen).await;
+        assert_ne!(taken.json()["account"], account, "{with_next}");
+        let owner = auth_at(v, &new, &dev, &card(&new, with_next.then_some(&next))).await;
+        assert_eq!(
+            (owner.status, owner.json()["account"].clone()),
+            (200, account.clone()),
+            "{with_next}: the account stays with the owner"
+        );
+
+        // The owner's own rotation onward is taken at auth only to the
+        // `next` its predecessor signed; without one, only a registrar's
+        // records could move it.
+        let onward = rotate(&new, &next, None);
+        let moved = auth_with(v, &next, &dev, &card(&next, None), onward).await;
+        assert_eq!(moved.json()["account"] == account, with_next, "{with_next}");
+        let after = auth_at(v, &new, &dev, &card(&new, with_next.then_some(&next))).await;
+        assert_eq!(
+            after.status,
+            if with_next { 403 } else { 200 },
+            "{with_next}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_key_nobody_answers_for_waits_before_it_may_chat() {
     let dir = tempfile::tempdir().unwrap();
     let at = dir.path().join("registrar");
