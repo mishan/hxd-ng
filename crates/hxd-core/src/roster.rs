@@ -2168,6 +2168,11 @@ pub struct Core {
     /// chosen before a key was lifted cannot take a registration made
     /// after (`Core::take_revoked`). Never taken while another lock is held.
     pub(crate) push_writes: Mutex<()>,
+    /// Run once by the next registration that finds `push_writes` held,
+    /// before it waits, for the domain's tests of the wait.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) push_contended: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The reserved server account, or `None` when `[system]` did not
     /// ask for one. See [`crate::system`].
     pub(crate) system: Option<crate::system::SystemState>,

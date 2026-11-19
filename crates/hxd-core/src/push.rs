@@ -33,7 +33,7 @@
 //! *sending* is not — that is the gateway's, it is spawned, and it never
 //! happens under a lock (`crate::notify`).
 
-use std::sync::PoisonError;
+use std::sync::{PoisonError, TryLockError};
 use std::time::SystemTime;
 
 use crate::inbox::{Mailbox, StoreError};
@@ -450,10 +450,19 @@ impl crate::roster::Core {
         let devid = r.devid;
         endpoint::registrable(&r.endpoint, policy.allow_private_endpoints)
             .map_err(|_| PushError::BadSubscription("That is not a push endpoint."))?;
-        let writing = self
-            .push_writes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let writing = match self.push_writes.try_lock() {
+            Ok(writing) => writing,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                if let Some(contended) = self.push_contended.lock().unwrap().take() {
+                    contended();
+                }
+                self.push_writes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            }
+        };
         let registered = store
             .register(
                 &Device {
@@ -588,13 +597,17 @@ impl crate::roster::Core {
             .unwrap_or_else(PoisonError::into_inner);
         let keys = {
             let refused = self.revoked.read().unwrap();
-            let (added, pending) = &mut *store.pending.lock().unwrap();
+            let (changes, pending) = &mut *store.pending.lock().unwrap();
             for key in keys {
-                *added += 1;
+                *changes += 1;
                 pending.retain(|(_, k)| *k != key);
-                pending.push((*added, key));
+                pending.push((*changes, key));
             }
+            let held = pending.len();
             pending.retain(|(_, k)| !refused.lifts(k));
+            if pending.len() != held {
+                *changes += 1;
+            }
             pending.clone()
         };
         for (added, key) in keys {
@@ -607,8 +620,9 @@ impl crate::roster::Core {
                 }
             };
             if forget {
-                let (_, pending) = &mut *store.pending.lock().unwrap();
+                let (changes, pending) = &mut *store.pending.lock().unwrap();
                 pending.retain(|entry| *entry != (added, key));
+                *changes += 1;
             }
             if let Ok(taken) = taken {
                 self.devices_changed(false, &taken);
@@ -1111,16 +1125,15 @@ mod tests {
             assert!(Instant::now() < until, "the revoked device was not ended");
             std::thread::yield_now();
         }
-        let registered = channel();
+        let contended = channel();
+        *core.push_contended.lock().unwrap() = Some(Box::new(move || {
+            contended.0.send(()).unwrap();
+        }));
         let again = std::thread::spawn({
             let core = core.clone();
-            move || {
-                let r = core.push_register(uid, registration([14; 32]));
-                registered.0.send(()).unwrap();
-                r
-            }
+            move || core.push_register(uid, registration([14; 32]))
         });
-        let _ = registered.1.recv_timeout(Duration::from_millis(100));
+        let waited = contended.1.recv_timeout(Duration::from_secs(5)).is_ok();
         resume.0.send(()).unwrap();
         retry.join().unwrap();
         lift.join().unwrap();
@@ -1131,6 +1144,52 @@ mod tests {
             .devices(&bob, SystemTime::now())
             .unwrap();
         assert_eq!(rows.len(), 1, "the registration made after the lift");
+        assert!(waited, "the registration waited on the retry's delete");
+    }
+
+    /// A key that becomes pending while a gateway reads is not let
+    /// through: whether its identity then leaves the published list with
+    /// the delete still failing, or a retry takes the row after it was
+    /// read.
+    #[test]
+    fn a_key_pending_only_during_a_read_lets_no_row_through() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for retried in [false, true] {
+            let devices = Arc::new(MemoryDevices::new());
+            let core = Arc::new(Core::new().with_devices(devices.clone()));
+            let alice = Mailbox::identified("alice", [7; 32]);
+            let phone = DeviceId::of_device(&[10; 32]);
+            devices
+                .register(&device(alice.clone(), phone.as_str()), 8)
+                .unwrap();
+            let meanwhile = core.clone();
+            let failing = devices.clone();
+            *devices.after_read.lock().unwrap() = Some(Box::new(move || {
+                // The revocation's delete fails, and so does the retry
+                // when its identity leaves the list: the key stays
+                // pending, and the lists no longer refuse its rows.
+                failing.failing_deletes.store(2, SeqCst);
+                meanwhile.set_published_revocations(crate::Published {
+                    devices: [([7; 32], [10; 32])].into(),
+                    covered: [[7; 32]].into(),
+                    ..Default::default()
+                });
+                meanwhile.set_published_revocations(crate::Published::default());
+                if retried {
+                    meanwhile.sweep_devices();
+                }
+            }));
+            let gateway = core.push_store().unwrap();
+            assert!(
+                gateway
+                    .devices(&alice, SystemTime::now())
+                    .unwrap()
+                    .is_empty(),
+                "retried: {retried}"
+            );
+            let left = devices.devices(&alice, SystemTime::now()).unwrap().len();
+            assert_eq!(left, usize::from(!retried), "the revocation ran");
+        }
     }
 
     /// A key the operator lifts while its delete waits is forgotten: the

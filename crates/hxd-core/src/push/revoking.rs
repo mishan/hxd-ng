@@ -23,9 +23,11 @@ use crate::revoked::Refused;
 
 pub(crate) struct Revoking {
     store: Arc<dyn PushStore>,
-    /// Revoked keys whose rows a store error kept, each with the count
-    /// of the last time it was added, so a retry that took its rows
-    /// before it was added again does not forget it.
+    /// Revoked keys whose rows a store error kept, and a count of every
+    /// change to them. Each key carries the count it was added at, so a
+    /// retry that took its rows before it was added again does not
+    /// forget it; and a read that sees the count move while it reads
+    /// reads again (`live`). Every change to the set must bump it.
     pub(crate) pending: Mutex<(u64, Vec<(u64, Unrevoked)>)>,
     /// The core's lists.
     revoked: Arc<RwLock<Refused>>,
@@ -40,18 +42,27 @@ impl Revoking {
         }
     }
 
-    /// What `read` answers, less the rows of a revoked key. The pending
-    /// keys are copied before it reads, so a retry that takes a row and
-    /// forgets its key meanwhile cannot let a copy of the row through.
+    /// What `read` answers, less the rows of a revoked key: by the lists
+    /// after it reads, and by the keys pending before it does, which only
+    /// stand for the whole read if none changed meanwhile. A key added
+    /// during the read may have rows in it, and one taken may have had
+    /// them read before they went, so then it reads again. Each change
+    /// follows a revocation, a lift or a retry, so the reads settle: the
+    /// loop is bounded only by how often those happen.
     fn live(
         &self,
-        read: impl FnOnce() -> Result<Vec<Device>, StoreError>,
+        read: impl Fn() -> Result<Vec<Device>, StoreError>,
     ) -> Result<Vec<Device>, StoreError> {
-        let pending = self.pending.lock().unwrap().1.clone();
-        let mut rows = read()?;
-        let refused = self.revoked.read().unwrap();
-        rows.retain(|d| !refused.refuses_row(d) && !pending.iter().any(|(_, k)| k.made(d)));
-        Ok(rows)
+        loop {
+            let (changes, pending) = self.pending.lock().unwrap().clone();
+            let mut rows = read()?;
+            if self.pending.lock().unwrap().0 != changes {
+                continue;
+            }
+            let refused = self.revoked.read().unwrap();
+            rows.retain(|d| !refused.refuses_row(d) && !pending.iter().any(|(_, k)| k.made(d)));
+            return Ok(rows);
+        }
     }
 }
 
