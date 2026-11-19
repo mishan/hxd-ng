@@ -59,6 +59,12 @@ impl TextEncoding {
         }
     }
 
+    /// Whether `s` reaches this connection as it is, nothing in it sent
+    /// as `?`.
+    pub fn keeps(self, s: &str) -> bool {
+        self == TextEncoding::Utf8 || text::mac_roman_to_utf8(&text::from_utf8(s)) == s
+    }
+
     /// [`Self::encode`], cut to at most `max` bytes without splitting a
     /// character.
     pub fn encode_capped(self, s: &str, max: usize) -> Vec<u8> {

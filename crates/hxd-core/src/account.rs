@@ -67,6 +67,10 @@ pub struct Account {
     /// server and announced to every session on it, and a door everyone
     /// walks through should not be handed either.
     pub set_avatar: bool,
+    /// The pronouns the account's user set, from its file's `[profile]`:
+    /// shown only where its `[extra] pronouns` and the server allow
+    /// (`crate::pronouns`).
+    pub pronouns: Option<String>,
     /// May this account redact, revoke, purge and read reports
     /// (`docs/moderation.md` §2)? Server-local policy, the `[extra]
     /// moderate` key. Backend default: the disconnect-users (kick) bit —
@@ -119,6 +123,7 @@ impl Account {
             has_inbox: false,
             attach_news: false,
             set_avatar: false,
+            pronouns: None,
             moderate: false,
             can_spam: false,
             manage_roles: false,
@@ -178,6 +183,7 @@ pub struct Extras<T> {
     pub file_getinfo: T,
     pub attach_news: T,
     pub set_avatar: T,
+    pub pronouns: T,
     pub moderate: T,
     pub can_spam: T,
     pub manage_roles: T,
@@ -195,6 +201,7 @@ impl<T: Copy> Extras<T> {
             file_getinfo: f(self.file_getinfo, other.file_getinfo),
             attach_news: f(self.attach_news, other.attach_news),
             set_avatar: f(self.set_avatar, other.set_avatar),
+            pronouns: f(self.pronouns, other.pronouns),
             moderate: f(self.moderate, other.moderate),
             can_spam: f(self.can_spam, other.can_spam),
             manage_roles: f(self.manage_roles, other.manage_roles),
@@ -265,11 +272,12 @@ impl AccountConfig {
         let extras = Extras {
             // A password makes an account a person rather than a door,
             // and so does a linked identity: `guest` is one login many
-            // people share, so detaching, mail and an avatar are each
-            // handed to whoever walks through it next.
+            // people share, so detaching, mail, an avatar and pronouns
+            // are each handed to whoever walks through it next.
             can_detach: key(x.can_detach, person, m.can_detach),
             inbox: key(x.inbox, person, m.inbox),
             set_avatar: key(x.set_avatar, person, m.set_avatar),
+            pronouns: key(x.pronouns, person, m.pronouns),
             // mhxd's, on for every account that does not turn it off.
             file_list: key(x.file_list, true, m.file_list),
             file_getinfo: key(x.file_getinfo, true, m.file_getinfo),
@@ -713,6 +721,14 @@ pub trait AccountAdmin: Send + Sync + 'static {
     /// it, once `check` has passed.
     fn delete_role(&self, name: &str, check: RoleCheck<'_>) -> Result<(), AdminError> {
         let _ = (name, check);
+        Err(AdminError::Unsupported)
+    }
+
+    /// Set or clear the pronouns of the account `login` names, in what
+    /// the backend keeps beside its policy, and nothing else of it.
+    /// Answers the account as it now reads.
+    fn write_pronouns(&self, login: &str, pronouns: Option<&str>) -> Result<Account, AdminError> {
+        let _ = (login, pronouns);
         Err(AdminError::Unsupported)
     }
 

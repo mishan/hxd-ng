@@ -28,7 +28,7 @@ grants beside them — `moderate`, `can_spam`, `set_subject`,
 `manage_rooms` — whether said in `[extra]`, granted by a role
 (roles.md) or derived, since a new account given the kick bit moderates
 by default — and holding a role a room's gate names, unless the session
-holds it too or `manage_roles` (roles.md §5). Not `can_detach`, `inbox` or `set_avatar`: those follow from a
+holds it too or `manage_roles` (roles.md §5). Not `can_detach`, `inbox`, `set_avatar` or `pronouns`: those follow from a
 password and say an account is one person, not what it may do to
 anyone else, so a password-less administrator may still give an account
 a password. Without that, `modify_users` is every privilege there is,
@@ -61,6 +61,12 @@ bit the account's roles give is written only as `false`, while it is
 unset; set, it has no key and goes on following the roles (roles.md
 §6.1). Own keys are written as sent instead: every access key, raw
 bit and raw denial the edit leaves out goes.
+
+`[profile]` is the user's own, and no edit touches it: an account's
+pronouns are written there by the server when its user sets them
+(system-account.md §3), and by nobody else. An operator who must take
+them down edits the file and sends SIGHUP; `[extra] pronouns = false`
+hides them instead.
 
 Passwords are capped at 31 characters on every path, since a classic
 login cuts its password there and a longer one could never be typed on

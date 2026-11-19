@@ -90,7 +90,7 @@ every moderator. KDX had account *classes* for this; Discord has
 - Nick colors are fogWraith's Colored Nicknames: a client chooses its
   own color, and the server relays it (`UserInfo::color`).
 - Get User Info's text on the classic wire is composed by this server
-  (`name`, `login`, `address`, `online`).
+  (`name`, `pronouns`, `login`, `address`, `online`).
 
 ## 2. The role
 

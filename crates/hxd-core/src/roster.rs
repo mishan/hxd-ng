@@ -238,10 +238,11 @@ pub struct Transport {
     /// once where a classic client is sent an invite to answer
     /// (`docs/chat-rooms.md` §6.1). The ng frontend sets it.
     pub joins_rooms: bool,
-    /// This link shows the roles a user holds (`docs/roles.md` §7.1), so
-    /// a change to them alone is worth telling it, and can fetch the
-    /// roster again when told it is stale. A classic client's row has
-    /// nowhere to put them, and the frontend sets it only for ng.
+    /// This link shows the roles a user holds (`docs/roles.md` §7.1) and
+    /// their pronouns, so a change to either alone is worth telling it,
+    /// and can fetch the roster again when told it is stale. A classic
+    /// client's row has nowhere to put them, and the frontend sets it
+    /// only for ng.
     pub roles: bool,
     /// This link speaks the friend family (`docs/instant-messaging.md`
     /// §7): the ng wire's, or capability bit 6 on the classic one. A
@@ -371,6 +372,9 @@ pub struct UserInfo {
     /// nick color draws for a user who chose none (`docs/roles.md` §8).
     /// An ng client works it out from `roles` itself.
     pub role_color: Option<u32>,
+    /// The pronouns it shows (`crate::pronouns`), which only the ng wire
+    /// shows on a row.
+    pub pronouns: Option<String>,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -382,6 +386,8 @@ pub struct UserDetails {
     pub connected_at: Instant,
     /// The roles its account lists.
     pub roles: Vec<String>,
+    /// The pronouns it shows (`crate::pronouns`).
+    pub pronouns: Option<String>,
 }
 
 /// A domain event, delivered on session channels. The session layer encodes
@@ -1323,6 +1329,10 @@ pub(crate) struct UserSession {
     /// What this session is denied whatever its account says
     /// ([`Core::set_session_mask`]).
     pub(crate) mask: crate::DenyMask,
+    /// Its role color changed since its account was last told it: what
+    /// self-info carries, so an account change that alters nothing else
+    /// it shows is told all the same.
+    pub(crate) recolored: bool,
     /// Its part in instant messaging, from its announce, where it takes
     /// part (`crate::messaging`).
     pub(crate) messaging: Option<crate::messaging::SessionState>,
@@ -1521,6 +1531,8 @@ pub(crate) struct RosterInner {
     /// last told of them (`crate::messaging`).
     pub(crate) presences: crate::messaging::Presences,
     pub(crate) persons: crate::coalesce::Persons,
+    /// `[server] pronouns = false`: none shown, none taken.
+    pub(crate) pronouns_off: bool,
     /// Detached sessions ended before their grace ran out, and why.
     pub(crate) endings: crate::ending::Endings,
 }
@@ -2247,6 +2259,10 @@ pub struct Core {
     /// When each owner last changed its avatar (`AvatarPolicy`'s
     /// interval). Its own lock, taken with nothing else held.
     pub(crate) avatar_turns: Mutex<HashMap<crate::avatar::Turn, Instant>>,
+    /// When each login last changed its pronouns
+    /// ([`crate::pronouns::INTERVAL`]), by the core's clock. Taken under
+    /// `account_writes`, with nothing else held.
+    pub(crate) pronoun_turns: Mutex<HashMap<String, Instant>>,
     /// The server's emoji catalog, or `None` without `[emoji]`.
     pub(crate) emoji: Option<crate::emoji::EmojiState>,
 }
@@ -2745,6 +2761,11 @@ impl Core {
             .as_ref()
             .map_or_else(Vec::new, |a| a.roles.clone());
         let lobby_heard_from = r.last_ids.get(&0).copied().unwrap_or(0);
+        let pronouns = info
+            .account
+            .as_deref()
+            .filter(|_| !r.pronouns_off)
+            .and_then(|a| crate::pronouns::shown(a, &Default::default()));
         r.users.insert(
             uid,
             UserSession {
@@ -2762,6 +2783,7 @@ impl Core {
                     remote: None,
                     roles,
                     role_color,
+                    pronouns,
                 },
                 access: info.access,
                 login: info.login,
@@ -2814,6 +2836,7 @@ impl Core {
                 outbox: Outbox::live(tx, conn),
                 account: info.account,
                 mask: Default::default(),
+                recolored: false,
                 messaging: None,
                 guest: Default::default(),
                 device,
@@ -3313,6 +3336,7 @@ impl Core {
                 .account
                 .as_ref()
                 .map_or_else(Vec::new, |a| a.roles.clone()),
+            pronouns: r.pronouns_shown(s),
         })
     }
 
@@ -3328,6 +3352,7 @@ impl Core {
                 .account
                 .as_ref()
                 .map_or_else(Vec::new, |a| a.roles.clone()),
+            pronouns: r.pronouns_shown(s),
         })
     }
 

@@ -543,10 +543,9 @@ whole list: everything else is already refused by §3.1.
   returns, or that line and nothing else when the request fails or times
   out, as the extension requires.
 - **As home server**, `info_text_for_peer` builds what an ordinary,
-  unprivileged client may see: the name, the icon number and how long the
-  user has been connected. Never the login or address. hxd-ng's own 303 is
-  all-or-nothing today and includes both, so this is a new, smaller text,
-  not a reuse.
+  unprivileged client may see: the name, the pronouns the user shows
+  (system-account.md §3), the icon number and how long the user has
+  been connected. Never the login or address.
 
 ## 7. The link wire (`hxd-link`)
 

@@ -212,7 +212,7 @@ impl RoleEntry {
         for (key, on) in &self.extra {
             if matches!(
                 key.as_str(),
-                "can_detach" | "inbox" | "set_avatar" | "vouch" | "personal"
+                "can_detach" | "inbox" | "set_avatar" | "pronouns" | "vouch" | "personal"
             ) {
                 return Err(format!(
                     "extra.{key} says an account is one person, so a role, which \

@@ -684,6 +684,7 @@ impl RosterInner {
             remote: Some(g.remote.clone()),
             roles: Vec::new(),
             role_color: None,
+            pronouns: None,
         }
     }
 }
@@ -1250,8 +1251,11 @@ impl Core {
             .map(|s| s.connected_at.elapsed().as_secs())
             .max()
             .unwrap_or_else(|| sess.connected_at.elapsed().as_secs());
+        let pronouns = r
+            .pronouns_shown(sess)
+            .map_or_else(String::new, |p| format!("pronouns: {p}\r"));
         Ok(format!(
-            "    name: {}\r    icon: {}\r  online: {}h {}m {}s\r",
+            "    name: {}\r{pronouns}    icon: {}\r  online: {}h {}m {}s\r",
             sess.info.nick,
             sess.info.icon,
             secs / 3600,

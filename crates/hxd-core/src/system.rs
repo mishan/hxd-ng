@@ -323,6 +323,9 @@ impl Core {
                 self.command_report(from, who, &reason)
             }
             "stop" => self.command_stop(from, words.next()),
+            // The rest of the message, as typed: a value is refused, never
+            // reshaped, so what the line holds is what is checked.
+            "pronouns" => self.command_pronouns(from, &text[word.len()..]),
             "roles" if self.accounts_enabled() => self.command_roles(from),
             "role" if self.accounts_enabled() => {
                 let words: Vec<&str> = words.collect();
@@ -344,7 +347,7 @@ impl Core {
     }
 
     fn help(&self) -> String {
-        // Under ten lines, and only the commands this server can
+        // Ten lines at most, and only the commands this server can
         // actually run: a help text that lists something unimplemented
         // is worse than one that is short.
         let mut help = String::from(
@@ -355,6 +358,11 @@ impl Core {
              /report <nick or login> <reason> — tell the moderators about someone\n\
              /stop [#article] — stop following a news thread",
         );
+        if self.pronouns_enabled() {
+            help.push_str("\n/pronouns [<text> | clear] - the pronouns your account shows");
+        } else if self.accounts_enabled() {
+            help.push_str("\n/pronouns clear - remove the pronouns your account keeps");
+        }
         if self.rooms_enabled() {
             help.push_str(
                 "\n/rooms [word] — the rooms you may join\n\
@@ -367,6 +375,54 @@ impl Core {
             );
         }
         help
+    }
+
+    /// `/pronouns`, `/pronouns <text>` and `/pronouns clear`, with `rest`
+    /// what followed the command.
+    fn command_pronouns(&self, from: Uid, rest: &str) -> String {
+        let rest = rest.strip_suffix('\n').unwrap_or(rest);
+        let rest = rest.strip_suffix('\r').unwrap_or(rest);
+        let value = match rest.trim_start() {
+            "" if !self.pronouns_enabled() => {
+                return "ok: this server shows no pronouns; /pronouns clear removes any your \
+                        account keeps"
+                    .into()
+            }
+            "" => {
+                return match self.pronouns_of(from) {
+                    Some(p) => format!("ok: {p}"),
+                    None => "ok: none".into(),
+                }
+            }
+            value if value.eq_ignore_ascii_case("clear") => None,
+            value => Some(value),
+        };
+        if let Err(flooded) = self.spend_spam(from, crate::pronouns::SPAM_POINTS, 304) {
+            self.spam_kicked(flooded);
+            return "error: slow down".into();
+        }
+        use crate::pronouns::PronounsError as E;
+        let serial = self.session_serial(from).unwrap_or_default();
+        match self.set_pronouns(from, serial, value) {
+            Ok(_) => match value {
+                Some(p) => format!("ok: your pronouns are {p}"),
+                None => "ok: cleared".into(),
+            },
+            Err(E::Off) => "error: this server does not show pronouns".into(),
+            Err(E::NotAllowed) => "error: your account may not set pronouns".into(),
+            Err(E::BadValue) => format!(
+                "error: pronouns are 1 to {} characters, with no line breaks, invisible \
+                 characters, doubled spaces or space at either end",
+                crate::pronouns::MAX_CHARS
+            ),
+            Err(E::RateLimited(after)) => {
+                format!(
+                    "error: slow down; try again in {}s",
+                    after.as_millis().div_ceil(1000)
+                )
+            }
+            Err(E::Failed) => "error: that did not work".into(),
+        }
     }
 
     /// `/roles` (`docs/roles.md` §6.3).

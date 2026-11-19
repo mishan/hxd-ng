@@ -176,14 +176,24 @@ async fn pair_with(
     a_extra: &str,
     b_extra: &str,
 ) -> (Server, Server, [tempfile::TempDir; 2]) {
-    pair_full(a_holds, b_holds, "", a_link, a_offers, a_extra, b_extra).await
+    pair_full(
+        a_holds,
+        b_holds,
+        ["", ""],
+        a_link,
+        a_offers,
+        a_extra,
+        b_extra,
+    )
+    .await
 }
 
-/// [`pair_with`], with `server` as more keys of both `[server]` sections.
+/// [`pair_with`], with `server` as more keys of `a`'s `[server]` section
+/// and `b`'s.
 async fn pair_full(
     a_holds: u8,
     b_holds: u8,
-    server: &str,
+    server: [&str; 2],
     a_link: &str,
     a_offers: &str,
     a_extra: &str,
@@ -196,7 +206,7 @@ async fn pair_full(
         da.path(),
         1,
         "aa",
-        server,
+        server[0],
         a_link,
         &format!(
             "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
@@ -210,7 +220,7 @@ async fn pair_full(
         db.path(),
         2,
         "bb",
-        server,
+        server[1],
         "",
         &format!(
             "[[link.peer]]\nname = \"aa\"\ndial = \"{a_addr}\"\nprotection = \"key\"\n\
@@ -1131,6 +1141,82 @@ async fn private_messages_and_user_info_cross_the_link() {
 }
 
 #[tokio::test]
+async fn a_ghosts_user_info_carries_the_pronouns_its_home_shows() {
+    // And a server that shows none shows a ghost's none either.
+    for here in ["", "pronouns = false"] {
+        ghost_pronouns(here).await;
+    }
+}
+
+async fn ghost_pronouns(here: &str) {
+    let (a, b, dirs) = pair_full(2, 1, [here, ""], "", EVERY_FEATURE, "", "").await;
+    assert!(comes_up(&a.hub, 2, Duration::from_secs(10)).await);
+    assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
+    let cjk = "\u{5f7c}/\u{5979}";
+    let mut there = Vec::new();
+    for (login, pronouns) in [("bob", "he/him"), ("carol", cjk)] {
+        let path = dirs[1].path().join(format!("accounts/{login}.toml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{text}[profile]\npronouns = \"{pronouns}\"\n"),
+        )
+        .unwrap();
+        there.push(
+            legacy::Client::login_at(b.legacy, &Login::account(login, login, "pw"))
+                .await
+                .unwrap(),
+        );
+    }
+    let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
+        .await
+        .unwrap();
+    let mut utf8 = legacy::Client::login_at(
+        a.legacy,
+        &Login {
+            caps: Some(1 << 1),
+            ..Login::guest("utf8")
+        },
+    )
+    .await
+    .unwrap();
+    let (bob, carol) = (
+        row(&mut ann, "bob").await.uid,
+        row(&mut ann, "carol").await.uid,
+    );
+    async fn read(c: &mut legacy::Client, uid: u16) -> String {
+        let asked = [(tag::UID, uid.to_be_bytes().to_vec())];
+        let f = c
+            .call(ClientHdr::UserGetInfo.as_u32(), &asked)
+            .await
+            .unwrap();
+        String::from_utf8(f.bytes(tag::BODY).unwrap()).unwrap()
+    }
+
+    let text = read(&mut ann, bob).await;
+    if !here.is_empty() {
+        assert!(
+            text.contains("name: bob\r") && !text.contains("pronouns"),
+            "{text:?}"
+        );
+        return;
+    }
+    assert!(text.contains("name: bob\rpronouns: he/him\r"), "{text:?}");
+    // Where the reader's encoding would show them as question marks,
+    // they are left out, as a local user's are.
+    let text = read(&mut ann, carol).await;
+    assert!(
+        text.contains("name: carol\r") && !text.contains("pronouns"),
+        "{text:?}"
+    );
+    let text = read(&mut utf8, carol).await;
+    assert!(
+        text.contains(&format!("name: carol\npronouns: {cjk}\n")),
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_link_without_messages_refuses_them_and_names_the_server_for_info() {
     let (a, b, _dirs) = linked_offering("", r#"["chat"]"#).await;
     let mut ann = legacy::Client::login_at(a.legacy, &Login::guest("ann"))
@@ -2046,7 +2132,7 @@ async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature() {
 }
 
 async fn a_peer_not_trying_the_draft_hears_a_signed_line_with_its_signature_on(server: &str) {
-    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, "", "").await;
+    let (a, b, _dirs) = pair_full(2, 1, [server; 2], "", EVERY_FEATURE, "", "").await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob) = (person(1), person(2));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2123,7 +2209,7 @@ async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device() {
 }
 
 async fn private_messages_cross_signed_and_sealed_to_a_ghosts_device_on(server: &str) {
-    let (a, b, _dirs) = pair_full(2, 1, server, "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
+    let (a, b, _dirs) = pair_full(2, 1, [server; 2], "", EVERY_FEATURE, USER_KEYS, USER_KEYS).await;
     assert!(comes_up(&b.hub, 1, Duration::from_secs(10)).await);
     let (alice, bob, carol) = (person(1), person(2), person(3));
     let (mut on_a, a_hello) = keyed(&a, &alice).await;
@@ -2377,7 +2463,16 @@ fn alice_on(n: u8) -> Person {
 /// Two servers linked, each showing a person's devices as one user, with
 /// `drafts` in each one's entry for the other.
 async fn coalescing(drafts: &str) -> (Server, Server, [tempfile::TempDir; 2]) {
-    let servers = pair_full(2, 1, "coalesce = true", "", EVERY_FEATURE, drafts, drafts).await;
+    let servers = pair_full(
+        2,
+        1,
+        ["coalesce = true"; 2],
+        "",
+        EVERY_FEATURE,
+        drafts,
+        drafts,
+    )
+    .await;
     assert!(comes_up(&servers.0.hub, 2, Duration::from_secs(10)).await);
     assert!(comes_up(&servers.1.hub, 1, Duration::from_secs(10)).await);
     servers

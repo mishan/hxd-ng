@@ -767,6 +767,9 @@ fn write_user<M: serde::ser::SerializeMap>(m: &mut M, u: &UserInfo) -> Result<()
     if !u.roles.is_empty() {
         m.serialize_entry("roles", &u.roles)?;
     }
+    if let Some(pronouns) = &u.pronouns {
+        m.serialize_entry("pronouns", pronouns)?;
+    }
     if let Some(r) = &u.remote {
         m.serialize_entry("remote", &remote_json(r))?;
         // As its home server says, over a link trying the user keys
@@ -1471,6 +1474,7 @@ mod tests {
             },
             // The ng wire works it out from `roles`, never sends it.
             role_color: full.then_some(0x0000_80ff),
+            pronouns: full.then(|| "she/her".into()),
         }
     }
 
@@ -1489,6 +1493,7 @@ mod tests {
                 want["avatar"] = crate::avatar::avatar_json(u.avatar.as_ref().unwrap());
                 want["color"] = json!(0x00ff_8000);
                 want["roles"] = json!(["staff"]);
+                want["pronouns"] = json!("she/her");
                 want["identity"] = json!({
                     "fingerprint": hl_identity::Fingerprint([1; 32]).to_string(),
                     "handle": "ann@example.org",

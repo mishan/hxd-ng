@@ -58,7 +58,7 @@ been exercised on newer toolchains; CI runs stable.
 
 | Crate | Role |
 |---|---|
-| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, what a line or message answers (`reply`), the emoji an account reacts to a line or a stored message with (`reaction`, every change to a line's made in order at one desk, `reaction::desk`, and to a message's under a mutex of its own, `reaction::pm`), the news tree, avatars, the server's emoji catalog, the copy of it the server serves from and what a line or message keeps of the emoji it names (`emoji`), access bits, auth traits and account administration (`admin`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
+| `hxd-core` | The domain: presence roster, chat rooms, curated rooms and the `RoomStore` their file is behind (`rooms`), messaging, the relationship store of blocks, friendships and message requests (`relationships`), the friends, presence, instant messages and requests over it (`messaging`), and the portable friendships presented and withdrawn there, checked with `hl-identity`'s friendship objects (`messaging::portable`), moderation and bans, what a line or message answers (`reply`), the emoji an account reacts to a line or a stored message with (`reaction`, every change to a line's made in order at one desk, `reaction::desk`, and to a message's under a mutex of its own, `reaction::pm`), the news tree, avatars, the server's emoji catalog, the copy of it the server serves from and what a line or message keeps of the emoji it names (`emoji`), access bits, auth traits and account administration (`admin`), an account's pronouns (`pronouns`), other servers' users as ghosts and the export feed a link reads (`server_link`), and `instrument` — every metric the server records, and `TimedMutex`, which the roster and the stores lock with. **Wire-free and UTF-8** — no transaction types, no Mac Roman, no JSON. Both frontends speak to it; a future frontend is "just" a third caller. |
 | `hxd-session` | The legacy frontend: TRTP handshake, 22-byte-header framing, per-connection reader/writer/loop tasks, mhxd-mirroring protocol behavior, Mac Roman or negotiated UTF-8 ↔ UTF-8 at its edges (`encoding.rs`), the legacy news binding — `NEWSPATH` resolution, the 1.5 transactions and the 1.2 flat view (`news.rs`), HOPE, the secure login, and the transport it agrees (`hope.rs`, `docs/hope.md`), the server banner (`banner.rs`), the 1.5 user editor (`accounts.rs`), the friend family of fogWraith's instant messaging extension and the message requests draft (`friends.rs`), device proof, with the checks behind a `DeviceProver` the binary wires in (`device.rs`), a chat line as its history entry, for 700 and for Structured Chat's 106 alike (`structured.rs`), the Server Emoji draft's catalog, images and refs (`emoji.rs`), and the Reactions draft's Send Reaction, Reaction Changed and Get Reactions and a line's reactions in its 700 entry (`reactions.rs`, `docs/reactions.md`), the Replies draft's `DATA_REPLY_TO` on a line, a private message and an instant message, its sub-field on 106 and 700, and 700 by line id (`replies.rs`, `docs/replies.md`), and the packed target the two drafts share (`target.rs`). `run_session` is generic over the byte stream so the ng port can feed it a tunneled WebSocket, and `serve_tls` feeds it a TLS session from the legacy TLS port (`tls.rs`, whose certificate SIGHUP reloads). |
 | `hxd-ng-session` | The ng frontend: the HTTP layer on the ng port (discovery, identity endpoints, the registrar's routes — `registrar.rs` — and the WebSocket upgrade for both the JSON protocol and the TRTP tunnel — `http.rs`), server-side identity state (`identity.rs`), the checks a signed line, message or article passes on ingest (`signed.rs`), and what a sealed message's box is checked for and to whom it may go (`sealed.rs`), the server's emoji, their refs and `GET /emoji/{hash}` (`emoji.rs`), the login/resume/sync handshake, session-token registry, seq-stamped event encoding. |
 | `hxd-link` | The link wire of fogWraith's Server Linking Extension (`docs/server-link.md`): the 900-block as ordered field lists (so a relay can pass a group on whole), server groups and Hello, user groups (`users.rs`), the key proof over the TLS 1.3 exporter, the hub (server table, loop and tag checks, newest-wins, the task fanning the core's export feed out to the links, and each link's ghosts), one session loop per link, the dialer, and the user keys draft's certificates fetched by hash, the checks of a ghost's signed line or message, and the sessions seen to sign (`keys.rs`). Knows nothing about classic clients or the ng wire; `hxd-session` hands it a bit-11 login on the TLS port through `PeerAcceptor`. |
@@ -394,7 +394,20 @@ Three layers, all `cargo test --workspace`:
   changes, self-info and private chat joins, one that never did is sent
   nothing new, a color masked to RGB and one of the wrong size ignored,
   an ng client sees a classic user's color, and a user who chose none
-  drawn in their highest colored role's), `banner.rs` (the banner push after the agreement, and a
+  drawn in their highest colored role's), `pronouns.rs` (pronouns
+  set with `/pronouns` on a server built from a real config: a
+  `pronouns:` line in Get User Info for a reader whose encoding keeps
+  the value, in Mac Roman and in UTF-8, and no line, the text as it
+  was, for someone with none, a hand-edited value the server would not
+  have written and a server with `[server] pronouns = false`; nothing
+  else sent for a change; a value refused whole, a guest and `[extra]
+  pronouns = false` refused, the interval spent by a change alone, a
+  set priced as a User Change, and both account editors leaving
+  `[profile]` as it was; and on the ng wire, `pronouns` on the `user`
+  object from the login reply on, a value set on either wire heard on
+  the other, a change a `user_changed` with no `account_changed` and no
+  seq skipped, and the `pronouns` request refused as the command is,
+  `not_available` where none are shown; `link.rs` has a ghost's), `banner.rs` (the banner push after the agreement, and a
   banner file fetched over HTXF once per login), `inbox.rs` (offline
   private messages across both wires: queue, flush at login, resync,
   blocks, retention, the sender's daily quota refusing only
@@ -843,7 +856,8 @@ sees what the server decides a minute or a day on without waiting for
 it, while its sockets and timers run in real time. The verifying
 side's identity state and registrars read it (`IdentityState`,
 `Registrars`; `IdentityState::clock` hands it to a test), and so do the
-registrar's routes; code moved onto it reads no other clock. Everything
+registrar's routes and the interval between an account's pronouns
+changes; code moved onto it reads no other clock. Everything
 else, the registrar's operator commands and enrollment included, is on
 real time. A new test that would sleep past
 a deadline in that code advances the clock instead. More of the server

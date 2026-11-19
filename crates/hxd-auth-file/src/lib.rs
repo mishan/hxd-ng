@@ -23,6 +23,9 @@
 //! login = true            # may the identity log in without the password
 //! allow_self_link = true  # may the user link with just the password
 //! reserve_name = false    # is the login name reserved as a display name (§9)
+//!
+//! [profile]               # the user's own, written by the server when they
+//! pronouns = "she/her"    # set it; at most 32 characters
 //! ```
 //!
 //! Identity links are written back with `toml_edit`, so comments and
@@ -82,6 +85,28 @@ struct AccountFile {
     extra: ExtraTable,
     #[serde(default)]
     identity: IdentityTable,
+    #[serde(default)]
+    profile: ProfileTable,
+}
+
+/// What the user says about themselves: set by the user alone.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTable {
+    /// Any value, so one of the wrong type is dropped like any other
+    /// the server would not have written.
+    pronouns: Option<toml::Value>,
+}
+
+impl ProfileTable {
+    /// The pronouns as written, and whether they may be shown.
+    fn pronouns(&self) -> Option<(String, bool)> {
+        let v = self.pronouns.as_ref()?;
+        Some(match v.as_str() {
+            Some(p) => (p.to_owned(), hxd_core::pronouns::valid(p)),
+            None => (v.to_string(), false),
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,6 +148,9 @@ struct ExtraTable {
     /// identity, as `can_detach` — the bootstrap guest cannot, since
     /// every change is decoded here and announced to everyone.
     set_avatar: Option<bool>,
+    /// May this account's pronouns be shown, and may it set them?
+    /// Default: a password or a linked identity, as `set_avatar`.
+    pronouns: Option<bool>,
     /// May this account redact, revoke, purge and read reports? Default:
     /// the disconnect_users (kick) bit (`docs/moderation.md` §2).
     moderate: Option<bool>,
@@ -187,8 +215,12 @@ impl AccountFile {
             .name
             .filter(|n| !hxd_core::nameless(n))
             .unwrap_or_else(|| login.clone());
+        // A hand edit the server would not have written is not shown,
+        // and costs the account nothing else (`audit` says so).
+        let pronouns = self.profile.pronouns().and_then(|(p, ok)| ok.then_some(p));
         let mut account = Account::new(login, name, has_password, identity, config);
         account.roles = self.roles;
+        account.pronouns = pronouns;
         account
     }
 
@@ -234,6 +266,7 @@ impl AccountFile {
             file_getinfo: x.file_getinfo,
             attach_news: x.attach_news,
             set_avatar: x.set_avatar,
+            pronouns: x.pronouns,
             moderate: x.moderate,
             can_spam: x.can_spam,
             manage_roles: x.manage_roles,
@@ -512,6 +545,16 @@ impl FileAuth {
                         let complaint = format!(
                             "{login}.toml: identity.fingerprint is not a valid fingerprint; \
                              identity login will ignore it"
+                        );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
+                    if let Some((p, false)) = f.profile.pronouns() {
+                        let complaint = format!(
+                            "{login}.toml: profile.pronouns {p:?} is not shown: 1 to {} \
+                             characters, with no line breaks, invisible characters, doubled \
+                             spaces or space at either end",
+                            hxd_core::pronouns::MAX_CHARS
                         );
                         tracing::warn!("{complaint}");
                         found.push(complaint);
@@ -973,6 +1016,32 @@ impl AccountAdmin for FileAuth {
             write_atomic(&path, &text).map_err(|e| failed(&e))?;
         }
         Ok(after)
+    }
+
+    fn write_pronouns(&self, login: &str, pronouns: Option<&str>) -> Result<Account, AdminError> {
+        self.edit_account(login, |doc| {
+            match pronouns {
+                Some(p) => {
+                    let item = &mut doc["profile"].or_insert(toml_edit::table())["pronouns"];
+                    // A comment on the value it replaces stays.
+                    let decor = item.as_value().map(|v| v.decor().clone());
+                    *item = toml_edit::value(p);
+                    if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
+                        *v.decor_mut() = decor;
+                    }
+                }
+                None => {
+                    if let Some(table) = doc.get_mut("profile").and_then(|t| t.as_table_like_mut())
+                    {
+                        table.remove("pronouns");
+                        if table.is_empty() {
+                            doc.remove("profile");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn roles(&self) -> Vec<RoleView> {
@@ -1842,6 +1911,38 @@ mod tests {
     }
 
     #[test]
+    fn pronouns_are_written_under_profile_keeping_the_files_comments() {
+        let (td, auth) = backend();
+        let before = "# Alice's account\nname = \"Alice\"\npassword = \"pw\" # keep\n\n\
+                      [extra]\npronouns = true # mine\n";
+        write(td.path(), "alice.toml", before);
+        let read = || std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
+
+        let a = auth.write_pronouns("alice", Some("she/her")).unwrap();
+        assert_eq!(a.pronouns.as_deref(), Some("she/her"));
+        let text = read();
+        assert!(text.starts_with(before), "{text}");
+        assert!(text.contains("[profile]\npronouns = \"she/her\""), "{text}");
+        assert_eq!(
+            auth.lookup("alice").unwrap().pronouns.as_deref(),
+            Some("she/her")
+        );
+        // A comment on the value outlives a new one.
+        write(
+            td.path(),
+            "alice.toml",
+            &text.replace("\"she/her\"", "\"she/her\" # hers"),
+        );
+        auth.write_pronouns("alice", Some("they/them")).unwrap();
+        let text = read();
+        assert!(text.contains("pronouns = \"they/them\" # hers"), "{text}");
+
+        let a = auth.write_pronouns("alice", None).unwrap();
+        assert_eq!(a.pronouns, None);
+        assert_eq!(read(), before);
+    }
+
+    #[test]
     fn identity_link_round_trip_preserves_comments() {
         let (td, auth) = backend();
         write(
@@ -2127,8 +2228,21 @@ mod tests {
             "typo.toml",
             "password = \"pw\"\n[access]\nsend_mesgs = true\n",
         );
+        // Pronouns the server would not have written: not shown, and the
+        // account is as good as ever otherwise.
+        write(
+            td.path(),
+            "forged.toml",
+            "password = \"pw\"\n[profile]\npronouns = \"she/her\\r   login: admin\"\n",
+        );
         let said = auth.audit();
-        assert_eq!(said.len(), 5, "{said:?}");
+        assert_eq!(said.len(), 6, "{said:?}");
+        assert!(
+            said.iter()
+                .any(|s| s.starts_with("forged.toml") && s.contains("profile.pronouns")),
+            "{said:?}"
+        );
+        assert_eq!(auth.lookup("forged").unwrap().pronouns, None);
         assert!(
             said.iter()
                 .any(|s| s.starts_with("kiosk.toml")
@@ -2169,7 +2283,13 @@ mod tests {
             "password = \"pw\"\n[identity]\nfingerprint = \"6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0\"\n\
              login = false\n",
         );
-        for name in ["broken.toml", "orphan.toml", "Alice.toml", "typo.toml"] {
+        for name in [
+            "broken.toml",
+            "orphan.toml",
+            "Alice.toml",
+            "typo.toml",
+            "forged.toml",
+        ] {
             std::fs::remove_file(td.path().join(name)).unwrap();
         }
         assert!(auth.audit().is_empty());
@@ -2774,6 +2894,7 @@ mod tests {
             ("[role.r]\nextra = { can_detach = true }\n", "one person"),
             ("[role.r]\nextra = { inbox = true }\n", "one person"),
             ("[role.r]\nextra = { personal = true }\n", "one person"),
+            ("[role.r]\nextra = { pronouns = true }\n", "one person"),
             ("[role.r]\nextra = { flying = true }\n", "no [extra] key"),
             ("[role.Mods]\n", "lowercase"),
             ("[role.-mods]\n", "starting with"),
