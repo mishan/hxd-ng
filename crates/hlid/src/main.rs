@@ -31,7 +31,8 @@
 //!              an attestation from a registrar, put into the card
 //! hlid revoke  --registrar HOST (--device-cert FILE | --device-pub HEX) [--reason R] [--by-device]
 //! hlid revoke  --registrar HOST --identity-revoke --yes
-//! hlid rotate  --registrar HOST --to SUCCESSOR_KEY
+//! hlid rotate  --registrar HOST --to SUCCESSOR_KEY [--next-key FILE]
+//!              hand over, committing the successor to a key of its own
 //! hlid backup  --registrar HOST [--recovery | --delete [--recovery]]
 //!              the identity key sealed under a passphrase or a recovery code
 //! hlid restore --registrar HOST --handle S [--recovery]
@@ -119,7 +120,7 @@ fn usage() -> ! {
         "  hlid register --registrar HOST|URL --handle S [--proof CODE] [--successor-commit [--successor-key FILE]] [--identity K] [--card FILE] [--no-put]\n",
         "  hlid revoke --registrar HOST|URL (--device-cert FILE | --device-pub HEX) [--reason lost|stolen|retired] [--by-device]\n",
         "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
-        "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--identity K]\n",
+        "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--next-key FILE] [--identity K]\n",
         "  hlid backup --registrar HOST|URL [--recovery] [--delete] [--identity K] [--password-file F | --password-stdin]\n",
         "  hlid restore --registrar HOST|URL --handle S [--recovery] [--name S] (--password-file F | --password-stdin)\n",
         "\n",
@@ -155,9 +156,13 @@ fn usage() -> ! {
         "publishes the card there. --successor-commit makes a successor identity\n",
         "key (successor.key beside the identity key) and commits the card to it,\n",
         "which is what lets `hlid rotate` move your names to it later and stops a\n",
-        "thief with your identity key from moving them anywhere else. `revoke`\n",
-        "publishes a device's revocation, or with --identity-revoke the\n",
-        "identity's own, which is final.\n",
+        "thief with your identity key from moving them anywhere else. `rotate`\n",
+        "commits the successor the same way, inside the rotation both keys sign:\n",
+        "it makes the successor's own successor key before it signs (--next-key;\n",
+        "by default successor.next.key for --to successor.key). A rerun after a\n",
+        "failed or unanswered post passes the same --next-key, or none, so the same\n",
+        "key is reused. `revoke` publishes a device's revocation, or with\n",
+        "--identity-revoke the identity's own, which is final.\n",
         "\n",
         "`hlid backup` seals the identity key under a passphrase and keeps it at\n",
         "the registrar, which cannot open it; --recovery seals it under a new\n",
