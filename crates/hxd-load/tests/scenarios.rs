@@ -558,12 +558,8 @@ async fn a_cut_inside_the_grace_shows_nothing_and_one_past_it_recovers() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_addr = a_tls.local_addr().unwrap();
-    // A port for the proxy, free again by the time the run binds it.
-    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = proxy.local_addr().unwrap();
     let a_peer = format!(
         "grace = 2\n[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
          key = \"{}\"\naccount = \"link-bb\"\n",
@@ -596,7 +592,7 @@ async fn a_cut_inside_the_grace_shows_nothing_and_one_past_it_recovers() {
     i.grace = 2;
     i.recover = 20.0;
     i.between = 0.5;
-    let report = hxd_load::run(s).await.unwrap();
+    let report = hxd_load::run_on(s, Some(proxy)).await.unwrap();
     assert_clean(&report);
     assert_eq!(report.checks["link.recovered"].held, 2);
     assert_eq!(report.checks["link.grace_held"].held, 1);
@@ -616,11 +612,8 @@ async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
     let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
     let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_addr = a_tls.local_addr().unwrap();
-    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = proxy.local_addr().unwrap();
     let accept = |name: &str, seed: u8| {
         format!(
             "[[link.peer]]\nname = \"{name}\"\naccept = true\nprotection = \"key\"\n\
@@ -689,7 +682,7 @@ async fn a_stalled_peer_is_dropped_and_costs_the_room_nothing() {
             false
         }
     });
-    let report = hxd_load::run(s).await.unwrap();
+    let report = hxd_load::run_on(s, Some(proxy)).await.unwrap();
     done.store(true, std::sync::atomic::Ordering::Relaxed);
     assert_clean(&report);
     assert!(report.checks["link.contained"].held == 1);
@@ -823,11 +816,8 @@ async fn requests_across_a_slowed_link_take_its_round_trip() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let a_tls = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a_addr = a_tls.local_addr().unwrap();
-    let listen = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = proxy.local_addr().unwrap();
     let features = r#"features = ["chat", "msgs", "info"]"#;
     let a_peer = format!(
         "[[link.peer]]\nname = \"bb\"\naccept = true\nprotection = \"key\"\n\
@@ -859,7 +849,7 @@ async fn requests_across_a_slowed_link_take_its_round_trip() {
     s.requests.rate = 10.0;
     s.requests.step = 1.0;
     s.requests.peer_latency_ms = Some(150);
-    let report = hxd_load::run(s).await.unwrap();
+    let report = hxd_load::run_on(s, Some(proxy)).await.unwrap();
     assert_clean(&report);
     let msg = &report.ops["request.msg"];
     assert!(msg.count > 0 && msg.p50_ms >= 300.0, "{}", report.summary());

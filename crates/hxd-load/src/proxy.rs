@@ -53,9 +53,16 @@ impl Proxy {
         let listener = TcpListener::bind(listen)
             .await
             .map_err(|e| format!("proxy {listen}: {e}"))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| format!("proxy {listen}: {e}"))?;
+        Proxy::on(listener, upstream, latency).map_err(|e| format!("proxy {listen}: {e}"))
+    }
+
+    /// A proxy on a listener already bound, to `upstream`.
+    pub fn on(
+        listener: TcpListener,
+        upstream: SocketAddr,
+        latency: Duration,
+    ) -> std::io::Result<Proxy> {
+        let addr = listener.local_addr()?;
         let (state, rx) = watch::channel(State {
             open: true,
             latency,

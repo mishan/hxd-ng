@@ -134,6 +134,16 @@ impl Rng {
 
 /// Run a scenario to the end and report on it.
 pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
+    run_on(scenario, None).await
+}
+
+/// `run`, with `[target.proxy]` on `listener` rather than its `listen`:
+/// a port bound and then let go so the run can bind it again may be taken
+/// by anything else on the host meanwhile.
+pub async fn run_on(
+    scenario: Scenario,
+    listener: Option<tokio::net::TcpListener>,
+) -> Result<report::Report, String> {
     scenario.check()?;
     let started = SystemTime::now();
     let ctx = Ctx::new(scenario);
@@ -143,11 +153,22 @@ pub async fn run(scenario: Scenario) -> Result<report::Report, String> {
             logs.push((s.name.clone(), target::LogTail::start(path)?));
         }
     }
-    let proxy = match &ctx.scenario.target.proxy {
-        Some(p) => Some(
+    let proxy = match (&ctx.scenario.target.proxy, listener) {
+        (Some(p), Some(l)) => {
+            let at = l
+                .local_addr()
+                .map_err(|e| format!("proxy {}: {e}", p.listen))?;
+            if at != p.listen {
+                return Err(format!("proxy listener on {at}, not {}", p.listen));
+            }
+            let latency = Duration::from_millis(p.latency_ms);
+            Some(proxy::Proxy::on(l, p.upstream, latency).map_err(|e| format!("proxy {at}: {e}"))?)
+        }
+        (Some(p), None) => Some(
             proxy::Proxy::start(p.listen, p.upstream, Duration::from_millis(p.latency_ms)).await?,
         ),
-        None => None,
+        (None, Some(_)) => return Err("a proxy listener without [target.proxy]".into()),
+        (None, None) => None,
     };
     let before = links_up(&ctx).await?;
 
