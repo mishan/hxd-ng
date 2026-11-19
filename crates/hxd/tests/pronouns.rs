@@ -278,10 +278,11 @@ async fn a_value_is_refused_whole_and_only_a_change_made_waits_its_turn() {
     }
     assert_eq!(s.file("alice"), before);
 
-    // A line ending after the value is the message's, not the value's.
+    // Space before the value and a line ending after it are the
+    // message's, not the value's, as for every command.
     // And none of the refusals spent the account's turn.
     assert_eq!(
-        said(&mut alice, s.system(), "/pronouns they/them\r").await,
+        said(&mut alice, s.system(), "/pronouns \tthey/them\r").await,
         "ok: your pronouns are they/them"
     );
     let answer = said(&mut alice, s.system(), "/pronouns she/they").await;

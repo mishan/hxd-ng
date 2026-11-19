@@ -2189,8 +2189,15 @@ async fn dispatch(
         "pronouns" => match req.params.get("pronouns") {
             Some(v @ (Value::String(_) | Value::Null)) => {
                 let (uid, value) = (state.uid, v.as_str().map(str::to_owned));
+                // As the session is when it asks, so one that took its uid
+                // while this waited is not the one set for.
+                let serial = ctx.core.session_serial(uid).unwrap_or_default();
                 use hxd_core::pronouns::PronounsError as E;
-                match off_reactor(&ctx.core, move |c| c.set_pronouns(uid, value.as_deref())).await {
+                match off_reactor(&ctx.core, move |c| {
+                    c.set_pronouns(uid, serial, value.as_deref())
+                })
+                .await
+                {
                     Some(Ok(_)) => reply_ok(req.id, json!({})),
                     Some(Err(E::Off)) => reply_err(
                         req.id,

@@ -82,22 +82,35 @@ impl Core {
         r.pronouns_shown(r.users.get(&uid)?)
     }
 
-    /// Set session `uid`'s account's pronouns, or clear them with
-    /// `None`. A value is refused, never cut. Answers whether they
+    /// Set the account's pronouns of session `uid`, while it is still
+    /// the session with `serial`, or clear them with `None`. A value is refused, never cut. Answers whether they
     /// changed: setting what is there writes nothing and spends no turn.
     /// Store I/O, so off the reactor.
-    pub fn set_pronouns(&self, uid: Uid, value: Option<&str>) -> Result<bool, PronounsError> {
+    pub fn set_pronouns(
+        &self,
+        uid: Uid,
+        serial: u64,
+        value: Option<&str>,
+    ) -> Result<bool, PronounsError> {
         let admin = self.admin.as_deref().ok_or(PronounsError::Off)?;
-        let (login, account, mask, serial) = {
+        if value.is_some_and(|v| !valid(v)) {
+            return Err(PronounsError::BadValue);
+        }
+        // Read with account writes held, so the account cannot change
+        // between the checks and the write; a mask may, and the rows
+        // told after it show only what the mask then allows.
+        let _writing = self.begin_account_write();
+        let (login, account, mask) = {
             let r = self.roster.lock().unwrap();
             // What is kept may be taken down whether or not it is shown.
             if r.pronouns_off && value.is_some() {
                 return Err(PronounsError::Off);
             }
-            let s = r.users.get(&uid).ok_or(PronounsError::NotAllowed)?;
+            let s = r.users.get(&uid).filter(|s| s.serial == serial);
+            let s = s.ok_or(PronounsError::NotAllowed)?;
             let account = s.account.as_deref().filter(|_| !s.system);
             let account = account.ok_or(PronounsError::NotAllowed)?;
-            (s.login.clone(), account.clone(), s.mask, s.serial)
+            (s.login.clone(), account.clone(), s.mask)
         };
         // A shared login keeps nothing of anyone's, whatever its file
         // says. Clearing is never refused to the account's own user: what
@@ -106,21 +119,7 @@ impl Core {
         if !account.is_person() || login == "guest" || (value.is_some() && !x.pronouns) {
             return Err(PronounsError::NotAllowed);
         }
-        if value.is_some_and(|v| !valid(v)) {
-            return Err(PronounsError::BadValue);
-        }
-        let _writing = self.begin_account_write();
-        // As it is now, from the session that asked: another of the
-        // account may have changed it while this one waited.
-        let now_set = {
-            let r = self.roster.lock().unwrap();
-            let s = r.users.get(&uid).filter(|s| s.serial == serial);
-            s.ok_or(PronounsError::NotAllowed)?
-                .account
-                .as_ref()
-                .and_then(|a| a.pronouns.clone())
-        };
-        if now_set.as_deref() == value {
+        if account.pronouns.as_deref() == value {
             // A value kept but not shown, which the server would not have
             // written, is still taken down; nothing shown changes.
             if value.is_none() {

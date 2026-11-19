@@ -382,7 +382,7 @@ impl Core {
     fn command_pronouns(&self, from: Uid, rest: &str) -> String {
         let rest = rest.strip_suffix('\n').unwrap_or(rest);
         let rest = rest.strip_suffix('\r').unwrap_or(rest);
-        let value = match rest.trim_start_matches(' ') {
+        let value = match rest.trim_start() {
             "" if !self.pronouns_enabled() => {
                 return "ok: this server shows no pronouns; /pronouns clear removes any your \
                         account keeps"
@@ -402,7 +402,8 @@ impl Core {
             return "error: slow down".into();
         }
         use crate::pronouns::PronounsError as E;
-        match self.set_pronouns(from, value) {
+        let serial = self.session_serial(from).unwrap_or_default();
+        match self.set_pronouns(from, serial, value) {
             Ok(_) => match value {
                 Some(p) => format!("ok: your pronouns are {p}"),
                 None => "ok: cleared".into(),
