@@ -2651,14 +2651,14 @@ async fn login_phase(
         system: false,
         transport,
     };
-    // A key revoked after the tunnel authenticated: `attach` refuses it,
+    // A key refused after the tunnel authenticated: `attach` refuses it,
     // and asking first only buys the right words.
-    let revoked = attach
+    let refused = attach
         .transport
         .identity
         .as_ref()
-        .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
-    let attached = if revoked {
+        .and_then(|t| ctx.core.key_refusal(&t.fingerprint, &t.device));
+    let attached = if refused.is_some() {
         None
     } else {
         ctx.core.attach(attach)
@@ -2667,10 +2667,10 @@ async fn login_phase(
         reply_error(
             tx,
             f.trans,
-            if revoked {
-                "This key is revoked on this server."
-            } else {
-                "Server full."
+            match refused {
+                Some(hxd_core::KeyRefusal::Revoked) => "This key is revoked on this server.",
+                Some(hxd_core::KeyRefusal::Unrevoked) => "This key is not admitted here.",
+                None => "Server full.",
             },
         );
         return None;

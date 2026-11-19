@@ -1350,7 +1350,9 @@ impl IdentityState {
         }
         self.finish_rotations(Some(&fingerprint));
         let device = Fingerprint::of(&cert.device);
-        if self.core.is_revoked(&fingerprint.0, &device.0) {
+        // A freeze, or a rotation with no anchors to keep it, is refused
+        // too, but by the records below, which say which it is.
+        if self.core.key_refusal(&fingerprint.0, &device.0) == Some(hxd_core::KeyRefusal::Revoked) {
             debug!(
                 fingerprint = %fingerprint.short(),
                 device = %device.short(),
@@ -1833,7 +1835,7 @@ impl IdentityState {
             for (from, to, record) in rotations {
                 this.accept_rotation(from, to, "a registrar's records", Some(&record));
                 if this.anchors.is_none() {
-                    refused.identities.insert(from.0);
+                    refused.unrevoked.insert(from.0);
                 }
             }
             // Here too: installing it drops what newly revoked devices

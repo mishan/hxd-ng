@@ -60,11 +60,25 @@ pub struct Published {
     /// The identities whose records this list was made from. Only for
     /// those does a key missing from it mean the key is not refused.
     pub covered: HashSet<[u8; 32]>,
+    /// Identities refused without being revoked: frozen, which can be
+    /// lifted, or rotated away from with no anchors here to refuse them
+    /// by. A resume of one of their sessions is not told `revoked`, but
+    /// their push registrations go as a revoked identity's do.
+    pub unrevoked: HashSet<[u8; 32]>,
 }
 
 impl Published {
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+        self.unrevoked.contains(identity) || self.revokes(identity, device)
+    }
+
+    fn revokes(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
         self.identities.contains(identity) || self.devices.contains(&(*identity, *device))
+    }
+
+    /// Is every device of `identity` refused, revoked or not?
+    fn refuses_identity(&self, identity: &[u8; 32]) -> bool {
+        self.identities.contains(identity) || self.unrevoked.contains(identity)
     }
 
     fn refuses(&self, tag: &IdentityTag) -> bool {
@@ -72,7 +86,7 @@ impl Published {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.identities.is_empty() && self.devices.is_empty()
+        self.identities.is_empty() && self.devices.is_empty() && self.unrevoked.is_empty()
     }
 }
 
@@ -119,8 +133,7 @@ impl Refused {
             (self.local.identities.contains(&i) || self.rotated.contains(&i))
                 .then_some(Unrevoked::LocalIdentity(i)),
             self.published
-                .identities
-                .contains(&i)
+                .refuses_identity(&i)
                 .then_some(Unrevoked::PublishedIdentity(i)),
             self.published
                 .devices
@@ -143,7 +156,7 @@ impl Refused {
                 !self.local.identities.contains(i) && !self.rotated.contains(i)
             }
             Unrevoked::PublishedDevice(i, d) => p.covered.contains(i) && !p.is_revoked(i, d),
-            Unrevoked::PublishedIdentity(i) => p.covered.contains(i) && !p.identities.contains(i),
+            Unrevoked::PublishedIdentity(i) => p.covered.contains(i) && !p.refuses_identity(i),
         }
     }
 
@@ -152,12 +165,41 @@ impl Refused {
             || self.published.is_revoked(identity, device)
             || self.rotated.contains(identity)
     }
+
+    fn refusal(&self, identity: &[u8; 32], device: &[u8; 32]) -> Option<KeyRefusal> {
+        if self.local.is_revoked(identity, device)
+            || self.published.revokes(identity, device)
+            || self.rotated.contains(identity)
+        {
+            Some(KeyRefusal::Revoked)
+        } else {
+            self.published
+                .unrevoked
+                .contains(identity)
+                .then_some(KeyRefusal::Unrevoked)
+        }
+    }
+}
+
+/// Why a key is refused here, for the words a refused login is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// Revoked, or rotated away from.
+    Revoked,
+    /// Refused by what a registrar publishes without being revoked
+    /// ([`Published::unrevoked`]): the records say why.
+    Unrevoked,
 }
 
 impl Core {
     /// Is this identity, or this device of it, revoked here?
     pub fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
         self.revoked.read().unwrap().is_revoked(identity, device)
+    }
+
+    /// Why [`Self::is_revoked`] refuses this identity or device, if it does.
+    pub fn key_refusal(&self, identity: &[u8; 32], device: &[u8; 32]) -> Option<KeyRefusal> {
+        self.revoked.read().unwrap().refusal(identity, device)
     }
 
     /// Does the current list refuse this session's transport identity?
@@ -209,7 +251,7 @@ impl Core {
         // deletes may wait on registrations.
         let ended = match list.is_empty() {
             true => Vec::new(),
-            false => self.end_revoked(|tag| list.refuses(tag)),
+            false => self.end_revoked(|tag| list.refuses(tag), |_| true),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
         self.take_revoked(keys.chain(ids).collect());
@@ -247,7 +289,8 @@ impl Core {
                 .collect();
             let ids = list
                 .identities
-                .difference(&refused.published.identities)
+                .union(&list.unrevoked)
+                .filter(|i| !refused.published.refuses_identity(i))
                 .copied()
                 .collect();
             refused.published = list.clone();
@@ -261,7 +304,10 @@ impl Core {
         // deletes may wait on registrations.
         let ended = match list.is_empty() {
             true => Vec::new(),
-            false => self.end_revoked(|tag| list.refuses(tag)),
+            false => self.end_revoked(
+                |tag| list.refuses(tag),
+                |tag| list.revokes(&tag.fingerprint, &tag.device),
+            ),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
         self.take_revoked(keys.chain(ids).collect());
@@ -286,7 +332,7 @@ impl Core {
                     .as_ref()
                     .is_some_and(|tag| tag.fingerprint == identity)
             },
-            false,
+            |_| false,
         )
     }
 
@@ -321,34 +367,48 @@ impl Core {
                         .as_ref()
                         .is_some_and(|t| t.fingerprint == identity)
             },
-            false,
+            |_| false,
         )
     }
 
-    /// The sessions `list` refuses, ended. Run after the list is written,
-    /// and with nothing else held: an `attach` from then on is refused,
-    /// and one that got in before is on the roster to be found here.
-    fn end_revoked(&self, refuses: impl Fn(&IdentityTag) -> bool) -> Vec<(Uid, String)> {
+    /// The sessions `list` refuses, ended, those it `revokes` as revoked.
+    /// Run after the list is written, and with nothing else held: an
+    /// `attach` from then on is refused, and one that got in before is on
+    /// the roster to be found here.
+    fn end_revoked(
+        &self,
+        refuses: impl Fn(&IdentityTag) -> bool,
+        revokes: impl Fn(&IdentityTag) -> bool,
+    ) -> Vec<(Uid, String)> {
         self.end_sessions(
             |s| s.info.transport.identity.as_ref().is_some_and(&refuses),
-            true,
+            |s| s.info.transport.identity.as_ref().is_some_and(&revokes),
         )
     }
 
     /// End the sessions `ends` picks, as kicked; a resume of one is told
-    /// so where `told` (`docs/hotline-ng.md` §6.2).
-    fn end_sessions(&self, ends: impl Fn(&UserSession) -> bool, told: bool) -> Vec<(Uid, String)> {
+    /// it was revoked where `as_revoked` (`docs/hotline-ng.md` §6.2).
+    fn end_sessions(
+        &self,
+        ends: impl Fn(&UserSession) -> bool,
+        as_revoked: impl Fn(&UserSession) -> bool,
+    ) -> Vec<(Uid, String)> {
         let mut r = self.roster.lock().unwrap();
-        let ended: Vec<(Uid, String)> = r
+        let ended: Vec<(Uid, String, bool)> = r
             .users
             .iter()
             .filter(|(_, s)| ends(s))
-            .map(|(uid, s)| (*uid, s.info.nick.clone()))
+            .map(|(uid, s)| (*uid, s.info.nick.clone(), as_revoked(s)))
             .collect();
-        for (uid, nick) in &ended {
-            info!(uid, nick = %nick, "ending a session whose key is revoked");
-            if told {
-                r.remember_end(*uid, crate::ending::EndedBy::Kicked);
+        for (uid, nick, revoked) in &ended {
+            info!(uid, nick = %nick, revoked = *revoked, "ending a session its key no longer admits");
+            // On its way out, as a kicked session is: no kick or device
+            // act takes it for a target meanwhile.
+            if let Some(sess) = r.users.get_mut(uid) {
+                sess.kicked = true;
+            }
+            if *revoked {
+                r.remember_end(*uid, crate::ending::EndedBy::Revoked);
             }
             r.send_to(*uid, Event::Kicked);
             r.export_leaving(*uid);
@@ -357,6 +417,9 @@ impl Core {
             }
         }
         ended
+            .into_iter()
+            .map(|(uid, nick, _)| (uid, nick))
+            .collect()
     }
 }
 

@@ -895,14 +895,14 @@ async fn handle_login(
         // cannot ask to be the server.
         system: false,
     };
-    // A key revoked after this socket authenticated (`crate::identity`
+    // A key refused after this socket authenticated (`crate::identity`
     // refuses it at auth; this is the socket that got in first). `attach`
     // refuses it too, so asking here only buys the right error.
-    let revoked = attach
+    let refused = attach
         .transport
         .identity
         .as_ref()
-        .is_some_and(|t| ctx.core.is_revoked(&t.fingerprint, &t.device));
+        .and_then(|t| ctx.core.key_refusal(&t.fingerprint, &t.device));
     let attach_friendships = attach.transport.friendships;
     let attach_guest_identities = attach.transport.guest_identities;
     let replies = attach.transport.replies;
@@ -914,16 +914,18 @@ async fn handle_login(
         .as_ref()
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let attached = if revoked {
+    let attached = if refused.is_some() {
         None
     } else {
         ctx.core.attach(attach)
     };
     let Some((uid, events)) = attached else {
-        let (code, text) = if revoked {
-            ("revoked", "This key is revoked on this server.")
-        } else {
-            ("server_full", "Server full.")
+        let (code, text) = match refused {
+            Some(hxd_core::KeyRefusal::Revoked) => {
+                ("revoked", "This key is revoked on this server.")
+            }
+            Some(hxd_core::KeyRefusal::Unrevoked) => ("denied", "This key is not admitted here."),
+            None => ("server_full", "Server full."),
         };
         let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
         return None;
@@ -1295,6 +1297,9 @@ fn resume_gone(id: u64, ended: Option<hxd_core::EndedBy>) -> String {
             "This device was ended by another of your devices.",
         ),
         Some(hxd_core::EndedBy::Kicked) => reply_err(id, "kicked", "You were disconnected."),
+        Some(hxd_core::EndedBy::Revoked) => {
+            reply_err(id, "revoked", "This key is revoked on this server.")
+        }
         Some(hxd_core::EndedBy::Banned(hit)) => reply_err_banned(id, &hit),
         None => reply_err(id, "session_expired", "Session expired; log in again."),
     }

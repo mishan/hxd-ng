@@ -20,10 +20,25 @@ pub const ENDINGS: usize = 4096;
 pub enum EndedBy {
     /// One of its own person's devices ended it (`device_end`).
     Ended,
-    /// A kick, or its key's revocation.
+    /// A kick.
     Kicked,
+    /// Its identity or device key was revoked here, which a login with
+    /// that key is told too.
+    Revoked,
     /// A kick with a ban, or a ban, that stands now.
     Banned(crate::ban::BanHit),
+}
+
+impl EndedBy {
+    /// Which of two endings a resume is told: the one that says most.
+    fn rank(&self) -> u8 {
+        match self {
+            EndedBy::Ended => 0,
+            EndedBy::Kicked => 1,
+            EndedBy::Revoked => 2,
+            EndedBy::Banned(_) => 3,
+        }
+    }
 }
 
 /// What a ban of the session would match, kept so its resume can tell a
@@ -46,8 +61,13 @@ pub(crate) struct Endings {
 
 impl Endings {
     fn record(&mut self, key: (Uid, u64), why: EndedBy, who: Who, now: Instant) {
-        if self.by.insert(key, (why, who, now)).is_none() {
-            self.order.push_back(key);
+        match self.by.get_mut(&key) {
+            Some(had) if had.0.rank() >= why.rank() => {}
+            Some(had) => (had.0, had.1) = (why, who),
+            None => {
+                self.by.insert(key, (why, who, now));
+                self.order.push_back(key);
+            }
         }
         while self.order.len() > ENDINGS {
             if let Some(old) = self.order.pop_front() {
@@ -107,10 +127,11 @@ impl Core {
             let r = self.roster.lock().unwrap();
             r.endings.get((uid, serial), within, Instant::now())?
         };
-        if why != EndedBy::Kicked {
+        if !matches!(why, EndedBy::Kicked | EndedBy::Revoked) {
             return Some(why);
         }
-        // A kick's ban is placed after it: asked now, as a login would be.
+        // A kick's ban is placed after it, and a revocation may come
+        // between the two: asked now, as a login would be.
         let banned = who.addr.and_then(|a| self.address_banned(a)).or_else(|| {
             self.person_banned(
                 Some(&who.login),
@@ -172,5 +193,24 @@ mod tests {
         );
         e.forget(Duration::from_secs(60), later);
         assert!(e.by.is_empty() && e.order.is_empty(), "forgotten");
+    }
+
+    #[test]
+    fn of_two_endings_the_one_that_says_more_is_kept() {
+        use EndedBy::*;
+        let t0 = Instant::now();
+        let hour = Duration::from_secs(3600);
+        for (first, then, kept) in [
+            (Revoked, Kicked, Revoked),
+            (Kicked, Revoked, Revoked),
+            (Kicked, Ended, Kicked),
+        ] {
+            let mut e = Endings::default();
+            e.record((1, 1), first.clone(), who(), t0);
+            e.record((1, 1), then.clone(), who(), t0);
+            let why = e.get((1, 1), hour, t0).map(|(why, _)| why);
+            assert_eq!(why, Some(kept), "{first:?} then {then:?}");
+            assert_eq!(e.order.len(), 1);
+        }
     }
 }

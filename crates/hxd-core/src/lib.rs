@@ -99,7 +99,7 @@ pub use push::{Device, DeviceId, MemoryDevices, PushStore, Registered};
 pub use reaction::{Asked, ReactError, ReactionChange, ReactionKey, ReactionPolicy, Reactions};
 pub use relationships::{MemoryRelationships, RelationId, RelationshipStore, SentOn};
 pub use reply::Reply;
-pub use revoked::{Published, Revocations};
+pub use revoked::{KeyRefusal, Published, Revocations};
 pub use rooms::{
     MemoryRooms, PartReason, Room, RoomEdit, RoomError, RoomFile, RoomPolicy, RoomStore, RoomView,
     Topic,

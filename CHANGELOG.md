@@ -124,11 +124,16 @@ as AGENTS.md's "Releasing" describes it.
   `bad_request` rather than kicking the whole person.
 - An ng session kicked, banned, refused by a revocation or ended by
   another of its person's devices answers its `resume` with `kicked`,
-  `banned` (with the ban's reason and end) or `ended` rather than
-  `session_expired`, whether it was attached or detached, so a client
-  that missed the event stops instead of logging in again and undoing
-  it, coalescing on or off (docs/hotline-ng.md §6.2). A client that
-  knows none of the codes takes it as any other refused resume.
+  `banned` (with the ban's reason and end), `revoked` (as a login with
+  the key is) or `ended` rather than `session_expired`, whether it was
+  attached or detached, so a client that missed the event stops
+  instead of logging in again and undoing it, coalescing on or off
+  (docs/hotline-ng.md §6.2). A session ended by a freeze at its
+  registrar or a rotation of its identity is still `session_expired`,
+  and its next `/identity/auth` is refused `denied` or `rotated`, as
+  the records say, rather than `revoked`.
+  A client that knows none of the codes takes it as any other refused
+  resume.
 - Metrics: `hxd_roster_rows` counts the rows the user list shows,
   beside `hxd_sessions` (docs/metrics.md).
 - `hxd-load accounts --linked` links each account it writes to an
