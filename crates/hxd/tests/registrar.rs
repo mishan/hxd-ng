@@ -470,6 +470,141 @@ async fn token(s: &Server, id: &IdentityKey, dev: &DeviceKey, card: &[u8]) -> St
 }
 
 #[tokio::test]
+async fn a_card_a_held_rotation_would_not_take_is_refused_and_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"\nrotation_delay = 86400").await;
+    let (old, new, next, thief) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[3; 32]),
+        IdentityKey::from_seed(&[6; 32]),
+    );
+    let dev = DeviceKey::from_seed(&[102; 32]);
+    let mut req = request(&old, "alice");
+    req.successor = Some(commitment(&new));
+    assert_eq!(register(&s, req, &old).await.status, 200);
+    assert_eq!(register(&s, request(&new, "bobby"), &new).await.status, 200);
+    let rotated = Rotation {
+        identity: old.public(),
+        successor: new.public(),
+        time: now(),
+        next: Some(commitment(&next)),
+    }
+    .sign(&old, &new)
+    .unwrap();
+    let r = post(&s, "/registrar/records", json!({ "record": b64(&rotated) }))
+        .await
+        .json();
+    assert_eq!(r["published"], false, "{r}");
+
+    let card = |successor: Option<&IdentityKey>, at| {
+        let mut card = Card::new(&new, "Bob", at);
+        card.successor = successor.map(commitment);
+        card.sign(&new, vec![]).unwrap()
+    };
+    let plain = card(None, now());
+    let t = token(&s, &new, &dev, &plain).await;
+    let put = |card: Vec<u8>| {
+        let (addr, t) = (s.ng, t.clone());
+        async move {
+            http_as(
+                addr,
+                &addr.to_string(),
+                "PUT",
+                "/identity/card",
+                &[
+                    ("Authorization", &format!("Bearer {t}")),
+                    ("Content-Type", "application/cbor"),
+                ],
+                &card,
+            )
+            .await
+        }
+    };
+    let served = format!("/identity/card/{}", new.fingerprint());
+    // Naming another successor than the rotation's `next`: refused, and
+    // the card served is still the one before.
+    let stolen = card(Some(&thief), now() + 1);
+    let r = put(stolen.clone()).await;
+    assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+    let body = r.json();
+    assert_eq!(body["error"], "rotation_pending");
+    assert!(body["pending_until"].as_u64().is_some(), "{body}");
+    // Put by another identity's session, it is refused as another's card
+    // is, saying nothing of how this one stands.
+    let mut old_card = Card::new(&old, "Alice", now());
+    old_card.successor = Some(commitment(&new));
+    let old_card = old_card.sign(&old, vec![]).unwrap();
+    let theirs = token(&s, &old, &DeviceKey::from_seed(&[101; 32]), &old_card).await;
+    let r = http_as(
+        s.ng,
+        &s.ng.to_string(),
+        "PUT",
+        "/identity/card",
+        &[
+            ("Authorization", &format!("Bearer {theirs}")),
+            ("Content-Type", "application/cbor"),
+        ],
+        &stolen,
+    )
+    .await;
+    assert_eq!(
+        r.json()["error"],
+        "bad_card",
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // Shown at sign-in, it is a card the registrar will not take.
+    let r = auth_at(s.ng, &new, &dev, &stolen).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (401, json!("bad_card"))
+    );
+    assert_eq!(get(&s, &served).await.body, plain);
+    // Naming `next` is taken.
+    let named = card(Some(&next), now() + 2);
+    assert_eq!(put(named.clone()).await.status, 200);
+    assert_eq!(get(&s, &served).await.body, named);
+}
+
+#[tokio::test]
+async fn a_cached_card_the_successors_new_commitment_contradicts_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let (old, new, next, thief) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[3; 32]),
+        IdentityKey::from_seed(&[6; 32]),
+    );
+    // Shown at sign-in by a key the registrar does not know, the card is
+    // cached and its commitment left untaken.
+    let mut card = Card::new(&new, "Bob", now());
+    card.successor = Some(commitment(&thief));
+    let card = card.sign(&new, vec![]).unwrap();
+    token(&s, &new, &DeviceKey::from_seed(&[102; 32]), &card).await;
+    let path = format!("/identity/card/{}", new.fingerprint());
+    assert_eq!(get(&s, &path).await.body, card);
+
+    let mut req = request(&old, "alice");
+    req.successor = Some(commitment(&new));
+    assert_eq!(register(&s, req, &old).await.status, 200);
+    let rotated = Rotation {
+        identity: old.public(),
+        successor: new.public(),
+        time: now(),
+        next: Some(commitment(&next)),
+    }
+    .sign(&old, &new)
+    .unwrap();
+    let r = post(&s, "/registrar/records", json!({ "record": b64(&rotated) }))
+        .await
+        .json();
+    assert_eq!(r["published"], true, "{r}");
+    assert_eq!(get(&s, &path).await.status, 404);
+}
+
+#[tokio::test]
 async fn a_card_put_here_must_keep_the_registrars_commitment() {
     let dir = tempfile::tempdir().unwrap();
     let s = start(dir.path(), "signup = \"open\"").await;

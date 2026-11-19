@@ -175,7 +175,7 @@ pub struct HttpLimits {
     /// `POST /identity/challenge` one address may make a minute.
     pub challenges_per_minute: u32,
     /// `GET /avatars/{id}` one address may make a minute, and as many
-    /// `GET /emoji/{hash}` apart.
+    /// `GET /emoji/{hash}` and `GET /identity/card/<fp>` apart.
     pub avatar_fetches_per_minute: u32,
 }
 

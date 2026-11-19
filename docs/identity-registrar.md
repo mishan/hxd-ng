@@ -461,10 +461,18 @@ a rotation is pending, the identity it hands over records none, not even
 the key the rotation goes to, since the registrar cannot tell whose
 rotation it is, and the key it goes to records none but its `next`: a
 registration request that would make one is refused (`rotation_pending`,
-or as that identity's other requests are), and a card's commitment is
-not taken, though the card itself is accepted and served as any other
-(§6.4). A commitment recorded then could pin the identity to a thief's
-key for good, or have the rotation dropped at publication. That does not
+or as that identity's other requests are), and so is a card carrying
+one, put (`rotation_pending`) or shown at sign-in (`bad_card`), rather
+than served as the identity's card with a commitment the registrar does
+not hold. Otherwise a card of a frozen, revoked or rotated identity has
+its commitment left untaken, the card itself accepted and served as any
+other (§6.4). A card cached earlier that the registrar would now refuse,
+such as one of a successor naming another key than the `next` its
+rotation recorded, is no longer served. A residual: checking a card
+publishes no due rotation, so until the registrar's next write a card is
+still refused for a rotation that is due, with a `pending_until` already
+past. A commitment recorded then could pin the identity to a thief's key
+for good, or have the rotation dropped at publication. That does not
 stop whoever holds the successor's key from defeating the owner's
 rotation wherever it can write for the successor: by revoking the
 successor, or by rotating it on first, so that the owner's rotation is

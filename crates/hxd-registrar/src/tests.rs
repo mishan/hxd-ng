@@ -833,8 +833,17 @@ fn the_successor_of_a_held_rotation_commits_to_its_next_or_to_nothing() {
     );
     let mut card = Card::new(&new, "Bob", T + 10);
     card.successor = Some(commitment(&thief));
+    assert_eq!(
+        r.check_card(&card).unwrap_err(),
+        Refusal::RotationPending { until: T + DAY }
+    );
     r.note_card(&card).unwrap();
     assert_eq!(committed(&r), None);
+    // A card naming the rotation's `next`, or none, is taken as ever.
+    for successor in [Some(commitment(&next)), None] {
+        card.successor = successor;
+        assert!(r.check_card(&card).is_ok());
+    }
     // Published when its time comes, it commits the successor to `next`.
     assert!(records_of(&r, &new, T + DAY)
         .iter()
@@ -1034,6 +1043,12 @@ fn a_waiting_rotations_identity_commits_to_nothing() {
     );
     let mut card = Card::new(&old, "Alice", T + 20);
     card.successor = Some(commitment(&thiefs));
+    assert_eq!(
+        r.check_card(&card).unwrap_err(),
+        Refusal::RotationPending {
+            until: T + 10 + DAY
+        }
+    );
     r.note_card(&card).unwrap();
     assert_eq!(
         r.store.identity(&old.public()).unwrap().unwrap().commitment,

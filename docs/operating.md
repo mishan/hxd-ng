@@ -913,7 +913,7 @@ a window needs its seconds.
 | `http_connections_per_v6_48` | 64 | The same from one IPv6 /48's /64s together; at least `http_connections_per_addr` |
 | `ng_connections` | 4096 | Connections everyone holds to the ng port |
 | `challenges_per_minute` | 30 | `POST /identity/challenge`, per address |
-| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address, and `GET /emoji/{hash}` apart |
+| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address, and `GET /emoji/{hash}` and `GET /identity/card/<fp>` apart |
 
 #### Flood and spam
 

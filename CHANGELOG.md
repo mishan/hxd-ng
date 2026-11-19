@@ -151,7 +151,10 @@ as AGENTS.md's "Releasing" describes it.
   can destroy it there but not take it. `hxd registrar publish
   <fingerprint> --to <successor>` publishes a pending rotation to that
   successor at once, for a holder the operator has confirmed
-  (docs/identity-registrar.md §4.6, §5.4, §6.3, §8.2).
+  (docs/identity-registrar.md §4.6, §5.4, §6.3, §8.2). `GET
+  /identity/card/<fp>` is held per address to `[limits]
+  avatar_fetches_per_minute`, counted apart from the avatars and the
+  emoji.
 
 ### Fixed
 

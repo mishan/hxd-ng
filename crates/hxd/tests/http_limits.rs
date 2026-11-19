@@ -740,6 +740,28 @@ async fn an_address_fetches_so_many_avatars_a_minute() {
 }
 
 #[tokio::test]
+async fn an_address_fetches_so_many_cards_a_minute() {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path().display();
+    let server = start(
+        td.path(),
+        &format!("[identity]\nkey = \"{d}/server.key\"\n"),
+        "avatar_fetches_per_minute = 2",
+    )
+    .await;
+    let fp = IdentityKey::from_seed(&[1; 32]).fingerprint();
+    let path = format!("/identity/card/{fp}");
+    // No such card, so 404: counted all the same.
+    for _ in 0..2 {
+        assert_eq!(http(server.ng, "GET", &path, b"").await.status, 404);
+    }
+    let refused = http(server.ng, "GET", &path, b"").await;
+    assert_eq!(refused.status, 429);
+    assert!(retry_after(&refused) <= 30);
+    assert_eq!(refused.json()["error"], "rate_limited");
+}
+
+#[tokio::test]
 async fn failed_logins_made_at_once_are_held_to_the_limit() {
     // Each password spends its failure as it is let in, not once it has
     // been found wrong: otherwise every guess in flight at once passes a

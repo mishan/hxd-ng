@@ -1434,12 +1434,30 @@ impl Registrar {
     /// A card for an identity attested here must carry the commitment the
     /// registrar holds (§5.4). Called before the card is accepted.
     pub fn check_card(&self, card: &Card) -> Result<(), Refusal> {
-        match self.store.identity(&card.identity)? {
-            Some(row) if row.commitment.is_some() && card.successor != row.commitment => {
-                Err(Refusal::SuccessorMismatch)
+        if let Some(held) = self
+            .store
+            .identity(&card.identity)?
+            .and_then(|row| row.commitment)
+        {
+            if card.successor != Some(held) {
+                return Err(Refusal::SuccessorMismatch);
             }
-            _ => Ok(()),
+            return Ok(());
         }
+        // One `note_card` would not take while a rotation waits is
+        // refused, as `register` refuses it, rather than served as the
+        // identity's card with a commitment the registrar never holds.
+        if card.successor.is_some() {
+            if let Some(p) = self.store.pending(&card.identity)? {
+                return Err(Refusal::RotationPending {
+                    until: p.publish_at,
+                });
+            }
+            if let Some(until) = self.held_for(&card.identity, card.successor)? {
+                return Err(Refusal::RotationPending { until });
+            }
+        }
+        Ok(())
     }
 
     /// Record an accepted card's commitment, for an identity attested
