@@ -5521,9 +5521,13 @@ async fn a_session_detached_when_its_key_is_revoked_is_told_so_by_its_resume() {
         let (c, ok) = link_to_alice(ng, &p).await;
         let resume = json!({ "session": ok["session"], "token": ok["token"], "last_seq": 0 });
         drop(c);
-        while ctx.core.census().detached == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        timeout(Duration::from_secs(5), async {
+            while ctx.core.census().detached == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session never detached");
 
         let list = if identity {
             revoking(&[&p.id], &[])
