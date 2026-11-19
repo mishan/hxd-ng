@@ -114,8 +114,9 @@ pub struct Lookup {
     /// Each with its successor's too, since a predecessor can be named by
     /// two rotations to two keys, of which only one stands here.
     pub rotations: Vec<(Fingerprint, Fingerprint, Vec<u8>)>,
-    /// Some registrar that attested the identity has no list this
-    /// server can call current: `RegistrarsConfig::stale` decides.
+    /// Some registrar that attested the identity, or that a list is held
+    /// from, has no list this server can call current:
+    /// `RegistrarsConfig::stale` decides.
     pub stale: bool,
     /// The identity's lists were read, there was at least one, and every
     /// one from a registrar still trusted verified under its configured
@@ -782,8 +783,9 @@ mod tests {
     }
 
     /// A cache that cannot be read, or a trusted list in it that does not
-    /// verify, covers nobody: its silence is not a registrar's, and must
-    /// not lift a revocation it holds.
+    /// verify or was fetched under a key the operator has since replaced,
+    /// covers nobody: its silence is not a registrar's, and must not lift
+    /// a revocation it holds.
     #[test]
     fn records_not_read_whole_cover_no_identity() {
         struct Unreadable;
@@ -811,10 +813,39 @@ mod tests {
                 },
             )
             .unwrap();
-        let caches: [Arc<dyn RecordCache>; 2] = [Arc::new(Unreadable), Arc::new(unverified)];
-        for cache in caches {
-            let (refused, _) = registrars(cache).refused(&[fp], false);
-            assert!(refused.covered.is_empty());
+        let (fetched_under, configured) = (ServerKey::from_seed(&[3; 32]), [4; 32]);
+        let replaced = hxd_core::identity_records::MemoryRecordCache::default();
+        let page = SignedList {
+            registrar: "hl.example".into(),
+            issued: 1,
+            expires: u64::MAX,
+            fingerprint: Some(fp.0),
+            since: None,
+            more: false,
+            entries: vec![],
+        }
+        .sign(ListKind::Records, &fetched_under);
+        replaced
+            .put(
+                &fp.0,
+                &CachedList {
+                    registrar: "hl.example".into(),
+                    pages: vec![page],
+                    keys: vec![(fetched_under.public(), None)],
+                    fetched: 1,
+                },
+            )
+            .unwrap();
+        let caches: [(Arc<dyn RecordCache>, Option<PublicKey>); 3] = [
+            (Arc::new(Unreadable), None),
+            (Arc::new(unverified), None),
+            (Arc::new(replaced), Some(configured)),
+        ];
+        for (cache, key) in caches {
+            let mut r = registrars(cache);
+            r.cfg.keys.extend(key.map(|k| ("hl.example".to_owned(), k)));
+            let (refused, _) = r.refused(&[fp], false);
+            assert!(refused.covered.is_empty(), "{key:?}");
         }
     }
 
