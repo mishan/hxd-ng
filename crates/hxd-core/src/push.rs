@@ -165,7 +165,8 @@ pub enum Registered {
 }
 
 /// The device registry. One implementation in memory, one in SQLite, one
-/// conformance suite over both ([`conformance`]).
+/// conformance suite over both ([`conformance`]). A read that leads to a
+/// delivery is filtered in `revoking`, which the gateways read through.
 pub trait PushStore: Send + Sync + 'static {
     /// Store `device`, replacing any row the same `(owner, devid)`
     /// already has — endpoint, keys, expiry and all.
@@ -313,13 +314,33 @@ pub trait PushStore: Send + Sync + 'static {
     fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError>;
 }
 
-/// A revoked key whose rows are still to be taken.
+/// A revoked key whose rows are still to be taken, by whose list it is
+/// revoked: the operator's lifts a key when it leaves it out, and a
+/// registrar's does not (`Refused::lifts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unrevoked {
-    /// A device, and the identity whose mailboxes its rows are in, where
-    /// the revocation names one.
-    Device(Option<[u8; 32]>, [u8; 32]),
-    Identity([u8; 32]),
+    /// A device the operator revoked: its rows in every mailbox.
+    LocalDevice([u8; 32]),
+    /// An identity the operator revoked, or one rotated away from.
+    LocalIdentity([u8; 32]),
+    /// A device an identity revoked at a registrar: its rows in that
+    /// identity's mailboxes.
+    PublishedDevice([u8; 32], [u8; 32]),
+    PublishedIdentity([u8; 32]),
+}
+
+impl Unrevoked {
+    fn take(&self, store: &dyn PushStore) -> Result<Vec<Device>, StoreError> {
+        match self {
+            Unrevoked::LocalDevice(d) => store.devices_revoke_device(None, &DeviceId::of_device(d)),
+            Unrevoked::PublishedDevice(i, d) => {
+                store.devices_revoke_device(Some(i), &DeviceId::of_device(d))
+            }
+            Unrevoked::LocalIdentity(i) | Unrevoked::PublishedIdentity(i) => {
+                store.devices_revoke_identity(i)
+            }
+        }
+    }
 }
 
 /// Why a device was not registered.
@@ -437,19 +458,16 @@ impl crate::roster::Core {
         let (registered, mut taken) = registered;
         // Asked once the row is stored, so a revocation either finds the
         // row to take or is found here.
-        let revoked = key
+        let pending = key
             .as_ref()
-            .is_some_and(|k| self.revoked.read().unwrap().refuses(k));
-        if let Some(k) = key.filter(|_| revoked && registered != Registered::Full) {
+            .and_then(|k| self.revoked.read().unwrap().pending_for(k));
+        let revoked = pending.is_some();
+        if let Some(k) = pending.filter(|_| registered != Registered::Full) {
             match store.unregister(&owner, &devid) {
                 Ok(row) => taken.extend(row),
                 Err(e) => {
                     tracing::warn!("push: forgetting a revoked device: {e}");
-                    store
-                        .pending
-                        .lock()
-                        .unwrap()
-                        .push(Unrevoked::Device(owner.fingerprint, k.device));
+                    self.take_revoked(vec![k]);
                 }
             }
         }
@@ -526,45 +544,40 @@ impl crate::roster::Core {
         }
     }
 
-    /// Forget the rows the keys now revoked here registered: each
-    /// device's, by device and, for a registrar's, its identity, and
-    /// each identity's devices'.
-    pub(crate) fn devices_revoked(
-        &self,
-        identities: &[[u8; 32]],
-        devices: &[(Option<[u8; 32]>, [u8; 32])],
-    ) {
-        let keys = devices
-            .iter()
-            .map(|(i, d)| Unrevoked::Device(*i, *d))
-            .chain(identities.iter().map(|i| Unrevoked::Identity(*i)));
-        self.take_revoked(keys.collect());
-    }
-
-    /// Take the rows of `keys` and of every key a store error left, and
-    /// keep for next time the keys it fails for again: a revoked key's
-    /// row must not outlive one failed delete. A key revoked no more is
-    /// forgotten, and the lists are held while the rows go, so a key
-    /// lifted meanwhile cannot take a registration made after.
-    fn take_revoked(&self, mut keys: Vec<Unrevoked>) {
+    /// Take the rows of `keys`, keys now revoked here, and of every key a
+    /// store error left. Each is pending, its rows hidden from the
+    /// gateways, until a delete succeeds or the key is lifted: a revoked
+    /// key's row must not outlive one failed delete. The lists are read
+    /// only to choose the keys, so no store call is made under them.
+    pub(crate) fn take_revoked(&self, keys: Vec<Unrevoked>) {
         let Some(store) = self.devices.as_ref() else {
             return;
         };
-        keys.append(&mut store.pending.lock().unwrap());
-        let refused = self.revoked.read().unwrap();
-        for key in keys.into_iter().filter(|k| refused.still_revokes(k)) {
-            let taken = match key {
-                Unrevoked::Device(i, d) => {
-                    store.devices_revoke_device(i.as_ref(), &DeviceId::of_device(&d))
+        let keys = {
+            let refused = self.revoked.read().unwrap();
+            let mut pending = store.pending.lock().unwrap();
+            for key in keys {
+                if !pending.contains(&key) {
+                    pending.push(key);
                 }
-                Unrevoked::Identity(i) => store.devices_revoke_identity(&i),
-            };
-            match taken {
-                Ok(taken) => self.devices_changed(false, &taken),
+            }
+            pending.retain(|k| !refused.lifts(k));
+            pending.clone()
+        };
+        for key in keys {
+            let taken = key.take(&**store);
+            let forget = match &taken {
+                Ok(_) => true,
                 Err(e) => {
                     tracing::warn!("push: forgetting a revoked key's devices: {e}");
-                    store.pending.lock().unwrap().push(key);
+                    self.revoked.read().unwrap().lifts(&key)
                 }
+            };
+            if forget {
+                store.pending.lock().unwrap().retain(|k| *k != key);
+            }
+            if let Ok(taken) = taken {
+                self.devices_changed(false, &taken);
             }
         }
     }
@@ -869,7 +882,8 @@ mod tests {
         let bob = Mailbox::login("bob");
         let (uid, _events) = attach(&core, Some(tag([11; 32])));
         core.revoked.write().unwrap().local.devices.insert([11; 32]);
-        devices.failing_deletes.store(1, SeqCst);
+        // Its own delete, and the retry of it there and then.
+        devices.failing_deletes.store(2, SeqCst);
         let registered = core.push_register(uid, registration([11; 32]));
         assert_eq!(registered, Err(PushError::Revoked));
         assert_eq!(rows(&bob), 1, "taking itself back failed");
@@ -878,29 +892,115 @@ mod tests {
         assert_eq!(rows(&bob), 0, "and the sweep took the row");
     }
 
-    /// A key lifted while its delete waits to be retried takes nothing:
-    /// the device registered since keeps its row, and is pushed at.
+    /// A key the operator lifts while its delete waits is forgotten: the
+    /// device registered again after the lift keeps its row, and is read.
     #[test]
     fn a_lifted_key_takes_no_row_on_retry() {
         use std::sync::atomic::Ordering::SeqCst;
         let devices = Arc::new(MemoryDevices::new());
         let core = Core::new().with_devices(devices.clone());
         let bob = Mailbox::login("bob");
-        devices
-            .register(
-                &device(bob.clone(), DeviceId::of_device(&[12; 32]).as_str()),
-                8,
-            )
-            .unwrap();
-        devices.failing_deletes.store(1, SeqCst);
+        let row = device(bob.clone(), DeviceId::of_device(&[12; 32]).as_str());
+        devices.register(&row, 8).unwrap();
+        // The revocation's delete, and any retry before the sweep.
+        devices.failing_deletes.store(2, SeqCst);
         core.set_revocations(crate::Revocations {
             devices: [[12; 32]].into(),
             ..Default::default()
         });
         core.set_revocations(crate::Revocations::default());
+        devices
+            .register(
+                &Device {
+                    endpoint: "https://push.example/again".into(),
+                    ..row
+                },
+                8,
+            )
+            .unwrap();
         core.sweep_devices();
         let gateway = core.push_store().unwrap();
         assert_eq!(gateway.devices(&bob, SystemTime::now()).unwrap().len(), 1);
+    }
+
+    /// A registrar's revocation is not lifted by a list made without its
+    /// identity's records, which is every list once the identity has no
+    /// session here: the row stays hidden, and the sweep takes it.
+    #[test]
+    fn a_registrars_key_outlives_a_list_that_does_not_cover_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let alice = Mailbox::identified("alice", [7; 32]);
+        devices
+            .register(
+                &device(alice.clone(), DeviceId::of_device(&[10; 32]).as_str()),
+                8,
+            )
+            .unwrap();
+        devices.failing_deletes.store(1, SeqCst);
+        core.set_published_revocations(crate::Published {
+            devices: [([7; 32], [10; 32])].into(),
+            covered: [[7; 32]].into(),
+            ..Default::default()
+        });
+        core.set_published_revocations(crate::Published::default());
+        let gateway = core.push_store().unwrap();
+        assert!(gateway
+            .devices(&alice, SystemTime::now())
+            .unwrap()
+            .is_empty());
+        core.sweep_devices();
+        assert!(devices
+            .devices(&alice, SystemTime::now())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A retry hides every pending row until its own delete is done: a
+    /// gateway reading while the first key's rows go does not find the
+    /// second's.
+    #[test]
+    fn a_read_during_a_retry_finds_no_pending_row() {
+        use std::sync::atomic::Ordering::SeqCst;
+        type Store = std::sync::OnceLock<Arc<dyn PushStore>>;
+        #[derive(Default)]
+        struct Reader(Store, std::sync::Mutex<Vec<String>>);
+        impl crate::notify::NotificationGateway for Reader {
+            fn notify(&self, _: &crate::notify::Notification<'_>) {}
+            fn devices_changed(&self, _: bool, _: &[Device]) {
+                let store = self.0.get().unwrap();
+                for owner in [Mailbox::login("alice"), Mailbox::login("bob")] {
+                    let rows = store.devices(&owner, SystemTime::now()).unwrap();
+                    self.1
+                        .lock()
+                        .unwrap()
+                        .extend(rows.into_iter().map(|d| d.endpoint));
+                }
+            }
+        }
+        let devices = Arc::new(MemoryDevices::new());
+        let reader = Arc::new(Reader::default());
+        let core = Core::new().with_devices(devices.clone());
+        let _ = reader.0.set(core.push_store().unwrap());
+        let core = core.with_notifications(reader.clone());
+        for (owner, d) in [("alice", 10u8), ("bob", 11)] {
+            let id = DeviceId::of_device(&[d; 32]);
+            devices
+                .register(&device(Mailbox::login(owner), id.as_str()), 8)
+                .unwrap();
+        }
+        devices.failing_deletes.store(2, SeqCst);
+        core.set_revocations(crate::Revocations {
+            devices: [[10; 32], [11; 32]].into(),
+            ..Default::default()
+        });
+        core.sweep_devices();
+        assert!(devices
+            .devices(&Mailbox::login("bob"), SystemTime::now())
+            .unwrap()
+            .is_empty());
+        assert_eq!(*reader.1.lock().unwrap(), Vec::<String>::new());
     }
 
     /// A registration and an unregistration reach the gateway too: the

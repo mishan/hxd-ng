@@ -584,6 +584,7 @@ impl Registrars {
         let mut refused = hxd_core::Published::default();
         let mut rotations = Vec::new();
         for fp in identities {
+            refused.covered.insert(fp.0);
             let mut frozen: HashMap<String, bool> = HashMap::new();
             let found = self.lookup_fp(*fp, &[], 0);
             for record in found.records {

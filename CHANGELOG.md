@@ -170,9 +170,10 @@ as AGENTS.md's "Releasing" describes it.
   deletes them, and unsubscribes them from uniqush under `gateway =
   "uniqush"`; a registration racing the revocation is refused `revoked`.
   A frozen identity's devices register again at their next login once
-  the freeze lifts. Registrations left from before are deleted when the
-  operator's list is next loaded, or a registrar's revocation next
-  applied.
+  the freeze lifts. A registrar's revocation is applied, as before,
+  while its identity has a session here. Registrations left from before
+  are deleted when the operator's list is next loaded, or a registrar's
+  revocation next applied.
 
 ## [0.3.0] - 2026-11-05
 

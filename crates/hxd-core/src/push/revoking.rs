@@ -7,6 +7,11 @@
 //! to be taken are kept here, and the two reads that lead to a delivery,
 //! [`PushStore::devices`] and [`PushStore::unsubscribed`], leave their
 //! rows out.
+//!
+//! The pending keys are not kept across a restart. The operator's list
+//! is applied at startup, which takes its keys' rows again; a
+//! registrar's revocation is applied, and its rows taken, once its
+//! identity has a session here again.
 
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -41,11 +46,11 @@ impl Unrevoked {
     /// Did this key's device register `d`?
     fn made(&self, d: &Device) -> bool {
         match self {
-            Unrevoked::Device(identity, device) => {
-                d.devid == DeviceId::of_device(device)
-                    && identity.is_none_or(|i| d.owner.fingerprint == Some(i))
+            Unrevoked::LocalDevice(device) => d.devid == DeviceId::of_device(device),
+            Unrevoked::PublishedDevice(i, device) => {
+                d.devid == DeviceId::of_device(device) && d.owner.fingerprint == Some(*i)
             }
-            Unrevoked::Identity(i) => {
+            Unrevoked::LocalIdentity(i) | Unrevoked::PublishedIdentity(i) => {
                 d.owner.fingerprint == Some(*i) && d.devid.is_device_fingerprint()
             }
         }

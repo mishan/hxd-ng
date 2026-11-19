@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use tracing::info;
 
+use crate::push::Unrevoked;
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
 /// The fingerprints refused by hand: identity keys, which refuse every
@@ -56,6 +57,9 @@ pub struct Published {
     pub identities: HashSet<[u8; 32]>,
     /// `(identity, device)`.
     pub devices: HashSet<([u8; 32], [u8; 32])>,
+    /// The identities whose records this list was made from. Only for
+    /// those does a key missing from it mean the key is not refused.
+    pub covered: HashSet<[u8; 32]>,
 }
 
 impl Published {
@@ -88,19 +92,35 @@ impl Refused {
             || self.rotated.contains(&tag.fingerprint)
     }
 
-    /// Is `key` still revoked, by either list?
-    pub(crate) fn still_revokes(&self, key: &crate::push::Unrevoked) -> bool {
-        use crate::push::Unrevoked;
+    /// The revoked key whose rows a registration by `tag` must not
+    /// leave, if the lists refuse it.
+    pub(crate) fn pending_for(&self, tag: &IdentityTag) -> Option<Unrevoked> {
+        let (i, d) = (tag.fingerprint, tag.device);
+        if self.local.devices.contains(&d) {
+            Some(Unrevoked::LocalDevice(d))
+        } else if self.local.identities.contains(&i) || self.rotated.contains(&i) {
+            Some(Unrevoked::LocalIdentity(i))
+        } else if self.published.identities.contains(&i) {
+            Some(Unrevoked::PublishedIdentity(i))
+        } else if self.published.devices.contains(&(i, d)) {
+            Some(Unrevoked::PublishedDevice(i, d))
+        } else {
+            None
+        }
+    }
+
+    /// Has `key` been lifted? The operator's once their list leaves it
+    /// out. A registrar's only once a list made from its identity's
+    /// records does: one made without them says nothing about it.
+    pub(crate) fn lifts(&self, key: &Unrevoked) -> bool {
+        let p = &self.published;
         match key {
-            Unrevoked::Device(Some(i), d) => self.is_revoked(i, d),
-            Unrevoked::Device(None, d) => {
-                self.local.devices.contains(d) || self.published.devices.iter().any(|(_, x)| x == d)
+            Unrevoked::LocalDevice(d) => !self.local.devices.contains(d),
+            Unrevoked::LocalIdentity(i) => {
+                !self.local.identities.contains(i) && !self.rotated.contains(i)
             }
-            Unrevoked::Identity(i) => {
-                self.local.identities.contains(i)
-                    || self.published.identities.contains(i)
-                    || self.rotated.contains(i)
-            }
+            Unrevoked::PublishedDevice(i, d) => p.covered.contains(i) && !p.is_revoked(i, d),
+            Unrevoked::PublishedIdentity(i) => p.covered.contains(i) && !p.identities.contains(i),
         }
     }
 
@@ -161,7 +181,9 @@ impl Core {
             (ids, new)
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.devices_revoked(&identities, &devices);
+        let keys = devices.iter().map(|(_, d)| Unrevoked::LocalDevice(*d));
+        let ids = identities.iter().map(|i| Unrevoked::LocalIdentity(*i));
+        self.take_revoked(keys.chain(ids).collect());
         if list.is_empty() {
             return Vec::new();
         }
@@ -205,7 +227,11 @@ impl Core {
             (ids, new)
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.devices_revoked(&identities, &devices);
+        let keys = devices
+            .iter()
+            .filter_map(|(i, d)| i.map(|i| Unrevoked::PublishedDevice(i, *d)));
+        let ids = identities.iter().map(|i| Unrevoked::PublishedIdentity(*i));
+        self.take_revoked(keys.chain(ids).collect());
         if list.is_empty() {
             return Vec::new();
         }

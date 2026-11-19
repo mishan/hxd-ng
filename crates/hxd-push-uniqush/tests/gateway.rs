@@ -777,10 +777,28 @@ async fn a_row_deleted_is_unsubscribed_unless_another_holds_its_subscription() {
 #[tokio::test]
 async fn a_revoked_device_is_unsubscribed() {
     let (uq, addr) = mock(|_| None).await;
-    let s = running(addr).await;
-    let core = hxd_core::Core::new()
-        .with_devices(s.devices.clone())
-        .with_notifications(Arc::new(s.gateway.clone()));
+    // The gateway reads the registry as the server hands it one.
+    let devices = Arc::new(MemoryDevices::new());
+    let core = hxd_core::Core::new().with_devices(devices.clone());
+    let vapid = vapid();
+    let gateway = UniqushGateway::new(
+        core.push_store().unwrap(),
+        vapid.clone(),
+        push_config(),
+        Config {
+            addr,
+            token: Some("t0ken".into()),
+            service: "hxd-test".into(),
+        },
+    );
+    gateway.prepare().await.unwrap();
+    gateway.start();
+    let core = core.with_notifications(Arc::new(gateway.clone()));
+    let s = Server {
+        gateway,
+        devices,
+        vapid,
+    };
     let (fp, phone) = ([7u8; 32], [10u8; 32]);
     let alice = Mailbox::identified("alice", fp);
     let phones = DeviceId::of_device(&phone);
