@@ -214,7 +214,8 @@ as AGENTS.md's "Releasing" describes it.
   none: a further rotation of it is taken only from a trusted
   registrar's records, no longer from the `rotation` an `auth` carries.
   A rotation to a key already anchored to anything but its `next` is
-  ignored (docs/identity-registrar.md §7.4).
+  ignored, and so is any rotation into a key that is already a
+  rotation's successor (docs/identity-registrar.md §7.4).
   The file gains a `<fingerprint> = next <commitment>` line beside the
   plain one, and at the first start an anchor an older build took from a
   successor's card is dropped from it with a warning, leaving that

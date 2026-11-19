@@ -2095,6 +2095,14 @@ impl IdentityState {
         {
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             t.cards.remove(&from);
+            // A card the successor key showed before, committing to
+            // another, would refuse the owner's older one in the cache.
+            if t.cards
+                .get(&to)
+                .is_some_and(|c| next.is_some_and(|n| c.successor != Some(n)))
+            {
+                t.cards.remove(&to);
+            }
             t.devices
                 .retain(|_, d| Fingerprint::of(&d.identity) != from);
             t.tokens.retain(|_, (ident, _)| ident.fingerprint != from);
@@ -2386,10 +2394,18 @@ impl Anchors {
         // A rotation's successor is anchored by its rotation's `next`
         // alone. An older build anchored the first card the successor
         // key showed, which whoever holds that key alone could have shown.
-        let successors: HashSet<Fingerprint> = rotated.values().map(|(to, _)| *to).collect();
+        let mut into: HashMap<Fingerprint, usize> = HashMap::new();
+        for (to, _) in rotated.values() {
+            *into.entry(*to).or_default() += 1;
+        }
+        let successors: HashSet<Fingerprint> = into.keys().copied().collect();
         for to in &successors {
-            let next = nexts.get(to).copied();
-            if map.get(to).is_some_and(|a| Some(*a) != next) {
+            // Two rotations into one key, from an older build, leave no
+            // telling which brought the `next`; `rotate` takes no second.
+            let next = nexts.get(to).copied().filter(|_| into[to] == 1);
+            if map.get(to).is_some_and(|a| Some(*a) != next)
+                || (next.is_none() && nexts.contains_key(to))
+            {
                 compact = true;
                 tracing::warn!(
                     "{}: {} is a rotation's successor; its anchor is not that rotation's next, \
@@ -2511,6 +2527,13 @@ impl Anchors {
                 return false;
             }
             let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            // One predecessor to a key: whoever holds the successor key
+            // could make a second, to choose its `next` or, with two
+            // rotations on file, have load drop the owner's.
+            if rotated.values().any(|(t, _)| t == to) {
+                tracing::warn!(predecessor = %from.short(), successor = %to.short(), "rotation into a key that is already a successor; ignored");
+                return false;
+            }
             let next = match (map.get(to), next) {
                 (None, Some(n)) => {
                     map.insert(*to, n);
@@ -2920,6 +2943,84 @@ mod tests {
         }
         assert!(anchors.rotate(&fp(11), &to, Some(thief.0)));
         assert_eq!(Anchors::load(path).get(&to), Some(thief.0));
+    }
+
+    #[test]
+    fn a_successor_takes_no_next_from_a_second_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("successors");
+        let fp = |s: u8| IdentityKey::from_seed(&[s; 32]).fingerprint();
+        let (p, b, x, y, t) = (fp(1), fp(2), fp(4), fp(5), fp(6));
+        let anchors = Anchors::load(path.clone());
+        assert!(anchors.rotate(&p, &b, None));
+        assert!(
+            !anchors.rotate(&x, &b, Some(t.0)),
+            "a next for a successor with none"
+        );
+        assert!(!anchors.rotate(&y, &b, None), "one that brings none");
+        let (q, c) = (fp(7), fp(8));
+        assert!(anchors.rotate(&q, &c, Some(t.0)));
+        assert!(!anchors.rotate(&fp(9), &c, Some(t.0)), "even the same next");
+        assert!(!anchors.rotate(&fp(10), &c, None), "or none");
+        let file = std::fs::read_to_string(&path).unwrap();
+        for to in [b, c] {
+            assert_eq!(file.matches(&format!("=> {to}")).count(), 1, "{file}");
+        }
+        assert_eq!(Anchors::load(path.clone()).get(&c), Some(t.0));
+
+        // A file in which a second predecessor brought one.
+        std::fs::write(
+            &path,
+            format!(
+                "{p} => {b}\n{b} = {}\n{b} = next {}\n{x} => {b}\n",
+                b64(&t.0),
+                b64(&t.0)
+            ),
+        )
+        .unwrap();
+        assert_eq!(Anchors::load(path).get(&b), None);
+    }
+
+    #[test]
+    fn a_rotation_drops_a_cached_successor_card_that_disagrees_with_its_next() {
+        for (shown, kept) in [(6u8, false), (3, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let st = state(IdentityConfig {
+                anchors: Some(dir.path().join("successors")),
+                unattested: Unattested::Guest,
+                ..Default::default()
+            });
+            let [p, b, d, other] = [1, 2, 3, 6].map(|s| IdentityKey::from_seed(&[s; 32]));
+            let committed = if shown == 3 { &d } else { &other };
+            // The successor key signs in first, with no standing here.
+            let dev = DeviceKey::from_seed(&[9; 32]);
+            let (_, cert) = objects(&b, &dev);
+            let mut card = Card::new(&b, "B", now_unix());
+            card.successor = Some(committed.fingerprint().0);
+            let card = card.sign(&b, vec![]).unwrap();
+            let ch = st.issue_challenge().unwrap();
+            let proof =
+                LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
+            st.auth_with_proof(
+                &card,
+                &cert,
+                &proof,
+                Some(TEST_HOST),
+                AuthRequest::default(),
+            )
+            .unwrap();
+            assert!(st.card(&b.fingerprint()).is_some());
+
+            st.accept_rotation(
+                p.fingerprint(),
+                b.fingerprint(),
+                Some(d.fingerprint().0),
+                "test",
+                None,
+            );
+            assert_eq!(st.rotated_to(&p.fingerprint()), Some(b.fingerprint()));
+            assert_eq!(st.card(&b.fingerprint()).is_some(), kept, "{shown}");
+        }
     }
 
     #[test]

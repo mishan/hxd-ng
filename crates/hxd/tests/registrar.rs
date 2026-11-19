@@ -2305,6 +2305,58 @@ async fn a_successor_rotates_on_only_to_its_rotations_next() {
 }
 
 #[tokio::test]
+async fn a_successor_takes_no_next_from_a_second_predecessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, _) = verifier(&there, &r, Trust::Key, &live, "new_accounts = \"create\"").await;
+    let [old, new, own, thief] = [1, 2, 4, 6].map(|s| IdentityKey::from_seed(&[s; 32]));
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let old_card = attested_committing(&r, &old, "alice", &new, false).await;
+    let account = auth_at(v, &old, &dev, &old_card).await.json()["account"].clone();
+    assert!(account.is_string(), "{account}");
+    let card = |id: &IdentityKey, name: &str, successor: Option<&IdentityKey>| {
+        let mut c = Card::new(id, name, now());
+        c.successor = successor.map(commitment);
+        c.sign(id, vec![]).unwrap()
+    };
+    let rotate = |from: &IdentityKey, to: &IdentityKey, next: Option<&IdentityKey>| {
+        let r = Rotation {
+            identity: from.public(),
+            successor: to.public(),
+            time: now(),
+            next: next.map(commitment),
+        };
+        json!({ "rotation": b64(&r.sign(from, to).unwrap()) })
+    };
+    let owners = rotate(&old, &new, None);
+    let shown = auth_with(v, &new, &dev, &card(&new, "x", None), owners).await;
+    assert_eq!(shown.json()["account"], account);
+
+    // Whoever holds the successor key alone makes an identity of its own
+    // committed to it, rotates that one onto the successor with a `next`
+    // of their choosing, and then the successor onto that.
+    let own_card = attested_committing(&r, &own, "mallory", &new, false).await;
+    let mine = auth_at(v, &own, &dev, &own_card).await;
+    assert!(mine.json()["account"].is_string(), "{}", mine.json());
+    let second = rotate(&own, &new, Some(&thief));
+    auth_with(v, &new, &dev, &card(&new, "x", None), second).await;
+    let stolen = rotate(&new, &thief, None);
+    let taken = auth_with(v, &thief, &dev, &card(&thief, "t", None), stolen).await;
+    assert_ne!(taken.json()["account"], account);
+    let owner = auth_at(v, &new, &dev, &card(&new, "x", None)).await;
+    assert_eq!(
+        (owner.status, owner.json()["account"].clone()),
+        (200, account),
+        "the account stays with the owner"
+    );
+}
+
+#[tokio::test]
 async fn a_key_nobody_answers_for_waits_before_it_may_chat() {
     let dir = tempfile::tempdir().unwrap();
     let at = dir.path().join("registrar");

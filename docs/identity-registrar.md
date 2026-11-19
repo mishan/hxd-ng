@@ -972,10 +972,18 @@ successor whose rotation carried no `next` has no anchor: a further
 rotation of it shown at `auth` is ignored, and one is accepted only
 from a trusted registrar's records. A rotation to a key already
 anchored to anything but its `next`, by a card shown while the key
-stood alone, is ignored, as that anchor cannot be taken back. hxd-ng
-writes a rotation's `next` in `[identity] successors` as a line of its
-own, and drops, with a warning at load, any other anchor a successor
-has there, such as one an older build took from its card.
+stood alone, is ignored, as that anchor cannot be taken back. So is any
+rotation into a key that is already a rotation's successor, with a
+`next` or without: a key has one predecessor, the first accepted here,
+and whoever holds it alone could make a second, committed to it, to
+choose its `next` or to have the owner's dropped. If that holder's
+rotation arrives first, the owner's is the one ignored: the old key
+stays admitted with the owner's account, and nothing of it moves.
+hxd-ng writes a rotation's `next` in `[identity] successors` as a line
+of its own, and drops, with a warning at load, any other anchor a
+successor has there, such as one an older build took from its card, and
+any anchor of a key that is the successor of two rotations, as a file
+an older build wrote may hold.
 
 ### 7.5 Standing and probation
 
