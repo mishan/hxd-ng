@@ -203,15 +203,19 @@ impl Core {
             refused.local = list.clone();
             (ids, new)
         };
-        // Even an empty list: a key lifted is forgotten by a retry too.
         let keys = devices.iter().map(|(_, d)| Unrevoked::LocalDevice(*d));
         let ids = identities.iter().map(|i| Unrevoked::LocalIdentity(*i));
+        // Sessions first: the lists already hide the rows, and the
+        // deletes may wait on registrations.
+        let ended = match list.is_empty() {
+            true => Vec::new(),
+            false => self.end_revoked(|tag| list.refuses(tag)),
+        };
+        // Even an empty list: a key lifted is forgotten by a retry too.
         self.take_revoked(keys.chain(ids).collect());
-        if list.is_empty() {
-            return Vec::new();
+        if !list.is_empty() {
+            self.drop_revoked_presentations(&devices);
         }
-        let ended = self.end_revoked(|tag| list.refuses(tag));
-        self.drop_revoked_presentations(&devices);
         ended
     }
 
@@ -249,17 +253,21 @@ impl Core {
             refused.published = list.clone();
             (ids, new)
         };
-        // Even an empty list: a key lifted is forgotten by a retry too.
         let keys = devices
             .iter()
             .filter_map(|(i, d)| i.map(|i| Unrevoked::PublishedDevice(i, *d)));
         let ids = identities.iter().map(|i| Unrevoked::PublishedIdentity(*i));
+        // Sessions first: the lists already hide the rows, and the
+        // deletes may wait on registrations.
+        let ended = match list.is_empty() {
+            true => Vec::new(),
+            false => self.end_revoked(|tag| list.refuses(tag)),
+        };
+        // Even an empty list: a key lifted is forgotten by a retry too.
         self.take_revoked(keys.chain(ids).collect());
-        if list.is_empty() {
-            return Vec::new();
+        if !list.is_empty() {
+            self.drop_revoked_presentations(&devices);
         }
-        let ended = self.end_revoked(|tag| list.refuses(tag));
-        self.drop_revoked_presentations(&devices);
         ended
     }
 

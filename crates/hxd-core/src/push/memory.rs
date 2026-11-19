@@ -38,6 +38,10 @@ pub struct MemoryDevices {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) after_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once by the next device revocation's delete before it deletes.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) before_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl MemoryDevices {
@@ -229,6 +233,13 @@ impl PushStore for MemoryDevices {
         identity: Option<&[u8; 32]>,
         devid: &DeviceId,
     ) -> Result<Vec<Device>, StoreError> {
+        #[cfg(test)]
+        {
+            let meanwhile = self.before_delete.lock().unwrap().take();
+            if let Some(meanwhile) = meanwhile {
+                meanwhile();
+            }
+        }
         self.failing()?;
         let mut rows = self.rows.lock().unwrap();
         Ok(take(&mut rows, |r| {

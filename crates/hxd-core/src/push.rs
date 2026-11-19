@@ -33,6 +33,7 @@
 //! *sending* is not — that is the gateway's, it is spawned, and it never
 //! happens under a lock (`crate::notify`).
 
+use std::sync::PoisonError;
 use std::time::SystemTime;
 
 use crate::inbox::{Mailbox, StoreError};
@@ -449,6 +450,10 @@ impl crate::roster::Core {
         let devid = r.devid;
         endpoint::registrable(&r.endpoint, policy.allow_private_endpoints)
             .map_err(|_| PushError::BadSubscription("That is not a push endpoint."))?;
+        let writing = self
+            .push_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let registered = store
             .register(
                 &Device {
@@ -481,6 +486,7 @@ impl crate::roster::Core {
                 Ok(row) => taken.extend(row),
                 Err(e) => {
                     tracing::warn!("push: forgetting a revoked device: {e}");
+                    drop(writing);
                     self.take_revoked(pending);
                 }
             }
@@ -542,6 +548,12 @@ impl crate::roster::Core {
 
     pub(crate) fn devices_claim(&self, login: &str, fingerprint: &[u8; 32]) {
         if let Some(store) = self.devices.as_ref() {
+            // A row moved into the identity's mailbox is one a retry
+            // chosen before a lift must not take, as a registration is.
+            let _writing = self
+                .push_writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             match store.devices_claim(login, fingerprint) {
                 Ok(taken) => self.devices_changed(!taken.is_empty(), &taken),
                 Err(e) => tracing::warn!("push: claiming {login}'s devices: {e}"),
@@ -562,14 +574,18 @@ impl crate::roster::Core {
     /// store error left. Each is pending, its rows hidden from the
     /// gateways, until a delete succeeds or the key is lifted: a revoked
     /// key's row must not outlive one failed delete. The lists are read
-    /// only to choose the keys, so no store call is made under them. A
-    /// key lifted after that and before its delete can still take a
-    /// registration made since the lift: the device misses its pushes
-    /// until it registers again, and no revoked device is pushed at.
+    /// only to choose the keys, so no store call is made under them; a
+    /// registration and a claim wait on `push_writes` instead, so a key
+    /// lifted between the choice and the delete takes no row either
+    /// wrote after the lift.
     pub(crate) fn take_revoked(&self, keys: Vec<Unrevoked>) {
         let Some(store) = self.devices.as_ref() else {
             return;
         };
+        let _writing = self
+            .push_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let keys = {
             let refused = self.revoked.read().unwrap();
             let (added, pending) = &mut *store.pending.lock().unwrap();
@@ -1036,6 +1052,85 @@ mod tests {
                 .is_empty(),
             "the retry ran"
         );
+    }
+
+    /// A retry that chose a key before it was lifted does not take a
+    /// registration made after the lift while it was paused, and the
+    /// same list's newly revoked device is ended without waiting on it.
+    #[test]
+    fn a_retry_paused_across_a_lift_takes_no_new_registration() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Arc::new(Core::new().with_devices(devices.clone()));
+        let bob = Mailbox::identified("bob", [7; 32]);
+        let (uid, _events) = attach(&core, Some(tag([14; 32])));
+        let (_, mut other) = attach(&core, Some(tag([15; 32])));
+        devices
+            .register(
+                &device(bob.clone(), DeviceId::of_device(&[14; 32]).as_str()),
+                8,
+            )
+            .unwrap();
+        devices.failing_deletes.store(1, SeqCst);
+        core.set_revocations(crate::Revocations {
+            devices: [[14; 32]].into(),
+            ..Default::default()
+        });
+
+        let (paused, resume) = (channel(), channel::<()>());
+        *devices.before_delete.lock().unwrap() = Some(Box::new(move || {
+            paused.0.send(()).unwrap();
+            resume.1.recv().unwrap();
+        }));
+        let retry = std::thread::spawn({
+            let core = core.clone();
+            move || core.sweep_devices()
+        });
+        paused.1.recv().unwrap();
+        // The lift, and the next device's revocation, from a thread of its own.
+        let lift = std::thread::spawn({
+            let core = core.clone();
+            move || {
+                core.set_revocations(crate::Revocations {
+                    devices: [[15; 32]].into(),
+                    ..Default::default()
+                })
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while core.is_revoked(&[7; 32], &[14; 32]) {
+            assert!(Instant::now() < until, "the lift never landed");
+            std::thread::yield_now();
+        }
+        while !crate::roster::drain(&mut other)
+            .iter()
+            .any(|e| matches!(e, crate::Event::Kicked))
+        {
+            assert!(Instant::now() < until, "the revoked device was not ended");
+            std::thread::yield_now();
+        }
+        let registered = channel();
+        let again = std::thread::spawn({
+            let core = core.clone();
+            move || {
+                let r = core.push_register(uid, registration([14; 32]));
+                registered.0.send(()).unwrap();
+                r
+            }
+        });
+        let _ = registered.1.recv_timeout(Duration::from_millis(100));
+        resume.0.send(()).unwrap();
+        retry.join().unwrap();
+        lift.join().unwrap();
+        assert!(again.join().unwrap().is_ok());
+        let rows = core
+            .push_store()
+            .unwrap()
+            .devices(&bob, SystemTime::now())
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the registration made after the lift");
     }
 
     /// A key the operator lifts while its delete waits is forgotten: the

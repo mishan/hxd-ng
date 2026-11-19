@@ -2164,6 +2164,10 @@ pub struct Core {
     /// What a registration may do: how many devices a mailbox holds, and
     /// whether an endpoint on a private network is acceptable.
     pub(crate) push_policy: crate::push::PushPolicy,
+    /// Held by a registration and by a revoked key's delete, so a delete
+    /// chosen before a key was lifted cannot take a registration made
+    /// after (`Core::take_revoked`). Never taken while another lock is held.
+    pub(crate) push_writes: Mutex<()>,
     /// The reserved server account, or `None` when `[system]` did not
     /// ask for one. See [`crate::system`].
     pub(crate) system: Option<crate::system::SystemState>,
