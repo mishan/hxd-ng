@@ -2307,7 +2307,7 @@ async fn dispatch(
                     )
                     .await;
                 }
-                let from = state.uid;
+                let (from, serial) = (state.uid, state.serial);
                 let (signed, link) = match signed {
                     Some((signed, link)) => (Some(signed), link),
                     None => (None, None),
@@ -2372,13 +2372,15 @@ async fn dispatch(
                             return finish(ws_tx, out).await;
                         }
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_signed(from, uid, text, guid, media, signed, re, &refs)
+                            c.msg_signed(from, serial, uid, text, guid, media, signed, re, &refs)
                         })
                         .await
                     }
                     (None, Some(login)) => {
                         off_reactor(&ctx.core, move |c| {
-                            c.msg_login_signed(from, &login, text, guid, media, signed, re, &refs)
+                            c.msg_login_signed(
+                                from, serial, &login, text, guid, media, signed, re, &refs,
+                            )
                         })
                         .await
                     }

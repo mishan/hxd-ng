@@ -1535,6 +1535,9 @@ fn resends_icon_untasked(req: &LoginRequest) -> bool {
 /// Per-session protocol state after a successful login.
 struct Session {
     uid: Uid,
+    /// The serial of the session `uid` is: a later holder of the uid is
+    /// another session.
+    serial: u64,
     /// Lets the session go should this connection's task unwind before
     /// it reaches `end_session`.
     _held: hxd_core::HeldSession,
@@ -2673,6 +2676,7 @@ async fn login_phase(
         return None;
     };
     let held = ctx.core.hold(uid, &events, None);
+    let serial = events.serial();
     // Asked again now the session is on the roster: a ban placed since
     // the check above found no session to end. Ended here, before the
     // login is answered or anyone told of the join.
@@ -2791,6 +2795,7 @@ async fn login_phase(
 
     let mut sess = Session {
         uid,
+        serial,
         _held: held,
         account,
         announced: false,
@@ -5359,7 +5364,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             }
             // No guid: the legacy wire has no way to carry one, so every
             // send from it is its own message and a retry is a resend.
-            let from = sess.uid;
+            let (from, serial) = (sess.uid, sess.serial);
             let refs = emoji::refs_in(f, sess.has_cap(cap::SERVER_EMOJI));
             let re = match (sess.has_cap(cap::REPLIES))
                 .then(|| replies::reply_to(f, sess.reply_targets, replies::Said::Pm))
@@ -5372,7 +5377,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 None => None,
             };
             let sent = off_reactor(&ctx.core, move |c| {
-                c.msg_signed(from, to, body, None, media, None, re, &refs)
+                c.msg_signed(from, serial, to, body, None, media, None, re, &refs)
             });
             match sent.await {
                 Some(Ok(MsgOutcome::Delivered(Some(r)) | MsgOutcome::Queued(r)))

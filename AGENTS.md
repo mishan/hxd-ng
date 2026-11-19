@@ -786,8 +786,9 @@ Three layers, all `cargo test --workspace`:
   not, a device kick from a client without `persons` refused, a
   detached session kicked, banned or ended told so by its resume,
   coalescing on or off, while a guessed token, a lapsed session and
-  one forgotten by the sweep are told it expired, and with coalescing off each
-  device a user and a member of its own;
+  one forgotten by the sweep are told it expired, a system command
+  answered after a resume and from a classic device, coalescing on or
+  off, and with coalescing off each device a user and a member of its own;
   `voice.rs` has a person in voice, and `link.rs` a person across a
   link), `slow_consumer.rs` (a room flooded while one
   client reads

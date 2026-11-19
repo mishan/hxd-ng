@@ -2416,7 +2416,8 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_signed(from, to, text, guid, media, None, None, &[])
+        let serial = self.session_serial(from).unwrap_or_default();
+        self.msg_signed(from, serial, to, text, guid, media, None, None, &[])
     }
 
     /// [`Core::msg`], for a message that may be signed: its frontend
@@ -2425,11 +2426,13 @@ impl Core {
     /// which must be the recipient's (`docs/e2e-messages.md` §4.9).
     /// `re` is what it answers, which must be between the two of them,
     /// and `emoji` the refs its sender sent, of which it keeps what
-    /// [`Core::emoji_keep`] keeps.
+    /// [`Core::emoji_keep`] keeps. `serial` is the sender's session's,
+    /// which a command to the system account runs as.
     #[allow(clippy::too_many_arguments)]
     pub fn msg_signed(
         &self,
         from: Uid,
+        serial: u64,
         to: Uid,
         text: String,
         guid: Option<MessageGuid>,
@@ -2445,7 +2448,7 @@ impl Core {
             if signed.is_some() {
                 return Err(ChatError::NoIdentity);
             }
-            return self.run_system_command(from, &text);
+            return self.run_system_command(from, serial, &text);
         }
         let (sender, recipient) = {
             let r = self.roster.lock().unwrap();
@@ -2489,7 +2492,8 @@ impl Core {
         guid: Option<MessageGuid>,
         media: Option<crate::media::Handle>,
     ) -> Result<MsgOutcome, ChatError> {
-        self.msg_login_signed(from, to, text, guid, media, None, None, &[])
+        let serial = self.session_serial(from).unwrap_or_default();
+        self.msg_login_signed(from, serial, to, text, guid, media, None, None, &[])
     }
 
     /// [`Core::msg_login`], as [`Core::msg_signed`] is [`Core::msg`]:
@@ -2498,6 +2502,7 @@ impl Core {
     pub fn msg_login_signed(
         &self,
         from: Uid,
+        serial: u64,
         to: &str,
         text: String,
         guid: Option<MessageGuid>,
@@ -2511,7 +2516,7 @@ impl Core {
             if signed.is_some() {
                 return Err(ChatError::NoIdentity);
             }
-            return self.run_system_command(from, &text);
+            return self.run_system_command(from, serial, &text);
         }
         let emoji = self.emoji_keep(emoji);
         if let Some(routed) = self.messaging_route(
@@ -2625,15 +2630,20 @@ impl Core {
     /// from the wire's point of view the message arrived: what happened
     /// to it is in the answer, which is on its way back as a private
     /// message of its own.
-    fn run_system_command(&self, from: Uid, text: &str) -> Result<MsgOutcome, ChatError> {
+    fn run_system_command(
+        &self,
+        from: Uid,
+        serial: u64,
+        text: &str,
+    ) -> Result<MsgOutcome, ChatError> {
         // A session that is not on the roster is not one that can be
         // answered, and this is the same refusal any other message path
-        // would give it.
-        {
-            let r = self.roster.lock().unwrap();
-            r.users.get(&from).ok_or(ChatError::NoSuchUser)?;
+        // would give it. Nor is one that took the uid after the sender's
+        // session ended: uids recycle, serials never.
+        if self.session_serial(from) != Some(serial) {
+            return Err(ChatError::NoSuchUser);
         }
-        if let Some(answer) = self.system_command(from, text) {
+        if let Some(answer) = self.system_command(from, serial, text) {
             self.system_reply(from, answer);
         }
         Ok(MsgOutcome::Delivered(None))
@@ -6494,8 +6504,19 @@ mod tests {
         );
         core.chat_private(cid, a, "psst :party:".into(), 0, None, None, &sent)
             .unwrap();
-        core.msg_signed(a, b, ":party:".into(), None, None, None, None, &sent)
-            .unwrap();
+        let serial = core.session_serial(a).unwrap();
+        core.msg_signed(
+            a,
+            serial,
+            b,
+            ":party:".into(),
+            None,
+            None,
+            None,
+            None,
+            &sent,
+        )
+        .unwrap();
         core.chat_public(a, "plain".into(), 0, None).unwrap();
         let three = vec![kept.clone(); 3];
         assert_eq!(heard(&mut rx_b), [three, vec![None]].concat());
@@ -6813,7 +6834,18 @@ pub(crate) mod inbox_tests {
         };
         let guid = MessageGuid::parse("5f5e1000-1234-4abc-89ab-000000000001").unwrap();
         let send = |from, to, re: Reply| {
-            core.msg_signed(from, to, "yes".into(), None, None, None, Some(re), &[])
+            let serial = core.session_serial(from).unwrap();
+            core.msg_signed(
+                from,
+                serial,
+                to,
+                "yes".into(),
+                None,
+                None,
+                None,
+                Some(re),
+                &[],
+            )
         };
         let carols = Reply::im("carol".into(), guid.clone()).unwrap();
         for (case, re) in [
@@ -7681,6 +7713,7 @@ pub(crate) mod inbox_tests {
             };
             core.msg_signed(
                 a,
+                core.session_serial(a).unwrap(),
                 to,
                 "hi".into(),
                 Some(guid.clone()),

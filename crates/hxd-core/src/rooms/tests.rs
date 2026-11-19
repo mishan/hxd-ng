@@ -376,13 +376,16 @@ fn a_long_room_list_is_cut_to_one_message() {
         core.room_create(boss, edit).unwrap();
     }
     let (alice, _ra) = attach(&core, member("alice"));
-    let all = core.system_command(alice, "/rooms").unwrap();
+    let serial = core.session_serial(alice).unwrap();
+    let all = core.system_command(alice, serial, "/rooms").unwrap();
     assert!(all.len() <= 4096, "{}", all.len());
     assert!(
         all.ends_with("\n… and more; /rooms <word> narrows it"),
         "{all}"
     );
-    let narrowed = core.system_command(alice, "/rooms #room-1").unwrap();
+    let narrowed = core
+        .system_command(alice, serial, "/rooms #room-1")
+        .unwrap();
     assert_eq!(narrowed.lines().count(), 10, "{narrowed}");
     assert!(narrowed.starts_with("#room-10 — "));
 }
