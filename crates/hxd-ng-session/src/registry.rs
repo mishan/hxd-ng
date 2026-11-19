@@ -140,6 +140,16 @@ impl Registry {
         Ok(uid)
     }
 
+    /// The serial of the session `session_id` names, as it was when the
+    /// token was issued: what tells it from a session that took its uid.
+    pub(crate) fn serial(&self, session_id: &str) -> Option<u64> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|e| e.serial)
+    }
+
     /// The device certificate `session_id` logged in with, for a resume
     /// that has just been validated.
     pub(crate) fn device(&self, session_id: &str) -> Option<crate::push::DeviceOnSocket> {

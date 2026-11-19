@@ -183,6 +183,9 @@ type Ws = WebSocketStream<TokioIo<Upgraded>>;
 /// Per-connection state once a session is attached.
 pub(crate) struct SessState {
     pub(crate) uid: Uid,
+    /// The serial of the session `uid` is, from its token's entry: a
+    /// later holder of the uid is another session.
+    pub(crate) serial: u64,
     /// Lets the session go, as a lost connection does, should this
     /// connection's task unwind before it reaches `connection_lost`.
     _held: hxd_core::HeldSession,
@@ -1260,6 +1263,7 @@ async fn handle_login(
     Some((
         SessState {
             uid,
+            serial: ctx.registry.serial(&session_id).unwrap_or_default(),
             _held: {
                 drop(held);
                 ctx.core
@@ -1390,6 +1394,7 @@ async fn handle_resume(
     .map(|account| account.masked(&mask));
     let state = SessState {
         uid,
+        serial: ctx.registry.serial(&p.session).unwrap_or_default(),
         _held: held,
         session_id: p.session.clone(),
         access,
@@ -2188,10 +2193,8 @@ async fn dispatch(
         // A string sets, `null` clears; a value is refused, never cut.
         "pronouns" => match req.params.get("pronouns") {
             Some(v @ (Value::String(_) | Value::Null)) => {
-                let (uid, value) = (state.uid, v.as_str().map(str::to_owned));
-                // As the session is when it asks, so one that took its uid
-                // while this waited is not the one set for.
-                let serial = ctx.core.session_serial(uid).unwrap_or_default();
+                let (uid, serial) = (state.uid, state.serial);
+                let value = v.as_str().map(str::to_owned);
                 use hxd_core::pronouns::PronounsError as E;
                 match off_reactor(&ctx.core, move |c| {
                     c.set_pronouns(uid, serial, value.as_deref())
