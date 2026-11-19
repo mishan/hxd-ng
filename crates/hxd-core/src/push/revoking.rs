@@ -21,8 +21,10 @@ use crate::inbox::{Mailbox, StoreError};
 
 pub(crate) struct Revoking {
     store: Arc<dyn PushStore>,
-    /// Revoked keys whose rows a store error kept.
-    pub(crate) pending: Mutex<Vec<Unrevoked>>,
+    /// Revoked keys whose rows a store error kept, each with the count
+    /// of the last time it was added, so a retry that took its rows
+    /// before it was added again does not forget it.
+    pub(crate) pending: Mutex<(u64, Vec<(u64, Unrevoked)>)>,
 }
 
 impl Revoking {
@@ -35,8 +37,8 @@ impl Revoking {
 
     fn live(&self, mut rows: Vec<Device>) -> Vec<Device> {
         let pending = self.pending.lock().unwrap();
-        if !pending.is_empty() {
-            rows.retain(|d| !pending.iter().any(|k| k.made(d)));
+        if !pending.1.is_empty() {
+            rows.retain(|d| !pending.1.iter().any(|(_, k)| k.made(d)));
         }
         rows
     }

@@ -81,7 +81,7 @@ impl Published {
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
     pub(crate) local: Revocations,
-    published: Published,
+    pub(crate) published: Published,
     rotated: HashSet<[u8; 32]>,
 }
 
@@ -92,21 +92,29 @@ impl Refused {
             || self.rotated.contains(&tag.fingerprint)
     }
 
-    /// The revoked key whose rows a registration by `tag` must not
-    /// leave, if the lists refuse it.
-    pub(crate) fn pending_for(&self, tag: &IdentityTag) -> Option<Unrevoked> {
+    /// Every revoked key that refuses `tag`, each lifted on its own, whose
+    /// rows a registration by `tag` must not leave. Empty if none does.
+    pub(crate) fn pending_for(&self, tag: &IdentityTag) -> Vec<Unrevoked> {
         let (i, d) = (tag.fingerprint, tag.device);
-        if self.local.devices.contains(&d) {
-            Some(Unrevoked::LocalDevice(d))
-        } else if self.local.identities.contains(&i) || self.rotated.contains(&i) {
-            Some(Unrevoked::LocalIdentity(i))
-        } else if self.published.identities.contains(&i) {
-            Some(Unrevoked::PublishedIdentity(i))
-        } else if self.published.devices.contains(&(i, d)) {
-            Some(Unrevoked::PublishedDevice(i, d))
-        } else {
-            None
-        }
+        [
+            self.local
+                .devices
+                .contains(&d)
+                .then_some(Unrevoked::LocalDevice(d)),
+            (self.local.identities.contains(&i) || self.rotated.contains(&i))
+                .then_some(Unrevoked::LocalIdentity(i)),
+            self.published
+                .identities
+                .contains(&i)
+                .then_some(Unrevoked::PublishedIdentity(i)),
+            self.published
+                .devices
+                .contains(&(i, d))
+                .then_some(Unrevoked::PublishedDevice(i, d)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Has `key` been lifted? The operator's once their list leaves it

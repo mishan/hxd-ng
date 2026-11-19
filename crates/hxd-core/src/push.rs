@@ -460,14 +460,15 @@ impl crate::roster::Core {
         // row to take or is found here.
         let pending = key
             .as_ref()
-            .and_then(|k| self.revoked.read().unwrap().pending_for(k));
-        let revoked = pending.is_some();
-        if let Some(k) = pending.filter(|_| registered != Registered::Full) {
+            .map(|k| self.revoked.read().unwrap().pending_for(k))
+            .unwrap_or_default();
+        let revoked = !pending.is_empty();
+        if revoked && registered != Registered::Full {
             match store.unregister(&owner, &devid) {
                 Ok(row) => taken.extend(row),
                 Err(e) => {
                     tracing::warn!("push: forgetting a revoked device: {e}");
-                    self.take_revoked(vec![k]);
+                    self.take_revoked(pending);
                 }
             }
         }
@@ -555,16 +556,16 @@ impl crate::roster::Core {
         };
         let keys = {
             let refused = self.revoked.read().unwrap();
-            let mut pending = store.pending.lock().unwrap();
+            let (added, pending) = &mut *store.pending.lock().unwrap();
             for key in keys {
-                if !pending.contains(&key) {
-                    pending.push(key);
-                }
+                *added += 1;
+                pending.retain(|(_, k)| *k != key);
+                pending.push((*added, key));
             }
-            pending.retain(|k| !refused.lifts(k));
+            pending.retain(|(_, k)| !refused.lifts(k));
             pending.clone()
         };
-        for key in keys {
+        for (added, key) in keys {
             let taken = key.take(&**store);
             let forget = match &taken {
                 Ok(_) => true,
@@ -574,7 +575,8 @@ impl crate::roster::Core {
                 }
             };
             if forget {
-                store.pending.lock().unwrap().retain(|k| *k != key);
+                let (_, pending) = &mut *store.pending.lock().unwrap();
+                pending.retain(|entry| *entry != (added, key));
             }
             if let Ok(taken) = taken {
                 self.devices_changed(false, &taken);
@@ -724,8 +726,9 @@ mod tests {
     }
 
     /// An account `bob` with a mailbox, its socket having proved
-    /// `identity` if given.
+    /// `identity` if given, which the account is then linked to.
     fn attach(core: &Core, identity: Option<IdentityTag>) -> (Uid, crate::Events) {
+        let linked = identity.as_ref().map(|t| t.fingerprint);
         core.attach(crate::roster::AttachInfo {
             account: None,
             nick: "bob".into(),
@@ -748,7 +751,7 @@ mod tests {
             set_subject: false,
             is_person: true,
             reads_on_delivery: false,
-            identity: None,
+            identity: linked,
             system: false,
         })
         .unwrap()
@@ -839,7 +842,7 @@ mod tests {
         let registered = core.push_register(uid, registration([10; 32]));
         assert_eq!(registered, Err(PushError::Revoked));
         assert!(devices
-            .devices(&Mailbox::login("bob"), SystemTime::now())
+            .devices(&Mailbox::identified("bob", [7; 32]), SystemTime::now())
             .unwrap()
             .is_empty());
     }
@@ -879,7 +882,7 @@ mod tests {
         core.sweep_devices();
         assert_eq!(rows(&alice), 0, "and the sweep took the row");
 
-        let bob = Mailbox::login("bob");
+        let bob = Mailbox::identified("bob", [7; 32]);
         let (uid, _events) = attach(&core, Some(tag([11; 32])));
         core.revoked.write().unwrap().local.devices.insert([11; 32]);
         // Its own delete, and the retry of it there and then.
@@ -890,6 +893,30 @@ mod tests {
         assert!(read(&bob), "and no gateway is handed the row");
         core.sweep_devices();
         assert_eq!(rows(&bob), 0, "and the sweep took the row");
+    }
+
+    /// A device both lists refuse stays hidden when one of them lifts it:
+    /// a racing registration leaves every key that refuses it pending.
+    #[test]
+    fn a_key_one_list_lifts_is_still_the_others() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let bob = Mailbox::identified("bob", [7; 32]);
+        let (uid, _events) = attach(&core, Some(tag([13; 32])));
+        {
+            let mut refused = core.revoked.write().unwrap();
+            refused.local.devices.insert([13; 32]);
+            refused.published.devices.insert(([7; 32], [13; 32]));
+            refused.published.covered.insert([7; 32]);
+        }
+        devices.failing_deletes.store(usize::MAX, SeqCst);
+        let registered = core.push_register(uid, registration([13; 32]));
+        assert_eq!(registered, Err(PushError::Revoked));
+        core.set_revocations(crate::Revocations::default());
+        let gateway = core.push_store().unwrap();
+        assert!(gateway.devices(&bob, SystemTime::now()).unwrap().is_empty());
+        assert_eq!(devices.devices(&bob, SystemTime::now()).unwrap().len(), 1);
     }
 
     /// A key the operator lifts while its delete waits is forgotten: the

@@ -172,10 +172,11 @@ async fn start_server_full(
     .await
 }
 
-/// A device registry, and the gateway sending to it if there is one.
+/// A device registry, and how to make the gateway sending to it, from
+/// the registry as the core hands a gateway it, if there is one.
 type Push = (
     Arc<hxd_core::push::MemoryDevices>,
-    Option<Arc<dyn hxd_core::notify::NotificationGateway>>,
+    Option<Box<dyn FnOnce(Arc<dyn PushStore>) -> Arc<dyn hxd_core::notify::NotificationGateway>>>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -219,11 +220,14 @@ async fn start_server_inner(
     } else {
         Core::new()
     };
-    let core = match &push {
-        Some((devices, None)) => core.with_devices(devices.clone()),
-        Some((devices, Some(gateway))) => core
-            .with_devices(devices.clone())
-            .with_notifications(gateway.clone()),
+    let has_push = push.is_some();
+    let core = match push {
+        Some((devices, None)) => core.with_devices(devices),
+        Some((devices, Some(gateway))) => {
+            let core = core.with_devices(devices);
+            let store = core.push_store().unwrap();
+            core.with_notifications(gateway(store))
+        }
         None => core,
     };
     // Failed logins are counted by address and login, and loopback is
@@ -307,7 +311,7 @@ async fn start_server_inner(
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
         files: None,
         registrar: None,
-        push: push.map(|_| {
+        push: has_push.then(|| {
             Arc::new(hxd_ng_session::push::PushInfo {
                 vapid: "BEl6…".into(),
                 content: "sender".into(),
@@ -5096,12 +5100,15 @@ async fn start_server_pushing(dir: &Path) -> Pushing {
         true,
     )
     .unwrap();
-    let gateway = hxd_push_webpush::WebPushGateway::new(
-        devices.clone(),
-        Arc::new(vapid),
-        Default::default(),
-        sent.clone(),
-    );
+    let transport = sent.clone();
+    let gateway = move |store| -> Arc<dyn hxd_core::notify::NotificationGateway> {
+        Arc::new(hxd_push_webpush::WebPushGateway::new(
+            store,
+            Arc::new(vapid),
+            Default::default(),
+            transport,
+        ))
+    };
     let (_legacy, ng, ctx) = start_server_inner(
         dir,
         IdentityConfig::default(),
@@ -5111,7 +5118,7 @@ async fn start_server_pushing(dir: &Path) -> Pushing {
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         None,
-        Some((devices.clone(), Some(Arc::new(gateway)))),
+        Some((devices, Some(Box::new(gateway)))),
         None,
         None,
     )

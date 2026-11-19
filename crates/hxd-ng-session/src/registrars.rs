@@ -117,6 +117,13 @@ pub struct Lookup {
     /// Some registrar that attested the identity has no list this
     /// server can call current: `RegistrarsConfig::stale` decides.
     pub stale: bool,
+    /// The identity's lists were read, there was at least one, and every
+    /// one from a registrar still trusted verified under its configured
+    /// key: only then does a record missing from them mean no trusted
+    /// registrar published it. Lists from registrars no longer trusted
+    /// alone count as complete and refusing nothing, which lifts what
+    /// those registrars revoked.
+    pub complete: bool,
 }
 
 impl Registrars {
@@ -584,9 +591,11 @@ impl Registrars {
         let mut refused = hxd_core::Published::default();
         let mut rotations = Vec::new();
         for fp in identities {
-            refused.covered.insert(fp.0);
             let mut frozen: HashMap<String, bool> = HashMap::new();
             let found = self.lookup_fp(*fp, &[], 0);
+            if found.complete {
+                refused.covered.insert(fp.0);
+            }
             for record in found.records {
                 match record {
                     Record::RevokeIdentity(_) => {
@@ -627,14 +636,17 @@ impl Registrars {
     }
 
     fn lookup_fp(&self, fp: Fingerprint, hosts: &[String], now: u64) -> Lookup {
-        let held = match self.cache.lists(&fp.0) {
-            Ok(held) => held,
+        let (held, read) = match self.cache.lists(&fp.0) {
+            Ok(held) => (held, true),
             Err(e) => {
                 warn!("identity records cache: {}", e.0);
-                Vec::new()
+                (Vec::new(), false)
             }
         };
-        let mut lookup = Lookup::default();
+        let mut lookup = Lookup {
+            complete: read && !held.is_empty(),
+            ..Lookup::default()
+        };
         let on_file = held.iter().map(|l| &l.registrar);
         for host in hosts.iter().chain(on_file).filter(|h| self.trusts(h)) {
             if !held.iter().any(|l| {
@@ -645,11 +657,9 @@ impl Registrars {
                 lookup.stale = true;
             }
         }
-        for l in held
-            .iter()
-            .filter(|l| self.trusts(&l.registrar) && self.under_configured_key(l))
-        {
-            let Some(pages) = verified(l) else {
+        for l in held.iter().filter(|l| self.trusts(&l.registrar)) {
+            let Some(pages) = verified(l).filter(|_| self.under_configured_key(l)) else {
+                lookup.complete = false;
                 continue;
             };
             let keys: Vec<PublicKey> = l.keys.iter().map(|(k, _)| *k).collect();
@@ -771,6 +781,43 @@ mod tests {
         assert!(attested.contains_key(&live));
     }
 
+    /// A cache that cannot be read, or a trusted list in it that does not
+    /// verify, covers nobody: its silence is not a registrar's, and must
+    /// not lift a revocation it holds.
+    #[test]
+    fn records_not_read_whole_cover_no_identity() {
+        struct Unreadable;
+        impl RecordCache for Unreadable {
+            fn put(&self, _: &[u8; 32], _: &CachedList) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn lists(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                Err(hxd_core::StoreError("unreadable".into()))
+            }
+            fn first_seen(&self, _: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
+                Ok(now)
+            }
+        }
+        let fp = Fingerprint([1; 32]);
+        let unverified = hxd_core::identity_records::MemoryRecordCache::default();
+        unverified
+            .put(
+                &fp.0,
+                &CachedList {
+                    registrar: "hl.example".into(),
+                    pages: vec![],
+                    keys: vec![],
+                    fetched: 1,
+                },
+            )
+            .unwrap();
+        let caches: [Arc<dyn RecordCache>; 2] = [Arc::new(Unreadable), Arc::new(unverified)];
+        for cache in caches {
+            let (refused, _) = registrars(cache).refused(&[fp], false);
+            assert!(refused.covered.is_empty());
+        }
+    }
+
     #[test]
     fn a_retiring_key_held_is_used_only_until_its_deadline() {
         let (old, new) = ([1; 32], [2; 32]);
@@ -835,7 +882,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let (_, rotations) = registrars(cache).refused(&[pred], false);
+        let (refused, rotations) = registrars(cache).refused(&[pred], false);
+        assert!(refused.covered.contains(&pred.0), "its list was read");
         assert_eq!(rotations.len(), 2);
         for (f, t, record) in rotations {
             let r = Rotation::parse(&record).unwrap();
