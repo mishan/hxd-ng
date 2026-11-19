@@ -1,23 +1,25 @@
 //! The registry as the domain and the gateways see it: the store, less
 //! the rows of a revoked key that a store error kept.
 //!
-//! A failed delete is retried (`Core::sweep_devices`), but until it
-//! succeeds the row is still the store's, and both gateways read the
-//! rows they deliver to and subscribe from the store. So the keys still
-//! to be taken are kept here, and the two reads that lead to a delivery,
-//! [`PushStore::devices`] and [`PushStore::unsubscribed`], leave their
-//! rows out.
+//! A revoked key's rows are deleted when its revocation is applied, and a
+//! failed delete is retried (`Core::sweep_devices`), but until then the
+//! rows are still the store's, and both gateways read the rows they
+//! deliver to and subscribe from the store. So the two reads that lead to
+//! a delivery, [`PushStore::devices`] and [`PushStore::unsubscribed`],
+//! leave out every row of a key the lists refuse now, and of a key still
+//! to be taken here, whatever order the rows are written and deleted in.
 //!
 //! The pending keys are not kept across a restart. The operator's list
 //! is applied at startup, which takes its keys' rows again; a
 //! registrar's revocation is applied, and its rows taken, once its
 //! identity has a session here again.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use super::{Device, DeviceId, PushStore, Registered, SidecarRecord, Unrevoked};
 use crate::inbox::{Mailbox, StoreError};
+use crate::revoked::Refused;
 
 pub(crate) struct Revoking {
     store: Arc<dyn PushStore>,
@@ -25,22 +27,31 @@ pub(crate) struct Revoking {
     /// of the last time it was added, so a retry that took its rows
     /// before it was added again does not forget it.
     pub(crate) pending: Mutex<(u64, Vec<(u64, Unrevoked)>)>,
+    /// The core's lists.
+    revoked: Arc<RwLock<Refused>>,
 }
 
 impl Revoking {
-    pub(crate) fn new(store: Arc<dyn PushStore>) -> Self {
+    pub(crate) fn new(store: Arc<dyn PushStore>, revoked: Arc<RwLock<Refused>>) -> Self {
         Revoking {
             store,
             pending: Mutex::default(),
+            revoked,
         }
     }
 
-    fn live(&self, mut rows: Vec<Device>) -> Vec<Device> {
-        let pending = self.pending.lock().unwrap();
-        if !pending.1.is_empty() {
-            rows.retain(|d| !pending.1.iter().any(|(_, k)| k.made(d)));
-        }
-        rows
+    /// What `read` answers, less the rows of a revoked key. The pending
+    /// keys are copied before it reads, so a retry that takes a row and
+    /// forgets its key meanwhile cannot let a copy of the row through.
+    fn live(
+        &self,
+        read: impl FnOnce() -> Result<Vec<Device>, StoreError>,
+    ) -> Result<Vec<Device>, StoreError> {
+        let pending = self.pending.lock().unwrap().1.clone();
+        let mut rows = read()?;
+        let refused = self.revoked.read().unwrap();
+        rows.retain(|d| !refused.refuses_row(d) && !pending.iter().any(|(_, k)| k.made(d)));
+        Ok(rows)
     }
 }
 
@@ -61,11 +72,11 @@ impl Unrevoked {
 
 impl PushStore for Revoking {
     fn devices(&self, owner: &Mailbox, now: SystemTime) -> Result<Vec<Device>, StoreError> {
-        Ok(self.live(self.store.devices(owner, now)?))
+        self.live(|| self.store.devices(owner, now))
     }
 
     fn unsubscribed(&self, now: SystemTime) -> Result<Vec<Device>, StoreError> {
-        Ok(self.live(self.store.unsubscribed(now)?))
+        self.live(|| self.store.unsubscribed(now))
     }
 
     fn register(

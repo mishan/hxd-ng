@@ -33,6 +33,11 @@ pub struct MemoryDevices {
     /// domain's tests of a store error.
     #[cfg(test)]
     pub(crate) failing_deletes: std::sync::atomic::AtomicUsize,
+    /// Run once by the next `devices` after it has read its rows, for
+    /// the domain's tests of what happens meanwhile.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl MemoryDevices {
@@ -147,13 +152,23 @@ impl PushStore for MemoryDevices {
     }
 
     fn devices(&self, owner: &Mailbox, now: SystemTime) -> Result<Vec<Device>, StoreError> {
-        let rows = self.rows.lock().unwrap();
-        Ok(rows
+        let read = self
+            .rows
+            .lock()
+            .unwrap()
             .iter()
             .rev()
             .filter(|r| owns(owner, &r.owner) && live(r, now))
             .cloned()
-            .collect())
+            .collect();
+        #[cfg(test)]
+        {
+            let meanwhile = self.after_read.lock().unwrap().take();
+            if let Some(meanwhile) = meanwhile {
+                meanwhile();
+            }
+        }
+        Ok(read)
     }
 
     fn touch(&self, owner: &Mailbox, devid: &DeviceId, at: SystemTime) -> Result<(), StoreError> {

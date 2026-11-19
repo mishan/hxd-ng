@@ -2712,7 +2712,10 @@ impl Core {
     /// mail and subscriptions — and for the expiry sweep. Sending is the
     /// gateway's, and a gateway is given [`Self::push_store`].
     pub fn with_devices(mut self, devices: Arc<dyn crate::push::PushStore>) -> Self {
-        self.devices = Some(Arc::new(crate::push::revoking::Revoking::new(devices)));
+        self.devices = Some(Arc::new(crate::push::revoking::Revoking::new(
+            devices,
+            self.revoked.clone(),
+        )));
         self
     }
 

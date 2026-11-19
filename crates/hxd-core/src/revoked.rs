@@ -82,7 +82,7 @@ impl Published {
 pub(crate) struct Refused {
     pub(crate) local: Revocations,
     pub(crate) published: Published,
-    rotated: HashSet<[u8; 32]>,
+    pub(crate) rotated: HashSet<[u8; 32]>,
 }
 
 impl Refused {
@@ -90,6 +90,21 @@ impl Refused {
         self.local.refuses(tag)
             || self.published.refuses(tag)
             || self.rotated.contains(&tag.fingerprint)
+    }
+
+    /// Was `d` registered by a key the lists refuse now: a device's own
+    /// row, filed under its fingerprint, in a mailbox its identity's
+    /// revocation or the device's reaches? A password device's never is.
+    pub(crate) fn refuses_row(&self, d: &crate::push::Device) -> bool {
+        let Some(dev) = d.devid.device_fingerprint() else {
+            return false;
+        };
+        self.local.devices.contains(&dev)
+            || d.owner.fingerprint.is_some_and(|i| {
+                self.local.identities.contains(&i)
+                    || self.rotated.contains(&i)
+                    || self.published.is_revoked(&i, &dev)
+            })
     }
 
     /// Every revoked key that refuses `tag`, each lifted on its own, whose

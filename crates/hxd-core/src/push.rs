@@ -86,6 +86,19 @@ impl DeviceId {
         &self.0
     }
 
+    /// The device fingerprint this id spells, for an identity device's.
+    pub(crate) fn device_fingerprint(&self) -> Option<[u8; 32]> {
+        if !self.is_device_fingerprint() {
+            return None;
+        }
+        let hex = |c: u8| (c as char).to_digit(16).expect("checked as hex") as u8;
+        let mut fp = [0; 32];
+        for (b, pair) in fp.iter_mut().zip(self.0.as_bytes().chunks(2)) {
+            *b = hex(pair[0]) << 4 | hex(pair[1]);
+        }
+        Some(fp)
+    }
+
     /// Is this spelled the way [`Self::of_device`] spells a device
     /// fingerprint? Such an id is an identity device's, and a session
     /// without that device's certificate may not claim it.
@@ -549,7 +562,10 @@ impl crate::roster::Core {
     /// store error left. Each is pending, its rows hidden from the
     /// gateways, until a delete succeeds or the key is lifted: a revoked
     /// key's row must not outlive one failed delete. The lists are read
-    /// only to choose the keys, so no store call is made under them.
+    /// only to choose the keys, so no store call is made under them. A
+    /// key lifted after that and before its delete can still take a
+    /// registration made since the lift: the device misses its pushes
+    /// until it registers again, and no revoked device is pushed at.
     pub(crate) fn take_revoked(&self, keys: Vec<Unrevoked>) {
         let Some(store) = self.devices.as_ref() else {
             return;
@@ -917,6 +933,109 @@ mod tests {
         let gateway = core.push_store().unwrap();
         assert!(gateway.devices(&bob, SystemTime::now()).unwrap().is_empty());
         assert_eq!(devices.devices(&bob, SystemTime::now()).unwrap().len(), 1);
+    }
+
+    /// A row of a key the lists refuse now is never handed to a gateway,
+    /// before any delete has run: whichever list, and whatever wrote it.
+    #[test]
+    fn a_row_of_a_key_revoked_now_is_never_read() {
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        {
+            let mut refused = core.revoked.write().unwrap();
+            refused.local.devices.insert([1; 32]);
+            refused.local.identities.insert([8; 32]);
+            refused.rotated.insert([5; 32]);
+            refused.published.identities.insert([6; 32]);
+            refused.published.devices.insert(([7; 32], [2; 32]));
+        }
+        let row = |login: &str, fp: Option<u8>, id: DeviceId| {
+            let owner = match fp {
+                Some(fp) => Mailbox::identified(login, [fp; 32]),
+                None => Mailbox::login(login),
+            };
+            (owner, id)
+        };
+        let of = |d: u8| DeviceId::of_device(&[d; 32]);
+        let rows = [
+            row("bob", None, of(1)),
+            row("alice", Some(7), of(2)),
+            row("carol", Some(8), of(3)),
+            row("erin", Some(5), of(4)),
+            row("frank", Some(6), of(11)),
+            // The registrar's revocation is alice's identity's, not dave's.
+            row("dave", Some(9), of(2)),
+            row(
+                "carol",
+                Some(8),
+                DeviceId::parse("carols-password").unwrap(),
+            ),
+        ];
+        for (owner, id) in &rows {
+            devices
+                .register(&device(owner.clone(), id.as_str()), 8)
+                .unwrap();
+        }
+        let gateway = core.push_store().unwrap();
+        let now = SystemTime::now();
+        let mut read: Vec<_> = rows
+            .iter()
+            .flat_map(|(owner, _)| gateway.devices(owner, now).unwrap())
+            .chain(gateway.unsubscribed(now).unwrap())
+            .map(|d| d.owner.login)
+            .collect();
+        read.sort();
+        read.dedup();
+        assert_eq!(
+            read,
+            ["carol", "dave"],
+            "dave's and carol's password row alone"
+        );
+        assert_eq!(
+            gateway.devices(&rows[6].0, now).unwrap()[0].devid.as_str(),
+            "carols-password"
+        );
+    }
+
+    /// A row read just before a retry takes it and forgets its key is not
+    /// let through: the key was copied before the read.
+    #[test]
+    fn a_retry_during_a_read_lets_no_row_through() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Arc::new(Core::new().with_devices(devices.clone()));
+        let alice = Mailbox::identified("alice", [7; 32]);
+        devices
+            .register(
+                &device(alice.clone(), DeviceId::of_device(&[10; 32]).as_str()),
+                8,
+            )
+            .unwrap();
+        // The revocation's delete, and the retry when it is applied again.
+        devices.failing_deletes.store(2, SeqCst);
+        core.set_published_revocations(crate::Published {
+            devices: [([7; 32], [10; 32])].into(),
+            covered: [[7; 32]].into(),
+            ..Default::default()
+        });
+        // Its identity has left: the lists say nothing of it now.
+        core.set_published_revocations(crate::Published::default());
+        let retry = core.clone();
+        *devices.after_read.lock().unwrap() = Some(Box::new(move || {
+            retry.sweep_devices();
+        }));
+        let gateway = core.push_store().unwrap();
+        assert!(gateway
+            .devices(&alice, SystemTime::now())
+            .unwrap()
+            .is_empty());
+        assert!(
+            devices
+                .devices(&alice, SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "the retry ran"
+        );
     }
 
     /// A key the operator lifts while its delete waits is forgotten: the
