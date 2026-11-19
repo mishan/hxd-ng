@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use crate::avatar::AvatarOwner;
 use crate::ban::{Ban, BanTarget};
 use crate::inbox::StoreError;
+use crate::push::PushStore;
 use crate::Core;
 
 impl Core {

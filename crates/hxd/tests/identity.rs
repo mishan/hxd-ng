@@ -172,6 +172,13 @@ async fn start_server_full(
     .await
 }
 
+/// A device registry, and how to make the gateway sending to it, from
+/// the registry as the core hands a gateway it, if there is one.
+type Push = (
+    Arc<hxd_core::push::MemoryDevices>,
+    Option<Box<dyn FnOnce(Arc<dyn PushStore>) -> Arc<dyn hxd_core::notify::NotificationGateway>>>,
+);
+
 #[allow(clippy::too_many_arguments)]
 async fn start_server_inner(
     dir: &Path,
@@ -182,7 +189,7 @@ async fn start_server_inner(
     forwarded_header: hxd_ng_session::ForwardedHeader,
     enroll: Option<hxd_ng_session::enroll::MailboxConfig>,
     web_client: Option<&str>,
-    devices: Option<Arc<hxd_core::push::MemoryDevices>>,
+    push: Option<Push>,
     banner: Option<Arc<hxd_session::Banner>>,
     login_limits: Option<hxd_core::LoginLimits>,
 ) -> (SocketAddr, SocketAddr, NgCtx) {
@@ -213,8 +220,14 @@ async fn start_server_inner(
     } else {
         Core::new()
     };
-    let core = match &devices {
-        Some(devices) => core.with_devices(devices.clone()),
+    let has_push = push.is_some();
+    let core = match push {
+        Some((devices, None)) => core.with_devices(devices),
+        Some((devices, Some(gateway))) => {
+            let core = core.with_devices(devices);
+            let store = core.push_store().unwrap();
+            core.with_notifications(gateway(store))
+        }
         None => core,
     };
     // Failed logins are counted by address and login, and loopback is
@@ -298,7 +311,7 @@ async fn start_server_inner(
         enroll: enroll.map(|c| Arc::new(hxd_ng_session::enroll::Mailbox::new(c))),
         files: None,
         registrar: None,
-        push: devices.map(|_| {
+        push: has_push.then(|| {
             Arc::new(hxd_ng_session::push::PushInfo {
                 vapid: "BEl6…".into(),
                 content: "sender".into(),
@@ -5042,12 +5055,75 @@ async fn start_server_with_push(dir: &Path) -> (SocketAddr, Arc<hxd_core::push::
         hxd_ng_session::ForwardedHeader::default(),
         Some(Default::default()),
         None,
-        Some(devices.clone()),
+        Some((devices.clone(), None)),
         None,
         None,
     )
     .await;
     (ng, devices)
+}
+
+/// A push service that takes every push, and remembers the endpoints
+/// it was asked to deliver to.
+#[cfg(feature = "push")]
+#[derive(Default)]
+struct PushService(std::sync::Mutex<Vec<String>>);
+
+#[cfg(feature = "push")]
+impl hxd_push_webpush::Transport for PushService {
+    fn post(
+        &self,
+        push: hxd_push_webpush::Push,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = hxd_push_webpush::Outcome> + Send>>
+    {
+        self.0.lock().unwrap().push(push.endpoint);
+        Box::pin(async { hxd_push_webpush::Outcome::Accepted })
+    }
+}
+
+#[cfg(feature = "push")]
+struct Pushing {
+    ng: SocketAddr,
+    ctx: NgCtx,
+    sent: Arc<PushService>,
+}
+
+/// A server with a mailbox, a device registry and the in-process
+/// gateway, sending to a [`PushService`].
+#[cfg(feature = "push")]
+async fn start_server_pushing(dir: &Path) -> Pushing {
+    let devices = Arc::new(hxd_core::push::MemoryDevices::new());
+    let sent = Arc::new(PushService::default());
+    let vapid = hxd_push_webpush::Vapid::load_or_create(
+        &dir.join("vapid.key"),
+        "mailto:a@example.org",
+        true,
+    )
+    .unwrap();
+    let transport = sent.clone();
+    let gateway = move |store| -> Arc<dyn hxd_core::notify::NotificationGateway> {
+        Arc::new(hxd_push_webpush::WebPushGateway::new(
+            store,
+            Arc::new(vapid),
+            Default::default(),
+            transport,
+        ))
+    };
+    let (_legacy, ng, ctx) = start_server_inner(
+        dir,
+        IdentityConfig::default(),
+        hxd_session::TrtpLogin::Verify,
+        &[],
+        true,
+        hxd_ng_session::ForwardedHeader::default(),
+        Some(Default::default()),
+        None,
+        Some((devices, Some(Box::new(gateway)))),
+        None,
+        None,
+    )
+    .await;
+    Pushing { ng, ctx, sent }
 }
 
 /// A subscription, as a browser hands it to a client: the RFC 8291
@@ -5240,6 +5316,67 @@ async fn a_resumed_session_is_still_the_device_it_logged_in_as() {
     assert_eq!(
         reply["error"]["code"], "no_capability",
         "a web certificate is no more trusted for having dropped its socket: {reply}"
+    );
+}
+
+/// A device its identity revoked at a registrar stops buzzing once the
+/// server applies the revocation (push-notifications.md §5.1), and the
+/// identity's other device does not.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_revoked_device_is_sent_no_more_notifications() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_server_pushing(dir.path()).await;
+    let phone = person(46, "Alice");
+    let (mut p, _) = link_to_alice(s.ng, &phone).await;
+    let laptop = another_device(&phone, 147, hl_identity::caps::WEB);
+    let (mut l, _) = alices_device(s.ng, &laptop).await;
+    // Each endpoint named after its device, as the server files it.
+    for (c, d) in [(&mut p, &phone), (&mut l, &laptop)] {
+        let r = c
+            .request("push_register", subscription(&device_id(d)))
+            .await;
+        assert!(r.get("ok").is_some(), "{r}");
+    }
+
+    s.ctx.core.set_published_revocations(hxd_core::Published {
+        devices: [(phone.id.fingerprint().0, phone.dev.fingerprint().0)].into(),
+        ..Default::default()
+    });
+    p.event("kicked").await;
+    // Away, so a message to the account is one to be woken for.
+    drop((p, l));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ng", s.ng))
+        .await
+        .unwrap();
+    let mut bob = Ng::from_ws(ws).await;
+    let ok = bob
+        .request("login", json!({ "login": "bob", "password": "s3cret" }))
+        .await;
+    assert!(ok.get("ok").is_some(), "{ok}");
+    let r = bob
+        .request(
+            "msg",
+            json!({ "to_login": "alice", "text": "are you there" }),
+        )
+        .await;
+    assert!(r.get("ok").is_some(), "{r}");
+
+    let endpoint = |p: &Person| format!("https://push.example.net/v/{}", device_id(p));
+    let sent = || s.sent.0.lock().unwrap().clone();
+    for _ in 0..100 {
+        if !sent().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        sent(),
+        [endpoint(&laptop)],
+        "the laptop is woken and the revoked phone is not"
     );
 }
 

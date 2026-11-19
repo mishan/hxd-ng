@@ -24,6 +24,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn PushStore>) {
     unregistering_takes_one_or_all(&*new_store());
     linking_claims_and_deleting_purges(&*new_store());
     rotation_drops_what_the_successor_never_vouched_for(&*new_store());
+    a_revoked_key_takes_the_rows_its_devices_made(&*new_store());
     a_mailbox_holds_a_bounded_number_of_devices(&*new_store());
     a_gone_answer_retires_only_the_endpoint_it_was_about(&*new_store());
     a_rekey_clears_every_mailbox(&*new_store());
@@ -332,6 +333,57 @@ fn rotation_drops_what_the_successor_never_vouched_for(s: &dyn PushStore) {
         s.devices(&Mailbox::login("carol"), t(200)).unwrap().len(),
         1,
         "nobody else is touched"
+    );
+}
+
+fn a_revoked_key_takes_the_rows_its_devices_made(s: &dyn PushStore) {
+    let (phone, laptop) = (DeviceId::of_device(&[1; 32]), DeviceId::of_device(&[2; 32]));
+    let mine = Mailbox::identified("bob", fp());
+    let theirs = Mailbox::identified("carol", [8; 32]);
+    for (owner, id, at) in [
+        (&mine, phone.as_str(), 100),
+        (&mine, laptop.as_str(), 101),
+        (&mine, "bobs-password", 102),
+        (&theirs, phone.as_str(), 103),
+    ] {
+        s.register(&device(owner.clone(), id, "https://a.example/1", at), CAP)
+            .unwrap();
+    }
+    let left = |m: &Mailbox| -> Vec<String> {
+        let mut ids: Vec<_> = s
+            .devices(m, t(200))
+            .unwrap()
+            .into_iter()
+            .map(|d| d.devid.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let taken = s.devices_revoke_device(Some(&fp()), &phone).unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].owner, mine, "the identity's row, as it was");
+    assert_eq!(
+        left(&theirs),
+        [phone.as_str()],
+        "another identity's row under the same key is not this identity's to revoke"
+    );
+
+    assert_eq!(
+        s.devices_revoke_identity(&fp()).unwrap().len(),
+        1,
+        "the laptop"
+    );
+    assert_eq!(
+        left(&mine),
+        ["bobs-password"],
+        "a password device is not the key revoked"
+    );
+
+    assert_eq!(s.devices_revoke_device(None, &phone).unwrap().len(), 1);
+    assert!(
+        left(&theirs).is_empty(),
+        "the operator's revocation is anyone's"
     );
 }
 

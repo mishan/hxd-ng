@@ -162,6 +162,19 @@ as AGENTS.md's "Releasing" describes it.
   now apply to any card of an identity with a list held, whichever
   registrars the card names. An identity with no list on file, as one
   an operator linked by hand, is admitted as before.
+- Push notifications to a revoked device. A device key revoked by the
+  operator's list or by a trusted registrar's records, or one whose
+  identity key is revoked, or frozen under `[identity] frozen = deny`,
+  kept its push registrations until its certificate expired, up to 90
+  days, and was still sent notifications. Applying the revocation now
+  deletes them, and unsubscribes them from uniqush under `gateway =
+  "uniqush"`; a registration racing the revocation is refused `revoked`.
+  A frozen identity's devices register again at their next login once
+  the freeze lifts. A registrar's revocation still reaches this server
+  only while its identity has a session here, so until one of its
+  devices connects, a device revoked there is still sent notifications.
+  Registrations left from before are deleted when the operator's list is
+  next loaded, or a registrar's revocation next applied.
 
 ## [0.3.0] - 2026-11-05
 

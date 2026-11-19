@@ -29,6 +29,36 @@ pub struct MemoryDevices {
     /// In registration order, which is what "newest first" reverses.
     rows: Mutex<Vec<Device>>,
     sidecar: Mutex<Option<SidecarRecord>>,
+    /// How many of the next deletes a revocation makes fail, for the
+    /// domain's tests of a store error.
+    #[cfg(test)]
+    pub(crate) failing_deletes: std::sync::atomic::AtomicUsize,
+    /// Run once by the next `devices` after it has read its rows, for
+    /// the domain's tests of what happens meanwhile.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run once by the next device revocation's delete before it deletes.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) before_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl MemoryDevices {
+    #[cfg(test)]
+    fn failing(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.failing_deletes.load(SeqCst) == 0 {
+            return Ok(());
+        }
+        self.failing_deletes.fetch_sub(1, SeqCst);
+        Err(StoreError("a delete that fails".into()))
+    }
+
+    #[cfg(not(test))]
+    fn failing(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// Take the rows `gone` picks out of `rows`, answering with them.
@@ -92,6 +122,7 @@ impl PushStore for MemoryDevices {
     }
 
     fn unregister(&self, owner: &Mailbox, devid: &DeviceId) -> Result<Option<Device>, StoreError> {
+        self.failing()?;
         let mut rows = self.rows.lock().unwrap();
         Ok(take(&mut rows, |r| r.devid == *devid && owns(owner, &r.owner)).pop())
     }
@@ -125,13 +156,23 @@ impl PushStore for MemoryDevices {
     }
 
     fn devices(&self, owner: &Mailbox, now: SystemTime) -> Result<Vec<Device>, StoreError> {
-        let rows = self.rows.lock().unwrap();
-        Ok(rows
+        let read = self
+            .rows
+            .lock()
+            .unwrap()
             .iter()
             .rev()
             .filter(|r| owns(owner, &r.owner) && live(r, now))
             .cloned()
-            .collect())
+            .collect();
+        #[cfg(test)]
+        {
+            let meanwhile = self.after_read.lock().unwrap().take();
+            if let Some(meanwhile) = meanwhile {
+                meanwhile();
+            }
+        }
+        Ok(read)
     }
 
     fn touch(&self, owner: &Mailbox, devid: &DeviceId, at: SystemTime) -> Result<(), StoreError> {
@@ -184,6 +225,33 @@ impl PushStore for MemoryDevices {
         let mut rows = self.rows.lock().unwrap();
         Ok(take(&mut rows, |r| {
             r.owner.fingerprint.as_ref() == Some(from)
+        }))
+    }
+
+    fn devices_revoke_device(
+        &self,
+        identity: Option<&[u8; 32]>,
+        devid: &DeviceId,
+    ) -> Result<Vec<Device>, StoreError> {
+        #[cfg(test)]
+        {
+            let meanwhile = self.before_delete.lock().unwrap().take();
+            if let Some(meanwhile) = meanwhile {
+                meanwhile();
+            }
+        }
+        self.failing()?;
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            r.devid == *devid && identity.is_none_or(|i| r.owner.fingerprint.as_ref() == Some(i))
+        }))
+    }
+
+    fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
+        self.failing()?;
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            r.owner.fingerprint.as_ref() == Some(identity) && r.devid.is_device_fingerprint()
         }))
     }
 

@@ -210,6 +210,8 @@ fn refused(id: u64, e: PushError) -> String {
             "A guest has no mailbox, so there is nothing to be notified about.",
         ),
         PushError::NoSession => ("server_error", "Server error."),
+        // Login's answer to a revoked key.
+        PushError::Revoked => ("revoked", "This key is revoked on this server."),
         PushError::BadSubscription(text) => ("bad_request", text),
         PushError::TooManyDevices => (
             "too_many_devices",

@@ -20,6 +20,7 @@ use std::collections::HashSet;
 
 use tracing::info;
 
+use crate::push::Unrevoked;
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
 /// The fingerprints refused by hand: identity keys, which refuse every
@@ -56,6 +57,9 @@ pub struct Published {
     pub identities: HashSet<[u8; 32]>,
     /// `(identity, device)`.
     pub devices: HashSet<([u8; 32], [u8; 32])>,
+    /// The identities whose records this list was made from. Only for
+    /// those does a key missing from it mean the key is not refused.
+    pub covered: HashSet<[u8; 32]>,
 }
 
 impl Published {
@@ -77,8 +81,8 @@ impl Published {
 #[derive(Debug, Default)]
 pub(crate) struct Refused {
     pub(crate) local: Revocations,
-    published: Published,
-    rotated: HashSet<[u8; 32]>,
+    pub(crate) published: Published,
+    pub(crate) rotated: HashSet<[u8; 32]>,
 }
 
 impl Refused {
@@ -86,6 +90,61 @@ impl Refused {
         self.local.refuses(tag)
             || self.published.refuses(tag)
             || self.rotated.contains(&tag.fingerprint)
+    }
+
+    /// Was `d` registered by a key the lists refuse now: a device's own
+    /// row, filed under its fingerprint, in a mailbox its identity's
+    /// revocation or the device's reaches? A password device's never is.
+    pub(crate) fn refuses_row(&self, d: &crate::push::Device) -> bool {
+        let Some(dev) = d.devid.device_fingerprint() else {
+            return false;
+        };
+        self.local.devices.contains(&dev)
+            || d.owner.fingerprint.is_some_and(|i| {
+                self.local.identities.contains(&i)
+                    || self.rotated.contains(&i)
+                    || self.published.is_revoked(&i, &dev)
+            })
+    }
+
+    /// Every revoked key that refuses `tag`, each lifted on its own, whose
+    /// rows a registration by `tag` must not leave. Empty if none does.
+    pub(crate) fn pending_for(&self, tag: &IdentityTag) -> Vec<Unrevoked> {
+        let (i, d) = (tag.fingerprint, tag.device);
+        [
+            self.local
+                .devices
+                .contains(&d)
+                .then_some(Unrevoked::LocalDevice(d)),
+            (self.local.identities.contains(&i) || self.rotated.contains(&i))
+                .then_some(Unrevoked::LocalIdentity(i)),
+            self.published
+                .identities
+                .contains(&i)
+                .then_some(Unrevoked::PublishedIdentity(i)),
+            self.published
+                .devices
+                .contains(&(i, d))
+                .then_some(Unrevoked::PublishedDevice(i, d)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Has `key` been lifted? The operator's once their list leaves it
+    /// out. A registrar's only once a list made from its identity's
+    /// records does: one made without them says nothing about it.
+    pub(crate) fn lifts(&self, key: &Unrevoked) -> bool {
+        let p = &self.published;
+        match key {
+            Unrevoked::LocalDevice(d) => !self.local.devices.contains(d),
+            Unrevoked::LocalIdentity(i) => {
+                !self.local.identities.contains(i) && !self.rotated.contains(i)
+            }
+            Unrevoked::PublishedDevice(i, d) => p.covered.contains(i) && !p.is_revoked(i, d),
+            Unrevoked::PublishedIdentity(i) => p.covered.contains(i) && !p.identities.contains(i),
+        }
     }
 
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
@@ -125,24 +184,38 @@ impl Core {
     /// one should not be able to come back through it.
     ///
     /// The presentations a newly revoked device made are dropped too
-    /// (`docs/proposals/portable-friends.md` §6): store work, so this is
-    /// called off the reactor.
+    /// (`docs/proposals/portable-friends.md` §6), and the push
+    /// registrations newly revoked keys made (push-notifications.md
+    /// §5.1): store work, so this is called off the reactor.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
-        let devices: Vec<_> = {
+        let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
                 .devices
                 .difference(&refused.local.devices)
                 .map(|d| (None, *d))
                 .collect();
+            let ids = list
+                .identities
+                .difference(&refused.local.identities)
+                .copied()
+                .collect();
             refused.local = list.clone();
-            new
+            (ids, new)
         };
-        if list.is_empty() {
-            return Vec::new();
+        let keys = devices.iter().map(|(_, d)| Unrevoked::LocalDevice(*d));
+        let ids = identities.iter().map(|i| Unrevoked::LocalIdentity(*i));
+        // Sessions first: the lists already hide the rows, and the
+        // deletes may wait on registrations.
+        let ended = match list.is_empty() {
+            true => Vec::new(),
+            false => self.end_revoked(|tag| list.refuses(tag)),
+        };
+        // Even an empty list: a key lifted is forgotten by a retry too.
+        self.take_revoked(keys.chain(ids).collect());
+        if !list.is_empty() {
+            self.drop_revoked_presentations(&devices);
         }
-        let ended = self.end_revoked(|tag| list.refuses(tag));
-        self.drop_revoked_presentations(&devices);
         ended
     }
 
@@ -165,21 +238,36 @@ impl Core {
     /// [`Self::set_revocations`] does for the operator's own list.
     /// Called off the reactor, as [`Self::set_revocations`] is.
     pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
-        let devices: Vec<_> = {
+        let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
                 .devices
                 .difference(&refused.published.devices)
                 .map(|(i, d)| (Some(*i), *d))
                 .collect();
+            let ids = list
+                .identities
+                .difference(&refused.published.identities)
+                .copied()
+                .collect();
             refused.published = list.clone();
-            new
+            (ids, new)
         };
-        if list.is_empty() {
-            return Vec::new();
+        let keys = devices
+            .iter()
+            .filter_map(|(i, d)| i.map(|i| Unrevoked::PublishedDevice(i, *d)));
+        let ids = identities.iter().map(|i| Unrevoked::PublishedIdentity(*i));
+        // Sessions first: the lists already hide the rows, and the
+        // deletes may wait on registrations.
+        let ended = match list.is_empty() {
+            true => Vec::new(),
+            false => self.end_revoked(|tag| list.refuses(tag)),
+        };
+        // Even an empty list: a key lifted is forgotten by a retry too.
+        self.take_revoked(keys.chain(ids).collect());
+        if !list.is_empty() {
+            self.drop_revoked_presentations(&devices);
         }
-        let ended = self.end_revoked(|tag| list.refuses(tag));
-        self.drop_revoked_presentations(&devices);
         ended
     }
 
