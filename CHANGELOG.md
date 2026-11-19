@@ -154,7 +154,10 @@ as AGENTS.md's "Releasing" describes it.
   (docs/identity-registrar.md §4.6, §5.4, §6.3, §8.2). `GET
   /identity/card/<fp>` is held per address to `[limits]
   avatar_fetches_per_minute`, counted apart from the avatars and the
-  emoji.
+  emoji. On a server with a registrar, `GET /identity/card/<fp>` answers
+  404 for a cached card the registrar would now refuse, and 503, as `PUT
+  /identity/card` does, when the registrar's store cannot check a card;
+  `hlid restore` takes only a 404 as no card and otherwise stops.
 
 ### Fixed
 

@@ -676,20 +676,28 @@ pub(crate) fn restore_cmd(args: &[String]) -> R<()> {
         .open(&identity, &keys)
         .map_err(|e| format!("the envelope did not open: {e}"))?;
 
-    let card = agent()
-        .get(&format!("{}/identity/card/{}", reg.base, id.fingerprint()))
-        .call()
-        .ok()
-        .and_then(|resp| {
+    // Only a 404 means there is no card: on any other failure a fresh
+    // card made here would drop the commitment the registrar holds.
+    let url = format!("{}/identity/card/{}", reg.base, id.fingerprint());
+    let card = match agent().get(&url).call() {
+        Ok(resp) => {
             let mut body = Vec::new();
             std::io::Read::read_to_end(
                 &mut std::io::Read::take(resp.into_reader(), 64 * 1024),
                 &mut body,
             )
-            .ok()?;
+            .map_err(|e| format!("{url}: {e}"))?;
             Some(body)
-        })
-        .filter(|b| Card::parse(b).is_ok_and(|c| c.identity == id.public()));
+        }
+        Err(ureq::Error::Status(404, _)) => None,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(format!(
+                "{url} answered {code}: the card could not be fetched; try the restore again later"
+            ))
+        }
+        Err(e) => return Err(format!("{url}: {e}")),
+    }
+    .filter(|b| Card::parse(b).is_ok_and(|c| c.identity == id.public()));
     crate::lay_out(
         &home,
         &id,

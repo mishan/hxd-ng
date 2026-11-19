@@ -641,6 +641,12 @@ impl RegistrarStore for SqliteRegistrarStore {
         sql(self.conn.lock().unwrap().execute_batch("COMMIT"))
     }
 
+    fn begin_read(&self) -> Result<(), StoreError> {
+        // DEFERRED: under WAL its first read fixes the snapshot every read
+        // after it sees, and no writer waits on it.
+        sql(self.conn.lock().unwrap().execute_batch("BEGIN DEFERRED"))
+    }
+
     fn rollback(&self) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         if !conn.is_autocommit() {
@@ -1008,6 +1014,23 @@ mod tests {
         server.rollback();
         assert!(!server.invite_open(&[3; 32]).unwrap());
         assert_eq!(server.add_invites(&[[3; 32]]).unwrap(), 1);
+    }
+
+    /// What `check_card` reads in one call it reads from one state, even
+    /// while another opener writes.
+    #[test]
+    fn a_read_transaction_sees_one_state_and_holds_off_no_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registrar.db");
+        let reader = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+        let writer = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+
+        reader.begin_read().unwrap();
+        assert!(!reader.invite_open(&[1; 32]).unwrap());
+        assert_eq!(writer.add_invites(&[[1; 32]]).unwrap(), 1);
+        assert!(!reader.invite_open(&[1; 32]).unwrap());
+        reader.rollback();
+        assert!(reader.invite_open(&[1; 32]).unwrap());
     }
 
     #[test]

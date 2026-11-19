@@ -19,6 +19,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RegistrarStore>) {
     an_issuance_creates_the_identity_and_logs_in_order(&*new_store());
     a_commitment_is_set_once(&*new_store());
     an_invite_is_spent_exactly_once(&*new_store());
+    a_read_transaction_ends_with_rollback(&*new_store());
     a_record_is_published_once_and_answers_with_its_seq(&*new_store());
     a_rotation_moves_every_handle_and_keeps_its_age(&*new_store());
     lapsing_keeps_the_earliest_time_and_bars_on_request(&*new_store());
@@ -169,6 +170,18 @@ fn a_commitment_is_set_once(s: &dyn RegistrarStore) {
         !s.set_commitment(&key(3), &[5; 32]).unwrap(),
         "no such identity"
     );
+}
+
+fn a_read_transaction_ends_with_rollback(s: &dyn RegistrarStore) {
+    s.add_invites(&[[1; 32]]).unwrap();
+    s.begin_read().unwrap();
+    assert!(s.invite_open(&[1; 32]).unwrap());
+    s.rollback();
+    // Nothing is left open: a write and a decision's transaction follow.
+    assert_eq!(s.add_invites(&[[2; 32]]).unwrap(), 1);
+    s.begin().unwrap();
+    s.commit().unwrap();
+    assert!(s.invite_open(&[2; 32]).unwrap());
 }
 
 fn an_invite_is_spent_exactly_once(s: &dyn RegistrarStore) {

@@ -380,6 +380,13 @@ pub trait RegistrarStore: Send + Sync + 'static {
     }
     /// Undo what [`begin`](Self::begin) opened, if anything is open.
     fn rollback(&self) {}
+    /// Open a transaction in which the reads that follow, until
+    /// [`rollback`](Self::rollback), see one state of the store, without
+    /// holding off its writers as [`begin`](Self::begin) does. A store
+    /// only one process can open needs nothing here, as for `begin`.
+    fn begin_read(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     fn identity(&self, key: &Key) -> Result<Option<IdentityRow>, StoreError>;
     /// By `SHA-256(key)`, which is what URLs and operators name.

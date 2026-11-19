@@ -690,6 +690,21 @@ impl Registrar {
         result
     }
 
+    /// Run reads that must see one state of the store: the mutex, then the
+    /// store's read transaction, which holds off no other process.
+    fn reading<T>(&self, f: impl FnOnce() -> Result<T, Refusal>) -> Result<T, Refusal> {
+        struct Open<'a>(&'a dyn RegistrarStore);
+        impl Drop for Open<'_> {
+            fn drop(&mut self) {
+                self.0.rollback();
+            }
+        }
+        let _w = self.write.lock().unwrap();
+        self.store.begin_read()?;
+        let _open = Open(&*self.store);
+        f()
+    }
+
     fn limit(&self, key: Limit, max: u32, now: u64) -> Result<(), Refusal> {
         self.limits
             .lock()
@@ -1434,30 +1449,32 @@ impl Registrar {
     /// A card for an identity attested here must carry the commitment the
     /// registrar holds (§5.4). Called before the card is accepted.
     pub fn check_card(&self, card: &Card) -> Result<(), Refusal> {
-        if let Some(held) = self
-            .store
-            .identity(&card.identity)?
-            .and_then(|row| row.commitment)
-        {
-            if card.successor != Some(held) {
-                return Err(Refusal::SuccessorMismatch);
+        self.reading(|| {
+            if let Some(held) = self
+                .store
+                .identity(&card.identity)?
+                .and_then(|row| row.commitment)
+            {
+                if card.successor != Some(held) {
+                    return Err(Refusal::SuccessorMismatch);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        // One `note_card` would not take while a rotation waits is
-        // refused, as `register` refuses it, rather than served as the
-        // identity's card with a commitment the registrar never holds.
-        if card.successor.is_some() {
-            if let Some(p) = self.store.pending(&card.identity)? {
-                return Err(Refusal::RotationPending {
-                    until: p.publish_at,
-                });
+            // One `note_card` would not take while a rotation waits is
+            // refused, as `register` refuses it, rather than served as the
+            // identity's card with a commitment the registrar never holds.
+            if card.successor.is_some() {
+                if let Some(p) = self.store.pending(&card.identity)? {
+                    return Err(Refusal::RotationPending {
+                        until: p.publish_at,
+                    });
+                }
+                if let Some(until) = self.held_for(&card.identity, card.successor)? {
+                    return Err(Refusal::RotationPending { until });
+                }
             }
-            if let Some(until) = self.held_for(&card.identity, card.successor)? {
-                return Err(Refusal::RotationPending { until });
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Record an accepted card's commitment, for an identity attested

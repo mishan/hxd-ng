@@ -713,7 +713,9 @@ is why a registrar is an identity-enabled server and not a bare HTTP
 service. The registrar anchors the card's `successor` as §5.4 says.
 hxd-ng keeps cards in memory, so after a restart it answers `card`
 404 until the card is put or shown again; the commitment is kept, and
-`lookup` serves it.
+`lookup` serves it. It also answers 404 for a cached card it would now
+refuse, and 503, to `GET` and `PUT` alike, when its store cannot check
+a card (`hotline-ng-identity.md` §7).
 
 ### 6.5 Errors
 

@@ -1910,29 +1910,32 @@ impl IdentityState {
     }
 
     /// The cached card `GET /identity/card` serves: not one this server's
-    /// registrar would now refuse for its successor, such as a card cached
-    /// before a rotation recorded the successor's commitment as another.
-    pub fn served_card(&self, fp: &Fingerprint) -> Option<(u64, Vec<u8>)> {
-        let (updated, successor, bytes) = {
-            let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            let c = t.cards.get(fp)?;
-            (c.updated, c.successor, c.bytes.clone())
+    /// registrar would now refuse, such as a card cached before a rotation
+    /// recorded the successor's commitment as another, or as one where
+    /// the card names none. `Err` when the registrar could not say, which
+    /// is its store failing: no card is served then rather than one it
+    /// might refuse.
+    pub fn served_card(
+        &self,
+        fp: &Fingerprint,
+    ) -> Result<Option<(u64, Vec<u8>)>, hxd_registrar::Refusal> {
+        let Some((updated, bytes)) = self.card(fp) else {
+            return Ok(None);
         };
-        // A card naming no successor is one the registrar takes as ever.
-        if successor.is_none() {
-            return Some((updated, bytes));
-        }
         if let (Some(reg), Ok(card)) = (&self.registrar, hl_identity::Card::parse(&bytes)) {
             match reg.check_card(&card) {
                 Err(
                     hxd_registrar::Refusal::SuccessorMismatch
                     | hxd_registrar::Refusal::RotationPending { .. },
-                ) => return None,
-                Err(e) => tracing::warn!("registrar could not check a cached card: {e}"),
+                ) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!("registrar could not check a cached card: {e}");
+                    return Err(e);
+                }
                 Ok(()) => {}
             }
         }
-        Some((updated, bytes))
+        Ok(Some((updated, bytes)))
     }
 
     /// `PUT /identity/card` for the identity a token or device proved.

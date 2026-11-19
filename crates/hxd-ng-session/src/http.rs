@@ -2056,8 +2056,17 @@ async fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
     let Some(fp) = hl_identity::Fingerprint::parse(fp) else {
         return plain(StatusCode::BAD_REQUEST, "malformed fingerprint");
     };
-    let Ok(served) = crate::spawn_blocking("identity", move || st.served_card(&fp)).await else {
-        return plain(StatusCode::INTERNAL_SERVER_ERROR, "card lookup task failed");
+    let served = match crate::spawn_blocking("identity", move || st.served_card(&fp)).await {
+        Ok(Ok(served)) => served,
+        // Not a 404, which a client takes as "this identity has no card"
+        // and may answer by making one without the commitment it holds.
+        Ok(Err(_)) => {
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the registrar could not check the card",
+            )
+        }
+        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "card lookup task failed"),
     };
     match served {
         Some((updated, bytes)) => {
@@ -2136,7 +2145,12 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
             if let hxd_registrar::Refusal::RotationPending { until } = e {
                 body["pending_until"] = json!(until);
             }
-            return json_resp(StatusCode::from_u16(e.status()).unwrap(), body);
+            // The registrar's store failing, as `GET` answers it.
+            let status = match e {
+                hxd_registrar::Refusal::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::from_u16(e.status()).unwrap(),
+            };
+            return json_resp(status, body);
         }
         Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed"),
     };
