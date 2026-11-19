@@ -170,7 +170,9 @@ as AGENTS.md's "Releasing" describes it.
   commits to that key. Before, it signed no `next` and left the
   successor to register a commitment afterward, which a thief holding
   only the successor's key could have beaten at another registrar
-  (docs/identity-registrar.md §4.6).
+  (docs/identity-registrar.md §4.6). A `--next-key` naming `--to`, the
+  identity key or that card's file is refused, and `hlid card`, `cert`
+  and `attest` refuse an `-o` that holds a key.
 
 ### Fixed
 

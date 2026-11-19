@@ -461,6 +461,10 @@ pub(crate) fn write_private(path: &Path, text: &str) -> R<()> {
 
 fn write_out(a: &Args, bytes: &[u8]) -> R<()> {
     let path = a.one("o")?;
+    // A key written over is gone for good, and nothing this writes is one.
+    if read_seed(Path::new(path)).is_ok() {
+        return Err(format!("{path} holds a key; hlid will not write over it"));
+    }
     std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
     eprintln!("wrote {} bytes to {path}", bytes.len());
     Ok(())

@@ -413,6 +413,22 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
         Some(p) => std::path::PathBuf::from(p),
         None => Path::new(to).with_extension("next.key"),
     };
+    let card = Path::new(to).with_file_name("successor-card.bin");
+    // The next key is the only key the successor can rotate to, so it may
+    // not be a file the printed `hlid card` step or this rotation reads
+    // as another key.
+    for (other, what) in [
+        (card.clone(), "the successor card the next step writes"),
+        (Path::new(to).to_owned(), "--to"),
+        (a.file("identity", IDENTITY_KEY)?, "the identity key"),
+    ] {
+        if same_file(&next_key, &other) {
+            return Err(format!(
+                "--next-key {} is {what}; name another file",
+                next_key.display()
+            ));
+        }
+    }
     let bytes = Rotation {
         identity: old.public(),
         successor: new.public(),
@@ -444,7 +460,6 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
     if handles.is_empty() {
         handles.push("HANDLE");
     }
-    let card = Path::new(to).with_file_name("successor-card.bin");
     let card = card.to_string_lossy();
     println!(
         "next: the successor {} needs a card of its own, and then each handle again \
@@ -472,6 +487,21 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
          logs in there"
     );
     Ok(())
+}
+
+/// Whether two paths name one file, the second perhaps not yet made: each
+/// is resolved as far as it exists, its directory if not itself.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| {
+        p.canonicalize().unwrap_or_else(|_| {
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty());
+            dir.unwrap_or(Path::new("."))
+                .canonicalize()
+                .map(|d| d.join(p.file_name().unwrap_or_default()))
+                .unwrap_or_else(|_| p.to_owned())
+        })
+    };
+    resolve(a) == resolve(b)
 }
 
 /// A word as a POSIX shell reads it back: bare when that is safe, else

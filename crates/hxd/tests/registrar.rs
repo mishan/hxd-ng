@@ -1217,6 +1217,31 @@ async fn hlid_rotate_signs_the_successors_commitment_and_the_successor_is_held_t
 
     let succ = home.join("successor.key");
     let succ = succ.to_str().unwrap();
+    // A next key where a printed step or a key already lives would be
+    // written over, so it is refused before anything is made or posted.
+    let card = home.join("successor-card.bin");
+    let seed = std::fs::read(succ).unwrap();
+    let rotate = ["rotate", "--registrar", &url, "--to", succ, "--next-key"];
+    for next in [
+        card.clone(),
+        home.join(".").join("successor-card.bin"),
+        PathBuf::from(succ),
+        home.join("identity.key"),
+    ] {
+        let next = next.to_str().unwrap();
+        let (ok, _, err) = hlid(&bin, &home, &[&rotate[..], &[next]].concat()).await;
+        assert!(!ok, "{next}");
+        assert!(err.contains("--next-key"), "{err}");
+    }
+    assert!(!card.exists());
+    let old = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], old.fingerprint().to_string());
+    // Nor does `hlid card` write over a key.
+    let card_over = ["card", "--identity", succ, "--name", "A", "-o", succ];
+    assert!(!hlid(&bin, &home, &card_over).await.0);
+    assert_eq!(std::fs::read(succ).unwrap(), seed);
+
     let (ok, out, err) = hlid(&bin, &home, &["rotate", "--registrar", &url, "--to", succ]).await;
     assert!(ok, "{err}");
     assert!(out.contains("rotate published"), "{out}");
