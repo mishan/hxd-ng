@@ -371,6 +371,30 @@ const MAX_TOKENS: usize = 65536;
 /// map on every request — the sweep was O(n) per unauthenticated call.
 const SWEEP_EVERY: usize = 256;
 
+/// How often the records sweep refreshes the lists of an identity with
+/// push registrations here and no session. They are fetched only once
+/// due, as a live identity's are, so this bounds the reading and
+/// verifying of what is held, and how long after its list falls due a
+/// revocation of one of its devices reaches its registrations.
+const OFFLINE_SWEEP: Duration = Duration::from_secs(600);
+
+/// How far into the `OFFLINE_SWEEP` window `fp` is first refreshed, by
+/// its first bytes, so the identities a restart finds away do not all
+/// fall due on one tick.
+fn stagger(fp: &Fingerprint) -> Duration {
+    OFFLINE_SWEEP * u32::from(u16::from_be_bytes([fp.0[0], fp.0[1]])) / 65536
+}
+
+/// The records sweep's state for identities with push registrations here
+/// and no session.
+#[derive(Default)]
+struct Offline {
+    /// What was last found against each, and when it is next refreshed.
+    found: HashMap<Fingerprint, (Instant, hxd_core::Published)>,
+    /// Every identity with push registrations, as the store last said.
+    pushing: HashSet<Fingerprint>,
+}
+
 struct DeviceRecord {
     cert: Vec<u8>,
     identity: PublicKey,
@@ -468,6 +492,9 @@ pub struct IdentityState {
     /// The registrars this server trusts, their keys and their records.
     registrars: Option<Arc<crate::registrars::Registrars>>,
     handovers: Mutex<Arc<Handovers>>,
+    /// What the records sweep found against identities away, installed
+    /// with every sweep's list until it is refreshed.
+    offline: Mutex<Offline>,
 }
 
 /// What the server commits to and has handed over
@@ -519,6 +546,24 @@ pub fn check_handovers(key: &PublicKey, h: &Handovers, now: u64) -> Result<(), S
         );
     }
     Ok(())
+}
+
+/// What `list` says of `fp` alone.
+fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Published {
+    // Destructured, so a field added is one to say how to cut.
+    let hxd_core::Published {
+        identities,
+        devices,
+        covered,
+        unrevoked,
+    } = list;
+    let of = |i: &[u8; 32]| *i == fp.0;
+    hxd_core::Published {
+        identities: identities.iter().copied().filter(of).collect(),
+        devices: devices.iter().copied().filter(|(i, _)| of(i)).collect(),
+        covered: covered.iter().copied().filter(of).collect(),
+        unrevoked: unrevoked.iter().copied().filter(of).collect(),
+    }
 }
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
@@ -653,6 +698,7 @@ impl IdentityState {
             registrar: None,
             registrars: None,
             handovers: Mutex::default(),
+            offline: Mutex::default(),
         };
         state.finish_rotations(None);
         state
@@ -1806,6 +1852,11 @@ impl IdentityState {
     /// session here refreshed where they are due, a few at a time, and
     /// what they now refuse installed in the core, which ends the
     /// sessions it refuses there and then. Answers those, for the log.
+    /// An identity with push registrations and no session is swept too,
+    /// so a device revoked at its registrar loses its registrations
+    /// without coming back (push-notifications.md §5.1): what its held
+    /// lists refuse is installed as soon as it is seen away, and they are
+    /// refreshed every `OFFLINE_SWEEP`, after the live identities'.
     ///
     /// The lists asked for are the ones admission fetched, by the
     /// identity's fingerprint, never the card it shows now: a card can be
@@ -1821,21 +1872,97 @@ impl IdentityState {
             .into_iter()
             .map(Fingerprint)
             .collect();
+        let core = self.core.clone();
+        let answer = crate::spawn_blocking("identity", move || core.push_identities())
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.0));
         let (now, sweep) = (self.clock.unix(), self.clock.now());
-        registrars.retain_attested(&live);
-        futures_util::stream::iter(&live)
+        let (offline, new, due) = {
+            let mut held = self.offline.lock().unwrap_or_else(|e| e.into_inner());
+            let Offline { found, pushing } = &mut *held;
+            match answer {
+                Ok(ids) => *pushing = ids.into_iter().map(Fingerprint).collect(),
+                // The last answer stands until the store gives another.
+                Err(e) => tracing::warn!("push identities: {e}"),
+            }
+            // An identity back on the roster is read every sweep, and seen
+            // away afresh once it leaves it again.
+            let on: HashSet<&Fingerprint> = live.iter().collect();
+            found.retain(|fp, _| pushing.contains(fp) && !on.contains(fp));
+            let offline: Vec<Fingerprint> = pushing
+                .iter()
+                .filter(|fp| !on.contains(fp))
+                .copied()
+                .collect();
+            let (mut new, mut due) = (Vec::new(), Vec::new());
+            for fp in &offline {
+                match found.get(fp) {
+                    None => new.push(*fp),
+                    Some((next, _)) if *next <= sweep => due.push(*fp),
+                    Some(_) => {}
+                }
+            }
+            (offline, new, due)
+        };
+        registrars.retain_attested(&[&live[..], &offline[..]].concat());
+        let mut ended = Vec::new();
+        // What the held lists already refuse of an identity newly away, as
+        // after a restart, is installed before anything is fetched.
+        if !new.is_empty() {
+            let first = new.iter().map(|fp| (*fp, sweep + stagger(fp))).collect();
+            ended.extend(self.install(&registrars, &live, first).await);
+        }
+        self.refresh(&registrars, &live, now, sweep).await;
+        ended.extend(self.install(&registrars, &live, Vec::new()).await);
+        // Last, so what is fetched for identities away holds up no
+        // revocation of a live one.
+        if !due.is_empty() {
+            self.refresh(&registrars, &due, now, sweep).await;
+            let next = due.iter().map(|fp| (*fp, sweep + OFFLINE_SWEEP)).collect();
+            ended.extend(self.install(&registrars, &live, next).await);
+        }
+        ended
+    }
+
+    /// The lists of `ids` refreshed where they are due, a few at a time.
+    async fn refresh(
+        &self,
+        registrars: &Arc<crate::registrars::Registrars>,
+        ids: &[Fingerprint],
+        now: u64,
+        sweep: Instant,
+    ) {
+        futures_util::stream::iter(ids)
             .for_each_concurrent(8, |fp| {
                 let registrars = registrars.clone();
                 async move { registrars.refresh_held(*fp, now, sweep).await }
             })
             .await;
+    }
+
+    /// Install what the held lists of `live` and of `away` refuse, with
+    /// what was last found against every other identity away, keeping
+    /// each of `away`'s to be refreshed when it says. Answers the
+    /// sessions ended.
+    async fn install(
+        self: &Arc<Self>,
+        registrars: &Arc<crate::registrars::Registrars>,
+        live: &[Fingerprint],
+        away: Vec<(Fingerprint, Instant)>,
+    ) -> Vec<(hxd_core::Uid, String)> {
         let frozen_refuses = self.cfg.frozen == Frozen::Deny;
-        let this = self.clone();
+        let (this, registrars) = (self.clone(), registrars.clone());
+        let asked: Vec<Fingerprint> = live
+            .iter()
+            .copied()
+            .chain(away.iter().map(|(fp, _)| *fp))
+            .collect();
         // A rotation found is accepted as at an admission, which refuses
         // its predecessor unless an anchor here overrules it; with no
         // file to keep rotations in, the record refuses it here.
         crate::spawn_blocking("identity", move || {
-            let (mut refused, rotations) = registrars.refused(&live, frozen_refuses);
+            let (mut refused, rotations, unread) = registrars.refused(&asked, frozen_refuses);
             for (from, to, record) in rotations {
                 let next = hl_identity::Rotation::parse(&record)
                     .ok()
@@ -1843,6 +1970,17 @@ impl IdentityState {
                 this.accept_rotation(from, to, next, "a registrar's records", Some(&record));
                 if this.anchors.is_none() {
                     refused.unrevoked.insert(from.0);
+                }
+            }
+            {
+                let mut held = this.offline.lock().unwrap_or_else(|e| e.into_inner());
+                // One whose lists could not be read keeps what was found
+                // before, or stays newly away, and is read again next tick.
+                for (fp, next) in away.into_iter().filter(|(fp, _)| !unread.contains(fp)) {
+                    held.found.insert(fp, (next, published_of(&refused, &fp)));
+                }
+                for (_, part) in held.found.values() {
+                    refused.merge(part);
                 }
             }
             // Here too: installing it drops what newly revoked devices

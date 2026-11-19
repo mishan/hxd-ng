@@ -255,6 +255,18 @@ impl PushStore for MemoryDevices {
         }))
     }
 
+    fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        let rows = self.rows.lock().unwrap();
+        let mut ids: Vec<[u8; 32]> = rows
+            .iter()
+            .filter(|r| r.devid.is_device_fingerprint())
+            .filter_map(|r| r.owner.fingerprint)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
         self.unregister_all(of)
     }

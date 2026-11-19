@@ -25,6 +25,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn PushStore>) {
     linking_claims_and_deleting_purges(&*new_store());
     rotation_drops_what_the_successor_never_vouched_for(&*new_store());
     a_revoked_key_takes_the_rows_its_devices_made(&*new_store());
+    the_identities_whose_devices_hold_rows_are_listed_once(&*new_store());
     a_mailbox_holds_a_bounded_number_of_devices(&*new_store());
     a_gone_answer_retires_only_the_endpoint_it_was_about(&*new_store());
     a_rekey_clears_every_mailbox(&*new_store());
@@ -385,6 +386,34 @@ fn a_revoked_key_takes_the_rows_its_devices_made(s: &dyn PushStore) {
         left(&theirs).is_empty(),
         "the operator's revocation is anyone's"
     );
+}
+
+fn the_identities_whose_devices_hold_rows_are_listed_once(s: &dyn PushStore) {
+    let (phone, laptop) = (DeviceId::of_device(&[1; 32]), DeviceId::of_device(&[2; 32]));
+    let mine = Mailbox::identified("bob", fp());
+    let theirs = Mailbox::identified("carol", [8; 32]);
+    let (not_hex, upper_hex) = ("g".repeat(64), "AB".repeat(32));
+    for (owner, id, at) in [
+        (&mine, phone.as_str(), 100),
+        (&mine, laptop.as_str(), 101),
+        // None is a device's own row.
+        (&theirs, "carols-password", 102),
+        (&theirs, &not_hex, 102),
+        (&theirs, &upper_hex, 102),
+        (&bob(), phone.as_str(), 103),
+    ] {
+        s.register(&device(owner.clone(), id, "https://a.example/1", at), CAP)
+            .unwrap();
+    }
+    assert_eq!(s.device_identities().unwrap(), [fp()]);
+    s.register(
+        &device(theirs, phone.as_str(), "https://a.example/2", 104),
+        CAP,
+    )
+    .unwrap();
+    let mut ids = s.device_identities().unwrap();
+    ids.sort_unstable();
+    assert_eq!(ids, [fp(), [8; 32]]);
 }
 
 fn a_mailbox_holds_a_bounded_number_of_devices(s: &dyn PushStore) {

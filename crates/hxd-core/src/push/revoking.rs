@@ -11,8 +11,8 @@
 //!
 //! The pending keys are not kept across a restart. The operator's list
 //! is applied at startup, which takes its keys' rows again; a
-//! registrar's revocation is applied, and its rows taken, once its
-//! identity has a session here again.
+//! registrar's at the first records sweep, which reads the lists of
+//! every identity with rows here.
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
@@ -153,6 +153,10 @@ impl PushStore for Revoking {
 
     fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError> {
         self.store.devices_revoke_identity(identity)
+    }
+
+    fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        self.store.device_identities()
     }
 
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {

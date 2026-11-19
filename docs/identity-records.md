@@ -74,12 +74,17 @@ is found, the records cache is durable, and the fetch is its own crate.
   its session is attached would otherwise keep that session until it
   next resumes, which can be days for a phone. So a sweep refreshes, on
   the records' own lifetime, the lists of identities with a live or
-  detached session, from the registrars that attested each when it was
-  admitted, reached then or not, and applying a list that now refuses
-  one ends its sessions through the same path `set_revocations` uses. A rotation's
+  detached session, and every ten minutes those of identities with push
+  registrations here and no session (push-notifications.md §5.1). It
+  asks the registrars it holds a list from for each, and those that
+  attested it when it was admitted, reached then or not, which a
+  restart forgets. Applying a list that now refuses one ends its
+  sessions through the same path `set_revocations` uses. A rotation's
   predecessor and a device revocation end theirs too; a freeze ends
   them only when `frozen = deny`. An attestation revocation waits for
-  the session's next admission.
+  the session's next admission. A rotation the sweep finds is accepted
+  as at an admission, for an identity away as for one here, and moves
+  what §4 moves.
 - **A ban on a registrar reads every attestation.** `banned_registrars`
   (and `*@host`) is checked against each attestation on the card,
   verified or not: a card is the identity's own signature, so an

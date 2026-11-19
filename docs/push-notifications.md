@@ -588,19 +588,28 @@ unsubscribed, since its password is not the key revoked, and if it
 registered the same subscription, that endpoint is still pushed through
 its row.
 
-A registrar's revocation is applied only while its identity has a
-session here: this server reads what registrars publish for the
-identities it has on the roster, and nobody else's. A lost phone whose
-identity has no session here keeps being sent notifications until one
-of that identity's devices connects, or until its certificate expires.
-The same holds after a restart for a revocation whose delete the store
-failed and that was still to be retried. The operator's own list has no
-such gap: it is applied at startup and on every reload.
+A registrar's revocation is applied by the records sweep
+(identity-records.md §2), each minute. It refreshes the lists of the
+identities with a session here first, then those of the identities with
+push registrations here and no session, each of those every ten
+minutes, spread across the ten by fingerprint, and fetches a list only
+once it falls due under `revocation_max_age`. So an identity away costs
+the registrars no more fetches than one connected, and while its
+registrar can be reached a lost phone whose identity has no session here
+stops being sent notifications within `revocation_max_age`, ten
+minutes, a minute and the sweep's own time of its revocation being
+published. What the lists already held refuse is applied as soon as an
+identity is seen away: after a restart, at the first sweep and before it
+fetches anything, which also retries a delete the store failed before
+the restart. An identity with no list held here has nothing to read but
+the registrars remembered as having attested it, which a restart
+forgets. The operator's own list is applied at startup and on every
+reload.
 
 Together these give the one thing a password account cannot have: **a lost phone
 stops buzzing when its key is revoked** -- at once by the operator, and by
-a registrar once its identity connects here -- not when someone remembers
-to call `push_unregister` from another device.
+a registrar within the sweep's bound -- not when someone remembers to call
+`push_unregister` from another device.
 
 **The certificate's capabilities say who may do what.** Registering needs
 the certificate's `message` bit (bit 1): a push is a message delivered to
