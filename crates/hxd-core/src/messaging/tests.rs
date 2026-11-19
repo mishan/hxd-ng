@@ -1288,6 +1288,7 @@ fn a_signed_id_and_the_daily_quota_hold_an_im_as_they_hold_mail() {
     assert_eq!(
         s.core.msg_login_signed(
             a,
+            s.core.session_serial(a).unwrap(),
             "dave",
             "hello?".into(),
             Some(g4.clone()),

@@ -85,6 +85,7 @@ pub const LIVE_QUEUE_BYTES: usize = 16 << 20;
 pub struct Events {
     rx: mpsc::Receiver<SeqEvent>,
     conn: Arc<ConnState>,
+    serial: u64,
 }
 
 /// What one connection shares with its session's sink.
@@ -109,6 +110,7 @@ impl ConnState {
 impl Events {
     fn channel(
         budget: &Arc<crate::budget::QueueBudget>,
+        serial: u64,
     ) -> (mpsc::Sender<SeqEvent>, Arc<ConnState>, Events) {
         let (tx, rx) = mpsc::channel(LIVE_QUEUE_CAP);
         let conn = Arc::new(ConnState {
@@ -116,7 +118,7 @@ impl Events {
             notify: Default::default(),
             share: budget.share(),
         });
-        (tx, conn.clone(), Events { rx, conn })
+        (tx, conn.clone(), Events { rx, conn, serial })
     }
 
     /// The next event; `None` once the stream has ended — this connection
@@ -156,6 +158,12 @@ impl Events {
     /// `select!` that also receives from it.
     pub fn lag(&self) -> Lag {
         Lag(self.conn.clone())
+    }
+
+    /// The serial of the session these events are for: a later holder
+    /// of its uid is another session.
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 }
 
@@ -2755,7 +2763,7 @@ impl Core {
         r.last_serial += 1;
         let serial = r.last_serial;
         let device = r.new_device();
-        let (tx, conn, rx) = Events::channel(&self.queue_budget);
+        let (tx, conn, rx) = Events::channel(&self.queue_budget, serial);
         let roles = info
             .account
             .as_ref()
@@ -3114,7 +3122,7 @@ impl Core {
             r.end_session(uid);
             return Resume::Gone;
         }
-        let (tx, conn, rx) = Events::channel(&self.queue_budget);
+        let (tx, conn, rx) = Events::channel(&self.queue_budget, sess.serial);
         let old = std::mem::replace(&mut sess.outbox.sink, Sink::Live(tx, conn));
         let next_seq = sess.outbox.next_seq;
         let outcome = match old {

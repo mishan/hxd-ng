@@ -208,15 +208,15 @@ impl Core {
     /// A private message addressed to the system account. Answers the
     /// text of the one message to send back, or `None` when there is no
     /// system account and the message is an ordinary one.
-    pub(crate) fn system_command(&self, from: Uid, text: &str) -> Option<String> {
+    pub(crate) fn system_command(&self, from: Uid, serial: u64, text: &str) -> Option<String> {
         let system = self.system.as_ref()?;
         if !system.policy.commands {
             return Some(
                 "Commands are off on this server. This account only sends notifications.".into(),
             );
         }
-        match self.system_rate_allows(from, system.policy.rate) {
-            Rationed::Allowed => Some(self.run_command(from, text)),
+        match self.system_rate_allows(from, serial, system.policy.rate) {
+            Rationed::Allowed => Some(self.run_command(from, serial, text)),
             // One refusal per burst, and silence after it: a client
             // pasting a script should not get a message back per line.
             Rationed::Refused { first: true } => Some("error: slow down".into()),
@@ -224,20 +224,8 @@ impl Core {
         }
     }
 
-    fn system_rate_allows(&self, uid: Uid, per_minute: u32) -> Rationed {
+    fn system_rate_allows(&self, uid: Uid, serial: u64, per_minute: u32) -> Rationed {
         let Some(system) = self.system.as_ref() else {
-            return Rationed::Refused { first: false };
-        };
-        // Copied out and released before the ration's own lock: nothing
-        // here holds the roster while taking another.
-        let Some(serial) = self
-            .roster
-            .lock()
-            .unwrap()
-            .users
-            .get(&uid)
-            .map(|s| s.serial)
-        else {
             return Rationed::Refused { first: false };
         };
         let mut rate = system.rate.lock().unwrap();
@@ -272,7 +260,7 @@ impl Core {
     /// One command per message: the first line is the command, and what
     /// follows belongs to its last argument, so a reason or a message
     /// body can have line breaks in it.
-    fn run_command(&self, from: Uid, text: &str) -> String {
+    fn run_command(&self, from: Uid, serial: u64, text: &str) -> String {
         let text = text.trim_start();
         let (first, rest) = match text.split_once('\n') {
             Some((first, rest)) => (first, Some(rest)),
@@ -325,7 +313,7 @@ impl Core {
             "stop" => self.command_stop(from, words.next()),
             // The rest of the message, as typed: a value is refused, never
             // reshaped, so what the line holds is what is checked.
-            "pronouns" => self.command_pronouns(from, &text[word.len()..]),
+            "pronouns" => self.command_pronouns(from, serial, &text[word.len()..]),
             "roles" if self.accounts_enabled() => self.command_roles(from),
             "role" if self.accounts_enabled() => {
                 let words: Vec<&str> = words.collect();
@@ -379,7 +367,7 @@ impl Core {
 
     /// `/pronouns`, `/pronouns <text>` and `/pronouns clear`, with `rest`
     /// what followed the command.
-    fn command_pronouns(&self, from: Uid, rest: &str) -> String {
+    fn command_pronouns(&self, from: Uid, serial: u64, rest: &str) -> String {
         let rest = rest.strip_suffix('\n').unwrap_or(rest);
         let rest = rest.strip_suffix('\r').unwrap_or(rest);
         let value = match rest.trim_start() {
@@ -402,7 +390,6 @@ impl Core {
             return "error: slow down".into();
         }
         use crate::pronouns::PronounsError as E;
-        let serial = self.session_serial(from).unwrap_or_default();
         match self.set_pronouns(from, serial, value) {
             Ok(_) => match value {
                 Some(p) => format!("ok: your pronouns are {p}"),
@@ -1055,6 +1042,46 @@ mod tests {
         assert_eq!(
             command(&s, alice, &mut rx, "/block"),
             "error: /block <nick or login>"
+        );
+    }
+
+    #[test]
+    fn a_command_from_an_ended_session_does_not_run_as_its_uids_next_holder() {
+        let s = server(SystemPolicy::default());
+        let to = s.core.start_system_session().unwrap();
+        let (alice, _rx) = s.login("alice");
+        let serial = s.core.session_serial(alice).unwrap();
+        // Alice's command is on its way to the core when her session
+        // ends, and the uid space is so full that bob is handed her uid.
+        s.core.end_session(alice);
+        {
+            let mut r = s.core.roster.lock().unwrap();
+            r.freed_uids = Default::default();
+            r.last_uid = alice - 1;
+        }
+        let (bob, mut bob_rx) = s.login("bob");
+        assert_eq!(bob, alice, "the uid was handed on");
+        let sent = s.core.msg_signed(
+            alice,
+            serial,
+            to,
+            "/block alice".into(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(sent, Err(crate::ChatError::NoSuchUser));
+        assert_eq!(answers(&mut bob_rx), Vec::<String>::new());
+        assert_eq!(
+            command(&s, bob, &mut bob_rx, "/blocks"),
+            "ok: you have blocked nobody"
+        );
+        assert_eq!(
+            command(&s, bob, &mut bob_rx, "/block alice"),
+            "ok: blocked alice",
+            "and bob's own command runs as his"
         );
     }
 

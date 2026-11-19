@@ -1366,6 +1366,53 @@ async fn away(server: &Server, login: &str, persons: bool) -> (u64, u64, (String
 }
 
 #[tokio::test]
+async fn a_system_command_runs_after_a_resume_and_from_each_device() {
+    for coalesce in [true, false] {
+        let td = tempfile::tempdir().unwrap();
+        let server = start_with(td.path(), coalesce, "").await;
+        let mut laptop = device(&server, "alice").await;
+        let (_, _, session) = away(&server, "alice", coalesce).await;
+        let (mut phone, _) = ng::Client::resume(server.ng, session, 0, Vec::new())
+            .await
+            .unwrap();
+        let system = server.core.system_uid().unwrap();
+        let sent = json!({ "to_login": "server", "text": "/pronouns she/her" });
+        phone.request("msg", sent).await.unwrap();
+        let answer = phone
+            .event_where("msg", |d| d["from"]["uid"] == system)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.data["text"], "ok: your pronouns are she/her",
+            "{coalesce}: the resumed session's own"
+        );
+
+        let trans = laptop
+            .send(
+                hxproto::messages::ClientHdr::Msg.as_u32(),
+                &[
+                    (tag::UID, system.to_be_bytes().to_vec()),
+                    (tag::BODY, b"/pronouns".to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(!laptop.reply(trans).await.unwrap().is_error());
+        let answer = laptop
+            .recv_where(|f| {
+                f.ty == legacy::push::MSG && f.uint(tag::UID) == Some(u32::from(system))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.bytes(tag::BODY).as_deref(),
+            Some(&b"ok: she/her"[..]),
+            "{coalesce}: and the classic device's"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_detached_session_ended_or_kicked_is_told_so_when_it_resumes() {
     for coalesce in [true, false] {
         let td = tempfile::tempdir().unwrap();
