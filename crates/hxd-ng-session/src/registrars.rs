@@ -882,6 +882,7 @@ mod tests {
                 identity: from.public(),
                 successor: t.public(),
                 time: 10,
+                next: None,
             }
             .sign(&from, t)
             .unwrap()

@@ -594,6 +594,7 @@ hxd registrar invites --add 10                  # print ten new invite codes
 hxd registrar unlock <handle>                   # forget its envelope fetch counts
 hxd registrar freeze <fingerprint>              # a holder reports a theft
 hxd registrar freeze --lift <fingerprint>
+hxd registrar publish <fingerprint> --to <successor>   # its pending rotation, now
 hxd registrar revoke <handle> --reason abuse    # withdraw the name; or lapsed, unspecified
 hxd registrar recover <handle> --identity <fingerprint> [--keep-age]
 hxd registrar inspect other.example             # verify another registrar's
@@ -912,7 +913,7 @@ a window needs its seconds.
 | `http_connections_per_v6_48` | 64 | The same from one IPv6 /48's /64s together; at least `http_connections_per_addr` |
 | `ng_connections` | 4096 | Connections everyone holds to the ng port |
 | `challenges_per_minute` | 30 | `POST /identity/challenge`, per address |
-| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address, and `GET /emoji/{hash}` apart |
+| `avatar_fetches_per_minute` | 600 | `GET /avatars/{id}`, per address, and `GET /emoji/{hash}` and `GET /identity/card/<fp>` apart |
 
 #### Flood and spam
 

@@ -603,6 +603,7 @@ async fn a_rotation_is_followed_and_its_friendships_move_to_the_successor() {
         identity: alice.id.public(),
         successor: successor.id.public(),
         time: now(),
+        next: None,
     }
     .sign(&alice.id, &successor.id)
     .unwrap();

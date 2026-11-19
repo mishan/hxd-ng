@@ -450,6 +450,7 @@ fn a_rotated_identity_presents_its_old_friendships_and_its_record_is_fetched() {
         identity: alice.id.public(),
         successor: successor.id.public(),
         time: now(),
+        next: None,
     }
     .sign(&alice.id, &successor.id)
     .unwrap();

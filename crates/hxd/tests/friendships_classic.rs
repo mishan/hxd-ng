@@ -765,6 +765,7 @@ async fn get_friendships_answers_a_rotation_in_chain_order() {
         identity: alice.id.public(),
         successor: next.id.public(),
         time: now(),
+        next: None,
     }
     .sign(&alice.id, &next.id)
     .unwrap();

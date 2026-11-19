@@ -1409,10 +1409,13 @@ impl IdentityState {
         if let Some(reg) = &self.registrar {
             match reg.check_card(card) {
                 Ok(()) => {}
-                Err(hxd_registrar::Refusal::SuccessorMismatch) => {
+                Err(
+                    hxd_registrar::Refusal::SuccessorMismatch
+                    | hxd_registrar::Refusal::RotationPending { .. },
+                ) => {
                     debug!(
                         fingerprint = %fingerprint.short(),
-                        "card changes the successor this server's registrar holds"
+                        "card changes the successor this server's registrar holds, or will"
                     );
                     return Err(AuthRefused::BadCard);
                 }
@@ -1906,6 +1909,35 @@ impl IdentityState {
     pub fn card(&self, fp: &Fingerprint) -> Option<(u64, Vec<u8>)> {
         let t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         t.cards.get(fp).map(|c| (c.updated, c.bytes.clone()))
+    }
+
+    /// The cached card `GET /identity/card` serves: not one this server's
+    /// registrar would now refuse, such as a card cached before a rotation
+    /// recorded the successor's commitment as another, or as one where
+    /// the card names none. `Err` when the registrar could not say, which
+    /// is its store failing: no card is served then rather than one it
+    /// might refuse.
+    pub fn served_card(
+        &self,
+        fp: &Fingerprint,
+    ) -> Result<Option<(u64, Vec<u8>)>, hxd_registrar::Refusal> {
+        let Some((updated, bytes)) = self.card(fp) else {
+            return Ok(None);
+        };
+        if let (Some(reg), Ok(card)) = (&self.registrar, hl_identity::Card::parse(&bytes)) {
+            match reg.check_card(&card) {
+                Err(
+                    hxd_registrar::Refusal::SuccessorMismatch
+                    | hxd_registrar::Refusal::RotationPending { .. },
+                ) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!("registrar could not check a cached card: {e}");
+                    return Err(e);
+                }
+                Ok(()) => {}
+            }
+        }
+        Ok(Some((updated, bytes)))
     }
 
     /// `PUT /identity/card` for the identity a token or device proved.

@@ -236,7 +236,8 @@ most 512 bytes.
 Permanent and final: the key is dead and names no successor. A user
 who has a successor rotates (§4.6) instead. A registrar that accepts one
 releases the handle after the hold (§5.2), deletes the identity's
-envelopes (§9), and keeps publishing the record.
+envelopes (§9), and keeps publishing the record. One posted while a
+rotation is pending cancels the rotation (§4.6).
 
 ### 4.6 Rotation
 
@@ -249,6 +250,7 @@ acknowledged by the successor (`ack`), §4.1. At most 512 bytes.
 | `identity` | bstr(32) | yes | Predecessor public key |
 | `successor` | bstr(32) | yes | Successor public key |
 | `time` | uint | yes | |
+| `next` | bstr(32) | no | `SHA-256` of the successor's own successor key: the commitment the successor takes as it holds the identity (§5.4). Never the predecessor's or the successor's own fingerprint, refused `bad_request` |
 | `sig` | bstr(64) | yes | By `identity` |
 | `ack` | bstr(64) | yes | By `successor` |
 
@@ -259,7 +261,29 @@ possible only while the user still holds the old key — theft, not loss.
 Loss is recovery (§8.3), which is weaker on purpose.
 
 A rotation is one hop. The successor should commit its own `successor`
-in its card, so the chain continues.
+in its card, so the chain continues, and the rotation should name the
+same commitment as `next`. A registrar that publishes the rotation
+records `next` as the successor's commitment if the successor holds
+none here, whether the rotation brings it here or it was known
+already; a successor holding one keeps it, and a rotation to it naming
+another `next`, or none, is refused (`successor_mismatch`, §5.4). `next` is
+inside both signatures, so nobody holding only one of the two keys can
+post the same rotation at any registrar with another. A commitment sent beside
+the record, such as the successor's card, would not hold: rotation
+records are public once published and name no registrar, so a thief
+holding only the successor's key could post the owner's rotation at a
+second registrar first, beside a commitment to a key of its own.
+
+The predecessor's identity revocation (§4.5) always wins: posted while
+a rotation is pending, it is accepted and cancels the rotation. Once
+the identity has committed to its successor, a thief holding only the
+old key can therefore destroy the identity, but not take it, since a
+rotation it signs goes only to the committed key (§5.4); without a
+commitment, its rotation to a key of its own is accepted, and published
+at once where there is no delay. The owner's answers to a theft are to
+rotate first, and a freeze (§8.2). Once the rotation is published the predecessor writes
+nothing more, its revocation included (`revoked`, naming the
+successor); the successor may revoke itself.
 
 ### 4.7 Freeze
 
@@ -425,11 +449,38 @@ attestations come due; it does not rewrite history.
 
 ### 5.4 Commitments and rotation at the registrar
 
-A registration request's `successor`, and the `successor` of any card
-the registrar caches for an attested identity, is recorded as that
-identity's **commitment**: once recorded, immutable, exactly as the
-identity spec's §3.4 rule for servers. A later request or card that
-changes or drops it is refused (`successor_mismatch`).
+An identity this registrar knows (§9.2) that has no **commitment** yet
+takes one from the first of: a registration request with a `successor`,
+a card carrying one `PUT` to the registrar (§6.4), or a card carrying
+one shown at sign-in on the registrar's server (the ng `auth`, or a
+classic client's device proof). Once recorded it is immutable, exactly
+as the identity spec's §3.4 rule for servers. A later request or card
+that changes or drops it is refused (`successor_mismatch`). None is
+recorded for an identity that is frozen, revoked or rotated away. While
+a rotation is pending, the identity it hands over records none, not even
+the key the rotation goes to, since the registrar cannot tell whose
+rotation it is, and the key it goes to records none but its `next`: a
+registration request that would make one is refused (`rotation_pending`,
+or as that identity's other requests are), and so is a card carrying
+one, put (`rotation_pending`) or shown at sign-in (`bad_card`), rather
+than served as the identity's card with a commitment the registrar does
+not hold. Otherwise a card of a frozen, revoked or rotated identity has
+its commitment left untaken, the card itself accepted and served as any
+other (§6.4). A card cached earlier that the registrar would now refuse,
+such as one of a successor naming another key than the `next` its
+rotation recorded, is no longer served. A residual: checking a card
+publishes no due rotation, so until the registrar's next write a card is
+still refused for a rotation that is due, with a `pending_until` already
+past. A commitment recorded then could pin the identity to a thief's key
+for good, or have the rotation dropped at publication. That does not
+stop whoever holds the successor's key from defeating the owner's
+rotation wherever it can write for the successor: by revoking the
+successor, or by rotating it on first, so that the owner's rotation is
+refused at posting, or dropped when it comes due if it was posted first
+(condition 5). Where the successor is unknown and the registrar takes no
+new registration from it (`closed`, or an invite it does not have), it
+can do neither. It cannot take the identity either way. A rotation names
+the successor's own commitment as `next` (§4.6).
 
 A rotation record (§4.6) posted to the registrar is accepted when:
 
@@ -437,27 +488,39 @@ A rotation record (§4.6) posted to the registrar is accepted when:
 2. the identity is attested here and not frozen;
 3. the registrar holds no commitment for it, or `SHA-256(successor)`
    equals the commitment;
-4. no rotation for this identity has been accepted already.
+4. no rotation for this identity has been accepted already;
+5. the successor, if this registrar knows it, is neither revoked,
+   rotated away nor frozen and has no rotation of its own pending
+   (`bad_request`), and holds no commitment here or holds the one the
+   rotation names as `next`; a rotation without `next` to a successor
+   holding one is refused too (`successor_mismatch`).
 
 On acceptance the registrar records the successor as holding every
 handle the predecessor held, with each handle's `registered` preserved;
 publishes the rotation under *both* fingerprints (§6.2); publishes a
 §4.8 revocation (reason 2) of the predecessor's attestations; deletes
-the predecessor's envelopes; and records the successor's card
-`successor`, if any, as the next commitment. The successor obtains its
+the predecessor's envelopes. In the same write a successor holding no
+commitment here, new or known, takes the rotation's `next` as its
+commitment; one holding a commitment keeps it, which condition 5 makes
+the same. A held rotation whose record the registrar can no longer read
+is dropped, not published without its `next`. The successor obtains its
 own attestations by sending an ordinary registration request for each
-handle, which the registrar answers as a reissue.
+handle, which the registrar answers as a reissue; one carrying a
+`successor` must match the commitment held, or with none records it.
 
 **The registrar SHOULD delay publication** of an accepted rotation by
 `rotation_delay` (default 24 hours when the registrar holds a contact
 address for the identity, otherwise 0) and notify the identity through
 that address, so that a rotation signed by a thief before the owner
 noticed can be met with a freeze (§8.1) before any server acts on it.
-During the delay the rotation is pending: a freeze cancels it, and a
-second rotation is refused. When the delay ends, the registrar checks
+During the delay the rotation is pending: a freeze cancels it, so does
+the predecessor's identity revocation (§4.6), and a second rotation is
+refused `rotation_pending`. When the delay ends, the registrar checks
 it again as if it had just been posted, and drops it if it no longer
-passes: the successor may have been revoked or rotated on meanwhile,
-and handles moved to it then could never be renewed.
+passes: the successor may have been revoked, frozen, committed or
+rotated on meanwhile, and handles moved to it then could never be
+renewed. The operator may end the delay early (§8.2), and the rotation
+is checked the same way.
 
 Step 3 is the sentence that makes the card's commitment worth
 publishing before any server has anchored it. A thief with the identity
@@ -503,18 +566,18 @@ anything else off the alphabet, a code without `S1`, a number of symbols
 other than 56 with it, and a last seed symbol with any of its four low
 bits set.
 
-What it checks next depends on whether it holds the card the code is
-for:
+What it checks next depends on whether it holds the commitment the
+code is for, from the card or from `lookup` (§6.3):
 
-- **Without the card**, the check symbols are all there is: a code
+- **Without the commitment**, the check symbols are all there is: a code
   whose check symbols are not its seed's MUST be read as no code. A
   misread seed is another key, and nothing about it looks wrong until
   the rotation it signs is refused; ten bits miss about one random
   misreading in a thousand.
-- **With the card**, the commitment decides instead of the check
-  symbols, which it outranks: the client MUST NOT sign with a code
-  unless `SHA-256` of its key's public key equals the card's
-  `successor`, whatever its check symbols say. A code that does not
+- **With the commitment**, it decides instead of the check symbols,
+  which it outranks: the client MUST NOT sign with a code unless
+  `SHA-256` of its key's public key equals the commitment, whatever its
+  check symbols say. A code that does not
   match MAY be mended: read again with each seed symbol in turn taken
   for each other symbol, or with its one symbol off the alphabet taken
   for each, and the reading the commitment matches taken. A misread
@@ -592,9 +655,15 @@ for a rotation, assigns a `seq`, stores it, and answers
 `{ "seq": n, "published": true }` — or `"published": false` with
 `"pending_until"` for a rotation inside its delay. A record already
 held is answered with its existing `seq` and is not a failure, so a
-client that lost the reply can post again. Registrar-signed records
-(§4.7, §4.8) are never accepted here; they come from the registrar's own
-tools.
+client that lost the reply can post again; the same rotation posted
+again while it waits is answered as pending. A different rotation
+while one is pending is answered `rotation_pending` with the held
+rotation's `pending_until`.
+Registrars before that code answered a second rotation `bad_request`
+with the text "a rotation for this identity is already pending", and a
+client talking to one takes that answer to mean the same.
+Registrar-signed records (§4.7, §4.8) are never accepted here; they
+come from the registrar's own tools.
 
 Portable vouches and withdrawals (`identity-vouch.md` §4.1) are
 accepted here too, from vouchers attested at this registrar, and are
@@ -610,9 +679,19 @@ until `until`.
 ### 6.3 `lookup`
 
 `GET <lookup>/<handle>` — `{ "fingerprint": "…", "identity": "…base64url
-pubkey…", "registered": n, "expires": n }` for a *held* handle; 404
-otherwise, one code for free, lapsed, reserved and unknown alike, so a
-lookup reveals less than a registration attempt already would.
+pubkey…", "registered": n, "expires": n, "successor": "…" }` for a
+*held* handle; 404 otherwise, one code for free, lapsed, reserved and
+unknown alike, so a lookup reveals less than a registration attempt
+already would. `successor` is the commitment the registrar holds for
+the holder (§5.4), as a fingerprint, and is absent while it holds none.
+It is read from the registrar's store, so it is there whenever the
+handle is, where a card (§6.4) may not be to hand: a client checking a
+successor code on a device with no card (§5.5), or making a card that
+must carry the commitment, reads it here. A client that does not know
+the field ignores it. It reveals the commitment to anyone who asks, as
+the holder's card already does wherever it is published: the hash of
+a key nobody has seen, which tells a reader only that a successor
+exists and lets it check one presented later.
 
 `GET <lookup>?identity=<fingerprint>` — `{ "handles": [ "alice", … ] }`
 for the handles this registrar attests to that key; an empty array for
@@ -632,6 +711,11 @@ handle does `lookup` then `card`. A `PUT` needs the transport's
 authentication and a `manage`-capable device, as §7 there says, which
 is why a registrar is an identity-enabled server and not a bare HTTP
 service. The registrar anchors the card's `successor` as §5.4 says.
+hxd-ng keeps cards in memory, so after a restart it answers `card`
+404 until the card is put or shown again; the commitment is kept, and
+`lookup` serves it. It also answers 404 for a cached card it would now
+refuse, and 503, to `GET` and `PUT` alike, when its store cannot check
+a card (`hotline-ng-identity.md` §7).
 
 ### 6.5 Errors
 
@@ -646,6 +730,7 @@ service. The registrar anchors the card's `successor` as §5.4 says.
 | `frozen` | 403 | §8.1; reissue, records and envelope puts all refuse. An envelope fetch is answered `not_found` (§9.2) |
 | `revoked` | 403 | identity revoked or rotated away; the body names `successor` when there is one |
 | `successor_mismatch` | 409 | §5.4 |
+| `rotation_pending` | 409 | §5.4: a rotation of this identity, or to it, is held; the body carries its `pending_until` |
 | `not_registered` | 404 | a record for an identity this registrar does not attest to |
 | `not_found` | 404 | lookups; every envelope fetch that is not a match; every route under `envelopes` at a registrar that keeps none |
 | `too_large` | 413 | the object's size bound |
@@ -970,10 +1055,32 @@ The thief may already have signed things. The holder:
 2. generates the successor key — the one whose hash they committed, if
    they committed one, since nothing else will be accepted where the
    commitment is held;
-3. signs a rotation with the old key and acknowledges with the new;
+3. signs a rotation with the old key and acknowledges with the new,
+   naming the successor's own commitment as `next` (§4.6);
 4. the registrar verifies out of band that it is the holder posting,
-   lifts the freeze, and accepts and publishes the rotation — without
-   the delay, since the holder is on the line.
+   lifts the freeze, and once the holder posts the rotation (the freeze
+   canceled any pending one, so it is pending again only once posted
+   again), publishes it at once with `hxd registrar publish
+   <fingerprint> --to <successor>`, naming the successor the holder
+   confirmed, since the holder is on the line. A rotation pending to
+   any other key is refused and left waiting.
+
+Lifting the freeze opens a window until the holder's rotation is posted.
+In it the thief's revocation is accepted, as it is at any time (§4.6):
+the identity can be destroyed, though not taken. Without a commitment
+the thief's own rotation is accepted too. `--to` keeps the operator from
+publishing that one, but left alone it publishes by itself when the
+delay ends, and while it waits the holder's rotation is refused
+`rotation_pending`; the remedy is to freeze again, which cancels it.
+Where the registrar holds no commitment, the thief may also record one
+in the window, to a key of its own: the holder's rotation is then
+refused `successor_mismatch`, and the holder is left with revoking the
+identity or with recovery (§8.3). The holder posts at once. A thief that
+reposts its rotation each time the freeze lifts can keep that up for as
+long as it likes, so freezing again ends a round, not the contest. A
+mode that lifts the freeze and publishes the holder's rotation in one
+write, taking the signed record from the operator, would close the
+window; it is not built.
 
 Every server that trusts the registrar moves the link at the next
 admission. A server that anchored the commitment would have accepted
@@ -1086,9 +1193,12 @@ second, a delete included, which the store keeps across restarts
 (`bad_time`): a put sent again, or an older one sent over a newer,
 changes nothing. A client that lost the reply, or puts twice in one
 second, signs the put again once the second has turned. Puts are held to the
-record posts' rate per identity (§10). Only an attested identity may put (`not_registered`), and
-only an unfrozen one (`frozen`) that is neither revoked nor rotated away
-(`revoked`). It answers `{ "stored": true }` or `{ "deleted": true }`.
+record posts' rate per identity (§10). Only an identity this registrar
+knows may put (`not_registered`): one that has registered here, its
+handles lapsed or not, or the successor of a rotation it published,
+before the successor's first reissue too. And only an unfrozen one
+(`frozen`) that is neither revoked nor rotated away (`revoked`). It
+answers `{ "stored": true }` or `{ "deleted": true }`.
 A client opens what it is about to put with the keys it will fetch with
 before sending it, so that what is stored is what those keys open.
 
@@ -1248,7 +1358,7 @@ ceiling is a setting with a default.
 | Envelopes per identity | 2 (one per kind) | a put replaces |
 | Envelope size | `envelope_max`, 1024 | `too_large` |
 | Clock skew | 300 s | `bad_time` |
-| Pending rotations | 1 per identity | second refused `bad_request` |
+| Pending rotations | 1 per identity | second refused `rotation_pending` |
 
 Signed requests are replay-checked by `time` and a seen-set of request
 digests held for the skew window, as the transport does for proofs. A
@@ -1320,6 +1430,7 @@ running server uses, and never create a registrar key of their own:
 
 ```sh
 hxd registrar freeze   <fingerprint> [--lift]
+hxd registrar publish  <fingerprint> --to <successor>   # §8.2: its pending rotation, without the delay
 hxd registrar revoke   <handle> --reason abuse|lapsed|unspecified   # abuse also bars the holder
 hxd registrar recover  <handle> --identity <new fingerprint> [--keep-age]
 hxd registrar invites  --add 10
@@ -1442,6 +1553,9 @@ To fold into `identity-threat-model.md`:
 - **Stolen identity key, amended.** The registrar's refusal to publish
   a non-committed rotation and its delay-and-notify window are the
   mitigations that were previously listed as "registrar freeze" alone.
+  The old key's revocation always cancels a pending rotation, so a
+  stolen identity key of a committed identity can destroy it but not
+  take it (§4.6).
 - **Malicious registrar, amended.** It can additionally serve a stale
   or empty per-identity list; a server's `revocation_stale` and the
   user's second attestation elsewhere are the answers, unchanged.

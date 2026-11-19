@@ -44,7 +44,7 @@ hxfiles-xfer = { git = "https://github.com/mishan/hx-libs.git", rev = "420d58e7c
 hxhfs = { git = "https://github.com/mishan/hx-libs.git", rev = "420d58e7c112579d3ce76f463d14c1f85111c678" }
 hxhope = { git = "https://github.com/mishan/hx-libs.git", rev = "420d58e7c112579d3ce76f463d14c1f85111c678" }
 hxcrypto = { git = "https://github.com/mishan/hx-libs.git", rev = "420d58e7c112579d3ce76f463d14c1f85111c678" }
-hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "420d58e7c112579d3ce76f463d14c1f85111c678" }
+hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "6fc4492bc8d35256a3b9a67d3679398371d04f3e" }
 
 # Internal.
 hl-private-file = { path = "crates/hl-private-file" }

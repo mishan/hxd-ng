@@ -138,6 +138,31 @@ as AGENTS.md's "Releasing" describes it.
   beside `hxd_sessions` (docs/metrics.md).
 - `hxd-load accounts --linked` links each account it writes to an
   identity of its own (docs/load-testing.md).
+- The registrar's handle lookup carries `successor`, the commitment it
+  holds for the holder, read from its store, so a client can learn it
+  after a restart has emptied the card cache. A rotation record's
+  `next`, signed by both keys, is recorded as the successor's commitment
+  when the successor holds none at the registrar. A rotation is refused
+  when its successor is frozen, has a rotation of its own pending, or
+  already holds a commitment other than its `next` (or holds one and the
+  rotation names none), at posting and again when a held rotation is
+  published. No commitment is recorded for a frozen, revoked or rotated
+  identity, and while a rotation waits, none for the identity it hands
+  over and none but its `next` for the successor. A second rotation
+  posted while one waits answers the new code `rotation_pending` (409)
+  with `pending_until`, where it was `bad_request` before. The old key's
+  identity revocation still cancels a pending rotation: once an identity
+  has committed to its successor at the registrar, a stolen identity key
+  can destroy it there but not take it. `hxd registrar publish
+  <fingerprint> --to <successor>` publishes a pending rotation to that
+  successor at once, for a holder the operator has confirmed
+  (docs/identity-registrar.md §4.6, §5.4, §6.3, §8.2). `GET
+  /identity/card/<fp>` is held per address to `[limits]
+  avatar_fetches_per_minute`, counted apart from the avatars and the
+  emoji. On a server with a registrar, `GET /identity/card/<fp>` answers
+  404 for a cached card the registrar would now refuse, and 503, as `PUT
+  /identity/card` does, when the registrar's store cannot check a card;
+  `hlid restore` takes only a 404 as no card and otherwise stops.
 
 ### Fixed
 

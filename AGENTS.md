@@ -543,7 +543,9 @@ Three layers, all `cargo test --workspace`:
   while a sender with it sends refs; `link.rs` has a ghost's) and
   `registrar.rs` (the registrar built from a real
   `[registrar]` section: discovery under its own host only, handles,
-  rotations published under both keys, a card's commitment, invites from
+  rotations published under both keys, a card's commitment and a
+  lookup naming it after a restart, a held rotation refusing another
+  until `hxd registrar publish`, invites from
   the file and the command, the operator's commands on the running
   store, `hlid register`, `revoke` and `rotate` driven as a user
   would, and key backup: an envelope put, found by its salt, fetched and

@@ -182,6 +182,10 @@ pub enum Refusal {
         successor: Option<PublicKey>,
     },
     SuccessorMismatch,
+    /// A rotation of this identity, or to it, is held until `until` (§5.4).
+    RotationPending {
+        until: u64,
+    },
     NotRegistered,
     NotFound,
     TooLarge,
@@ -209,6 +213,7 @@ impl Refusal {
             Refusal::Frozen => "frozen",
             Refusal::Revoked { .. } => "revoked",
             Refusal::SuccessorMismatch => "successor_mismatch",
+            Refusal::RotationPending { .. } => "rotation_pending",
             Refusal::NotRegistered => "not_registered",
             Refusal::NotFound => "not_found",
             Refusal::TooLarge => "too_large",
@@ -225,7 +230,8 @@ impl Refusal {
             | Refusal::HandleReserved
             | Refusal::HandleTaken
             | Refusal::HandleHeld
-            | Refusal::SuccessorMismatch => 409,
+            | Refusal::SuccessorMismatch
+            | Refusal::RotationPending { .. } => 409,
             Refusal::ProofRequired { .. }
             | Refusal::ProofInvalid
             | Refusal::SignupClosed
@@ -266,6 +272,9 @@ impl Refusal {
             Refusal::SuccessorMismatch => {
                 "the successor does not match the one this identity committed to".into()
             }
+            Refusal::RotationPending { .. } => {
+                "a rotation of this identity, or to it, is already pending".into()
+            }
             Refusal::NotRegistered => "this registrar does not attest to that identity".into(),
             Refusal::NotFound => "not found".into(),
             Refusal::TooLarge => "the object is too large".into(),
@@ -299,6 +308,11 @@ fn parse_refusal(e: hl_identity::Error) -> Refusal {
     match e {
         E::BadSignature | E::InvalidKey => Refusal::BadSignature,
         E::TooLarge => Refusal::TooLarge,
+        E::BadField("next") => Refusal::BadRequest(
+            "a rotation's next commits to its own predecessor or successor, which hands \
+             nothing over"
+                .into(),
+        ),
         other => Refusal::BadRequest(other.to_string()),
     }
 }
@@ -332,6 +346,8 @@ pub struct Found {
     pub identity: PublicKey,
     pub registered: u64,
     pub expires: u64,
+    /// The commitment this registrar holds for the holder (§5.4).
+    pub successor: Option<[u8; 32]>,
 }
 
 /// The IPv6 /48 an address is in, which a site is given to make many
@@ -674,6 +690,21 @@ impl Registrar {
         result
     }
 
+    /// Run reads that must see one state of the store: the mutex, then the
+    /// store's read transaction, which holds off no other process.
+    fn reading<T>(&self, f: impl FnOnce() -> Result<T, Refusal>) -> Result<T, Refusal> {
+        struct Open<'a>(&'a dyn RegistrarStore);
+        impl Drop for Open<'_> {
+            fn drop(&mut self) {
+                self.0.rollback();
+            }
+        }
+        let _w = self.write.lock().unwrap();
+        self.store.begin_read()?;
+        let _open = Open(&*self.store);
+        f()
+    }
+
     fn limit(&self, key: Limit, max: u32, now: u64) -> Result<(), Refusal> {
         self.limits
             .lock()
@@ -714,6 +745,22 @@ impl Registrar {
                 // request that changes *or drops* it is refused.
                 if row.commitment.is_some() && req.successor != row.commitment {
                     return Err(Refusal::SuccessorMismatch);
+                }
+                // A commitment recorded while a rotation waits would
+                // decide after the fact whose rotation it is (§5.4), even
+                // one naming the key it goes to: whoever posted it may be
+                // a thief.
+                if row.commitment.is_none() && req.successor.is_some() {
+                    if let Some(p) = self.store.pending(&req.identity)? {
+                        return Err(Refusal::RotationPending {
+                            until: p.publish_at,
+                        });
+                    }
+                }
+            }
+            if row.as_ref().is_none_or(|r| r.commitment.is_none()) {
+                if let Some(until) = self.held_for(&req.identity, req.successor)? {
+                    return Err(Refusal::RotationPending { until });
                 }
             }
 
@@ -993,7 +1040,7 @@ impl Registrar {
         })
     }
 
-    /// §5.4's four conditions, then publish or hold.
+    /// §5.4's conditions, then publish or hold.
     fn accept_rotation(
         &self,
         row: &IdentityRow,
@@ -1002,12 +1049,12 @@ impl Registrar {
         bytes: &[u8],
         now: u64,
     ) -> Result<Posted, Refusal> {
-        if self.store.pending(&r.identity)?.is_some() {
-            return Err(Refusal::BadRequest(
-                "a rotation for this identity is already pending".into(),
-            ));
+        if let Some(p) = self.store.pending(&r.identity)? {
+            return Err(Refusal::RotationPending {
+                until: p.publish_at,
+            });
         }
-        self.rotation_allowed(row, &r.successor)?;
+        self.rotation_allowed(row, &r.successor, r.next)?;
         if self.cfg.rotation_delay > 0 {
             let until = now.saturating_add(self.cfg.rotation_delay);
             self.store.publish(&Publish {
@@ -1022,15 +1069,23 @@ impl Registrar {
             })?;
             return Ok(Posted::Pending { until });
         }
-        let seq = self.publish_rotation(r.identity, r.successor, d, bytes.to_vec(), now)?;
+        let seq = self.publish_rotation(r.identity, r.successor, d, bytes.to_vec(), r.next, now)?;
         Ok(Posted::Published { seq })
     }
 
     /// Whether `row` may rotate to `successor` as things stand: the
-    /// commitment, if there is one, names it, and it has not itself been
-    /// revoked or rotated away. Asked when a rotation is posted, and again
-    /// when a held one is published — either may have changed meanwhile.
-    fn rotation_allowed(&self, row: &IdentityRow, successor: &Key) -> Result<(), Refusal> {
+    /// commitment, if there is one, names it, and the successor, if this
+    /// registrar knows it, is neither revoked, rotated away nor frozen,
+    /// has no rotation of its own pending, and holds no commitment but
+    /// the rotation's `next`. Asked when a rotation is posted, and again
+    /// when a held one is published: any of it may have changed
+    /// meanwhile.
+    fn rotation_allowed(
+        &self,
+        row: &IdentityRow,
+        successor: &Key,
+        next: Option<[u8; 32]>,
+    ) -> Result<(), Refusal> {
         if row
             .commitment
             .is_some_and(|c| c != Fingerprint::of(successor).0)
@@ -1042,6 +1097,20 @@ impl Registrar {
                 return Err(Refusal::BadRequest(
                     "the successor key is revoked or rotated away".into(),
                 ));
+            }
+            if succ.frozen {
+                return Err(Refusal::BadRequest("the successor key is frozen".into()));
+            }
+            if self.store.pending(successor)?.is_some() {
+                return Err(Refusal::BadRequest(
+                    "the successor key has a rotation of its own pending".into(),
+                ));
+            }
+            // It keeps the commitment it holds, so a rotation naming
+            // another `next`, or none, would hand it over to a commitment
+            // the rotation does not say.
+            if succ.commitment.is_some() && succ.commitment != next {
+                return Err(Refusal::SuccessorMismatch);
             }
         }
         Ok(())
@@ -1056,6 +1125,7 @@ impl Registrar {
         to: Key,
         d: [u8; 32],
         bytes: Vec<u8>,
+        commitment: Option<[u8; 32]>,
         now: u64,
     ) -> Result<u64, Refusal> {
         let mut records = vec![NewRecord {
@@ -1077,7 +1147,12 @@ impl Registrar {
         let seqs = self.store.publish(&Publish {
             records,
             effects: vec![
-                Effect::Rotate { from, to, at: now },
+                Effect::Rotate {
+                    from,
+                    to,
+                    at: now,
+                    commitment,
+                },
                 Effect::DropPending(from),
                 Effect::DeleteEnvelopes(from),
             ],
@@ -1088,6 +1163,44 @@ impl Registrar {
             "registrar published a rotation"
         );
         Ok(seqs[0])
+    }
+
+    /// When a rotation waiting to hand an identity over to `successor`
+    /// comes due, if `commitment` is not the `next` it names: recorded
+    /// now, it would have that rotation dropped at publication (§5.4).
+    /// Pending rotations are one per identity and held only for the
+    /// delay, so they are few enough to read whole.
+    fn held_for(
+        &self,
+        successor: &Key,
+        commitment: Option<[u8; 32]>,
+    ) -> Result<Option<u64>, Refusal> {
+        if commitment.is_none() {
+            return Ok(None);
+        }
+        for p in self.store.pending_due(u64::MAX)? {
+            if &p.successor == successor && self.held_next(&p.bytes).ok() != Some(commitment) {
+                return Ok(Some(p.publish_at));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The `next` of a held rotation (§4.6), read again from its bytes:
+    /// one this build can no longer read is refused rather than published
+    /// without it.
+    fn held_next(&self, bytes: &[u8]) -> Result<Option<[u8; 32]>, Refusal> {
+        let keys = self.keys();
+        let registrar = RegistrarKeys {
+            host: &self.cfg.host,
+            keys: &keys,
+        };
+        match Record::parse(bytes, Some(registrar)).map_err(parse_refusal)? {
+            Record::Rotate(r) => Ok(r.next),
+            _ => Err(Refusal::BadRequest(
+                "a held record is not a rotation".into(),
+            )),
+        }
     }
 
     fn attestation_revocation(
@@ -1133,36 +1246,46 @@ impl Registrar {
     /// time — there is no timer to miss.
     fn publish_due(&self, now: u64) -> Result<(), Refusal> {
         for p in self.store.pending_due(now)? {
-            // Everything accepting it checked, checked again: the
-            // successor may have revoked itself or rotated on while this
-            // one waited, and handles moved to it then would be stuck.
-            let refused = match self.store.identity(&p.identity)? {
-                None => Some(Refusal::NotRegistered),
-                Some(row) => match Self::usable(&row) {
-                    Err(r) => Some(r),
-                    Ok(()) => match self.rotation_allowed(&row, &p.successor) {
-                        Err(Refusal::Store(e)) => return Err(Refusal::Store(e)),
-                        Err(r) => Some(r),
-                        Ok(()) => None,
-                    },
-                },
-            };
-            if let Some(why) = refused {
-                tracing::info!(
-                    from = %Fingerprint::of(&p.identity).short(),
-                    to = %Fingerprint::of(&p.successor).short(),
-                    %why,
-                    "registrar dropped a held rotation"
-                );
-                self.store.publish(&Publish {
-                    records: vec![],
-                    effects: vec![Effect::DropPending(p.identity)],
-                })?;
-            } else {
-                self.publish_rotation(p.identity, p.successor, p.digest, p.bytes, now)?;
-            }
+            self.publish_held(p, now)?;
         }
         Ok(())
+    }
+
+    /// Publish a held rotation, or drop it if it no longer passes: its
+    /// seq, or `None` when dropped.
+    fn publish_held(&self, p: Pending, now: u64) -> Result<Option<u64>, Refusal> {
+        // Everything accepting it checked, checked again: the successor
+        // may have revoked itself or rotated on while this one waited,
+        // and handles moved to it then would be stuck.
+        let next = self.held_next(&p.bytes);
+        let refused = match (self.store.identity(&p.identity)?, &next) {
+            (None, _) => Some(Refusal::NotRegistered),
+            (_, Err(why)) => Some(why.clone()),
+            (Some(row), Ok(next)) => match Self::usable(&row) {
+                Err(r) => Some(r),
+                Ok(()) => match self.rotation_allowed(&row, &p.successor, *next) {
+                    Err(Refusal::Store(e)) => return Err(Refusal::Store(e)),
+                    Err(r) => Some(r),
+                    Ok(()) => None,
+                },
+            },
+        };
+        if let Some(why) = refused {
+            tracing::info!(
+                from = %Fingerprint::of(&p.identity).short(),
+                to = %Fingerprint::of(&p.successor).short(),
+                %why,
+                "registrar dropped a held rotation"
+            );
+            self.store.publish(&Publish {
+                records: vec![],
+                effects: vec![Effect::DropPending(p.identity)],
+            })?;
+            return Ok(None);
+        }
+        let next = next.expect("refused above");
+        self.publish_rotation(p.identity, p.successor, p.digest, p.bytes, next, now)
+            .map(Some)
     }
 
     fn sign_list(
@@ -1282,15 +1405,23 @@ impl Registrar {
     ) -> Result<Option<Found>, Refusal> {
         self.lookup_limit(addr, now)?;
         // Stored in canonical lowercase (§5.1): `Alice` asks after `alice`.
-        Ok(self
+        let Some(h) = self
             .store
             .handle(&handle.to_ascii_lowercase())?
             .filter(|h| h.state(now, self.hold()) == HandleState::Held)
-            .map(|h| Found {
-                identity: h.identity,
-                registered: h.registered,
-                expires: h.expires,
-            }))
+        else {
+            return Ok(None);
+        };
+        let successor = self
+            .store
+            .identity(&h.identity)?
+            .and_then(|row| row.commitment);
+        Ok(Some(Found {
+            identity: h.identity,
+            registered: h.registered,
+            expires: h.expires,
+            successor,
+        }))
     }
 
     /// The handles this registrar attests to that key, held ones only.
@@ -1318,12 +1449,32 @@ impl Registrar {
     /// A card for an identity attested here must carry the commitment the
     /// registrar holds (§5.4). Called before the card is accepted.
     pub fn check_card(&self, card: &Card) -> Result<(), Refusal> {
-        match self.store.identity(&card.identity)? {
-            Some(row) if row.commitment.is_some() && card.successor != row.commitment => {
-                Err(Refusal::SuccessorMismatch)
+        self.reading(|| {
+            if let Some(held) = self
+                .store
+                .identity(&card.identity)?
+                .and_then(|row| row.commitment)
+            {
+                if card.successor != Some(held) {
+                    return Err(Refusal::SuccessorMismatch);
+                }
+                return Ok(());
             }
-            _ => Ok(()),
-        }
+            // One `note_card` would not take while a rotation waits is
+            // refused, as `register` refuses it, rather than served as the
+            // identity's card with a commitment the registrar never holds.
+            if card.successor.is_some() {
+                if let Some(p) = self.store.pending(&card.identity)? {
+                    return Err(Refusal::RotationPending {
+                        until: p.publish_at,
+                    });
+                }
+                if let Some(until) = self.held_for(&card.identity, card.successor)? {
+                    return Err(Refusal::RotationPending { until });
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Record an accepted card's commitment, for an identity attested
@@ -1333,6 +1484,19 @@ impl Registrar {
             return Ok(());
         };
         self.writing(|| {
+            // As `register` does: none for an identity that may not write
+            // or has one already, none while a rotation of it waits, and
+            // none a rotation to it would not match.
+            let open = self
+                .store
+                .identity(&card.identity)?
+                .is_some_and(|row| row.commitment.is_none() && Self::usable(&row).is_ok());
+            if !open
+                || self.store.pending(&card.identity)?.is_some()
+                || self.held_for(&card.identity, Some(c))?.is_some()
+            {
+                return Ok(());
+            }
             if self.store.set_commitment(&card.identity, &c)? {
                 tracing::info!(
                     fingerprint = %Fingerprint::of(&card.identity).short(),
@@ -1663,6 +1827,26 @@ impl Registrar {
         })
     }
 
+    /// Publish an identity's held rotation to `to` now rather than at the
+    /// end of its delay (§8.2 step 4). Returns the rotation's seq.
+    pub fn publish_pending(&self, fp: &[u8; 32], to: &[u8; 32], now: u64) -> Result<u64, OpError> {
+        self.writing(|| {
+            let row = self
+                .store
+                .identity_by_fingerprint(fp)?
+                .ok_or(OpError::UnknownIdentity)?;
+            let p = self
+                .store
+                .pending(&row.key)?
+                .ok_or(OpError::NothingPending)?;
+            let successor = Fingerprint::of(&p.successor).0;
+            if &successor != to {
+                return Err(OpError::PendingToAnother(successor));
+            }
+            self.publish_held(p, now)?.ok_or(OpError::PendingDropped)
+        })
+    }
+
     /// Withdraw the registrar's word for a handle (§4.8): the holder's
     /// attestations for it are void, the handle lapses, and with `bar`
     /// the holder may not reissue it — which is what `abuse` means.
@@ -1750,6 +1934,10 @@ pub enum OpError {
     UnknownIdentity,
     UnknownHandle,
     SameIdentity,
+    NothingPending,
+    /// The pending rotation is to this other successor's fingerprint.
+    PendingToAnother([u8; 32]),
+    PendingDropped,
     Store(StoreError),
 }
 
@@ -1761,6 +1949,17 @@ impl fmt::Display for OpError {
             }
             OpError::UnknownHandle => write!(f, "this registrar has never issued that handle"),
             OpError::SameIdentity => write!(f, "that identity already holds the handle"),
+            OpError::NothingPending => write!(f, "that identity has no rotation pending"),
+            OpError::PendingToAnother(fp) => write!(
+                f,
+                "the pending rotation is to {}, not the successor given; nothing was published",
+                Fingerprint(*fp)
+            ),
+            OpError::PendingDropped => write!(
+                f,
+                "the pending rotation no longer passes the checks a rotation must, and was \
+                 dropped"
+            ),
             OpError::Store(e) => write!(f, "{e}"),
         }
     }

@@ -2551,7 +2551,8 @@ pub struct LimitsSection {
     #[serde(default = "default_challenges_per_minute")]
     pub challenges_per_minute: u32,
     /// `GET /avatars/{id}` one address may make a minute, and as many
-    /// `GET /emoji/{hash}` apart; 0 for no limit.
+    /// `GET /emoji/{hash}` and `GET /identity/card/<fp>` apart; 0 for no
+    /// limit.
     #[serde(default = "default_avatar_fetches_per_minute")]
     pub avatar_fetches_per_minute: u32,
 }

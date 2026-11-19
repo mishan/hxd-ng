@@ -433,7 +433,12 @@ identity session in the roster.
 
 `GET /identity/card/<fingerprint>` — public, no authentication. Returns the
 server's cached card for that identity as `application/cbor`, exactly the
-bytes received, so the signature verifies; 404 if none. Cacheable: the
+bytes received, so the signature verifies; 404 if none, and 404 too for
+a cached card a registrar on the server would now refuse (its successor
+other than the commitment the registrar holds, `identity-registrar.md`
+§5.4); 503 when that registrar cannot check the card right now, so the
+card may exist and a client retries rather than take it as absent.
+Cacheable: the
 server sets `ETag` to the card's `updated` value in entity-tag syntax —
 the decimal in double quotes, `ETag: "1757116860"` — and answers
 `If-None-Match` with 304. `updated` is the card's own version, so it is a
@@ -660,8 +665,10 @@ A rotation is its own signed object (`identity-registrar.md` §4.6),
 learned from a trusted registrar's records or from the successor's
 `auth` request (§5.1). It never rides in a card, and an earlier
 revision's "carried in the card's attestations as a successor
-attestation" is withdrawn. What a server accepts, and what moves to the
-successor on acceptance, is `identity-registrar.md` §7.4.
+attestation" is withdrawn. Its fields, among them `next`, the
+successor's own commitment signed by both keys, are listed there. What
+a server accepts, and what moves to the successor on acceptance, is
+`identity-registrar.md` §7.4.
 
 ### 8.6 Legacy clients on the TCP port
 

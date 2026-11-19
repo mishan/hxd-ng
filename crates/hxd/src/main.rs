@@ -250,6 +250,11 @@ enum Command {
         fingerprint: String,
         lift: bool,
     },
+    /// `registrar publish <fingerprint> --to FP`.
+    RegistrarPublish {
+        fingerprint: String,
+        to: String,
+    },
     /// `registrar revoke <handle> --reason R`.
     RegistrarRevoke {
         handle: String,
@@ -390,6 +395,7 @@ hxd [--config …] identity revoke <fingerprint> [--device] [--lift]\n  \
 hxd [--config …] identity successor (<path> | --from <path>) [--replace]\n  \
 hxd [--config …] identity handover <successor-key> [--next <path>]\n  \
 hxd [--config …] registrar freeze <fingerprint> [--lift]\n  \
+hxd [--config …] registrar publish <fingerprint> --to <successor-fingerprint>\n  \
 hxd [--config …] registrar revoke <handle> --reason abuse|lapsed|unspecified\n  \
 hxd [--config …] registrar recover <handle> --identity <fingerprint> [--keep-age]\n  \
 hxd [--config …] registrar invites --add N\n  \
@@ -447,7 +453,10 @@ that successor, given by its private key, which becomes the server key;\n\
 the old one is kept beside it. --next makes the successor's own\n\
 successor at <path>. Cut short, it finishes when run again.\n\n\
 `registrar freeze` publishes a signed freeze of an identity this\n\
-registrar attests (--lift publishes the lift); `revoke` withdraws the\n\
+registrar attests (--lift publishes the lift); `publish` publishes an\n\
+identity's pending rotation without waiting out rotation_delay, once\n\
+the holder is known to be the one rotating, and only if it is to the\n\
+successor --to names; `revoke` withdraws the\n\
 attestations of a handle, and with --reason abuse keeps its holder from\n\
 reissuing it; `recover` gives a handle to a new key after the holder\n\
 proved themselves out of band; `invites --add` prints new invite codes\n\
@@ -530,6 +539,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut no_block = false;
     let mut all = false;
     let mut kind = None;
+    let mut to = None;
     let mut outcome = None;
     let mut note = None;
     let mut of = None;
@@ -583,6 +593,12 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 reason = Some(
                     args.next()
                         .ok_or_else(|| "--reason needs a value".to_string())?,
+                );
+            }
+            "--to" => {
+                to = Some(
+                    args.next()
+                        .ok_or_else(|| "--to needs a fingerprint".to_string())?,
                 );
             }
             "--identity" => {
@@ -789,6 +805,9 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     if next.is_some() && !matches!(words[..], ["identity", "handover", _]) {
         return Err("--next belongs to `identity handover`".into());
     }
+    if to.is_some() && !matches!(words[..], ["registrar", "publish", _]) {
+        return Err("--to belongs to `registrar publish`".to_string());
+    }
     if kind.is_some() && !matches!(words[..], ["registrar", "unlock", _]) {
         return Err("--kind belongs to `registrar unlock`".to_string());
     }
@@ -877,6 +896,10 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         ["registrar", "freeze", fp] => Command::RegistrarFreeze {
             fingerprint: fp.to_string(),
             lift,
+        },
+        ["registrar", "publish", fp] => Command::RegistrarPublish {
+            fingerprint: fp.to_string(),
+            to: to.ok_or("`registrar publish` needs --to <the successor's fingerprint>")?,
         },
         ["registrar", "revoke", handle] => Command::RegistrarRevoke {
             handle: handle.to_string(),
@@ -1103,6 +1126,11 @@ async fn main() {
                         "froze"
                     }
                 );
+                return Ok(());
+            }
+            Command::RegistrarPublish { fingerprint, to } => {
+                let seq = hxd::registrar::publish(&config, fingerprint, to)?;
+                println!("published the rotation of {fingerprint} to {to} as record {seq}");
                 return Ok(());
             }
             Command::RegistrarRevoke { handle, reason } => {

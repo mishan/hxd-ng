@@ -1259,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "hl-identity"
 version = "0.1.0"
-source = "git+https://github.com/mishan/hx-libs.git?rev=420d58e7c112579d3ce76f463d14c1f85111c678#420d58e7c112579d3ce76f463d14c1f85111c678"
+source = "git+https://github.com/mishan/hx-libs.git?rev=6fc4492bc8d35256a3b9a67d3679398371d04f3e#6fc4492bc8d35256a3b9a67d3679398371d04f3e"
 dependencies = [
  "argon2",
  "chacha20poly1305",

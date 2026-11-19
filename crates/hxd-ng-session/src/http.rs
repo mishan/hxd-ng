@@ -121,6 +121,9 @@ pub(crate) struct Gates {
     /// `GET /emoji/{hash}`, per address, at the avatars' rate: a client
     /// draws a chat's worth of each as it joins.
     emoji_fetches: RateGate,
+    /// `GET /identity/card/<fp>`, per address, at the avatars' rate too:
+    /// each one may be checked against the registrar's store.
+    card_fetches: RateGate,
 }
 
 impl Gates {
@@ -148,6 +151,7 @@ impl Gates {
             challenges: RateGate::per_minute(l.challenges_per_minute, exempt.clone()),
             avatar_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
             emoji_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
+            card_fetches: RateGate::per_minute(l.avatar_fetches_per_minute, exempt.clone()),
             exempt,
         }
     }
@@ -487,12 +491,20 @@ async fn route(
             return enroll_route(req, client, &ctx).await;
         }
         (&Method::GET, p) if p.starts_with("/identity/card/") => {
-            let inm = req
-                .headers()
-                .get(hyper::header::IF_NONE_MATCH)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            get_card(&p["/identity/card/".len()..], inm.as_deref(), &ctx)
+            match gates.card_fetches.take(client.ip()) {
+                Ok(()) => {
+                    let inm = req
+                        .headers()
+                        .get(hyper::header::IF_NONE_MATCH)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    get_card(&p["/identity/card/".len()..], inm.as_deref(), &ctx).await
+                }
+                Err(wait) => {
+                    hxd_core::instrument::throttled("fetch");
+                    slow_down(wait, "too many card fetches")
+                }
+            }
         }
         _ => plain(StatusCode::NOT_FOUND, "not found"),
     };
@@ -2037,14 +2049,26 @@ async fn unlink(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp {
     }
 }
 
-fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
-    let Some(st) = ctx.identity.as_ref() else {
+async fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
+    let Some(st) = ctx.identity.clone() else {
         return plain(StatusCode::NOT_FOUND, "identity disabled");
     };
     let Some(fp) = hl_identity::Fingerprint::parse(fp) else {
         return plain(StatusCode::BAD_REQUEST, "malformed fingerprint");
     };
-    match st.card(&fp) {
+    let served = match crate::spawn_blocking("identity", move || st.served_card(&fp)).await {
+        Ok(Ok(served)) => served,
+        // Not a 404, which a client takes as "this identity has no card"
+        // and may answer by making one without the commitment it holds.
+        Ok(Err(_)) => {
+            return plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the registrar could not check the card",
+            )
+        }
+        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "card lookup task failed"),
+    };
+    match served {
         Some((updated, bytes)) => {
             // Entity-tag syntax: a quoted string (§7). `updated` is the
             // card's own version, so it is a strong validator.
@@ -2100,8 +2124,12 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
         let card = registrar
             .as_ref()
             .and_then(|_| hl_identity::Card::parse(&bytes).ok());
+        // Another identity's card is the identity state's to refuse, and
+        // first: checked here, it would say how that identity stands.
         if let (Some(reg), Some(card)) = (&registrar, &card) {
-            reg.check_card(card)?;
+            if card.identity == ident.identity {
+                reg.check_card(card)?;
+            }
         }
         let updated = state.update_card(&ident, &bytes);
         if let (Ok(true), Some(reg), Some(card)) = (&updated, &registrar, &card) {
@@ -2113,10 +2141,16 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
     let updated = match updated {
         Ok(Ok(updated)) => updated,
         Ok(Err(e)) => {
-            return json_resp(
-                StatusCode::from_u16(e.status()).unwrap(),
-                json!({ "error": e.code(), "text": e.text() }),
-            )
+            let mut body = json!({ "error": e.code(), "text": e.text() });
+            if let hxd_registrar::Refusal::RotationPending { until } = e {
+                body["pending_until"] = json!(until);
+            }
+            // The registrar's store failing, as `GET` answers it.
+            let status = match e {
+                hxd_registrar::Refusal::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::from_u16(e.status()).unwrap(),
+            };
+            return json_resp(status, body);
         }
         Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "card update task failed"),
     };

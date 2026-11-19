@@ -341,15 +341,27 @@ fn apply(tx: &Connection, e: &Effect) -> rusqlite::Result<()> {
                 params![&key[..]],
             )?;
         }
-        Effect::Rotate { from, to, at } => {
+        Effect::Rotate {
+            from,
+            to,
+            at,
+            commitment,
+        } => {
             tx.execute(
                 "UPDATE registrar_identity SET rotated_to = ?2 WHERE key = ?1",
                 params![&from[..], &to[..]],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO registrar_identity (key, fingerprint, created)
-                 VALUES (?1, ?2, ?3)",
-                params![&to[..], &fingerprint(to)[..], int(*at)],
+                "INSERT INTO registrar_identity (key, fingerprint, created, commitment)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (key) DO UPDATE SET
+                   commitment = COALESCE(commitment, excluded.commitment)",
+                params![
+                    &to[..],
+                    &fingerprint(to)[..],
+                    int(*at),
+                    commitment.as_ref().map(|c| &c[..])
+                ],
             )?;
             tx.execute(
                 "UPDATE registrar_handle SET identity = ?2 WHERE identity = ?1",
@@ -627,6 +639,12 @@ impl RegistrarStore for SqliteRegistrarStore {
 
     fn commit(&self) -> Result<(), StoreError> {
         sql(self.conn.lock().unwrap().execute_batch("COMMIT"))
+    }
+
+    fn begin_read(&self) -> Result<(), StoreError> {
+        // DEFERRED: under WAL its first read fixes the snapshot every read
+        // after it sees, and no writer waits on it.
+        sql(self.conn.lock().unwrap().execute_batch("BEGIN DEFERRED"))
     }
 
     fn rollback(&self) {
@@ -996,6 +1014,23 @@ mod tests {
         server.rollback();
         assert!(!server.invite_open(&[3; 32]).unwrap());
         assert_eq!(server.add_invites(&[[3; 32]]).unwrap(), 1);
+    }
+
+    /// What `check_card` reads in one call it reads from one state, even
+    /// while another opener writes.
+    #[test]
+    fn a_read_transaction_sees_one_state_and_holds_off_no_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registrar.db");
+        let reader = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+        let writer = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
+
+        reader.begin_read().unwrap();
+        assert!(!reader.invite_open(&[1; 32]).unwrap());
+        assert_eq!(writer.add_invites(&[[1; 32]]).unwrap(), 1);
+        assert!(!reader.invite_open(&[1; 32]).unwrap());
+        reader.rollback();
+        assert!(reader.invite_open(&[1; 32]).unwrap());
     }
 
     #[test]

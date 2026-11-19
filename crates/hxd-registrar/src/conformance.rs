@@ -19,6 +19,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RegistrarStore>) {
     an_issuance_creates_the_identity_and_logs_in_order(&*new_store());
     a_commitment_is_set_once(&*new_store());
     an_invite_is_spent_exactly_once(&*new_store());
+    a_read_transaction_ends_with_rollback(&*new_store());
     a_record_is_published_once_and_answers_with_its_seq(&*new_store());
     a_rotation_moves_every_handle_and_keeps_its_age(&*new_store());
     lapsing_keeps_the_earliest_time_and_bars_on_request(&*new_store());
@@ -171,6 +172,18 @@ fn a_commitment_is_set_once(s: &dyn RegistrarStore) {
     );
 }
 
+fn a_read_transaction_ends_with_rollback(s: &dyn RegistrarStore) {
+    s.add_invites(&[[1; 32]]).unwrap();
+    s.begin_read().unwrap();
+    assert!(s.invite_open(&[1; 32]).unwrap());
+    s.rollback();
+    // Nothing is left open: a write and a decision's transaction follow.
+    assert_eq!(s.add_invites(&[[2; 32]]).unwrap(), 1);
+    s.begin().unwrap();
+    s.commit().unwrap();
+    assert!(s.invite_open(&[2; 32]).unwrap());
+}
+
 fn an_invite_is_spent_exactly_once(s: &dyn RegistrarStore) {
     assert_eq!(s.add_invites(&[[1; 32], [2; 32]]).unwrap(), 2);
     assert_eq!(s.add_invites(&[[2; 32], [3; 32]]).unwrap(), 1);
@@ -235,6 +248,7 @@ fn a_rotation_moves_every_handle_and_keeps_its_age(s: &dyn RegistrarStore) {
             from: key(1),
             to: key(2),
             at: T + 100,
+            commitment: Some([9; 32]),
         }],
     );
     assert_eq!(
@@ -245,7 +259,7 @@ fn a_rotation_moves_every_handle_and_keeps_its_age(s: &dyn RegistrarStore) {
         .identity(&key(2))
         .unwrap()
         .expect("the successor gets a row");
-    assert_eq!(succ.created, T + 100);
+    assert_eq!((succ.created, succ.commitment), (T + 100, Some([9; 32])));
     assert!(s.handles_of(&key(1)).unwrap().is_empty());
     let moved = s.handles_of(&key(2)).unwrap();
     assert_eq!(
@@ -256,6 +270,39 @@ fn a_rotation_moves_every_handle_and_keeps_its_age(s: &dyn RegistrarStore) {
         vec![("al", T + 5), ("alice", T)]
     );
     assert_eq!(s.handle("carol").unwrap().unwrap().identity, key(3));
+
+    // A successor this store already holds takes the rotation's
+    // commitment if it has none, and keeps its own if it has one.
+    s.issue(&issue(key(4), "dave", T)).unwrap();
+    let mut erin = issue(key(6), "erin", T);
+    erin.commitment = Some([7; 32]);
+    s.issue(&erin).unwrap();
+    for (from, to) in [(5, 4), (7, 6)] {
+        publish(
+            s,
+            vec![record(
+                RecordKind::Rotate,
+                key(from),
+                Some(key(to)),
+                None,
+                &format!("r{from}"),
+            )],
+            vec![Effect::Rotate {
+                from: key(from),
+                to: key(to),
+                at: T + 100,
+                commitment: Some([8; 32]),
+            }],
+        );
+    }
+    assert_eq!(
+        s.identity(&key(4)).unwrap().unwrap().commitment,
+        Some([8; 32])
+    );
+    assert_eq!(
+        s.identity(&key(6)).unwrap().unwrap().commitment,
+        Some([7; 32])
+    );
 }
 
 fn lapsing_keeps_the_earliest_time_and_bars_on_request(s: &dyn RegistrarStore) {
