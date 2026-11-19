@@ -341,15 +341,27 @@ fn apply(tx: &Connection, e: &Effect) -> rusqlite::Result<()> {
                 params![&key[..]],
             )?;
         }
-        Effect::Rotate { from, to, at } => {
+        Effect::Rotate {
+            from,
+            to,
+            at,
+            commitment,
+        } => {
             tx.execute(
                 "UPDATE registrar_identity SET rotated_to = ?2 WHERE key = ?1",
                 params![&from[..], &to[..]],
             )?;
             tx.execute(
-                "INSERT OR IGNORE INTO registrar_identity (key, fingerprint, created)
-                 VALUES (?1, ?2, ?3)",
-                params![&to[..], &fingerprint(to)[..], int(*at)],
+                "INSERT INTO registrar_identity (key, fingerprint, created, commitment)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (key) DO UPDATE SET
+                   commitment = COALESCE(commitment, excluded.commitment)",
+                params![
+                    &to[..],
+                    &fingerprint(to)[..],
+                    int(*at),
+                    commitment.as_ref().map(|c| &c[..])
+                ],
             )?;
             tx.execute(
                 "UPDATE registrar_handle SET identity = ?2 WHERE identity = ?1",

@@ -222,15 +222,18 @@ pub async fn route(
             let handle = p["/lookup/".len()..].to_owned();
             let now = now();
             match blocking(move || reg.lookup_handle(&handle, client, now)).await {
-                Ok(Some(found)) => json_resp(
-                    StatusCode::OK,
-                    json!({
+                Ok(Some(found)) => {
+                    let mut body = json!({
                         "fingerprint": hl_identity::Fingerprint::of(&found.identity).to_string(),
                         "identity": b64(&found.identity),
                         "registered": found.registered,
                         "expires": found.expires,
-                    }),
-                ),
+                    });
+                    if let Some(c) = found.successor {
+                        body["successor"] = json!(hl_identity::Fingerprint(c).to_string());
+                    }
+                    json_resp(StatusCode::OK, body)
+                }
                 // One answer for free, lapsed, reserved and unknown.
                 Ok(None) => refused(Refusal::NotFound),
                 Err(e) => refused(e),
@@ -392,6 +395,7 @@ fn refused(e: Refusal) -> Resp {
             body["successor"] = json!(hl_identity::Fingerprint::of(successor).to_string());
         }
         Refusal::RateLimited { retry_after } => body["retry_after"] = json!(retry_after),
+        Refusal::RotationPending { until } => body["pending_until"] = json!(until),
         _ => {}
     }
     let mut resp = json_resp(StatusCode::from_u16(e.status()).unwrap(), body);

@@ -94,11 +94,16 @@ impl State {
                     row.revoked = true;
                 }
             }
-            Effect::Rotate { from, to, at } => {
+            Effect::Rotate {
+                from,
+                to,
+                at,
+                commitment,
+            } => {
                 if let Some(row) = self.identities.get_mut(from) {
                     row.rotated_to = Some(*to);
                 }
-                self.identities.entry(*to).or_insert(IdentityRow {
+                let row = self.identities.entry(*to).or_insert(IdentityRow {
                     key: *to,
                     commitment: None,
                     frozen: false,
@@ -106,6 +111,9 @@ impl State {
                     rotated_to: None,
                     created: *at,
                 });
+                if row.commitment.is_none() {
+                    row.commitment = *commitment;
+                }
                 for h in self.handles.values_mut() {
                     if h.identity == *from {
                         h.identity = *to;

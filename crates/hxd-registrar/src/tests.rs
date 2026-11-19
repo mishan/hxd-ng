@@ -522,6 +522,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
         identity: old.public(),
         successor: impostor.public(),
         time: T + 100,
+        next: None,
     }
     .sign(&old, &impostor)
     .unwrap();
@@ -534,6 +535,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
         identity: old.public(),
         successor: new.public(),
         time: T + 100,
+        next: None,
     }
     .sign(&old, &new)
     .unwrap();
@@ -584,6 +586,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
         identity: old.public(),
         successor: impostor.public(),
         time: T + 140,
+        next: None,
     }
     .sign(&old, &impostor)
     .unwrap();
@@ -605,6 +608,7 @@ fn a_delayed_rotation_can_be_met_with_a_freeze() {
         identity: old.public(),
         successor: thief.public(),
         time: T + 10,
+        next: None,
     }
     .sign(&old, &thief)
     .unwrap();
@@ -626,13 +630,16 @@ fn a_delayed_rotation_can_be_met_with_a_freeze() {
         identity: old.public(),
         successor: id(7).public(),
         time: T + 30,
+        next: None,
     }
     .sign(&old, &id(7))
     .unwrap();
-    assert!(matches!(
-        r.post_record(&second, T + 30),
-        Err(Refusal::BadRequest(_))
-    ));
+    assert_eq!(
+        r.post_record(&second, T + 30).unwrap_err(),
+        Refusal::RotationPending {
+            until: T + 10 + DAY
+        }
+    );
 
     r.freeze(&old.fingerprint().0, true, T + 40).unwrap();
     assert_eq!(
@@ -647,6 +654,415 @@ fn a_delayed_rotation_can_be_met_with_a_freeze() {
 }
 
 #[test]
+fn the_old_keys_revocation_takes_a_pending_rotation_whatever_it_committed() {
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    let (old, new) = (id(1), id(2));
+    let mut req = request(&old, "alice", T);
+    req.successor = Some(commitment(&new));
+    r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+    r.post_record(&rotation(&old, &new, None, T), T).unwrap();
+    // Whoever holds the old key may destroy the identity, though not
+    // take it.
+    let revoke = IdentityRevocation {
+        identity: old.public(),
+        time: T + 10,
+        reason: None,
+    }
+    .sign(&old)
+    .unwrap();
+    assert!(matches!(
+        r.post_record(&revoke, T + 10),
+        Ok(Posted::Published { .. })
+    ));
+    assert!(records_of(&r, &new, T + DAY).is_empty());
+    assert_eq!(r.store.pending(&old.public()).unwrap(), None);
+}
+
+/// `from`'s rotation to `to`, naming `to`'s own commitment as `next`.
+fn rotation(
+    from: &IdentityKey,
+    to: &IdentityKey,
+    next: Option<&IdentityKey>,
+    time: u64,
+) -> Vec<u8> {
+    Rotation {
+        identity: from.public(),
+        successor: to.public(),
+        time,
+        next: next.map(commitment),
+    }
+    .sign(from, to)
+    .unwrap()
+}
+
+#[test]
+fn a_rotations_next_is_the_commitment_of_a_successor_that_has_none() {
+    let (old, new, next) = (id(1), id(2), id(3));
+    let rotated = |next: Option<&IdentityKey>, known: bool| {
+        let r = registrar();
+        let mut req = request(&old, "alice", T);
+        req.successor = Some(commitment(&new));
+        r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+        if known {
+            register(&r, &new, "bobby", T).unwrap();
+        }
+        r.post_record(&rotation(&old, &new, next, T + 10), T + 10)
+            .unwrap();
+        r.lookup_handle("alice", addr(1), T + 10)
+            .unwrap()
+            .unwrap()
+            .successor
+    };
+    assert_eq!(rotated(Some(&next), false), Some(commitment(&next)));
+    assert_eq!(rotated(None, false), None);
+    assert_eq!(rotated(Some(&next), true), Some(commitment(&next)));
+}
+
+#[test]
+fn a_rotation_posted_at_another_registrar_names_the_owners_next_there_too() {
+    let (old, new, next, thief) = (id(1), id(2), id(3), id(6));
+    let (a, b) = (registrar(), registrar());
+    for r in [&a, &b] {
+        let mut req = request(&old, "alice", T);
+        req.successor = Some(commitment(&new));
+        r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+    }
+    // Published at one, the record is public, and a thief holding only
+    // the successor's key posts it at the other, having made the
+    // successor known there first: it brings the owner's commitment with
+    // it, and nothing the thief can sign replaces it.
+    let bytes = rotation(&old, &new, Some(&next), T);
+    a.post_record(&bytes, T).unwrap();
+    register(&b, &new, "zzzz", T + 1).unwrap();
+    b.post_record(&bytes, T + 10).unwrap();
+    let found = b.lookup_handle("alice", addr(1), T + 10).unwrap().unwrap();
+    assert_eq!(
+        (found.identity, found.successor),
+        (new.public(), Some(commitment(&next)))
+    );
+    let mut req = request(&new, "alice", T + 20);
+    req.successor = Some(commitment(&thief));
+    assert_eq!(
+        b.register(&req.sign(&new).unwrap(), addr(1), T + 20)
+            .unwrap_err(),
+        Refusal::SuccessorMismatch
+    );
+    assert_eq!(
+        b.post_record(&rotation(&new, &thief, None, T + 20), T + 20)
+            .unwrap_err(),
+        Refusal::SuccessorMismatch
+    );
+}
+
+#[test]
+fn a_rotation_is_refused_to_a_successor_that_could_not_take_it() {
+    let (old, new, next, thief) = (id(1), id(2), id(3), id(6));
+    let rotating = || {
+        let r = registrar_with(|c| c.rotation_delay = DAY);
+        let mut req = request(&old, "alice", T);
+        req.successor = Some(commitment(&new));
+        r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+        r
+    };
+    let commit_new = |r: &Registrar, to: &IdentityKey, at| {
+        let mut req = request(&new, "bobby", at);
+        req.successor = Some(commitment(to));
+        r.register(&req.sign(&new).unwrap(), addr(1), at).unwrap();
+    };
+    let post = |r: &Registrar, next: Option<&IdentityKey>| {
+        r.post_record(&rotation(&old, &new, next, T + 10), T + 10)
+    };
+    let bad = |why: &str| Err(Refusal::BadRequest(why.into()));
+
+    // A successor holding a commitment keeps it, so a rotation naming
+    // another `next`, or none, is refused; the same one is taken.
+    let r = rotating();
+    commit_new(&r, &thief, T);
+    assert_eq!(post(&r, Some(&next)), Err(Refusal::SuccessorMismatch));
+    assert_eq!(post(&r, None), Err(Refusal::SuccessorMismatch));
+    let r = rotating();
+    commit_new(&r, &next, T);
+    assert!(post(&r, Some(&next)).is_ok());
+
+    // A frozen successor, or one with a rotation of its own pending.
+    let r = rotating();
+    register(&r, &new, "bobby", T).unwrap();
+    r.freeze(&new.fingerprint().0, true, T + 1).unwrap();
+    assert_eq!(post(&r, None), bad("the successor key is frozen"));
+    let r = rotating();
+    register(&r, &new, "bobby", T).unwrap();
+    r.post_record(&rotation(&new, &next, None, T + 5), T + 5)
+        .unwrap();
+    assert_eq!(
+        post(&r, None),
+        bad("the successor key has a rotation of its own pending")
+    );
+}
+
+#[test]
+fn the_successor_of_a_held_rotation_commits_to_its_next_or_to_nothing() {
+    let (old, new, next, thief) = (id(1), id(2), id(3), id(6));
+    let held = || {
+        let r = registrar_with(|c| c.rotation_delay = DAY);
+        let mut req = request(&old, "alice", T);
+        req.successor = Some(commitment(&new));
+        r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+        r.post_record(&rotation(&old, &new, Some(&next), T), T)
+            .unwrap();
+        r
+    };
+    let commit_new = |r: &Registrar, to: &IdentityKey, at| {
+        let mut req = request(&new, "bobby", at);
+        req.successor = Some(commitment(to));
+        r.register(&req.sign(&new).unwrap(), addr(1), at)
+    };
+    let committed = |r: &Registrar| r.store.identity(&new.public()).unwrap().unwrap().commitment;
+
+    // Whoever holds the successor's key, while the rotation waits: a
+    // commitment of its own would have the owner's rotation dropped,
+    // whether the key is new here or known.
+    let r = held();
+    assert_eq!(
+        commit_new(&r, &thief, T + 5).unwrap_err(),
+        Refusal::RotationPending { until: T + DAY }
+    );
+    register(&r, &new, "bobby", T + 5).unwrap();
+    assert_eq!(
+        commit_new(&r, &thief, T + 10).unwrap_err(),
+        Refusal::RotationPending { until: T + DAY }
+    );
+    let mut card = Card::new(&new, "Bob", T + 10);
+    card.successor = Some(commitment(&thief));
+    r.note_card(&card).unwrap();
+    assert_eq!(committed(&r), None);
+    // Published when its time comes, it commits the successor to `next`.
+    assert!(records_of(&r, &new, T + DAY)
+        .iter()
+        .any(|rec| matches!(rec, Record::Rotate(_))));
+    assert_eq!(committed(&r), Some(commitment(&next)));
+
+    // The rotation's own `next` may be committed to early.
+    let r = held();
+    commit_new(&r, &next, T + 20).unwrap();
+    assert!(records_of(&r, &new, T + DAY)
+        .iter()
+        .any(|rec| matches!(rec, Record::Rotate(_))));
+}
+
+#[test]
+fn a_held_rotation_that_no_longer_reads_is_dropped() {
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    let (old, new) = (id(1), id(2));
+    register(&r, &old, "alice", T).unwrap();
+    r.store
+        .publish(&Publish {
+            records: vec![],
+            effects: vec![Effect::SetPending(Pending {
+                identity: old.public(),
+                successor: new.public(),
+                publish_at: T + DAY,
+                digest: [1; 32],
+                bytes: b"not a rotation".to_vec(),
+            })],
+        })
+        .unwrap();
+    assert!(records_of(&r, &old, T + DAY).is_empty());
+    assert_eq!(r.store.pending(&old.public()).unwrap(), None);
+    assert_eq!(
+        r.lookup_handle("alice", addr(1), T + DAY)
+            .unwrap()
+            .unwrap()
+            .identity,
+        old.public()
+    );
+}
+
+#[test]
+fn a_rotation_whose_next_hands_nothing_over_is_refused_by_name() {
+    use hl_identity::cbor::{self, Value};
+    let r = registrar();
+    let (old, new) = (id(1), id(2));
+    register(&r, &old, "alice", T).unwrap();
+    // `next` is read before either signature is checked, so a record
+    // with it rewritten needs neither key.
+    for to in [&old, &new] {
+        let mut v = cbor::decode_canonical(&rotation(&old, &new, Some(&id(3)), T)).unwrap();
+        if let Value::Map(entries) = &mut v {
+            for (k, val) in entries.iter_mut() {
+                if k == &Value::Text("next".into()) {
+                    *val = Value::Bytes(commitment(to).to_vec());
+                }
+            }
+        }
+        assert!(matches!(
+            r.post_record(&cbor::encode(&v), T),
+            Err(Refusal::BadRequest(why)) if why.contains("hands nothing over")
+        ));
+    }
+}
+
+#[test]
+fn a_card_records_no_commitment_for_an_identity_that_may_not_write() {
+    let alice = id(1);
+    let fp = alice.fingerprint().0;
+    let revocation = IdentityRevocation {
+        identity: alice.public(),
+        time: T + 1,
+        reason: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    let rotation = Rotation {
+        identity: alice.public(),
+        successor: id(2).public(),
+        time: T + 1,
+        next: None,
+    }
+    .sign(&alice, &id(2))
+    .unwrap();
+    for case in ["frozen", "revoked", "rotated"] {
+        let r = registrar();
+        register(&r, &alice, "alice", T).unwrap();
+        match case {
+            "frozen" => assert!(r.freeze(&fp, true, T + 1).is_ok()),
+            "revoked" => assert!(r.post_record(&revocation, T + 1).is_ok()),
+            _ => assert!(r.post_record(&rotation, T + 1).is_ok()),
+        }
+        let mut card = Card::new(&alice, "Alice", T + 2);
+        card.successor = Some([4; 32]);
+        r.note_card(&card).unwrap();
+        let row = r.store.identity(&alice.public()).unwrap().unwrap();
+        assert_eq!(row.commitment, None, "{case}");
+    }
+}
+
+#[test]
+fn an_operator_publishes_a_held_rotation_at_once() {
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    let old = id(1);
+    let new = id(2);
+    let (fp, to) = (old.fingerprint().0, new.fingerprint().0);
+    let mut req = request(&old, "alice", T);
+    req.successor = Some(commitment(&new));
+    r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
+    assert_eq!(
+        r.publish_pending(&fp, &to, T + 1).unwrap_err(),
+        OpError::NothingPending
+    );
+    assert_eq!(
+        r.publish_pending(&id(9).fingerprint().0, &to, T + 1)
+            .unwrap_err(),
+        OpError::UnknownIdentity
+    );
+    let rot = Rotation {
+        identity: old.public(),
+        successor: new.public(),
+        time: T + 10,
+        next: None,
+    }
+    .sign(&old, &new)
+    .unwrap();
+    r.post_record(&rot, T + 10).unwrap();
+    // The operator names the successor they confirmed with the holder,
+    // and a rotation to any other is left waiting.
+    assert_eq!(
+        r.publish_pending(&fp, &id(6).fingerprint().0, T + 15)
+            .unwrap_err(),
+        OpError::PendingToAnother(to)
+    );
+    let seq = r.publish_pending(&fp, &to, T + 20).unwrap();
+    assert_eq!(
+        r.post_record(&rot, T + 30).unwrap(),
+        Posted::Published { seq }
+    );
+    assert_eq!(
+        r.lookup_handle("alice", addr(1), T + 30)
+            .unwrap()
+            .unwrap()
+            .identity,
+        new.public()
+    );
+    assert_eq!(
+        r.publish_pending(&fp, &to, T + 40).unwrap_err(),
+        OpError::NothingPending
+    );
+
+    // One that no longer passes is dropped, not published: here its
+    // successor revoked itself while it waited.
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    register(&r, &old, "alice", T).unwrap();
+    register(&r, &new, "bobby", T).unwrap();
+    r.post_record(&rot, T + 10).unwrap();
+    let gone = IdentityRevocation {
+        identity: new.public(),
+        time: T + 20,
+        reason: None,
+    }
+    .sign(&new)
+    .unwrap();
+    r.post_record(&gone, T + 20).unwrap();
+    assert_eq!(
+        r.publish_pending(&fp, &to, T + 30).unwrap_err(),
+        OpError::PendingDropped
+    );
+    assert!(records_of(&r, &old, T + 40).is_empty());
+    assert_eq!(
+        r.publish_pending(&fp, &to, T + 40).unwrap_err(),
+        OpError::NothingPending
+    );
+}
+
+#[test]
+fn a_waiting_rotations_identity_commits_to_nothing() {
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    let (old, owners, thiefs) = (id(1), id(2), id(6));
+    let fp = old.fingerprint().0;
+    register(&r, &old, "alice", T).unwrap();
+    // A thief holding the old key of an uncommitted identity rotates it
+    // to its own key, then tries to pin the commitment to that key, which
+    // the registrar cannot tell from the owner doing the same.
+    let stolen = rotation(&old, &thiefs, None, T + 10);
+    r.post_record(&stolen, T + 10).unwrap();
+    let mut req = request(&old, "alice", T + 20);
+    req.successor = Some(commitment(&thiefs));
+    assert_eq!(
+        r.register(&req.sign(&old).unwrap(), addr(1), T + 20)
+            .unwrap_err(),
+        Refusal::RotationPending {
+            until: T + 10 + DAY
+        }
+    );
+    let mut card = Card::new(&old, "Alice", T + 20);
+    card.successor = Some(commitment(&thiefs));
+    r.note_card(&card).unwrap();
+    assert_eq!(
+        r.store.identity(&old.public()).unwrap().unwrap().commitment,
+        None
+    );
+    // The owner's way out, §8.2: a freeze cancels the thief's rotation,
+    // and once it is lifted the owner's rotation is the one that waits.
+    r.freeze(&fp, true, T + 30).unwrap();
+    r.freeze(&fp, false, T + 40).unwrap();
+    assert!(matches!(
+        r.post_record(&rotation(&old, &owners, None, T + 50), T + 50),
+        Ok(Posted::Pending { .. })
+    ));
+    assert!(matches!(
+        r.post_record(&stolen, T + 60),
+        Err(Refusal::RotationPending { .. })
+    ));
+    let to = owners.fingerprint().0;
+    r.publish_pending(&fp, &to, T + 70).unwrap();
+    assert_eq!(
+        r.lookup_handle("alice", addr(1), T + 70)
+            .unwrap()
+            .unwrap()
+            .identity,
+        owners.public()
+    );
+}
+
+#[test]
 fn a_delayed_rotation_publishes_itself_when_its_time_comes() {
     let r = registrar_with(|c| c.rotation_delay = DAY);
     let old = id(1);
@@ -656,6 +1072,7 @@ fn a_delayed_rotation_publishes_itself_when_its_time_comes() {
         identity: old.public(),
         successor: new.public(),
         time: T,
+        next: None,
     }
     .sign(&old, &new)
     .unwrap();
@@ -681,6 +1098,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
         identity: old.public(),
         successor: new.public(),
         time: T,
+        next: None,
     }
     .sign(&old, &new)
     .unwrap();
@@ -701,8 +1119,8 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     assert_eq!(found.identity, old.public());
     assert!(register(&r, &old, "alice", T + DAY).unwrap().reissued);
 
-    // Likewise a successor that rotated on to a key of its own, its
-    // rotation due first.
+    // Likewise a successor rotating on to a key of its own, refused
+    // while that rotation waits.
     let r = registrar_with(|c| c.rotation_delay = DAY);
     register(&r, &old, "alice", T).unwrap();
     register(&r, &new, "bobby", T).unwrap();
@@ -710,6 +1128,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
         identity: new.public(),
         successor: other.public(),
         time: T,
+        next: None,
     }
     .sign(&new, &other)
     .unwrap();
@@ -718,10 +1137,14 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
         identity: old.public(),
         successor: new.public(),
         time: T + 10,
+        next: None,
     }
     .sign(&old, &new)
     .unwrap();
-    r.post_record(&rot, T + 10).unwrap();
+    assert_eq!(
+        r.post_record(&rot, T + 10).unwrap_err(),
+        Refusal::BadRequest("the successor key has a rotation of its own pending".into())
+    );
     assert!(records_of(&r, &old, T + DAY + 10).is_empty());
     let rotations: Vec<([u8; 32], [u8; 32])> = records_of(&r, &new, T + DAY + 10)
         .into_iter()
@@ -732,6 +1155,24 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
         .collect();
     assert_eq!(rotations, vec![(new.public(), other.public())]);
     assert!(register(&r, &old, "alice", T + DAY + 10).is_ok());
+
+    // And one the successor's holder rotates on after the owner's was
+    // posted: the owner's is dropped when it comes due.
+    let r = registrar_with(|c| c.rotation_delay = DAY);
+    register(&r, &old, "alice", T).unwrap();
+    r.post_record(&rotation(&old, &new, None, T), T).unwrap();
+    register(&r, &new, "bobby", T + 5).unwrap();
+    r.post_record(&rotation(&new, &other, None, T + 10), T + 10)
+        .unwrap();
+    assert!(records_of(&r, &old, T + DAY).is_empty());
+    assert_eq!(r.store.pending(&old.public()).unwrap(), None);
+    assert_eq!(
+        r.lookup_handle("alice", addr(1), T + DAY)
+            .unwrap()
+            .unwrap()
+            .identity,
+        old.public()
+    );
 }
 
 #[test]
@@ -1521,6 +1962,7 @@ fn revocation_and_rotation_take_the_envelopes_with_them() {
         identity: bob.public(),
         successor: bob2.public(),
         time: T + 1,
+        next: None,
     }
     .sign(&bob, &bob2)
     .unwrap();
@@ -1541,6 +1983,7 @@ fn a_rotation_that_came_due_is_published_by_a_salt_lookup_or_a_fetch() {
             identity: bob.public(),
             successor: bob2.public(),
             time: T + 1,
+            next: None,
         }
         .sign(&bob, &bob2)
         .unwrap();

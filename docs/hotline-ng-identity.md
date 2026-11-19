@@ -660,8 +660,10 @@ A rotation is its own signed object (`identity-registrar.md` §4.6),
 learned from a trusted registrar's records or from the successor's
 `auth` request (§5.1). It never rides in a card, and an earlier
 revision's "carried in the card's attestations as a successor
-attestation" is withdrawn. What a server accepts, and what moves to the
-successor on acceptance, is `identity-registrar.md` §7.4.
+attestation" is withdrawn. Its fields, among them `next`, the
+successor's own commitment signed by both keys, are listed there. What
+a server accepts, and what moves to the successor on acceptance, is
+`identity-registrar.md` §7.4.
 
 ### 8.6 Legacy clients on the TCP port
 

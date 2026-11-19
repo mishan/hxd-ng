@@ -363,6 +363,7 @@ async fn a_rotation_is_published_under_both_keys() {
             identity: old.public(),
             successor: to.public(),
             time: now(),
+            next: None,
         }
         .sign(&old, to)
         .unwrap()
@@ -660,6 +661,96 @@ async fn the_operators_commands_act_on_the_running_registrar() {
     let err = hxd::registrar::freeze(&elsewhere, &fp, false).unwrap_err();
     assert!(err.contains("start the server once"), "{err}");
     assert!(!dir.path().join("missing.key").exists());
+}
+
+#[tokio::test]
+async fn a_lookup_names_the_commitment_the_registrar_kept_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let (alice, next, bob) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[3; 32]),
+    );
+    let mut req = request(&alice, "alice");
+    req.successor = Some(commitment(&next));
+    assert_eq!(register(&s, req, &alice).await.status, 200);
+    assert_eq!(register(&s, request(&bob, "bobby"), &bob).await.status, 200);
+    drop(s);
+
+    // A second server on the same files, with a store of its own.
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], alice.fingerprint().to_string());
+    assert_eq!(found["successor"], next.fingerprint().to_string());
+    let found = get(&s, "/registrar/lookup/bobby").await.json();
+    assert!(found["successor"].is_null(), "{found}");
+}
+
+#[tokio::test]
+async fn a_held_rotation_holds_off_another_and_the_operator_publishes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"\nrotation_delay = 86400").await;
+    let (old, new, next) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+        IdentityKey::from_seed(&[3; 32]),
+    );
+    let mut req = request(&old, "alice");
+    req.successor = Some(commitment(&new));
+    assert_eq!(register(&s, req, &old).await.status, 200);
+    // The rotation names the successor's own commitment.
+    let rotated = Rotation {
+        identity: old.public(),
+        successor: new.public(),
+        time: now(),
+        next: Some(commitment(&next)),
+    }
+    .sign(&old, &new)
+    .unwrap();
+    let r = post(&s, "/registrar/records", json!({ "record": b64(&rotated) }))
+        .await
+        .json();
+    assert_eq!(r["published"], false, "{r}");
+    let until = r["pending_until"].clone();
+
+    let other = IdentityKey::from_seed(&[6; 32]);
+    let r = post(
+        &s,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &other)) }),
+    )
+    .await;
+    assert_eq!(r.status, 409);
+    let body = r.json();
+    assert_eq!(body["error"], "rotation_pending");
+    assert_eq!(body["pending_until"], until);
+
+    let (old_fp, new_fp) = (old.fingerprint().to_string(), new.fingerprint().to_string());
+    let other = other.fingerprint().to_string();
+    let err = hxd::registrar::publish(&s.config, &old_fp, &other).unwrap_err();
+    assert!(err.contains(&format!("is to {new_fp}, not")), "{err}");
+    hxd::registrar::publish(&s.config, &old_fp, &new_fp).unwrap();
+    assert!(records_of(&s, &new)
+        .await
+        .iter()
+        .any(|r| matches!(r, Record::Rotate(_))));
+    // The old key, rotated away, writes nothing more.
+    let revoke = hl_identity::IdentityRevocation {
+        identity: old.public(),
+        time: now(),
+        reason: None,
+    }
+    .sign(&old)
+    .unwrap();
+    let r = post(&s, "/registrar/records", json!({ "record": b64(&revoke) })).await;
+    assert_eq!(r.status, 403);
+    assert_eq!(r.json()["successor"], new.fingerprint().to_string());
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], new_fp);
+    assert_eq!(found["successor"], next.fingerprint().to_string());
+    let err = hxd::registrar::publish(&s.config, &old_fp, &new_fp).unwrap_err();
+    assert!(err.contains("no rotation pending"), "{err}");
 }
 
 #[test]
@@ -1062,6 +1153,7 @@ fn rotation(from: &IdentityKey, to: &IdentityKey) -> Vec<u8> {
         identity: from.public(),
         successor: to.public(),
         time: now(),
+        next: None,
     }
     .sign(from, to)
     .unwrap()
@@ -2216,6 +2308,7 @@ async fn revocation_and_rotation_take_the_envelopes_with_them() {
         identity: bob.public(),
         successor: bob2.public(),
         time: now(),
+        next: None,
     }
     .sign(&bob, &bob2)
     .unwrap();

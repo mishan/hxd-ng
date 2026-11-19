@@ -394,7 +394,7 @@ fn read_invites(path: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-pub use imp::{build, freeze, invites_add, open, recover, reload, revoke, unlock};
+pub use imp::{build, freeze, invites_add, open, publish, recover, reload, revoke, unlock};
 
 #[cfg(feature = "inbox")]
 mod imp {
@@ -506,6 +506,15 @@ mod imp {
             .map_err(|e| e.to_string())
     }
 
+    /// `hxd registrar publish <fingerprint> --to <successor>` (§8.2):
+    /// the identity's pending rotation, published without waiting out
+    /// its delay, if it is to the successor the operator names.
+    pub fn publish(config: &Config, fp: &str, to: &str) -> Result<u64, String> {
+        open(config)?
+            .publish_pending(&fingerprint(fp)?, &fingerprint(to)?, now())
+            .map_err(|e| e.to_string())
+    }
+
     /// `hxd registrar revoke <handle> --reason …` (§4.8). `abuse` also
     /// bars the holder from reissuing it for the hold.
     pub fn revoke(config: &Config, handle: &str, reason: &str) -> Result<u64, String> {
@@ -583,6 +592,9 @@ mod imp {
         Err(NO_STORE.into())
     }
     pub fn freeze(_: &Config, _: &str, _: bool) -> Result<u64, String> {
+        Err(NO_STORE.into())
+    }
+    pub fn publish(_: &Config, _: &str, _: &str) -> Result<u64, String> {
         Err(NO_STORE.into())
     }
     pub fn revoke(_: &Config, _: &str, _: &str) -> Result<u64, String> {

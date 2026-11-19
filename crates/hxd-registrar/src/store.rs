@@ -216,12 +216,14 @@ pub enum Effect {
     /// The identity is revoked (§4.5).
     Revoke(Key),
     /// `from` is rotated to `to`: `to` gets an identity row if it has
-    /// none (created `at`), and every handle `from` holds moves to it
-    /// with `registered` kept (§5.4).
+    /// none (created `at`), committed to the rotation's `next` if it has
+    /// no commitment, and every handle `from` holds moves to it with
+    /// `registered` kept (§5.4). A commitment `to` already has is kept.
     Rotate {
         from: Key,
         to: Key,
         at: u64,
+        commitment: Option<[u8; 32]>,
     },
     /// Every handle of the identity that has not lapsed lapses `at`.
     LapseHandles {

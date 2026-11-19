@@ -404,6 +404,7 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
         identity: old.public(),
         successor: new.public(),
         time: now(),
+        next: None,
     }
     .sign(&old, &new)
     .map_err(|e| refuse_unreadable("rotation", e))?;
