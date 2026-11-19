@@ -577,9 +577,10 @@ impl Registrars {
     }
 
     /// What the held lists of `identities` (fingerprints) refuse, as one
-    /// list: each identity revoked, or frozen when `frozen_refuses`, and
-    /// each device an identity revoked, as that identity's; and, apart,
-    /// the rotations away from them, for the caller to accept or not.
+    /// list: each identity revoked, each frozen when `frozen_refuses`
+    /// (refused, not revoked), and each device an identity revoked, as
+    /// that identity's; and, apart, the rotations away from them, for the
+    /// caller to accept or not.
     /// Reads the store and verifies: called off the reactor.
     pub fn refused(
         &self,
@@ -622,7 +623,7 @@ impl Registrars {
                 }
             }
             if frozen_refuses && frozen.values().any(|f| *f) {
-                refused.identities.insert(fp.0);
+                refused.unrevoked.insert(fp.0);
             }
         }
         (refused, rotations)

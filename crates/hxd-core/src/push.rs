@@ -1027,6 +1027,37 @@ mod tests {
         );
     }
 
+    /// A freeze takes an identity's rows as its revocation would: a delete
+    /// it left is retried while the freeze stands, not lifted, and a row
+    /// that reaches the store meanwhile is refused.
+    #[test]
+    fn a_frozen_identitys_rows_go_as_a_revoked_ones_do() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let devices = Arc::new(MemoryDevices::new());
+        let core = Core::new().with_devices(devices.clone());
+        let alice = Mailbox::identified("alice", [7; 32]);
+        let row = device(alice.clone(), DeviceId::of_device(&[10; 32]).as_str());
+        devices.register(&row, 8).unwrap();
+        devices.failing_deletes.store(1, SeqCst);
+        let frozen = crate::Published {
+            unrevoked: [[7; 32]].into(),
+            covered: [[7; 32]].into(),
+            ..Default::default()
+        };
+        core.set_published_revocations(frozen.clone());
+        let now = SystemTime::now();
+        assert_eq!(
+            devices.devices(&alice, now).unwrap().len(),
+            1,
+            "its delete failed"
+        );
+        core.set_published_revocations(frozen);
+        assert!(devices.devices(&alice, now).unwrap().is_empty(), "retried");
+        devices.register(&row, 8).unwrap();
+        let gateway = core.push_store().unwrap();
+        assert!(gateway.devices(&alice, now).unwrap().is_empty(), "refused");
+    }
+
     /// A row read just before a retry takes it and forgets its key is not
     /// let through: the key was copied before the read.
     #[test]

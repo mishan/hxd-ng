@@ -1709,6 +1709,44 @@ fn forward(listener: tokio::net::TcpListener, to: Arc<std::sync::Mutex<SocketAdd
 }
 
 #[tokio::test]
+async fn a_session_its_registrar_freezes_resumes_as_expired_and_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let (v, identity) = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let mut here = session_at(v, &alice, &card).await;
+    let session = here.session.clone().unwrap();
+
+    hxd::registrar::freeze(&r.config, &alice.fingerprint().to_string(), false).unwrap();
+    next_list().await;
+    assert_eq!(identity.sweep_records().await.len(), 1);
+    here.event("kicked").await.unwrap();
+    // A freeze can be lifted: its resume is not told the key is revoked,
+    // and the auth that follows says what it is.
+    let mut c = hxd_testclient::ng::Client::connect(v).await.unwrap();
+    let resumed = c
+        .request(
+            "resume",
+            json!({ "session": session.0, "token": session.1, "last_seq": 0 }),
+        )
+        .await;
+    assert!(
+        matches!(&resumed, Err(hxd_testclient::Error::Refused { code, .. }) if code == "session_expired"),
+        "{resumed:?}"
+    );
+    let reply = auth_at(v, &alice, &DeviceKey::from_seed(&[101; 32]), &card).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("denied"))
+    );
+}
+
+#[tokio::test]
 async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
     let dir = tempfile::tempdir().unwrap();
     let at = dir.path().join("registrar");

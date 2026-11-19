@@ -982,8 +982,86 @@ fn a_session_ended_or_kicked_is_remembered_so_and_one_that_lapsed_or_rotated_is_
         });
         assert_eq!(
             core.ended_by(revoked.0, revoked.1, hour),
-            Some(EndedBy::Kicked),
+            Some(EndedBy::Revoked),
             "{case}: revoked"
+        );
+        let (g, _rg) = on(
+            &core,
+            session("gus", Some([8; 32]), None, proved_as([8; 32], 8)),
+        );
+        let published = (g, core.session_serial(g).unwrap());
+        core.set_published_revocations(crate::Published {
+            identities: [[8; 32]].into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            core.ended_by(published.0, published.1, hour),
+            Some(EndedBy::Revoked),
+            "{case}: revoked at its registrar"
+        );
+        let (h, mut rh) = on(
+            &core,
+            session("hal", Some([9; 32]), None, proved_as([9; 32], 9)),
+        );
+        let frozen = (h, core.session_serial(h).unwrap());
+        core.set_published_revocations(crate::Published {
+            unrevoked: [[9; 32]].into(),
+            ..Default::default()
+        });
+        assert!(
+            drain(&mut rh).contains(&Event::Kicked),
+            "{case}: a freeze ends the session"
+        );
+        assert_eq!(
+            core.ended_by(frozen.0, frozen.1, hour),
+            None,
+            "{case}: frozen, not revoked"
+        );
+        // A ban says most: a revocation before its kick is ended does
+        // not lose it.
+        let (i, _ri) = on(
+            &core,
+            session("ivy", Some([10; 32]), None, proved_as([10; 32], 10)),
+        );
+        let banned = (i, core.session_serial(i).unwrap());
+        core.kick(i, Some(std::time::Duration::from_secs(60)))
+            .unwrap();
+        core.set_revocations(crate::Revocations {
+            devices: [[10; 32]].into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                core.ended_by(banned.0, banned.1, hour),
+                Some(EndedBy::Banned(_))
+            ),
+            "{case}: banned, then revoked"
+        );
+        // One device of a person revoked, the other left be.
+        let (phone, _rp) = alice(&core, proved_as(ALICE, 21));
+        let (laptop, _rl) = alice(&core, proved_as(ALICE, 22));
+        let phone = (phone, core.session_serial(phone).unwrap());
+        core.set_revocations(crate::Revocations {
+            devices: [[21; 32]].into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            core.ended_by(phone.0, phone.1, hour),
+            Some(EndedBy::Revoked),
+            "{case}: the revoked device"
+        );
+        if coalesce {
+            assert_eq!(
+                core.device_end(laptop, device_of(&core, phone.0)),
+                Err(crate::coalesce::DeviceRefusal::NoSuchDevice),
+                "{case}: on its way out, no target"
+            );
+        }
+        let sibling = core.session_serial(laptop).expect("the other stays");
+        assert_eq!(
+            core.ended_by(laptop, sibling, hour),
+            None,
+            "{case}: its sibling"
         );
         let (f, _rf) = on(
             &core,

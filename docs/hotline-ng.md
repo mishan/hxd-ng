@@ -413,7 +413,8 @@ Errors:
 | `bad_request` | `params` malformed. |
 | `session_expired` | No such session, the token is wrong, or the grace window lapsed. Log in again. |
 | `ended` | The session was ended by a device of its own person (`device_end`, §7.6). Do not log in again on your own. |
-| `kicked` | The session was kicked, or its key revoked (hotline-ng-auth.md). Do not log in again on your own. |
+| `kicked` | The session was kicked. Do not log in again on your own. |
+| `revoked` | As for `login` (§6.1): the session's identity or device key was revoked here (identity-registrar.md §7.3). A login with that key is refused the same way. |
 | `banned` | As for `login` (§6.1), with `reason` and `expires_at`: the session was kicked with a ban, or banned, and the ban stands. |
 | `too_many_connections` | As for `login` (§6.1): the session's account holds as many connections as it may. The session is left as it was, and a resume after one of the others has closed finds it. A resume that takes the session over from a connection not yet known to be dead is not refused for that connection. |
 | `rate_limited` | As for `login` (§6.1): the session's account has been connecting too often. The session is left as it was; retry after `retry_after` seconds. |
@@ -422,16 +423,22 @@ Errors:
 `resync_required` is the one handshake error that does not close the
 connection.
 
-`ended`, `kicked` and `banned` are answered whether the session was
-attached or detached when it ended, only to the session's own token,
-and only within the grace window it could have resumed in; a server MAY
-forget them sooner, past a bound on how many it keeps, and answer
-`session_expired`. A session ended detached heard nothing of it, and
-one attached may lose its connection before its client reads the
+`ended`, `kicked`, `revoked` and `banned` are answered whether the
+session was attached or detached when it ended, only to the session's
+own token, and only within the grace window it could have resumed in; a
+server MAY forget them sooner, past a bound on how many it keeps, and
+answer `session_expired`. A session ended detached heard nothing of it,
+and one attached may lose its connection before its client reads the
 event; told only that its session expired, a client logs in again,
 undoing the end, the kick or the ban (rationale §9). A session ended
-because its key was rotated away from is `session_expired`: its
-successor logging in is the point.
+by a revocation is sent `kicked` while attached, but its resume is
+`revoked`, the answer its login would get, so a client learns the key
+is refused rather than taking it for a kick; one banned as well is
+`banned`. A session ended because its identity was frozen at its
+registrar, or its key was rotated away from, is `session_expired`: a
+freeze can be lifted, a successor logging in is the point of a
+rotation, and the next `auth` says which it was, `rotated` naming the
+successor (hotline-ng-identity.md §5.3).
 
 ### 6.3 Sync
 
@@ -2023,13 +2030,13 @@ news body is different: it declares its own type (news.md §5).
 |---|---|---|
 | `login_failed` | `login` | Wrong account or password. |
 | `denied` | `login` | Identity policy refused this socket. |
-| `revoked` | `login` | This identity or device key is revoked here. |
+| `revoked` | `login`, `resume` | This identity or device key is revoked here. |
 | `banned` | `login`, `resume` | Banned (§6.1). |
 | `server_full` | `login` | No uid free. |
 | `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
 | `session_expired` | `resume` | Log in again. |
 | `ended` | `resume` | Ended by a device of its person; do not log in again on your own. |
-| `kicked` | `resume` | Kicked, or its key revoked; do not log in again on your own. |
+| `kicked` | `resume` | Kicked; do not log in again on your own. |
 | `resync_required` | `resume` | Attached; follow with `sync`. |
 | `not_available` | `history`, `files_*`, `react`, `reactions`, `emoji_list`, family requests | The server does not offer this. |
 | `no_such_target` | `react` | No such line, or one this session may not react to, or an instant message's party it may not message: one answer for all (§7.3). Never for a `pm` target, which is answered `{}`. |

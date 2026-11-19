@@ -5513,6 +5513,37 @@ async fn a_socket_that_authenticated_first_cannot_log_in_after() {
 }
 
 #[tokio::test]
+async fn a_session_detached_when_its_key_is_revoked_is_told_so_by_its_resume() {
+    for identity in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_legacy, ng, ctx) = start_server(dir.path()).await;
+        let p = person(67, "Away");
+        let (c, ok) = link_to_alice(ng, &p).await;
+        let resume = json!({ "session": ok["session"], "token": ok["token"], "last_seq": 0 });
+        drop(c);
+        timeout(Duration::from_secs(5), async {
+            while ctx.core.census().detached == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session never detached");
+
+        let list = if identity {
+            revoking(&[&p.id], &[])
+        } else {
+            revoking(&[], &[&p.dev])
+        };
+        assert_eq!(ctx.core.set_revocations(list).len(), 1, "{identity}");
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{ng}/ng"))
+            .await
+            .unwrap();
+        let reply = Ng::from_ws(ws).await.request("resume", resume).await;
+        assert_eq!(reply["error"]["code"], "revoked", "{identity}: {reply}");
+    }
+}
+
+#[tokio::test]
 async fn a_reload_reads_the_lists_and_a_bad_one_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, ctx) = start_server(dir.path()).await;
