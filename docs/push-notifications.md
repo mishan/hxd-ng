@@ -606,8 +606,10 @@ the registrars remembered as having attested it, which a restart
 forgets. The refusals the sweep keeps are kept in memory, so after a
 restart a trusted list held damaged, with its registrar out of reach,
 is used as held under `revocation_stale = cached`, which admits the
-device it no longer shows revoked; `revocation_stale = deny` refuses it.
-The operator's own list is applied at startup and on every reload.
+device it no longer shows revoked. `revocation_stale = deny` refuses
+that device's login, but not a push registration it already holds,
+which is still sent to until the list is read whole again or the
+operator revokes the device. The operator's own list is applied at startup and on every reload.
 
 Together these give the one thing a password account cannot have: **a lost phone
 stops buzzing when its key is revoked** -- at once by the operator, and by
