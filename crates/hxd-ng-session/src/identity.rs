@@ -1919,14 +1919,22 @@ impl IdentityState {
                     here.entry(*fp).or_insert(part);
                 }
             }
-            found.retain(|fp, _| pushing.contains(fp));
-            here.retain(|fp, _| {
-                on.contains(fp) || (pushing.contains(fp) && !found.contains_key(fp))
+            // A refusal is kept, and its identity swept, until a whole read
+            // clears it, push registrations or none: what refuses a device
+            // here also refuses its login, which would register again.
+            found.retain(|fp, (_, part)| pushing.contains(fp) || !part.is_empty());
+            here.retain(|fp, part| {
+                on.contains(fp)
+                    || (!found.contains_key(fp) && (pushing.contains(fp) || !part.is_empty()))
             });
             let offline: Vec<Fingerprint> = pushing
                 .iter()
+                .chain(found.keys())
+                .chain(here.keys())
                 .filter(|fp| !on.contains(fp))
                 .copied()
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect();
             let (mut new, mut due) = (Vec::new(), Vec::new());
             for fp in &offline {

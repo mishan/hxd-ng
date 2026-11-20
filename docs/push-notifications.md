@@ -603,8 +603,11 @@ identity is seen away: after a restart, at the first sweep and before it
 fetches anything, which also retries a delete the store failed before
 the restart. An identity with no list held here has nothing to read but
 the registrars remembered as having attested it, which a restart
-forgets. The operator's own list is applied at startup and on every
-reload.
+forgets. The refusals the sweep keeps are kept in memory, so after a
+restart a trusted list held damaged, with its registrar out of reach,
+is used as held under `revocation_stale = cached`, which admits the
+device it no longer shows revoked; `revocation_stale = deny` refuses it.
+The operator's own list is applied at startup and on every reload.
 
 Together these give the one thing a password account cannot have: **a lost phone
 stops buzzing when its key is revoked** -- at once by the operator, and by

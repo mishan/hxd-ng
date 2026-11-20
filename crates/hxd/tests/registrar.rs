@@ -2494,6 +2494,89 @@ async fn a_list_read_in_part_keeps_what_was_found_before() {
     assert!(a.delivered().is_empty(), "refreshed: still hidden");
 }
 
+/// A refusal outlives its identity's last push registration until a
+/// whole read clears it: with the registrar out of reach and the lists
+/// held damaged or unreadable, the revoked device is still refused, and
+/// so registers nothing.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_refusal_outlives_its_identitys_last_push_registration() {
+    for unreadable in [false, true] {
+        let a = Away::start().await;
+        let (phone, laptop) = (
+            DeviceKey::from_seed(&[101; 32]),
+            DeviceKey::from_seed(&[102; 32]),
+        );
+        a.register(&phone).await;
+        let mut here = session_as(a.v, &a.alice, &laptop, &a.card).await;
+        post_device_revocation(&a.r, &a.alice, &phone).await;
+        let clock = a.identity.clock();
+        clock.advance(Duration::from_secs(2));
+        a.identity.sweep_records().await;
+        assert!(a.rows().is_empty(), "the phone's registration went");
+        // With it went the last of hers, and she is seen away.
+        here.request("logout", json!({})).await.unwrap();
+        a.identity.sweep_records().await;
+
+        a.down.store(true, Ordering::SeqCst);
+        let db = a.db();
+        if unreadable {
+            db.execute_batch("ALTER TABLE identity_records RENAME TO elsewhere")
+                .unwrap();
+        } else {
+            let mut list: Vec<u8> = db
+                .query_row("SELECT list FROM identity_records", [], |r| r.get(0))
+                .unwrap();
+            *list.last_mut().unwrap() ^= 1;
+            db.execute("UPDATE identity_records SET list = ?1", [list])
+                .unwrap();
+        }
+        clock.advance(Duration::from_secs(2));
+        a.identity.sweep_records().await;
+        let reply = auth_at(a.v, &a.alice, &phone, &a.card).await;
+        assert_eq!(
+            (reply.status, reply.json()["error"].clone()),
+            (403, json!("revoked")),
+            "unreadable: {unreadable}"
+        );
+    }
+}
+
+/// A refusal kept for an identity with no push registration is read
+/// again on the same cadence, and a whole read that no longer finds it
+/// lets it go: a freeze lifted while its identity was away refuses
+/// nothing once the identity's lists are next refreshed.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_refusal_kept_without_push_registrations_is_lifted_by_a_whole_read() {
+    let a = Away::start().await;
+    let laptop = DeviceKey::from_seed(&[102; 32]);
+    let (fp, dev) = (
+        a.alice.fingerprint(),
+        hl_identity::Fingerprint::of(&laptop.public()),
+    );
+    let _here = session_as(a.v, &a.alice, &laptop, &a.card).await;
+    hxd::registrar::freeze(&a.r.config, &fp.to_string(), false).unwrap();
+    let clock = a.identity.clock();
+    clock.advance(Duration::from_secs(2));
+    a.identity.sweep_records().await;
+    assert!(a.core.key_refusal(&fp.0, &dev.0).is_some(), "frozen");
+    // Its session ended, so she is seen away.
+    a.identity.sweep_records().await;
+    assert!(a.core.key_refusal(&fp.0, &dev.0).is_some(), "kept");
+
+    hxd::registrar::freeze(&a.r.config, &fp.to_string(), true).unwrap();
+    clock.advance(Duration::from_secs(2));
+    a.identity.sweep_records().await;
+    assert!(
+        a.core.key_refusal(&fp.0, &dev.0).is_some(),
+        "kept until read again"
+    );
+    clock.advance(Duration::from_secs(602));
+    a.identity.sweep_records().await;
+    assert_eq!(a.core.key_refusal(&fp.0, &dev.0), None, "and lifted");
+}
+
 /// What a held list refuses is applied as soon as its identity is seen
 /// away, before anything is fetched for it: as after a restart, a device
 /// revoked in a list held here loses its registration at the first sweep.
