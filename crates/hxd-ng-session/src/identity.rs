@@ -1737,8 +1737,18 @@ impl IdentityState {
             .map(|a| a.registrar.clone())
             .collect();
         let found = registrars.lookup(&card.identity, &hosts, now);
+        // A list held damaged proves nothing either way, and so does a
+        // store that could not be read for an identity a list could be
+        // held for: refused once the lists that do say something have.
+        let unproven = found.damaged
+            || (!found.read
+                && (registrars.attested(&fingerprint)
+                    || card
+                        .attestations
+                        .iter()
+                        .any(|a| registrars.trusts(&a.registrar))));
         let mut unattested = false;
-        if found.stale {
+        if found.stale && !unproven {
             match registrars.config().stale {
                 crate::registrars::Stale::Cached => {
                     info!(fingerprint = %fingerprint.short(), "registrar records past their lifetime; using what is held");
@@ -1794,6 +1804,10 @@ impl IdentityState {
                 }
                 Record::RevokeDevice(_) => {}
             }
+        }
+        if unproven {
+            info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records held here could not be read whole");
+            return Err(AuthRefused::Denied);
         }
         if frozen.values().any(|f| *f) {
             match self.cfg.frozen {
@@ -3117,6 +3131,151 @@ mod tests {
             auth,
             Arc::new(hxd_core::Core::new()),
         )
+    }
+
+    /// A list held damaged is refused only after what the whole lists
+    /// say, so a revocation in another is still answered `revoked`; and a
+    /// store that cannot be read refuses an identity a trusted registrar
+    /// names, and only that.
+    #[test]
+    fn a_damaged_list_is_refused_after_what_the_whole_ones_say() {
+        use crate::registrars::{Registrars, RegistrarsConfig, Stale};
+        use hl_identity::{ListKind, SignedList};
+        use hxd_core::identity_records::{CachedList, MemoryRecordCache, RecordCache};
+        struct Unreadable;
+        impl RecordCache for Unreadable {
+            fn put(&self, _: &[u8; 32], _: &CachedList) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn lists(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                Err(hxd_core::StoreError("unreadable".into()))
+            }
+            fn first_seen(&self, _: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
+                Ok(now)
+            }
+        }
+        let (a, b) = (
+            ServerKey::from_seed(&[3; 32]),
+            ServerKey::from_seed(&[4; 32]),
+        );
+        let id = IdentityKey::from_seed(&[1; 32]);
+        let (phone, laptop) = (
+            DeviceKey::from_seed(&[101; 32]),
+            DeviceKey::from_seed(&[102; 32]),
+        );
+        let fp = id.fingerprint();
+        let now = hxd_core::clock::Clock::default().unix();
+        let revoked = hl_identity::DeviceRevocation {
+            identity: id.public(),
+            device: phone.public(),
+            time: now,
+            until: now + 3600,
+            reason: None,
+            signer: None,
+            signer_cert: None,
+        }
+        .sign(&id)
+        .unwrap();
+        let page = SignedList {
+            registrar: "a.example".into(),
+            issued: now,
+            expires: u64::MAX,
+            fingerprint: Some(fp.0),
+            since: None,
+            more: false,
+            entries: vec![(1, revoked)],
+        }
+        .sign(ListKind::Records, &a);
+        // B's list damaged two ways: cut short, and whole under B's key
+        // with the key stored beside it flipped, which would otherwise
+        // read as a key the operator has replaced.
+        let whole_b = SignedList {
+            registrar: "b.example".into(),
+            issued: now,
+            expires: u64::MAX,
+            fingerprint: Some(fp.0),
+            since: None,
+            more: false,
+            entries: vec![],
+        }
+        .sign(ListKind::Records, &b);
+        let mut flipped = b.public();
+        flipped[0] ^= 1;
+        let held = |b_pages: Vec<Vec<u8>>, b_key: PublicKey| {
+            let held = MemoryRecordCache::default();
+            for (host, pages, key) in [
+                ("a.example", vec![page.clone()], a.public()),
+                ("b.example", b_pages, b_key),
+            ] {
+                let list = CachedList {
+                    registrar: host.into(),
+                    pages,
+                    keys: vec![(key, None)],
+                    fetched: now,
+                };
+                held.put(&fp.0, &list).unwrap();
+            }
+            Arc::new(held)
+        };
+        let st = |cache: Arc<dyn RecordCache>| {
+            let cfg = RegistrarsConfig {
+                keys: HashMap::from([
+                    ("a.example".to_owned(), a.public()),
+                    ("b.example".to_owned(), b.public()),
+                ]),
+                trusted: Vec::new(),
+                urls: HashMap::new(),
+                timeout: Duration::from_secs(1),
+                max_age: Duration::from_secs(3600),
+                stale: Stale::Cached,
+                user_agent: String::new(),
+            };
+            let registrars = Registrars::new(cfg, cache, hxd_core::clock::Clock::default());
+            state(IdentityConfig::default()).with_registrars(Arc::new(registrars))
+        };
+        let cert = |dev: &DeviceKey| {
+            let signed = DeviceCert::for_device(&id, dev, now - 5, cert::RECOMMENDED_LIFETIME)
+                .unwrap()
+                .sign(&id);
+            DeviceCert::parse(&signed).unwrap()
+        };
+        let bare = Card::parse(&Card::new(&id, "alice", now).sign(&id, vec![]).unwrap()).unwrap();
+
+        let answer = |st: &IdentityState, card: &Card, dev| {
+            st.apply_records(card, &cert(dev), now)
+                .map(|_| ())
+                .map_err(AuthRefused::code)
+        };
+        for (case, damaged) in [
+            ("cut short", held(vec![], b.public())),
+            ("its key flipped", held(vec![whole_b], flipped)),
+        ] {
+            let damaged = st(damaged);
+            assert_eq!(answer(&damaged, &bare, &phone), Err("revoked"), "{case}");
+            assert_eq!(answer(&damaged, &bare, &laptop), Err("denied"), "{case}");
+        }
+
+        let unreadable = st(Arc::new(Unreadable));
+        assert_eq!(
+            answer(&unreadable, &bare, &laptop),
+            Ok(()),
+            "named by no registrar"
+        );
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "a.example".into(),
+            registrar_key: a.public(),
+            handle: "alice".into(),
+            registered: now,
+            issued: now,
+            expires: now + 3600,
+            level: None,
+        };
+        let attested = Card::new(&id, "alice", now)
+            .sign(&id, vec![att.signed_value(&a)])
+            .unwrap();
+        let attested = Card::parse(&attested).unwrap();
+        assert_eq!(answer(&unreadable, &attested, &laptop), Err("denied"));
     }
 
     /// Compacting rewrites the file owner-only beside a stray temporary

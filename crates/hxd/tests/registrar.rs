@@ -2262,6 +2262,80 @@ async fn a_key_admitted_while_its_registrar_was_down_is_still_swept() {
     alice_here.event("kicked").await.unwrap();
 }
 
+/// After a restart, with its registrar out of reach, a trusted list held
+/// damaged proves nothing either way: every device of its identity is
+/// refused `denied`, whatever `revocation_stale` says, until the list is
+/// fetched whole again, at the first login after the registrar answers,
+/// or within the minute for one trusted on its discovery document.
+#[tokio::test]
+async fn a_list_held_damaged_refuses_its_identity_until_it_is_fetched_whole() {
+    for discovery in [false, true] {
+        let trust = || match discovery {
+            false => Trust::Key,
+            true => Trust::Discovery,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let r = open_registrar(dir.path()).await;
+        let there = dir.path().join("verifier");
+        std::fs::create_dir_all(&there).unwrap();
+        let alice = IdentityKey::from_seed(&[1; 32]);
+        let (phone, laptop) = (
+            DeviceKey::from_seed(&[101; 32]),
+            DeviceKey::from_seed(&[102; 32]),
+        );
+        let card = attested(&r, &alice, "alice").await;
+        let refused = |reply: &Reply| (reply.status, reply.json()["error"].clone());
+        let live = format!("http://{}", r.ng);
+        let v = verifier(&there, &r, trust(), &live, "").await.0;
+        post_device_revocation(&r, &alice, &phone).await;
+        assert_eq!(
+            refused(&auth_at(v, &alice, &phone, &card).await),
+            (403, json!("revoked"))
+        );
+
+        let db = rusqlite::Connection::open(there.join("server.db")).unwrap();
+        let mut list: Vec<u8> = db
+            .query_row("SELECT list FROM identity_records", [], |r| r.get(0))
+            .unwrap();
+        *list.last_mut().unwrap() ^= 1;
+        db.execute("UPDATE identity_records SET list = ?1", [list])
+            .unwrap();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let (restarted, identity) = verifier(
+            &there,
+            &r,
+            trust(),
+            &format!("http://{addr}"),
+            "registrar_timeout = 1",
+        )
+        .await;
+        for dev in [&phone, &laptop] {
+            assert_eq!(
+                refused(&auth_at(restarted, &alice, dev, &card).await),
+                (403, json!("denied")),
+                "discovery: {discovery}"
+            );
+        }
+
+        forward(
+            tokio::net::TcpListener::bind(addr).await.unwrap(),
+            Arc::new(std::sync::Mutex::new(r.ng)),
+        );
+        if discovery {
+            identity.clock().advance(Duration::from_secs(60));
+        }
+        assert_eq!(
+            refused(&auth_at(restarted, &alice, &phone, &card).await),
+            (403, json!("revoked")),
+            "discovery: {discovery}"
+        );
+        let reply = auth_at(restarted, &alice, &laptop, &card).await;
+        assert_eq!(reply.json()["handle"], "alice@127.0.0.1", "{discovery}");
+    }
+}
+
 /// Alice's account at a linked verifier with push registrations, for the
 /// sweep of identities with no session here.
 #[cfg(feature = "push")]

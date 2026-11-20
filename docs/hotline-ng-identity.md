@@ -285,7 +285,8 @@ continues in this order and fails on the first error:
 4. the server-local revocation list first (§12, `identity-registrar.md`
    §7.3), then records fetched per `identity-registrar.md` §7.2 and
    applied per §7.3 there; a stale cache is `[identity]
-   revocation_stale`. A minute's sweep keeps the lists of the
+   revocation_stale`, and a cached list that does not verify is
+   refused `denied`. A minute's sweep keeps the lists of the
    identities with sessions here current, and ends a session as soon as
    its list refuses it. *(Built.)*
 5. attestations verified against trusted registrars, expired or untrusted
@@ -781,7 +782,7 @@ section because hxd-ng has one profile and one switch.
 | `[identity] classic_proof` | `any` | `any` or `encrypted`: `encrypted` refuses Prove Device on a session `hotline-ng-auth.md` §8 does not count encrypted, which leaves the TLS port and a HOPE cipher |
 | `[identity] successors` | `identity-successors` | Where §3.4 successor commitments are kept, for the identities §13 says get one. `""` keeps them in the card cache only, which a restart forgets — and so does enough traffic to evict the card. Making the caches forget is the attack the commitment exists to stop |
 | `[identity] revocation_max_age` | `3600` | How long a fetched record list is current: the smaller of this and the list's own `expires` (`identity-registrar.md` §7.2). Lists are kept in the moderation store's database when there is one, so a restart still has them |
-| `[identity] revocation_stale` | `cached` | `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime, or holds nothing (`identity-registrar.md` §7.2) |
+| `[identity] revocation_stale` | `cached` | `cached`, `guest`, `deny`: what §5.2 step 4 does when the registrar is unreachable and the cache is past its lifetime, or holds nothing (`identity-registrar.md` §7.2); a held list that does not verify is refused `denied` whatever this says |
 | `[identity] frozen` | `deny` | `deny`, `guest`: what a frozen identity is admitted as (`identity-registrar.md` §7.3) |
 | `[identity] revoked_devices`, `revoked_identities` | empty | Fingerprints refused by hand, consulted before any registrar (`identity-registrar.md` §7.3). A revoked identity refuses every device of it; a revoked device, only itself. Refused at `/identity/auth` with `revoked`, and a token minted before the revocation no longer redeems. SIGHUP re-reads these two lists and nothing else, and installing them, at startup or on SIGHUP, ends every session they now refuse, live or detached, on either wire. `hxd identity revoke <fingerprint> [--device] [--lift]` edits them in the config file |
 | `[identity] banned_registrars` | empty | Hosts whose identities are refused outright with `denied`, before the admission policy runs: any attestation on the card naming one, verified or not, refuses it (`identity-registrar.md` §7.3). At `/identity/auth`, a ban's `*@host` reads every attestation on the card the same way; a re-admission and a socket login read the accepted handle |

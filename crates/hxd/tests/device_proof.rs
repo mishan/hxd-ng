@@ -326,6 +326,13 @@ async fn a_proved_device_is_on_the_user_list_from_its_announcement_on_every_port
             .await
             .unwrap();
         assert_eq!(shown(&joined), &fp, "{port:?}");
+        // Gone before the next login, which would otherwise join its
+        // person under `[server] coalesce` rather than be announced.
+        drop(c);
+        watcher
+            .event_where("user_parted", |d| d["uid"] == uid)
+            .await
+            .unwrap();
     }
 
     // Proved after joining, it holds, and the users here are told.

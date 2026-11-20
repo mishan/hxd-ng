@@ -866,6 +866,12 @@ lifetime, `[identity] revocation_stale` decides:
 The default is the threat model's: "servers keep cached attestations
 with a staleness limit rather than failing closed." An unattested
 identity with no list held has no registrar to ask and is never stale.
+A list held that no longer verifies is not stale: it proves nothing
+either way, and once the other lists held have been applied the server
+refuses with `denied` whatever `revocation_stale` says, until the list
+is fetched whole; so does a cache that cannot be read, for an identity
+whose card names a trusted registrar or that one is remembered as
+attesting (`identity-records.md` §3).
 
 ### 7.3 Applying records
 
