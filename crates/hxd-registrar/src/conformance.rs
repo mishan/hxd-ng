@@ -18,6 +18,7 @@ use crate::store::{
 pub fn run(new_store: &dyn Fn() -> Box<dyn RegistrarStore>) {
     an_issuance_creates_the_identity_and_logs_in_order(&*new_store());
     a_commitment_is_set_once(&*new_store());
+    a_card_is_kept_until_a_newer_one(&*new_store());
     an_invite_is_spent_exactly_once(&*new_store());
     a_read_transaction_ends_with_rollback(&*new_store());
     a_record_is_published_once_and_answers_with_its_seq(&*new_store());
@@ -170,6 +171,33 @@ fn a_commitment_is_set_once(s: &dyn RegistrarStore) {
         !s.set_commitment(&key(3), &[5; 32]).unwrap(),
         "no such identity"
     );
+}
+
+fn a_card_is_kept_until_a_newer_one(s: &dyn RegistrarStore) {
+    assert!(
+        !s.set_card(&key(1), T, b"card:1").unwrap(),
+        "no such identity"
+    );
+    s.issue(&issue(key(1), "alice", T)).unwrap();
+    assert_eq!(s.card(&key(1)).unwrap(), None);
+    assert!(s.set_card(&key(1), T, b"card:1").unwrap());
+    assert!(!s.set_card(&key(1), T, b"card:2").unwrap(), "as new");
+    assert!(!s.set_card(&key(1), T - 1, b"card:0").unwrap(), "older");
+    assert_eq!(s.card(&key(1)).unwrap(), Some((T, b"card:1".to_vec())));
+    assert!(s.set_card(&key(1), T + 1, b"card:3").unwrap());
+    assert_eq!(s.card(&key(1)).unwrap(), Some((T + 1, b"card:3".to_vec())));
+    publish(s, vec![], vec![Effect::Revoke(key(1))]);
+    assert_eq!(s.card(&key(1)).unwrap(), None, "gone with a revocation");
+    s.issue(&issue(key(2), "bob", T)).unwrap();
+    assert!(s.set_card(&key(2), T, b"card:4").unwrap());
+    let rotate = Effect::Rotate {
+        from: key(2),
+        to: key(3),
+        at: T,
+        commitment: None,
+    };
+    publish(s, vec![], vec![rotate]);
+    assert_eq!(s.card(&key(2)).unwrap(), None, "gone with a rotation");
 }
 
 fn a_read_transaction_ends_with_rollback(s: &dyn RegistrarStore) {

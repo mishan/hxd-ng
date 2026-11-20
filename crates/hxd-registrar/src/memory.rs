@@ -45,6 +45,7 @@ struct State {
     /// Invite hash → spent.
     invites: HashMap<[u8; 32], bool>,
     envelopes: HashMap<(Key, u8), Envelope>,
+    cards: HashMap<Key, (u64, Vec<u8>)>,
     slots: HashMap<u32, ([u8; 32], Lockout)>,
     epochs: HashMap<(String, u8), u64>,
     next_log: u64,
@@ -93,6 +94,7 @@ impl State {
                 if let Some(row) = self.identities.get_mut(key) {
                     row.revoked = true;
                 }
+                self.cards.remove(key);
             }
             Effect::Rotate {
                 from,
@@ -103,6 +105,7 @@ impl State {
                 if let Some(row) = self.identities.get_mut(from) {
                     row.rotated_to = Some(*to);
                 }
+                self.cards.remove(from);
                 let row = self.identities.entry(*to).or_insert(IdentityRow {
                     key: *to,
                     commitment: None,
@@ -276,6 +279,19 @@ impl RegistrarStore for MemoryStore {
             }
             _ => Ok(false),
         }
+    }
+
+    fn card(&self, key: &Key) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        Ok(self.state.lock().unwrap().cards.get(key).cloned())
+    }
+
+    fn set_card(&self, key: &Key, updated: u64, bytes: &[u8]) -> Result<bool, StoreError> {
+        let mut s = self.state.lock().unwrap();
+        if !s.identities.contains_key(key) || s.cards.get(key).is_some_and(|c| c.0 >= updated) {
+            return Ok(false);
+        }
+        s.cards.insert(*key, (updated, bytes.to_vec()));
+        Ok(true)
     }
 
     fn pending(&self, key: &Key) -> Result<Option<Pending>, StoreError> {

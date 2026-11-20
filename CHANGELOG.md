@@ -163,6 +163,29 @@ as AGENTS.md's "Releasing" describes it.
   404 for a cached card the registrar would now refuse, and 503, as `PUT
   /identity/card` does, when the registrar's store cannot check a card;
   `hlid restore` takes only a 404 as no card and otherwise stops.
+- The registrar keeps, in its store, the newest card put or shown at
+  sign-in that carries the successor commitment it holds for an
+  identity, and `GET /identity/card/<fp>` serves it when it is newer
+  than the cached card or the cache has none, as after a restart. A
+  restore (`hlid restore`) then takes that card, signed by the
+  identity and carrying the commitment; before, after a restart it made
+  a card without it, which the registrar refused. A kept card is
+  checked as a cached one is, and not served when the registrar would
+  refuse it. A card dated past the registrar's clock skew is not kept.
+  For an identity the registrar has revoked or rotated away, `GET
+  /identity/card/<fp>` serves no card, cached or kept, where a cached
+  one was served before, and the kept card goes. The registrar
+  database moves to schema 3 on first start, adding the kept card to
+  each identity's row; a build from before this release refuses to open
+  it. docs/identity-registrar.md §6.3 now says a client must not sign
+  the lookup's `successor` into a card without checking it against an
+  object the identity signed (§6.3, §6.4).
+- On every server with `[identity]`, the `ETag` of `GET
+  /identity/card/<fp>` is the card's `updated` and a digest of its
+  bytes, where it was `updated` alone, since two cards of one identity
+  can share an `updated` (docs/hotline-ng-identity.md §7). A client
+  that sends back the tag it was given is unaffected; one that built
+  the tag from `updated` is sent the card again rather than 304.
 - `hlid rotate` signs the successor's own commitment into the rotation
   as `next`: it makes the successor's successor key first
   (`--next-key`, by default `successor.next.key` for `--to

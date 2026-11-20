@@ -433,16 +433,20 @@ identity session in the roster.
 
 `GET /identity/card/<fingerprint>` — public, no authentication. Returns the
 server's cached card for that identity as `application/cbor`, exactly the
-bytes received, so the signature verifies; 404 if none, and 404 too for
-a cached card a registrar on the server would now refuse (its successor
-other than the commitment the registrar holds, `identity-registrar.md`
-§5.4); 503 when that registrar cannot check the card right now, so the
-card may exist and a client retries rather than take it as absent.
-Cacheable: the
-server sets `ETag` to the card's `updated` value in entity-tag syntax —
-the decimal in double quotes, `ETag: "1757116860"` — and answers
-`If-None-Match` with 304. `updated` is the card's own version, so it is a
-strong validator. Relays, tunnels, other servers and registrars all use
+bytes received, so the signature verifies, or the newer card a
+registrar on the server keeps for it (`identity-registrar.md` §6.4);
+404 if none, and 404 too for a card that registrar would now refuse
+(its successor other than the commitment the registrar holds,
+`identity-registrar.md` §5.4) or for an identity it has seen revoked or
+rotated away; 503 when that registrar cannot check the card right
+now, so the card may exist and a client retries rather than take it as
+absent. Cacheable: the server sets `ETag` to the card's `updated` value
+and the first eight bytes of the `SHA-256` of its bytes in hex, in
+entity-tag syntax (`ETag: "1757116860-3f2a9c01d4e5b6a7"`), and answers
+`If-None-Match` with 304. A client sends back the tag it was given and
+makes none of its own: two cards of one identity can share an
+`updated`, as a cached card a registrar refuses and the one it keeps in
+its place do. Relays, tunnels, other servers and registrars all use
 this.
 
 `PUT /identity/card` — authenticated by transport token or client

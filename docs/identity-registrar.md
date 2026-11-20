@@ -464,9 +464,10 @@ registration request that would make one is refused (`rotation_pending`,
 or as that identity's other requests are), and so is a card carrying
 one, put (`rotation_pending`) or shown at sign-in (`bad_card`), rather
 than served as the identity's card with a commitment the registrar does
-not hold. Otherwise a card of a frozen, revoked or rotated identity has
-its commitment left untaken, the card itself accepted and served as any
-other (§6.4). A card cached earlier that the registrar would now refuse,
+not hold. Otherwise a card of a frozen identity has its commitment left
+untaken, the card itself accepted and served as any other, and a card of
+an identity revoked or rotated away has it left untaken too, and is not
+served (§6.4). A card cached earlier that the registrar would now refuse,
 such as one of a successor naming another key than the `next` its
 rotation recorded, is no longer served. A residual: checking a card
 publishes no due rotation, so until the registrar's next write a card is
@@ -686,12 +687,19 @@ already would. `successor` is the commitment the registrar holds for
 the holder (§5.4), as a fingerprint, and is absent while it holds none.
 It is read from the registrar's store, so it is there whenever the
 handle is, where a card (§6.4) may not be to hand: a client checking a
-successor code on a device with no card (§5.5), or making a card that
-must carry the commitment, reads it here. A client that does not know
-the field ignores it. It reveals the commitment to anyone who asks, as
-the holder's card already does wherever it is published: the hash of
-a key nobody has seen, which tells a reader only that a successor
-exists and lets it check one presented later.
+successor code on a device with no card (§5.5) reads it here. A client
+that does not know the field ignores it. It reveals the commitment to
+anyone who asks, as the holder's card already does wherever it is
+published: the hash of a key nobody has seen, which tells a reader only
+that a successor exists and lets it check one presented later.
+
+The field is unauthenticated: a registrar, its store or anyone between
+it and the client can name a key of their own there. A client making a
+card, as a restore does (§9.4), MUST NOT sign this `successor` into it
+without verifying it against an object the identity signed, such as a
+card carrying it that `card` serves (§6.4). Signed into a card, it is a
+commitment the identity made, and the registrar and every server that
+anchors it hold it for good (§5.4).
 
 `GET <lookup>?identity=<fingerprint>` — `{ "handles": [ "alice", … ] }`
 for the handles this registrar attests to that key; an empty array for
@@ -711,11 +719,22 @@ handle does `lookup` then `card`. A `PUT` needs the transport's
 authentication and a `manage`-capable device, as §7 there says, which
 is why a registrar is an identity-enabled server and not a bare HTTP
 service. The registrar anchors the card's `successor` as §5.4 says.
-hxd-ng keeps cards in memory, so after a restart it answers `card`
-404 until the card is put or shown again; the commitment is kept, and
-`lookup` serves it. It also answers 404 for a cached card it would now
-refuse, and 503, to `GET` and `PUT` alike, when its store cannot check
-a card (`hotline-ng-identity.md` §7).
+hxd-ng caches cards in memory, and keeps in its store the newest card
+put or shown at sign-in that carries the commitment it holds for an
+identity attested here, once that commitment is recorded and while the
+identity is not frozen, revoked or rotated away, and none dated past
+its clock skew. `card` serves the newer of the two that it would not
+refuse, so after a restart, or once the cached card is refused, it
+serves the kept card: signed by the identity, carrying the commitment a
+restore must keep (§9.4). For an identity this registrar has seen
+revoked or rotated away it serves none, cached or kept, and the kept
+card is dropped with the revocation or rotation. A
+card carrying no commitment is not kept, and after a restart `card`
+answers 404 for it until it is put or shown again; so it does for an
+identity that committed in its registration request alone. It also
+answers 404 for a cached or kept card it would now refuse, and 503, to
+`GET` and `PUT` alike, when its store cannot read or check a card
+(`hotline-ng-identity.md` §7).
 
 ### 6.5 Errors
 
@@ -1391,7 +1410,8 @@ needs a threat-model entry this document would rather not write.
 
 An envelope holds the identity seed and nothing else: not the card,
 and not the successor key a card commits to (§5.4). A restore takes the
-card the registrar keeps (§6.4), which carries the commitment. Where
+card the registrar keeps (§6.4), which carries the commitment, and never
+the commitment `lookup` names (§6.3). Where
 the registrar keeps none, a new card commits to nothing, and the
 registrar, holding the commitment, refuses the next registration
 `successor_mismatch` until a card commits to the same successor again
@@ -1542,7 +1562,7 @@ the card the registrar keeps. Both read the secret from `--password-file` or
   held to one conformance suite. The trait is shaped around the two
   writes, an issuance and a publication with its effects, rather than
   around the tables: `identity` (pubkey, fingerprint, commitment,
-  frozen, revoked, rotated_to, contact, created), `handle` (canonical,
+  frozen, revoked, rotated_to, contact, created, card), `handle` (canonical,
   identity, registered, state, lapsed_at), `attestation` (identity,
   handle, issued, expires, bytes), `record` (seq, kind, identity,
   other_identity, device, until, bytes), `envelope` (identity, kind,

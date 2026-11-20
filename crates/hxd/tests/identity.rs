@@ -2510,8 +2510,8 @@ async fn a_management_token_still_opens_a_socket() {
 
 #[tokio::test]
 async fn a_put_card_replaces_the_served_bytes_only_when_it_is_newer() {
-    // §7: the cached bytes are what `GET /identity/card` serves, and
-    // `updated` is the ETag — so equal `updated` must not change them.
+    // §7: the cached bytes are what `GET /identity/card` serves, and a
+    // card of equal `updated` must not change them.
     let dir = tempfile::tempdir().unwrap();
     let (_legacy, ng, _ctx) = start_server(dir.path()).await;
     let p = person(27, "Editing");
@@ -2551,7 +2551,8 @@ async fn a_put_card_replaces_the_served_bytes_only_when_it_is_newer() {
     let path = format!("/identity/card/{}", p.id.fingerprint());
     let r = http(ng, "GET", &path, &[], b"").await;
     assert_eq!(r.body, newer, "the served bytes are the newest card");
-    assert_eq!(r.header("etag").unwrap(), format!("\"{at}\""));
+    let etag = r.header("etag").unwrap();
+    assert!(etag.starts_with(&format!("\"{at}-")), "{etag}");
 
     // Someone else's card, over this identity's token.
     let q = person(28, "Interloper");

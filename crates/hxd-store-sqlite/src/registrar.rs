@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use crate::Synchronous;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE registrar_identity (
@@ -128,6 +128,13 @@ CREATE TABLE registrar_unlock (
   epoch  INTEGER NOT NULL,
   PRIMARY KEY (handle, kind)
 );
+";
+
+/// The card kept for an identity (§6.4), so a restore finds its
+/// commitment in a card the identity signed after a restart too.
+const SCHEMA_V3: &str = "
+ALTER TABLE registrar_identity ADD COLUMN card BLOB;
+ALTER TABLE registrar_identity ADD COLUMN card_updated INTEGER;
 ";
 
 fn sql<T>(r: rusqlite::Result<T>) -> Result<T, StoreError> {
@@ -280,6 +287,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             if from.is_none_or(|v| v < 2) {
                 steps.push_str(SCHEMA_V2);
             }
+            if from.is_none_or(|v| v < 3) {
+                steps.push_str(SCHEMA_V3);
+            }
             steps.push_str(&match from {
                 None => format!("INSERT INTO registrar_meta (version) VALUES ({SCHEMA_VERSION});"),
                 Some(_) => format!("UPDATE registrar_meta SET version = {SCHEMA_VERSION};"),
@@ -337,7 +347,8 @@ fn apply(tx: &Connection, e: &Effect) -> rusqlite::Result<()> {
         }
         Effect::Revoke(key) => {
             tx.execute(
-                "UPDATE registrar_identity SET revoked = 1 WHERE key = ?1",
+                "UPDATE registrar_identity SET revoked = 1, card = NULL, card_updated = NULL
+                 WHERE key = ?1",
                 params![&key[..]],
             )?;
         }
@@ -348,7 +359,8 @@ fn apply(tx: &Connection, e: &Effect) -> rusqlite::Result<()> {
             commitment,
         } => {
             tx.execute(
-                "UPDATE registrar_identity SET rotated_to = ?2 WHERE key = ?1",
+                "UPDATE registrar_identity SET rotated_to = ?2, card = NULL, card_updated = NULL
+                 WHERE key = ?1",
                 params![&from[..], &to[..]],
             )?;
             tx.execute(
@@ -661,6 +673,31 @@ impl RegistrarStore for SqliteRegistrarStore {
         let n = sql(conn.execute(
             "UPDATE registrar_identity SET commitment = ?2 WHERE key = ?1 AND commitment IS NULL",
             params![&key[..], &commitment[..]],
+        ))?;
+        Ok(n > 0)
+    }
+
+    fn card(&self, key: &Key) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Option<i64>, Option<Vec<u8>>)> = sql(conn
+            .query_row(
+                "SELECT card_updated, card FROM registrar_identity WHERE key = ?1",
+                params![&key[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        Ok(match row {
+            Some((Some(updated), Some(bytes))) => Some((uint(updated), bytes)),
+            _ => None,
+        })
+    }
+
+    fn set_card(&self, key: &Key, updated: u64, bytes: &[u8]) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = sql(conn.execute(
+            "UPDATE registrar_identity SET card = ?3, card_updated = ?2
+             WHERE key = ?1 AND (card_updated IS NULL OR card_updated < ?2)",
+            params![&key[..], int(updated), bytes],
         ))?;
         Ok(n > 0)
     }
@@ -1056,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn a_first_version_file_gains_the_envelopes_and_keeps_its_rows() {
+    fn a_first_version_file_gains_what_later_versions_add_and_keeps_its_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registrar.db");
         Connection::open(&path)
@@ -1064,14 +1101,17 @@ mod tests {
             .execute_batch(&format!(
                 "CREATE TABLE registrar_meta (version INTEGER NOT NULL);\n{SCHEMA_V1}\n\
                  INSERT INTO registrar_meta (version) VALUES (1);\n\
-                 INSERT INTO registrar_invite (code_hash) VALUES (x'{}');",
-                "01".repeat(32)
+                 INSERT INTO registrar_invite (code_hash) VALUES (x'{}');\n\
+                 INSERT INTO registrar_identity (key, fingerprint, created) VALUES (x'{}', x'', 1);",
+                "01".repeat(32),
+                "02".repeat(32)
             ))
             .unwrap();
         let s = SqliteRegistrarStore::open(&path, Synchronous::Normal).unwrap();
         assert!(s.invite_open(&[1; 32]).unwrap());
         s.set_lockout_slot(1, &[0; 32], &Lockout::default())
             .unwrap();
+        assert!(s.set_card(&[2; 32], 1, b"card").unwrap());
         drop(s);
         let version: i64 = Connection::open(&path)
             .unwrap()

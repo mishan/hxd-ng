@@ -103,9 +103,9 @@ async fn admit(
         let admitted = st.admit_device(verified, &login, shown.is_some(), may_link);
         // A card shown is recorded by this server's registrar as one shown
         // at the ng port's `auth` is.
-        if let (Ok(_), Some(reg), Some(card)) = (&admitted, &registrar, &shown) {
-            if let Ok(card) = hl_identity::Card::parse(card) {
-                if let Err(e) = reg.note_card(&card) {
+        if let (Ok(_), Some(reg), Some(bytes)) = (&admitted, &registrar, &shown) {
+            if let Ok(card) = hl_identity::Card::parse(bytes) {
+                if let Err(e) = reg.note_card(&card, bytes, st.clock().unix()) {
                     tracing::warn!("registrar could not record a card's commitment: {e}");
                 }
             }

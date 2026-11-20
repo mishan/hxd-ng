@@ -213,12 +213,13 @@ pub struct Recovery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SetFrozen(Key, bool),
-    /// The identity is revoked (§4.5).
+    /// The identity is revoked (§4.5), and its kept card goes.
     Revoke(Key),
     /// `from` is rotated to `to`: `to` gets an identity row if it has
     /// none (created `at`), committed to the rotation's `next` if it has
     /// no commitment, and every handle `from` holds moves to it with
-    /// `registered` kept (§5.4). A commitment `to` already has is kept.
+    /// `registered` kept (§5.4). A commitment `to` already has is kept,
+    /// and the card kept for `from` goes.
     Rotate {
         from: Key,
         to: Key,
@@ -418,6 +419,12 @@ pub trait RegistrarStore: Send + Sync + 'static {
     /// Set the identity's commitment if it has none. `false` when it
     /// already had one, or there is no such identity.
     fn set_commitment(&self, key: &Key, commitment: &[u8; 32]) -> Result<bool, StoreError>;
+    /// The card kept for the identity (§6.4), as its `updated` and bytes.
+    fn card(&self, key: &Key) -> Result<Option<(u64, Vec<u8>)>, StoreError>;
+    /// Keep a card for the identity, replacing one with an older
+    /// `updated`. `false` when one as new is kept already, or there is no
+    /// such identity.
+    fn set_card(&self, key: &Key, updated: u64, bytes: &[u8]) -> Result<bool, StoreError>;
 
     fn pending(&self, key: &Key) -> Result<Option<Pending>, StoreError>;
     /// Pending rotations whose `publish_at` is at or before `now`.
