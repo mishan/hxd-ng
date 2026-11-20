@@ -636,9 +636,17 @@ describe('a rotation the registrar publishes', () => {
     const bob0 = await signIn(crew, bob, bob.devices[0]);
     const old = await befriend(alice, alice0, alice.devices[0], bob, bob0, bob.devices[0]);
 
-    hlid(registrar.dir, ['rotate', '--registrar', registrar.httpBase, '--to', join(registrar.dir, 'successor.key')]);
+    const rotated = hlid(registrar.dir, ['rotate', '--registrar', registrar.httpBase, '--to', join(registrar.dir, 'successor.key')]);
+    // The successor's card as `rotate` says to make it, committed to the
+    // `next` the rotation signed, then reissued.
+    const steps = rotated.split('\n').filter((l) => l.startsWith('  hlid '));
+    assert.equal(steps.length, 2, rotated);
+    for (const step of steps) hlid(registrar.dir, step.trim().split(/\s+/).slice(1));
     await new Promise((r) => setTimeout(r, 1100));
-    const next = await enrolledDevice(server, 'alice-next', { identity: join(registrar.dir, 'successor.key') });
+    const next = await enrolledDevice(server, 'alice-next', {
+      identity: join(registrar.dir, 'successor.key'),
+      card: join(registrar.dir, 'successor-card.bin'),
+    });
     await assert.rejects(alice.devices[0].getToken(), (e) => e.code === 'rotated', 'the predecessor is refused by name');
     const alice1 = await signIn(crew, { name: 'alice' }, next);
     const found = await bob0.conn.findUser({ fingerprint: next.fingerprint });
