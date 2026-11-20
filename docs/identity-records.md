@@ -121,6 +121,8 @@ server anchored for the predecessor is ignored, whoever publishes it:
 the commitment exists to beat a thief who signs a rotation with a stolen
 key, and a registrar that never held the commitment publishes that
 rotation in good faith. The first rotation accepted for a key stands.
+A registrar's rotation that §7.4 does not take for its successor is
+held: the predecessor is refused and nothing moves.
 
 Once accepted, the predecessor is refused `rotated`, naming the
 successor, at `auth`, and by the core everywhere else a key is checked

@@ -173,6 +173,21 @@ as AGENTS.md's "Releasing" describes it.
   (docs/identity-registrar.md §4.6). A `--next-key` naming `--to`, the
   identity key or that card's file is refused, and `hlid card`, `cert`
   and `attest` refuse an `-o` that holds a key.
+- A trusted registrar's rotation that this server does not take for
+  its successor (one anchored here to a key other than its `next`,
+  already a rotation's successor, or rotated away) is held rather than
+  ignored: the old key is refused `rotated`, naming the successor, and
+  its sessions end, but nothing moves, the account link included, and
+  the successor gains no anchor. One shown only at `auth` is still
+  ignored, and so is any rotation from an old key anchored here to
+  another or into a key that rotated to it. Whoever holds the successor
+  key alone can force a hold, locking the old key out here, though not
+  taking anything of it. To give the account to the successor, set `fingerprint` in
+  its file's `[identity]` table by hand. `[identity] successors` gains a
+  `<predecessor> => <successor> held` line; a build from before this
+  release drops it when it compacts the file and admits the old key
+  again, until an upgraded one fetches the registrar's records again
+  (docs/identity-registrar.md §7.4).
 
 ### Fixed
 
