@@ -753,6 +753,131 @@ async fn committed_card(s: &Server, alice: &IdentityKey, next: &IdentityKey) -> 
     newer
 }
 
+/// `PUT /identity/card` with a transport token.
+async fn put_card(s: &Server, token: &str, card: &[u8]) -> Reply {
+    http_as(
+        s.ng,
+        &s.ng.to_string(),
+        "PUT",
+        "/identity/card",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Content-Type", "application/cbor"),
+        ],
+        card,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_card_put_again_after_the_store_failed_to_keep_it_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let (alice, next) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    committed_card(&s, &alice, &next).await;
+    let t = token(
+        &s,
+        &alice,
+        &DeviceKey::from_seed(&[102; 32]),
+        &committed(&alice, &next, now() + 1),
+    )
+    .await;
+    let db = rusqlite::Connection::open(dir.path().join("registrar.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER full BEFORE UPDATE OF card ON registrar_identity
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .unwrap();
+    let card = committed(&alice, &next, now() + 2);
+    assert_eq!(put_card(&s, &t, &card).await.status, 503);
+    db.execute_batch("DROP TRIGGER full").unwrap();
+    // The same card again, now cached here already.
+    assert_eq!(put_card(&s, &t, &card).await.status, 200);
+    let kept: Vec<u8> = db
+        .query_row(
+            "SELECT card FROM registrar_identity WHERE key = ?1",
+            [&alice.public()[..]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, card);
+}
+
+#[tokio::test]
+async fn an_older_card_put_makes_no_commitment() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let (alice, next) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    assert_eq!(
+        register(&s, request(&alice, "alice"), &alice).await.status,
+        200
+    );
+    let at = now();
+    let plain = Card::new(&alice, "Alice", at).sign(&alice, vec![]).unwrap();
+    let t = token(&s, &alice, &DeviceKey::from_seed(&[101; 32]), &plain).await;
+    let r = put_card(&s, &t, &committed(&alice, &next, at - 1)).await;
+    assert_eq!(
+        r.json()["updated"],
+        false,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert!(found["successor"].is_null(), "{found}");
+}
+
+/// A card of `alice` dated `at`, committed to `next`.
+fn committed(alice: &IdentityKey, next: &IdentityKey, at: u64) -> Vec<u8> {
+    let mut card = Card::new(alice, "Alice", at);
+    card.successor = Some(commitment(next));
+    card.sign(alice, vec![]).unwrap()
+}
+
+#[tokio::test]
+async fn a_card_served_in_place_of_one_as_new_is_not_answered_304() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let (alice, next) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let at = now();
+    assert_eq!(
+        register(&s, request(&alice, "alice"), &alice).await.status,
+        200
+    );
+    let plain = Card::new(&alice, "Alice", at).sign(&alice, vec![]).unwrap();
+    token(&s, &alice, &DeviceKey::from_seed(&[101; 32]), &plain).await;
+    let path = format!("/identity/card/{}", alice.fingerprint());
+    let first = get(&s, &path).await;
+    assert_eq!(first.body, plain);
+    let etag = first.header("etag").unwrap().to_owned();
+    // The commitment made, the cached card is refused and one as new
+    // carrying it is kept and served in its place.
+    let mut req = request(&alice, "alice");
+    req.successor = Some(commitment(&next));
+    assert_eq!(register(&s, req, &alice).await.status, 200);
+    let kept = committed(&alice, &next, at);
+    token(&s, &alice, &DeviceKey::from_seed(&[102; 32]), &kept).await;
+    let r = http_as(
+        s.ng,
+        &s.ng.to_string(),
+        "GET",
+        &path,
+        &[("If-None-Match", &etag)],
+        b"",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, kept);
+}
+
 #[tokio::test]
 async fn a_card_carrying_the_commitment_is_served_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();

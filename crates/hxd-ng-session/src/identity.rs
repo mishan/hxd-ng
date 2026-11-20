@@ -2438,10 +2438,9 @@ fn remember_card(
     });
     entry.seen = seen;
     entry.successor = entry.successor.or(card.successor);
-    // Strictly newer, matching what `update_card` accepts. With `>=`,
-    // two cards signed in the same second could share an ETag and carry
-    // different bytes, and §7 promises a strong validator. The empty
-    // check is the fresh entry above, whose `updated` is 0.
+    // Strictly newer, matching what `update_card` accepts, so a card
+    // signed in the same second does not replace the one served. The
+    // empty check is the fresh entry above, whose `updated` is 0.
     if entry.bytes.is_empty() || card.updated > entry.updated {
         entry.updated = card.updated;
         entry.bytes = bytes;
@@ -3847,8 +3846,7 @@ mod tests {
         let c3 = Card::new(&id, "Three", now + 1).sign(&id, vec![]).unwrap();
         assert!(st.update_card(&ident, &c2).unwrap());
         assert!(!st.update_card(&ident, &c1).unwrap());
-        // Equal `updated` doesn't replace the bytes either: the ETag is
-        // `updated`, and §7 calls it a strong validator.
+        // Equal `updated` doesn't replace the bytes either.
         assert!(!st.update_card(&ident, &c3).unwrap());
         assert_eq!(st.card(&id.fingerprint()).unwrap().1, c2);
         let other = IdentityKey::from_seed(&[9u8; 32]);

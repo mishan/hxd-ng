@@ -109,7 +109,7 @@ pub async fn download(req: Request<Incoming>, ctx: &NgCtx) -> Resp {
 
 /// `If-None-Match` against our ETag, by the weak comparison RFC 9110
 /// §13.1.2 asks of it: `*` matches, and so does a tag a proxy weakened.
-fn none_match(header: &str, etag: &str) -> bool {
+pub(crate) fn none_match(header: &str, etag: &str) -> bool {
     header.split(',').map(str::trim).any(|tag| {
         let tag = tag.strip_prefix("W/").unwrap_or(tag);
         tag == "*" || tag == etag

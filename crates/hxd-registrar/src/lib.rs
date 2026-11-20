@@ -1539,6 +1539,11 @@ impl Registrar {
         })
     }
 
+    /// The `updated` of the card kept for the identity, if one is.
+    pub fn kept_card_updated(&self, identity: &PublicKey) -> Result<Option<u64>, Refusal> {
+        self.reading(|| Ok(self.store.card(identity)?.map(|(updated, _)| updated)))
+    }
+
     // --- §9 envelopes ---------------------------------------------------------
 
     fn envelope_settings(&self) -> Result<&Envelopes, Refusal> {

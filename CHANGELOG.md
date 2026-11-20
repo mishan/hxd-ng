@@ -180,6 +180,12 @@ as AGENTS.md's "Releasing" describes it.
   it. docs/identity-registrar.md §6.3 now says a client must not sign
   the lookup's `successor` into a card without checking it against an
   object the identity signed (§6.3, §6.4).
+- On every server with `[identity]`, the `ETag` of `GET
+  /identity/card/<fp>` is the card's `updated` and a digest of its
+  bytes, where it was `updated` alone, since two cards of one identity
+  can share an `updated` (docs/hotline-ng-identity.md §7). A client
+  that sends back the tag it was given is unaffected; one that built
+  the tag from `updated` is sent the card again rather than 304.
 - `hlid rotate` signs the successor's own commitment into the rotation
   as `next`: it makes the successor's successor key first
   (`--next-key`, by default `successor.next.key` for `--to

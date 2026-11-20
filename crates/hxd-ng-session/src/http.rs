@@ -61,6 +61,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
+use sha2::Digest;
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -2070,12 +2071,12 @@ async fn get_card(fp: &str, if_none_match: Option<&str>, ctx: &NgCtx) -> Resp {
     };
     match served {
         Some((updated, bytes)) => {
-            // Entity-tag syntax: a quoted string (§7). `updated` is the
-            // card's own version, so it is a strong validator.
-            let etag = format!("\"{updated}\"");
-            if if_none_match
-                .is_some_and(|inm| inm.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
-            {
+            // Entity-tag syntax: a quoted string (§7). Two cards of one
+            // identity can share an `updated`, as a cached one refused
+            // and the one a registrar keeps do, so the bytes are in it.
+            let digest = sha2::Sha256::digest(&bytes);
+            let etag = format!("\"{updated}-{}\"", crate::emoji::hex(&digest[..8]));
+            if if_none_match.is_some_and(|inm| crate::banner::none_match(inm, &etag)) {
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(ETAG, etag)
@@ -2132,8 +2133,25 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
             }
         }
         let updated = state.update_card(&ident, &bytes);
-        if let (Ok(true), Some(reg), Some(card)) = (&updated, &registrar, &card) {
-            reg.note_card(card, &bytes, state.clock().unix())?;
+        if let (Ok(new), Some(reg), Some(card)) = (&updated, &registrar, &card) {
+            // A card new to the cache is noted. So is the cached card put
+            // again, as a client does after showing it at `auth` and as a
+            // retry of a put whose note failed does, unless the store
+            // keeps one as new already; never an older card.
+            let again = || {
+                card.successor.is_some()
+                    && state
+                        .card(&ident.fingerprint)
+                        .is_some_and(|(_, b)| b == bytes)
+            };
+            if *new
+                || (again()
+                    && reg
+                        .kept_card_updated(&card.identity)?
+                        .is_none_or(|u| u < card.updated))
+            {
+                reg.note_card(card, &bytes, state.clock().unix())?;
+            }
         }
         Ok::<_, hxd_registrar::Refusal>(updated)
     })

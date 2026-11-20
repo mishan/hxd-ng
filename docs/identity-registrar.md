@@ -464,9 +464,10 @@ registration request that would make one is refused (`rotation_pending`,
 or as that identity's other requests are), and so is a card carrying
 one, put (`rotation_pending`) or shown at sign-in (`bad_card`), rather
 than served as the identity's card with a commitment the registrar does
-not hold. Otherwise a card of a frozen, revoked or rotated identity has
-its commitment left untaken, the card itself accepted and served as any
-other (§6.4). A card cached earlier that the registrar would now refuse,
+not hold. Otherwise a card of a frozen identity has its commitment left
+untaken, the card itself accepted and served as any other, and a card of
+an identity revoked or rotated away has it left untaken too, and is not
+served (§6.4). A card cached earlier that the registrar would now refuse,
 such as one of a successor naming another key than the `next` its
 rotation recorded, is no longer served. A residual: checking a card
 publishes no due rotation, so until the registrar's next write a card is
@@ -722,11 +723,12 @@ hxd-ng caches cards in memory, and keeps in its store the newest card
 put or shown at sign-in that carries the commitment it holds for an
 identity attested here, once that commitment is recorded and while the
 identity is not frozen, revoked or rotated away, and none dated past
-its clock skew. `card` serves the newer of the two, so after a restart
-it serves the kept card: signed by the identity, carrying the
-commitment a restore must keep (§9.4). For an identity this registrar
-has seen revoked or rotated away it serves none, cached or kept, and the kept card is
-dropped with the revocation or rotation. A
+its clock skew. `card` serves the newer of the two that it would not
+refuse, so after a restart, or once the cached card is refused, it
+serves the kept card: signed by the identity, carrying the commitment a
+restore must keep (§9.4). For an identity this registrar has seen
+revoked or rotated away it serves none, cached or kept, and the kept
+card is dropped with the revocation or rotation. A
 card carrying no commitment is not kept, and after a restart `card`
 answers 404 for it until it is put or shown again; so it does for an
 identity that committed in its registration request alone. It also
