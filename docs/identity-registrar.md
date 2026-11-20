@@ -978,7 +978,10 @@ rotation into a key that is already a rotation's successor, with a
 and whoever holds it alone could make a second, committed to it, to
 choose its `next` or to have the owner's dropped. If that holder's
 rotation arrives first, the owner's is the one ignored: the old key
-stays admitted with the owner's account, and nothing of it moves.
+stays admitted with the owner's account, and nothing of it moves. A
+rotation into a key that has itself rotated away is ignored too: what
+it moved there would be stranded, since that key's `auth` is refused
+`rotated`.
 hxd-ng writes a rotation's `next` in `[identity] successors` as a line
 of its own, and drops, with a warning at load, any other anchor a
 successor has there, such as one an older build took from its card, and

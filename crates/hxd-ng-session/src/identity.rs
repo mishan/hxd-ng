@@ -2534,6 +2534,14 @@ impl Anchors {
                 tracing::warn!(predecessor = %from.short(), successor = %to.short(), "rotation into a key that is already a successor; ignored");
                 return false;
             }
+            // As `accept_rotation` checked them, but under the locks a
+            // rotation recorded meanwhile takes: `from` anchored, by its
+            // own rotation, to another key, or `to` already rotated
+            // away, which would strand whatever moved to it.
+            if map.get(from).is_some_and(|a| *a != to.0) || rotated.contains_key(to) {
+                tracing::warn!(predecessor = %from.short(), successor = %to.short(), "rotation from a key anchored elsewhere, or into one rotated away; ignored");
+                return false;
+            }
             let next = match (map.get(to), next) {
                 (None, Some(n)) => {
                     map.insert(*to, n);
@@ -2979,6 +2987,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Anchors::load(path).get(&b), None);
+    }
+
+    #[test]
+    fn a_rotation_is_checked_against_its_predecessors_commitment_as_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = |s: u8| IdentityKey::from_seed(&[s; 32]).fingerprint();
+        let (p, b, d, t) = (fp(1), fp(2), fp(3), fp(6));
+        let anchors = Anchors::load(dir.path().join("successors"));
+        // B => T found unanchored by `accept_rotation`, recorded only
+        // after the owner's P => B anchored B to D.
+        assert!(anchors.rotate(&p, &b, Some(d.0)));
+        assert!(!anchors.rotate(&b, &t, None));
+        assert!(anchors.rotate(&b, &d, None), "onward to the commitment");
+    }
+
+    #[test]
+    fn a_rotation_into_a_key_that_has_rotated_away_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = |s: u8| IdentityKey::from_seed(&[s; 32]).fingerprint();
+        let (p, b, d, t) = (fp(1), fp(2), fp(3), fp(6));
+        let anchors = Anchors::load(dir.path().join("successors"));
+        assert!(anchors.rotate(&b, &t, None));
+        assert!(!anchors.rotate(&p, &b, Some(d.0)));
+        assert_eq!(anchors.rotated(&p), None);
     }
 
     #[test]
