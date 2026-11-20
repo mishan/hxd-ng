@@ -24,6 +24,10 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    # Inline #[cfg(test)] modules are test code that paths-ignore cannot
+    # reach, so the Rust extractor leaves cfg(test) off instead.
+    env:
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: -test
     strategy:
       fail-fast: false
       matrix:

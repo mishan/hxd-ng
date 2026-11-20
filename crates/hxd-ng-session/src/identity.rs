@@ -2106,33 +2106,54 @@ impl IdentityState {
         t.cards.get(fp).map(|c| (c.updated, c.bytes.clone()))
     }
 
-    /// The cached card `GET /identity/card` serves: not one this server's
-    /// registrar would now refuse, such as a card cached before a rotation
-    /// recorded the successor's commitment as another, or as one where
-    /// the card names none. `Err` when the registrar could not say, which
-    /// is its store failing: no card is served then rather than one it
-    /// might refuse.
+    /// The card `GET /identity/card` serves: the newer of the one cached
+    /// here and the one this server's registrar keeps, which outlives a
+    /// restart, and none of an identity the registrar has seen revoked or
+    /// rotated away. Nor one the registrar would now refuse, such as a
+    /// card cached before a rotation recorded the successor's commitment
+    /// as another, or as one where the card names none. `Err` when the
+    /// registrar could not say, which is its store failing: no card is
+    /// served then rather than one it might refuse.
     pub fn served_card(
         &self,
         fp: &Fingerprint,
     ) -> Result<Option<(u64, Vec<u8>)>, hxd_registrar::Refusal> {
-        let Some((updated, bytes)) = self.card(fp) else {
-            return Ok(None);
+        let cached = self.card(fp);
+        let Some(reg) = &self.registrar else {
+            return Ok(cached);
         };
-        if let (Some(reg), Ok(card)) = (&self.registrar, hl_identity::Card::parse(&bytes)) {
+        let kept = match reg.kept_card(&fp.0, self.clock.unix()) {
+            Ok(kept) => kept,
+            Err(hxd_registrar::Refusal::Revoked { .. }) => return Ok(None),
+            Err(e) => {
+                tracing::warn!("registrar could not read the card it keeps: {e}");
+                return Err(e);
+            }
+        };
+        let mut cards: Vec<_> = cached.into_iter().chain(kept).collect();
+        cards.sort_by_key(|c| std::cmp::Reverse(c.0));
+        for (updated, bytes) in cards {
+            // Bytes that do not verify as this identity's card, such as a
+            // store's damaged copy, are not served.
+            let Some(card) = hl_identity::Card::parse(&bytes)
+                .ok()
+                .filter(|c| Fingerprint::of(&c.identity) == *fp)
+            else {
+                continue;
+            };
             match reg.check_card(&card) {
                 Err(
                     hxd_registrar::Refusal::SuccessorMismatch
                     | hxd_registrar::Refusal::RotationPending { .. },
-                ) => return Ok(None),
+                ) => {}
                 Err(e) => {
                     tracing::warn!("registrar could not check a cached card: {e}");
                     return Err(e);
                 }
-                Ok(()) => {}
+                Ok(()) => return Ok(Some((updated, bytes))),
             }
         }
-        Ok(Some((updated, bytes)))
+        Ok(None)
     }
 
     /// `PUT /identity/card` for the identity a token or device proved.

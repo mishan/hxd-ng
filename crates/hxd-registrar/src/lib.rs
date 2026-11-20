@@ -1478,8 +1478,11 @@ impl Registrar {
     }
 
     /// Record an accepted card's commitment, for an identity attested
-    /// here that has none yet.
-    pub fn note_card(&self, card: &Card) -> Result<(), Refusal> {
+    /// here that has none yet, and keep the card when it carries the
+    /// commitment held: a restore takes the commitment from a card the
+    /// identity signed, never from `lookup` (§6.3), and a card cached in
+    /// memory is gone after a restart.
+    pub fn note_card(&self, card: &Card, bytes: &[u8], now: u64) -> Result<(), Refusal> {
         let Some(c) = card.successor else {
             return Ok(());
         };
@@ -1487,23 +1490,52 @@ impl Registrar {
             // As `register` does: none for an identity that may not write
             // or has one already, none while a rotation of it waits, and
             // none a rotation to it would not match.
-            let open = self
+            let Some(row) = self
                 .store
                 .identity(&card.identity)?
-                .is_some_and(|row| row.commitment.is_none() && Self::usable(&row).is_ok());
-            if !open
-                || self.store.pending(&card.identity)?.is_some()
-                || self.held_for(&card.identity, Some(c))?.is_some()
-            {
+                .filter(|row| Self::usable(row).is_ok())
+            else {
                 return Ok(());
+            };
+            match row.commitment {
+                Some(held) if held != c => return Ok(()),
+                Some(_) => {}
+                None => {
+                    if self.store.pending(&card.identity)?.is_some()
+                        || self.held_for(&card.identity, Some(c))?.is_some()
+                        || !self.store.set_commitment(&card.identity, &c)?
+                    {
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        fingerprint = %Fingerprint::of(&card.identity).short(),
+                        "registrar recorded a successor commitment from a card"
+                    );
+                }
             }
-            if self.store.set_commitment(&card.identity, &c)? {
-                tracing::info!(
-                    fingerprint = %Fingerprint::of(&card.identity).short(),
-                    "registrar recorded a successor commitment from a card"
-                );
+            // A card dated past the clock would outrank every card after
+            // it for as long as it is kept.
+            if card.updated <= now.saturating_add(self.cfg.clock_skew) {
+                self.store.set_card(&card.identity, card.updated, bytes)?;
             }
             Ok(())
+        })
+    }
+
+    /// The card [`Self::note_card`] kept for the identity with this
+    /// fingerprint, as its `updated` and bytes. `Revoked` for an identity
+    /// revoked or rotated away, of which no card is served (§6.4), a
+    /// rotation that has come due included.
+    pub fn kept_card(&self, fp: &[u8; 32], now: u64) -> Result<Option<(u64, Vec<u8>)>, Refusal> {
+        self.writing(|| self.publish_due(now))?;
+        self.reading(|| match self.store.identity_by_fingerprint(fp)? {
+            Some(row) => {
+                if let Err(e @ Refusal::Revoked { .. }) = Self::usable(&row) {
+                    return Err(e);
+                }
+                Ok(self.store.card(&row.key)?)
+            }
+            None => Ok(None),
         })
     }
 

@@ -1915,7 +1915,7 @@ async fn auth(
         // holds it to one it already has, which admission checked.
         if let (Ok(_), Some(reg)) = (&result, &registrar) {
             if let Ok(card) = hl_identity::Card::parse(&presented) {
-                if let Err(e) = reg.note_card(&card) {
+                if let Err(e) = reg.note_card(&card, &presented, st.clock().unix()) {
                     warn!("registrar could not record a card's commitment: {e}");
                 }
             }
@@ -2133,7 +2133,7 @@ async fn put_card(req: Request<Incoming>, peer: SocketAddr, ctx: &NgCtx) -> Resp
         }
         let updated = state.update_card(&ident, &bytes);
         if let (Ok(true), Some(reg), Some(card)) = (&updated, &registrar, &card) {
-            reg.note_card(card)?;
+            reg.note_card(card, &bytes, state.clock().unix())?;
         }
         Ok::<_, hxd_registrar::Refusal>(updated)
     })

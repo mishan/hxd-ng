@@ -354,17 +354,69 @@ fn a_commitment_is_immutable_in_requests_and_cards() {
     let mut card = Card::new(&bob, "Bob", T);
     assert!(r.check_card(&card).is_ok());
     card.successor = Some([4; 32]);
-    r.note_card(&card).unwrap();
+    r.note_card(&card, b"", T).unwrap();
     card.successor = Some([5; 32]);
     assert_eq!(r.check_card(&card).unwrap_err(), Refusal::SuccessorMismatch);
     // An identity this registrar never attested is not its to police.
     let stranger = Card::new(&id(3), "Carol", T);
-    r.note_card(&Card {
-        successor: Some([6; 32]),
-        ..stranger.clone()
-    })
+    r.note_card(
+        &Card {
+            successor: Some([6; 32]),
+            ..stranger.clone()
+        },
+        b"",
+        T,
+    )
     .unwrap();
     assert!(r.check_card(&stranger).is_ok());
+}
+
+#[test]
+fn a_card_is_kept_only_while_it_carries_the_commitment_held() {
+    let r = registrar();
+    let (alice, next) = (id(1), id(9));
+    let mut req = request(&alice, "alice", T);
+    req.successor = Some(commitment(&next));
+    r.register(&req.sign(&alice).unwrap(), addr(1), T).unwrap();
+    let kept = || r.kept_card(&alice.fingerprint().0, T).unwrap();
+    let skew = Config::new(HOST).clock_skew;
+    // In order, each a card noted and the card kept after it.
+    for (successor, updated, want) in [
+        (None, T + 1, None),
+        (Some([4; 32]), T + 2, None),
+        (Some(commitment(&next)), T + 3, Some(T + 3)),
+        (Some(commitment(&next)), T + 2, Some(T + 3)),
+        (Some(commitment(&next)), T + 4, Some(T + 4)),
+        // Dated past the clock and its skew, it is not kept.
+        (Some(commitment(&next)), T + skew + 1, Some(T + 4)),
+        (Some(commitment(&next)), u64::MAX, Some(T + 4)),
+    ] {
+        let mut card = Card::new(&alice, "Alice", updated);
+        card.successor = successor;
+        let bytes = card.sign(&alice, vec![]).unwrap();
+        r.note_card(&card, &bytes, T).unwrap();
+        let got = kept();
+        assert_eq!(
+            got.as_ref().map(|k| k.0),
+            want,
+            "{successor:?} at {updated}"
+        );
+        if want == Some(updated) {
+            assert_eq!(got.unwrap().1, bytes);
+        }
+    }
+
+    // A card making the commitment is kept as one carrying it.
+    let bob = id(2);
+    register(&r, &bob, "bob", T).unwrap();
+    let mut card = Card::new(&bob, "Bob", T);
+    card.successor = Some([5; 32]);
+    let bytes = card.sign(&bob, vec![]).unwrap();
+    r.note_card(&card, &bytes, T).unwrap();
+    assert_eq!(
+        r.kept_card(&bob.fingerprint().0, T).unwrap(),
+        Some((T, bytes))
+    );
 }
 
 #[test]
@@ -837,7 +889,7 @@ fn the_successor_of_a_held_rotation_commits_to_its_next_or_to_nothing() {
         r.check_card(&card).unwrap_err(),
         Refusal::RotationPending { until: T + DAY }
     );
-    r.note_card(&card).unwrap();
+    r.note_card(&card, b"", T).unwrap();
     assert_eq!(committed(&r), None);
     // A card naming the rotation's `next`, or none, is taken as ever.
     for successor in [Some(commitment(&next)), None] {
@@ -939,9 +991,13 @@ fn a_card_records_no_commitment_for_an_identity_that_may_not_write() {
         }
         let mut card = Card::new(&alice, "Alice", T + 2);
         card.successor = Some([4; 32]);
-        r.note_card(&card).unwrap();
+        r.note_card(&card, b"", T).unwrap();
         let row = r.store.identity(&alice.public()).unwrap().unwrap();
         assert_eq!(row.commitment, None, "{case}");
+        match (case, r.kept_card(&fp, T + 2)) {
+            ("frozen", kept) => assert_eq!(kept, Ok(None), "{case}"),
+            (_, kept) => assert!(matches!(kept, Err(Refusal::Revoked { .. })), "{case}"),
+        }
     }
 }
 
@@ -1049,7 +1105,7 @@ fn a_waiting_rotations_identity_commits_to_nothing() {
             until: T + 10 + DAY
         }
     );
-    r.note_card(&card).unwrap();
+    r.note_card(&card, b"", T).unwrap();
     assert_eq!(
         r.store.identity(&old.public()).unwrap().unwrap().commitment,
         None
@@ -1492,6 +1548,12 @@ impl RegistrarStore for FailingCommit {
     }
     fn set_commitment(&self, key: &Key, commitment: &[u8; 32]) -> Result<bool, StoreError> {
         self.inner.set_commitment(key, commitment)
+    }
+    fn card(&self, key: &Key) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        self.inner.card(key)
+    }
+    fn set_card(&self, key: &Key, updated: u64, bytes: &[u8]) -> Result<bool, StoreError> {
+        self.inner.set_card(key, updated, bytes)
     }
     fn pending(&self, key: &Key) -> Result<Option<Pending>, StoreError> {
         self.inner.pending(key)
