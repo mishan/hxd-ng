@@ -205,6 +205,24 @@ as AGENTS.md's "Releasing" describes it.
   devices connects, a device revoked there is still sent notifications.
   Registrations left from before are deleted when the operator's list is
   next loaded, or a registrar's revocation next applied.
+- A rotation's successor is no longer anchored from its own card, which
+  whoever holds the successor key alone could show first, committing to
+  a key of their own, and then rotate the identity to it with every
+  registrar refusing. A rotation's `next` is the successor's commitment
+  in `[identity] successors`, and a successor card that disagrees is
+  refused `bad_card`. A successor whose rotation carried no `next` has
+  none: a further rotation of it is taken only from a trusted
+  registrar's records, no longer from the `rotation` an `auth` carries.
+  A rotation to a key already anchored to anything but its `next` is
+  ignored, and so is any rotation into a key that is already a
+  rotation's successor or has itself rotated away
+  (docs/identity-registrar.md §7.4).
+  The file gains a `<fingerprint> = next <commitment>` line beside the
+  plain one, and at the first start an anchor an older build took from a
+  successor's card is dropped from it with a warning, leaving that
+  successor to a registrar's records. Rolled back, a build from before
+  this release keeps the plain line and drops the `next` one, so after
+  upgrading again that successor too is left to a registrar's records.
 
 ## [0.3.0] - 2026-11-05
 
