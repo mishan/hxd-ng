@@ -143,11 +143,12 @@ A registrar gone for good leaves the lists held from it damaged or old
 for as long as it is trusted. The way out is to stop trusting it: take
 it out of `trusted_registrars` and `registrar_keys` and restart. Lists
 held from a registrar not trusted are not read, so what it published,
-revocations included, no longer applies, and its identities are admitted
-as unattested; a device it revoked that must stay out goes in
-`revoked_devices`. A rotation this server already took from it, kept in
-the successors file when there is one (§4), still stands: its
-predecessor is refused `rotated` after the restart.
+revocations included, no longer applies, and its identities are
+unattested, so `unattested` decides their admission; a device it revoked
+that must stay out goes in `revoked_devices`. A rotation this server
+already took from it, kept in the successors file when there is one
+(§4), still stands: its predecessor is refused `rotated` after the
+restart.
 
 What refuses a stolen key at a server that never
 held its list is its holder revoking it, and the operator's own
