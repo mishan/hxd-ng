@@ -2803,6 +2803,85 @@ async fn a_rotation_shown_at_auth_is_taken_only_to_the_anchored_key() {
 }
 
 #[tokio::test]
+async fn a_registrars_rotation_into_a_key_anchored_elsewhere_refuses_the_old_key_and_moves_nothing()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("registrar");
+    std::fs::create_dir_all(&at).unwrap();
+    let r = start(&at, "signup = \"open\"").await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let live = format!("http://{}", r.ng);
+    let (v, identity) = verifier(&there, &r, Trust::Key, &live, "").await;
+    let [old, new, other] = [1, 2, 3].map(|s| IdentityKey::from_seed(&[s; 32]));
+    std::fs::write(
+        there.join("accounts/alice.toml"),
+        format!(
+            "name = \"alice\"\npassword = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            old.fingerprint()
+        ),
+    )
+    .unwrap();
+    let dev = DeviceKey::from_seed(&[101; 32]);
+    let old_card = attested_committing(&r, &old, "alice", &new, false).await;
+    let account = auth_at(v, &old, &dev, &old_card).await.json()["account"].clone();
+    assert_eq!(account, "alice");
+    let mut old_here = session_at(v, &old, &old_card).await;
+
+    // The successor key, attested and linking no account, is anchored
+    // here to a key its rotation will not name. Shown at `auth`, the
+    // rotation is ignored, as one replayed by whoever holds that key
+    // alone would be.
+    let new_card = attested_committing(&r, &new, "bob", &other, false).await;
+    let reply = auth_at(v, &new, &dev, &new_card).await;
+    assert_eq!(
+        (reply.status, reply.json().get("account").cloned()),
+        (200, Some(Value::Null))
+    );
+    let shown = json!({ "rotation": b64(&rotation(&old, &new)) });
+    assert_eq!(auth_with(v, &new, &dev, &new_card, shown).await.status, 200);
+    assert_eq!(auth_at(v, &old, &dev, &old_card).await.status, 200);
+
+    // Its registrar publishes it: the old key is refused, and its
+    // account stays where it was, though nothing stops it moving.
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &new)) }),
+    )
+    .await;
+    assert_eq!(posted.json()["published"], true);
+    next_list().await;
+    identity.sweep_records().await;
+    old_here.event("kicked").await.unwrap();
+    let reply = auth_at(v, &old, &dev, &old_card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+    let reply = auth_at(v, &new, &dev, &new_card).await;
+    assert_eq!(
+        (reply.status, reply.json().get("account").cloned()),
+        (200, Some(Value::Null))
+    );
+    let alice = std::fs::read_to_string(there.join("accounts/alice.toml")).unwrap();
+    assert!(alice.contains(&old.fingerprint().to_string()), "{alice}");
+    let file = std::fs::read_to_string(there.join("successors")).unwrap();
+    assert!(
+        file.contains(&format!(
+            "{} => {} held",
+            old.fingerprint(),
+            new.fingerprint()
+        )),
+        "{file}"
+    );
+}
+
+#[tokio::test]
 async fn a_successor_rotates_on_only_to_its_rotations_next() {
     for with_next in [false, true] {
         let dir = tempfile::tempdir().unwrap();

@@ -977,16 +977,55 @@ rotation into a key that is already a rotation's successor, with a
 `next` or without: a key has one predecessor, the first accepted here,
 and whoever holds it alone could make a second, committed to it, to
 choose its `next` or to have the owner's dropped. If that holder's
-rotation arrives first, the owner's is the one ignored: the old key
-stays admitted with the owner's account, and nothing of it moves. A
-rotation into a key that has itself rotated away is ignored too: what
-it moved there would be stranded, since that key's `auth` is refused
-`rotated`.
+rotation arrives first, the owner's is the one not taken, and nothing
+of it moves. A rotation into a key that has itself rotated away is not
+taken either: what it moved there would be stranded, since that key's
+`auth` is refused `rotated`.
+
+Each of these three is ignored when an `auth` request shows it, since
+whoever holds the successor key alone can replay one there, and the old
+key stays admitted. From a trusted registrar's records it is **held**
+instead: the registrar has said the old key is retired, and this server
+declines only to hand what it holds to a successor it cannot vouch for.
+The predecessor is refused `rotated`, naming the successor, at `auth`
+and wherever else its key is checked, and its sessions end, as at an
+acceptance; nothing moves, neither the account link nor bans, mail,
+friendships or the rest; the successor takes no anchor from it. A
+held rotation stands as an accepted one does: no other rotation of
+that predecessor is taken, and neither key can be a rotation's
+successor here again. A rotation from a predecessor anchored to
+another key is never held: it is the thief's rotation the anchor
+beats, whoever publishes it, and the old key stays admitted, for the
+owner's own rotation to the anchored key to be taken. Nor is one into
+a key that rotated to its predecessor, which would leave each refused
+as rotated to the other.
+
+Whoever holds the successor key alone can force a hold, and so lock
+the old key out here until the operator relinks it: by anchoring the
+successor elsewhere with standing, by having a rotation of a key of
+their own into it accepted first, or by having a registrar publish its
+rotation onward first. They take nothing by it, since nothing moves to
+the successor. A hold can come without a thief, too: the successor
+key signed in with standing before a rotation that carries no `next`,
+or records applied out of order, the onward rotation before the one
+into it. Once one is held, the predecessor's account can still be
+reached with its password, if it has one, and the operator can link it
+by hand, setting `fingerprint` in the account file's `[identity]` table
+once no other account links that key, to a key this server admits: the
+successor, or, where the successor has itself rotated away (`B => C`
+accepted before `A => B` was held), the end of its rotations, `C`,
+since `B` is refused `rotated` too. What else the server keeps stays
+with the predecessor's key.
 hxd-ng writes a rotation's `next` in `[identity] successors` as a line
 of its own, and drops, with a warning at load, any other anchor a
 successor has there, such as one an older build took from its card, and
 any anchor of a key that is the successor of two rotations, as a file
-an older build wrote may hold.
+an older build wrote may hold. A held rotation is the line
+`<predecessor> => <successor> held`. A build from before held
+rotations reads it as malformed and drops it when it compacts the
+file, admitting the predecessor again as it would have; a build that
+holds them holds it again at the next fetch of the registrar's records
+that publish it.
 
 ### 7.5 Standing and probation
 

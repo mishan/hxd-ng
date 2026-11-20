@@ -1779,6 +1779,7 @@ impl IdentityState {
                         r.next,
                         "a registrar's records",
                         record.map(|(_, _, b)| b.as_slice()),
+                        true,
                     );
                     // Refused only to a rotation accepted here, so one
                     // the anchor overrules names nobody; with no file to
@@ -2009,7 +2010,7 @@ impl IdentityState {
                 let next = hl_identity::Rotation::parse(&record)
                     .ok()
                     .and_then(|r| r.next);
-                this.accept_rotation(from, to, next, "a registrar's records", Some(&record));
+                this.accept_rotation(from, to, next, "a registrar's records", Some(&record), true);
                 if this.anchors.is_none() {
                     refused.unrevoked.insert(from.0);
                 }
@@ -2230,6 +2231,7 @@ impl IdentityState {
                 r.next,
                 "the successor's auth",
                 Some(bytes),
+                false,
             );
         } else {
             debug!(predecessor = %from.short(), "rotation shown for a key not anchored to it; ignored");
@@ -2245,6 +2247,11 @@ impl IdentityState {
     ///
     /// `next`, signed by both keys, becomes `to`'s commitment (§7.4).
     ///
+    /// With `hold`, for a trusted registrar's rotation, one `rotate`
+    /// refuses for its successor is held instead: `from` is refused as
+    /// rotated to `to`, and nothing moves. Never for a rotation shown at
+    /// `auth`, which whoever holds the successor key alone can replay.
+    ///
     /// The rotation's `record`, where the caller has it, is kept with the
     /// core once the rotation stands here, for the friends of the identity
     /// to fetch and check it by (`docs/proposals/portable-friends.md` §10).
@@ -2255,6 +2262,7 @@ impl IdentityState {
         next: Option<[u8; 32]>,
         source: &str,
         record: Option<&[u8]>,
+        hold: bool,
     ) {
         let Some(anchors) = &self.anchors else {
             return;
@@ -2265,7 +2273,7 @@ impl IdentityState {
             }
         };
         if let Some(stands) = anchors.rotated(&from) {
-            if stands == to {
+            if stands == to && !anchors.held(&from) {
                 keep(record);
             }
             return;
@@ -2274,11 +2282,16 @@ impl IdentityState {
             tracing::warn!(predecessor = %from.short(), successor = %to.short(), source, "rotation to a key other than the one anchored; ignored");
             return;
         }
-        if !anchors.rotate(&from, &to, next) {
+        let held = !anchors.rotate(&from, &to, next);
+        if held && !(hold && anchors.hold(&from, &to)) {
             return;
         }
-        keep(record);
-        info!(predecessor = %from, successor = %to, source, "identity rotated");
+        if held {
+            tracing::warn!(predecessor = %from, successor = %to, source, "rotation held: the predecessor is refused and nothing moves");
+        } else {
+            keep(record);
+            info!(predecessor = %from, successor = %to, source, "identity rotated");
+        }
         for (uid, nick) in self.core.refuse_rotated(from.0) {
             info!(uid, nick = %nick, "session ended: its key rotated away");
         }
@@ -2287,9 +2300,10 @@ impl IdentityState {
             t.cards.remove(&from);
             // A card the successor key showed before, committing to
             // another, would refuse the owner's older one in the cache.
-            if t.cards
-                .get(&to)
-                .is_some_and(|c| next.is_some_and(|n| c.successor != Some(n)))
+            if !held
+                && t.cards
+                    .get(&to)
+                    .is_some_and(|c| next.is_some_and(|n| c.successor != Some(n)))
             {
                 t.cards.remove(&to);
             }
@@ -2297,7 +2311,9 @@ impl IdentityState {
                 .retain(|_, d| Fingerprint::of(&d.identity) != from);
             t.tokens.retain(|_, (ident, _)| ident.fingerprint != from);
         }
-        self.finish_rotation(from, to);
+        if !held {
+            self.finish_rotation(from, to);
+        }
     }
 
     /// Move what `from`'s rotation to `to` moves (`docs/identity-records.md`
@@ -2440,15 +2456,25 @@ struct Anchors {
     /// Fingerprint → committed successor, mirroring the file. Read on
     /// every auth and every card update, so no I/O happens under it.
     map: Mutex<HashMap<Fingerprint, [u8; 32]>>,
-    /// Predecessor → successor, for each rotation accepted (§7.4), and
-    /// whether what it moves has all moved.
-    rotated: Mutex<HashMap<Fingerprint, (Fingerprint, bool)>>,
+    /// Predecessor to successor, for each rotation accepted or held
+    /// (§7.4), and what it has moved.
+    rotated: Mutex<HashMap<Fingerprint, (Fingerprint, Moves)>>,
     /// Serialises appends without holding `map`.
     io: Mutex<()>,
     /// False when the file exists and could not be read. Writing from
     /// the empty map we would otherwise start with is "make the caches
     /// forget", done durably, by a transient `EACCES`.
     writable: bool,
+}
+
+/// What a rotation on file has moved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Moves {
+    Pending,
+    Done,
+    /// Nothing, ever: the predecessor is refused, and its successor
+    /// takes nothing of it, not even an anchor.
+    Held,
 }
 
 /// Ceiling on anchored identities. Standing (an account here, or an
@@ -2462,6 +2488,7 @@ const ANCHORS_HEADER: &str = "\
 # Deleting a line un-anchors that identity; that is the attack.
 # A rotation accepted: <predecessor fingerprint> => <successor fingerprint>,
 # then again, ending in the word moved, once everything it moves has moved.
+# A rotation held, refusing the predecessor and moving nothing, ends in held.
 # A successor's commitment is its rotation's: <fingerprint> = next <successor>,
 # beside the line above; any other line for a successor is not its anchor.
 ";
@@ -2475,7 +2502,7 @@ impl Anchors {
         use std::collections::hash_map::Entry;
         let mut map: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
         let mut nexts: HashMap<Fingerprint, [u8; 32]> = HashMap::new();
-        let mut rotated: HashMap<Fingerprint, (Fingerprint, bool)> = HashMap::new();
+        let mut rotated: HashMap<Fingerprint, (Fingerprint, Moves)> = HashMap::new();
         let mut writable = true;
         let mut compact = false;
         match std::fs::read_to_string(&path) {
@@ -2486,9 +2513,12 @@ impl Anchors {
                         continue;
                     }
                     if let Some((from, to)) = line.split_once("=>") {
-                        let (to, moved) = match to.trim().strip_suffix("moved") {
-                            Some(to) => (to, true),
-                            None => (to, false),
+                        let to = to.trim();
+                        let (to, moves) = match (to.strip_suffix("moved"), to.strip_suffix("held"))
+                        {
+                            (Some(to), _) => (to, Moves::Done),
+                            (_, Some(to)) => (to, Moves::Held),
+                            _ => (to, Moves::Pending),
                         };
                         match (
                             Fingerprint::parse(from.trim()),
@@ -2500,12 +2530,12 @@ impl Anchors {
                             (Some(from), Some(to)) => match rotated.entry(from) {
                                 Entry::Occupied(mut e) => {
                                     compact = true;
-                                    if e.get().0 == to {
-                                        e.get_mut().1 |= moved;
+                                    if *e.get() == (to, Moves::Pending) && moves == Moves::Done {
+                                        e.get_mut().1 = Moves::Done;
                                     }
                                 }
                                 Entry::Vacant(v) => {
-                                    v.insert((to, moved));
+                                    v.insert((to, moves));
                                 }
                             },
                             _ => {
@@ -2584,8 +2614,10 @@ impl Anchors {
         // A rotation's successor is anchored by its rotation's `next`
         // alone. An older build anchored the first card the successor
         // key showed, which whoever holds that key alone could have shown.
+        // A held rotation gave its successor no anchor, so it takes none
+        // away either.
         let mut into: HashMap<Fingerprint, usize> = HashMap::new();
-        for (to, _) in rotated.values() {
+        for (to, _) in rotated.values().filter(|(_, m)| *m != Moves::Held) {
             *into.entry(*to).or_default() += 1;
         }
         let successors: HashSet<Fingerprint> = into.keys().copied().collect();
@@ -2622,9 +2654,13 @@ impl Anchors {
             }
             let mut lines: Vec<_> = rotated.iter().collect();
             lines.sort_by_key(|(fp, _)| fp.to_string());
-            for (from, (to, moved)) in lines {
-                let moved = if *moved { " moved" } else { "" };
-                text.push_str(&format!("{from} => {to}{moved}\n"));
+            for (from, (to, moves)) in lines {
+                let moves = match moves {
+                    Moves::Pending => "",
+                    Moves::Done => " moved",
+                    Moves::Held => " held",
+                };
+                text.push_str(&format!("{from} => {to}{moves}\n"));
             }
             if let Err(e) = hl_private_file::replace(&path, text.as_bytes()) {
                 tracing::warn!("{}: {e}; successor anchors not compacted", path.display());
@@ -2652,7 +2688,7 @@ impl Anchors {
         rotated.keys().copied().collect()
     }
 
-    /// Whether `fp` is the successor of a rotation accepted here.
+    /// Whether `fp` is the successor of a rotation accepted or held here.
     fn is_successor(&self, fp: &Fingerprint) -> bool {
         let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
         rotated.values().any(|(to, _)| to == fp)
@@ -2666,13 +2702,19 @@ impl Anchors {
             .map(|(to, _)| *to)
     }
 
+    /// Whether `fp`'s rotation is held.
+    fn held(&self, fp: &Fingerprint) -> bool {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        rotated.get(fp).is_some_and(|(_, m)| *m == Moves::Held)
+    }
+
     /// The rotations whose moves have not all landed, to `to` or, with
     /// `None`, to anyone.
     fn unmoved(&self, to: Option<&Fingerprint>) -> Vec<(Fingerprint, Fingerprint)> {
         let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
         rotated
             .iter()
-            .filter(|(_, (t, moved))| !moved && to.is_none_or(|to| t == to))
+            .filter(|(_, (t, m))| *m == Moves::Pending && to.is_none_or(|to| t == to))
             .map(|(from, (t, _))| (*from, *t))
             .collect()
     }
@@ -2682,8 +2724,8 @@ impl Anchors {
         let to = {
             let mut rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
             match rotated.get_mut(from) {
-                Some((to, moved)) if !*moved => {
-                    *moved = true;
+                Some((to, m)) if *m == Moves::Pending => {
+                    *m = Moves::Done;
                     *to
                 }
                 _ => return,
@@ -2744,7 +2786,7 @@ impl Anchors {
                     return false;
                 }
             };
-            rotated.insert(*from, (*to, false));
+            rotated.insert(*from, (*to, Moves::Pending));
             (rotated.len() > MAX_ANCHORS, next)
         };
         if !self.writable || full {
@@ -2759,6 +2801,36 @@ impl Anchors {
         lines.push_str(&format!("{from} => {to}\n"));
         if let Err(e) = append_private(&self.path, &lines) {
             tracing::error!("{}: {e}; rotation not persisted", self.path.display());
+        }
+        true
+    }
+
+    /// Record `from`'s rotation to `to` as held, which `rotate` refused
+    /// for its successor, unless one is on file for `from` already,
+    /// `from` is anchored to another key (that rotation is the thief's
+    /// the anchor beats, and the owner's, to the anchored key, is still
+    /// to be taken), or `to` rotated to `from`, which would leave each
+    /// refused as rotated to the other. False when nothing was recorded. Kept in memory
+    /// whether or not the file can take it, as `rotate`'s are.
+    fn hold(&self, from: &Fingerprint, to: &Fingerprint) -> bool {
+        let full = {
+            let mut rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+            if rotated.contains_key(from)
+                || self.get(from).is_some_and(|a| a != to.0)
+                || rotated.get(to).is_some_and(|(t, _)| t == from)
+            {
+                return false;
+            }
+            rotated.insert(*from, (*to, Moves::Held));
+            rotated.len() > MAX_ANCHORS
+        };
+        if !self.writable || full {
+            tracing::warn!(predecessor = %from.short(), "rotation held for this run only: the successor file is unwritable or full");
+            return true;
+        }
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = append_private(&self.path, &format!("{from} => {to} held\n")) {
+            tracing::error!("{}: {e}; held rotation not persisted", self.path.display());
         }
         true
     }
@@ -3204,6 +3276,135 @@ mod tests {
     }
 
     #[test]
+    fn a_registrars_rotation_refused_for_its_successor_is_held_across_a_restart() {
+        use hxd_core::relationships::RelationshipStore as _;
+        let [k0, k1, k2, m, x] = [1, 2, 3, 4, 5].map(|s| IdentityKey::from_seed(&[s; 32]));
+        let [f0, f1, f2, fm, fx] = [&k0, &k1, &k2, &m, &x].map(|k| k.fingerprint());
+        type Conflict<'a> = Box<dyn Fn(&Anchors) + 'a>;
+        let cases: [(&str, Conflict, bool); 5] = [
+            (
+                "successor anchored elsewhere",
+                Box::new(|a| a.commit(&f1, fm.0)),
+                true,
+            ),
+            (
+                "successor already a successor",
+                Box::new(|a| assert!(a.rotate(&fx, &f1, Some(f2.0)))),
+                true,
+            ),
+            (
+                "successor rotated away",
+                Box::new(|a| assert!(a.rotate(&f1, &f2, None))),
+                true,
+            ),
+            (
+                "predecessor anchored elsewhere",
+                Box::new(|a| a.commit(&f0, fm.0)),
+                false,
+            ),
+            (
+                "successor rotated to the predecessor",
+                Box::new(|a| assert!(a.rotate(&f1, &f0, None))),
+                false,
+            ),
+        ];
+        let record = hl_identity::Rotation {
+            identity: k0.public(),
+            successor: k1.public(),
+            time: now_unix(),
+            next: Some(f2.0),
+        }
+        .sign(&k0, &k1)
+        .unwrap();
+        for (case, conflict, held) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("successors");
+            let auth = MemAuth::new();
+            auth.accounts
+                .lock()
+                .unwrap()
+                .get_mut("alice")
+                .unwrap()
+                .identity
+                .fingerprint = Some(f0.0);
+            let cfg = || IdentityConfig {
+                anchors: Some(path.clone()),
+                unattested: Unattested::Guest,
+                ..Default::default()
+            };
+            let friends = Arc::new(hxd_core::relationships::MemoryRelationships::new());
+            let mut first = cfg();
+            first.hosts.push(TEST_HOST.into());
+            let st = IdentityState::new(
+                ServerKey::from_seed(&[5u8; 32]),
+                first,
+                auth.clone(),
+                Arc::new(hxd_core::Core::new().with_relationships(friends.clone())),
+            );
+            let anchors = st.anchors.as_ref().unwrap();
+            conflict(anchors);
+            let anchor = anchors.get(&f1);
+            // A card the successor key showed, committing to another key
+            // than the rotation's `next`.
+            let mut shown = Card::new(&k1, "B", now_unix());
+            shown.successor = Some(fm.0);
+            let shown = shown.sign(&k1, vec![]).unwrap();
+            remember_card(
+                &mut st.tables.lock().unwrap().cards,
+                f1,
+                &Card::parse(&shown).unwrap(),
+                shown,
+                Instant::now(),
+            );
+
+            // Shown at `auth`, it is never held.
+            st.accept_rotation(f0, f1, None, "test", None, false);
+            assert_eq!(st.rotated_to(&f0), None, "{case}");
+            for _ in 0..2 {
+                st.accept_rotation(f0, f1, Some(f2.0), "test", Some(&record), true);
+            }
+            assert!(!anchors.hold(&f0, &f1), "{case}");
+            assert!(
+                st.card(&f1).is_some(),
+                "{case}: the successor's card is kept"
+            );
+            assert!(
+                friends.rotation_from(&f0.0).unwrap().is_none(),
+                "{case}: no record for friends to follow"
+            );
+
+            for st in [st, state_with(cfg(), auth.clone())] {
+                assert_eq!(st.rotated_to(&f0), held.then_some(f1), "{case}");
+                assert_eq!(st.anchors.as_ref().unwrap().get(&f1), anchor, "{case}");
+                let dev = DeviceKey::from_seed(&[9; 32]);
+                let (card, cert) = objects(&k0, &dev);
+                let ch = st.issue_challenge().unwrap();
+                let proof =
+                    LoginProof::sign(&dev, &ch, &st.server_key(), TEST_HOST, now_unix()).unwrap();
+                let refused = st
+                    .auth_with_proof(
+                        &card,
+                        &cert,
+                        &proof,
+                        Some(TEST_HOST),
+                        AuthRequest::default(),
+                    )
+                    .err();
+                assert_eq!(
+                    refused == Some(AuthRefused::Rotated { successor: f1 }),
+                    held,
+                    "{case}: {refused:?}"
+                );
+                assert_eq!(
+                    auth.lookup("alice").unwrap().identity.fingerprint,
+                    Some(f0.0),
+                    "{case}: the account link stays"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_rotation_drops_a_cached_successor_card_that_disagrees_with_its_next() {
         for (shown, kept) in [(6u8, false), (3, true)] {
             let dir = tempfile::tempdir().unwrap();
@@ -3239,6 +3440,7 @@ mod tests {
                 Some(d.fingerprint().0),
                 "test",
                 None,
+                false,
             );
             assert_eq!(st.rotated_to(&p.fingerprint()), Some(b.fingerprint()));
             assert_eq!(st.card(&b.fingerprint()).is_some(), kept, "{shown}");
