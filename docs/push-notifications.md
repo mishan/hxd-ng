@@ -606,10 +606,11 @@ the registrars remembered as having attested it, which a restart
 forgets. The refusals the sweep keeps are kept in memory. After a
 restart, a trusted list held damaged, with the registrar out of reach,
 refuses the identity's every device at login, `denied` whatever
-`revocation_stale` says (identity-records.md §3), so a revoked device
-does not register again; a push registration it already holds is still
-sent to until the list is read whole again or the operator revokes the
-device. The operator's own list is applied at startup and on every reload.
+`revocation_stale` says unless a list held whole answers `revoked` or
+`rotated` first (identity-records.md §3), so a revoked device does not
+register again; a push registration it already holds is still sent to
+until the list is read whole again or the operator revokes the device.
+The operator's own list is applied at startup and on every reload.
 
 Together these give the one thing a password account cannot have: **a lost phone
 stops buzzing when its key is revoked** -- at once by the operator, and by
