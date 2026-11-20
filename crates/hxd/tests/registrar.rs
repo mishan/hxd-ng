@@ -2439,9 +2439,10 @@ async fn a_registrars_rotation_into_a_key_anchored_elsewhere_refuses_the_old_key
     // rotation is ignored, as one replayed by whoever holds that key
     // alone would be.
     let new_card = attested_committing(&r, &new, "bob", &other, false).await;
+    let reply = auth_at(v, &new, &dev, &new_card).await;
     assert_eq!(
-        auth_at(v, &new, &dev, &new_card).await.json()["account"],
-        Value::Null
+        (reply.status, reply.json().get("account").cloned()),
+        (200, Some(Value::Null))
     );
     let shown = json!({ "rotation": b64(&rotation(&old, &new)) });
     assert_eq!(auth_with(v, &new, &dev, &new_card, shown).await.status, 200);
@@ -2468,9 +2469,10 @@ async fn a_registrars_rotation_into_a_key_anchored_elsewhere_refuses_the_old_key
         ),
         (403, json!("rotated"), json!(new.fingerprint().to_string()))
     );
+    let reply = auth_at(v, &new, &dev, &new_card).await;
     assert_eq!(
-        auth_at(v, &new, &dev, &new_card).await.json()["account"],
-        Value::Null
+        (reply.status, reply.json().get("account").cloned()),
+        (200, Some(Value::Null))
     );
     let alice = std::fs::read_to_string(there.join("accounts/alice.toml")).unwrap();
     assert!(alice.contains(&old.fingerprint().to_string()), "{alice}");

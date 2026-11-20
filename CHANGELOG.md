@@ -182,8 +182,10 @@ as AGENTS.md's "Releasing" describes it.
   ignored, and so is any rotation from an old key anchored here to
   another or into a key that rotated to it. Whoever holds the successor
   key alone can force a hold, locking the old key out here, though not
-  taking anything of it. To give the account to the successor, set `fingerprint` in
-  its file's `[identity]` table by hand. `[identity] successors` gains a
+  taking anything of it. To give the account to its owner, set
+  `fingerprint` in its file's `[identity]` table by hand to a key that
+  is admitted: the successor, or, if the successor has rotated on, the
+  end of its rotations. `[identity] successors` gains a
   `<predecessor> => <successor> held` line; a build from before this
   release drops it when it compacts the file and admits the old key
   again, until an upgraded one fetches the registrar's records again
@@ -238,10 +240,11 @@ as AGENTS.md's "Releasing" describes it.
   refused `bad_card`. A successor whose rotation carried no `next` has
   none: a further rotation of it is taken only from a trusted
   registrar's records, no longer from the `rotation` an `auth` carries.
-  A rotation to a key already anchored to anything but its `next` is
-  ignored, and so is any rotation into a key that is already a
-  rotation's successor or has itself rotated away
-  (docs/identity-registrar.md §7.4).
+  Shown at `auth`, a rotation to a key already anchored to anything but
+  its `next` is ignored, and so is any rotation into a key that is
+  already a rotation's successor or has itself rotated away
+  (docs/identity-registrar.md §7.4); from a registrar's records, such
+  a rotation is held, as the held-rotation note above says.
   The file gains a `<fingerprint> = next <commitment>` line beside the
   plain one, and at the first start an anchor an older build took from a
   successor's card is dropped from it with a warning, leaving that

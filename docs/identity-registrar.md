@@ -1010,9 +1010,12 @@ key signed in with standing before a rotation that carries no `next`,
 or records applied out of order, the onward rotation before the one
 into it. Once one is held, the predecessor's account can still be
 reached with its password, if it has one, and the operator can link it
-to the successor by hand, setting `fingerprint` in the account file's
-`[identity]` table once no other account links that key; what else the
-server keeps stays with the predecessor's key.
+by hand, setting `fingerprint` in the account file's `[identity]` table
+once no other account links that key, to a key this server admits: the
+successor, or, where the successor has itself rotated away (`B => C`
+accepted before `A => B` was held), the end of its rotations, `C`,
+since `B` is refused `rotated` too. What else the server keeps stays
+with the predecessor's key.
 hxd-ng writes a rotation's `next` in `[identity] successors` as a line
 of its own, and drops, with a warning at load, any other anchor a
 successor has there, such as one an older build took from its card, and
