@@ -163,6 +163,16 @@ as AGENTS.md's "Releasing" describes it.
   404 for a cached card the registrar would now refuse, and 503, as `PUT
   /identity/card` does, when the registrar's store cannot check a card;
   `hlid restore` takes only a 404 as no card and otherwise stops.
+- `hlid rotate` signs the successor's own commitment into the rotation
+  as `next`: it makes the successor's successor key first
+  (`--next-key`, by default `successor.next.key` for `--to
+  successor.key`), and the successor's card it prints the command for
+  commits to that key. Before, it signed no `next` and left the
+  successor to register a commitment afterward, which a thief holding
+  only the successor's key could have beaten at another registrar
+  (docs/identity-registrar.md §4.6). A `--next-key` naming `--to`, the
+  identity key or that card's file is refused, and `hlid card`, `cert`
+  and `attest` refuse an `-o` that holds a key.
 
 ### Fixed
 

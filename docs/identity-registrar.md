@@ -1471,7 +1471,7 @@ a test rig:
 hlid register    --registrar hl.example --handle alice [--proof CODE] [--successor-commit]
 hlid revoke      --registrar hl.example (--device-cert FILE | --device-pub HEX) [--reason stolen] [--by-device]
 hlid revoke      --registrar hl.example --identity-revoke --yes
-hlid rotate      --registrar hl.example --to <successor key file>
+hlid rotate      --registrar hl.example --to <successor key file> [--next-key FILE]
 hlid backup      --registrar hl.example [--recovery] [--delete]
 hlid restore     --registrar hl.example --handle alice [--recovery]
 ```
@@ -1481,7 +1481,11 @@ cannot give back, so `hlid revoke` takes its certificate — whose
 `expires` is then the record's `until` — or its public key. `register`
 puts the attestation into the card, re-signs it and publishes it at the
 registrar; `--successor-commit` makes a successor key beside the
-identity key and commits the card and the registration to it. `backup`
+identity key and commits the card and the registration to it. `rotate`
+makes the successor's own successor key first (`--next-key`, by default
+`successor.next.key` for `--to successor.key`), signs its commitment
+into the rotation as `next` (§4.6), and prints the successor's card and
+reissues, the card committing to that key. `backup`
 puts a passphrase envelope, or with `--recovery` makes a recovery code,
 shows it once and puts its envelope; `--delete` removes one kind.
 `restore` looks up the salt, derives, fetches and opens, and lays the

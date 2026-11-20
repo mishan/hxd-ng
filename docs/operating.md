@@ -616,7 +616,10 @@ hlid restore --registrar hl.example --handle alice --password-file pass
 `register` puts the attestation into your card and publishes the card
 at the registrar. `--successor-commit` makes a successor key and commits
 to it, which is what lets you rotate to it later — and stops a thief
-with your identity key from rotating anywhere else. A server that
+with your identity key from rotating anywhere else. `rotate` commits
+the successor in turn, inside the rotation: it makes the successor's own
+successor key (`successor.next.key` here, or `--next-key`) before it
+signs, then prints the successor's card and reissues to run. A server that
 should trust the registrar's names lists its key in
 `[identity] registrar_keys`, or its host in `trusted_registrars`. Behind
 a proxy, forward `Host` ([above](#behind-a-reverse-proxy)).

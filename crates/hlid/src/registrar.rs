@@ -157,7 +157,10 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
     let successor = match (card.successor, a.has("successor-commit")) {
         (Some(c), _) => Some(c),
         (None, false) => None,
-        (None, true) => Some(successor_commitment(&a)?),
+        (None, true) => Some(successor_commitment(&match a.opt("successor-key") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => crate::hlid_home()?.join(SUCCESSOR_KEY),
+        })?),
     };
     let request = RegisterRequest {
         identity: id.public(),
@@ -242,19 +245,17 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
 /// the whole point of the commitment, so it is written before the
 /// commitment is ever sent: a commitment to a key that was lost with the
 /// terminal would lock the identity out of rotating at all.
-fn successor_commitment(a: &Args) -> R<[u8; 32]> {
-    let path = match a.opt("successor-key") {
-        Some(p) => std::path::PathBuf::from(p),
-        None => crate::hlid_home()?.join(SUCCESSOR_KEY),
-    };
+fn successor_commitment(path: &Path) -> R<[u8; 32]> {
     let key = if path.is_file() {
-        IdentityKey::from_seed(&read_seed(&path)?)
+        eprintln!("using the existing successor key at {}", path.display());
+        IdentityKey::from_seed(&read_seed(path)?)
     } else {
         let key = IdentityKey::generate();
-        crate::write_private(&path, &crate::hex(&*key.seed()))?;
+        crate::write_private(path, &crate::hex(&*key.seed()))?;
         eprintln!(
-            "wrote a successor identity key to {} — keep it apart from the identity key; \
-             it is the only key this identity can rotate to",
+            "wrote a successor identity key to {}; keep it safe and back it up: it is the \
+             only key the identity committing to it can rotate to, and without it that \
+             identity cannot rotate at all",
             path.display()
         );
         key
@@ -392,19 +393,47 @@ pub(crate) fn revoke_cmd(args: &[String]) -> R<()> {
 
 // --- rotate --------------------------------------------------------------
 
-/// `hlid rotate --registrar HOST --to SUCCESSOR_KEY`: hand the identity
-/// over to the successor (§4.6). Both keys sign; the registrar publishes
-/// the rotation only if it is to the committed key, if one was.
+/// `hlid rotate --registrar HOST --to SUCCESSOR_KEY [--next-key FILE]`:
+/// hand the identity over to the successor (§4.6). Both keys sign; the
+/// registrar publishes the rotation only if it is to the committed key,
+/// if one was.
+///
+/// The successor's own commitment goes inside both signatures as `next`,
+/// so its key is made first. A commitment registered for the successor
+/// afterward would leave a window in which a thief holding only the
+/// successor's key could post this rotation at another registrar beside
+/// a commitment to a key of its own.
 pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let reg = discover(&a)?;
     let old = identity(&a)?;
-    let new = IdentityKey::from_seed(&read_seed(Path::new(a.one("to")?))?);
+    let to = a.one("to")?;
+    let new = IdentityKey::from_seed(&read_seed(Path::new(to))?);
+    let next_key = match a.opt("next-key") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => Path::new(to).with_extension("next.key"),
+    };
+    let card = Path::new(to).with_file_name("successor-card.bin");
+    // The next key is the only key the successor can rotate to, so it may
+    // not be a file the printed `hlid card` step or this rotation reads
+    // as another key.
+    for (other, what) in [
+        (card.clone(), "the successor card the next step writes"),
+        (Path::new(to).to_owned(), "--to"),
+        (a.file("identity", IDENTITY_KEY)?, "the identity key"),
+    ] {
+        if same_file(&next_key, &other) {
+            return Err(format!(
+                "--next-key {} is {what}; name another file",
+                next_key.display()
+            ));
+        }
+    }
     let bytes = Rotation {
         identity: old.public(),
         successor: new.public(),
         time: now(),
-        next: None,
+        next: Some(successor_commitment(&next_key)?),
     }
     .sign(&old, &new)
     .map_err(|e| refuse_unreadable("rotation", e))?;
@@ -412,9 +441,9 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
 
     // The successor has no card, and `register` puts the attestation
     // into one of the registering identity's own, so the next step is
-    // two commands: a card, then a reissue per handle. The old card,
-    // when it is where it usually is, fills in the name and the handles.
-    let to = a.one("to")?;
+    // two commands: a card carrying `next`, which the registrar now holds
+    // for the successor, then a reissue per handle. The old card, when it
+    // is where it usually is, fills in the name and the handles.
     let old_card = a
         .file("card", CARD_FILE)
         .ok()
@@ -431,7 +460,6 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
     if handles.is_empty() {
         handles.push("HANDLE");
     }
-    let card = Path::new(to).with_file_name("successor-card.bin");
     let card = card.to_string_lossy();
     println!(
         "next: the successor {} needs a card of its own, and then each handle again \
@@ -439,9 +467,10 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
         Fingerprint::of(&new.public())
     );
     println!(
-        "  hlid card --identity {} --name {} -o {}",
+        "  hlid card --identity {} --name {} --successor-key {} -o {}",
         shell_word(to),
         shell_word(name),
+        shell_word(&next_key.to_string_lossy()),
         shell_word(&card)
     );
     for h in handles {
@@ -458,6 +487,21 @@ pub(crate) fn rotate_cmd(args: &[String]) -> R<()> {
          logs in there"
     );
     Ok(())
+}
+
+/// Whether two paths name one file, the second perhaps not yet made: each
+/// is resolved as far as it exists, its directory if not itself.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| {
+        p.canonicalize().unwrap_or_else(|_| {
+            let dir = p.parent().filter(|d| !d.as_os_str().is_empty());
+            dir.unwrap_or(Path::new("."))
+                .canonicalize()
+                .map(|d| d.join(p.file_name().unwrap_or_default()))
+                .unwrap_or_else(|_| p.to_owned())
+        })
+    };
+    resolve(a) == resolve(b)
 }
 
 /// A word as a POSIX shell reads it back: bare when that is safe, else

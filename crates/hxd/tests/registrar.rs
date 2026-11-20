@@ -1191,6 +1191,178 @@ async fn hlid_registers_revokes_and_rotates() {
     assert_eq!(a.registered, card.attestations[0].registered);
 }
 
+#[tokio::test]
+async fn hlid_rotate_signs_the_successors_commitment_and_the_successor_is_held_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let url = format!("http://{}", s.ng);
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    let (ok, _, err) = hlid(
+        &bin,
+        &home,
+        &[
+            "register",
+            "--registrar",
+            &url,
+            "--handle",
+            "alice",
+            "--successor-commit",
+            "--no-put",
+        ],
+    )
+    .await;
+    assert!(ok, "{err}");
+
+    let succ = home.join("successor.key");
+    let succ = succ.to_str().unwrap();
+    // A next key where a printed step or a key already lives would be
+    // written over, so it is refused before anything is made or posted.
+    let card = home.join("successor-card.bin");
+    let seed = std::fs::read(succ).unwrap();
+    let rotate = ["rotate", "--registrar", &url, "--to", succ, "--next-key"];
+    for next in [
+        card.clone(),
+        home.join(".").join("successor-card.bin"),
+        PathBuf::from(succ),
+        home.join("identity.key"),
+    ] {
+        let next = next.to_str().unwrap();
+        let (ok, _, err) = hlid(&bin, &home, &[&rotate[..], &[next]].concat()).await;
+        assert!(!ok, "{next}");
+        assert!(err.contains("--next-key"), "{err}");
+    }
+    assert!(!card.exists());
+    let old = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], old.fingerprint().to_string());
+    // Nor does `hlid card` write over a key.
+    let card_over = ["card", "--identity", succ, "--name", "A", "-o", succ];
+    assert!(!hlid(&bin, &home, &card_over).await.0);
+    assert_eq!(std::fs::read(succ).unwrap(), seed);
+
+    let (ok, out, err) = hlid(&bin, &home, &["rotate", "--registrar", &url, "--to", succ]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("rotate published"), "{out}");
+    let new = IdentityKey::from_seed(&hex32(Path::new(succ)));
+    let signed_next = records_of(&s, &new)
+        .await
+        .iter()
+        .find_map(|r| match r {
+            Record::Rotate(r) => Some(r.next),
+            _ => None,
+        })
+        .expect("a rotation under the successor");
+    assert!(signed_next.is_some(), "the rotation carries no next");
+    let next_key = home.join("successor.next.key");
+    let next = IdentityKey::from_seed(&hex32(&next_key));
+    assert_eq!(signed_next, Some(commitment(&next)));
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], new.fingerprint().to_string());
+    assert_eq!(found["successor"], next.fingerprint().to_string());
+
+    // A thief holding the successor's key alone rotates it nowhere else.
+    let other = dir.path().join("other.key");
+    let other = other.to_str().unwrap();
+    assert!(hlid(&bin, &home, &["keygen", "identity", other]).await.0);
+    let rotate = ["rotate", "--registrar", &url, "--identity", succ, "--to"];
+    let (ok, _, err) = hlid(&bin, &home, &[&rotate[..], &[other]].concat()).await;
+    assert!(!ok);
+    assert!(err.contains("successor_mismatch"), "{err}");
+    let next_key = next_key.to_str().unwrap();
+    let (ok, out, err) = hlid(&bin, &home, &[&rotate[..], &[next_key]].concat()).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("rotate published"), "{out}");
+}
+
+/// `-o` may be a pipe (`-o /dev/stdout | base64`), which the check for a
+/// key already there must not open for reading.
+#[cfg(unix)]
+#[test]
+fn hlid_card_writes_to_a_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let hlid = || {
+        let mut c = std::process::Command::new(&bin);
+        c.env("HLID_HOME", &home);
+        c
+    };
+    let init = hlid().args(["init", "--name", "Alice"]).status();
+    assert!(init.unwrap().success());
+    let fifo = dir.path().join("out");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+    let drain = std::thread::spawn({
+        let fifo = fifo.clone();
+        move || std::fs::read(fifo).unwrap()
+    });
+    let mut child = hlid()
+        .args(["card", "--name", "Alice", "-o"])
+        .arg(&fifo)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let Some(status) = child.try_wait().unwrap() else {
+        child.kill().unwrap();
+        // A writer lets the reader's open return, so the test ends.
+        drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        panic!("hlid card -o <pipe> did not finish");
+    };
+    assert!(status.success());
+    Card::parse(&drain.join().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn hlid_rotate_to_a_successor_holding_a_commitment_names_that_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let url = format!("http://{}", s.ng);
+    let (home, succ_home) = (dir.path().join("hlid"), dir.path().join("successor"));
+    let succ = succ_home.join("identity.key");
+    let (succ, held) = (succ.to_str().unwrap(), succ_home.join("successor.key"));
+    for (home, name, handle, key) in [
+        (&succ_home, "Bob", "bobby", None),
+        (&home, "Alice", "alice", Some(succ)),
+    ] {
+        assert!(hlid(&bin, home, &["init", "--name", name]).await.0);
+        let mut args = vec!["register", "--registrar", url.as_str(), "--handle", handle];
+        args.extend(["--successor-commit", "--no-put"]);
+        args.extend(key.iter().flat_map(|k| ["--successor-key", *k]));
+        let (ok, _, err) = hlid(&bin, home, &args).await;
+        assert!(ok, "{err}");
+    }
+    let new = IdentityKey::from_seed(&hex32(Path::new(succ)));
+    let c = IdentityKey::from_seed(&hex32(&held));
+
+    let rotate = ["rotate", "--registrar", &url, "--to", succ, "--next-key"];
+    let fresh = dir.path().join("fresh.key");
+    let (ok, _, err) = hlid(
+        &bin,
+        &home,
+        &[&rotate[..], &[fresh.to_str().unwrap()]].concat(),
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("successor_mismatch"), "{err}");
+    let (ok, out, err) = hlid(
+        &bin,
+        &home,
+        &[&rotate[..], &[held.to_str().unwrap()]].concat(),
+    )
+    .await;
+    assert!(ok, "{err}");
+    assert!(out.contains("rotate published"), "{out}");
+    let found = get(&s, "/registrar/lookup/alice").await.json();
+    assert_eq!(found["fingerprint"], new.fingerprint().to_string());
+    assert_eq!(found["successor"], c.fingerprint().to_string());
+}
+
 /// How a verifier trusts the registrar.
 enum Trust {
     /// On the key in its config.
