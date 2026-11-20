@@ -1,7 +1,7 @@
 # Applying a registrar's records: the verifying server
 
 Status: R1, R2 and R3 built; R4 is designed further before it is
-staged. §6 stages it.
+staged; R5, device epochs, is specified and not built. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -154,6 +154,22 @@ What refuses a stolen key at a server that never
 held its list is its holder revoking it, and the operator's own
 `revoked_identities`.
 
+A device epoch floor (`identity-registrar.md` §4.10, §7.3) is kept apart
+from the lists, for the same reason: the highest device epoch record
+verified for an identity is written to a table of its own, by the
+identity's fingerprint, only ever upward, and re-verified as it is read,
+and it is applied at every login of that fingerprint whatever the card
+shows and whatever later lists say. A list that no longer carries the
+record lowers nothing, and a thief showing an older card with no
+attestations, onto an account linked to the identity, is refused here
+once this server has seen the reset. An old record replayed is a lower
+or equal floor and does nothing. Beside it the server keeps, for each
+`epoch` it has seen for the identity, the earliest `time` it has seen
+for that `epoch`, kept only ever earlier, since registrars prune
+superseded records from the full list and one `epoch` can be posted to
+two registrars with two times; that time decides which friendship
+presentations it keeps (`proposals/portable-friends.md` §6).
+
 ## 4. Rotation at the server
 
 §7.4 as written: accepted from a trusted registrar's list, or from an
@@ -270,3 +286,55 @@ its configured key.
   and waits again, which is the letter of "durable for a day".
 - **R4: standing and probation.** §7.5 and `identity-vouch.md`, which is
   a draft of its own and is designed further before it is staged.
+- **R5: device epochs.** §4.10 there, in four parts, each with its
+  tests, after the `hl-identity` pin advances to the record.
+  - *The registrar accepts and publishes resets*: `POST records`' order
+    of §6.2 there, with `epoch` in the answer to a retry of either kind
+    ahead of the rate limits, the step bound, a `time` before the last
+    reset's refused, the daily limit of §10 there, the refusal of a
+    device-signed record or vouch withdrawal whose signer is below the
+    floor, and the superseded record leaving the full list but kept in
+    the per-identity list, in the transaction that publishes the next,
+    in both registrar stores.
+  - *The server refuses certificates below the floor*: one question of
+    the core, asked with an identity, a device and an epoch, in place of
+    asking after an identity and a device, so that no caller can leave
+    the epoch out; each session's identity tag carrying the epoch it
+    proved; the published floors beside the published revocations; the
+    check at `auth`, at the classic device proof (refused alike with
+    every refusal but the clock's), at a device on file, at token
+    redemption and resume; the sweep ending the sessions it now refuses,
+    connected or detached, on both wires; `epoch` in `auth`'s refusal;
+    and no certificate below the floor answered for sealing.
+  - *The floor kept* (§3): `identity_device_floor` (fingerprint, epoch,
+    the signed record) and the earliest `time` seen for each epoch, a
+    schema migration and so a minor release, read for every login of the
+    fingerprint. The e2e has a reset outlive the record's deletion at
+    the registrar and a restart of the server, and refuse an older card
+    without attestations once the server has seen the reset, while a
+    server that never saw it admits that card onto its linked account,
+    the residual it is.
+  - - *What a reset device signed and registered*: each device-signed
+    record in a list checked against the floor before it is applied;
+    friendship objects checked with it, the friendships held before the
+    reset kept, a presentation of one not held answered `Reset`, and the
+    presentations of a friendship no longer held, its hash's earliest
+    time of taking at or after a half's reset `time`, dropped when the
+    floor is installed or rises or a half's reset `time` moves earlier
+    from any record (`proposals/portable-friends.md` §6), with the time
+    of taking kept as it was when the same hash is presented again;
+    vouch withdrawals kept only where a registrar published them before
+    its floor, each one taken from a list kept with that registrar and
+    its `seq`; and push registrations carrying their certificate's epoch
+    and removed below it when it is installed, on the path that removes
+    a revoked device's (push-notifications.md §5.1). Installing a floor
+    judges again each of these taken before it was known
+    (`identity-registrar.md` §7.3).
+
+  What a reset leaves, as a device revocation leaves it today: a server
+  that has not fetched a list since the reset and cannot reach the
+  registrar admits a certificate below it under `revocation_stale =
+  cached`; an identity never attested has no registrar to publish one;
+  a card without attestations at a server that holds no floor for the
+  identity is admitted with no fetch; and across a link nothing is
+  checked (`server-link.md` §7.7).

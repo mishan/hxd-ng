@@ -306,6 +306,25 @@ makes a local edge, as the extension describes.
   of the target, so it is outside `instant-messaging.md` §4.4's
   friend-request bounds, ledger and holds, and it lapses, is declined
   or is canceled touching the offer alone.
+  An 802 with an offer on an edge left inactive by a `Reset` is an
+  upgrade offer too, on two conditions. The target's own presentation of
+  a friendship for the pair must have been answered `Reset` here (§4.3),
+  which is the target's consent at this server. And the sender's own
+  identity's half of that friendship must be below its floor (§6), which
+  the server checks against the friendship the `Reset` record keeps.
+  Whether it qualifies is decided when the 802 arrives, and stays so. It
+  is checked first as any 802 with an offer is, so that it tests no
+  hidden link, and it is answered the same whether or not it qualifies:
+  as a friend request is, on this wire, and `pending_out` on the ng wire
+  (`hotline-ng.md` §7.5), so the answer says nothing of the target's
+  presentation; only that a qualifying one skips the friend-request
+  ledger and bounds could tell, a small leak to a party that already
+  holds the friendship. The target's client asks its user before
+  accepting, since the offer comes from a device the old friendship did
+  not name. Its acceptance makes the edge portable, presented by both
+  and active. It is then an active edge as any other, held to both
+  parties' `MaxRosterSize`, with §4.3's effects of activation, and the
+  `Reset` record goes.
 - **Friend Response (805)** accepting carries the whole friendship,
   which the accepting client builds from the offer it was sent, from a
   device-proved session signing the acceptance with its own
@@ -394,26 +413,47 @@ other for good.
 
 For each friendship the server checks, in this order:
 
-1. the friendship (the objects' §3 steps 1 to 5), and that one of its
-   identities is the presenting account's linked fingerprint: else
-   `BadSignature`; then, unless it is for an edge already active, the
-   presenter's own bound on inactive presentations (below), else
+1. the friendship (the objects' §3 steps 1 to 5) with every floor taken
+   as 0, so that its signatures verify whatever the floors, and that one
+   of its identities is the presenting account's linked fingerprint:
+   else `BadSignature`; then, unless it is for an edge already active,
+   the presenter's own bound on inactive presentations (below), else
    `RosterFull`, before anything of the other party is looked at;
 2. the other party: if it has no account here, or one messaging
    refuses, or one that has blocked the presenter here, it answers
-   `AccountNotFound`, keeping nothing new and changing nothing it
-   already holds, as Find User answers all three;
+   `AccountNotFound`, keeping only the hash, counted toward the bound
+   below, and changing nothing it already holds, as Find User answers
+   all three;
    and the same if the presenter has blocked it here, which tells the
    presenter only of its own block, and leaves the client to present
    again after an unblock;
 3. withdrawals: if one it holds ends the friendship, `Withdrawn`, unless
-   the other party's link is one step 4 would hide, when it answers
-   `AccountNotFound` and keeps nothing new;
-4. if the other party's link is one this server would not show the
+   the other party's link is one step 5 would hide, when it answers
+   `AccountNotFound`, keeping only the hash as step 2 does. A held
+   withdrawal is judged against the current floor of its signer (§6), so
+   `Withdrawn` comes before any `Reset`;
+4. floors: if a half's certificate is below its signer's device epoch
+   floor here and the friendship is not held here (§6), `Reset`,
+   whichever party's half it is; but where step 5 would hide the other
+   party's link, `AccountNotFound`, as step 3 answers for a hidden
+   party, since reaching this step already says the other party passed
+   step 2. It comes after step 3 so that a withdrawal held here wins.
+   Either answer keeps a `Reset` record: the friendship itself, by its
+   hash, so that the upgrade offer that remakes it (§4.1) can be checked
+   against which half is below the floor. The record is counted toward
+   the bound of step 1, shown to nobody, and does not make the
+   friendship held. It goes when that upgrade offer's acceptance
+   activates the edge, when the presenter presents another friendship
+   for the pair, or 30 days after the last presentation of it answered
+   `Reset`, or `AccountNotFound` in its place on the classic wire (§7),
+   which a client presenting the friendship again at each login keeps
+   restarting; while a qualifying upgrade offer for it is pending, it is
+   kept until the offer is answered or lapses;
+5. if the other party's link is one this server would not show the
    presenter, `AccountNotFound` too, but it records the presentation
    (below), since activation needs both parties and so shows nobody
    anything the hidden party has not chosen;
-5. otherwise `OK`, and it records that this party has presented it,
+6. otherwise `OK`, and it records that this party has presented it,
    replacing any friendship this party presented here for the pair
    before. A replacement on an active edge sends both parties'
    sessions its entry again, with the hashes it now carries.
@@ -432,24 +472,23 @@ on it are released when it is active again.
 An active edge counts toward each party's `MaxRosterSize`, as
 `instant-messaging.md` §4.4 counts roster states, in place of any
 pending request or approval between the pair that its activation ends.
-Past the presenter's own, it does
-not become active: the presentation is kept and the presenter answered
-`RosterFull`, its own count. Past the other party's, the presenter is
-answered `OK`, since the other party's roster is not the presenter's
-business, and the edge becomes active when the other party next
-presents or has room. Presenting again for an edge already active is
-never `RosterFull`. An inactive presentation is shown to nobody and
-does not count toward the cap, so that a cap's answer says nothing of a
-hidden party. Inactive presentations are bounded on their own, at
-`MaxRosterSize` per presenting account; past it a presentation is
-refused `RosterFull` at step 1, rather than an older one dropped while
-the client still records it as presented. The bound counts every
+Past the presenter's own, it does not become active: the presentation is
+kept and the presenter answered `RosterFull`, its own count. Past the
+other party's, the presenter is answered `OK`, since the other party's
+roster is not the presenter's business, and the edge becomes active when
+the other party next presents or has room. Presenting again for an edge
+already active is never `RosterFull`. An inactive presentation is shown
+to nobody and does not count toward the cap, so that a cap's answer says
+nothing of a hidden party. Inactive presentations are bounded on their
+own, at `MaxRosterSize` per presenting account; past it a presentation
+is refused `RosterFull` at step 1, rather than an older one dropped
+while the client still records it as presented. The bound counts every
 friendship the account has presented here that is not active, whether
-step 4 recorded it or step 2 kept nothing of it but its hash, as the
-identity draft has it, so that reaching it says nothing of which other
-parties were hidden. A
-party's presentations are dropped when it unlinks or its account is
-deleted; its withdrawals are kept.
+step 5 recorded it, step 4 kept it for a `Reset`, or step 2 or 3 kept
+nothing of it but its hash, as the identity draft has it, so that
+reaching it says nothing of which other parties were hidden. A party's
+presentations are dropped when it unlinks or its account is deleted; its
+withdrawals are kept.
 
 **A hidden link.** An account whose identity link this server would not
 show is not found by others. Presenting a friendship is that account
@@ -518,10 +557,11 @@ friendship hash, or for a withdrawal its pair hash, and a reason code.
 | Reason | For | The client |
 |---|---|---|
 | `OK` (0) | presented, or a withdrawal taken | records it as presented here |
-| `AccountNotFound` (1) | steps 2 to 4 | tries again at a later login |
+| `AccountNotFound` (1) | steps 2 to 5 | tries again at a later login |
 | `RateLimited` (10) | past the rate below | tries again after the ng wire's `retry_after`, or on the classic wire, which carries no delay, backs off |
 | `RosterFull` (12) | step 1's bound, or activation past a cap, which may pass | tries again when it has room |
 | `BadSignature` (16) | step 1, or a withdrawal that does not verify or is not the presenter's | drops the object |
+| `Reset` (new) | step 4: a friendship whose signatures verify, with a half below its signer's floor, that is not held here (§6) | keeps its copy; where the half is its own identity's, remakes it from a current device (§6); where it is the friend's, waits for the friend's upgrade offer, which it asks its user about |
 | `Withdrawn` (new) | step 3, or a half at 802 or 805 that a withdrawal held here ends | with the withdrawal beside it, treats the friendship as withdrawn once it has checked that (§5.3); with none, the server's own (above), stops presenting it here; at 802 or 805, which carry none, tries again after `S` |
 | `Stale` (new) | an object whose `time` is not within `S` of the server's clock: a withdrawal here or at 803 and 806, an offer or an acceptance at 802 and 805 | signs it afresh, or tells the user its clock is off |
 
@@ -540,7 +580,7 @@ before the friend family's roster request, for the same reason.
 **Rate.** Each object costs a signature check, a friendship about
 four, so a server keeps with each presentation the hash it checked,
 and the same account presenting again under that hash skips step 1's
-signatures, though never steps 2 to 4. The hash goes with the
+signatures, though never steps 2 to 5. The hash goes with the
 presentation, and being the presenter's own it says nothing of anyone
 else's. Presenting draws on the same per-account rate as Find User
 (822), which the extension requires to be rate-limited, one object at
@@ -653,11 +693,20 @@ Hotline server (§11).
 A client handed a withdrawal ending one of its friendships, in a
 `Removed` entry or a reply, checks it whole (the objects, §4); one whose
 `from` is the verified successor of one of the pair counts as that
-party's (§10). It also checks the signing device against the
-revocations it knows, and does not spread one a revoked device signed,
-since a dishonest server can hand it one signed after the theft (§6).
-It never acts on one it has not checked, and a `Removed` without one
-changes nothing beyond that server's row.
+party's (§10). It also checks the signing device against the revocations
+and device epoch floors it knows, and does not spread one a revoked
+device signed, or one whose signer is below a floor it knows, since a
+dishonest server can hand it one signed after the theft (§6). Before
+spreading one it MUST fetch the withdrawer's records from the registrars
+of the attestations it holds for that identity, past any cache, and
+spreads nothing until one such fetch succeeds: a device that was reset
+can still sign one at a server that never learned the floor, and a
+spread of it, signed by the friend's own device, would pass everywhere.
+An identity it holds no attestation for has no registrar to ask and so
+no floor to learn, and its withdrawals are spread as before; that is the
+residual of an unattested identity. It never acts on one it has not
+checked, and a `Removed` without one changes nothing beyond that
+server's row.
 
 Once it has checked one, it signs its own: the same pair, `party` the
 original's effective party (the objects, §4), left out where that is
@@ -754,14 +803,125 @@ does not recognize is withdrawn. Confirming stops a thief only once the
 owner suspects the device; until then, its friendships look like any
 other device's.
 
+**A device reset** (`identity-registrar.md` §4.10) names certificates
+rather than a device key: every certificate of the identity below the
+new floor is revoked, and the objects' check refuses an offer,
+acceptance, withdrawal or friendship any half of which a device below it
+signed, however it is dated, once that half's signatures verify (the
+objects, §5). A server holding the floor applies that check to
+everything it is handed from then on, and counts no withdrawal it holds
+from such a device, so a thief whose device was reset can neither make a
+friendship nor end one the owner makes after it, wherever the floor is
+known.
+
+**What a server already held stands.** A friendship is *held* at a
+server when the server's time of taking it, below, comes before the
+reset `time` of each of its halves that is below its signer's floor. For
+a half whose certificate is in epoch `e`, that is the earliest `time` of
+any device epoch record with an `epoch` above `e` that this server has
+seen. A registrar keeps superseded device epoch records in the
+per-identity list (`identity-registrar.md` §4.9), and one `epoch` can be
+posted to two registrars with two times, so a server keeps, for each
+identity, the earliest `time` it has seen for each `epoch`. A later time
+holds more, not less: a server that has seen only a later time holds
+what it took in between until a half's reset `time` moves earlier, from
+any record, including one for an `epoch` it never had, and then judges
+again (below). The time of taking a friendship is the earliest at which
+the server took any presentation of it stored now under its hash;
+presenting the same hash again leaves that time as it was, so presenting
+again never moves it later and never un-holds the friendship. The
+comparison is of a time on this server's side with a time the identity
+key signed, never of a certificate with a time, which §4.10 there
+forbids. A record kept for a `Reset` (§4.3) does not make a friendship
+held.
+
+A held friendship stays, with its presentations, and is shown as before;
+presenting it again there, as the friend's client does, is answered as
+before. Its halves skip the floor, but the withdrawals the server holds
+are still judged against the current floor, so a reset device's
+withdrawal ends it no more there than anywhere. A server does this for
+every presentation, held or not, in one order: it keeps the held
+withdrawals that stand at the current floor (`hl-identity`'s
+`Held::stands`), calls `Friendship::check` with those and `|_| 0` for
+the halves, which answers `Withdrawn` first wherever a standing
+withdrawal ends the friendship, and only then tests the halves' floors
+itself, unless the friendship is held, for `Reset`. `Held::stands` is
+public from the hx-libs change that tests the floor after the
+signatures; at the release before it, the same test is
+`Held::withdrawal().cert` read with `DeviceCert::parse` and checked with
+`check_floor` (the objects, §5). Only a friendship not held is refused,
+with `Reset` and not `BadSignature`, so the friend's client, which
+checked the friendship when it was made, keeps its copy.
+
+**When a floor is installed or rises, or whenever a half's reset `time`
+moves earlier, from any record**, a server judges again what it stored
+before. It drops the presentations of each friendship that is no longer
+held: whose earliest time of taking, above, is at or after the reset
+`time` of a half below the floor. A held friendship keeps every
+presentation stored under its hash, a later one by the other party
+included. Where a drop leaves the other party's presentation standing,
+the edge goes inactive, keeping its id, as for any dropped presentation
+(§4.3); where the edge was active, both parties are told `Removed`
+without a withdrawal, as for a revocation, and an inactive presentation,
+shown to nobody, is dropped without a word. Without this, a server slow
+to learn of a reset would keep for good an edge a thief made after it.
+
+A presentation taken before the reset's `time`, as a thief's while it
+still had the device can be, is held, and a friendship the thief made
+then stands at that server. That is the residual of grandfathering.
+Where the owner knows which device leaked, a reset after a theft is
+paired with an identity-signed revocation of that key
+(`identity-registrar.md` §4.4), which drops what the device presented
+wherever it is applied (above). Where it does not know, which is when a
+reset is most often the answer, the residual stands, and the owner
+withdraws, from a current device, any friendship it does not recognize.
+
+A reset also voids the owner's own withdrawals signed before it by
+devices now below the floor. A friend the owner removed then, presenting
+the old friendship at a server that held only that withdrawal, is
+answered `Reset` rather than `Withdrawn`: the friendship still does not
+stand, but the friend's client is told to wait for an upgrade offer that
+will not come. The owner's client keeps its cutoffs (§5.1) and signs
+them afresh from a current device for each server, which restores the
+`Withdrawn` there.
+
+**Remaking one.** A pre-reset friendship presented where it was not held
+is made again by the party whose half is below its floor, from a device
+enrolled since: an upgrade offer (§4.1), taken only on an edge the other
+party's own presentation was answered `Reset` on here. Its acceptance
+makes a friendship whose halves check; the edge is then an active edge
+as any other, held to both parties' `MaxRosterSize` and with §4.3's
+effects of activation. Each party's devices present the new friendship
+from then on in place of the old, at every server where the old one was
+answered `Reset`, and may present it where the old one is held, which
+replaces the old there. A party whose own presentation was answered
+`Reset` before the other party presented has no such edge to offer on:
+it sends an ordinary offer in Add Friend (802), a friend request held to
+the usual bounds, which the other party's client recognizes as the
+friendship it holds and asks its user about.
+
+A device enrolled after a reset learns what to remake as a new device
+learns any friendship (§5.2): from the entries of servers where the
+friendship is held and active, and Get Friendships there, where it finds
+a friendship whose own half is below the floor it knows. It does not
+adopt it as it stands; it asks the user, as adoption does, and on yes
+sends an upgrade offer on that active edge, as §4.1 allows on any edge
+between two linked accounts, and presents the result where the old
+friendship was answered `Reset`. Get Friendships answers only for active
+edges, so a friendship answered `Reset` everywhere it was presented is
+not learned this way: the new device learns it only from the friend's
+offer, or from another of its person's devices, the channel §11 leaves
+open.
+
 A device that holds the identity key (a holder, `identity-enrollment.md`)
 is the identity: revoking it is not enough, and only rotating the
 identity (`identity-registrar.md` §4.6) recovers from its theft.
 
-How a client learns of a revocation: from the registrar's records for
-an attested identity, or because the user revoked the device from this
-client. An identity with no registrar may never tell its other devices,
-which is part of why adoption asks rather than waiting for one.
+How a client learns of a revocation or a reset: from the registrar's
+records for an attested identity, or because the user revoked the
+device, or reset, from this client. An identity with no registrar may
+never tell its other devices, which is part of why adoption asks rather
+than waiting for one.
 
 ---
 
@@ -769,10 +929,21 @@ which is part of why adoption asks rather than waiting for one.
 
 The classic wire needs fields, transactions, reason codes and a
 capability bit, all fogWraith's to number, asked for with message
-requests' in one list (`instant-messaging.md` §7). He has reserved
-them, which is not adopting this draft: `CAPABILITY_FRIENDSHIPS` is bit
-15 (`0x8000`), Present Friendships 833 and Get Friendships 834, and the
-fields and codes are as below.
+requests' in one list (`instant-messaging.md` §7). He has reserved them,
+which is not adopting this draft: `CAPABILITY_FRIENDSHIPS` is bit 15
+(`0x8000`), Present Friendships 833 and Get Friendships 834, and the
+fields and codes are as below, but for `Reset` (§4.3), which device
+epochs added later and is still to be asked for. Until it has a number,
+a classic server answers `AccountNotFound` where §4.3 would answer
+`Reset`, and keeps the `Reset` record all the same, so the upgrade offer
+that remakes the friendship is still taken. The client keeps its copy
+and tries again later, and nothing leaks, since that answer already
+covers every other party it cannot be told about. A classic client is
+not told which friendships need remaking, so one whose identity was
+reset sends an upgrade offer for each pre-reset friendship whose own
+half is below the floor that this device knows it presented at this
+server, or that its user confirms there, so that presenting stays
+opt-in (§5.1).
 
 | Field | Number | Type | In |
 |---|---|---|---|
@@ -786,6 +957,7 @@ fields and codes are as below.
 |---|---|---|
 | 18 | `Withdrawn` | A withdrawal this server holds ends the friendship |
 | 19 | `Stale` | A friendship object's `time` is not within `S` of the server's clock |
+| (to ask for) | `Reset` | A friendship whose signatures verify, with a half signed below its identity's device epoch floor, that is not held here (§6) |
 
 `BadSignature` (16) is the identity draft's, for a signed message that
 fails; this widens it to friendship objects.
@@ -846,7 +1018,8 @@ and its friend request event, a `friendship` on its accept, a
 cancels an upgrade offer, `friendships` (hashes) on entries, the
 requests `friendships_present`, answered for each object, and
 `friendships_fetch` by hash or fingerprint, answered with friendships
-and `rotations`, and the errors `withdrawn` and `stale`. The capability
+and `rotations`, the result `reset` (§4.3), and the errors `withdrawn`
+and `stale`. The capability
 is a `friendships` family (`hotline-ng.md` §4), offered only to a
 session whose login proved a device, and never without `messaging`, in
 place of bits 13 and `CAPABILITY_FRIENDSHIPS`. An ng login proves its
@@ -884,7 +1057,9 @@ they are reserved before PF3 needs them.
    any port; `[identity] classic_hosts` and `classic_proof`, owed to
    `hotline-ng-identity.md` §12. The server's half is built, driven by
    `hxproto`'s builders and parsers in `crates/hxd/tests/device_proof.rs`
-   and `friendships_classic.rs`; GtkHx's is still to come.
+   and `friendships_classic.rs`; GtkHx's is still to come. Device
+   epochs' `Reset` (§4.3) waits for its number, and is answered
+   `AccountNotFound` on this wire until then (§7).
 4. **PF4, upstream.** §4's rules and §7's numbers as the identity
    draft's second version, citing the objects, written server-neutral
    once PF2 has shown they work: without hxd-ng's settings (`[identity]

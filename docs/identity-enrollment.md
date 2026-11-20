@@ -551,6 +551,61 @@ answered like one, defaulting to no rather than to yes. A user who said
 renewals should cost a code did not say they should cost a code and one
 Return.
 
+**Across a device reset.** A reset (`identity-registrar.md` §4.10)
+revokes every certificate of the identity below its new floor, so a
+holder's record of what it certified no longer has to be complete: a
+device it forgot is revoked with the rest. Bringing a device back after
+one is always a fresh enrollment with a new device key:
+
+- A holder MUST NOT renew a `prev` whose `epoch` is below the floor it
+  knows for the identity. It answers as it answers a lapsed `prev`: the
+  device enrolls afresh, with a code and a person.
+- An enrollee whose certificate was refused at login with `epoch`
+  (`hotline-ng-identity.md` §5.3) MUST generate a new device keypair
+  before it enrolls again.
+- A holder MUST refuse a request for a device key that its own record
+  shows certified below the floor, or that the registrar's records show
+  in a device revocation or as the signer, with a certificate below the
+  floor, of any record, with `denied` and a reason the enrollee can act
+  on: the device's key was signed out by a reset, and it makes a new
+  one.
+
+Renewing the same key at the new epoch would undo the reset for the key
+it was most likely for. Certificates are not secret: a server answers
+one for sealing, and a friend's client sees them in friendships. If a
+device key was copied, a new certificate for it reaches whoever holds
+the copy, and the holder cannot tell which device leaked, or whether any
+did. A new key for every device that comes back is right in every case,
+and costs one code per device the person still uses, after something
+rare. A new key is a new device to every server: sealed messages waiting
+for the old key cannot be read by the new one, and its push
+registrations go with the old key, so it registers again. Friendships a
+server held before the reset are kept there; one a server must be shown
+afresh is made again from the new device
+(`proposals/portable-friends.md` §6). A client that reuses its key,
+enrolled by a holder that has lost its record of that key, is certified
+at the new epoch and gets a copy back in; that is a residual of any
+client that does not make a new key.
+
+**Minting at the current epoch.** A holder sets a certificate's `epoch`
+to the highest floor it knows (`hotline-ng-identity.md` §3.3). Minting
+and resetting take one lock, and a mint reads the epoch under it as it
+signs, not when its session opened or its prompt was shown, so no
+certificate is signed at the old epoch after a reset. It SHOULD fetch
+the identity's records from each registrar that attests it
+(`identity-registrar.md` §6.2) before it answers any request while it is
+online, as `agent` is. A holder that renews its own certificate offline
+mints at the epoch it last learned, and if that is stale the certificate
+is refused at first use and minted again once the next fetch corrects
+it. An enrollee SHOULD check a delivered certificate against the records
+it can fetch, and tell its user that the holder that answered is behind
+a device reset rather than store a certificate that is already dead; it
+then makes a new device key and enrolls again with it, as one refused at
+login does, since a holder that recorded the dead certificate refuses
+that key (above). A device that certifies itself from an envelope
+(`identity-registrar.md` §9.4) MUST fetch the records first: it has just
+reached the registrar for the envelope, so this costs one more `GET`.
+
 ---
 
 ## 9. What the mailbox is trusted with

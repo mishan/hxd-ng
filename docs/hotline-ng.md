@@ -365,7 +365,7 @@ Errors:
 | `bad_request` | `params` present but malformed. |
 | `login_failed` | No such account, or the wrong password. Deliberately one code (rationale §5). |
 | `denied` | The server's identity policy refused this socket (hotline-ng-identity.md §8.1). No credentials failed, and there is nothing to retry. |
-| `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). |
+| `revoked` | The socket's identity or device key was revoked on this server after it authenticated (identity-registrar.md §7.3). For a device certificate below its identity's device epoch floor, the error carries `epoch`, the floor, so a client can say its device was signed out by a reset and enroll again with a new key (hotline-ng-identity.md §3.3, §5.3). |
 | `banned` | The address or identity is banned. *hxd-ng* refuses a banned address before the upgrade — closing the TCP connection at accept, or answering the HTTP request 403 — and never sends this code. |
 | `server_full` | No uid is free. |
 | `too_many_connections` | The account already holds as many connections as the server lets one account hold. Waiting does not help and there is no `retry_after`: closing one of the others does. *hxd-ng:* `[limits] connections_per_account`, for an account with a password or a linked identity (§9). |
@@ -414,7 +414,7 @@ Errors:
 | `session_expired` | No such session, the token is wrong, or the grace window lapsed. Log in again. |
 | `ended` | The session was ended by a device of its own person (`device_end`, §7.6). Do not log in again on your own. |
 | `kicked` | The session was kicked. Do not log in again on your own. |
-| `revoked` | As for `login` (§6.1): the session's identity or device key was revoked here (identity-registrar.md §7.3). A login with that key is refused the same way. |
+| `revoked` | As for `login` (§6.1): the session's identity or device key was revoked here (identity-registrar.md §7.3), with `epoch` where its certificate is below the floor. A login with that key is refused the same way. |
 | `banned` | As for `login` (§6.1), with `reason` and `expires_at`: the session was kicked with a ban, or banned, and the ban stands. |
 | `too_many_connections` | As for `login` (§6.1): the session's account holds as many connections as it may. The session is left as it was, and a resume after one of the others has closed finds it. A resume that takes the session over from a connection not yet known to be dead is not refused for that connection. |
 | `rate_limited` | As for `login` (§6.1): the session's account has been connecting too often. The session is left as it was; retry after `retry_after` seconds. |
@@ -1468,7 +1468,15 @@ What the family's existing requests take beside what they took:
   friendship already standing between two linked accounts it is an
   **upgrade offer**: answered `{ "state": "accepted" }`, outside the
   friend-request bounds, the friendship standing whatever becomes of
-  it, and told to the friend's friendships sessions alone. An offer
+  it, and told to the friend's friendships sessions alone. An offer also
+  counts as an upgrade offer on a friendship a device reset left
+  inactive here, where the account named by `login` presented it here
+  and was answered `reset`, and the caller's own half of it is below its
+  identity's floor (portable-friends §4.1, §6). It is answered `{
+  "state": "pending_out" }`, as a friend request is, whether or not it
+  counts as one, so the answer says nothing of the friend's
+  presentation; its acceptance makes them friends here, held to the
+  roster bounds as any friend. An offer
   lapses at its `expires`: the request stays, plain, and an upgrade
   offer goes.
 - **`friend_respond` with a `friendship`** accepts the offer `login`
@@ -1530,6 +1538,7 @@ Two requests are added, answered to friendships sessions alone:
   | `no_such_user` | the other party has no account here, does not take part, or one of the two has blocked the other; counted toward the bound below as a presentation is | tries again at a later login |
   | `roster_full` | this account's own bound on friendships it presented whose friendship here is not active, or its roster as the friendship becomes active | tries again when it has room |
   | `bad_signature` | a friendship that fails its checks or names neither of this account's identity and a successor's, or a withdrawal that fails its checks or is not this session's own | drops the object |
+  | `reset` | a friendship whose signatures verify, with a half signed by a device below its identity's device epoch floor, that this server did not hold before the reset (portable-friends §4.3, §6) | keeps it; remakes it from a current device where the half is its own, and otherwise waits for the friend's upgrade offer |
   | `withdrawn` | a withdrawal held here ends the friendship | with `withdraw`, checks it and treats the friendship as withdrawn; with none, stops presenting it here |
   | `stale` | a withdrawal whose `time` is not within ten minutes of the server's clock | signs it afresh |
 
@@ -2030,7 +2039,7 @@ news body is different: it declares its own type (news.md §5).
 |---|---|---|
 | `login_failed` | `login` | Wrong account or password. |
 | `denied` | `login` | Identity policy refused this socket. |
-| `revoked` | `login`, `resume` | This identity or device key is revoked here. |
+| `revoked` | `login`, `resume` | This identity or device key is revoked here; with `epoch`, the device was signed out by a reset. |
 | `banned` | `login`, `resume` | Banned (§6.1). |
 | `server_full` | `login` | No uid free. |
 | `too_many_connections` | `login`, `resume` | The account holds as many connections as it may. |
@@ -2062,7 +2071,7 @@ news body is different: it declares its own type (news.md §5).
 | `cert_changed` | `msg` | The `cert` of a sealed message names a key other than the target's now: fetch its certificate and seal again, never in the clear (e2e-messages.md §4.3). For `boxes`, the error's `device` names the box (§4.14 there). |
 | `devices_changed` | `msg` | The `boxes` are not one for each device the target can be sealed to: the error's `devices` lists them as they are now, to seal to again. Nothing was delivered (e2e-messages.md §4.14). |
 | `bad_signature` | `chat`, `msg`, `report`, `news_post` | A `signed` that failed a check of e2e-messages.md §4.11, named by `text`: `signed too long ago; sign it again` for one whose `sent` is out of the server's window. Nothing was relayed or stored. |
-| `withdrawn`, `stale` | the `messaging` family | §7.5: a friendship object a withdrawal held here ends, or one out of the server's time. `bad_signature` is §7.5's too, for a friendship object that fails its checks. |
+| `withdrawn`, `stale` | the `messaging` family | §7.5: a friendship object a withdrawal held here ends, or one out of the server's time. `bad_signature` is §7.5's too, for a friendship object that fails its checks, and `reset` is a `friendships_present` result, not an error. |
 
 The files codes are §7.2's. Each family's document lists its own. A
 client MUST treat a code it does not recognize as a failure of that one

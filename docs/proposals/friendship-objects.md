@@ -32,11 +32,18 @@ devices can make one; a device need not hold the identity key
 as `cert`, and is signed by that certificate's `device` key. The
 certificate must be for the object's `from` (its `identity` is `from`),
 allow messages (bit 1 of `caps`, or `caps` absent), be at most 512
-bytes, as a signed message's is (`e2e-messages.md` §2, §3.5), and be
-valid at the object's `time`. Revocation is not part of this check
-(§5). `from` repeats the certificate's `identity` so that the checks
-that come before the signature, of the pair and of `to`, can run on the
-object alone; an object whose `from` is not its certificate's
+bytes, as a signed message's is (`e2e-messages.md` §2, §3.5), be
+valid at the object's `time`. Once the signatures verify, it must also
+not be below the floor its checker holds for `from` (the device epoch,
+`hotline-ng-identity.md` §3.3), checked as of now rather than of
+`time`: an epoch carries no time, and a `time` its signer chose proves
+nothing. The floor comes after the signatures so that only a genuine
+object is refused for it, and a forged one with any certificate fails
+as forged. A checker holding no floor for `from` uses 0. A device's
+revocation is not part of this
+check (§5). `from` repeats the certificate's `identity` so that the
+checks that come before the signature, of the pair and of `to`, can run
+on the object alone; an object whose `from` is not its certificate's
 `identity` is rejected. Bit 2 of `caps`, which the identity spec's §3.3
 describes as "may sign vouches and withdrawals", means a vouch's
 withdrawals (`identity-vouch.md` §4.1); a friendship's need only bit
@@ -114,8 +121,10 @@ orders a card's checks:
 4. each certificate is for its object's `from`, allows messages, and
    is valid at that object's `time` (§1);
 5. the identity key's signature on each certificate, and each
-   certificate's device key's on its object;
-6. no withdrawal the checker holds ends it (§4).
+   certificate's device key's on its object; then that neither
+   certificate is below the floor held for its `from` (§1);
+6. no withdrawal the checker holds ends it (§4), counting none whose
+   certificate is now below the floor held for its `from`.
 
 A lone offer, checked as a server takes it, gets the steps that apply
 to one object: 1 without the array, then 3 to 6. A client accepts an
@@ -241,7 +250,8 @@ and the client tries again later.
    pair the old friendships make;
 5. the certificate, by §1, at `time`;
 6. the identity key's signature on the certificate, and the
-   certificate's device key's on the withdrawal.
+   certificate's device key's on the withdrawal; then that the
+   certificate is not below the floor held for `from` (§1).
 
 Step 4's rotation rule is checked when a withdrawal is taken, or when
 one kept unchecked first matches a pair (above), against the rotations
@@ -273,6 +283,37 @@ its old window, and a client checks a withdrawal handed to it without
 regard to its age (§4). A device that is retired is therefore revoked,
 not left to lapse, so that the checks that consult revocation
 (`portable-friends.md` §5.3, §6) reach it.
+
+A device reset (`identity-registrar.md` §4.10) is the exception. It
+names certificates rather than a device key, and §1 checks the floor as
+of now, so every object signed under a certificate below it is refused
+wherever the floor is held, whatever the object's `time`. An offer, an
+acceptance, or a friendship with a half so signed fails at step 5, a
+withdrawal so signed at step 6, each only once its signatures verify,
+and a withdrawal held from before the floor rose ends nothing once its
+signer is below it (§3 step 6). That is what keeps a device that was
+reset from signing a withdrawal dated inside its old window and ending
+friendships remade since. The check stays strict; a server keeps the
+friendships it held before the reset, and one shown a pre-reset
+friendship it does not hold has it remade from a current device
+(`portable-friends.md` §6).
+
+`hl-identity` takes the floor as a function of the signing identity key,
+required, on `Offer::check`, `Friendship::check`, `Withdrawal::parse`
+and `Withdrawal::check`, so a checker cannot leave it out; one holding
+no floors passes `|_| 0`. A refusal is `BelowFloor`. Signing holds no
+floor. The crate as first released tests the floor with the certificate,
+at step 4 (step 5 for a withdrawal), before the signatures; it is to
+test it after them, as above.
+
+A checker that must tell a floor's refusal from a forgery, or check a
+held friendship whose halves skip the floor (`portable-friends.md` §6),
+filters its held withdrawals by the current floor itself, checks with
+`|_| 0`, and then tests the halves' floors with `check_floor` where it
+must. The same change makes `Held::stands` public for that filter. At
+the release this document was written against, `stands` is private, and
+the filter reads each `Held::withdrawal().cert` with `DeviceCert::parse`
+and keeps those `check_floor` passes.
 
 ---
 

@@ -153,11 +153,65 @@ limit is what bounds that cache.
 | `expires` | uint | yes | Recommended 90 days; renew at one-third remaining |
 | `caps` | uint | no | Absent = all. Bit 0 login, 1 message, 2 vouch — may sign vouches and withdrawals (`identity-vouch.md` §4.1), 3 manage |
 | `name` | tstr | no | Human label, device lists only. 1–64 characters, no leading or trailing space, and no control or invisible characters (§3.5) — it is rendered next to a fingerprint. Absent is fine; present and blank is not |
+| `epoch` | uint | no | The device epoch the certificate was issued in (below). Absent means 0: a signer omits it rather than write 0, and a reader refuses an `epoch` of 0 written out, or one past `2^63 - 1`, so a certificate has one encoding and its epoch fits a signed 64-bit integer |
 | `sig` | bstr(64) | yes | |
 
 Web-client certificates omit the vouch and manage bits, so a script in
 a browser can neither spend the user's vouches (`identity-vouch.md`
 §4.1) nor revoke their other devices (`identity-registrar.md` §4.4).
+
+**Device epochs.** A certificate whose `epoch` is below its identity's
+*floor*, the highest `epoch` among the device epoch records
+(`identity-registrar.md` §4.10) its reader holds for that identity, is
+revoked for login, and the objects below are judged by it. The floor is
+checked when an object is read, not as of when it says it was signed:
+an epoch carries no time, and a `time` its signer chose proves nothing.
+
+- A device revocation (`identity-registrar.md` §4.4) or a vouch
+  (`identity-vouch.md` §4.1) whose signer's certificate is below the
+  floor is void.
+- A friendship object (`proposals/friendship-objects.md`) so signed
+  fails its check once its signatures verify, but a server keeps
+  showing a friendship it held before the reset
+  (`proposals/portable-friends.md` §6).
+- A vouch withdrawal so signed keeps its effect where a registrar
+  published it before its own floor rose, since a withdrawal only takes
+  standing away; one handed to a server directly is refused once the
+  server knows the floor, and one it took before is judged again when
+  the floor is installed (`identity-vouch.md` §4.1).
+- Signed chat lines, messages and articles are not judged by the floor:
+  each was checked at ingest, from a session admitted then, and a reset
+  ends that session.
+
+What the identity key signs is never affected. A floor and a device
+revocation compose by either refusing, with one caution: a device
+revocation a device signed is itself void below the floor, so after a
+reset a device key it named stays out only because its own
+certificates are below the floor too, and because a holder refuses to
+certify a key it knows was reset (`identity-enrollment.md` §8). A
+revocation meant to outlast a reset is signed with the identity key.
+
+A minter MUST set `epoch` to the highest floor it knows for the
+identity, and SHOULD fetch the identity's records
+(`identity-registrar.md` §6.2) before minting whenever it is online. A
+certificate minted below a floor fails safe: it is refused at first
+use, `revoked` with the floor (§5.3). A certificate from before this
+key is epoch 0, valid until its identity's first reset and revoked by
+any; a reader that does not know the key ignores it, by §3.1's rule,
+and admits the certificate as it did. A classic client proving its
+device (`proposals/portable-friends.md` §3) is refused alike with every
+other refusal but the clock's, so it is never told `epoch`; it learns
+of a reset from the identity's records, which it fetches from the
+registrars of its card's attestations when a proof it expected to pass
+is refused.
+
+The key adds at most 15 bytes. A server keeps a session's certificate
+for `signs` and `sealed` only up to 512 bytes, as a signed message
+carries it (`e2e-messages.md` §3.5), so a minter whose `name` brought a
+certificate near that bound SHOULD check it still fits. `hl-identity`
+carries the key as `DeviceCert::epoch`, bounded by `cert::EPOCH_MAX`,
+and checks it with `DeviceCert::check_floor`, which refuses
+`BelowFloor`.
 
 ### 3.4 User card
 
@@ -339,7 +393,7 @@ transport's codes:
 |---|---|---|
 | `bad_card`, `bad_cert`, `card_too_large` | 401 | prove it again |
 | `login_failed` | 401 | the `login`/`password` of §5.4 didn't verify |
-| `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage` |
+| `revoked`, `no_manage` | 403 | policy, or the device certificate lacks `manage`. A `revoked` for a certificate below its identity's floor (§3.3) carries the floor as `epoch` in the body, so a client can say its device was signed out by a reset; one that does not know the key ignores it |
 | `rotated`, `frozen` | 403 | a record applied at §5.2 step 4 (`identity-registrar.md` §7.3); `rotated` carries `successor` in the body |
 | `already_linked`, `would_orphan`, `not_linked` | 409 | conflicts with the account's state (§8.2, §8.4) |
 | `banned` | 403 | a ban on the identity, the registrar that issued its handle, or (at `/identity/link`, or with credentials) the account (`moderation.md` §3.5); nothing is linked or created |

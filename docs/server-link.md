@@ -926,6 +926,18 @@ fetches over one link, and are kept whole once it comes. A refusal, no answer, o
 it is fetched for leaves them unverified, and the link as it was: Janus
 up to 2.0.28 answers `UnknownUser` to every server's own request.
 
+**No revocation is applied to a fetched certificate.** A ghost's
+certificate is checked as `e2e-messages.md` §5 says, and against no
+revocation of any kind: not a device revocation, not its identity's,
+and not its identity's device epoch floor (`identity-registrar.md`
+§4.10). Applying them needs this server to fetch the ghost's records
+from its own trusted registrars, which is `identity-registrar.md` §7
+for ghosts and its own work, after device epochs, which the floor then
+rides on. Until then a ghost's lines and messages signed by a revoked
+device, or by one its identity reset, are shown here as signed. Its
+home server applies all of it to its own users, and a session it ends
+there takes its ghost away here.
+
 **A sealed 905** to a local user is checked here as `e2e-messages.md`
 §5 says, `DATA_LINK_SEALED_TO` against the target's current `device_enc`
 key, and refused `NoDeviceKeys` when it differs or is missing, or when the
