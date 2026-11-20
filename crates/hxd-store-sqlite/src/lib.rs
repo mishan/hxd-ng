@@ -5374,6 +5374,28 @@ mod tests {
         hxd_core::push::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    /// A row whose owner is not a fingerprint, as a hand edit leaves,
+    /// is passed over: the other identities are still listed.
+    #[test]
+    fn a_damaged_owner_hides_no_other_identity() {
+        use hxd_core::push::PushStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let devid = "ab".repeat(32);
+        for fp in ["07".repeat(32), "zz".repeat(32)] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO push_device (owner, owner_fp, devid, endpoint, p256dh, auth, \
+                     registered_at) VALUES ('bob', ?1, ?2, 'https://a.example/1', x'00', x'00', 1)",
+                    rusqlite::params![fp, devid],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.device_identities().unwrap(), [[7; 32]]);
+    }
+
     /// A category and a way to post into it, for the search tests.
     fn news_fixture() -> (SqliteStore, hxd_core::news::NodeId) {
         use hxd_core::news::{NewNode, NewsStore, NodeKind};

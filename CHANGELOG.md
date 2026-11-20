@@ -210,11 +210,16 @@ as AGENTS.md's "Releasing" describes it.
   deletes them, and unsubscribes them from uniqush under `gateway =
   "uniqush"`; a registration racing the revocation is refused `revoked`.
   A frozen identity's devices register again at their next login once
-  the freeze lifts. A registrar's revocation still reaches this server
-  only while its identity has a session here, so until one of its
-  devices connects, a device revoked there is still sent notifications.
-  Registrations left from before are deleted when the operator's list is
-  next loaded, or a registrar's revocation next applied.
+  the freeze lifts. A registrar's revocation reaches an identity with
+  no session here too: the records sweep refreshes the lists of
+  identities with push registrations every ten minutes, fetching each
+  only once due under `revocation_max_age`, so while the registrar can
+  be reached a device revoked there is sent notifications for no longer
+  than `revocation_max_age`, ten minutes, a minute and the sweep's own
+  time. The sweep accepts a rotation it finds for such an identity too,
+  and with anchors moves its account link as at an admission.
+  Registrations left from before are deleted when the operator's list
+  is next loaded, or a registrar's revocation next applied.
 - A rotation's successor is no longer anchored from its own card, which
   whoever holds the successor key alone could show first, committing to
   a key of their own, and then rotate the identity to it with every

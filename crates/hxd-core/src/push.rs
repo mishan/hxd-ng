@@ -285,6 +285,10 @@ pub trait PushStore: Send + Sync + 'static {
     /// because a password is not the key that was revoked.
     fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError>;
 
+    /// Every identity with a row one of its devices registered, each
+    /// once: those whose registrars' revocations reach a row here.
+    fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError>;
+
     /// An account went: take its devices with it, so a later holder of
     /// the freed login inherits nobody's phone.
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError>;
@@ -628,6 +632,16 @@ impl crate::roster::Core {
                 self.devices_changed(false, &taken);
             }
         }
+    }
+
+    /// [`PushStore::device_identities`], none without a registry: the
+    /// identities whose registrars' records the sweep reads even while
+    /// they have no session here, so a device revoked there is sent no
+    /// more notifications (push-notifications.md §5.1).
+    pub fn push_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        self.devices
+            .as_ref()
+            .map_or(Ok(Vec::new()), |store| store.device_identities())
     }
 
     /// Delete the rows whose device certificates have expired. The

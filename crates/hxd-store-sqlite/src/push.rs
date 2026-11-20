@@ -336,6 +336,24 @@ impl PushStore for SqliteStore {
         )
     }
 
+    fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare(
+            "SELECT DISTINCT owner_fp FROM push_device WHERE owner_fp IS NOT NULL \
+               AND length(devid) = 64 AND devid NOT GLOB '*[^0-9a-f]*'",
+        ))?;
+        let hex = sql(stmt.query_map([], |r| r.get::<_, String>(0)))?;
+        // One damaged row costs its own identity's sweep, not everyone's.
+        Ok(sql(hex.collect::<rusqlite::Result<Vec<_>>>())?
+            .into_iter()
+            .filter_map(|h| {
+                super::fp_from_hex(&h)
+                    .inspect_err(|e| tracing::warn!("push device owner {h:?}: {}", e.0))
+                    .ok()
+            })
+            .collect())
+    }
+
     fn devices_purge(&self, of: &Mailbox) -> Result<Vec<Device>, StoreError> {
         self.unregister_all(of)
     }

@@ -382,10 +382,11 @@ pub async fn sweeper(
     }
 }
 
-/// Keep the records of the identities with sessions here current, and
-/// end the sessions of the ones they now refuse (`docs/identity-records.md`
-/// §2). A list is fetched again only once it is due, so a tick costs a
-/// cache read for each identity until one is.
+/// Keep the records of the identities with sessions or push
+/// registrations here current, and end the sessions of the ones they now
+/// refuse (`docs/identity-records.md` §2). A list is fetched again only
+/// once it is due, so a tick costs a cache read for each identity it
+/// sweeps until one is.
 pub async fn records_sweeper(identity: Arc<identity::IdentityState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

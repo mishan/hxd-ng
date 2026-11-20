@@ -103,6 +103,10 @@ pub struct Registrars {
     cache: Arc<dyn RecordCache>,
 }
 
+/// A rotation found: the predecessor, the successor and the record as
+/// it was published.
+pub type Rotated = (Fingerprint, Fingerprint, Vec<u8>);
+
 /// What the registrars publish against one identity, as known now.
 #[derive(Debug, Default)]
 pub struct Lookup {
@@ -125,6 +129,8 @@ pub struct Lookup {
     /// alone count as complete and refusing nothing, which lifts what
     /// those registrars revoked.
     pub complete: bool,
+    /// The identity's lists could be read from the cache.
+    pub read: bool,
 }
 
 impl Registrars {
@@ -278,9 +284,9 @@ impl Registrars {
         Some(hosts)
     }
 
-    /// Forget the registrars that attested identities with no session
-    /// here now, but for one admitted within `ADMITTING`, whose session
-    /// may not have attached yet.
+    /// Forget the registrars that attested identities the sweep no longer
+    /// reads, but for one admitted within `ADMITTING`, whose session may
+    /// not have attached yet.
     pub fn retain_attested(&self, live: &[Fingerprint]) {
         let live: HashSet<&Fingerprint> = live.iter().collect();
         self.attested
@@ -580,21 +586,23 @@ impl Registrars {
     /// list: each identity revoked, each frozen when `frozen_refuses`
     /// (refused, not revoked), and each device an identity revoked, as
     /// that identity's; and, apart, the rotations away from them, for the
-    /// caller to accept or not.
+    /// caller to accept or not, and the identities whose lists could not
+    /// be read.
     /// Reads the store and verifies: called off the reactor.
     pub fn refused(
         &self,
         identities: &[Fingerprint],
         frozen_refuses: bool,
-    ) -> (
-        hxd_core::Published,
-        Vec<(Fingerprint, Fingerprint, Vec<u8>)>,
-    ) {
+    ) -> (hxd_core::Published, Vec<Rotated>, Vec<Fingerprint>) {
         let mut refused = hxd_core::Published::default();
         let mut rotations = Vec::new();
+        let mut unread = Vec::new();
         for fp in identities {
             let mut frozen: HashMap<String, bool> = HashMap::new();
             let found = self.lookup_fp(*fp, &[], 0);
+            if !found.read {
+                unread.push(*fp);
+            }
             if found.complete {
                 refused.covered.insert(fp.0);
             }
@@ -626,7 +634,7 @@ impl Registrars {
                 refused.unrevoked.insert(fp.0);
             }
         }
-        (refused, rotations)
+        (refused, rotations, unread)
     }
 
     /// What the cached lists of the trusted registrars say of `identity`,
@@ -647,6 +655,7 @@ impl Registrars {
         };
         let mut lookup = Lookup {
             complete: read && !held.is_empty(),
+            read,
             ..Lookup::default()
         };
         let on_file = held.iter().map(|l| &l.registrar);
@@ -842,11 +851,16 @@ mod tests {
             (Arc::new(unverified), None),
             (Arc::new(replaced), Some(configured)),
         ];
-        for (cache, key) in caches {
+        for (i, (cache, key)) in caches.into_iter().enumerate() {
             let mut r = registrars(cache);
             r.cfg.keys.extend(key.map(|k| ("hl.example".to_owned(), k)));
-            let (refused, _) = r.refused(&[fp], false);
+            let (refused, _, unread) = r.refused(&[fp], false);
             assert!(refused.covered.is_empty(), "{key:?}");
+            assert_eq!(
+                unread.is_empty(),
+                i > 0,
+                "only the unreadable cache is unread"
+            );
         }
     }
 
@@ -915,7 +929,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (refused, rotations) = registrars(cache).refused(&[pred], false);
+        let (refused, rotations, _) = registrars(cache).refused(&[pred], false);
         assert!(refused.covered.contains(&pred.0), "its list was read");
         assert_eq!(rotations.len(), 2);
         for (f, t, record) in rotations {

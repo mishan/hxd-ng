@@ -88,6 +88,21 @@ impl Published {
     pub fn is_empty(&self) -> bool {
         self.identities.is_empty() && self.devices.is_empty() && self.unrevoked.is_empty()
     }
+
+    /// Add what `other` refuses, and the identities it was made from.
+    pub fn merge(&mut self, other: &Published) {
+        // Destructured, so a field added is a field merged.
+        let Published {
+            identities,
+            devices,
+            covered,
+            unrevoked,
+        } = other;
+        self.identities.extend(identities);
+        self.devices.extend(devices);
+        self.covered.extend(covered);
+        self.unrevoked.extend(unrevoked);
+    }
 }
 
 /// Both lists, the operator's and the registrars', and the keys rotated
