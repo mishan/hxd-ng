@@ -391,6 +391,10 @@ fn stagger(fp: &Fingerprint) -> Duration {
 struct Offline {
     /// What was last found against each, and when it is next refreshed.
     found: HashMap<Fingerprint, (Instant, hxd_core::Published)>,
+    /// The same of each identity with a session here, and of one that
+    /// has left and is not yet seen away, for a read of its lists that is
+    /// not whole.
+    live: HashMap<Fingerprint, hxd_core::Published>,
     /// Every identity with push registrations, as the store last said.
     pushing: HashSet<Fingerprint>,
 }
@@ -564,6 +568,22 @@ fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Publi
         covered: covered.iter().copied().filter(of).collect(),
         unrevoked: unrevoked.iter().copied().filter(of).collect(),
     }
+}
+
+/// What `list` says of `fp`, and if it did not read `fp`'s lists whole,
+/// what `before` refused too: a list read in part says nothing of what
+/// it left out, and lifts nothing either.
+fn slice_of(
+    list: &hxd_core::Published,
+    fp: &Fingerprint,
+    before: Option<&hxd_core::Published>,
+) -> hxd_core::Published {
+    let mut part = published_of(list, fp);
+    if let Some(before) = before.filter(|_| !part.covered.contains(&fp.0)) {
+        part.merge(before);
+        part.covered.clear();
+    }
+    part
 }
 
 /// Credentials a client may add to `/identity/auth` (§5.4) to verify a
@@ -1880,16 +1900,29 @@ impl IdentityState {
         let (now, sweep) = (self.clock.unix(), self.clock.now());
         let (offline, new, due) = {
             let mut held = self.offline.lock().unwrap_or_else(|e| e.into_inner());
-            let Offline { found, pushing } = &mut *held;
+            let Offline {
+                found,
+                live: here,
+                pushing,
+            } = &mut *held;
             match answer {
                 Ok(ids) => *pushing = ids.into_iter().map(Fingerprint).collect(),
                 // The last answer stands until the store gives another.
                 Err(e) => tracing::warn!("push identities: {e}"),
             }
             // An identity back on the roster is read every sweep, and seen
-            // away afresh once it leaves it again.
+            // away afresh once it leaves it again, what was found of it
+            // going with it each way.
             let on: HashSet<&Fingerprint> = live.iter().collect();
-            found.retain(|fp, _| pushing.contains(fp) && !on.contains(fp));
+            for fp in &live {
+                if let Some((_, part)) = found.remove(fp) {
+                    here.entry(*fp).or_insert(part);
+                }
+            }
+            found.retain(|fp, _| pushing.contains(fp));
+            here.retain(|fp, _| {
+                on.contains(fp) || (pushing.contains(fp) && !found.contains_key(fp))
+            });
             let offline: Vec<Fingerprint> = pushing
                 .iter()
                 .filter(|fp| !on.contains(fp))
@@ -1953,6 +1986,7 @@ impl IdentityState {
     ) -> Vec<(hxd_core::Uid, String)> {
         let frozen_refuses = self.cfg.frozen == Frozen::Deny;
         let (this, registrars) = (self.clone(), registrars.clone());
+        let live_ids = live.to_vec();
         let asked: Vec<Fingerprint> = live
             .iter()
             .copied()
@@ -1974,12 +2008,22 @@ impl IdentityState {
             }
             {
                 let mut held = this.offline.lock().unwrap_or_else(|e| e.into_inner());
+                let Offline {
+                    found, live: here, ..
+                } = &mut *held;
                 // One whose lists could not be read keeps what was found
                 // before, or stays newly away, and is read again next tick.
                 for (fp, next) in away.into_iter().filter(|(fp, _)| !unread.contains(fp)) {
-                    held.found.insert(fp, (next, published_of(&refused, &fp)));
+                    let before = found.get(&fp).map(|(_, p)| p).or(here.get(&fp));
+                    let part = slice_of(&refused, &fp, before);
+                    found.insert(fp, (next, part));
+                    here.remove(&fp);
                 }
-                for (_, part) in held.found.values() {
+                for fp in &live_ids {
+                    let part = slice_of(&refused, fp, here.get(fp));
+                    here.insert(*fp, part);
+                }
+                for part in here.values().chain(found.values().map(|(_, p)| p)) {
                     refused.merge(part);
                 }
             }

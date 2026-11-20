@@ -2273,6 +2273,8 @@ struct Away {
     core: Arc<hxd_core::Core>,
     alice: IdentityKey,
     card: Vec<u8>,
+    /// The verifier reaches the registrar only while this is false.
+    down: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "push")]
@@ -2284,7 +2286,22 @@ impl Away {
             "[push]\ncontact = \"mailto:a@example.org\"\nvapid_key = \"{}\"",
             dir.path().join("vapid.key").display()
         );
-        let url = format!("http://{}", r.ng);
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", proxy.local_addr().unwrap());
+        let down = Arc::new(AtomicBool::new(false));
+        let (to, cut) = (r.ng, down.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut a, _) = proxy.accept().await.unwrap();
+                if cut.load(Ordering::SeqCst) {
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut b = TcpStream::connect(to).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                });
+            }
+        });
         let (v, _, identity, core) = linked_verifier(dir.path(), &r, Trust::Key, &url, &push).await;
         let alice = IdentityKey::from_seed(&[1; 32]);
         let card = attested(&r, &alice, "alice").await;
@@ -2296,6 +2313,7 @@ impl Away {
             core,
             alice,
             card,
+            down,
         }
     }
 
@@ -2425,6 +2443,55 @@ async fn a_device_revoked_while_its_identity_is_away_loses_its_push_registration
     clock.advance(Duration::from_secs(600));
     identity.sweep_records().await;
     assert!(a.rows().is_empty(), "and then refreshed");
+}
+
+/// A list read in part says nothing of what it left out: with the
+/// registrar out of reach and the list held damaged, what was found
+/// before still hides a row the revoked device has again, as a claim of
+/// a login's rows can give it, while its identity is here, once it
+/// leaves, and when its lists are next refreshed.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_list_read_in_part_keeps_what_was_found_before() {
+    let a = Away::start().await;
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    a.register(&phone).await;
+    let mut here = session_as(a.v, &a.alice, &laptop, &a.card).await;
+    let clock = a.identity.clock();
+    post_device_revocation(&a.r, &a.alice, &phone).await;
+    clock.advance(Duration::from_secs(2));
+    a.identity.sweep_records().await;
+    assert!(a.rows().is_empty(), "the phone's registration went");
+
+    a.down.store(true, Ordering::SeqCst);
+    let db = a.db();
+    let mut list: Vec<u8> = db
+        .query_row("SELECT list FROM identity_records", [], |r| r.get(0))
+        .unwrap();
+    *list.last_mut().unwrap() ^= 1;
+    db.execute("UPDATE identity_records SET list = ?1", [list])
+        .unwrap();
+    let again = format!(
+        "INSERT INTO push_device (owner, owner_fp, devid, endpoint, p256dh, auth, \
+         registered_at) VALUES ('alice', '{}', '{}', 'https://push.example.net/v/again', \
+         zeroblob(65), zeroblob(16), 1)",
+        hxd_core::push::DeviceId::of_device(&a.alice.fingerprint().0).as_str(),
+        devid(&phone)
+    );
+    db.execute_batch(&again).unwrap();
+    clock.advance(Duration::from_secs(2));
+    a.identity.sweep_records().await;
+    assert!(a.delivered().is_empty(), "here: still hidden");
+
+    here.request("logout", json!({})).await.unwrap();
+    a.identity.sweep_records().await;
+    assert!(a.delivered().is_empty(), "seen away: still hidden");
+    clock.advance(Duration::from_secs(602));
+    a.identity.sweep_records().await;
+    assert!(a.delivered().is_empty(), "refreshed: still hidden");
 }
 
 /// What a held list refuses is applied as soon as its identity is seen
