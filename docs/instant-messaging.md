@@ -776,6 +776,7 @@ take or leave, and until he does, nothing here is the extension's.
 | Reason code | `Requested` | 17 | 810 (§4.2) |
 | Reason code | `Withdrawn` | 18 | portable friends §7 |
 | Reason code | `Stale` | 19 | portable friends §7 |
+| Reason code | `Reset` | not yet: to ask for; `AccountNotFound` is answered in its place until it is | portable friends §4.3, §7 |
 | Capability bit | `CAPABILITY_FRIENDSHIPS` | bit 15 (`0x8000`) | portable friends §7 |
 | Transaction | Get Message Requests | 829 | above |
 | Transaction | Answer Message Request | 830 | above |

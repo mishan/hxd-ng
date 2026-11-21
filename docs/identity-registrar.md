@@ -220,6 +220,27 @@ cannot revoke the user's other devices; a tunnel or a native client with
 `manage` can, which is what "revokes the device from any other device"
 in the threat model means.
 
+A device-signed revocation is also judged by its signer's device epoch
+(§4.10): one whose `signer_cert` has an `epoch` below the floor its
+reader holds for the identity is void, whatever its `time`. The window
+check above is against a `time` the signer chose, so without this a
+device reset with the others could sign a revocation dated inside its
+old certificate's window, and revoke each device enrolled after the
+reset, one at a time. The registrar refuses one at acceptance (§6.2),
+and a server ignores one in a list it applies (§7.3), each against the
+floor it holds then. One a server applied before it knew the floor is
+judged again when the floor rises, and dropped if its signer is below
+it. The cost is that a device a reset device revoked stays out only
+through its own certificates being below the floor too, and a holder
+refusing to certify a key it knows was reset (`identity-enrollment.md`
+§8). A revocation the identity key signed is never affected, so one
+meant to outlast a later reset is signed with the identity key.
+`hl-identity`'s `DeviceRevocation::check_signer_floor` is the check,
+refusing `BelowFloor`, and `signer_epoch` reads the signer's epoch
+(`None` for the identity's own). `Record::parse` holds no floor, since a
+list is parsed before its identity's floor is known: the caller checks
+each device-signed revocation before applying it.
+
 ### 4.5 Identity revocation
 
 Domain `hl-identity/revoke-identity/v1`, signed by the identity key. At
@@ -345,19 +366,119 @@ Domain `hl-identity/records/v1`, signed by the registrar key. What the
 | `entries` | array | yes | Each `[seq, record]`: a registrar-assigned `uint`, monotonic across the registrar, and the record's encoded bytes as `bstr` |
 | `sig` | bstr(64) | yes | |
 
-Records inside are the objects of §4.4–§4.8, each with its own
-signature, which the reader verifies individually. The list's signature
-says the registrar published these; the records' signatures say who
-made them. **An empty per-identity list is a signed statement that the
-registrar holds nothing against that key**, and is cacheable like any
-other.
+Records inside are the objects of §4.4 to §4.8 and §4.10, each with
+its own signature, which the reader verifies individually. The list's
+signature says the registrar published these; the records' signatures
+say who made them. **An empty per-identity list is a signed statement
+that the registrar holds nothing against that key**, and is cacheable
+like any other.
 
 A page is at most 1 MiB. Entries leave the *full* list when they stop
 mattering — a device revocation after its `until`, an attestation
 revocation after the last attestation it voids would have expired — and
 never leave a *per-identity* list, which is the one a verifier consults
 for a key in front of it. Rotations, identity revocations and freezes
-are never pruned from either.
+are never pruned from either. A device epoch record superseded by a
+higher one leaves the full list, where the higher one says all a reader
+of it needs, but stays in the per-identity list, so a server that
+missed an earlier reset still learns when it was signed (§4.10, §7.3).
+Each is at most 512 bytes, at most four are published a day, and the
+per-identity list keeps a bounded number of them (§10).
+
+### 4.10 Device epoch
+
+Domain `hl-identity/device-epoch/v1`, signed by the **identity key**. At
+most 512 bytes. A *reset*: every device certificate of `identity` whose
+`epoch` (`hotline-ng-identity.md` §3.3) is below this record's is
+revoked.
+
+| Key | Type | Req | Notes |
+|---|---|---|---|
+| `v` | uint | yes | `1` |
+| `identity` | bstr(32) | yes | The key that signs this |
+| `epoch` | uint | yes | The floor. At least 1, at most `2^63 - 1`, so it fits the signed 64-bit integer a store keeps; anything else is refused |
+| `time` | uint | yes | When it was signed. Never compared with a certificate. It orders and displays the record, and bounds what a server keeps of friendships it took before the reset (§7.3) |
+| `sig` | bstr(64) | yes | |
+
+- **The identity key alone signs it.** A device signature never
+  verifies on it, whatever the device's `caps`: a reset ends what only
+  the identity key can certify again, so a stolen `manage` device must
+  not be able to sign every other device out.
+- **It has no `reason`.** It is published, and "compromise suspected"
+  is worth not publishing. Nothing that follows a reset depends on why.
+- **Effect.** It revokes a certificate when `cert.identity` is its
+  `identity` and `cert.epoch` is below its `epoch`, for login, and it
+  judges the device-signed objects `hotline-ng-identity.md` §3.3 lists:
+  device revocations (§4.4), vouches, vouch withdrawals and friendship
+  objects, each by its own rule there. Signed chat lines, messages and
+  articles are not judged by it. Floors only rise: an identity's floor
+  is the highest `epoch` among the records a reader holds for it, from
+  every registrar and from what it kept (§7.3).
+- **Telling it apart.** Records carry no type tag (§4.9). This one's
+  key is `epoch`, read by `Record::parse` after `ack` or `successor`,
+  `device`, `frozen` and `handle`, and before the identity revocation
+  read when none of them is present. It carries none of those five:
+  `DeviceEpoch::parse` refuses one that does by name, and
+  `Record::parse` reads it as the kind that key names, which fails its
+  signature (a record with `device` beside `epoch` is a failed device
+  revocation). A record with `epoch` that does not verify as a
+  device epoch is read as an identity revocation, and reports its
+  failure as a device epoch only if that fails too: an identity
+  revocation carrying an unknown `epoch` key verified as itself before
+  this record existed, and still must. The two domains differ, so at
+  most one verifies. A reader from before this record reads it as an
+  identity revocation, which fails its signature, and skips the entry
+  rather than refusing the identity; that failure is what lets a list
+  carry the record to old servers, and `hl-identity`'s tests hold it.
+
+How it composes:
+
+- **Device revocation (§4.4)** names a device key and is permanent for
+  every certificate of it, whatever its epoch; the floor names
+  certificates. Either refuses. An identity-signed revocation outlasts
+  every reset; a device-signed one is void once its signer is below
+  the floor (§4.4).
+- **Identity revocation (§4.5)** refuses everything and makes the floor
+  moot.
+- **Rotation (§4.6).** Certificates name their identity key, so the
+  predecessor's are refused `rotated` once a rotation is accepted. The
+  successor is a new key with no records and floor 0; its certificates
+  may start at any epoch, and nothing is carried over. A rotation is
+  the answer when the identity key itself may be out, a reset when
+  only devices may be.
+- **Freeze (§4.7).** A frozen identity's reset is refused `frozen`, as
+  its other records are.
+- **Several registrars.** An identity attested at several posts the
+  reset to each, and a reader takes the highest floor across them. A
+  registrar that missed one is caught up by the next post, within the
+  step bound (§6.2).
+
+The epoch is a counter, not a cutoff on `issued`, so no certificate is
+compared with a clock, and a reset retried after a lost reply asks for
+the same `epoch` again, which the registrar answers as done (§6.2).
+Every minter must know the current epoch, so a minter that does not
+mints a certificate that is dead at first use, which fails safe and
+visibly.
+
+`time` has one effect beyond order: a server keeps a friendship it took
+a presentation of before the earliest `time` it has seen for each reset
+that puts one of its halves below the floor, and refuses one it did not
+(`proposals/portable-friends.md` §6). A `time` earlier than the
+identity's current record's is refused (§6.2), so one bad clock cannot
+reach back past the last reset that registrar published; an honest
+holder never trips it, since it signs each post at the later of now and
+that registrar's current record's `time` (below). Within that bound, a
+`time` in the past is accepted: it makes servers keep less, a cost to
+the identity that signed it and to the friends whose friendships with it
+must then be remade, and nobody else. A `time` up to the skew tolerance
+in the future is accepted too, as for every record, and lets a server
+keep what it took up to that long after the reset was signed. The clock
+residual is that tolerance, at most five minutes by default, plus
+however far the server's own clock, which times what it takes, is wrong.
+
+`hl-identity`: `DeviceEpoch { identity, epoch, time }` with `sign`,
+`parse` and `revokes(&cert)`, and `Record::DeviceEpoch`, whose `kind()`
+is `"device_epoch"`.
 
 ---
 
@@ -650,9 +771,10 @@ that would rather pull everything periodically than ask per identity.
 Omit `since` for the whole thing from the beginning, paged by `more`.
 
 `POST <records>` with `{ "record": "…" }` — a user posts a §4.4, §4.5 or
-§4.6 record. The registrar verifies it as §7.1 says a server would (the
-same function), checks that `identity` is attested here, applies §5.4
-for a rotation, assigns a `seq`, stores it, and answers
+§4.6 record, a device epoch (§4.10), or a portable vouch or vouch
+withdrawal (below). The registrar verifies it as §7.1 says a server
+would (the same function), checks that `identity` is attested here,
+applies §5.4 for a rotation, assigns a `seq`, stores it, and answers
 `{ "seq": n, "published": true }` — or `"published": false` with
 `"pending_until"` for a rotation inside its delay. A record already
 held is answered with its existing `seq` and is not a failure, so a
@@ -665,6 +787,112 @@ with the text "a rotation for this identity is already pending", and a
 client talking to one takes that answer to mean the same.
 Registrar-signed records (§4.7, §4.8) are never accepted here; they
 come from the registrar's own tools.
+
+**A device that was reset signs nothing that is published.** A device
+revocation (§4.4), a vouch or a vouch withdrawal whose `signer_cert` has
+an `epoch` below the identity's current floor is refused
+`bad_signature`, "the signer's device was reset", whatever its `time`.
+The check comes right after the record parses and verifies, before the
+digest check, so posting again the exact bytes of one published before
+the floor rose is refused, not answered as held; the copy already
+published stays in the lists. Readers ignore a device revocation or a
+vouch below the floor wherever they find it (§7.3). A vouch withdrawal
+published before the floor rose keeps its effect, since a withdrawal
+only takes standing away; the registrar, which knows the order of its
+own publications, refuses only those posted after it published the
+floor, and a server takes one below its floor only from a registrar
+whose list shows it published before that registrar's floor (§7.3,
+`identity-vouch.md` §4.1).
+
+That test is only as good as each registrar's floor, so a holder posts
+its identity's current device epoch record to every registrar it is
+registered at whenever it resets, first thing after it registers at a
+new registrar, and again whenever a list it reads from a registrar lacks
+it, each time signing the record afresh, as every post of a reset is
+signed (below), rather than resending its bytes. A registrar that never
+learned the floor proves nothing before it, and a below-floor withdrawal
+it published is taken from it by nobody. A registrar that learned the
+floor late, from a post it missed or after a restore from a backup, can
+have published, before its floor record, a withdrawal a thief posted
+after the reset; a server takes that one. That is a residual of a
+registrar behind its identity's resets.
+
+**A device epoch (§4.10)** is posted here too, and decided in this
+order, under the registrar's one writer lock, which decides every write
+in turn, with `cur` the `epoch` of the identity's current device epoch
+record (0 for none):
+
+1. the record parses and verifies, and a `time` in the future past the
+   skew tolerance is refused, as for every record;
+2. the exact bytes already held are answered with the current
+   record's `seq` and `"epoch": cur`, which may be higher than the one
+   posted, so the answer names one record;
+3. `not_registered` and `frozen`, as for every record;
+4. an `epoch` at most `cur` is not a failure, and nothing is stored:
+   `{ "seq": <the current record's seq>, "published": true, "epoch": cur }`.
+   It is decided before the record-post and reset limits (§10) are
+   checked or charged, so a retry is answered even at those limits; it
+   is still charged as a lookup;
+5. an `epoch` past `cur + 16` is `bad_request`, "an epoch advances at
+   most 16 at a time";
+6. a `time` earlier than the current record's is `bad_request`, "a reset
+   is not dated before the last one";
+7. the rate limits, then publication: a `seq` and the record stored, and
+   the identity's earlier device epoch record taken out of the full list
+   (§4.9) in the same transaction, so no reader of it sees two or none;
+   the per-identity list keeps both. The answer is
+   `{ "seq": n, "published": true, "epoch": epoch }`.
+
+Every answer to a device epoch, at steps 2, 4 and 7, also carries
+`"hash"`: the base64url SHA-256 of the current record's encoding, the
+one that set the identity's floor here.
+
+Step 4 makes a retry safe without a read first: a holder whose post
+landed and whose reply was lost signs the same `epoch` again with a
+fresh `time`, which is new bytes and passes step 2, and is answered as
+done. The `epoch` in every answer says where the identity stands: one
+above the `epoch` posted is not done, since another holder reset past it
+and the devices minted since at the higher epoch are not signed out, and
+that holder resets again at the answer plus 1. One equal to it is done
+only if `hash` names bytes this holder posted for this reset. Two
+holders can choose the same `epoch`: the first's record is published, it
+may certify devices at that epoch, and the second is answered at step 4
+without the floor moving, so those devices are not signed out by the
+second's reset. A holder therefore keeps the hash of each record it
+posts for a reset, and a `hash` it does not recognize means another
+holder reset to that epoch first; it resets again at the answer plus 1.
+A retry of exact bytes is answered with their own hash, and one signed
+afresh with the hash of the post that landed, which the holder kept, so
+retries stay idempotent. A holder that lost its own hashes, as across a
+crash, takes an answer it cannot recognize as another's and resets once
+more, which is safe.
+
+The bound of step 5 rather than `cur + 1` is so one post catches up a
+registrar that missed resets, up to sixteen behind, while a buggy or
+hostile signer still cannot push the floor to the top of its range and
+leave the identity no epoch to mint in short of rotating. The epoch is
+then not exactly a count of resets, which nothing depends on.
+
+**A holder's reset.** It first fetches the per-identity list from each
+registrar that attests the identity, past any cache (`Cache-Control:
+no-cache`), and takes `target` as one past the highest `epoch` any of
+them, or its own record, holds. With no registrar reachable it stops and
+says so: a reset nobody can fetch protects nothing. To each registrar
+`R` it posts `target`, or `cur_R + 16` first where `R` is more than
+sixteen behind, and goes on from `R`'s answer until `R` answers
+`target`. Every post, the steps of a catch-up included, is signed afresh
+with its `time` the later of now and the `time` of `R`'s current record,
+which the fetch read, so step 6 never refuses an honest holder whose
+clock is behind. An answer above `target` means another holder reset
+past it meanwhile: the holder takes that answer plus 1 as its new
+`target` and posts again to every registrar, including those already
+done. That second reset signs out the devices the other holder minted at
+the higher epoch, which is intended: a reset is a statement that no
+device certified before it is trusted, whichever holder certified it,
+and the other holder learns of it as any minter does (§4.10). Each post
+that publishes spends one of `R`'s daily resets (§10), so a registrar
+far behind takes days to catch up, and a reset waits there meanwhile;
+the holder says where it is not yet done and retries later.
 
 Portable vouches and withdrawals (`identity-vouch.md` §4.1) are
 accepted here too, from vouchers attested at this registrar, and are
@@ -904,10 +1132,55 @@ device:
 | rotation, this key the successor | §7.4, then continue |
 | freeze, latest `frozen = true` | `[identity] frozen`: `deny` (default) refuses with `denied`; `guest` admits as unattested |
 | device revocation of the presenting device | refuse: `revoked`; drop the cached certificate and card for that device (§5.5 there) |
+| device epoch, the presenting certificate's `epoch` below the floor | refuse: `revoked`, the body carrying the floor as `epoch`; drop the cached certificate and card for that device |
 | attestation revocation | discard that attestation before computing age; if none survive, the identity is unattested |
 
 Then age, from the oldest surviving `registered`, and admission policy,
 exactly as before.
+
+The floor is not a `time`-ordered effect: it is the highest `epoch`
+among the device epoch records the server holds for the identity, from
+every registrar it fetched from, and never lower than the highest it has
+verified before. A server keeps that record durably, by the identity's
+fingerprint, and applies it whatever later lists say, so a list that no
+longer carries it lowers nothing, and it is consulted for every login of
+the identity, whatever attestations the card shown carries
+(`identity-records.md` §3). It also keeps, for each `epoch` it has seen,
+the earliest `time` it has seen for it, which decides what friendships
+it keeps (`proposals/portable-friends.md` §6).
+
+The floor applies at `auth` on both bindings, at the classic wire's
+device proof, at a certificate-only re-admission, at token redemption
+and resume, to live sessions through the sweep, which ends them as it
+ends a revoked device's, to vouches, vouch withdrawals and friendship
+objects as `hotline-ng-identity.md` §3.3 says, and to push
+registrations; nor is a certificate below it served for sealing.
+
+**Installing a floor, raising it, or any record moving a half's reset
+`time` earlier judges again what the server took before.** A device
+revocation applied from a list is dropped if its signer is below the
+floor (§4.4). The presentations of each friendship no longer held are
+dropped: those whose earliest time of taking under that hash is at or
+after the reset `time` of a half below the floor, as
+`proposals/portable-friends.md` §6 says. A vouch withdrawal below the
+floor that was handed to the server directly is dropped, and one taken
+from a registrar's list stays only if that list shows it published
+before the registrar's own floor above its signer's epoch: the list
+carries a device epoch record whose `epoch` is above the signer's, the
+first of which has a higher `seq` than the withdrawal's
+(`identity-vouch.md` §4.1). The server keeps, with each withdrawal it
+took from a list, the registrar and the `seq` it came under, for this
+test. From then on, a below-floor withdrawal handed to the server is
+refused.
+
+The cost falls on the owner's own withdrawals too: one its device signed
+before the reset and handed to a server directly, or published by a
+registrar that never learned the floor, is dropped, and the vouch it
+withdrew counts again. So after a reset a holder signs again, from a
+current device or with the identity key, every vouch withdrawal it means
+to keep, and posts them where it posted the old ones, as its clients
+already sign their friendship cutoffs afresh
+(`proposals/portable-friends.md` §5.1).
 
 A server also keeps a **local revocation list**, `[identity]
 revoked_devices` and `revoked_identities`, of fingerprints the operator
@@ -1437,7 +1710,11 @@ ceiling is a setting with a default.
 | Registrations per hour, per address | 5 | `rate_limited` |
 | Registrations per hour, registrar-wide | 120 | `rate_limited`; reissues exempt |
 | Record posts per hour, per identity | 20 | `rate_limited` |
+| Device epochs published per day, per identity | 4 | `rate_limited` with `retry_after`; each also counts as a record post. An answer to an `epoch` at most the current one, or to bytes already held, counts toward neither |
+| Epoch step per published device epoch | 16 | `bad_request` |
+| Answers that charge nothing (a device epoch at or below the current one, bytes already held), per minute, per address | counted as lookups | `rate_limited`, so a free answer is not a free amplifier |
 | Device revocations kept per identity | 256 | oldest-`until` pruned from the full list; per-identity list keeps all |
+| Superseded device epoch records kept per identity | 256 | the oldest dropped from the per-identity list; a server that read it keeps its earliest `time` for that `epoch` (§7.3); one that never did has only the later records' times, and so may hold presentations taken between the two, a residual of a reset that many resets back. A vouch withdrawal's test (§7.3) then reads the first record left above its signer's epoch, which has a higher `seq` than the dropped one, so it passes a withdrawal published between the two, one an honest registrar refused; only a registrar behind its identity's resets, already a residual (§6.2), could have published one there |
 | Envelope fetches per hour, per handle, per address | 10 | `rate_limited`, then lockout doubling from 1 hour, capped at 24 and forgotten a day after the last ends, or sooner if its slot is taken over (§9.2). Per kind, for any handle asked after, kept in the store |
 | Envelope fetches per day, per handle | 200 | `rate_limited` until the day turns; per kind, kept in the store |
 | Envelope fetches per hour, per address | 30, and 8 times that per IPv6 /48 | `rate_limited`. Counted in memory, apart from registrations and lookups so a flood of fetches leaves them their room; past 16384 addresses at once a new one goes uncounted rather than refused, since the stored counts are the bound on guessing. An IPv4-mapped IPv6 address counts as its IPv4 |
@@ -1455,7 +1732,8 @@ Signed requests are replay-checked by `time` and a seen-set of request
 digests held for the skew window, as the transport does for proofs. A
 registration request seen again inside the window is answered with the
 reply it got the first time and issues nothing, so a client that lost
-the reply can resend it; records are idempotent by digest (§6.2); an
+the reply can resend it; records are idempotent by digest (§6.2), and
+a device epoch at or below the current one is answered as done; an
 envelope put must be newer than the last of its kind (§9.2).
 
 ---
@@ -1653,7 +1931,46 @@ To fold into `identity-threat-model.md`:
   take it (§4.6).
 - **Malicious registrar, amended.** It can additionally serve a stale
   or empty per-identity list; a server's `revocation_stale` and the
-  user's second attestation elsewhere are the answers, unchanged.
+  user's second attestation elsewhere are the answers, unchanged. A
+  list that drops a device epoch it once served lowers no floor a
+  server already holds (§7.3); one that never publishes a reset is
+  answered by the second attestation.
+- **Registrar operator, can additionally** see when an identity resets
+  its devices, and when, from the records it publishes; and, since a
+  holder fetches the identity's records before it mints, when and from
+  which addresses its holder and envelope devices certify devices. Not
+  how many devices exist, or which: a reset tells it less than revoking
+  each device would.
+- **Anyone shown a certificate** learns from its `epoch` the floor its
+  identity had when it was minted: that it has reset at least once, if
+  the `epoch` is above 0, and not how many times, since one reset may
+  move the floor by up to 16 (§6.2).
+- **New scenario, a device after a reset.** A thief holding a device
+  key and its certificate, still within its window, after its identity
+  reset. Mitigation: the certificate is refused at login, and the
+  device revocations, vouches and friendship objects its device signs
+  are refused however they are dated (§4.4), so a leaked `manage`
+  device cannot revoke the devices enrolled after the reset. The vouch
+  withdrawals it made before the reset still stand, which only takes
+  standing away.
+  A reset is signed by the identity key alone, so a stolen device
+  cannot sign one. Residuals: a server that has never fetched a list
+  since the reset and cannot reach the registrar admits it under
+  `revocation_stale = cached`; an identity never attested has no
+  registrar to publish a reset; a card shown without attestations, at a
+  server that holds no floor for the identity, is admitted with no
+  fetch, onto its linked account if it has one; a server that does not
+  know the record skips it; and across a link nothing is checked
+  (`server-link.md` §7.7). Each holds for a device revocation today.
+- **New scenario, a reused device key.** A client that enrolls again
+  after a reset with its old device key, at a holder that has lost its
+  record of that key, is certified at the new epoch, and a copy of that
+  key is back in. Mitigation: an enrollee refused for its epoch makes a
+  new key, and a holder refuses a key it knows was reset
+  (`identity-enrollment.md` §8). Residual: a client that does not.
+- **Stolen identity key, amended.** A thief holding it can reset, at
+  most four times a day, each ending every session of the identity
+  everywhere it is seen; the owner rotates (§4.6).
 
 ---
 
@@ -1723,6 +2040,16 @@ registrar keys as the rest so that the objects chain, and checked by
 - `freeze` and `revoke_attestation`, signed by the registrar key.
 - `records`: a per-identity list holding the above, with `seq` values
   and the list signature input; an empty per-identity list.
+- Device epochs, checked by `tests/device_epoch.rs` as well:
+  `device_cert_epoch` and `device_cert_epoch_max`, the device
+  certificate in epoch 3 and in epoch `2^63 - 1`; `device_epoch` and
+  `device_epoch_max`, the record at 4 and at `2^63 - 1`;
+  `records_device_epoch`, a per-identity list carrying one; and
+  `revoke_device_by_epoch_device`, a device revocation by a `manage`
+  device whose certificate is in epoch 1, dated inside its window,
+  refused at floor 2 and standing at 1. Among `rejects`: a certificate
+  with `epoch` 0 written out and one at `2^63`, a record at epoch 0, one
+  signed by a device key, and one carrying `device` beside `epoch`.
 - `envelope`: a `kind = 1` envelope with fixed salt and nonce, the
   passphrase in the clear, `enc_key`, `auth_key`, `auth_hash`, and the
   seed; a `kind = 2` envelope with its code; a decoy salt; and the

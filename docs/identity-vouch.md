@@ -157,7 +157,7 @@ the certificate and one attestation.
 | `predecessor` | bstr(32) | no | §7: "the subject is the person who held this key" |
 | `attestation` | bstr | no | One of the voucher's attestations, so the vouch verifies with no lookup at a server that trusts that registrar |
 | `signer` | bstr(32) | no | Present when a device key signed |
-| `signer_cert` | bstr | no | Required with `signer`; must carry `vouch` and be valid at `time` |
+| `signer_cert` | bstr | no | Required with `signer`; must carry `vouch` and be valid at `time`; a vouch's must not be below the voucher's device epoch floor (below) |
 | `sig` | bstr(64) | yes | |
 
 Withdrawal is `hl-identity/vouch-withdraw/v1`: `v`, `voucher`,
@@ -167,6 +167,53 @@ published where the vouch would be read: posted to the registrar's
 the voucher is on. A server that has seen a withdrawal ignores every
 vouch by that voucher for that subject with `time` before the
 withdrawal's.
+
+**A device that was reset vouches for nothing.** A vouch signed by a
+device whose certificate is below the voucher's floor
+(`hotline-ng-identity.md` §3.3, `identity-registrar.md` §4.10) is void,
+whatever its `time`: the floor is checked when the vouch is read, since
+a device that was reset could otherwise date one inside its old
+certificate's window. A registrar refuses one at acceptance (§5), and a
+server ignores one wherever it reads it, in a card, in a list or as one
+it counted at an earlier admission, against the floor it holds then. A
+reset therefore also voids the vouches the voucher's own devices signed
+before it; the voucher signs again from a device enrolled since, or
+with the identity key, whose vouches no reset touches.
+
+A **withdrawal** so signed keeps its effect where a registrar published
+it before its own floor rose. A withdrawal only takes standing away, so
+honoring one from a reset device can revive nothing, and a reset never
+brings back a vouch its owner withdrew. One rule decides the rest. A
+registrar refuses a withdrawal whose signing device is below a floor it
+has already published for the voucher, since it knows the order of its
+own publications. A server refuses one below the floor it holds that is
+handed to it directly. One it took before it knew the floor is judged
+again when the floor is installed: it stays only if it came from a
+registrar's list that shows it published before that registrar's floor,
+the first device epoch record there above the signer's epoch having a
+higher `seq` than the withdrawal's (`identity-registrar.md` §7.3). A
+holder posts its current device epoch record to every registrar it is
+registered at when it resets, first thing after it registers at a new
+one, and again whenever a list it reads lacks it, signing it afresh each
+time (`identity-registrar.md` §6.2), so that test has a floor to read
+wherever the voucher is registered.
+
+So a thief cannot make a withdrawal after the reset at a registrar that
+has its floor, nor have one counted at a server that knows the floor,
+whether posted there or spread from elsewhere. What it withdrew before
+the reset, and a registrar published then, stands: a vouch withdrawn by
+a stolen device stays withdrawn, and the voucher vouches again, from a
+current device or with the identity key. A registrar that learned the
+floor late, from a post it missed or a restore from a backup, may have
+published before its floor record a withdrawal a thief posted after the
+reset, which servers then keep; that is a residual.
+
+The rule costs the voucher's own withdrawals too: one its device signed
+before the reset and handed to a server directly, or published by a
+registrar that never learned the floor, is dropped when the floor is
+installed, and the vouch it withdrew counts again. So after a reset the
+voucher signs again, from a current device or with the identity key,
+each withdrawal it means to keep, and posts it where it posted the old.
 
 Web-client certificates omit the `vouch` bit, as they omit `manage`, so
 a script in a browser cannot spend the user's vouches. A tunnel or
@@ -222,13 +269,15 @@ future. The registrar writes `level` 2 for a vouched signup, which is
 what §5.3 there says level 2 means.
 
 A registrar also accepts portable vouches and withdrawals on `POST
-records` from attested vouchers, and includes them in the per-identity
-list for both `voucher` and `subject`, so that a server fetching records
-for a vouched identity gets its vouches and their withdrawals in one
-place. The outstanding count is enforced there too. This is the one
-mechanism that bounds a portable voucher across servers, and it is why
-a portable vouch is worth more from an attested identity than from a
-bare key.
+records` from attested vouchers, refusing a vouch, or a withdrawal,
+whose signing device is below the floor it has published for the voucher
+(§4.1, `identity-registrar.md` §6.2), and includes them in the
+per-identity list for both `voucher` and `subject`, so that a server
+fetching records for a vouched identity gets its vouches and their
+withdrawals in one place. The outstanding count is enforced there too.
+This is the one mechanism that bounds a portable voucher across servers,
+and it is why a portable vouch is worth more from an attested identity
+than from a bare key.
 
 The count is a bound, not a judgment. Whether a registrar should also
 learn that a voucher's vouched keys keep getting banned — and refuse
@@ -337,8 +386,9 @@ Registrar side, `[registrar] proof = vouch` beside the existing kinds.
   when they choose the portable form.
 - **A stolen vouch-capable device** can spend the user's vouches on the
   attacker's keys until revoked. Rule 4 bounds it to five; §6 makes each
-  one visible; the device revocation is the fix. Web clients cannot do
-  it at all.
+  one visible; the device revocation is the fix, and a reset voids
+  every vouch the device signed (§4.1), though not the withdrawals it
+  made before the reset. Web clients cannot do it at all.
 
 ---
 
