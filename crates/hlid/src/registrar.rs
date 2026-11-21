@@ -31,17 +31,26 @@ use crate::{
 const SUCCESSOR_KEY: &str = "successor.key";
 
 /// A registrar as discovery describes it.
-struct Registrar {
-    base: String,
-    host: String,
+pub(crate) struct Registrar {
+    pub(crate) base: String,
+    pub(crate) host: String,
     key: [u8; 32],
     retiring: Vec<[u8; 32]>,
     register: String,
-    records: String,
+    pub(crate) records: String,
     envelopes: Option<String>,
 }
 
-fn agent() -> ureq::Agent {
+impl Registrar {
+    /// Every key its lists and records may be signed by.
+    pub(crate) fn keys(&self) -> Vec<[u8; 32]> {
+        std::iter::once(self.key)
+            .chain(self.retiring.iter().copied())
+            .collect()
+    }
+}
+
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -54,12 +63,37 @@ fn key32(v: &Value, what: &str) -> R<[u8; 32]> {
 }
 
 fn discover(a: &Args) -> R<Registrar> {
-    let target = a.one("registrar")?;
-    let base = if target.contains("://") {
-        target.trim_end_matches('/').to_owned()
-    } else {
-        format!("https://{target}")
+    discover_at(a.one("registrar")?)
+}
+
+/// `--registrar`'s value as the base URL it is reached at, spelled one
+/// way: scheme and host in lowercase, no default port and no trailing
+/// slash, so that two spellings of one origin are one registrar.
+pub(crate) fn base_of(target: &str) -> String {
+    let url = match target.contains("://") {
+        true => target.to_owned(),
+        false => format!("https://{target}"),
     };
+    let url = url.trim_end_matches('/');
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let mut authority = authority.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "https" => Some(":443"),
+        "http" => Some(":80"),
+        _ => None,
+    };
+    if let Some(port) = default.filter(|p| authority.ends_with(p)) {
+        authority.truncate(authority.len() - port.len());
+    }
+    format!("{scheme}://{authority}{path}")
+}
+
+pub(crate) fn discover_at(target: &str) -> R<Registrar> {
+    let base = base_of(target);
     let doc: Value = agent()
         .get(&format!("{base}/.well-known/hotline"))
         .call()
@@ -125,7 +159,7 @@ fn post(url: &str, field: &str, bytes: &[u8]) -> R<Value> {
     send(agent().post(url), json!({ field: b64(bytes) })).map_err(|(_, e)| e)
 }
 
-fn identity(a: &Args) -> R<IdentityKey> {
+pub(crate) fn identity(a: &Args) -> R<IdentityKey> {
     Ok(IdentityKey::from_seed(&read_seed(
         &a.file("identity", IDENTITY_KEY)?,
     )?))
@@ -180,9 +214,7 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
             .ok_or("reply has no attestation")?,
     )?;
     let att = Attestation::parse(&att_bytes).map_err(|e| format!("attestation: {e}"))?;
-    let keys: Vec<[u8; 32]> = std::iter::once(reg.key)
-        .chain(reg.retiring.iter().copied())
-        .collect();
+    let keys = reg.keys();
     if att.identity != id.public()
         || att.registrar != reg.host
         || !keys.contains(&att.registrar_key)
@@ -225,6 +257,12 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
         att.expires,
         card_path.display()
     );
+    // Where `hlid devices reset` posts.
+    let kept = crate::devices::Holder::open(&id.public(), true)
+        .and_then(|h| h.map_or(Ok(()), |mut h| h.add_registrar(&reg.base, &reg.host)));
+    if let Err(e) = kept {
+        eprintln!("hlid: this registrar was not kept for `hlid devices reset`: {e}");
+    }
     if a.has("no-put") {
         return Ok(());
     }

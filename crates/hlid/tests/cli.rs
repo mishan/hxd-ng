@@ -264,3 +264,84 @@ fn a_bundle_will_not_be_built_from_someone_elses_card() {
     );
     assert!(err.contains("card of"), "{err}");
 }
+
+#[test]
+fn a_certificate_minted_with_nowhere_to_keep_an_epoch_is_at_epoch_0_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let cert = dir.path().join("web.cert");
+    let out = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env_remove("HLID_HOME")
+        .env_remove("HOME")
+        .args([
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    let cert = hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap()).unwrap();
+    assert_eq!(cert.epoch, 0);
+}
+
+#[test]
+fn a_certificate_minted_with_explicit_paths_makes_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let elsewhere = dir.path().join("never");
+    let cert = dir.path().join("web.cert");
+    let out = hlid(
+        &elsewhere,
+        &[
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    assert!(!elsewhere.exists());
+}
+
+#[test]
+fn a_reset_refuses_a_card_named_that_is_another_identitys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, other) = (dir.path().join("alice"), dir.path().join("bob"));
+    ok(&home, &["init", "--name", "alice"]);
+    ok(&other, &["init", "--name", "bob"]);
+    let bobs = other.join("card.bin");
+    let stderr = fails(
+        &home,
+        &[
+            "devices",
+            "reset",
+            "--card",
+            bobs.to_str().unwrap(),
+            "--registrar",
+            "http://127.0.0.1:1",
+        ],
+    );
+    assert!(stderr.contains("another identity's card"), "{stderr}");
+    assert!(
+        !stderr.contains("no registrar could be reached"),
+        "{stderr}"
+    );
+}

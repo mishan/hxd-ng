@@ -33,6 +33,8 @@
 //! hlid revoke  --registrar HOST --identity-revoke --yes
 //! hlid rotate  --registrar HOST --to SUCCESSOR_KEY [--next-key FILE]
 //!              hand over, committing the successor to a key of its own
+//! hlid devices reset [--registrar HOST]...
+//!              publish a device epoch that signs out every device certified so far
 //! hlid backup  --registrar HOST [--recovery | --delete [--recovery]]
 //!              the identity key sealed under a passphrase or a recovery code
 //! hlid restore --registrar HOST --handle S [--recovery]
@@ -54,6 +56,7 @@
 //! Key files are the raw seed in hex, the seed being what a registrar's
 //! envelope wraps (`hlid backup`).
 
+mod devices;
 mod enroll;
 mod registrar;
 
@@ -91,6 +94,7 @@ fn main() {
         "register" => registrar::register_cmd(&args[1..]),
         "revoke" => registrar::revoke_cmd(&args[1..]),
         "rotate" => registrar::rotate_cmd(&args[1..]),
+        "devices" => devices::devices_cmd(&args[1..]),
         "backup" => registrar::backup_cmd(&args[1..]),
         "restore" => registrar::restore_cmd(&args[1..]),
         _ => usage(),
@@ -101,7 +105,7 @@ fn main() {
     }
 }
 
-fn usage() -> ! {
+pub(crate) fn usage() -> ! {
     eprintln!(concat!(
         "usage:\n",
         "  hlid init --name S [--days N] [--device-name S]\n",
@@ -121,6 +125,7 @@ fn usage() -> ! {
         "  hlid revoke --registrar HOST|URL (--device-cert FILE | --device-pub HEX) [--reason lost|stolen|retired] [--by-device]\n",
         "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
         "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--next-key FILE] [--identity K]\n",
+        "  hlid devices reset [--registrar HOST|URL]... [--forget URL]... [--identity K] [--card FILE] [--cert FILE] [--device K]\n",
         "  hlid backup --registrar HOST|URL [--recovery] [--delete] [--identity K] [--password-file F | --password-stdin]\n",
         "  hlid restore --registrar HOST|URL --handle S [--recovery] [--name S] (--password-file F | --password-stdin)\n",
         "\n",
@@ -163,6 +168,18 @@ fn usage() -> ! {
         "failed or unanswered post passes the same --next-key, or none, so the same\n",
         "key is reused. `revoke` publishes a device's revocation, or with\n",
         "--identity-revoke the identity's own, which is final.\n",
+        "\n",
+        "`hlid devices reset` publishes a device epoch one past the highest any\n",
+        "registrar holds, at every registrar the identity is registered at or its\n",
+        "card's attestations name, and at each --registrar: servers that enforce\n",
+        "device epochs then refuse every certificate below it, whether or not this\n",
+        "machine remembers minting it. Each device you still use enrolls again,\n",
+        "with a new key; this machine's own certificate is renewed at the new\n",
+        "epoch. A run that is not done everywhere says where; running it again\n",
+        "resets once more. --forget drops a registrar the identity is no longer\n",
+        "registered at, for this run and the ones after. `hlid cert` mints at the highest epoch learned, kept in\n",
+        "$HLID_HOME/holder.json, or at 0 with no $HLID_HOME or $HOME. Off Unix\n",
+        "holder.json has no lock: run one hlid at a time there.\n",
         "\n",
         "`hlid backup` seals the identity key under a passphrase and keeps it at\n",
         "the registrar, which cannot open it; --recovery seals it under a new\n",
@@ -283,7 +300,7 @@ impl Args {
         }
         Ok(None)
     }
-    fn many(&self, k: &str) -> Vec<&str> {
+    pub(crate) fn many(&self, k: &str) -> Vec<&str> {
         self.flags
             .get(k)
             .map(|v| v.iter().map(String::as_str).collect())
@@ -397,8 +414,8 @@ pub(crate) fn hlid_home() -> R<PathBuf> {
 /// The fixed names inside it: what `hlid init` writes, and what the
 /// corresponding flags fall back to when they are omitted.
 pub(crate) const IDENTITY_KEY: &str = "identity.key";
-const DEVICE_KEY: &str = "device.key";
-const CERT_FILE: &str = "cert.bin";
+pub(crate) const DEVICE_KEY: &str = "device.key";
+pub(crate) const CERT_FILE: &str = "cert.bin";
 pub(crate) const CARD_FILE: &str = "card.bin";
 /// What `hlid init` writes, and `hlid restore` does.
 pub(crate) const LAID_OUT: [&str; 4] = [IDENTITY_KEY, DEVICE_KEY, CERT_FILE, CARD_FILE];
@@ -617,7 +634,7 @@ pub(crate) fn lay_out(
 /// The directory holds private keys, so it is created 0700 rather than
 /// left to the umask. Existing is not an error — a user may well have
 /// made it themselves — but its mode is then theirs, not ours.
-fn create_private_dir(path: &Path) -> R<()> {
+pub(crate) fn create_private_dir(path: &Path) -> R<()> {
     if path.is_dir() {
         return Ok(());
     }
@@ -688,8 +705,23 @@ fn make_cert(args: &[String]) -> R<()> {
         .map_err(|e| format!("--days: {e}"))?;
     c.caps = parse_caps(a.opt("caps"))?;
     c.name = a.opt("name").map(str::to_owned);
+    // Read under the holder's lock, held while this signs: a reset raises
+    // the floor under it before it posts, so nothing is signed at the old
+    // epoch once one has begun.
+    let holder = devices::Holder::open(&id.public(), false)?;
+    c.epoch = match &holder {
+        Some(h) => h.floor(),
+        None => {
+            eprintln!(
+                "hlid: no $HLID_HOME or $HOME directory keeps a device epoch, so this is \
+                 minted at epoch 0, which servers that enforce device epochs refuse after any reset"
+            );
+            0
+        }
+    };
     let bytes = c.sign(&id);
     DeviceCert::parse(&bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
+    drop(holder);
 
     // `--bundle` writes the §5.4 object instead of a bare certificate:
     // the same bytes the enrollment mailbox carries, so a browser handed

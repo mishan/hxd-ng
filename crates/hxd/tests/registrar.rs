@@ -32,6 +32,8 @@ const HOST: &str = "127.0.0.1";
 
 struct Server {
     ng: SocketAddr,
+    /// Its `[registrar] host`.
+    host: &'static str,
     config: hxd::Config,
     config_path: PathBuf,
     registrar: Arc<hxd_registrar::Registrar>,
@@ -41,6 +43,11 @@ struct Server {
 /// A server built the way `hxd` builds one, from a config file with an
 /// `[identity]` and a `[registrar]`, every path inside `dir`.
 async fn start(dir: &Path, registrar_extra: &str) -> Server {
+    start_named(dir, HOST, registrar_extra).await
+}
+
+/// [`start`], the registrar named `host`, which must resolve here.
+async fn start_named(dir: &Path, host: &'static str, registrar_extra: &str) -> Server {
     let d = dir.display();
     // Bound first, so that `hosts` can name the address the tests reach
     // it by: without a name, no `v = 2` proof logs in.
@@ -51,7 +58,7 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
          hosts = [\"{ng}\"]\n\
-         [registrar]\nhost = \"{HOST}\"\nkey = \"{d}/registrar.key\"\n\
+         [registrar]\nhost = \"{host}\"\nkey = \"{d}/registrar.key\"\n\
          store = \"{d}/registrar.db\"\ninvites = \"{d}/invites\"\n{registrar_extra}\n"
     );
     let config_path = dir.join("hxd-ng.toml");
@@ -67,6 +74,7 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
     tokio::spawn(hxd_ng_session::serve(listener, ng_ctx));
     Server {
         ng,
+        host,
         config,
         config_path,
         registrar,
@@ -141,14 +149,19 @@ async fn http_as(
     }
 }
 
+/// The `Host` a request to `s` carries: its registrar's name.
+fn host_of(s: &Server) -> String {
+    format!("{}:{}", s.host, s.ng.port())
+}
+
 async fn get(s: &Server, path: &str) -> Reply {
-    http_as(s.ng, &s.ng.to_string(), "GET", path, &[], b"").await
+    http_as(s.ng, &host_of(s), "GET", path, &[], b"").await
 }
 
 async fn post(s: &Server, path: &str, body: Value) -> Reply {
     http_as(
         s.ng,
-        &s.ng.to_string(),
+        &host_of(s),
         "POST",
         path,
         &[("Content-Type", "application/json")],
@@ -217,7 +230,7 @@ async fn records_of(s: &Server, id: &IdentityKey) -> Vec<Record> {
     assert_eq!(r.header("Cache-Control"), Some("max-age=3600"));
     let k = keys(s);
     let rk = RegistrarKeys {
-        host: HOST,
+        host: s.host,
         keys: &k,
     };
     let list = SignedList::parse(&r.body, ListKind::Records, rk).unwrap();
@@ -1733,6 +1746,170 @@ async fn hlid_rotate_to_a_successor_holding_a_commitment_names_that_one() {
     let found = get(&s, "/registrar/lookup/alice").await.json();
     assert_eq!(found["fingerprint"], new.fingerprint().to_string());
     assert_eq!(found["successor"], c.fingerprint().to_string());
+}
+
+/// The device epochs a per-identity list carries, in its order.
+async fn epochs_at(s: &Server, id: &IdentityKey) -> Vec<u64> {
+    records_of(s, id)
+        .await
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::DeviceEpoch(e) => Some(e.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn hlid_resets_devices_at_every_registrar_and_a_rerun_past_a_daily_limit_resets_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (da, db) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::create_dir_all(&da).unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    let a = start(&da, "signup = \"open\"").await;
+    // Named apart, so the card's attestation for `b` is a target of its
+    // own, reached nowhere.
+    let b = start_named(&db, "localhost", "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let ua = format!("http://{}", a.ng);
+    let ub = format!("http://localhost:{}", b.ng.port());
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    for url in [&ua, &ub] {
+        let args = [
+            "register",
+            "--registrar",
+            url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ];
+        let (ok, _, err) = hlid(&bin, &home, &args).await;
+        assert!(ok, "{err}");
+    }
+    let alice = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+
+    // Another holder reset three times at `a` alone, spending three of its
+    // four resets today.
+    for epoch in 1..=3 {
+        let bytes = DeviceEpoch {
+            identity: alice.public(),
+            epoch,
+            time: now(),
+        }
+        .sign(&alice)
+        .unwrap();
+        let r = post(&a, "/registrar/records", json!({ "record": b64(&bytes) })).await;
+        assert_eq!(r.status, 200);
+    }
+
+    let reset = ["devices", "reset"];
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    for url in [&ua, &ub] {
+        assert!(
+            out.contains(&format!("epoch 4 published at {url}")),
+            "{out}"
+        );
+    }
+    assert!(
+        out.contains(&format!("{ua}, {ub} publish epoch 4")),
+        "{out}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![4]);
+    // This machine's certificate is renewed at the new floor, and the
+    // next one minted is at it too.
+    let own = || DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    assert_eq!(own().epoch, 4);
+    let web = dir.path().join("web.cert");
+    let mint = [
+        "cert",
+        "--device-pub",
+        &"aa".repeat(32),
+        "--device-enc-pub",
+        &"bb".repeat(32),
+        "-o",
+        web.to_str().unwrap(),
+    ];
+    assert!(hlid(&bin, &home, &mint).await.0);
+    let minted = || DeviceCert::parse(&std::fs::read(&web).unwrap()).unwrap();
+    assert_eq!(minted().epoch, 4);
+
+    // `a` has published its four today: the next reset is not done there,
+    // and says so and when to try again, while `b` takes it.
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(!ok);
+    assert!(out.contains(&format!("epoch 5 published at {ub}")), "{out}");
+    assert!(
+        err.contains(&format!("not done at {ua}: refused (429 rate_limited)"))
+            && err.contains("try again in"),
+        "{err}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![4, 5]);
+    assert_eq!(own().epoch, 5);
+
+    // The next day a rerun resets once more, past what `b` took. Named
+    // with --cert, another device's certificate is not renewed with its
+    // key: that would undo the reset for it.
+    a.clock.advance(Duration::from_secs(86_400));
+    let web_arg = web.to_str().unwrap();
+    let (ok, out, err) = hlid(&bin, &home, &["devices", "reset", "--cert", web_arg]).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("{ua}, {ub} publish epoch 6")),
+        "{out}"
+    );
+    assert!(
+        out.contains("is not this machine's device's certificate"),
+        "{out}"
+    );
+    assert_eq!(minted().epoch, 4);
+    assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4, 6]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![4, 5, 6]);
+    assert!(hlid(&bin, &home, &mint).await.0);
+    assert_eq!(minted().epoch, 6);
+
+    // A registrar forgotten is left out of this reset and the next.
+    let forget = ["devices", "reset", "--forget", &ub];
+    let (ok, out, err) = hlid(&bin, &home, &forget).await;
+    assert!(ok, "{err}");
+    assert!(out.contains(&format!("{ua} publishes epoch 7")), "{out}");
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(out.contains(&format!("{ua} publishes epoch 8")), "{out}");
+    assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4, 6, 7, 8]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![4, 5, 6]);
+}
+
+#[tokio::test]
+async fn hlid_resets_nothing_when_no_registrar_can_be_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(hlid(&bin, &home, &["init", "--name", "Bob"]).await.0);
+    let (ok, _, err) = hlid(
+        &bin,
+        &home,
+        &["devices", "reset", "--registrar", "http://127.0.0.1:1"],
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("no registrar could be reached"), "{err}");
+    let web = dir.path().join("web.cert");
+    let mint = [
+        "cert",
+        "--device-pub",
+        &"aa".repeat(32),
+        "--device-enc-pub",
+        &"bb".repeat(32),
+        "-o",
+        web.to_str().unwrap(),
+    ];
+    assert!(hlid(&bin, &home, &mint).await.0);
+    let cert = DeviceCert::parse(&std::fs::read(&web).unwrap()).unwrap();
+    assert_eq!(cert.epoch, 0);
 }
 
 /// How a verifier trusts the registrar.
