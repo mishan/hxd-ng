@@ -41,6 +41,11 @@ struct Server {
 /// A server built the way `hxd` builds one, from a config file with an
 /// `[identity]` and a `[registrar]`, every path inside `dir`.
 async fn start(dir: &Path, registrar_extra: &str) -> Server {
+    start_as(dir, false, registrar_extra).await
+}
+
+/// [`start`], serving the enrollment mailbox when `enroll` is set.
+async fn start_as(dir: &Path, enroll: bool, registrar_extra: &str) -> Server {
     let d = dir.display();
     // Bound first, so that `hosts` can name the address the tests reach
     // it by: without a name, no `v = 2` proof logs in.
@@ -49,7 +54,7 @@ async fn start(dir: &Path, registrar_extra: &str) -> Server {
     let text = format!(
         "[paths]\naccounts = \"{d}/accounts\"\n\
          [ng]\nbind = \"127.0.0.1:0\"\n\
-         [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
+         [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = {enroll}\n\
          hosts = [\"{ng}\"]\n\
          [registrar]\nhost = \"{HOST}\"\nkey = \"{d}/registrar.key\"\n\
          store = \"{d}/registrar.db\"\ninvites = \"{d}/invites\"\n{registrar_extra}\n"
@@ -1733,6 +1738,740 @@ async fn hlid_rotate_to_a_successor_holding_a_commitment_names_that_one() {
     let found = get(&s, "/registrar/lookup/alice").await.json();
     assert_eq!(found["fingerprint"], new.fingerprint().to_string());
     assert_eq!(found["successor"], c.fingerprint().to_string());
+}
+
+/// The device epochs a per-identity list carries, in its order.
+async fn epochs_at(s: &Server, id: &IdentityKey) -> Vec<u64> {
+    records_of(s, id)
+        .await
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::DeviceEpoch(e) => Some(e.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn hlid_resets_devices_at_every_registrar_and_finishes_a_reset_a_limit_held_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (da, db) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::create_dir_all(&da).unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    let a = start(&da, "signup = \"open\"").await;
+    let b = start(&db, "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let (ua, ub) = (format!("http://{}", a.ng), format!("http://{}", b.ng));
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    for url in [&ua, &ub] {
+        let args = [
+            "register",
+            "--registrar",
+            url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ];
+        let (ok, _, err) = hlid(&bin, &home, &args).await;
+        assert!(ok, "{err}");
+    }
+    let alice = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+
+    // Another holder reset at `a` alone, past where `b` can be caught up
+    // in one post.
+    for epoch in [16, 20] {
+        let bytes = DeviceEpoch {
+            identity: alice.public(),
+            epoch,
+            time: now(),
+        }
+        .sign(&alice)
+        .unwrap();
+        let r = post(&a, "/registrar/records", json!({ "record": b64(&bytes) })).await;
+        assert_eq!(r.status, 200);
+    }
+
+    let reset = ["devices", "reset"];
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 21 at {ua}")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("devices reset to epoch 21 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![16, 20, 21]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![16, 21]);
+    // This machine's certificate is renewed at the new floor, and the
+    // next one minted is at it too.
+    let own = DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    assert_eq!(own.epoch, 21);
+    let web = dir.path().join("web.cert");
+    let mint = [
+        "cert",
+        "--device-pub",
+        &"aa".repeat(32),
+        "--device-enc-pub",
+        &"bb".repeat(32),
+        "-o",
+        web.to_str().unwrap(),
+    ];
+    assert!(hlid(&bin, &home, &mint).await.0);
+    assert_eq!(
+        DeviceCert::parse(&std::fs::read(&web).unwrap())
+            .unwrap()
+            .epoch,
+        21
+    );
+
+    // `a` publishes four resets a day: the third run is held up there,
+    // and says so, while `b` takes it.
+    assert!(hlid(&bin, &home, &reset).await.0);
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(!ok);
+    assert!(
+        out.contains(&format!("devices reset to epoch 23 at {ub}")),
+        "{out}"
+    );
+    assert!(
+        err.contains("rate_limited") && err.contains("try again in"),
+        "{err}"
+    );
+    assert!(err.contains("run `hlid devices reset` again"), "{err}");
+    assert_eq!(epochs_at(&a, &alice).await, vec![16, 20, 21, 22]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![16, 21, 22, 23]);
+
+    // The next day a `register` (at `b`, whose clock has not moved)
+    // brings `a` to that reset's epoch, as the reset's own post, and a
+    // rerun then finishes the reset rather than starting another:
+    // neither registrar is moved again.
+    a.clock.advance(Duration::from_secs(86_400));
+    let again = [
+        "register",
+        "--registrar",
+        &ub,
+        "--handle",
+        "alice",
+        "--no-put",
+    ];
+    let (ok, _, err) = hlid(&bin, &home, &again).await;
+    assert!(ok, "{err}");
+    assert_eq!(epochs_at(&a, &alice).await, vec![16, 20, 21, 22, 23]);
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 23 at {ua}")),
+        "{out}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![16, 20, 21, 22, 23]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![16, 21, 22, 23]);
+
+    // But a device certified at a reset's epoch while it was held up is
+    // not signed out by finishing it, so the rerun goes past it. `b` has
+    // spent its day.
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(!ok && err.contains("rate_limited"), "{err}");
+    assert!(hlid(&bin, &home, &mint).await.0);
+    let minted = DeviceCert::parse(&std::fs::read(&web).unwrap()).unwrap();
+    assert_eq!(minted.epoch, 24);
+    b.clock.advance(Duration::from_secs(86_400));
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 25 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(
+        epochs_at(&a, &alice).await,
+        vec![16, 20, 21, 22, 23, 24, 25]
+    );
+    assert_eq!(epochs_at(&b, &alice).await, vec![16, 21, 22, 23, 25]);
+
+    // A registrar first registered at is brought to the epoch at once.
+    let dc = dir.path().join("c");
+    std::fs::create_dir_all(&dc).unwrap();
+    let c = start(&dc, "signup = \"open\"").await;
+    let uc = format!("http://{}", c.ng);
+    let args = [
+        "register",
+        "--registrar",
+        &uc,
+        "--handle",
+        "alice",
+        "--no-put",
+    ];
+    let (ok, _, err) = hlid(&bin, &home, &args).await;
+    assert!(ok, "{err}");
+    assert_eq!(epochs_at(&c, &alice).await, vec![16, 25]);
+
+    // A reset held up is finished by a rerun, unless asked for afresh:
+    // another machine may have certified a device at its epoch.
+    assert!(hlid(&bin, &home, &reset).await.0);
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(!ok && err.contains("rate_limited"), "{err}");
+    let (ok, out, _) = hlid(&bin, &home, &["devices", "reset", "--fresh"]).await;
+    assert!(!ok);
+    assert!(
+        out.contains(&format!("devices reset to epoch 28 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(
+        epochs_at(&b, &alice).await,
+        vec![16, 21, 22, 23, 25, 26, 27, 28]
+    );
+
+    // With no registrar to be reached, nothing is claimed.
+    let elsewhere = dir.path().join("elsewhere");
+    assert!(hlid(&bin, &elsewhere, &["init", "--name", "Bob"]).await.0);
+    let (ok, _, err) = hlid(
+        &bin,
+        &elsewhere,
+        &["devices", "reset", "--registrar", "http://127.0.0.1:1"],
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("no registrar could be reached"), "{err}");
+}
+
+/// What [`interfere`] does to the next record post it carries.
+enum Next {
+    Pass,
+    /// Lets it land, and drops the reply.
+    LoseReply,
+    /// Posts these bytes first, as another holder would.
+    Race(Vec<u8>),
+    /// Holds up the next per-identity list read this long.
+    StallList(Duration),
+    /// [`Next::Race`], then [`Next::Blind`].
+    RaceThenBlind(Vec<u8>),
+    /// Answers every per-identity list read 503.
+    Blind,
+    /// Lets the next record post land, and answers it this epoch.
+    Lie(u64),
+}
+
+/// An HTTP request or response off `from`: the head and a
+/// `Content-Length` body. `None` at the end of the stream.
+async fn message(from: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        if from.read(&mut byte).await.ok()? == 0 {
+            return None;
+        }
+        buf.push(byte[0]);
+    }
+    let len = String::from_utf8_lossy(&buf)
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    from.read_exact(&mut body).await.ok()?;
+    buf.extend(body);
+    Some(buf)
+}
+
+/// A proxy in front of `s`, one request at a time, doing what `next`
+/// says to the next record post.
+async fn interfere(s: &Server, next: Arc<std::sync::Mutex<Next>>) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    let to = s.ng;
+    tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let next = next.clone();
+            tokio::spawn(async move {
+                let mut server = TcpStream::connect(to).await.unwrap();
+                while let Some(req) = message(&mut client).await {
+                    let what = {
+                        let mut next = next.lock().unwrap();
+                        let hit = match &*next {
+                            Next::Pass => false,
+                            Next::StallList(_) | Next::Blind => {
+                                req.starts_with(b"GET /registrar/records/")
+                            }
+                            _ => req.starts_with(b"POST /registrar/records "),
+                        };
+                        match (hit, &*next) {
+                            (true, Next::Blind) => Next::Blind,
+                            (true, Next::RaceThenBlind(_)) => {
+                                std::mem::replace(&mut *next, Next::Blind)
+                            }
+                            (true, _) => std::mem::replace(&mut *next, Next::Pass),
+                            (false, _) => Next::Pass,
+                        }
+                    };
+                    if let Next::Blind = what {
+                        let busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                        client.write_all(busy.as_bytes()).await.unwrap();
+                        continue;
+                    }
+                    if let Next::StallList(d) = what {
+                        tokio::time::sleep(d).await;
+                    }
+                    if let Next::Race(bytes) | Next::RaceThenBlind(bytes) = &what {
+                        let body = json!({ "record": b64(bytes) }).to_string();
+                        let r = http_as(
+                            to,
+                            &to.to_string(),
+                            "POST",
+                            "/registrar/records",
+                            &[("Content-Type", "application/json")],
+                            body.as_bytes(),
+                        )
+                        .await;
+                        assert_eq!(r.status, 200);
+                    }
+                    server.write_all(&req).await.unwrap();
+                    let Some(reply) = message(&mut server).await else {
+                        return;
+                    };
+                    if let Next::LoseReply = what {
+                        return;
+                    }
+                    if let Next::Lie(epoch) = what {
+                        let body = json!({ "seq": 1, "published": true, "epoch": epoch,
+                                           "hash": b64(&[7; 32]) })
+                        .to_string();
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        client.write_all(head.as_bytes()).await.unwrap();
+                        client.write_all(body.as_bytes()).await.unwrap();
+                        continue;
+                    }
+                    client.write_all(&reply).await.unwrap();
+                }
+            });
+        }
+    });
+    at
+}
+
+#[tokio::test]
+async fn hlid_reset_retries_a_lost_reply_and_goes_past_another_holders_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (da, db) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::create_dir_all(&da).unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    let a = start(&da, "signup = \"open\"").await;
+    let b = start(&db, "signup = \"open\"").await;
+    let next = Arc::new(std::sync::Mutex::new(Next::Pass));
+    let ua = format!("http://{}", a.ng);
+    let ub = format!("http://{}", interfere(&b, next.clone()).await);
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    // `b` first, so that what it answers holds up nothing at `a`.
+    for url in [&ub, &ua] {
+        let args = [
+            "register",
+            "--registrar",
+            url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ];
+        let (ok, _, err) = hlid(&bin, &home, &args).await;
+        assert!(ok, "{err}");
+    }
+    let alice = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+    let reset = ["devices", "reset"];
+
+    // The reply to `b` is lost after the reset landed there: the post
+    // again is answered with the first one's hash, and nothing more is
+    // published.
+    *next.lock().unwrap() = Next::LoseReply;
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 1 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(epochs_at(&b, &alice).await, vec![1]);
+
+    // Another holder resets `b` to 2 just ahead of this one: that
+    // holder's devices at 2 stay signed in unless both go to 3, and `a`
+    // is not spent on the 2 that would not do. Its clock is a little
+    // ahead, so its record is not this one's.
+    let theirs = DeviceEpoch {
+        identity: alice.public(),
+        epoch: 2,
+        time: now() + 5,
+    }
+    .sign(&alice)
+    .unwrap();
+    *next.lock().unwrap() = Next::Race(theirs);
+    let (ok, out, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert!(err.contains("another holder reset meanwhile"), "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 3 at {ua}")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("devices reset to epoch 3 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![1, 3]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![1, 2, 3]);
+
+    // Naming one registrar leaves out none the identity is registered at,
+    // and one named as it is known is reset once.
+    let named = format!("{ua}/");
+    let (ok, out, err) = hlid(&bin, &home, &["devices", "reset", "--registrar", &named]).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("devices reset to epoch 4 at {ub}")),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches(&format!("devices reset to epoch 4 at {ua}"))
+            .count(),
+        1,
+        "{out}"
+    );
+    assert_eq!(epochs_at(&b, &alice).await, vec![1, 2, 3, 4]);
+
+    // Reading a slow registrar's records holds up no reset: `register`
+    // reads `b`'s while the holder's file stays free for `hlid cert`.
+    *next.lock().unwrap() = Next::StallList(Duration::from_secs(4));
+    let args = [
+        "register",
+        "--registrar",
+        &ua,
+        "--handle",
+        "alice",
+        "--no-put",
+    ];
+    let cert = dir.path().join("web.cert");
+    let mint = [
+        "cert",
+        "--device-pub",
+        &"aa".repeat(32),
+        "--device-enc-pub",
+        &"bb".repeat(32),
+        "-o",
+        cert.to_str().unwrap(),
+    ];
+    let started = std::time::Instant::now();
+    let registering = async { (hlid(&bin, &home, &args).await, started.elapsed()) };
+    let minting = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        (hlid(&bin, &home, &mint).await, started.elapsed())
+    };
+    let (((ok, _, err), registered), ((minted, _, waited), at)) =
+        tokio::join!(registering, minting);
+    assert!(ok, "{err}");
+    assert!(minted, "{waited}");
+    assert!(!waited.contains("waiting for another hlid"), "{waited}");
+    assert!(at < registered, "the slow registrar was not read");
+
+    // A registrar that names itself other than as it was registered at is
+    // not taken for it.
+    let kept = std::fs::read_to_string(home.join("holder.json")).unwrap();
+    let moved = kept.replacen("\"127.0.0.1\"", "\"elsewhere.example\"", 1);
+    assert_ne!(kept, moved);
+    std::fs::write(home.join("holder.json"), moved).unwrap();
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(!ok);
+    assert!(
+        err.contains(
+            "it names itself 127.0.0.1, where the identity is registered at elsewhere.example"
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn hlid_reset_posts_nothing_past_an_epoch_its_lists_do_not_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let (da, db) = (dir.path().join("a"), dir.path().join("b"));
+    std::fs::create_dir_all(&da).unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    let a = start(&da, "signup = \"open\"").await;
+    let b = start(&db, "signup = \"open\"").await;
+    let next = Arc::new(std::sync::Mutex::new(Next::Pass));
+    let ua = format!("http://{}", a.ng);
+    let ub = format!("http://{}", interfere(&b, next.clone()).await);
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    for url in [&ub, &ua] {
+        let args = [
+            "register",
+            "--registrar",
+            url,
+            "--handle",
+            "alice",
+            "--no-put",
+        ];
+        let (ok, _, err) = hlid(&bin, &home, &args).await;
+        assert!(ok, "{err}");
+    }
+    let alice = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+
+    // Another holder takes `b` to 5 just ahead of this reset to 1, and
+    // `b` is not read again: `a` is not reset to the 1 that would leave
+    // that holder's devices signed in, nor to an epoch no list shows.
+    let theirs = DeviceEpoch {
+        identity: alice.public(),
+        epoch: 5,
+        time: now() + 5,
+    }
+    .sign(&alice)
+    .unwrap();
+    *next.lock().unwrap() = Next::RaceThenBlind(theirs);
+    let reset = ["devices", "reset"];
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(
+        !ok && err.contains("past what any list read shows"),
+        "{err}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, Vec::<u64>::new());
+    // Once `b` can be read, both go past 5.
+    *next.lock().unwrap() = Next::Pass;
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert_eq!(epochs_at(&a, &alice).await, vec![6]);
+
+    // An answer is not signed: one claiming an epoch near the top of the
+    // range moves no target, and a rerun finishes the reset it held up.
+    *next.lock().unwrap() = Next::Lie(1 << 62);
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(
+        !ok && err.contains("past what any list read shows"),
+        "{err}"
+    );
+    assert_eq!(epochs_at(&a, &alice).await, vec![6]);
+    let (ok, _, err) = hlid(&bin, &home, &reset).await;
+    assert!(ok, "{err}");
+    assert_eq!(epochs_at(&a, &alice).await, vec![6, 7]);
+    assert_eq!(epochs_at(&b, &alice).await, vec![5, 6, 7]);
+}
+
+/// Post an enrollment request, as a browser does, and wait for its
+/// answer.
+async fn enroll_at(s: &Server, code: Option<&str>, request: &[u8]) -> Value {
+    let mut body = json!({ "request": b64(request) });
+    if let Some(c) = code {
+        body["code"] = json!(c);
+    }
+    let posted = post(s, "/identity/enroll/requests", body).await;
+    assert_eq!(
+        posted.status,
+        201,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+    get(s, &format!("/identity/enroll/requests/{handle}"))
+        .await
+        .json()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hlid_agent_mints_at_the_registrars_epoch_and_refuses_what_a_reset_signed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_as(dir.path(), true, "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    let url = format!("http://{}", s.ng);
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    let args = [
+        "register",
+        "--registrar",
+        &url,
+        "--handle",
+        "alice",
+        "--no-put",
+    ];
+    let (ok, _, err) = hlid(&bin, &home, &args).await;
+    assert!(ok, "{err}");
+    let alice = IdentityKey::from_seed(&hex32(&home.join("identity.key")));
+
+    // A browser this holder certified before another holder's reset, and
+    // a device whose key that holder revoked.
+    let old = DeviceKey::from_seed(&[0x51; 32]);
+    let hex = |k: [u8; 32]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let old_file = dir.path().join("old.cert");
+    let mint = [
+        "cert",
+        "--device-pub",
+        &hex(old.public()),
+        "--device-enc-pub",
+        &hex(old.public_enc()),
+        "-o",
+        old_file.to_str().unwrap(),
+    ];
+    assert!(hlid(&bin, &home, &mint).await.0);
+    let old_cert = std::fs::read(&old_file).unwrap();
+    let revoked = DeviceKey::from_seed(&[0x52; 32]);
+    let reset = DeviceEpoch {
+        identity: alice.public(),
+        epoch: 1,
+        time: now(),
+    }
+    .sign(&alice)
+    .unwrap();
+    let revocation = DeviceRevocation {
+        identity: alice.public(),
+        device: revoked.public(),
+        time: now(),
+        until: now() + 86_400,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    for record in [reset, revocation] {
+        let r = post(&s, "/registrar/records", json!({ "record": b64(&record) })).await;
+        assert_eq!(r.status, 200);
+    }
+
+    /// The agent, ended and reaped however the test ends.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Reaped(
+        std::process::Command::new(&bin)
+            .env("HLID_HOME", &home)
+            .args(["agent", "--server", &url])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let mut answer_yes = move || {
+        use std::io::Write;
+        stdin.write_all(b"y\n").unwrap();
+    };
+    // The codes it shows, and the renewals it asks about.
+    let (tx, shown) = std::sync::mpsc::channel::<String>();
+    let stderr = child.0.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let lines = std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok);
+        for line in lines {
+            let code = line
+                .split_whitespace()
+                .find(|t| t.len() == 9 && t.as_bytes()[4] == b'-');
+            match code {
+                Some(c) if line.contains("enter code") => tx.send(c.to_owned()).unwrap(),
+                _ if line.starts_with("Renew") => tx.send("renew?".into()).unwrap(),
+                _ if line.starts_with("Enrollment request") => tx.send("enroll?".into()).unwrap(),
+                _ => {}
+            }
+        }
+    });
+    let next = || async {
+        for _ in 0..300 {
+            if let Ok(c) = shown.try_recv() {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("hlid agent showed nothing more");
+    };
+
+    // Renewing a certificate below the floor is refused as a lapsed one
+    // is.
+    let code = next().await;
+    let mut renewal = hl_identity::EnrollRequest::new(&old, now());
+    renewal.prev = Some(old_cert);
+    let answer = enroll_at(&s, None, &renewal.sign(&old)).await;
+    assert_eq!(answer["denied"], "bad_renewal", "{answer}");
+
+    // A key the records revoke is told to make a new one.
+    let asked = hl_identity::EnrollRequest::new(&revoked, now()).sign(&revoked);
+    let answer = enroll_at(&s, Some(&code), &asked).await;
+    assert_eq!(answer["denied"], "key_reset", "{answer}");
+
+    // And a new device is certified at the epoch the registrar holds,
+    // which this holder never reset to itself.
+    let fresh = DeviceKey::from_seed(&[0x53; 32]);
+    let code = next().await;
+    answer_yes();
+    let asked = hl_identity::EnrollRequest::new(&fresh, now()).sign(&fresh);
+    let answer = enroll_at(&s, Some(&code), &asked).await;
+    let bundle = hl_identity::Bundle::parse(&unb64(answer["bundle"].as_str().unwrap())).unwrap();
+    assert_eq!(bundle.open().unwrap().0.epoch, 1, "{answer}");
+    assert_eq!(next().await, "enroll?");
+
+    // The key this holder certified before the reset is signed out too,
+    // though no record names it.
+    let code = next().await;
+    let asked = hl_identity::EnrollRequest::new(&old, now()).sign(&old);
+    let answer = enroll_at(&s, Some(&code), &asked).await;
+    assert_eq!(answer["denied"], "key_reset", "{answer}");
+    let code = next().await;
+
+    // A renewal checked against the floor, then a reset here while it is
+    // asked about: approving it certifies nothing at the new epoch.
+    let mut renewal = hl_identity::EnrollRequest::new(&fresh, now());
+    renewal.prev = Some(bundle.cert.clone());
+    let body = json!({ "request": b64(&renewal.sign(&fresh)) });
+    let posted = post(&s, "/identity/enroll/requests", body).await;
+    assert_eq!(posted.status, 201);
+    assert_eq!(next().await, "renew?");
+    let (ok, _, err) = hlid(&bin, &home, &["devices", "reset"]).await;
+    assert!(ok, "{err}");
+    answer_yes();
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+    let answer = get(&s, &format!("/identity/enroll/requests/{handle}"))
+        .await
+        .json();
+    assert_eq!(answer["denied"], "bad_renewal", "{answer}");
+
+    // The holder's file unwritable as it signs: the request is answered,
+    // not left pending to be asked about again.
+    let other = DeviceKey::from_seed(&[0x54; 32]);
+    let asked = hl_identity::EnrollRequest::new(&other, now()).sign(&other);
+    let body = json!({ "request": b64(&asked), "code": code });
+    let posted = post(&s, "/identity/enroll/requests", body).await;
+    assert_eq!(posted.status, 201);
+    assert_eq!(next().await, "enroll?");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    answer_yes();
+    let handle = posted.json()["request"].as_str().unwrap().to_owned();
+    let answer = get(&s, &format!("/identity/enroll/requests/{handle}"))
+        .await
+        .json();
+    assert_eq!(answer["denied"], "unavailable", "{answer}");
+    mode(0o700);
+    drop(child);
+    let _ = reader.join();
+
+    // A registrar named for a reset stays one it must reach, on a rerun
+    // that does not name it.
+    let away = ["devices", "reset", "--registrar", "http://127.0.0.1:1"];
+    let (ok, _, err) = hlid(&bin, &home, &away).await;
+    assert!(!ok && err.contains("127.0.0.1:1"), "{err}");
+    let (ok, _, err) = hlid(&bin, &home, &["devices", "reset"]).await;
+    assert!(!ok && err.contains("127.0.0.1:1"), "{err}");
+    let (ok, _, err) = hlid(&bin, &home, &["devices", "reset", "--fresh"]).await;
+    assert!(!ok && err.contains("127.0.0.1:1"), "{err}");
 }
 
 /// How a verifier trusts the registrar.
@@ -3780,12 +4519,23 @@ async fn hlid_backs_up_and_restores_an_identity() {
     let code_file = dir.path().join("code");
     std::fs::write(&code_file, code).unwrap();
     let original = hex32(&home.join("identity.key"));
+    let (ok, _, err) = hlid(&bin, &home, &["devices", "reset"]).await;
+    assert!(ok, "{err}");
 
     for (name, secret, recovery) in [
         ("by-passphrase", pass, false),
         ("by-code", code_file.to_str().unwrap(), true),
     ] {
         let restored = dir.path().join(name);
+        // A floor this holder kept that the registrar does not hold, for
+        // one of the two.
+        let floor = if recovery { 1 } else { 4 };
+        if !recovery {
+            std::fs::create_dir_all(&restored).unwrap();
+            let fp = IdentityKey::from_seed(&original).fingerprint();
+            let kept = format!("{{\"{fp}\": {{\"epoch\": 4}}}}");
+            std::fs::write(restored.join("holder.json"), kept).unwrap();
+        }
         let mut args = vec![
             "restore",
             "--registrar",
@@ -3806,7 +4556,31 @@ async fn hlid_backs_up_and_restores_an_identity() {
         assert_eq!(card.attestations[0].full_handle(), "alice@127.0.0.1");
         let cert = DeviceCert::parse(&std::fs::read(restored.join("cert.bin")).unwrap()).unwrap();
         assert_eq!(cert.identity, IdentityKey::from_seed(&original).public());
+        assert_eq!(cert.epoch, floor, "{name}: minted below the floor");
     }
+
+    // Another holder resets, and this machine's certificate is renewed at
+    // the floor its registrar now holds, with no reset of its own.
+    let id = IdentityKey::from_seed(&original);
+    let theirs = DeviceEpoch {
+        identity: id.public(),
+        epoch: 2,
+        time: now(),
+    }
+    .sign(&id)
+    .unwrap();
+    let r = post(&s, "/registrar/records", json!({ "record": b64(&theirs) })).await;
+    assert_eq!(r.status, 200);
+    let (ok, _, err) = hlid(&bin, &home, &["devices", "renew"]).await;
+    assert!(ok, "{err}");
+    let cert = DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    assert_eq!(cert.epoch, 2);
+    let (ok, out, err) = hlid(&bin, &home, &["devices", "renew"]).await;
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("nothing renewed") && out.contains("at epoch 2 already"),
+        "{out}"
+    );
 
     // A passphrase on the command line is one `ps` shows.
     let (ok, _, err) = hlid(

@@ -264,3 +264,147 @@ fn a_bundle_will_not_be_built_from_someone_elses_card() {
     );
     assert!(err.contains("card of"), "{err}");
 }
+
+#[test]
+fn a_certificate_is_minted_at_the_kept_epoch_and_a_long_one_is_warned_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let seed = std::fs::read_to_string(home.join("identity.key")).unwrap();
+    let seed: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&seed.trim()[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    let id = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
+    let kept = format!("{{\"{}\": {{\"epoch\": 7}}}}", id.fingerprint());
+    std::fs::write(home.join("holder.json"), kept).unwrap();
+
+    let cert = dir.path().join("web.cert");
+    let mint = |name: &str| {
+        hlid(
+            &home,
+            &[
+                "cert",
+                "--device-pub",
+                &key_hex(DEVICE_PUB),
+                "--device-enc-pub",
+                &key_hex(DEVICE_ENC_PUB),
+                "--name",
+                name,
+                "--caps",
+                "web",
+                "--days",
+                "36500",
+                "-o",
+                cert.to_str().unwrap(),
+            ],
+        )
+    };
+    let out = mint("laptop");
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("past the"));
+    let c = hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap()).unwrap();
+    assert_eq!(c.epoch, 7);
+
+    // The longest name there is, at the highest epoch there is, for as
+    // long as there is.
+    let kept = format!("{{\"{}\": {{\"epoch\": {}}}}}", id.fingerprint(), i64::MAX);
+    std::fs::write(home.join("holder.json"), kept).unwrap();
+    let out = mint(&"\u{1d538}".repeat(64));
+    assert!(out.status.success());
+    assert!(std::fs::read(&cert).unwrap().len() > 512);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("past the 512"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mint_waits_for_whoever_holds_the_holders_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let lock = std::fs::File::create(home.join("holder.lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env("HLID_HOME", &home)
+        .args([
+            "cert",
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+        ])
+        .args([&key_hex(DEVICE_ENC_PUB), "-o", cert.to_str().unwrap()])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Unlocked once the child says it is waiting, and not before.
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let (tx, waiting) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        while stderr.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.contains("waiting for another hlid") {
+                let _ = tx.send(());
+            }
+            line.clear();
+        }
+    });
+    waiting
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the mint did not wait for the lock");
+    assert!(!cert.exists(), "minted under another's lock");
+    drop(lock);
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    assert!(cert.is_file());
+}
+
+#[test]
+fn a_certificate_is_minted_with_explicit_paths_and_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let cert = dir.path().join("web.cert");
+    let out = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env_remove("HLID_HOME")
+        .env_remove("HOME")
+        .args([
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+        ])
+        .args(["--device-pub", &key_hex(DEVICE_PUB), "--device-enc-pub"])
+        .args([&key_hex(DEVICE_ENC_PUB), "-o", cert.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap())
+            .unwrap()
+            .epoch,
+        0
+    );
+}
+
+#[test]
+fn devices_renew_renews_this_machines_certificate_at_the_kept_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let before =
+        hl_identity::DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    let kept = format!(
+        "{{\"{}\": {{\"epoch\": 3}}}}",
+        hl_identity::Fingerprint::of(&before.identity)
+    );
+    std::fs::write(home.join("holder.json"), kept).unwrap();
+    ok(&home, &["devices", "renew"]);
+    let after =
+        hl_identity::DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    assert_eq!((after.epoch, after.device), (3, before.device));
+}
