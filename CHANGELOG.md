@@ -69,9 +69,21 @@ as AGENTS.md's "Releasing" describes it.
   sweep ends its sessions on both wires, connected or detached, and a
   resume or a login on a socket that authenticated first is refused
   `revoked` with `epoch`. Nothing is sealed to it. With no reset every
-  certificate is admitted as before. The floor is read from the lists
-  held, not yet kept apart from them, and a reset device's push
+  certificate is admitted as before. A reset device's push
   registrations and friendship presentations are not yet judged by it.
+
+- Schema 38 keeps each identity's device epoch records apart from the
+  lists that carried them, by fingerprint, in a new
+  `identity_device_floor` table, each verified again as it is read
+  (docs/identity-records.md §3). A floor seen once stands whatever the
+  registrar publishes later, after a restart, and whatever card the
+  identity shows, even once its registrar, or every registrar, is no
+  longer trusted; a certificate below it is told `revoked` with `epoch`
+  under `revocation_stale = "deny"` too, not `denied`. A floor that
+  cannot be read refuses the identity `denied`. The main SQLite store
+  migrates from schema 37 on first start, and a build from before
+  refuses the migrated file: take a backup first (docs/operating.md,
+  "Backups").
 
 - `hlid devices reset` is the holder's side of device epochs. Each run
   reads every registrar's per-identity list, past any cache, and posts a

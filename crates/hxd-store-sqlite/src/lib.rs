@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1072,6 +1072,20 @@ ALTER TABLE chat_line ADD COLUMN emoji BLOB;
 ALTER TABLE message ADD COLUMN emoji BLOB;
 ";
 
+/// The device epoch records seen for each identity, by its fingerprint,
+/// apart from the lists that carried them (`docs/identity-records.md`
+/// §3): for each `epoch`, the record with the earliest `time` seen. The
+/// highest `epoch` is the identity's floor.
+const SCHEMA_V38: &str = "
+CREATE TABLE identity_device_floor (
+  identity BLOB    NOT NULL,
+  epoch    INTEGER NOT NULL,
+  time     INTEGER NOT NULL,
+  record   BLOB    NOT NULL,
+  PRIMARY KEY (identity, epoch)
+) WITHOUT ROWID;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1830,6 +1844,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 37 {
         steps.push_str(SCHEMA_V37);
+    }
+    if version < 38 {
+        steps.push_str(SCHEMA_V38);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -4906,6 +4923,54 @@ mod tests {
             store.push(&retry, 100).unwrap(),
             Pushed::Stored { .. }
         ));
+    }
+
+    #[test]
+    fn version_thirty_seven_migrates_into_a_kept_floor_beside_the_lists_held() {
+        use hxd_core::identity_records::{KeptEpoch, RecordCache};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO identity_records (identity, registrar, list, fetched, keys)
+                 VALUES (x'09', 'hl.example', x'', 1, x'');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 37).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let held = store.conn.lock().unwrap().query_row(
+            "SELECT registrar FROM identity_records WHERE identity = x'09'",
+            [],
+            |r| r.get::<_, String>(0),
+        );
+        assert_eq!(held.unwrap(), "hl.example");
+        let kept = KeptEpoch {
+            epoch: 1,
+            time: 10,
+            record: vec![1],
+        };
+        store.keep_epoch(&[9; 32], &kept).unwrap();
+        assert_eq!(store.epochs(&[9; 32]).unwrap(), [kept]);
+        // What a build of schema 37 refuses as a newer hxd's.
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 38);
     }
 
     /// An empty catalog at revision 0, whose ids, kept in the file,

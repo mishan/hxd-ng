@@ -1,7 +1,8 @@
 //! Registrars' record lists on SQLite (`docs/identity-records.md` §2):
-//! one row per identity and registrar, the last list fetched.
+//! one row per identity and registrar, the last list fetched; and one
+//! per identity and device epoch, the earliest record of it seen.
 
-use hxd_core::identity_records::{CachedList, RecordCache, FIRST_SEEN_KEPT};
+use hxd_core::identity_records::{CachedList, KeptEpoch, RecordCache, FIRST_SEEN_KEPT};
 use hxd_core::inbox::StoreError;
 use rusqlite::{params, OptionalExtension};
 
@@ -115,11 +116,67 @@ impl RecordCache for SqliteStore {
         sql(tx.commit())?;
         Ok(now)
     }
+
+    fn keep_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO identity_device_floor (identity, epoch, time, record)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (identity, epoch) DO UPDATE
+               SET time = excluded.time, record = excluded.record
+               WHERE excluded.time < identity_device_floor.time",
+            params![
+                identity.to_vec(),
+                i64::try_from(kept.epoch).unwrap_or(i64::MAX),
+                i64::try_from(kept.time).unwrap_or(i64::MAX),
+                kept.record,
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn replace_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT OR REPLACE INTO identity_device_floor (identity, epoch, time, record)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                identity.to_vec(),
+                i64::try_from(kept.epoch).unwrap_or(i64::MAX),
+                i64::try_from(kept.time).unwrap_or(i64::MAX),
+                kept.record,
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT epoch, time, record FROM identity_device_floor WHERE identity = ?1",
+        ))?;
+        let rows = sql(stmt.query_map(params![identity.to_vec()], |r| {
+            let (epoch, time): (i64, i64) = (r.get(0)?, r.get(1)?);
+            Ok(KeptEpoch {
+                epoch: u64::try_from(epoch).unwrap_or(0),
+                time: u64::try_from(time).unwrap_or(0),
+                record: r.get(2)?,
+            })
+        }))?;
+        rows.map(sql).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passes_the_conformance_suite() {
+        hxd_core::identity_records::conformance::run(&|| {
+            Box::new(SqliteStore::in_memory().unwrap())
+        });
+    }
 
     #[test]
     fn a_list_comes_back_with_its_keys_deadlines() {
