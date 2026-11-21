@@ -28,8 +28,8 @@ use hl_identity::{
 use serde_json::{json, Value};
 
 use crate::{
-    b64, caps_words, now, parse_caps, read_file, read_seed, refuse_unreadable, seconds,
-    server_base, unb64, CARD_FILE, IDENTITY_KEY, R,
+    b64, caps_words, now, parse_caps, read_file, read_seed, seconds, server_base, unb64, CARD_FILE,
+    IDENTITY_KEY, R,
 };
 
 /// Longer than the mailbox's 30-second long poll, so a poll that comes
@@ -40,6 +40,9 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(45);
 /// not answer. The mailbox's own long poll, so a stuck request costs the
 /// same as an idle one and no more.
 const IDLE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long the registrars' records read for one request serve the next.
+const FLOOR_FRESH: Duration = Duration::from_secs(60);
 
 /// What a holder asks a human. A trait because the point of putting this
 /// flow behind a mailbox rather than a clipboard is that the prompt can
@@ -397,6 +400,8 @@ fn with_holder(args: &[String], budget: Option<usize>) -> R<()> {
     let found = discover(&base, web)?;
     let holder = Holder {
         id: &id,
+        args: &a,
+        floor: Default::default(),
         card: &card,
         card_name: &parsed_card.name,
         policy: &policy,
@@ -464,6 +469,8 @@ struct Session {
 /// Everything the loop needs that does not change between sessions.
 struct Holder<'a> {
     id: &'a IdentityKey,
+    args: &'a crate::Args,
+    floor: std::cell::RefCell<Option<(std::time::Instant, crate::devices::Floor)>>,
     card: &'a [u8],
     card_name: &'a str,
     policy: &'a Policy,
@@ -644,6 +651,18 @@ impl Holder<'_> {
         Ok(())
     }
 
+    /// The registrars' floor, read again once [`FLOOR_FRESH`] has passed.
+    fn floor(&self, ui: &mut dyn Prompt) -> R<crate::devices::Floor> {
+        if let Some((at, f)) = &*self.floor.borrow() {
+            if at.elapsed() < FLOOR_FRESH {
+                return Ok(f.clone());
+            }
+        }
+        let f = crate::devices::sync(self.args, self.id, &mut |line| ui.tell(line))?;
+        *self.floor.borrow_mut() = Some((std::time::Instant::now(), f.clone()));
+        Ok(f)
+    }
+
     /// Verify one request, ask about it, and answer. Errors here are
     /// about *this* request; a standing agent reports them and carries
     /// on rather than exiting.
@@ -698,6 +717,38 @@ impl Holder<'_> {
                 return Err("refused a request whose pairing proof does not verify".into());
             }
         };
+
+        // What the registrars hold, read only for a request that got this
+        // far, and at most once a minute, so junk spends none of their
+        // lookups on this holder's address: a certificate minted below
+        // the floor is dead at first use (§8).
+        let floor = match self.floor(ui) {
+            Ok(floor) => floor,
+            Err(e) => {
+                self.answer(s, json!({ "id": id_of_request, "denied": "unavailable" }))?;
+                return Err(e);
+            }
+        };
+        if floor.reset_keys.contains(&request.device) {
+            self.answer(s, json!({ "id": id_of_request, "denied": "key_reset" }))?;
+            return Err(format!(
+                "refused {}: its key was signed out by a device reset, and it must make a new one",
+                device_fp.short()
+            ));
+        }
+        // Answered as a lapsed certificate is: the device enrolls afresh,
+        // with a new key (§8).
+        if renewal
+            .as_ref()
+            .is_some_and(|p| p.check_floor(floor.epoch).is_err())
+        {
+            self.answer(s, json!({ "id": id_of_request, "denied": "bad_renewal" }))?;
+            return Err(
+                "refused a renewal: the certificate it wants renewed was signed out by a device \
+                 reset"
+                    .into(),
+            );
+        }
 
         let (mut caps, mut days) = grant(self.policy, request.caps, request.days);
         if let Some(prev) = &renewal {
@@ -756,8 +807,36 @@ impl Holder<'_> {
         .map_err(|e| format!("--days: {e}"))?;
         cert.caps = caps;
         cert.name = request.name.clone();
-        let cert_bytes = cert.sign(self.id);
-        DeviceCert::parse(&cert_bytes).map_err(|e| refuse_unreadable("device certificate", e))?;
+        // Read again as it signs, under the holder's lock: a reset run
+        // beside this agent while the prompt was up is in the file. One
+        // that moved the floor past what this request was checked against
+        // is a reason to check it again, and a renewal below it is
+        // signed out.
+        let mut kept = crate::devices::Holder::load(&self.id.public())?;
+        let moved = kept.epoch();
+        if moved > floor.epoch {
+            drop(kept);
+            *self.floor.borrow_mut() = None;
+            let below = renewal
+                .as_ref()
+                .is_some_and(|p| p.check_floor(moved).is_err());
+            let denied = if below { "bad_renewal" } else { "unavailable" };
+            self.answer(s, json!({ "id": id_of_request, "denied": denied }))?;
+            return Err(format!(
+                "refused {}: the device epoch moved while it was asked about; {}",
+                device_fp.short(),
+                if below {
+                    "the certificate it wants renewed was signed out by the reset"
+                } else {
+                    "it may ask again"
+                }
+            ));
+        }
+        cert.epoch = kept.epoch().max(floor.epoch);
+        let cert_bytes = crate::devices::mint(&cert, self.id)?;
+        kept.minted(cert.epoch);
+        kept.save()?;
+        drop(kept);
         let bundle = Bundle {
             cert: cert_bytes,
             card: self.card.to_vec(),

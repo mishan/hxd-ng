@@ -74,7 +74,7 @@ been exercised on newer toolchains; CI runs stable.
 | `hxd-push-uniqush` | The second gateway (`docs/push-notifications.md` §4.1): a uniqush-push sidecar over TCP with its token or over its Unix socket, the mailbox as a subscriber (`subscriber.rs`), the store's rows kept as the record with uniqush's copy subscribed, unsubscribed and pruned in step by a task of its own, and the in-process sender's payload, collapse key and breaker. Behind the same trait and the `uniqush` Cargo feature, chosen by `[push] gateway`. |
 | `hxd-feeds` | The feed reader (`docs/news-feeds.md` §5, §7): the fetch, through `hxd-fetch`; the parse of RSS, RDF, Atom and JSON Feed into items oldest first, each known by a hash of its identity; and the conversion of a feed's HTML into markdown that holds none, over a tokenizer and a stack it bounds itself. Hands its caller normalized items and knows nothing about Hotline. |
 | `hxd-fetch` | The outbound GET to a URL the operator chose (`docs/news-feeds.md` §4), for feeds and, by `docs/identity-records.md`, registrars: conditional and bounded in time and in bytes after decompression, a URL on the local network fetched as configured and any other's every hop of a redirect resolved once and checked by the push sender's classifier before it is connected to, and a proxy only when one is configured. |
-| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar, and `backup` and `restore` keep the identity key there sealed and bring it back. |
+| `hlid` | The identity tool: `init` (a whole identity in one command, into `$HLID_HOME`, which every file flag falls back to), keygen, device certificates, cards, attestations, `inspect`; `auth` runs the challenge binding against a server; `tunnel` listens on a local port for a classic client and carries it to `/trtp` over WebSocket with the user's device key (spec §11.1), and on the port after it for the client's file transfers and banner, carried to `/htxf`; `register`, `revoke` and `rotate` talk to a registrar, `devices reset` signs out every device the identity certified, at each registrar it is registered at, and every certificate is minted at the device epoch kept in `holder.json` (`devices.rs`), and `backup` and `restore` keep the identity key there sealed and bring it back. |
 | `hxd-testclient` | Scripted clients for the server's own tests: the classic wire over TCP or TLS, framed with the pinned `hxproto` rather than the server's framer and read through a buffer so a timeout cannot cut a frame, with the instant messaging extension's requests built and replies read by `hxproto`'s own (`messaging.rs`), and the ng wire with every event's seq checked as it arrives. Both keep what arrives while they wait for something else. Shared by `hxd-load` and the e2e suites. |
 | `hxd-load` | The load harness (`docs/load-testing.md`): scenarios from TOML — the login storm, public chat, the slow consumer, churn — open-loop, timed from when each thing was due, with the server's invariants checked under load and a JSON report. `hxd-load accounts` writes the accounts churn logs in to. Its `tests/` run each scenario small against a real server. |
 | `hlrelay` | A relay (`docs/hotline-ng-auth.md` §10.2, `docs/relay.md`): discovery, `/trtp` and `/htxf` in front of a classic server that has never heard of Hotline-ng, each socket copied to a TCP connection of its own. Knows nothing about the bytes it carries and does not authenticate. |
@@ -551,7 +551,15 @@ Three layers, all `cargo test --workspace`:
   until `hxd registrar publish`, invites from
   the file and the command, the operator's commands on the running
   store, `hlid register`, `revoke` and `rotate` driven as a user
-  would, and key backup: an envelope put, found by its salt, fetched and
+  would, `hlid devices reset` across two registrars, the one behind
+  caught up, a reset the other's daily limit held up finished by a
+  rerun, gone past once this holder certified a device at its epoch
+  and with `--fresh`, a lost
+  reply retried, another holder's reset at the same epoch gone past,
+  and a registrar registered at afterward brought to the epoch, `hlid
+  agent` minting at a registrar's epoch and refusing a renewal below it
+  and a revoked key, `hlid restore` minting at the floor, and key
+  backup: an envelope put, found by its salt, fetched and
   opened, every miss one answer and every salt without an envelope a
   stable decoy, a guessed-at handle locked out until the clock moves
   or `hxd registrar unlock`, a

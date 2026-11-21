@@ -59,7 +59,18 @@ as AGENTS.md's "Releasing" describes it.
   A device revocation signed by a device certified below the identity's
   epoch is refused `bad_signature`. The full record list carries an
   identity's latest reset alone; its own list keeps the 256 before it.
-  No schema change. Servers do not apply resets yet.
+  No schema change. Servers do not apply resets yet. `hlid devices
+  reset` is the holder's side: it reads every registrar the identity is
+  registered at, resets one past the highest epoch any holds, catches up
+  a registrar more than 16 behind, finishes a reset a rerun finds held
+  up (or goes past it if this holder certified a device at its epoch
+  since; `--fresh` always starts a new one, for a device another machine
+  may have certified), and renews this machine's certificate. `hlid cert`, `enroll`,
+  `agent` and `restore` mint at the epoch it keeps in
+  `$HLID_HOME/holder.json`, and `enroll` and `agent` read the
+  registrars' records first, refusing a renewal below the epoch and a
+  key a reset signed out. `hlid register` posts the current epoch to a
+  registrar that lacks it.
 
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]
