@@ -571,6 +571,57 @@ pub fn check_handovers(key: &PublicKey, h: &Handovers, now: u64) -> Result<(), S
     Ok(())
 }
 
+/// What the lists held say of `card`'s identity, and whether one of the
+/// registrars that attested it has none current. Reads the store: called
+/// off the reactor.
+fn records_of(
+    registrars: &crate::registrars::Registrars,
+    card: &hl_identity::Card,
+    now: u64,
+) -> crate::registrars::Lookup {
+    // Only an attestation under a key its registrar publishes was
+    // fetched for, so only its registrar can be stale.
+    let hosts: Vec<String> = card
+        .attestations
+        .iter()
+        .filter(|a| {
+            registrars
+                .keys(&a.registrar, &a.identity, now)
+                .contains(&a.registrar_key)
+        })
+        .map(|a| a.registrar.clone())
+        .collect();
+    registrars.lookup(&card.identity, &hosts, now)
+}
+
+/// What the lists say of a certificate besides its floor, which is said
+/// in the floor's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    Nothing,
+    /// A rotation away from its identity, which `apply_records` decides.
+    Rotated,
+    /// A revocation of its identity or its device.
+    Revoked,
+}
+
+/// The highest device epoch in `found` (`identity-registrar.md` §7.3),
+/// and what else in it names `cert` outright.
+fn floor_of(found: &crate::registrars::Lookup, cert: &hl_identity::DeviceCert) -> (u64, Named) {
+    found
+        .records
+        .iter()
+        .fold((0, Named::Nothing), |(floor, named), r| match r {
+            Record::DeviceEpoch(e) => (floor.max(e.epoch), named),
+            Record::RevokeIdentity(_) => (floor, Named::Revoked),
+            Record::RevokeDevice(d) if d.device == cert.device => (floor, Named::Revoked),
+            Record::Rotate(r) if r.identity == cert.identity && named == Named::Nothing => {
+                (floor, Named::Rotated)
+            }
+            _ => (floor, named),
+        })
+}
+
 /// What `list` says of `fp` alone.
 fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Published {
     // Destructured, so a field added is one to say how to cut.
@@ -1445,25 +1496,63 @@ impl IdentityState {
         let device = Fingerprint::of(&cert.device);
         // A freeze, or a rotation with no anchors to keep it, is refused
         // too, but by the records below, which say which it is.
-        let refused = match self.core.key_refusal(&hxd_core::CertRef {
+        let installed = match self.core.key_refusal(&hxd_core::CertRef {
             identity: fingerprint.0,
             device: device.0,
             epoch: cert.epoch,
         }) {
-            Some(hxd_core::KeyRefusal::Revoked) => Some(AuthRefused::Revoked),
-            // Whatever the lists say now, told the higher of the two: they
-            // may have been fetched since the floor was installed.
-            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => Some(AuthRefused::BelowFloor {
-                floor: floor.max(self.held_floor(&card.identity)),
-            }),
-            Some(hxd_core::KeyRefusal::Unrevoked) | None => None,
+            Some(hxd_core::KeyRefusal::Revoked) => {
+                debug!(
+                    fingerprint = %fingerprint.short(),
+                    device = %device.short(),
+                    "identity auth refused: revoked here"
+                );
+                let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                t.devices.remove(&cert.device);
+                return Err(AuthRefused::Revoked);
+            }
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => floor,
+            Some(hxd_core::KeyRefusal::Unrevoked) | None => 0,
+        };
+
+        // The floor, the higher of the one installed and the one the lists
+        // just fetched publish, decided before any policy below. One the
+        // lists raise is installed now, as the sweep would install it: the
+        // sessions and tokens below it go before the sweep comes round.
+        let now = self.clock.unix();
+        let found = self.registrars.as_ref().map(|r| records_of(r, card, now));
+        let (listed, named) = found
+            .as_ref()
+            .map_or((0, Named::Nothing), |f| floor_of(f, cert));
+        if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
+            for (uid, nick) in ended {
+                info!(uid, nick = %nick, "session ended: below a floor fetched at auth");
+            }
+            // Dropped here too: an identity with no session the sweep
+            // keeps lists for is installed without its floor next time.
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.tokens.retain(|_, (ident, _)| {
+                ident.fingerprint != fingerprint || ident.device_epoch >= listed
+            });
+        }
+        let floor = installed.max(listed);
+        let refused = match named {
+            Named::Revoked => Some(AuthRefused::Revoked),
+            Named::Rotated => None,
+            Named::Nothing => cert
+                .check_floor(floor)
+                .is_err()
+                .then_some(AuthRefused::BelowFloor { floor }),
         };
         if let Some(refused) = refused {
-            debug!(
-                fingerprint = %fingerprint.short(),
-                device = %device.short(),
-                "identity auth refused: revoked here"
-            );
+            match refused {
+                AuthRefused::Revoked => {
+                    info!(fingerprint = %fingerprint.short(), "identity auth refused: revoked at its registrar")
+                }
+                _ => {
+                    info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor")
+                }
+            }
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             t.devices.remove(&cert.device);
             return Err(refused);
@@ -1472,7 +1561,8 @@ impl IdentityState {
         // A banned registrar refuses every identity that carries its
         // attestation, verified or not, and whatever else the card
         // carries: a card is its holder's own signature, so what is on it
-        // its holder chose, and nobody can put it on another's.
+        // its holder chose, and nobody can put it on another's. A
+        // rotation listed for it is answered `denied` here too.
         if card
             .attestations
             .iter()
@@ -1483,8 +1573,7 @@ impl IdentityState {
         }
 
         // Step 4, continued: what the registrars that attested it publish.
-        let now = self.clock.unix();
-        let attestations = self.apply_records(card, cert, now)?;
+        let attestations = self.apply_records(card, cert, found, floor)?;
         // A rotation to this key whose moves have not all landed would
         // leave it to be admitted without the predecessor's account, and
         // `new_accounts = create` to make it another one; it is admitted
@@ -1751,33 +1840,22 @@ impl IdentityState {
     /// `identity-registrar.md` §7.3: the records the registrars that
     /// attested the identity publish against it, applied in time order.
     /// A revocation of it or of this device refuses; a freeze, or records
-    /// past their lifetime, refuse or downgrade as configured, and a
-    /// certificate below their floor is refused with it. Answers the
+    /// past their lifetime, refuse or downgrade as configured, and past a
+    /// rotation the anchors overrule, a certificate below `floor` is
+    /// refused. Answers the
     /// attestations that survive, or `None` when the identity is to be
     /// taken as unattested.
     fn apply_records(
         &self,
         card: &hl_identity::Card,
         cert: &hl_identity::DeviceCert,
-        now: u64,
+        found: Option<crate::registrars::Lookup>,
+        floor: u64,
     ) -> Result<Option<Vec<Attestation>>, AuthRefused> {
-        let Some(registrars) = &self.registrars else {
+        let (Some(registrars), Some(found)) = (&self.registrars, found) else {
             return Ok(Some(card.attestations.clone()));
         };
         let fingerprint = Fingerprint::of(&card.identity);
-        // Only an attestation under a key its registrar publishes was
-        // fetched for, so only its registrar can be stale.
-        let hosts: Vec<String> = card
-            .attestations
-            .iter()
-            .filter(|a| {
-                registrars
-                    .keys(&a.registrar, &a.identity, now)
-                    .contains(&a.registrar_key)
-            })
-            .map(|a| a.registrar.clone())
-            .collect();
-        let found = registrars.lookup(&card.identity, &hosts, now);
         // A list held damaged proves nothing either way, and so does a
         // store that could not be read for an identity a list could be
         // held for: refused once the lists that do say something have.
@@ -1789,20 +1867,21 @@ impl IdentityState {
                         .iter()
                         .any(|a| registrars.trusts(&a.registrar))));
         let mut unattested = false;
+        // Denied once what the records held say has been said.
+        let mut stale_denies = false;
         if found.stale && !unproven {
             match registrars.config().stale {
                 crate::registrars::Stale::Cached => {
                     info!(fingerprint = %fingerprint.short(), "registrar records past their lifetime; using what is held");
                 }
                 crate::registrars::Stale::Guest => unattested = true,
-                crate::registrars::Stale::Deny => return Err(AuthRefused::Denied),
+                crate::registrars::Stale::Deny => stale_denies = true,
             }
         }
         let mut attestations = card.attestations.clone();
         // A registrar's latest freeze record is its word; any registrar's
         // standing freeze holds.
         let mut frozen: HashMap<&str, bool> = HashMap::new();
-        let mut floor = 0;
         for record in &found.records {
             match record {
                 Record::RevokeIdentity(_) => {
@@ -1844,16 +1923,18 @@ impl IdentityState {
                         return Err(AuthRefused::Rotated { successor });
                     }
                 }
-                Record::DeviceEpoch(e) => floor = floor.max(e.epoch),
-                Record::RevokeDevice(_) => {}
+                Record::RevokeDevice(_) | Record::DeviceEpoch(_) => {}
             }
         }
-        // Not in `time` order: the highest floor any registrar published.
         if cert.check_floor(floor).is_err() {
             info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             t.devices.remove(&cert.device);
             return Err(AuthRefused::BelowFloor { floor });
+        }
+        if stale_denies {
+            info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records past their lifetime");
+            return Err(AuthRefused::Denied);
         }
         if unproven {
             info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records held here could not be read whole");
@@ -1869,24 +1950,6 @@ impl IdentityState {
             }
         }
         Ok((!unattested).then_some(attestations))
-    }
-
-    /// The highest device epoch in the lists held for `identity`. Reads
-    /// the store: called off the reactor.
-    fn held_floor(&self, identity: &PublicKey) -> u64 {
-        let Some(registrars) = &self.registrars else {
-            return 0;
-        };
-        let found = registrars.lookup(identity, &[], self.clock.unix());
-        found
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                Record::DeviceEpoch(e) => Some(e.epoch),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
     }
 
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
@@ -3330,7 +3393,8 @@ mod tests {
         let bare = Card::parse(&Card::new(&id, "alice", now).sign(&id, vec![]).unwrap()).unwrap();
 
         let answer = |st: &IdentityState, card: &Card, dev| {
-            st.apply_records(card, &cert(dev), now)
+            let found = st.registrars.as_ref().map(|r| records_of(r, card, now));
+            st.apply_records(card, &cert(dev), found, 0)
                 .map(|_| ())
                 .map_err(AuthRefused::code)
         };

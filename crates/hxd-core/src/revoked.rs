@@ -383,6 +383,26 @@ impl Core {
         ended
     }
 
+    /// Raise `identity`'s device epoch floor to `floor`, as a list fetched
+    /// at an admission publishes it before the sweep installs it, and end
+    /// the sessions below it as the sweep would. `None` if the floor held
+    /// is that high already. The sweep's next install replaces it with
+    /// what the lists it reads say. Called off the reactor.
+    pub fn raise_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
+        {
+            let mut refused = self.revoked.write().unwrap();
+            let held = refused.published.floors.get(&identity).copied();
+            if held.unwrap_or(0) >= floor {
+                return None;
+            }
+            refused.published.floors.insert(identity, floor);
+        }
+        Some(self.end_revoked(
+            |tag| tag.fingerprint == identity && tag.device_epoch < floor,
+            |_| Some(EndedBy::BelowFloor(floor)),
+        ))
+    }
+
     /// Refuse `identity` from now on, as a key its holder rotated away
     /// from (`identity-registrar.md` §7.4), and end its sessions.
     pub fn refuse_rotated(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {

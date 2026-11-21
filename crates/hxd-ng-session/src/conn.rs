@@ -898,11 +898,8 @@ async fn handle_login(
     // A key refused after this socket authenticated (`crate::identity`
     // refuses it at auth; this is the socket that got in first). `attach`
     // refuses it too, so asking here only buys the right error.
-    let refused = attach
-        .transport
-        .identity
-        .as_ref()
-        .and_then(|t| ctx.core.key_refusal(&t.cert()));
+    let cert = attach.transport.identity.as_ref().map(|t| t.cert());
+    let refused = cert.and_then(|c| ctx.core.key_refusal(&c));
     let attach_friendships = attach.transport.friendships;
     let attach_guest_identities = attach.transport.guest_identities;
     let replies = attach.transport.replies;
@@ -920,6 +917,9 @@ async fn handle_login(
         ctx.core.attach(attach)
     };
     let Some((uid, events)) = attached else {
+        // Asked again: a list installed since the first asking refuses
+        // the attach too.
+        let refused = refused.or_else(|| cert.and_then(|c| ctx.core.key_refusal(&c)));
         let reply = match refused {
             Some(hxd_core::KeyRefusal::Revoked) => reply_err_revoked(req.id, None),
             Some(hxd_core::KeyRefusal::BelowFloor(floor)) => reply_err_revoked(req.id, Some(floor)),

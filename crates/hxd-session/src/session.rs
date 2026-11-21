@@ -1949,6 +1949,16 @@ fn names_guest(login: &str) -> bool {
     login.is_empty() || login.eq_ignore_ascii_case("guest")
 }
 
+/// What a login refused for its key is told.
+fn key_refusal_text(refused: hxd_core::KeyRefusal) -> &'static str {
+    match refused {
+        hxd_core::KeyRefusal::Revoked | hxd_core::KeyRefusal::BelowFloor(_) => {
+            "This key is revoked on this server."
+        }
+        hxd_core::KeyRefusal::Unrevoked => "This key is not admitted here.",
+    }
+}
+
 /// Why [`reconcile_login`] refused. The client hears "Login failed." for
 /// the first two — which one it was is nothing a guesser should learn —
 /// but only the first is a guess, and only a guess counts against the
@@ -2351,6 +2361,7 @@ async fn login_phase(
     // before the backend is asked: that may link it to the account the
     // login names, and a link written for a banned person is a way back
     // in once the ban on them ends or is evaded.
+    // So is a key refused since the tunnel authenticated.
     if let Some(t) = transport.identity.as_ref() {
         if let Some(hit) = ctx
             .core
@@ -2358,6 +2369,11 @@ async fn login_phase(
         {
             info!(ban = hit.id, "tunnelled login refused: banned");
             reply_error(tx, f.trans, &banned_text(&hit.reason));
+            return None;
+        }
+        if let Some(refused) = ctx.core.key_refusal(&t.cert()) {
+            info!("tunnelled login refused: its key is refused here");
+            reply_error(tx, f.trans, key_refusal_text(refused));
             return None;
         }
     }
@@ -2653,27 +2669,21 @@ async fn login_phase(
     };
     // A key refused after the tunnel authenticated: `attach` refuses it,
     // and asking first only buys the right words.
-    let refused = attach
-        .transport
-        .identity
-        .as_ref()
-        .and_then(|t| ctx.core.key_refusal(&t.cert()));
+    let cert = attach.transport.identity.as_ref().map(|t| t.cert());
+    let refused = cert.and_then(|c| ctx.core.key_refusal(&c));
     let attached = if refused.is_some() {
         None
     } else {
         ctx.core.attach(attach)
     };
     let Some((uid, events)) = attached else {
+        // Asked again: a list installed since the first asking refuses
+        // the attach too.
+        let refused = refused.or_else(|| cert.and_then(|c| ctx.core.key_refusal(&c)));
         reply_error(
             tx,
             f.trans,
-            match refused {
-                Some(hxd_core::KeyRefusal::Revoked | hxd_core::KeyRefusal::BelowFloor(_)) => {
-                    "This key is revoked on this server."
-                }
-                Some(hxd_core::KeyRefusal::Unrevoked) => "This key is not admitted here.",
-                None => "Server full.",
-            },
+            refused.map_or("Server full.", key_refusal_text),
         );
         return None;
     };

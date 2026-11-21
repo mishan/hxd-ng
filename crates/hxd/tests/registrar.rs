@@ -2810,16 +2810,13 @@ async fn a_reset_held_is_applied_while_its_registrar_cannot_be_reached() {
     let nowhere = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
     next_list().await;
-    for (stale, refused) in [
-        ("cached", (403, json!("revoked"), json!(1))),
-        ("guest", (403, json!("revoked"), json!(1))),
-        ("deny", (403, json!("denied"), Value::Null)),
-    ] {
+    // The floor held is told before what the stale lists' policy says.
+    for stale in ["cached", "guest", "deny"] {
         let extra = format!("registrar_timeout = 1\nrevocation_stale = \"{stale}\"");
         let v = verifier(&there, &r, Trust::Key, &nowhere, &extra).await.0;
         assert_eq!(
             refusal(&auth_at(v, &alice, &phone, &card).await),
-            refused,
+            (403, json!("revoked"), json!(1)),
             "{stale}"
         );
         if stale == "cached" {
@@ -2847,7 +2844,7 @@ async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
         &r,
         Trust::Key,
         &url,
-        "registrar_timeout = 1\nrevocation_stale = \"deny\"",
+        "revocation_stale = \"deny\"",
     )
     .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
@@ -2863,14 +2860,174 @@ async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
     assert!(identity.sweep_records().await.is_empty());
     laptop_here.request("ping", json!({})).await.unwrap();
 
-    // Her registrar silent and the lists past their lifetime, a stranger
+    // Her registrar gone and the lists past their lifetime, a stranger
     // to them would be denied; the floor installed is told as it is.
-    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    *to.lock().unwrap() = silent.local_addr().unwrap();
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    *to.lock().unwrap() = closed.local_addr().unwrap();
+    drop(closed);
     next_list().await;
     assert_eq!(
         refusal(&auth_at(v, &alice, &phone, &card).await),
         (403, json!("revoked"), json!(1))
+    );
+}
+
+#[tokio::test]
+async fn a_floor_auth_fetches_is_applied_before_any_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, _, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "banned_registrars = [\"banned.example\"]",
+    )
+    .await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let (phone, tablet, watch) = (dev(101), dev(103), dev(104));
+    let reply = register(&r, request(&alice, "alice"), &alice).await.json();
+    let att = unb64(reply["attestation"].as_str().unwrap());
+    let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+    let card = Card::new(&alice, "alice", now())
+        .sign(&alice, vec![att.clone()])
+        .unwrap();
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Her card beside an attestation from a registrar banned here, which
+    // policy would refuse `denied`.
+    let key = hl_identity::ServerKey::from_seed(&[9; 32]);
+    let other = Attestation {
+        identity: alice.public(),
+        registrar: "banned.example".into(),
+        registrar_key: key.public(),
+        handle: "alice".into(),
+        registered: now() - 120,
+        issued: now() - 120,
+        expires: now() + 3600,
+        level: None,
+    };
+    let banned = Card::new(&alice, "alice", now())
+        .sign(&alice, vec![att, other.signed_value(&key)])
+        .unwrap();
+
+    let mut desk = session_in(
+        v,
+        &dev(102),
+        &cert_in(&alice, &dev(102), 0),
+        &card,
+        json!({}),
+    )
+    .await;
+
+    // The first auth to fetch the reset is of a device the lists revoke
+    // too: told so, not denied, and the floor it fetched goes into force
+    // at once, for the other devices' tokens and sessions.
+    post_reset(&r, &alice, 1).await;
+    post_device_revocation(&r, &alice, &tablet).await;
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &tablet, &banned).await),
+        (403, json!("revoked"), Value::Null)
+    );
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "a token below the floor that auth fetched no longer redeems"
+    );
+    desk.event("kicked").await.unwrap();
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &watch, &banned).await),
+        (403, json!("revoked"), json!(1))
+    );
+}
+
+#[tokio::test]
+async fn a_token_below_a_floor_fetched_at_auth_does_not_outlive_the_next_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, identity, _) =
+        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, tablet) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[103; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &tablet, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+    // With no session of hers to keep it, the sweep installs lists that
+    // say nothing of her.
+    identity.sweep_records().await;
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "the token went with the floor's fetch"
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let (old, new) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let card = attested_committing(&r, &old, "alice", &new, true).await;
+    post_reset(&r, &old, 1).await;
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &new)) }),
+    )
+    .await;
+    assert_eq!(posted.json()["published"], true);
+    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "")
+        .await
+        .0;
+    let reply = auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+
+    // Lists held past their lifetime, the registrar gone, and the
+    // rotation not taken here yet: still a rotation, not `denied`.
+    std::fs::remove_file(there.join("successors")).unwrap();
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nowhere = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    next_list().await;
+    let extra = "registrar_timeout = 1\nrevocation_stale = \"deny\"";
+    let v = verifier(&there, &r, Trust::Key, &nowhere, extra).await.0;
+    let reply = auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
     );
 }
 
@@ -2881,7 +3038,10 @@ fn forward(listener: tokio::net::TcpListener, to: Arc<std::sync::Mutex<SocketAdd
             let (mut a, _) = listener.accept().await.unwrap();
             let to = *to.lock().unwrap();
             tokio::spawn(async move {
-                let mut b = TcpStream::connect(to).await.unwrap();
+                // One that cannot be reached is a connection dropped.
+                let Ok(mut b) = TcpStream::connect(to).await else {
+                    return;
+                };
                 let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
             });
         }
