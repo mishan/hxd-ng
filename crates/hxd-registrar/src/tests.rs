@@ -6,9 +6,9 @@ use std::sync::Arc;
 use hl_identity::envelope::{Keys, Secret};
 use hl_identity::registrar::{attestation_reason, device_reason};
 use hl_identity::{
-    Attestation, Card, DeviceCert, DeviceKey, DeviceRevocation, IdentityKey, IdentityRevocation,
-    ListKind, Record, RecoveryCode, RegisterRequest, RegistrarKeys, Rotation, ServerKey,
-    SignedList, Stats,
+    Attestation, Card, DeviceCert, DeviceEpoch, DeviceKey, DeviceRevocation, IdentityKey,
+    IdentityRevocation, ListKind, Record, RecoveryCode, RegisterRequest, RegistrarKeys, Rotation,
+    ServerKey, SignedList, Stats,
 };
 use sha2::{Digest, Sha256};
 
@@ -436,17 +436,17 @@ fn a_device_revocation_is_published_once_by_either_signer() {
     };
     let bytes = rev.sign(&alice).unwrap();
     assert_eq!(
-        r.post_record(&bytes, T).unwrap_err(),
+        r.post_record(&bytes, addr(1), T).unwrap_err(),
         Refusal::NotRegistered
     );
 
     register(&r, &alice, "alice", T).unwrap();
-    let Posted::Published { seq } = r.post_record(&bytes, T).unwrap() else {
+    let Posted::Published { seq } = r.post_record(&bytes, addr(1), T).unwrap() else {
         panic!("a device revocation is never held back")
     };
     // Posting again after a lost reply is not a failure.
     assert_eq!(
-        r.post_record(&bytes, T + 5).unwrap(),
+        r.post_record(&bytes, addr(1), T + 5).unwrap(),
         Posted::Published { seq }
     );
 
@@ -460,7 +460,7 @@ fn a_device_revocation_is_published_once_by_either_signer() {
     .sign_as_device(&laptop, cert)
     .unwrap();
     assert!(matches!(
-        r.post_record(&by_device, T + 1).unwrap(),
+        r.post_record(&by_device, addr(1), T + 1).unwrap(),
         Posted::Published { .. }
     ));
     let held = records_of(&r, &alice, T + 2);
@@ -475,7 +475,10 @@ fn a_device_revocation_is_published_once_by_either_signer() {
     }
     .sign(&alice)
     .unwrap();
-    assert_eq!(r.post_record(&future, T + 2).unwrap_err(), Refusal::BadTime);
+    assert_eq!(
+        r.post_record(&future, addr(1), T + 2).unwrap_err(),
+        Refusal::BadTime
+    );
     let freeze = Freeze {
         identity: alice.public(),
         registrar: HOST.into(),
@@ -484,7 +487,7 @@ fn a_device_revocation_is_published_once_by_either_signer() {
     }
     .sign(&reg_key());
     assert!(matches!(
-        r.post_record(&freeze, T + 2),
+        r.post_record(&freeze, addr(1), T + 2),
         Err(Refusal::BadRequest(_))
     ));
 }
@@ -504,7 +507,7 @@ fn records_are_rate_limited_per_identity() {
             signer: None,
             signer_cert: None,
         };
-        r.post_record(&rev.sign(&alice).unwrap(), T)
+        r.post_record(&rev.sign(&alice).unwrap(), addr(1), T)
     };
     post(10).unwrap();
     post(11).unwrap();
@@ -525,7 +528,7 @@ fn an_identity_revocation_ends_everything_and_holds_the_names() {
     }
     .sign(&alice)
     .unwrap();
-    r.post_record(&bytes, T + 10).unwrap();
+    r.post_record(&bytes, addr(1), T + 10).unwrap();
     assert_eq!(
         register(&r, &alice, "alice", T + 20).unwrap_err(),
         Refusal::Revoked { successor: None }
@@ -550,7 +553,7 @@ fn an_identity_revocation_ends_everything_and_holds_the_names() {
     .sign(&alice)
     .unwrap();
     assert_eq!(
-        r.post_record(&dev, T + 30).unwrap_err(),
+        r.post_record(&dev, addr(1), T + 30).unwrap_err(),
         Refusal::Revoked { successor: None }
     );
 }
@@ -579,7 +582,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
     .sign(&old, &impostor)
     .unwrap();
     assert_eq!(
-        r.post_record(&wrong, T + 100).unwrap_err(),
+        r.post_record(&wrong, addr(1), T + 100).unwrap_err(),
         Refusal::SuccessorMismatch
     );
 
@@ -592,7 +595,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
     .sign(&old, &new)
     .unwrap();
     assert!(matches!(
-        r.post_record(&rot, T + 100).unwrap(),
+        r.post_record(&rot, addr(1), T + 100).unwrap(),
         Posted::Published { .. }
     ));
 
@@ -643,7 +646,7 @@ fn a_rotation_moves_the_names_to_the_committed_successor() {
     .sign(&old, &impostor)
     .unwrap();
     assert_eq!(
-        r.post_record(&again, T + 140).unwrap_err(),
+        r.post_record(&again, addr(1), T + 140).unwrap_err(),
         Refusal::Revoked {
             successor: Some(new.public())
         }
@@ -665,13 +668,13 @@ fn a_delayed_rotation_can_be_met_with_a_freeze() {
     .sign(&old, &thief)
     .unwrap();
     assert_eq!(
-        r.post_record(&rot, T + 10).unwrap(),
+        r.post_record(&rot, addr(1), T + 10).unwrap(),
         Posted::Pending {
             until: T + 10 + DAY
         }
     );
     assert_eq!(
-        r.post_record(&rot, T + 11).unwrap(),
+        r.post_record(&rot, addr(1), T + 11).unwrap(),
         Posted::Pending {
             until: T + 10 + DAY
         }
@@ -687,7 +690,7 @@ fn a_delayed_rotation_can_be_met_with_a_freeze() {
     .sign(&old, &id(7))
     .unwrap();
     assert_eq!(
-        r.post_record(&second, T + 30).unwrap_err(),
+        r.post_record(&second, addr(1), T + 30).unwrap_err(),
         Refusal::RotationPending {
             until: T + 10 + DAY
         }
@@ -712,7 +715,8 @@ fn the_old_keys_revocation_takes_a_pending_rotation_whatever_it_committed() {
     let mut req = request(&old, "alice", T);
     req.successor = Some(commitment(&new));
     r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
-    r.post_record(&rotation(&old, &new, None, T), T).unwrap();
+    r.post_record(&rotation(&old, &new, None, T), addr(1), T)
+        .unwrap();
     // Whoever holds the old key may destroy the identity, though not
     // take it.
     let revoke = IdentityRevocation {
@@ -723,7 +727,7 @@ fn the_old_keys_revocation_takes_a_pending_rotation_whatever_it_committed() {
     .sign(&old)
     .unwrap();
     assert!(matches!(
-        r.post_record(&revoke, T + 10),
+        r.post_record(&revoke, addr(1), T + 10),
         Ok(Posted::Published { .. })
     ));
     assert!(records_of(&r, &new, T + DAY).is_empty());
@@ -758,7 +762,7 @@ fn a_rotations_next_is_the_commitment_of_a_successor_that_has_none() {
         if known {
             register(&r, &new, "bobby", T).unwrap();
         }
-        r.post_record(&rotation(&old, &new, next, T + 10), T + 10)
+        r.post_record(&rotation(&old, &new, next, T + 10), addr(1), T + 10)
             .unwrap();
         r.lookup_handle("alice", addr(1), T + 10)
             .unwrap()
@@ -784,9 +788,9 @@ fn a_rotation_posted_at_another_registrar_names_the_owners_next_there_too() {
     // successor known there first: it brings the owner's commitment with
     // it, and nothing the thief can sign replaces it.
     let bytes = rotation(&old, &new, Some(&next), T);
-    a.post_record(&bytes, T).unwrap();
+    a.post_record(&bytes, addr(1), T).unwrap();
     register(&b, &new, "zzzz", T + 1).unwrap();
-    b.post_record(&bytes, T + 10).unwrap();
+    b.post_record(&bytes, addr(1), T + 10).unwrap();
     let found = b.lookup_handle("alice", addr(1), T + 10).unwrap().unwrap();
     assert_eq!(
         (found.identity, found.successor),
@@ -800,7 +804,7 @@ fn a_rotation_posted_at_another_registrar_names_the_owners_next_there_too() {
         Refusal::SuccessorMismatch
     );
     assert_eq!(
-        b.post_record(&rotation(&new, &thief, None, T + 20), T + 20)
+        b.post_record(&rotation(&new, &thief, None, T + 20), addr(1), T + 20)
             .unwrap_err(),
         Refusal::SuccessorMismatch
     );
@@ -822,7 +826,7 @@ fn a_rotation_is_refused_to_a_successor_that_could_not_take_it() {
         r.register(&req.sign(&new).unwrap(), addr(1), at).unwrap();
     };
     let post = |r: &Registrar, next: Option<&IdentityKey>| {
-        r.post_record(&rotation(&old, &new, next, T + 10), T + 10)
+        r.post_record(&rotation(&old, &new, next, T + 10), addr(1), T + 10)
     };
     let bad = |why: &str| Err(Refusal::BadRequest(why.into()));
 
@@ -843,7 +847,7 @@ fn a_rotation_is_refused_to_a_successor_that_could_not_take_it() {
     assert_eq!(post(&r, None), bad("the successor key is frozen"));
     let r = rotating();
     register(&r, &new, "bobby", T).unwrap();
-    r.post_record(&rotation(&new, &next, None, T + 5), T + 5)
+    r.post_record(&rotation(&new, &next, None, T + 5), addr(1), T + 5)
         .unwrap();
     assert_eq!(
         post(&r, None),
@@ -859,7 +863,7 @@ fn the_successor_of_a_held_rotation_commits_to_its_next_or_to_nothing() {
         let mut req = request(&old, "alice", T);
         req.successor = Some(commitment(&new));
         r.register(&req.sign(&old).unwrap(), addr(1), T).unwrap();
-        r.post_record(&rotation(&old, &new, Some(&next), T), T)
+        r.post_record(&rotation(&old, &new, Some(&next), T), addr(1), T)
             .unwrap();
         r
     };
@@ -956,7 +960,7 @@ fn a_rotation_whose_next_hands_nothing_over_is_refused_by_name() {
             }
         }
         assert!(matches!(
-            r.post_record(&cbor::encode(&v), T),
+            r.post_record(&cbor::encode(&v), addr(1), T),
             Err(Refusal::BadRequest(why)) if why.contains("hands nothing over")
         ));
     }
@@ -986,8 +990,8 @@ fn a_card_records_no_commitment_for_an_identity_that_may_not_write() {
         register(&r, &alice, "alice", T).unwrap();
         match case {
             "frozen" => assert!(r.freeze(&fp, true, T + 1).is_ok()),
-            "revoked" => assert!(r.post_record(&revocation, T + 1).is_ok()),
-            _ => assert!(r.post_record(&rotation, T + 1).is_ok()),
+            "revoked" => assert!(r.post_record(&revocation, addr(1), T + 1).is_ok()),
+            _ => assert!(r.post_record(&rotation, addr(1), T + 1).is_ok()),
         }
         let mut card = Card::new(&alice, "Alice", T + 2);
         card.successor = Some([4; 32]);
@@ -1027,7 +1031,7 @@ fn an_operator_publishes_a_held_rotation_at_once() {
     }
     .sign(&old, &new)
     .unwrap();
-    r.post_record(&rot, T + 10).unwrap();
+    r.post_record(&rot, addr(1), T + 10).unwrap();
     // The operator names the successor they confirmed with the holder,
     // and a rotation to any other is left waiting.
     assert_eq!(
@@ -1037,7 +1041,7 @@ fn an_operator_publishes_a_held_rotation_at_once() {
     );
     let seq = r.publish_pending(&fp, &to, T + 20).unwrap();
     assert_eq!(
-        r.post_record(&rot, T + 30).unwrap(),
+        r.post_record(&rot, addr(1), T + 30).unwrap(),
         Posted::Published { seq }
     );
     assert_eq!(
@@ -1057,7 +1061,7 @@ fn an_operator_publishes_a_held_rotation_at_once() {
     let r = registrar_with(|c| c.rotation_delay = DAY);
     register(&r, &old, "alice", T).unwrap();
     register(&r, &new, "bobby", T).unwrap();
-    r.post_record(&rot, T + 10).unwrap();
+    r.post_record(&rot, addr(1), T + 10).unwrap();
     let gone = IdentityRevocation {
         identity: new.public(),
         time: T + 20,
@@ -1065,7 +1069,7 @@ fn an_operator_publishes_a_held_rotation_at_once() {
     }
     .sign(&new)
     .unwrap();
-    r.post_record(&gone, T + 20).unwrap();
+    r.post_record(&gone, addr(1), T + 20).unwrap();
     assert_eq!(
         r.publish_pending(&fp, &to, T + 30).unwrap_err(),
         OpError::PendingDropped
@@ -1087,7 +1091,7 @@ fn a_waiting_rotations_identity_commits_to_nothing() {
     // to its own key, then tries to pin the commitment to that key, which
     // the registrar cannot tell from the owner doing the same.
     let stolen = rotation(&old, &thiefs, None, T + 10);
-    r.post_record(&stolen, T + 10).unwrap();
+    r.post_record(&stolen, addr(1), T + 10).unwrap();
     let mut req = request(&old, "alice", T + 20);
     req.successor = Some(commitment(&thiefs));
     assert_eq!(
@@ -1115,11 +1119,11 @@ fn a_waiting_rotations_identity_commits_to_nothing() {
     r.freeze(&fp, true, T + 30).unwrap();
     r.freeze(&fp, false, T + 40).unwrap();
     assert!(matches!(
-        r.post_record(&rotation(&old, &owners, None, T + 50), T + 50),
+        r.post_record(&rotation(&old, &owners, None, T + 50), addr(1), T + 50),
         Ok(Posted::Pending { .. })
     ));
     assert!(matches!(
-        r.post_record(&stolen, T + 60),
+        r.post_record(&stolen, addr(1), T + 60),
         Err(Refusal::RotationPending { .. })
     ));
     let to = owners.fingerprint().0;
@@ -1147,12 +1151,12 @@ fn a_delayed_rotation_publishes_itself_when_its_time_comes() {
     }
     .sign(&old, &new)
     .unwrap();
-    r.post_record(&rot, T).unwrap();
+    r.post_record(&rot, addr(1), T).unwrap();
     // The first thing to look after the delay publishes it.
     let recs = records_of(&r, &new, T + DAY);
     assert!(matches!(&recs[..], [Record::Rotate(_)]));
     assert!(matches!(
-        r.post_record(&rot, T + DAY + 1).unwrap(),
+        r.post_record(&rot, addr(1), T + DAY + 1).unwrap(),
         Posted::Published { .. }
     ));
 }
@@ -1173,7 +1177,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     }
     .sign(&old, &new)
     .unwrap();
-    r.post_record(&rot, T).unwrap();
+    r.post_record(&rot, addr(1), T).unwrap();
     // While it waits, the successor revokes itself.
     let gone = IdentityRevocation {
         identity: new.public(),
@@ -1182,7 +1186,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     }
     .sign(&new)
     .unwrap();
-    r.post_record(&gone, T + 10).unwrap();
+    r.post_record(&gone, addr(1), T + 10).unwrap();
     // Past the delay the rotation is dropped, and the name stays where
     // it can still be renewed.
     assert!(records_of(&r, &old, T + DAY).is_empty());
@@ -1203,7 +1207,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     }
     .sign(&new, &other)
     .unwrap();
-    r.post_record(&on, T).unwrap();
+    r.post_record(&on, addr(1), T).unwrap();
     let rot = Rotation {
         identity: old.public(),
         successor: new.public(),
@@ -1213,7 +1217,7 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     .sign(&old, &new)
     .unwrap();
     assert_eq!(
-        r.post_record(&rot, T + 10).unwrap_err(),
+        r.post_record(&rot, addr(1), T + 10).unwrap_err(),
         Refusal::BadRequest("the successor key has a rotation of its own pending".into())
     );
     assert!(records_of(&r, &old, T + DAY + 10).is_empty());
@@ -1231,9 +1235,10 @@ fn a_delayed_rotation_is_dropped_if_its_successor_moved_on() {
     // posted: the owner's is dropped when it comes due.
     let r = registrar_with(|c| c.rotation_delay = DAY);
     register(&r, &old, "alice", T).unwrap();
-    r.post_record(&rotation(&old, &new, None, T), T).unwrap();
+    r.post_record(&rotation(&old, &new, None, T), addr(1), T)
+        .unwrap();
     register(&r, &new, "bobby", T + 5).unwrap();
-    r.post_record(&rotation(&new, &other, None, T + 10), T + 10)
+    r.post_record(&rotation(&new, &other, None, T + 10), addr(1), T + 10)
         .unwrap();
     assert!(records_of(&r, &old, T + DAY).is_empty());
     assert_eq!(r.store.pending(&old.public()).unwrap(), None);
@@ -1545,6 +1550,13 @@ impl RegistrarStore for FailingCommit {
     }
     fn record_seq(&self, digest: &[u8; 32]) -> Result<Option<u64>, StoreError> {
         self.inner.record_seq(digest)
+    }
+    fn latest_record(
+        &self,
+        key: &Key,
+        kind: RecordKind,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        self.inner.latest_record(key, kind)
     }
     fn set_commitment(&self, key: &Key, commitment: &[u8; 32]) -> Result<bool, StoreError> {
         self.inner.set_commitment(key, commitment)
@@ -2034,7 +2046,7 @@ fn revocation_and_rotation_take_the_envelopes_with_them() {
     }
     .sign(&alice)
     .unwrap();
-    r.post_record(&revoke, T + 1).unwrap();
+    r.post_record(&revoke, addr(1), T + 1).unwrap();
     let rotate = Rotation {
         identity: bob.public(),
         successor: bob2.public(),
@@ -2043,7 +2055,7 @@ fn revocation_and_rotation_take_the_envelopes_with_them() {
     }
     .sign(&bob, &bob2)
     .unwrap();
-    r.post_record(&rotate, T + 1).unwrap();
+    r.post_record(&rotate, addr(1), T + 1).unwrap();
     for (who, kind) in [(&alice, 1), (&alice, 2), (&bob, 1)] {
         assert_eq!(r.store.envelope(&who.public(), kind).unwrap(), None);
     }
@@ -2064,7 +2076,7 @@ fn a_rotation_that_came_due_is_published_by_a_salt_lookup_or_a_fetch() {
         }
         .sign(&bob, &bob2)
         .unwrap();
-        r.post_record(&rotate, T + 1).unwrap();
+        r.post_record(&rotate, addr(1), T + 1).unwrap();
         let due = T + 1 + DAY;
         if by_fetch {
             assert_eq!(
@@ -2096,4 +2108,426 @@ fn a_registrar_without_envelopes_answers_as_if_the_endpoint_were_not_there() {
         r.fetch_envelope("alice", 1, &[0; 32], addr(1), T),
         Err(Refusal::NotFound)
     );
+}
+
+// --- device epochs (§4.10, §6.2) -------------------------------------------
+
+fn reset(who: &IdentityKey, epoch: u64, time: u64) -> Vec<u8> {
+    DeviceEpoch {
+        identity: who.public(),
+        epoch,
+        time,
+    }
+    .sign(who)
+    .unwrap()
+}
+
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// What an answer says of where the identity stands: `epoch` and `hash`.
+fn stands(p: Posted) -> (u64, [u8; 32]) {
+    match p {
+        Posted::DeviceEpoch { epoch, hash, .. } => (epoch, hash),
+        other => panic!("not a device epoch's answer: {other:?}"),
+    }
+}
+
+/// The epochs of the device epoch records in the full list.
+fn full_epochs(r: &Registrar, now: u64) -> Vec<u64> {
+    let k = keys(r);
+    let rk = RegistrarKeys {
+        host: HOST,
+        keys: &k,
+    };
+    SignedList::parse(&r.records_since(None, now).unwrap(), ListKind::Records, rk)
+        .unwrap()
+        .entries
+        .iter()
+        .filter_map(|(_, b)| match Record::parse(b, Some(rk)).unwrap() {
+            Record::DeviceEpoch(e) => Some(e.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+fn own_epochs(r: &Registrar, who: &IdentityKey, now: u64) -> Vec<u64> {
+    records_of(r, who, now)
+        .into_iter()
+        .filter_map(|rec| match rec {
+            Record::DeviceEpoch(e) => Some(e.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_reset_moves_the_floor_at_most_sixteen_at_a_time() {
+    let r = registrar();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let one = reset(&alice, 1, T);
+    let Posted::DeviceEpoch {
+        seq,
+        epoch,
+        hash: h,
+    } = r.post_record(&one, addr(1), T).unwrap()
+    else {
+        panic!("a device epoch is answered as one")
+    };
+    assert_eq!((epoch, h), (1, hash(&one)));
+    assert_eq!(own_epochs(&r, &alice, T), vec![1]);
+    assert!(seq > 0);
+
+    let far = reset(&alice, 1 + EPOCH_STEP_MAX + 1, T + 1);
+    assert!(matches!(
+        r.post_record(&far, addr(1), T + 1),
+        Err(Refusal::BadRequest(why)) if why.contains("at most 16")
+    ));
+    let jump = reset(&alice, 1 + EPOCH_STEP_MAX, T + 1);
+    assert_eq!(
+        stands(r.post_record(&jump, addr(1), T + 1).unwrap()),
+        (17, hash(&jump))
+    );
+}
+
+#[test]
+fn a_retry_of_either_kind_is_answered_where_the_identity_stands() {
+    let r = registrar_with(|c| c.rates.records_per_identity = 2);
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let two = reset(&alice, 2, T);
+    let Posted::DeviceEpoch { seq, .. } = r.post_record(&two, addr(1), T).unwrap() else {
+        panic!("published")
+    };
+    // A revocation spends the identity's last record post: what follows
+    // is answered all the same, since it stores nothing.
+    let rev = DeviceRevocation {
+        identity: alice.public(),
+        device: [9; 32],
+        time: T,
+        until: T + DAY,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    r.post_record(&rev, addr(1), T).unwrap();
+    let done = Posted::DeviceEpoch {
+        seq,
+        epoch: 2,
+        hash: hash(&two),
+    };
+    for (what, bytes) in [
+        ("the exact bytes", two.clone()),
+        ("signed afresh", reset(&alice, 2, T + 5)),
+        ("a lower epoch", reset(&alice, 1, T + 6)),
+    ] {
+        assert_eq!(r.post_record(&bytes, addr(1), T + 10), Ok(done), "{what}");
+    }
+    assert!(matches!(
+        r.post_record(&reset(&alice, 3, T + 10), addr(1), T + 10),
+        Err(Refusal::RateLimited { .. })
+    ));
+
+    // A superseded record's bytes are answered with the current one.
+    let r = registrar();
+    register(&r, &alice, "alice", T).unwrap();
+    let one = reset(&alice, 1, T);
+    r.post_record(&one, addr(1), T).unwrap();
+    let three = reset(&alice, 3, T + 1);
+    let Posted::DeviceEpoch { seq: current, .. } = r.post_record(&three, addr(1), T + 1).unwrap()
+    else {
+        panic!("published")
+    };
+    assert_eq!(
+        r.post_record(&one, addr(1), T + 2),
+        Ok(Posted::DeviceEpoch {
+            seq: current,
+            epoch: 3,
+            hash: hash(&three),
+        })
+    );
+}
+
+#[test]
+fn the_answers_that_store_nothing_are_counted_as_lookups() {
+    let alice = id(1);
+    let revocation = DeviceRevocation {
+        identity: alice.public(),
+        device: [9; 32],
+        time: T,
+        until: T + DAY,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    // Each record published, then posted again: the first repeat is the
+    // address's one lookup, and every answer after it is refused.
+    for (what, record, again) in [
+        (
+            "a reset",
+            reset(&alice, 1, T),
+            vec![reset(&alice, 1, T + 1)],
+        ),
+        ("a device revocation", revocation, vec![]),
+        ("a rotation", rotation(&alice, &id(2), None, T), vec![]),
+    ] {
+        let r = registrar_with(|c| c.rates.lookups_per_address = 1);
+        register(&r, &alice, "alice", T).unwrap();
+        r.post_record(&record, addr(1), T).unwrap();
+        r.post_record(&record, addr(1), T).unwrap();
+        for bytes in std::iter::once(record.clone()).chain(again) {
+            assert!(
+                matches!(
+                    r.post_record(&bytes, addr(1), T + 1),
+                    Err(Refusal::RateLimited { .. })
+                ),
+                "{what}"
+            );
+        }
+        assert!(r.post_record(&record, addr(2), T + 1).is_ok(), "{what}");
+    }
+    // One that publishes is a record post, not a lookup.
+    let r = registrar_with(|c| c.rates.lookups_per_address = 1);
+    register(&r, &alice, "alice", T).unwrap();
+    let one = reset(&alice, 1, T);
+    r.post_record(&one, addr(1), T).unwrap();
+    r.post_record(&one, addr(1), T).unwrap();
+    assert!(r
+        .post_record(&reset(&alice, 2, T + 1), addr(1), T + 1)
+        .is_ok());
+}
+
+#[test]
+fn held_bytes_are_answered_whatever_has_become_of_the_identity() {
+    let alice = id(1);
+    let revocation = DeviceRevocation {
+        identity: alice.public(),
+        device: [9; 32],
+        time: T,
+        until: T + DAY,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    let one = reset(&alice, 1, T);
+    for what in ["frozen", "revoked"] {
+        let r = registrar();
+        register(&r, &alice, "alice", T).unwrap();
+        let Posted::Published { seq } = r.post_record(&revocation, addr(1), T).unwrap() else {
+            panic!("published")
+        };
+        let done = r.post_record(&one, addr(1), T).unwrap();
+        match what {
+            "frozen" => {
+                r.freeze(&alice.fingerprint().0, true, T + 1).unwrap();
+            }
+            _ => {
+                let gone = IdentityRevocation {
+                    identity: alice.public(),
+                    time: T + 1,
+                    reason: None,
+                }
+                .sign(&alice)
+                .unwrap();
+                r.post_record(&gone, addr(1), T + 1).unwrap();
+            }
+        }
+        assert_eq!(
+            r.post_record(&revocation, addr(1), T + 2),
+            Ok(Posted::Published { seq }),
+            "{what}"
+        );
+        assert_eq!(r.post_record(&one, addr(1), T + 2), Ok(done), "{what}");
+    }
+}
+
+#[test]
+fn four_resets_publish_in_a_day() {
+    let r = registrar();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    for epoch in 1..=EPOCHS_PER_DAY as u64 {
+        r.post_record(&reset(&alice, epoch, T), addr(1), T).unwrap();
+        // A retry between them spends none of the day's.
+        r.post_record(&reset(&alice, epoch, T + 1), addr(1), T + 1)
+            .unwrap();
+    }
+    let Err(Refusal::RateLimited { retry_after }) =
+        r.post_record(&reset(&alice, 5, T + 2), addr(1), T + 2)
+    else {
+        panic!("a fifth reset in a day is refused")
+    };
+    assert_eq!(retry_after, DAY - 2);
+    assert_eq!(
+        stands(
+            r.post_record(&reset(&alice, 5, T + DAY), addr(1), T + DAY)
+                .unwrap()
+        )
+        .0,
+        5
+    );
+}
+
+#[test]
+fn a_reset_dated_before_the_last_is_refused() {
+    let r = registrar();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    r.post_record(&reset(&alice, 1, T + 100), addr(1), T + 100)
+        .unwrap();
+    assert!(matches!(
+        r.post_record(&reset(&alice, 2, T + 99), addr(1), T + 200),
+        Err(Refusal::BadRequest(why)) if why.contains("not dated before")
+    ));
+    // The same time is not earlier, and one long past the last is fine
+    // so long as it is not before it.
+    assert_eq!(
+        stands(
+            r.post_record(&reset(&alice, 2, T + 100), addr(1), T + 200)
+                .unwrap()
+        )
+        .0,
+        2
+    );
+}
+
+#[test]
+fn a_reset_is_refused_as_any_record_is() {
+    let r = registrar();
+    let alice = id(1);
+    assert_eq!(
+        r.post_record(&reset(&alice, 1, T), addr(1), T),
+        Err(Refusal::NotRegistered)
+    );
+    register(&r, &alice, "alice", T).unwrap();
+    assert_eq!(
+        r.post_record(&reset(&alice, 1, T + 1000), addr(1), T),
+        Err(Refusal::BadTime)
+    );
+    // Signed by any key but the identity's, as a device's would be.
+    use hl_identity::cbor::{self, Value};
+    let sig = |v: &Value| v.get("sig").cloned().unwrap();
+    let theirs = sig(&cbor::decode_canonical(&reset(&id(7), 1, T)).unwrap());
+    let mut forged = cbor::decode_canonical(&reset(&alice, 1, T)).unwrap();
+    if let Value::Map(entries) = &mut forged {
+        for (k, val) in entries.iter_mut() {
+            if k == &Value::Text("sig".into()) {
+                *val = theirs.clone();
+            }
+        }
+    }
+    let forged = cbor::encode(&forged);
+    assert_eq!(
+        r.post_record(&forged, addr(1), T),
+        Err(Refusal::BadSignature)
+    );
+    r.freeze(&alice.fingerprint().0, true, T + 1).unwrap();
+    assert_eq!(
+        r.post_record(&reset(&alice, 1, T + 2), addr(1), T + 2),
+        Err(Refusal::Frozen)
+    );
+    assert_eq!(own_epochs(&r, &alice, T + 2), Vec::<u64>::new());
+}
+
+#[test]
+fn a_superseded_reset_leaves_the_full_list_and_stays_in_its_own() {
+    let r = registrar();
+    let (alice, bob) = (id(1), id(2));
+    register(&r, &alice, "alice", T).unwrap();
+    register(&r, &bob, "bob", T).unwrap();
+    r.post_record(&reset(&alice, 1, T), addr(1), T).unwrap();
+    r.post_record(&reset(&bob, 4, T), addr(1), T).unwrap();
+    assert_eq!(full_epochs(&r, T), vec![1, 4]);
+    r.post_record(&reset(&alice, 2, T + 1), addr(1), T + 1)
+        .unwrap();
+    assert_eq!(full_epochs(&r, T + 1), vec![4, 2]);
+    assert_eq!(own_epochs(&r, &alice, T + 1), vec![1, 2]);
+}
+
+#[test]
+fn a_registrar_behind_is_caught_up_by_the_next_reset() {
+    let (a, b) = (registrar(), registrar());
+    let alice = id(1);
+    register(&a, &alice, "alice", T).unwrap();
+    register(&b, &alice, "alice", T).unwrap();
+    // The reset to 1 reached `a` alone.
+    a.post_record(&reset(&alice, 1, T), addr(1), T).unwrap();
+    for r in [&a, &b] {
+        let two = reset(&alice, 2, T + 1);
+        assert_eq!(
+            stands(r.post_record(&two, addr(1), T + 1).unwrap()),
+            (2, hash(&two))
+        );
+        assert_eq!(full_epochs(r, T + 1), vec![2]);
+    }
+}
+
+#[test]
+fn a_device_reset_away_signs_no_revocation() {
+    let r = registrar();
+    let alice = id(1);
+    register(&r, &alice, "alice", T).unwrap();
+    let old = DeviceKey::from_seed(&[2; 32]);
+    let old_cert = DeviceCert::for_device(&alice, &old, T - 10, 30 * DAY)
+        .unwrap()
+        .sign(&alice);
+    let revoke = |device: u8, time: u64, signer: &DeviceKey, cert: Vec<u8>| {
+        DeviceRevocation {
+            identity: alice.public(),
+            device: [device; 32],
+            time,
+            until: time + DAY,
+            reason: None,
+            signer: None,
+            signer_cert: None,
+        }
+        .sign_as_device(signer, cert)
+        .unwrap()
+    };
+    let before = revoke(8, T, &old, old_cert.clone());
+    r.post_record(&before, addr(1), T).unwrap();
+
+    r.post_record(&reset(&alice, 1, T + 1), addr(1), T + 1)
+        .unwrap();
+    // Dated inside its certificate's window, and refused all the same.
+    let after = revoke(9, T + 2, &old, old_cert);
+    let refused = r.post_record(&after, addr(1), T + 2).unwrap_err();
+    assert_eq!(refused, Refusal::SignerReset);
+    assert_eq!(refused.code(), "bad_signature");
+    // Its exact bytes, published before the reset, are no longer taken.
+    assert_eq!(
+        r.post_record(&before, addr(1), T + 2),
+        Err(Refusal::SignerReset)
+    );
+    assert!(records_of(&r, &alice, T + 2)
+        .iter()
+        .any(|rec| matches!(rec, Record::RevokeDevice(d) if d.device == [8; 32])));
+
+    // A device certified at the floor, and the identity itself, may.
+    let new = DeviceKey::from_seed(&[3; 32]);
+    let mut fresh = DeviceCert::for_device(&alice, &new, T, 30 * DAY).unwrap();
+    fresh.epoch = 1;
+    assert!(r
+        .post_record(&revoke(9, T + 2, &new, fresh.sign(&alice)), addr(1), T + 2)
+        .is_ok());
+    let by_identity = DeviceRevocation {
+        identity: alice.public(),
+        device: old.public(),
+        time: T + 3,
+        until: T + DAY,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign(&alice)
+    .unwrap();
+    assert!(r.post_record(&by_identity, addr(1), T + 3).is_ok());
 }

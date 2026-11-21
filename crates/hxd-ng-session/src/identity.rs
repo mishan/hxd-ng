@@ -1802,7 +1802,9 @@ impl IdentityState {
                         return Err(AuthRefused::Rotated { successor });
                     }
                 }
-                Record::RevokeDevice(_) => {}
+                // Floors are not applied here yet: a device epoch is read
+                // as it was before the record existed, as nothing.
+                Record::RevokeDevice(_) | Record::DeviceEpoch(_) => {}
             }
         }
         if unproven {

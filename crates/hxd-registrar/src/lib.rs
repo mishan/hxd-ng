@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use hl_identity::envelope::{Kdf, Kind as EnvelopeKind};
 use hl_identity::registrar::{attestation_reason, handle_is_canonical};
 use hl_identity::{
-    Attestation, AttestationRevocation, Card, EnvelopePut, Fingerprint, Freeze, KeyEnvelope,
-    ListKind, PublicKey, Record, RegisterRequest, RegistrarKeys, Rotation, ServerKey, SignedList,
-    Stats,
+    Attestation, AttestationRevocation, Card, DeviceEpoch, EnvelopePut, Fingerprint, Freeze,
+    KeyEnvelope, ListKind, PublicKey, Record, RegisterRequest, RegistrarKeys, Rotation, ServerKey,
+    SignedList, Stats,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -45,10 +45,21 @@ use sha2::{Digest, Sha256};
 pub use store::{
     Counts, Effect, EnvelopeRow, HandleRow, HandleState, IdentityRow, Issue, Issued, Key, Lockout,
     NewRecord, Page, Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore,
-    StoreError,
+    StoreError, SUPERSEDED_EPOCHS_KEPT,
 };
 
 const DAY: u64 = 86_400;
+
+/// How far one published device epoch may move an identity's floor
+/// (§6.2): enough to catch up a registrar that missed resets, and too
+/// little for one signer to use up the epochs an identity has to mint in.
+pub const EPOCH_STEP_MAX: u64 = 16;
+
+/// Device epochs published a day per identity (§10): each ends every
+/// session of the identity's earlier devices everywhere. Counted in a
+/// fixed window in memory, as `records_per_identity` is, so a restart
+/// starts it afresh.
+pub const EPOCHS_PER_DAY: u32 = 4;
 
 /// Who may register (§5.3). Only the kinds of proof this registrar can
 /// check are representable: `email`, `oidc` and `vouch` need machinery
@@ -166,6 +177,10 @@ impl Config {
 pub enum Refusal {
     BadRequest(String),
     BadSignature,
+    /// A device-signed record whose signer's certificate is below the
+    /// identity's device epoch here (§6.2): a `bad_signature` of its own
+    /// words.
+    SignerReset,
     BadTime,
     HandleInvalid,
     HandleReserved,
@@ -201,7 +216,7 @@ impl Refusal {
     pub fn code(&self) -> &'static str {
         match self {
             Refusal::BadRequest(_) => "bad_request",
-            Refusal::BadSignature => "bad_signature",
+            Refusal::BadSignature | Refusal::SignerReset => "bad_signature",
             Refusal::BadTime => "bad_time",
             Refusal::HandleInvalid => "handle_invalid",
             Refusal::HandleReserved => "handle_reserved",
@@ -225,7 +240,7 @@ impl Refusal {
     pub fn status(&self) -> u16 {
         match self {
             Refusal::BadRequest(_) => 400,
-            Refusal::BadSignature | Refusal::BadTime => 401,
+            Refusal::BadSignature | Refusal::SignerReset | Refusal::BadTime => 401,
             Refusal::HandleInvalid
             | Refusal::HandleReserved
             | Refusal::HandleTaken
@@ -249,6 +264,7 @@ impl Refusal {
         match self {
             Refusal::BadRequest(why) => why.clone(),
             Refusal::BadSignature => "a signature did not verify".into(),
+            Refusal::SignerReset => "the signer's device was reset".into(),
             Refusal::BadTime => {
                 "the request's time is outside the clock-skew tolerance, or it was already used"
                     .into()
@@ -338,6 +354,21 @@ pub enum Posted {
     Pending {
         until: u64,
     },
+    /// A device epoch, whether it moved the floor or not: where the
+    /// identity stands here, its current record's `seq`, `epoch` and digest.
+    DeviceEpoch {
+        seq: u64,
+        epoch: u64,
+        hash: [u8; 32],
+    },
+}
+
+/// The identity's current device epoch record.
+struct Floor {
+    seq: u64,
+    epoch: u64,
+    time: u64,
+    hash: [u8; 32],
 }
 
 /// A held handle, as `lookup` shows it (§6.3).
@@ -383,6 +414,7 @@ enum Limit {
     RegisterFrom(IpAddr),
     RegisterAll,
     Records(Key),
+    Epochs(Key),
     LookupFrom(IpAddr),
     Puts(Key),
     FetchFrom(IpAddr),
@@ -394,6 +426,7 @@ impl Limit {
     fn window(self) -> u64 {
         match self {
             Limit::LookupFrom(_) => 60,
+            Limit::Epochs(_) => DAY,
             _ => 3600,
         }
     }
@@ -941,8 +974,9 @@ impl Registrar {
 
     // --- §6.2 records ------------------------------------------------------
 
-    /// Accept a user-signed record (§4.4–§4.6).
-    pub fn post_record(&self, bytes: &[u8], now: u64) -> Result<Posted, Refusal> {
+    /// Accept a user-signed record (§4.4 to §4.6, §4.10). `addr` pays for
+    /// the answers that store nothing, as lookups do.
+    pub fn post_record(&self, bytes: &[u8], addr: IpAddr, now: u64) -> Result<Posted, Refusal> {
         let keys = self.keys();
         let registrar = RegistrarKeys {
             host: &self.cfg.host,
@@ -964,11 +998,29 @@ impl Registrar {
 
         self.writing(|| {
             self.publish_due(now)?;
+            let identity = *record.identity();
+            // A device that was reset signs nothing that is published, not
+            // even again (§6.2), so this comes before the digest.
+            if let Record::RevokeDevice(r) = &record {
+                let floor = self.floor(&identity)?.map_or(0, |f| f.epoch);
+                r.check_signer_floor(floor)
+                    .map_err(|_| Refusal::SignerReset)?;
+            }
             // Posting again after a lost reply is not a failure (§6.2).
             if let Some(seq) = self.store.record_seq(&d)? {
+                self.lookup_limit(addr, now)?;
+                if let Record::DeviceEpoch(_) = record {
+                    let f = self.floor(&identity)?.ok_or_else(|| {
+                        StoreError::new("a device epoch is held with no current one")
+                    })?;
+                    return Ok(Posted::DeviceEpoch {
+                        seq: f.seq,
+                        epoch: f.epoch,
+                        hash: f.hash,
+                    });
+                }
                 return Ok(Posted::Published { seq });
             }
-            let identity = *record.identity();
             if let Some(p) = self.store.pending(&identity)? {
                 if p.digest == d {
                     return Ok(Posted::Pending {
@@ -980,6 +1032,9 @@ impl Registrar {
                 return Err(Refusal::NotRegistered);
             };
             Self::usable(&row)?;
+            if let Record::DeviceEpoch(r) = &record {
+                return self.accept_epoch(r, d, bytes, addr, now);
+            }
             self.limit(
                 Limit::Records(identity),
                 self.cfg.rates.records_per_identity,
@@ -1024,7 +1079,9 @@ impl Registrar {
                     Posted::Published { seq: seq[0] }
                 }
                 Record::Rotate(r) => self.accept_rotation(&row, r, d, bytes, now)?,
-                Record::Freeze(_) | Record::RevokeAttestation(_) => unreachable!("refused above"),
+                Record::Freeze(_) | Record::RevokeAttestation(_) | Record::DeviceEpoch(_) => {
+                    unreachable!("answered above")
+                }
             };
             self.limits
                 .lock()
@@ -1037,6 +1094,93 @@ impl Registrar {
                 "registrar accepted a record"
             );
             Ok(posted)
+        })
+    }
+
+    /// The identity's current device epoch record (§4.10), if it has one.
+    fn floor(&self, identity: &Key) -> Result<Option<Floor>, Refusal> {
+        let Some((seq, bytes)) = self
+            .store
+            .latest_record(identity, RecordKind::DeviceEpoch)?
+        else {
+            return Ok(None);
+        };
+        let r = DeviceEpoch::parse(&bytes)
+            .map_err(|e| StoreError::new(format!("a held device epoch does not read: {e}")))?;
+        Ok(Some(Floor {
+            seq,
+            epoch: r.epoch,
+            time: r.time,
+            hash: digest(&bytes),
+        }))
+    }
+
+    /// §6.2's steps 4 to 7 for a device epoch, the identity known and
+    /// usable.
+    fn accept_epoch(
+        &self,
+        r: &DeviceEpoch,
+        d: [u8; 32],
+        bytes: &[u8],
+        addr: IpAddr,
+        now: u64,
+    ) -> Result<Posted, Refusal> {
+        let identity = r.identity;
+        let floor = self.floor(&identity)?;
+        let (cur, cur_time) = floor.as_ref().map_or((0, 0), |f| (f.epoch, f.time));
+        // A retry signed afresh, or another holder's reset to where this
+        // one already is: done, and nothing stored or charged but the
+        // asking.
+        if let Some(f) = floor.filter(|_| r.epoch <= cur) {
+            self.lookup_limit(addr, now)?;
+            return Ok(Posted::DeviceEpoch {
+                seq: f.seq,
+                epoch: f.epoch,
+                hash: f.hash,
+            });
+        }
+        if r.epoch > cur.saturating_add(EPOCH_STEP_MAX) {
+            return Err(Refusal::BadRequest(format!(
+                "an epoch advances at most {EPOCH_STEP_MAX} at a time"
+            )));
+        }
+        if r.time < cur_time {
+            return Err(Refusal::BadRequest(
+                "a reset is not dated before the last one".into(),
+            ));
+        }
+        self.limit(
+            Limit::Records(identity),
+            self.cfg.rates.records_per_identity,
+            now,
+        )?;
+        self.limit(Limit::Epochs(identity), EPOCHS_PER_DAY, now)?;
+        // The earlier record leaves the full list as this one is listed:
+        // the store lists an identity's latest alone there.
+        let seq = self.store.publish(&Publish {
+            records: vec![NewRecord {
+                kind: RecordKind::DeviceEpoch,
+                identity,
+                other: None,
+                until: None,
+                digest: d,
+                bytes: bytes.to_vec(),
+            }],
+            effects: vec![],
+        })?[0];
+        let mut limits = self.limits.lock().unwrap();
+        limits.charge(Limit::Records(identity), now);
+        limits.charge(Limit::Epochs(identity), now);
+        tracing::info!(
+            fingerprint = %Fingerprint::of(&identity).short(),
+            epoch = r.epoch,
+            seq,
+            "registrar published a device epoch"
+        );
+        Ok(Posted::DeviceEpoch {
+            seq,
+            epoch: r.epoch,
+            hash: d,
         })
     }
 
@@ -1313,8 +1457,10 @@ impl Registrar {
     }
 
     /// The per-identity list (§6.2): every record naming the key, never
-    /// pruned. An unknown fingerprint gets a signed empty list, which is
-    /// the registrar saying it holds nothing against that key.
+    /// pruned but for device epoch records past the latest and the
+    /// [`SUPERSEDED_EPOCHS_KEPT`] before it. An unknown fingerprint gets a
+    /// signed empty list, which is the registrar saying it holds nothing
+    /// against that key.
     pub fn records_for(
         &self,
         fp: &[u8; 32],

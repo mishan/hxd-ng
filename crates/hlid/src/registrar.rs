@@ -546,6 +546,7 @@ pub(crate) fn describe(bytes: &[u8]) -> Option<Value> {
         Record::Rotate(r) => {
             v["successor_fingerprint"] = json!(Fingerprint::of(&r.successor).to_string())
         }
+        Record::DeviceEpoch(r) => v["epoch"] = json!(r.epoch),
         Record::Freeze(_) | Record::RevokeAttestation(_) => {}
     }
     Some(v)
