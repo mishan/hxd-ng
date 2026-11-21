@@ -842,6 +842,22 @@ impl Registrars {
                 lookup.damaged = true;
             }
         }
+        // A device revocation its device signed below the floor is void,
+        // whatever its `time` (`identity-registrar.md` §4.4), so one
+        // applied before the floor rose goes with the next lookup.
+        let floor = lookup
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::DeviceEpoch(e) => Some(e.epoch),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        lookup.records.retain(|r| match r {
+            Record::RevokeDevice(d) => d.check_signer_floor(floor).is_ok(),
+            _ => true,
+        });
         lookup.records.sort_by_key(Record::time);
         lookup
     }

@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension, Params, TransactionBehavio
 use super::{bind, fp_hex, from_unix, mailbox_sql, unix, SqliteStore};
 
 const COLUMNS: &str = "owner, owner_fp, devid, endpoint, p256dh, auth, expires, \
-                       registered_at, last_push_at, delivery_point";
+                       registered_at, last_push_at, delivery_point, epoch";
 
 /// `sql` in the parent module's sense: a rusqlite error is an operator's
 /// problem, said once.
@@ -40,6 +40,7 @@ fn device_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Device, StoreErro
     let registered_at: i64 = r.get(7)?;
     let last_push_at: Option<i64> = r.get(8)?;
     let delivery_point: Option<String> = r.get(9)?;
+    let epoch: i64 = r.get(10)?;
     Ok((|| {
         let owner = match fp {
             Some(hex) => Mailbox::identified(login.clone(), super::fp_from_hex(&hex)?),
@@ -60,8 +61,16 @@ fn device_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Device, StoreErro
             registered_at: from_unix(registered_at),
             last_push_at: last_push_at.map(from_unix),
             delivery_point,
+            epoch: u64::try_from(epoch)
+                .map_err(|_| StoreError("a stored device epoch is negative".into()))?,
         })
     })())
+}
+
+/// A device epoch as the column holds it: an `INTEGER`, which an epoch
+/// never passes (`docs/hotline-ng-identity.md` §3.3).
+fn epoch_sql(epoch: u64) -> Result<i64, StoreError> {
+    i64::try_from(epoch).map_err(|_| StoreError("a device epoch past 2^63 - 1".into()))
 }
 
 /// The rows a statement answers with, as devices: a `SELECT` of
@@ -144,7 +153,7 @@ impl PushStore for SqliteStore {
         sql(tx.execute(
             &format!(
                 "INSERT INTO push_device ({COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)"
             ),
             params![
                 device.owner.login,
@@ -156,6 +165,7 @@ impl PushStore for SqliteStore {
                 device.expires.map(unix),
                 unix(device.registered_at),
                 delivery_point,
+                epoch_sql(device.epoch)?,
             ],
         ))?;
         sql(tx.commit())?;
@@ -319,6 +329,23 @@ impl PushStore for SqliteStore {
                 params![devid.as_str()],
             ),
         }
+    }
+
+    fn devices_revoke_below(
+        &self,
+        identity: &[u8; 32],
+        floor: u64,
+    ) -> Result<Vec<Device>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        collect(
+            &conn,
+            &format!(
+                "DELETE FROM push_device WHERE owner_fp = ?1 \
+                   AND length(devid) = 64 AND devid NOT GLOB '*[^0-9a-f]*' AND epoch < ?2 \
+                 RETURNING {COLUMNS}"
+            ),
+            params![fp_hex(identity), epoch_sql(floor)?],
+        )
     }
 
     fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError> {

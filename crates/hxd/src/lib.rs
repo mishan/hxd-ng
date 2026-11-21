@@ -6209,6 +6209,7 @@ sync = "full"
                     registered_at: std::time::SystemTime::now(),
                     last_push_at: None,
                     delivery_point: None,
+                    epoch: 0,
                 },
                 8,
             )
@@ -6267,6 +6268,7 @@ sync = "full"
                         registered_at: std::time::SystemTime::now(),
                         last_push_at: None,
                         delivery_point: None,
+                        epoch: 0,
                     },
                     8,
                 )
@@ -6303,6 +6305,7 @@ sync = "full"
                         registered_at: std::time::SystemTime::now(),
                         last_push_at: None,
                         delivery_point: None,
+                        epoch: 0,
                     },
                     8,
                 )

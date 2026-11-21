@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_VERSION: i64 = 39;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1096,6 +1096,16 @@ CREATE TABLE identity_records_superseded (
 ) WITHOUT ROWID;
 ";
 
+/// The device epoch a push registration's certificate was issued in, so
+/// a reset takes the rows below its floor (`docs/push-notifications.md`
+/// §5.1). A row from before reads as 0, so the first floor installed
+/// for its identity takes it, whatever its certificate's epoch: its
+/// device is pushed at no more until it registers again at its next
+/// login.
+const SCHEMA_V39: &str = "
+ALTER TABLE push_device ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1857,6 +1867,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 38 {
         steps.push_str(SCHEMA_V38);
+    }
+    if version < 39 {
+        steps.push_str(SCHEMA_V39);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -4980,7 +4993,46 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A push registration from before devices carried their epoch reads
+    /// as epoch 0, so the identity's first reset takes it.
+    #[test]
+    fn version_thirty_eight_migrates_into_push_rows_a_first_reset_takes() {
+        use hxd_core::push::PushStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let devid = "ab".repeat(32);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37, SCHEMA_V38,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO push_device (owner, owner_fp, devid, endpoint, p256dh, auth, \
+                 registered_at) VALUES ('bob', ?1, ?2, 'https://a.example/1', ?3, ?4, 1)",
+                rusqlite::params!["07".repeat(32), devid, [4u8; 65], [9u8; 16]],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 38).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let taken = store.devices_revoke_below(&[7; 32], 1).unwrap();
+        assert_eq!(
+            taken
+                .iter()
+                .map(|d| (d.devid.as_str(), d.epoch))
+                .collect::<Vec<_>>(),
+            [(devid.as_str(), 0)]
+        );
     }
 
     /// An empty catalog at revision 0, whose ids, kept in the file,

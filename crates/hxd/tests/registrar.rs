@@ -3380,6 +3380,70 @@ async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
     );
 }
 
+/// A device revocation a `manage` device signed is applied while that
+/// device's certificate is at the floor, and dropped once a reset leaves
+/// it below: the device it revoked, certified at the new floor, is let
+/// back in, at auth and by the sweep of an identity here.
+#[tokio::test]
+async fn a_device_revocation_signed_by_a_reset_device_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, identity, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "",
+        1,
+    )
+    .await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let (manager, laptop, tablet) = (dev(105), dev(106), dev(107));
+    let card = attested(&r, &alice, "alice").await;
+    let laptop_cert = cert_in(&alice, &laptop, 1);
+    let mut here = session_in(v, &laptop, &laptop_cert, &card, json!({})).await;
+    let mut stays = session_in(v, &tablet, &cert_in(&alice, &tablet, 1), &card, json!({})).await;
+
+    let revocation = DeviceRevocation {
+        identity: alice.public(),
+        device: laptop.public(),
+        time: now(),
+        until: now() + 3600,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign_as_device(&manager, cert_in(&alice, &manager, 0))
+    .unwrap();
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&revocation) }),
+    )
+    .await;
+    assert_eq!(posted.status, 200);
+    next_list().await;
+    assert_eq!(identity.sweep_records().await.len(), 1);
+    here.event("kicked").await.unwrap();
+    assert_eq!(
+        refusal(&auth_cert(v, &laptop, &card, &laptop_cert, json!({})).await),
+        (403, json!("revoked"), Value::Null)
+    );
+
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    assert!(identity.sweep_records().await.is_empty());
+    stays.request("ping", json!({})).await.unwrap();
+    let reply = auth_cert(v, &laptop, &card, &laptop_cert, json!({})).await;
+    assert_eq!(reply.json()["outcome"], "linked", "{:?}", reply.json());
+    session_in(v, &laptop, &laptop_cert, &card, json!({}))
+        .await
+        .request("ping", json!({}))
+        .await
+        .unwrap();
+}
+
 /// Every device epoch record in the store of the registrar in `dir`,
 /// deleted from under it, as a registrar that has lost them would.
 fn delete_resets(dir: &Path) {
@@ -3897,7 +3961,13 @@ impl Away {
 
     /// `dev` logs in, registers for push and logs out.
     async fn register(&self, dev: &DeviceKey) {
-        let mut c = session_as(self.v, &self.alice, dev, &self.card).await;
+        self.register_in(dev, 0).await
+    }
+
+    /// [`Self::register`], certified in device epoch `epoch`.
+    async fn register_in(&self, dev: &DeviceKey, epoch: u64) {
+        let cert = cert_in(&self.alice, dev, epoch);
+        let mut c = session_in(self.v, dev, &cert, &self.card, json!({})).await;
         let subscription = json!({
             "endpoint": format!("https://push.example.net/v/{}", devid(dev)),
             "p256dh": "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
@@ -4178,6 +4248,47 @@ async fn a_device_a_held_list_revokes_loses_its_push_registration_once_seen_away
     assert_eq!(a.rows(), [devid(&phone)]);
     a.identity.sweep_records().await;
     assert!(a.rows().is_empty(), "the phone's registration went");
+}
+
+/// A reset takes the push registrations its identity's devices made
+/// below its floor: at once where an admission fetches it, and for an
+/// identity away at its next refresh, hidden while a delete the store
+/// failed waits.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_reset_takes_the_push_registrations_below_its_floor() {
+    let a = Away::start().await;
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let (phone, laptop, tablet) = (dev(101), dev(102), dev(103));
+    for (d, epoch) in [(&phone, 0), (&laptop, 1), (&tablet, 2)] {
+        a.register_in(d, epoch).await;
+    }
+    let clock = a.identity.clock();
+    a.identity.sweep_records().await;
+    let sorted = |mut ids: Vec<String>| {
+        ids.sort();
+        ids
+    };
+    let two = sorted(vec![devid(&laptop), devid(&tablet)]);
+    assert_eq!(
+        a.rows(),
+        sorted(vec![devid(&phone), two[0].clone(), two[1].clone()])
+    );
+
+    post_reset(&a.r, &a.alice, 1).await;
+    clock.advance(Duration::from_secs(2));
+    a.register_in(&tablet, 2).await;
+    assert_eq!(a.rows(), two, "taken at the tablet's admission");
+
+    post_reset(&a.r, &a.alice, 2).await;
+    a.hold();
+    clock.advance(Duration::from_secs(602));
+    a.identity.sweep_records().await;
+    assert_eq!(a.rows(), two, "the delete failed");
+    assert_eq!(a.delivered(), [devid(&tablet)], "and the row is hidden");
+    a.release();
+    a.identity.sweep_records().await;
+    assert_eq!(a.rows(), [devid(&tablet)], "and then taken");
 }
 
 /// A frozen identity's rows are taken as a revoked one's, and while a

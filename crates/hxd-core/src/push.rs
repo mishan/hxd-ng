@@ -143,6 +143,10 @@ pub struct Device {
     /// (push-notifications.md §4.1). Pushes name these, so a row without
     /// one is not pushed at through the sidecar.
     pub delivery_point: Option<String>,
+    /// The device epoch its certificate was issued in, 0 for a password
+    /// device: a reset to a floor above it takes the row
+    /// (push-notifications.md §5.1).
+    pub epoch: u64,
 }
 
 impl Device {
@@ -285,6 +289,16 @@ pub trait PushStore: Send + Sync + 'static {
     /// because a password is not the key that was revoked.
     fn devices_revoke_identity(&self, identity: &[u8; 32]) -> Result<Vec<Device>, StoreError>;
 
+    /// An identity reset its devices to `floor`: forget every row one of
+    /// its devices registered under a certificate of an epoch below it,
+    /// answering with them. A password device's row stays, as for
+    /// [`Self::devices_revoke_identity`].
+    fn devices_revoke_below(
+        &self,
+        identity: &[u8; 32],
+        floor: u64,
+    ) -> Result<Vec<Device>, StoreError>;
+
     /// Every identity with a row one of its devices registered, each
     /// once: those whose registrars' revocations reach a row here.
     fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError>;
@@ -345,6 +359,9 @@ pub(crate) enum Unrevoked {
     /// identity's mailboxes.
     PublishedDevice([u8; 32], [u8; 32]),
     PublishedIdentity([u8; 32]),
+    /// An identity's device epoch floor: its devices' rows registered
+    /// below it.
+    PublishedFloor([u8; 32], u64),
 }
 
 impl Unrevoked {
@@ -357,6 +374,7 @@ impl Unrevoked {
             Unrevoked::LocalIdentity(i) | Unrevoked::PublishedIdentity(i) => {
                 store.devices_revoke_identity(i)
             }
+            Unrevoked::PublishedFloor(i, floor) => store.devices_revoke_below(i, *floor),
         }
     }
 }
@@ -448,6 +466,7 @@ impl crate::roster::Core {
     pub fn push_register(&self, uid: Uid, r: Registration) -> Result<bool, PushError> {
         let store = self.devices.as_ref().ok_or(PushError::NotAvailable)?;
         let (owner, key) = self.push_mailbox(uid)?;
+        let epoch = key.as_ref().map_or(0, |k| k.device_epoch);
         // The shape check a client can be told about. The address it
         // resolves to is the gateway's to check, before every send.
         let policy = self.push_policy;
@@ -479,6 +498,7 @@ impl crate::roster::Core {
                     registered_at: SystemTime::now(),
                     last_push_at: None,
                     delivery_point: None,
+                    epoch,
                 },
                 policy.max_devices,
             )
@@ -685,6 +705,7 @@ mod tests {
             registered_at: SystemTime::now(),
             last_push_at: None,
             delivery_point: None,
+            epoch: 0,
         }
     }
 
