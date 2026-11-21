@@ -48,6 +48,19 @@ as AGENTS.md's "Releasing" describes it.
   envelopes go when it is revoked or rotated. `hlid backup` and `hlid
   restore` are the user's side.
 
+- Device epochs at the registrar (docs/identity-registrar.md §4.10,
+  §6.2): `POST /registrar/records` takes a reset, signed by the identity
+  key alone, revoking every device certificate of the identity below
+  its `epoch`. An `epoch` may move at most 16 past the current one, a
+  reset dated before the last is refused, and four may be published a
+  day per identity; a reset at or below the current one, like any record
+  already held, is answered as done with where the identity stands
+  (`epoch`, and `hash`, the current record's) and counted as a lookup.
+  A device revocation signed by a device certified below the identity's
+  epoch is refused `bad_signature`. The full record list carries an
+  identity's latest reset alone; its own list keeps the 256 before it.
+  No schema change. Servers do not apply resets yet.
+
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]
   max_detached_per_addr` is now the backstop for every login there

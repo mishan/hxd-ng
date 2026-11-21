@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::store::{
     entry_cost, Counts, Effect, EnvelopeRow, HandleRow, IdentityRow, Issue, Issued, Key, Lockout,
     NewRecord, Page, Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore,
-    StoreError,
+    StoreError, SUPERSEDED_EPOCHS_KEPT,
 };
 
 #[derive(Debug, Clone)]
@@ -270,6 +270,22 @@ impl RegistrarStore for MemoryStore {
         Ok(self.state.lock().unwrap().digests.get(digest).copied())
     }
 
+    fn latest_record(
+        &self,
+        key: &Key,
+        kind: RecordKind,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .iter()
+            .rev()
+            .find(|(_, r)| r.kind == kind && &r.identity == key)
+            .map(|(seq, r)| (*seq, r.bytes.clone())))
+    }
+
     fn set_commitment(&self, key: &Key, commitment: &[u8; 32]) -> Result<bool, StoreError> {
         let mut s = self.state.lock().unwrap();
         match s.identities.get_mut(key) {
@@ -317,6 +333,25 @@ impl RegistrarStore for MemoryStore {
         budget: usize,
     ) -> Result<Page, StoreError> {
         let s = self.state.lock().unwrap();
+        // The device epoch records each list keeps of an identity: the
+        // latest, and for its own list the superseded ones after it.
+        let epochs_kept = match filter {
+            RecordFilter::Identity(_) => 1 + SUPERSEDED_EPOCHS_KEPT,
+            RecordFilter::All { .. } => 1,
+        };
+        let mut epochs: HashMap<Key, usize> = HashMap::new();
+        let epochs: HashSet<u64> = s
+            .records
+            .iter()
+            .rev()
+            .filter(|(_, r)| r.kind == RecordKind::DeviceEpoch)
+            .filter(|(_, r)| {
+                let n = epochs.entry(r.identity).or_default();
+                *n += 1;
+                *n <= epochs_kept
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
         // For the full list: the device revocations each identity keeps
         // in it — its latest `device_cap` by `until`, ties to the later
         // seq.
@@ -340,16 +375,19 @@ impl RegistrarStore for MemoryStore {
                 kept
             }
         };
-        let visible = |seq: u64, r: &NewRecord| match filter {
-            RecordFilter::Identity(key) => r.identity == key || r.other == Some(key),
-            RecordFilter::All { now, .. } => {
-                let live = r.until.is_none_or(|u| u >= now);
-                match r.kind {
-                    RecordKind::RevokeDevice => live && kept.contains(&seq),
-                    RecordKind::RevokeAttestation => live,
-                    _ => true,
+        let visible = |seq: u64, r: &NewRecord| {
+            let listed = match filter {
+                RecordFilter::Identity(key) => r.identity == key || r.other == Some(key),
+                RecordFilter::All { now, .. } => {
+                    let live = r.until.is_none_or(|u| u >= now);
+                    match r.kind {
+                        RecordKind::RevokeDevice => live && kept.contains(&seq),
+                        RecordKind::RevokeAttestation => live,
+                        _ => true,
+                    }
                 }
-            }
+            };
+            listed && (r.kind != RecordKind::DeviceEpoch || epochs.contains(&seq))
         };
         Ok(page(
             s.records

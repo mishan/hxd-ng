@@ -24,6 +24,7 @@ use hxd_registrar::store::entry_cost;
 use hxd_registrar::{
     Counts, Effect, EnvelopeRow, HandleRow, IdentityRow, Issue, Issued, Key, Lockout, Page,
     Pending, Publish, RecordFilter, RecordKind, Recovery, RegistrarStore, StoreError,
+    SUPERSEDED_EPOCHS_KEPT,
 };
 use rusqlite::{
     params, Connection, OptionalExtension, Row, Savepoint, Transaction, TransactionBehavior,
@@ -641,6 +642,23 @@ impl RegistrarStore for SqliteRegistrarStore {
         Ok(seq.map(uint))
     }
 
+    fn latest_record(
+        &self,
+        key: &Key,
+        kind: RecordKind,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(i64, Vec<u8>)> = sql(conn
+            .query_row(
+                "SELECT seq, bytes FROM registrar_record
+                 WHERE identity = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1",
+                params![&key[..], kind.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        Ok(row.map(|(seq, bytes)| (uint(seq), bytes)))
+    }
+
     fn begin(&self) -> Result<(), StoreError> {
         // IMMEDIATE takes the database's write lock now rather than at the
         // first write, so a decision's reads see the last writer's commit
@@ -734,18 +752,27 @@ impl RegistrarStore for SqliteRegistrarStore {
         match filter {
             RecordFilter::Identity(key) => {
                 let mut stmt = sql(conn.prepare(
-                    "SELECT seq, bytes FROM registrar_record
-                     WHERE seq > ?1 AND (identity = ?2 OR other = ?2)
+                    "WITH ranked AS (
+                       SELECT seq, kind, bytes,
+                              ROW_NUMBER() OVER (PARTITION BY kind ORDER BY seq DESC) AS rank
+                       FROM registrar_record
+                       WHERE identity = ?2 OR other = ?2
+                     )
+                     SELECT seq, bytes FROM ranked
+                     WHERE seq > ?1 AND (kind != 'device_epoch' OR rank <= ?3)
                      ORDER BY seq",
                 ))?;
-                let mut rows = sql(stmt.query(params![int(since), &key[..]]))?;
+                let kept = i64::try_from(1 + SUPERSEDED_EPOCHS_KEPT).unwrap_or(i64::MAX);
+                let mut rows = sql(stmt.query(params![int(since), &key[..], kept]))?;
                 page_of(&mut rows, budget)
             }
             RecordFilter::All { now, device_cap } => {
                 // Each identity's device revocations are ranked by
                 // `until`, latest first (ties to the later seq), over the
                 // whole table — the cap is on what the list carries, not
-                // on what a page happens to start from.
+                // on what a page happens to start from. Device epoch
+                // records have no `until`, so theirs is by seq, and only
+                // the latest is listed.
                 let mut stmt = sql(conn.prepare(
                     "WITH ranked AS (
                        SELECT seq, kind, until, bytes,
@@ -760,6 +787,7 @@ impl RegistrarStore for SqliteRegistrarStore {
                        AND (kind NOT IN ('revoke_device', 'revoke_attestation')
                             OR until IS NULL OR until >= ?2)
                        AND (kind != 'revoke_device' OR rank <= ?3)
+                       AND (kind != 'device_epoch' OR rank = 1)
                      ORDER BY seq",
                 ))?;
                 let cap = i64::try_from(device_cap).unwrap_or(i64::MAX);

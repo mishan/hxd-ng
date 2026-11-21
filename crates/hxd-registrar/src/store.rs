@@ -143,7 +143,12 @@ pub enum RecordKind {
     Rotate,
     Freeze,
     RevokeAttestation,
+    DeviceEpoch,
 }
+
+/// Superseded device epoch records the per-identity list keeps beside
+/// the current one (§10), the oldest dropped first.
+pub const SUPERSEDED_EPOCHS_KEPT: usize = 256;
 
 impl RecordKind {
     pub fn as_str(self) -> &'static str {
@@ -153,6 +158,7 @@ impl RecordKind {
             RecordKind::Rotate => "rotate",
             RecordKind::Freeze => "freeze",
             RecordKind::RevokeAttestation => "revoke_attestation",
+            RecordKind::DeviceEpoch => "device_epoch",
         }
     }
 
@@ -163,6 +169,7 @@ impl RecordKind {
             "rotate" => RecordKind::Rotate,
             "freeze" => RecordKind::Freeze,
             "revoke_attestation" => RecordKind::RevokeAttestation,
+            "device_epoch" => RecordKind::DeviceEpoch,
             _ => return None,
         })
     }
@@ -256,13 +263,16 @@ pub struct Publish {
 /// Which records a page is drawn from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordFilter {
-    /// Every record naming this key, as `identity` or as `other`; none
-    /// ever pruned.
+    /// Every record naming this key, as `identity` or as `other`, but its
+    /// device epoch records beyond the latest and the
+    /// [`SUPERSEDED_EPOCHS_KEPT`] before it.
     Identity(Key),
     /// The full list at `now`: device revocations past `until` and
     /// attestation revocations past `until` are gone, and so are an
     /// identity's device revocations beyond the `device_cap` latest by
-    /// `until` (§10). Rotations, identity revocations and freezes stay.
+    /// `until` (§10), and every device epoch record of an identity but
+    /// its latest (§4.9). Rotations, identity revocations and freezes
+    /// stay.
     All { now: u64, device_cap: usize },
 }
 
@@ -416,6 +426,13 @@ pub trait RegistrarStore: Send + Sync + 'static {
     /// and answers with the `seq` it has.
     fn publish(&self, p: &Publish) -> Result<Vec<u64>, StoreError>;
     fn record_seq(&self, digest: &[u8; 32]) -> Result<Option<u64>, StoreError>;
+    /// The identity's record of this kind with the highest `seq`, as its
+    /// `seq` and bytes.
+    fn latest_record(
+        &self,
+        key: &Key,
+        kind: RecordKind,
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError>;
     /// Set the identity's commitment if it has none. `false` when it
     /// already had one, or there is no such identity.
     fn set_commitment(&self, key: &Key, commitment: &[u8; 32]) -> Result<bool, StoreError>;

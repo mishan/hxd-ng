@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use hl_identity::envelope::{Kdf, Keys, Kind, Secret};
 use hl_identity::{
-    cert, Attestation, Card, DeviceCert, DeviceKey, DeviceProof, EnvelopePut, IdentityKey,
-    KeyEnvelope, ListKind, LoginProof, Record, RegisterRequest, RegistrarKeys, Rotation,
-    ServerChallenge, SignedList, Stats,
+    cert, Attestation, Card, DeviceCert, DeviceEpoch, DeviceKey, DeviceProof, DeviceRevocation,
+    EnvelopePut, IdentityKey, KeyEnvelope, ListKind, LoginProof, Record, RegisterRequest,
+    RegistrarKeys, Rotation, ServerChallenge, SignedList, Stats,
 };
 use hxd_testclient::device::{get_device_challenge, prove_device};
 use hxd_testclient::legacy::{Client, Login};
@@ -442,6 +442,105 @@ async fn a_rotation_is_published_under_both_keys() {
         2,
         "the rotation and one attestation revocation"
     );
+}
+
+#[tokio::test]
+async fn a_reset_is_published_and_answered_where_the_identity_stands() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    assert_eq!(
+        register(&s, request(&alice, "alice"), &alice).await.status,
+        200
+    );
+    let t = now();
+    let reset = |epoch: u64, time: u64| {
+        DeviceEpoch {
+            identity: alice.public(),
+            epoch,
+            time,
+        }
+        .sign(&alice)
+        .unwrap()
+    };
+    let post_record = |bytes: Vec<u8>| {
+        let s = &s;
+        async move { post(s, "/registrar/records", json!({ "record": b64(&bytes) })).await }
+    };
+
+    let one = reset(1, t);
+    let hash_one = b64(&Sha256::digest(&one));
+    let r = post_record(one.clone()).await;
+    assert_eq!(r.status, 200);
+    let done = r.json();
+    assert_eq!(
+        (&done["published"], &done["epoch"], &done["hash"]),
+        (&json!(true), &json!(1), &json!(hash_one))
+    );
+    assert!(done["seq"].as_u64().is_some());
+    for retry in [one.clone(), reset(1, t + 1)] {
+        let r = post_record(retry).await;
+        assert_eq!((r.status, r.json()), (200, done.clone()));
+    }
+    let r = post_record(reset(18, t + 1)).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, json!("bad_request"))
+    );
+
+    // A device certified before the reset revokes nothing after it.
+    let old = DeviceKey::from_seed(&[2; 32]);
+    let cert = DeviceCert::for_device(&alice, &old, t - 10, 86_400)
+        .unwrap()
+        .sign(&alice);
+    let revoke = DeviceRevocation {
+        identity: alice.public(),
+        device: [9; 32],
+        time: t,
+        until: t + 86_400,
+        reason: None,
+        signer: None,
+        signer_cert: None,
+    }
+    .sign_as_device(&old, cert)
+    .unwrap();
+    let r = post_record(revoke).await;
+    assert_eq!(r.status, 401);
+    assert_eq!(
+        r.json(),
+        json!({ "error": "bad_signature", "text": "the signer's device was reset" })
+    );
+
+    let two = reset(2, t + 2);
+    let r = post_record(two.clone()).await.json();
+    assert_eq!(
+        (&r["epoch"], &r["hash"]),
+        (&json!(2), &json!(b64(&Sha256::digest(&two))))
+    );
+    let epochs = |records: Vec<Record>| -> Vec<u64> {
+        records
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::DeviceEpoch(e) => Some(e.epoch),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(epochs(records_of(&s, &alice).await), vec![1, 2]);
+    let k = keys(&s);
+    let rk = RegistrarKeys {
+        host: HOST,
+        keys: &k,
+    };
+    let full = get(&s, "/registrar/records?since=0").await;
+    let full = SignedList::parse(&full.body, ListKind::Records, rk).unwrap();
+    let full = full
+        .entries
+        .iter()
+        .map(|(_, b)| Record::parse(b, Some(rk)).unwrap())
+        .collect();
+    assert_eq!(epochs(full), vec![2]);
 }
 
 /// The server key a challenge reply names.

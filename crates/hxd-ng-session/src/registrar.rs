@@ -144,10 +144,14 @@ pub async fn route(
                 return bad_body("record");
             };
             let now = now();
-            match blocking(move || reg.post_record(&bytes, now)).await {
+            match blocking(move || reg.post_record(&bytes, client, now)).await {
                 Ok(Posted::Published { seq }) => {
                     json_resp(StatusCode::OK, json!({ "seq": seq, "published": true }))
                 }
+                Ok(Posted::DeviceEpoch { seq, epoch, hash }) => json_resp(
+                    StatusCode::OK,
+                    json!({ "seq": seq, "published": true, "epoch": epoch, "hash": b64(&hash) }),
+                ),
                 Ok(Posted::Pending { until }) => json_resp(
                     StatusCode::OK,
                     json!({ "published": false, "pending_until": until }),

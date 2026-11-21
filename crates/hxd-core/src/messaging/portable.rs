@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hl_identity::friendship::{chain_end, Cutoff, Pair};
 use hl_identity::message::SKEW;
 use hl_identity::{
-    DeviceCert, Error as IdError, Fingerprint, Friendship, Offer, Rotation, Withdrawal,
+    DeviceCert, Error as IdError, Fingerprint, Friendship, Offer, PublicKey, Rotation, Withdrawal,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -49,6 +49,14 @@ pub const MAX_OBJECTS: usize = 32;
 /// How far a chain of rotations is followed: further than any person
 /// rotates, and short of a loop's cost.
 const MAX_CHAIN: usize = 16;
+
+/// The device epoch held for an identity, which this server does not
+/// keep yet: every friendship object is checked as if no identity had
+/// reset its devices. Applying the floor is the verifying server's part
+/// of device epochs, still to come.
+fn no_floor(_: &PublicKey) -> u64 {
+    0
+}
 
 /// What one object of a presentation came to (§4.3's reply).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +209,7 @@ impl Core {
                 let passes = w
                     .withdrawal
                     .as_deref()
-                    .and_then(|b| Withdrawal::parse(b, now).ok())
+                    .and_then(|b| Withdrawal::parse(b, now, no_floor).ok())
                     .is_some_and(|k| k.check_pair(pair, rotations).is_ok());
                 if !passes {
                     store
@@ -266,7 +274,7 @@ impl Core {
         bytes: Vec<u8>,
     ) -> Result<StoredOffer, MessagingError> {
         let now = self.clock.unix();
-        let offer = Offer::check(&bytes, now, &[]).map_err(|r| match r.error {
+        let offer = Offer::check(&bytes, now, &[], no_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
             _ => MessagingError::BadSignature,
         })?;
@@ -332,7 +340,7 @@ impl Core {
         bytes: Vec<u8>,
     ) -> Result<(), MessagingError> {
         let now = self.clock.unix();
-        let f = Friendship::check(&bytes, now, &[]).map_err(|r| match r.error {
+        let f = Friendship::check(&bytes, now, &[], no_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
             _ => MessagingError::BadSignature,
         })?;
@@ -423,7 +431,7 @@ impl Core {
         bytes: Vec<u8>,
     ) -> Result<Vec<u8>, MessagingError> {
         let now = self.clock.unix();
-        let kept = Withdrawal::parse(&bytes, now).map_err(|r| match r.error {
+        let kept = Withdrawal::parse(&bytes, now, no_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
             _ => MessagingError::BadSignature,
         })?;
@@ -502,7 +510,7 @@ impl Core {
                 continue;
             };
             had += 1;
-            if Friendship::check(&bytes, now, &[]).is_ok_and(|f| f.cut_by(cut)) {
+            if Friendship::check(&bytes, now, &[], no_floor).is_ok_and(|f| f.cut_by(cut)) {
                 store.unpresent(&p, &q).map_err(store_failed)?;
                 ended += 1;
             }
@@ -511,7 +519,7 @@ impl Core {
             let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? else {
                 continue;
             };
-            if Offer::check(&o.offer, now, &[]).is_ok_and(|o| o.cut_by(cut)) {
+            if Offer::check(&o.offer, now, &[], no_floor).is_ok_and(|o| o.cut_by(cut)) {
                 store.set_offer(&p, &q, None).map_err(store_failed)?;
             }
         }
@@ -775,7 +783,7 @@ impl Core {
         // What can be said of the withdrawal alone is said before anyone
         // is looked up, so that its answer is the same whoever it names.
         let now = self.clock.unix();
-        let kept = Withdrawal::parse(&withdraw, now).map_err(|r| match r.error {
+        let kept = Withdrawal::parse(&withdraw, now, no_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
             _ => MessagingError::BadSignature,
         })?;
@@ -821,7 +829,7 @@ impl Core {
         let now = self.clock.unix();
         let mut pairs: Vec<[u8; 32]> = withdrawals
             .iter()
-            .filter_map(|b| Withdrawal::parse(b, now).ok())
+            .filter_map(|b| Withdrawal::parse(b, now, no_floor).ok())
             .map(|k| k.withdrawal().pair)
             .collect();
         let named = pairs.len();
@@ -859,7 +867,7 @@ impl Core {
     ) -> Result<PresentResult, MessagingError> {
         let now = self.clock.unix();
         let refused = |hash, outcome| Ok(PresentResult { hash, outcome });
-        let kept = match Withdrawal::parse(&bytes, now) {
+        let kept = match Withdrawal::parse(&bytes, now, no_floor) {
             Ok(k) => k,
             Err(r) => {
                 let outcome = match r.error {
@@ -867,8 +875,8 @@ impl Core {
                     _ => Presented::BadSignature,
                 };
                 // Named by the pair it names where that can be read.
-                let pair =
-                    Withdrawal::parse(&bytes, u64::MAX).map_or([0; 32], |k| k.withdrawal().pair);
+                let pair = Withdrawal::parse(&bytes, u64::MAX, no_floor)
+                    .map_or([0; 32], |k| k.withdrawal().pair);
                 return refused(pair, outcome);
             }
         };
@@ -960,7 +968,7 @@ impl Core {
         let answer = |outcome| Ok(PresentResult { hash, outcome });
         // Step 1: the friendship, and that it names the presenter's key or
         // one that rotated to it.
-        let Ok(f) = Friendship::check(&bytes, now, &[]) else {
+        let Ok(f) = Friendship::check(&bytes, now, &[], no_floor) else {
             return answer(Presented::BadSignature);
         };
         let pair = f.pair();

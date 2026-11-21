@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::store::{
     Effect, EnvelopeRow, HandleRow, Issue, Issued, Key, Lockout, NewRecord, Pending, Publish,
-    RecordFilter, RecordKind, Recovery, RegistrarStore,
+    RecordFilter, RecordKind, Recovery, RegistrarStore, SUPERSEDED_EPOCHS_KEPT,
 };
 
 /// Run every case against a freshly built store.
@@ -27,6 +27,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RegistrarStore>) {
     a_per_identity_list_carries_both_sides_of_a_rotation(&*new_store());
     the_full_list_prunes_what_has_stopped_mattering(&*new_store());
     the_full_list_keeps_a_bounded_number_of_device_revocations(&*new_store());
+    a_device_epoch_supersedes_the_last_in_the_full_list_alone(&*new_store());
     pages_are_cut_by_budget_and_always_make_progress(&*new_store());
     pending_rotations_come_due_in_order(&*new_store());
     a_recovery_is_redeemed_by_the_issuance_it_grants(&*new_store());
@@ -481,6 +482,56 @@ fn the_full_list_keeps_a_bounded_number_of_device_revocations(s: &dyn RegistrarS
     assert_eq!(kept, vec![seq[0], seq[2], seq[4], seq[5]]);
     // The per-identity list keeps all of them.
     assert_eq!(seqs(s, RecordFilter::Identity(key(1))).len(), 5);
+}
+
+fn a_device_epoch_supersedes_the_last_in_the_full_list_alone(s: &dyn RegistrarStore) {
+    let epoch = |id: u8, n: usize| {
+        record(
+            RecordKind::DeviceEpoch,
+            key(id),
+            None,
+            None,
+            &format!("{id}:{n}"),
+        )
+    };
+    assert_eq!(
+        s.latest_record(&key(1), RecordKind::DeviceEpoch).unwrap(),
+        None
+    );
+    let other = publish(s, vec![epoch(2, 0)], vec![])[0];
+    let first = publish(s, vec![epoch(1, 0)], vec![])[0];
+    let full = || {
+        seqs(
+            s,
+            RecordFilter::All {
+                now: T,
+                device_cap: 256,
+            },
+        )
+    };
+    assert_eq!(full(), vec![other, first]);
+
+    // Each published alone, as the registrar does: the full list never
+    // holds two of an identity's, nor none once it has one.
+    let mut published = vec![first];
+    for n in 1..SUPERSEDED_EPOCHS_KEPT + 2 {
+        let next = epoch(1, n);
+        let seq = publish(s, vec![next.clone()], vec![])[0];
+        published.push(seq);
+        assert_eq!(full(), vec![other, seq]);
+        assert_eq!(
+            s.latest_record(&key(1), RecordKind::DeviceEpoch).unwrap(),
+            Some((seq, next.bytes))
+        );
+    }
+    assert_eq!(s.latest_record(&key(1), RecordKind::Rotate).unwrap(), None);
+    // Its own list keeps the latest and the ones before it up to the
+    // cap, the oldest dropped first.
+    assert_eq!(
+        seqs(s, RecordFilter::Identity(key(1))),
+        published[published.len() - 1 - SUPERSEDED_EPOCHS_KEPT..]
+    );
+    assert_eq!(seqs(s, RecordFilter::Identity(key(2))), vec![other]);
 }
 
 fn pages_are_cut_by_budget_and_always_make_progress(s: &dyn RegistrarStore) {

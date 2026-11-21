@@ -585,7 +585,10 @@ fn a_withdrawal_presented_must_be_the_sessions_own() {
             .core
             .friendships_present(a, vec![w.clone()], vec![])
             .unwrap();
-        let pair = Withdrawal::parse(&w, u64::MAX).unwrap().withdrawal().pair;
+        let pair = Withdrawal::parse(&w, u64::MAX, |_| 0)
+            .unwrap()
+            .withdrawal()
+            .pair;
         assert_eq!(
             taken[0],
             PresentResult {
