@@ -927,6 +927,11 @@ async fn tunnel_login(
     login: &[u8],
     password: &[u8],
 ) -> Result<Tunnel, String> {
+    login_over(tunnel_open(ng, p).await, login, password).await
+}
+
+/// A `/trtp` tunnel as `p`, through the TRTP handshake.
+async fn tunnel_open(ng: SocketAddr, p: &Person) -> Tunnel {
     let token = authenticate(ng, p).await["token"]
         .as_str()
         .unwrap()
@@ -938,6 +943,12 @@ async fn tunnel_login(
     let mut t = Tunnel::new(ws);
     t.send_raw(b"TRTPHOTL\x00\x01\x00\x02").await;
     t.read_exact(8).await;
+    t
+}
+
+/// A classic login over `t`: the session, or the text of the error
+/// reply that refused it.
+async fn login_over(mut t: Tunnel, login: &[u8], password: &[u8]) -> Result<Tunnel, String> {
     let xor: Vec<u8> = password.iter().map(|b| b ^ 0xff).collect();
     let xlogin: Vec<u8> = login.iter().map(|b| b ^ 0xff).collect();
     t.send(
@@ -1406,6 +1417,24 @@ async fn tunnelled_classic_login_links_under_verify_and_refuses_strangers() {
     drop(t);
     // An identity with no link still doesn't get in that way.
     assert!(tunnel_login(ng, &q, b"", b"").await.is_err());
+}
+
+#[tokio::test]
+async fn a_tunnelled_login_below_its_identitys_floor_links_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, ctx) = start_server(dir.path()).await;
+    let p = person(8, "Bob");
+    let t = tunnel_open(ng, &p).await;
+    ctx.core.set_published_revocations(hxd_core::Published {
+        floors: [(p.id.fingerprint().0, 1)].into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        login_over(t, b"bob", b"s3cret").await.err().as_deref(),
+        Some("This key is revoked on this server.")
+    );
+    let file = std::fs::read_to_string(dir.path().join("accounts/bob.toml")).unwrap();
+    assert!(!file.contains("fingerprint"), "{file}");
 }
 
 #[tokio::test]

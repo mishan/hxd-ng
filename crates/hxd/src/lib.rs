@@ -5297,7 +5297,12 @@ mod tests {
         });
         let err = reload_revocations(&core, &path).unwrap_err();
         assert!(err.contains("hxd-ng.toml"), "{err}");
-        assert!(core.is_revoked(&[7; 32], &[0; 32]), "nothing was lifted");
+        let cert = hxd_core::CertRef {
+            identity: [7; 32],
+            device: [0; 32],
+            epoch: 0,
+        };
+        assert!(core.refuses(&cert), "nothing was lifted");
     }
 
     #[test]

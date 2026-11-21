@@ -1261,6 +1261,7 @@ fn proved(signs: bool) -> Transport {
             signs,
             can_sign: true,
             device_expires: 0,
+            device_epoch: 0,
             sealed: None,
             device_cert: None,
         }),

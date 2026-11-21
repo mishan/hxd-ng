@@ -2217,6 +2217,9 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::BadCert => "the device certificate did not verify or is not valid now",
             AuthRefused::BadProof | AuthRefused::ClockSkew => "the login proof did not verify",
             AuthRefused::Revoked => "the device or identity is revoked",
+            AuthRefused::BelowFloor { .. } => {
+                "this device was signed out when its identity reset its devices"
+            }
             AuthRefused::Denied => "refused by server policy",
             AuthRefused::CardTooLarge => "the user card exceeds 16 KiB",
             AuthRefused::UnknownChallenge => "unknown or expired challenge",
@@ -2238,8 +2241,10 @@ fn refused(e: AuthRefused) -> Resp {
             AuthRefused::Rotated { .. } => "this identity has rotated to another key",
             AuthRefused::Backend => "server error",
         } });
-    if let AuthRefused::Rotated { successor } = e {
-        body["successor"] = json!(successor.to_string());
+    match e {
+        AuthRefused::Rotated { successor } => body["successor"] = json!(successor.to_string()),
+        AuthRefused::BelowFloor { floor } => body["epoch"] = json!(floor),
+        _ => {}
     }
     json_resp(StatusCode::from_u16(e.status()).unwrap(), body)
 }

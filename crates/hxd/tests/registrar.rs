@@ -1821,9 +1821,24 @@ async fn auth_with(
     card: &[u8],
     extra: Value,
 ) -> Reply {
-    let cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME)
-        .unwrap()
-        .sign(id);
+    auth_cert(at, dev, card, &cert_in(id, dev, 0), extra).await
+}
+
+/// `dev`'s certificate from `id`, issued in device epoch `epoch`.
+fn cert_in(id: &IdentityKey, dev: &DeviceKey, epoch: u64) -> Vec<u8> {
+    let mut cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME).unwrap();
+    cert.epoch = epoch;
+    cert.sign(id)
+}
+
+/// [`auth_with`], showing `cert`.
+async fn auth_cert(
+    at: SocketAddr,
+    dev: &DeviceKey,
+    card: &[u8],
+    cert: &[u8],
+    extra: Value,
+) -> Reply {
     let json_post = |path: &'static str, body: Value| async move {
         http_as(
             at,
@@ -1838,7 +1853,7 @@ async fn auth_with(
     let ch = json_post("/identity/challenge", Value::Null).await.json();
     let challenge: [u8; 32] = unb64(ch["challenge"].as_str().unwrap()).try_into().unwrap();
     let proof = LoginProof::sign(dev, &challenge, &s_key(&ch), &at.to_string(), now()).unwrap();
-    let mut body = json!({ "card": b64(card), "device_cert": b64(&cert), "proof": b64(&proof) });
+    let mut body = json!({ "card": b64(card), "device_cert": b64(cert), "proof": b64(&proof) });
     body.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
@@ -2225,6 +2240,19 @@ async fn prove_at(
     dev: &DeviceKey,
     card: &[u8],
 ) -> Result<(), String> {
+    prove_in(plain, account, id, dev, 0, card).await.1
+}
+
+/// [`prove_at`], with a certificate issued in device epoch `epoch`, and
+/// the connection it was proved on.
+async fn prove_in(
+    plain: SocketAddr,
+    account: &str,
+    id: &IdentityKey,
+    dev: &DeviceKey,
+    epoch: u64,
+    card: &[u8],
+) -> (Client, Result<(), String>) {
     let login = Login {
         caps: Some(CAP_DEVICE_PROOF as u32),
         ..Login::account(account, account, "pw")
@@ -2238,9 +2266,7 @@ async fn prove_at(
         .unwrap();
     let ch = ServerChallenge::parse_trtp(&reply.bytes(tag::SERVER_CHALLENGE).unwrap()).unwrap();
     let proof = DeviceProof::sign(dev, &ch.challenge, &ch.server_key, &host, now(), None).unwrap();
-    let cert = DeviceCert::for_device(id, dev, now() - 5, cert::RECOMMENDED_LIFETIME)
-        .unwrap()
-        .sign(id);
+    let cert = cert_in(id, dev, epoch);
     let reply = c
         .ask(
             ClientHdr::ProveDevice,
@@ -2248,10 +2274,11 @@ async fn prove_at(
         )
         .await
         .unwrap();
-    match reply.is_error() {
+    let proved = match reply.is_error() {
         true => Err(reply.error_text().unwrap()),
         false => Ok(()),
-    }
+    };
+    (c, proved)
 }
 
 #[tokio::test]
@@ -2415,7 +2442,18 @@ async fn session_as(
     dev: &DeviceKey,
     card: &[u8],
 ) -> hxd_testclient::ng::Client {
-    let token = auth_at(at, id, dev, card).await.json()["token"]
+    session_in(at, dev, &cert_in(id, dev, 0), card, json!({})).await
+}
+
+/// [`session_as`], showing `cert` and logging in with `params`.
+async fn session_in(
+    at: SocketAddr,
+    dev: &DeviceKey,
+    cert: &[u8],
+    card: &[u8],
+    params: Value,
+) -> hxd_testclient::ng::Client {
+    let token = auth_cert(at, dev, card, cert, json!({})).await.json()["token"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2424,7 +2462,7 @@ async fn session_as(
     let mut c = hxd_testclient::ng::Client::over(Box::new(tcp), &url)
         .await
         .unwrap();
-    c.login(json!({})).await.unwrap();
+    c.login(params).await.unwrap();
     c
 }
 
@@ -2534,6 +2572,465 @@ async fn a_key_its_registrar_revokes_loses_its_session_here_and_a_banned_registr
     );
 }
 
+/// `id` resets its devices to `epoch` at `r`.
+async fn post_reset(r: &Server, id: &IdentityKey, epoch: u64) {
+    let reset = DeviceEpoch {
+        identity: id.public(),
+        epoch,
+        time: now(),
+    }
+    .sign(id)
+    .unwrap();
+    let posted = post(r, "/registrar/records", json!({ "record": b64(&reset) })).await;
+    assert_eq!(
+        posted.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&posted.body)
+    );
+}
+
+/// What `/identity/auth` answered: its status, error and `epoch`.
+fn refusal(reply: &Reply) -> (u16, Value, Value) {
+    let body = reply.json();
+    (reply.status, body["error"].clone(), body["epoch"].clone())
+}
+
+#[tokio::test]
+async fn a_reset_refuses_the_certificates_below_its_floor_and_admits_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, identity, _) =
+        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop, tablet) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+        DeviceKey::from_seed(&[103; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let linked = |reply: Reply| (reply.status, reply.json()["outcome"].clone());
+
+    // No reset: whatever epoch a certificate was issued in, it logs in.
+    for (dev, epoch) in [(&phone, 0), (&laptop, 5)] {
+        let reply = auth_cert(v, dev, &card, &cert_in(&alice, dev, epoch), json!({})).await;
+        assert_eq!(linked(reply), (200, json!("linked")), "epoch {epoch}");
+    }
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(identity.identity_for_device(&phone.public()).is_some());
+    let upgraded = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tcp = TcpStream::connect(v).await.unwrap();
+    let mut upgraded =
+        hxd_testclient::ng::Client::over(Box::new(tcp), &format!("ws://{v}/ng?token={upgraded}"))
+            .await
+            .unwrap();
+    let mut current = session_in(v, &laptop, &cert_in(&alice, &laptop, 5), &card, json!({})).await;
+
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    assert!(identity.sweep_records().await.is_empty(), "epoch 5 stays");
+    current.request("ping", json!({})).await.unwrap();
+
+    // The phone's token, minted before the reset, no longer redeems, and
+    // the phone on file is not let back in by its certificate.
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "the upgrade is refused"
+    );
+    assert!(identity.identity_for_device(&phone.public()).is_none());
+    // A socket that upgraded before the reset logs in no more.
+    let login = upgraded.request_frame("login", json!({})).await.unwrap();
+    assert_eq!(
+        (&login["error"]["code"], &login["error"]["epoch"]),
+        (&json!("revoked"), &json!(1)),
+        "{login}"
+    );
+
+    // At auth it is told the floor; a device certified at it, or above,
+    // is let in.
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+    for (dev, epoch) in [(&tablet, 1), (&laptop, 5)] {
+        let reply = auth_cert(v, dev, &card, &cert_in(&alice, dev, epoch), json!({})).await;
+        assert_eq!(linked(reply), (200, json!("linked")), "epoch {epoch}");
+    }
+
+    // Reset again before the sweep has installed it: told the floor the
+    // lists just fetched say, not the one installed.
+    post_reset(&r, &alice, 3).await;
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(3))
+    );
+}
+
+#[tokio::test]
+async fn a_reset_ends_the_sessions_below_its_floor_on_both_wires() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, plain, identity, core) =
+        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let (alice, bob) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let sealed = json!({ "sealed": true });
+
+    let mut phone = session_in(
+        v,
+        &dev(101),
+        &cert_in(&alice, &dev(101), 0),
+        &card,
+        sealed.clone(),
+    )
+    .await;
+    let away = session_in(
+        v,
+        &dev(102),
+        &cert_in(&alice, &dev(102), 0),
+        &card,
+        json!({}),
+    )
+    .await;
+    let session = away.session.clone().unwrap();
+    drop(away);
+    timeout(Duration::from_secs(5), async {
+        while core.census().detached == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the session never detached");
+    let (mut classic, proved) = prove_in(plain, "alice", &alice, &dev(103), 0, &card).await;
+    proved.unwrap();
+    let mut laptop = session_in(
+        v,
+        &dev(104),
+        &cert_in(&alice, &dev(104), 1),
+        &card,
+        json!({}),
+    )
+    .await;
+    let (mut desktop, proved) = prove_in(plain, "alice", &alice, &dev(105), 1, &card).await;
+    proved.unwrap();
+    let mut b = session_in(
+        v,
+        &dev(201),
+        &cert_in(&bob, &dev(201), 0),
+        &bare(&bob),
+        sealed,
+    )
+    .await;
+    let of_phone = json!({ "uid": phone.uid.unwrap() });
+    b.request("device_cert", of_phone.clone()).await.unwrap();
+
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    let ended = identity.sweep_records().await;
+    assert_eq!(ended.len(), 3, "{ended:?}");
+    phone.event("kicked").await.unwrap();
+    let closed = loop {
+        if let Err(e) = classic.recv().await {
+            break e;
+        }
+    };
+    assert!(
+        matches!(closed, hxd_testclient::Error::Closed),
+        "{closed:?}"
+    );
+    assert!(
+        b.request("device_cert", of_phone).await.is_err(),
+        "the phone's ended session is sealed to no more"
+    );
+    let mut c = hxd_testclient::ng::Client::connect(v).await.unwrap();
+    let resumed = c
+        .request_frame(
+            "resume",
+            json!({ "session": session.0, "token": session.1, "last_seq": 0 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (&resumed["error"]["code"], &resumed["error"]["epoch"]),
+        (&json!("revoked"), &json!(1)),
+        "{resumed}"
+    );
+
+    // The devices certified at the floor stay, and a device below it is
+    // refused Prove Device as any device is.
+    laptop.request("ping", json!({})).await.unwrap();
+    desktop.ping().await.unwrap();
+    assert_eq!(
+        prove_in(plain, "alice", &alice, &dev(106), 0, &card)
+            .await
+            .1,
+        Err("The device could not be proved.".into())
+    );
+    prove_in(plain, "alice", &alice, &dev(106), 1, &card)
+        .await
+        .1
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_reset_held_is_applied_while_its_registrar_cannot_be_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nowhere = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    next_list().await;
+    // The floor held is told before what the stale lists' policy says.
+    for stale in ["cached", "guest", "deny"] {
+        let extra = format!("registrar_timeout = 1\nrevocation_stale = \"{stale}\"");
+        let v = verifier(&there, &r, Trust::Key, &nowhere, &extra).await.0;
+        assert_eq!(
+            refusal(&auth_at(v, &alice, &phone, &card).await),
+            (403, json!("revoked"), json!(1)),
+            "{stale}"
+        );
+        if stale == "cached" {
+            let reply = auth_cert(v, &laptop, &card, &cert_in(&alice, &laptop, 1), json!({})).await;
+            assert_eq!(
+                reply.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", proxy.local_addr().unwrap());
+    let to = Arc::new(std::sync::Mutex::new(r.ng));
+    forward(proxy, to.clone());
+    let (v, _, identity, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &url,
+        "revocation_stale = \"deny\"",
+    )
+    .await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let mut laptop_here =
+        session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    assert!(identity.sweep_records().await.is_empty());
+    laptop_here.request("ping", json!({})).await.unwrap();
+
+    // Her registrar gone and the lists past their lifetime, a stranger
+    // to them would be denied; the floor installed is told as it is.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    *to.lock().unwrap() = closed.local_addr().unwrap();
+    drop(closed);
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+}
+
+#[tokio::test]
+async fn a_floor_auth_fetches_is_applied_before_any_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, _, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "banned_registrars = [\"banned.example\"]",
+    )
+    .await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let (phone, tablet, watch) = (dev(101), dev(103), dev(104));
+    let reply = register(&r, request(&alice, "alice"), &alice).await.json();
+    let att = unb64(reply["attestation"].as_str().unwrap());
+    let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+    let card = Card::new(&alice, "alice", now())
+        .sign(&alice, vec![att.clone()])
+        .unwrap();
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Her card beside an attestation from a registrar banned here, which
+    // policy would refuse `denied`.
+    let key = hl_identity::ServerKey::from_seed(&[9; 32]);
+    let other = Attestation {
+        identity: alice.public(),
+        registrar: "banned.example".into(),
+        registrar_key: key.public(),
+        handle: "alice".into(),
+        registered: now() - 120,
+        issued: now() - 120,
+        expires: now() + 3600,
+        level: None,
+    };
+    let banned = Card::new(&alice, "alice", now())
+        .sign(&alice, vec![att, other.signed_value(&key)])
+        .unwrap();
+
+    let mut desk = session_in(
+        v,
+        &dev(102),
+        &cert_in(&alice, &dev(102), 0),
+        &card,
+        json!({}),
+    )
+    .await;
+
+    // The first auth to fetch the reset is of a device the lists revoke
+    // too: told so, not denied, and the floor it fetched goes into force
+    // at once, for the other devices' tokens and sessions.
+    post_reset(&r, &alice, 1).await;
+    post_device_revocation(&r, &alice, &tablet).await;
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &tablet, &banned).await),
+        (403, json!("revoked"), Value::Null)
+    );
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "a token below the floor that auth fetched no longer redeems"
+    );
+    desk.event("kicked").await.unwrap();
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &watch, &banned).await),
+        (403, json!("revoked"), json!(1))
+    );
+}
+
+#[tokio::test]
+async fn a_token_below_a_floor_fetched_at_auth_does_not_outlive_the_next_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, identity, _) =
+        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, tablet) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[103; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &tablet, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+    // With no session of hers to keep it, the sweep installs lists that
+    // say nothing of her.
+    identity.sweep_records().await;
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "the token went with the floor's fetch"
+    );
+}
+
+#[tokio::test]
+async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let there = dir.path().join("verifier");
+    std::fs::create_dir_all(&there).unwrap();
+    let (old, new) = (
+        IdentityKey::from_seed(&[1; 32]),
+        IdentityKey::from_seed(&[2; 32]),
+    );
+    let card = attested_committing(&r, &old, "alice", &new, true).await;
+    post_reset(&r, &old, 1).await;
+    let posted = post(
+        &r,
+        "/registrar/records",
+        json!({ "record": b64(&rotation(&old, &new)) }),
+    )
+    .await;
+    assert_eq!(posted.json()["published"], true);
+    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "")
+        .await
+        .0;
+    let reply = auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+
+    // Lists held past their lifetime, the registrar gone, and the
+    // rotation not taken here yet: still a rotation, not `denied`.
+    std::fs::remove_file(there.join("successors")).unwrap();
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nowhere = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    next_list().await;
+    let extra = "registrar_timeout = 1\nrevocation_stale = \"deny\"";
+    let v = verifier(&there, &r, Trust::Key, &nowhere, extra).await.0;
+    let reply = auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &card).await;
+    assert_eq!(
+        (
+            reply.status,
+            reply.json()["error"].clone(),
+            reply.json()["successor"].clone()
+        ),
+        (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+}
+
 /// Carries every connection to `listener` to wherever `to` says now.
 fn forward(listener: tokio::net::TcpListener, to: Arc<std::sync::Mutex<SocketAddr>>) {
     tokio::spawn(async move {
@@ -2541,7 +3038,10 @@ fn forward(listener: tokio::net::TcpListener, to: Arc<std::sync::Mutex<SocketAdd
             let (mut a, _) = listener.accept().await.unwrap();
             let to = *to.lock().unwrap();
             tokio::spawn(async move {
-                let mut b = TcpStream::connect(to).await.unwrap();
+                // One that cannot be reached is a connection dropped.
+                let Ok(mut b) = TcpStream::connect(to).await else {
+                    return;
+                };
                 let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
             });
         }
@@ -2997,30 +3497,32 @@ async fn a_refusal_outlives_its_identitys_last_push_registration() {
 async fn a_refusal_kept_without_push_registrations_is_lifted_by_a_whole_read() {
     let a = Away::start().await;
     let laptop = DeviceKey::from_seed(&[102; 32]);
-    let (fp, dev) = (
-        a.alice.fingerprint(),
-        hl_identity::Fingerprint::of(&laptop.public()),
-    );
+    let fp = a.alice.fingerprint();
+    let laptop_cert = hxd_core::CertRef {
+        identity: fp.0,
+        device: hl_identity::Fingerprint::of(&laptop.public()).0,
+        epoch: 0,
+    };
     let _here = session_as(a.v, &a.alice, &laptop, &a.card).await;
     hxd::registrar::freeze(&a.r.config, &fp.to_string(), false).unwrap();
     let clock = a.identity.clock();
     clock.advance(Duration::from_secs(2));
     a.identity.sweep_records().await;
-    assert!(a.core.key_refusal(&fp.0, &dev.0).is_some(), "frozen");
+    assert!(a.core.key_refusal(&laptop_cert).is_some(), "frozen");
     // Its session ended, so she is seen away.
     a.identity.sweep_records().await;
-    assert!(a.core.key_refusal(&fp.0, &dev.0).is_some(), "kept");
+    assert!(a.core.key_refusal(&laptop_cert).is_some(), "kept");
 
     hxd::registrar::freeze(&a.r.config, &fp.to_string(), true).unwrap();
     clock.advance(Duration::from_secs(2));
     a.identity.sweep_records().await;
     assert!(
-        a.core.key_refusal(&fp.0, &dev.0).is_some(),
+        a.core.key_refusal(&laptop_cert).is_some(),
         "kept until read again"
     );
     clock.advance(Duration::from_secs(602));
     a.identity.sweep_records().await;
-    assert_eq!(a.core.key_refusal(&fp.0, &dev.0), None, "and lifted");
+    assert_eq!(a.core.key_refusal(&laptop_cert), None, "and lifted");
 }
 
 /// What a held list refuses is applied as soon as its identity is seen

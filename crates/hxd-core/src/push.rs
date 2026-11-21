@@ -876,6 +876,7 @@ mod tests {
             signs: false,
             can_sign: false,
             device_expires: u64::MAX,
+            device_epoch: 0,
             sealed: None,
             device_cert: None,
         }
@@ -1159,7 +1160,7 @@ mod tests {
             }
         });
         let until = Instant::now() + Duration::from_secs(5);
-        while core.is_revoked(&[7; 32], &[14; 32]) {
+        while core.refuses(&tag([14; 32]).cert()) {
             assert!(Instant::now() < until, "the lift never landed");
             std::thread::yield_now();
         }

@@ -16,12 +16,26 @@
 //! whose linked identity is revoked can still be reached by its
 //! password, because a password is not the key that was stolen.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tracing::info;
 
+use crate::ending::EndedBy;
 use crate::push::Unrevoked;
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
+
+/// A device certificate as the lists judge it: the identity that signed
+/// it, the device key it certifies, and the device epoch it was issued
+/// in (`docs/hotline-ng-identity.md` §3.3). Asked with all three, so no
+/// caller can leave the epoch out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertRef {
+    /// SHA-256 of the identity key.
+    pub identity: [u8; 32],
+    /// SHA-256 of the device key.
+    pub device: [u8; 32],
+    pub epoch: u64,
+}
 
 /// The fingerprints refused by hand: identity keys, which refuse every
 /// device of the identity, and device keys, which refuse one.
@@ -38,7 +52,7 @@ impl Revocations {
     }
 
     /// Is either the identity or the device on the list?
-    pub fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
+    fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
         self.identities.contains(identity) || self.devices.contains(device)
     }
 
@@ -65,9 +79,16 @@ pub struct Published {
     /// by. A resume of one of their sessions is not told `revoked`, but
     /// their push registrations go as a revoked identity's do.
     pub unrevoked: HashSet<[u8; 32]>,
+    /// Each identity's device epoch floor, the highest `epoch` of the
+    /// device epoch records its registrars publish: every certificate of
+    /// the identity issued below it is revoked
+    /// (`identity-registrar.md` §4.10, §7.3).
+    pub floors: HashMap<[u8; 32], u64>,
 }
 
 impl Published {
+    /// Is this identity, or this device of it, refused, whatever the
+    /// certificate's epoch?
     fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
         self.unrevoked.contains(identity) || self.revokes(identity, device)
     }
@@ -76,17 +97,36 @@ impl Published {
         self.identities.contains(identity) || self.devices.contains(&(*identity, *device))
     }
 
+    /// The floor `cert` was issued below, if it was.
+    fn below_floor(&self, cert: &CertRef) -> Option<u64> {
+        self.floors
+            .get(&cert.identity)
+            .copied()
+            .filter(|floor| cert.epoch < *floor)
+    }
+
+    /// Why a session that proved `cert` is ended as revoked, if it is.
+    fn revoked_why(&self, cert: &CertRef) -> Option<EndedBy> {
+        match self.revokes(&cert.identity, &cert.device) {
+            true => Some(EndedBy::Revoked),
+            false => self.below_floor(cert).map(EndedBy::BelowFloor),
+        }
+    }
+
     /// Is every device of `identity` refused, revoked or not?
     fn refuses_identity(&self, identity: &[u8; 32]) -> bool {
         self.identities.contains(identity) || self.unrevoked.contains(identity)
     }
 
-    fn refuses(&self, tag: &IdentityTag) -> bool {
-        self.is_revoked(&tag.fingerprint, &tag.device)
+    fn refuses(&self, cert: &CertRef) -> bool {
+        self.is_revoked(&cert.identity, &cert.device) || self.below_floor(cert).is_some()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.identities.is_empty() && self.devices.is_empty() && self.unrevoked.is_empty()
+        self.identities.is_empty()
+            && self.devices.is_empty()
+            && self.unrevoked.is_empty()
+            && self.floors.is_empty()
     }
 
     /// Add what `other` refuses, and the identities it was made from.
@@ -97,11 +137,16 @@ impl Published {
             devices,
             covered,
             unrevoked,
+            floors,
         } = other;
         self.identities.extend(identities);
         self.devices.extend(devices);
         self.covered.extend(covered);
         self.unrevoked.extend(unrevoked);
+        for (identity, floor) in floors {
+            let held = self.floors.entry(*identity).or_default();
+            *held = (*held).max(*floor);
+        }
     }
 }
 
@@ -116,9 +161,13 @@ pub(crate) struct Refused {
 
 impl Refused {
     pub(crate) fn refuses(&self, tag: &IdentityTag) -> bool {
-        self.local.refuses(tag)
-            || self.published.refuses(tag)
-            || self.rotated.contains(&tag.fingerprint)
+        self.refuses_cert(&tag.cert())
+    }
+
+    fn refuses_cert(&self, cert: &CertRef) -> bool {
+        self.local.is_revoked(&cert.identity, &cert.device)
+            || self.published.refuses(cert)
+            || self.rotated.contains(&cert.identity)
     }
 
     /// Was `d` registered by a key the lists refuse now: a device's own
@@ -175,18 +224,15 @@ impl Refused {
         }
     }
 
-    fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
-        self.local.is_revoked(identity, device)
-            || self.published.is_revoked(identity, device)
-            || self.rotated.contains(identity)
-    }
-
-    fn refusal(&self, identity: &[u8; 32], device: &[u8; 32]) -> Option<KeyRefusal> {
+    fn refusal(&self, cert: &CertRef) -> Option<KeyRefusal> {
+        let (identity, device) = (&cert.identity, &cert.device);
         if self.local.is_revoked(identity, device)
             || self.published.revokes(identity, device)
             || self.rotated.contains(identity)
         {
             Some(KeyRefusal::Revoked)
+        } else if let Some(floor) = self.published.below_floor(cert) {
+            Some(KeyRefusal::BelowFloor(floor))
         } else {
             self.published
                 .unrevoked
@@ -201,20 +247,25 @@ impl Refused {
 pub enum KeyRefusal {
     /// Revoked, or rotated away from.
     Revoked,
+    /// Its certificate was issued below its identity's device epoch
+    /// floor, this one: revoked by a reset.
+    BelowFloor(u64),
     /// Refused by what a registrar publishes without being revoked
     /// ([`Published::unrevoked`]): the records say why.
     Unrevoked,
 }
 
 impl Core {
-    /// Is this identity, or this device of it, revoked here?
-    pub fn is_revoked(&self, identity: &[u8; 32], device: &[u8; 32]) -> bool {
-        self.revoked.read().unwrap().is_revoked(identity, device)
+    /// Is this certificate refused here: its identity or its device
+    /// revoked, or rotated away from, or the certificate issued below
+    /// its identity's floor?
+    pub fn refuses(&self, cert: &CertRef) -> bool {
+        self.revoked.read().unwrap().refuses_cert(cert)
     }
 
-    /// Why [`Self::is_revoked`] refuses this identity or device, if it does.
-    pub fn key_refusal(&self, identity: &[u8; 32], device: &[u8; 32]) -> Option<KeyRefusal> {
-        self.revoked.read().unwrap().refusal(identity, device)
+    /// Why [`Self::refuses`] refuses this certificate, if it does.
+    pub fn key_refusal(&self, cert: &CertRef) -> Option<KeyRefusal> {
+        self.revoked.read().unwrap().refusal(cert)
     }
 
     /// Does the current list refuse this session's transport identity?
@@ -266,7 +317,7 @@ impl Core {
         // deletes may wait on registrations.
         let ended = match list.is_empty() {
             true => Vec::new(),
-            false => self.end_revoked(|tag| list.refuses(tag), |_| true),
+            false => self.end_revoked(|tag| list.refuses(tag), |_| Some(EndedBy::Revoked)),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
         self.take_revoked(keys.chain(ids).collect());
@@ -320,8 +371,8 @@ impl Core {
         let ended = match list.is_empty() {
             true => Vec::new(),
             false => self.end_revoked(
-                |tag| list.refuses(tag),
-                |tag| list.revokes(&tag.fingerprint, &tag.device),
+                |tag| list.refuses(&tag.cert()),
+                |tag| list.revoked_why(&tag.cert()),
             ),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
@@ -330,6 +381,26 @@ impl Core {
             self.drop_revoked_presentations(&devices);
         }
         ended
+    }
+
+    /// Raise `identity`'s device epoch floor to `floor`, as a list fetched
+    /// at an admission publishes it before the sweep installs it, and end
+    /// the sessions below it as the sweep would. `None` if the floor held
+    /// is that high already. The sweep's next install replaces it with
+    /// what the lists it reads say. Called off the reactor.
+    pub fn raise_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
+        {
+            let mut refused = self.revoked.write().unwrap();
+            let held = refused.published.floors.get(&identity).copied();
+            if held.unwrap_or(0) >= floor {
+                return None;
+            }
+            refused.published.floors.insert(identity, floor);
+        }
+        Some(self.end_revoked(
+            |tag| tag.fingerprint == identity && tag.device_epoch < floor,
+            |_| Some(EndedBy::BelowFloor(floor)),
+        ))
     }
 
     /// Refuse `identity` from now on, as a key its holder rotated away
@@ -347,7 +418,7 @@ impl Core {
                     .as_ref()
                     .is_some_and(|tag| tag.fingerprint == identity)
             },
-            |_| false,
+            |_| None,
         )
     }
 
@@ -382,48 +453,48 @@ impl Core {
                         .as_ref()
                         .is_some_and(|t| t.fingerprint == identity)
             },
-            |_| false,
+            |_| None,
         )
     }
 
-    /// The sessions `list` refuses, ended, those it `revokes` as revoked.
-    /// Run after the list is written, and with nothing else held: an
-    /// `attach` from then on is refused, and one that got in before is on
-    /// the roster to be found here.
+    /// The sessions `list` refuses, ended, each that `revoked` names a
+    /// reason for as revoked. Run after the list is written, and with
+    /// nothing else held: an `attach` from then on is refused, and one
+    /// that got in before is on the roster to be found here.
     fn end_revoked(
         &self,
         refuses: impl Fn(&IdentityTag) -> bool,
-        revokes: impl Fn(&IdentityTag) -> bool,
+        revoked: impl Fn(&IdentityTag) -> Option<EndedBy>,
     ) -> Vec<(Uid, String)> {
         self.end_sessions(
             |s| s.info.transport.identity.as_ref().is_some_and(&refuses),
-            |s| s.info.transport.identity.as_ref().is_some_and(&revokes),
+            |s| s.info.transport.identity.as_ref().and_then(&revoked),
         )
     }
 
     /// End the sessions `ends` picks, as kicked; a resume of one is told
-    /// it was revoked where `as_revoked` (`docs/hotline-ng.md` §6.2).
+    /// it was revoked where `revoked` says why (`docs/hotline-ng.md` §6.2).
     fn end_sessions(
         &self,
         ends: impl Fn(&UserSession) -> bool,
-        as_revoked: impl Fn(&UserSession) -> bool,
+        revoked: impl Fn(&UserSession) -> Option<EndedBy>,
     ) -> Vec<(Uid, String)> {
         let mut r = self.roster.lock().unwrap();
-        let ended: Vec<(Uid, String, bool)> = r
+        let ended: Vec<(Uid, String, Option<EndedBy>)> = r
             .users
             .iter()
             .filter(|(_, s)| ends(s))
-            .map(|(uid, s)| (*uid, s.info.nick.clone(), as_revoked(s)))
+            .map(|(uid, s)| (*uid, s.info.nick.clone(), revoked(s)))
             .collect();
-        for (uid, nick, revoked) in &ended {
-            info!(uid, nick = %nick, revoked = *revoked, "ending a session its key no longer admits");
+        for (uid, nick, why) in &ended {
+            info!(uid, nick = %nick, revoked = why.is_some(), "ending a session its key no longer admits");
             // On its way out, as a kicked session is: no kick or device
             // act takes it for a target meanwhile.
             if let Some(sess) = r.users.get_mut(uid) {
                 sess.kicked = true;
             }
-            if *revoked {
-                r.remember_end(*uid, crate::ending::EndedBy::Revoked);
+            if let Some(why) = why {
+                r.remember_end(*uid, why.clone());
             }
             r.send_to(*uid, Event::Kicked);
             r.export_leaving(*uid);
@@ -454,6 +525,7 @@ mod tests {
             signs: false,
             can_sign: false,
             device_expires: u64::MAX,
+            device_epoch: 0,
             sealed: None,
             device_cert: None,
         }
@@ -572,10 +644,63 @@ mod tests {
     }
 
     #[test]
+    fn a_floor_ends_the_certificates_below_it_and_tells_their_resume_the_floor() {
+        let core = Core::new();
+        let at = |identity, device, epoch| IdentityTag {
+            device_epoch: epoch,
+            ..tag(identity, device)
+        };
+        let (old, mut rx) = attach(&core, "old", Some(at(1, 10, 0))).unwrap();
+        let (away, _a) = attach(&core, "away", Some(at(1, 11, 1))).unwrap();
+        assert!(core.connection_lost(away, 10));
+        let (current, _b) = attach(&core, "current", Some(at(1, 12, 2))).unwrap();
+        let (other, _c) = attach(&core, "other", Some(at(2, 20, 0))).unwrap();
+        let serials = [old, away].map(|uid| (uid, core.session_serial(uid).unwrap()));
+        drain(&mut rx);
+
+        let mut ended = core.set_published_revocations(Published {
+            floors: [([1; 32], 2)].into(),
+            ..Published::default()
+        });
+        ended.sort();
+        assert_eq!(ended, [(old, "old".into()), (away, "away".into())]);
+        assert!(drain(&mut rx).iter().any(|e| matches!(e, Event::Kicked)));
+        let hour = std::time::Duration::from_secs(3600);
+        for (uid, serial) in serials {
+            assert_eq!(
+                core.ended_by(uid, serial, hour),
+                Some(EndedBy::BelowFloor(2))
+            );
+        }
+        let on = |uid| core.snapshot().iter().any(|u| u.uid == uid);
+        assert!(
+            on(current) && on(other),
+            "the floor itself and another identity stay"
+        );
+        assert_eq!(
+            core.key_refusal(&at(1, 13, 1).cert()),
+            Some(KeyRefusal::BelowFloor(2))
+        );
+        assert!(attach(&core, "again", Some(at(1, 13, 1))).is_none());
+        assert_eq!(core.key_refusal(&at(1, 13, 2).cert()), None);
+
+        core.set_published_revocations(Published {
+            floors: [([1; 32], 2)].into(),
+            devices: [([1; 32], [13; 32])].into(),
+            ..Published::default()
+        });
+        assert_eq!(
+            core.key_refusal(&at(1, 13, 1).cert()),
+            Some(KeyRefusal::Revoked),
+            "a revoked device is told so, whatever its epoch"
+        );
+    }
+
+    #[test]
     fn a_revoked_key_cannot_attach_and_a_lifted_one_can() {
         let core = Core::new();
         core.set_revocations(list(&[], &[10]));
-        assert!(core.is_revoked(&[9; 32], &[10; 32]));
+        assert!(core.refuses(&tag(9, 10).cert()));
         assert!(attach(&core, "stolen", Some(tag(1, 10))).is_none());
         assert!(
             attach(&core, "other", Some(tag(1, 11))).is_some(),

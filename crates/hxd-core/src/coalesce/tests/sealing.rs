@@ -29,6 +29,7 @@ fn sealing(fingerprint: [u8; 32], device: u8, persons: bool, expires: Option<u64
             signs: false,
             can_sign: false,
             device_expires: u64::MAX,
+            device_epoch: 0,
             sealed: expires.map(|expires| {
                 SealedDevice {
                     cert: vec![device],

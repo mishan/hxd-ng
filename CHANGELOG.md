@@ -59,7 +59,19 @@ as AGENTS.md's "Releasing" describes it.
   A device revocation signed by a device certified below the identity's
   epoch is refused `bad_signature`. The full record list carries an
   identity's latest reset alone; its own list keeps the 256 before it.
-  No schema change. Servers do not apply resets yet.
+  No schema change.
+
+- Servers now apply resets (docs/identity-registrar.md §7.3): a device
+  certificate issued below the highest `epoch` its identity's trusted
+  registrars publish is refused `revoked` at `/identity/auth`,
+  with that floor as `epoch` in the body, and at the classic wire's
+  Prove Device, a device on file and a token's redemption; the records
+  sweep ends its sessions on both wires, connected or detached, and a
+  resume or a login on a socket that authenticated first is refused
+  `revoked` with `epoch`. Nothing is sealed to it. With no reset every
+  certificate is admitted as before. The floor is read from the lists
+  held, not yet kept apart from them, and a reset device's push
+  registrations and friendship presentations are not yet judged by it.
 
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]

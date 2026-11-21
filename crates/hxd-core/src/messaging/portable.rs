@@ -130,7 +130,7 @@ impl Core {
     pub(super) fn device_act(&self, uid: Uid) -> Result<(super::Me, Device), MessagingError> {
         let me = self.messenger(uid)?;
         let now = self.clock.unix();
-        let (identity, key, cert) = {
+        let (identity, key, cert, refused) = {
             let r = self.roster.lock().unwrap();
             let sess = r.users.get(&uid).ok_or(MessagingError::NotEnabled)?;
             let tag = sess
@@ -146,14 +146,14 @@ impl Core {
                 .device_cert
                 .clone()
                 .ok_or(MessagingError::NotDeviceProved)?;
-            (tag.fingerprint, tag.device, cert)
+            (tag.fingerprint, tag.device, cert, tag.cert())
         };
         let linked = self
             .directory
             .as_ref()
             .and_then(|d| d.account(&me.mailbox.login))
             .and_then(|(m, _)| m.fingerprint);
-        if linked != Some(identity) || self.is_revoked(&identity, &key) {
+        if linked != Some(identity) || self.refuses(&refused) {
             return Err(MessagingError::NotDeviceProved);
         }
         Ok((me, Device { key, cert }))

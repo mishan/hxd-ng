@@ -558,7 +558,12 @@ Three layers, all `cargo test --workspace`:
   put refused for another registrar and an identity that may not, the
   envelopes gone with a revocation and a rotation, and `hlid backup`
   then `hlid restore` bringing back the same identity by passphrase and
-  by recovery code), `signed.rs` (signed lines and messages signed with a real
+  by recovery code; and at a verifying server a certificate below a
+  reset's floor refused at `auth` with the floor, at a login after it,
+  on file, at a token's redemption and at Prove Device, its sessions
+  ended on both wires and their resume told the floor, the lists held
+  refusing it while the registrar is down, and a certificate at or
+  above the floor, or with no reset, let in), `signed.rs` (signed lines and messages signed with a real
   device key: a line heard with its signature on the ng wire and as an
   unsigned one's text on the classic, kept across a restart, signed
   again and answered as itself, and refused under its id with other
