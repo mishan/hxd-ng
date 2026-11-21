@@ -358,7 +358,7 @@ fn rotate_moves(r: &str, col: &str) -> String {
 }
 
 const PRESENTATION_COLUMNS: &str =
-    "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at";
+    "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at, taken";
 
 fn bytes32(v: Vec<u8>) -> Result<[u8; 32], StoreError> {
     <[u8; 32]>::try_from(v).map_err(|_| StoreError::new("a stored key is not 32 bytes"))
@@ -372,6 +372,7 @@ fn presentation_row(r: &Row<'_>) -> rusqlite::Result<Result<Presentation, StoreE
     let device: Vec<u8> = r.get(7)?;
     let edge: Option<i64> = r.get(8)?;
     let at: i64 = r.get(9)?;
+    let taken: i64 = r.get(10)?;
     Ok((|| {
         Ok(Presentation {
             presenter: fp_from_hex(&presenter)?,
@@ -383,6 +384,7 @@ fn presentation_row(r: &Row<'_>) -> rusqlite::Result<Result<Presentation, StoreE
             device: bytes32(device)?,
             edge: edge.map(id_of).transpose()?,
             at: from_unix(at),
+            taken: from_unix(taken),
         })
     })())
 }
@@ -1129,8 +1131,8 @@ impl RelationshipStore for SqliteStore {
             ))?;
             sql(tx.execute(
                 "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair,
-                        hash, friendship, device, edge, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        hash, friendship, device, edge, at, taken)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     presenter,
                     other,
@@ -1142,6 +1144,7 @@ impl RelationshipStore for SqliteStore {
                     p.device.as_slice(),
                     p.edge.map(|n| n as i64),
                     unix(p.at),
+                    unix(p.taken),
                 ],
             ))?;
             Ok(old)

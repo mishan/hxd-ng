@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 39;
+const SCHEMA_VERSION: i64 = 40;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1106,6 +1106,16 @@ const SCHEMA_V39: &str = "
 ALTER TABLE push_device ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// When each presentation of a friendship was first taken, which a device
+/// epoch floor's grandfathering compares with a reset's `time`
+/// (`docs/proposals/portable-friends.md` §6). A row from before takes the
+/// time it was last presented: no earlier than the truth, so it holds no
+/// more than it should.
+const SCHEMA_V40: &str = "
+ALTER TABLE friend_presentation ADD COLUMN taken INTEGER NOT NULL DEFAULT 0;
+UPDATE friend_presentation SET taken = at;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1870,6 +1880,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 39 {
         steps.push_str(SCHEMA_V39);
+    }
+    if version < 40 {
+        steps.push_str(SCHEMA_V40);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -5033,6 +5046,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(devid.as_str(), 0)]
         );
+    }
+
+    /// A presentation from before its taking time was kept takes the
+    /// time it was last presented.
+    #[test]
+    fn version_thirty_nine_migrates_into_presentations_taken_when_last_presented() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37, SCHEMA_V38, SCHEMA_V39,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair, \
+                 hash, friendship, device, at) VALUES (?1, ?2, ?3, ?3, ?3, ?3, ?3, ?3, 1234)",
+                rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 32]],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 39).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let p = store.presentation(&[7; 32], &[8; 32]).unwrap().unwrap();
+        assert_eq!(p.taken, from_unix(1234));
     }
 
     /// An empty catalog at revision 0, whose ids, kept in the file,

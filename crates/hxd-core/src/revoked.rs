@@ -399,6 +399,7 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
+            self.judge_floors(list.floors.keys().copied());
         }
         ended
     }
@@ -410,6 +411,16 @@ impl Core {
     /// is that high already. The sweep's next install replaces it with
     /// what the lists it reads say. Called off the reactor.
     pub fn raise_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
+        let ended = self.install_floor(identity, floor);
+        // Even a floor held already: the records fetched may have moved a
+        // reset's earliest `time` earlier.
+        if floor > 0 {
+            self.judge_floors([identity]);
+        }
+        ended
+    }
+
+    fn install_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
         let below = |refused: &Refused| {
             refused
                 .published

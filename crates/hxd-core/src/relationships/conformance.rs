@@ -54,6 +54,7 @@ fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation 
         device: [device; 32],
         edge: None,
         at: at(100 + u64::from(hash)),
+        taken: at(50 + u64::from(hash)),
     }
 }
 

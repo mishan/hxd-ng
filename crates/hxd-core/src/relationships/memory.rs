@@ -1167,6 +1167,7 @@ impl RelationshipStore for MemoryRelationships {
 fn floor_presentation(p: &Presentation) -> Presentation {
     Presentation {
         at: floor(p.at),
+        taken: floor(p.taken),
         ..p.clone()
     }
 }

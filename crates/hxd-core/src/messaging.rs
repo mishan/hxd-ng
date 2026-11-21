@@ -51,6 +51,7 @@ mod tests;
 
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
+pub(crate) use portable::Epochs;
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 

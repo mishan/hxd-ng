@@ -78,7 +78,10 @@ pub(super) fn server_of(
     let mut core = Core::new()
         .with_inbox(inbox.clone(), Arc::new(dir), inbox_policy)
         .with_relationships(rel.clone())
-        .with_messaging(policy);
+        .with_messaging(policy)
+        .with_record_cache(Arc::new(
+            crate::identity_records::MemoryRecordCache::default(),
+        ));
     if let Some(gateway) = gateway {
         core = core.with_notifications(gateway);
     }

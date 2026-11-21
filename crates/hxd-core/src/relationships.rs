@@ -430,6 +430,11 @@ pub struct Presentation {
     /// is active again.
     pub edge: Option<RelationId>,
     pub at: SystemTime,
+    /// When this server first took this presenter's presentation of the
+    /// friendship: kept when the same hash is presented again, so that
+    /// presenting again never un-holds a friendship a device epoch floor
+    /// rose under (§6).
+    pub taken: SystemTime,
 }
 
 /// A withdrawal this server holds (§4.3): what it ends, and the signed

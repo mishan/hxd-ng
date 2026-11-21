@@ -1,22 +1,24 @@
 //! Portable friendships against the in-memory stores, with real device
 //! keys: made on one server and presented on another, withdrawn, dropped
-//! with a revoked device, followed through a rotation, and refused to any
-//! act the device-act gate does not admit.
+//! with a revoked device, followed through a rotation, judged against a
+//! device epoch floor, and refused to any act the device-act gate does
+//! not admit.
 
 use std::sync::Arc;
 
 use hl_identity::friendship::Pair;
 use hl_identity::{
-    Acceptance, DeviceCert, DeviceKey, Fingerprint, Friendship, IdentityKey, Offer, Rotation,
-    Withdrawal,
+    Acceptance, DeviceCert, DeviceEpoch, DeviceKey, Fingerprint, Friendship, IdentityKey, Offer,
+    Rotation, Withdrawal,
 };
 use sha2::{Digest, Sha256};
 
 use super::super::tests::{messaging_bits, policy, server_of, Directory, Server};
 use super::super::*;
+use crate::identity_records::KeptEpoch;
 use crate::inbox::Mailbox;
 use crate::roster::{drain, AttachInfo};
-use crate::{Events, IdentityTag, InboxPolicy, Revocations};
+use crate::{Events, IdentityTag, InboxPolicy, Published, Revocations};
 
 const DAY: u64 = 24 * 3600;
 
@@ -49,6 +51,56 @@ fn person(seed: u8) -> Person {
 
 fn fp(p: &Person) -> [u8; 32] {
     p.id.fingerprint().0
+}
+
+/// A device of `who` certified in `epoch`, beside its others: its index.
+fn enroll(who: &mut Person, epoch: u64) -> usize {
+    let seed: [u8; 32] = Sha256::digest([&fp(who)[..], &[who.devices.len() as u8]].concat()).into();
+    let dev = DeviceKey::from_seed(&seed);
+    let mut cert = DeviceCert::for_device(&who.id, &dev, now() - 3600, 90 * DAY).unwrap();
+    cert.epoch = epoch;
+    let cert = cert.sign(&who.id);
+    who.devices.push((dev, cert));
+    who.devices.len() - 1
+}
+
+/// `who` reset its devices to `epoch` at `time`: the record kept here, and
+/// the floor installed as the lists publish it.
+fn reset(s: &Server, who: &Person, epoch: u64, time: u64) {
+    keep(s, who, epoch, time);
+    install(s, who, epoch);
+}
+
+/// The record of `who`'s reset to `epoch` at `time`, kept here.
+fn keep(s: &Server, who: &Person, epoch: u64, time: u64) {
+    let record = DeviceEpoch {
+        identity: who.id.public(),
+        epoch,
+        time,
+    }
+    .sign(&who.id)
+    .unwrap();
+    s.core
+        .record_cache()
+        .unwrap()
+        .keep_epoch(
+            &fp(who),
+            &KeptEpoch {
+                epoch,
+                time,
+                record,
+            },
+        )
+        .unwrap();
+}
+
+/// `who`'s floor at `epoch`, installed as the lists publish it.
+fn install(s: &Server, who: &Person, epoch: u64) {
+    s.core.set_published_revocations(Published {
+        floors: [(fp(who), epoch)].into(),
+        covered: [fp(who)].into(),
+        ..Default::default()
+    });
 }
 
 fn offer(from: &Person, dev: usize, to: &Person, time: u64) -> Vec<u8> {
@@ -148,7 +200,7 @@ fn session(
                     signs: false,
                     can_sign: false,
                     device_expires: expires,
-                    device_epoch: 0,
+                    device_epoch: DeviceCert::parse(cert).unwrap().epoch,
                     sealed: None,
                     device_cert: Some(Arc::new(cert.clone())),
                 }),
@@ -873,6 +925,280 @@ fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
     assert!(s
         .rel
         .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_reset_holds_what_was_taken_before_it_and_refuses_what_was_not() {
+    let (mut alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let t = s1.core.clock().unix();
+    let (_, _, b1, mut rb1, f) = made(&s1, &alice, &bob);
+    reset(&s1, &alice, 1, t + 5);
+    assert!(
+        !told(&mut rb1).iter().any(|e| e.1 == RosterState::Removed),
+        "held: taken before the reset"
+    );
+    let (_, again) = s1
+        .core
+        .friendships_present(b1, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&again), "presented again as before: {again:?}");
+
+    // A server that never took it before the reset: refused whichever
+    // party presents it, and never active.
+    let s2 = linked(&accounts);
+    reset(&s2, &alice, 1, s2.core.clock().unix() - 1);
+    let renewed = enroll(&mut alice, 1);
+    let (a2, mut ra2) = device(&s2.core, "alice", &alice, renewed);
+    let (b2, _) = device(&s2.core, "bob", &bob, 0);
+    for uid in [b2, a2] {
+        let (_, refused) = s2
+            .core
+            .friendships_present(uid, vec![], vec![f.clone()])
+            .unwrap();
+        assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+    }
+    assert!(told(&mut ra2).is_empty(), "never active");
+}
+
+#[test]
+fn a_floor_learned_late_drops_what_was_taken_after_the_reset() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let reset_at = s.core.clock().unix() - 30;
+    let (_, _, b, mut rb, f) = made(&s, &alice, &bob);
+    reset(&s, &alice, 1, reset_at);
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)],
+        "removed with no withdrawal"
+    );
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+}
+
+#[test]
+fn presenting_again_keeps_the_first_taking_and_an_earlier_reset_judges_again() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = s.core.clock().unix();
+    let (a, _, b, mut rb, f) = made(&s, &alice, &bob);
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    for uid in [a, b] {
+        let (_, again) = s
+            .core
+            .friendships_present(uid, vec![], vec![f.clone()])
+            .unwrap();
+        assert!(ok_all(&again));
+    }
+    drain(&mut rb);
+
+    reset(&s, &alice, 1, t + 5);
+    assert!(
+        told(&mut rb).is_empty(),
+        "held: first taken before the reset, whenever presented since"
+    );
+    // A record of the same epoch, signed earlier, as another registrar
+    // may publish it.
+    reset(&s, &alice, 1, t - 10);
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+}
+
+#[test]
+fn a_withdrawal_a_reset_device_signed_ends_nothing() {
+    let (mut alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (taken, _) = s
+        .core
+        .friendships_present(a, vec![withdraw(&alice, 0, &bob, now())], vec![])
+        .unwrap();
+    assert!(ok_all(&taken));
+    reset(&s, &alice, 1, now());
+
+    // A friendship made since by a device that stays, its halves dated
+    // inside the cutoff the reset device signed.
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    let o = offer(&alice, renewed, &bob, now() - 30);
+    assert_eq!(
+        s.core.friend_ask(a2, "bob", None, Some(o.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    let f = accept(&o, &bob, 0, now() - 30);
+    assert_eq!(
+        s.core.friend_answer(b, "alice", true, Some(f)),
+        Ok(RosterState::Accepted)
+    );
+}
+
+#[test]
+fn a_presentation_by_either_party_before_the_reset_holds_the_friendship() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (_, first) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&first));
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+
+    // Bob's first presentation comes after the reset, Alice's before it.
+    let (b, mut rb) = device(&s.core, "bob", &bob, 1);
+    let (_, second) = s
+        .core
+        .friendships_present(b, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&second), "{second:?}");
+    assert!(told(&mut rb).iter().any(|e| e.1 == RosterState::Accepted));
+    // Judged again, it keeps both.
+    reset(&s, &alice, 2, t + 8);
+    assert!(told(&mut rb).is_empty());
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_some());
+
+    // Alice's presentation goes with her device, and Bob's, which only
+    // hers held, with it.
+    s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&alice.devices[1].0.public()).0].into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_floor_with_no_record_kept_drops_nothing_and_presenting_drops_what_is_not_held() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let taken = s.core.clock().unix();
+    let (_, _, b, mut rb, f) = made(&s, &alice, &bob);
+    install(&s, &alice, 1);
+    assert!(
+        !told(&mut rb).iter().any(|e| e.1 == RosterState::Removed),
+        "no record shows it is not held"
+    );
+
+    // A record kept since, with nothing judged again: Bob's presenting
+    // finds it not held, and what is stored of it goes then.
+    keep(&s, &alice, 1, taken - 30);
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn an_offer_a_reset_device_signed_goes_with_the_floor() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let o = offer(&alice, 0, &bob, now());
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o)),
+        Ok(RosterState::PendingOut)
+    );
+    let wall = std::time::SystemTime::now();
+    assert!(s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap().is_some());
+    let (_, mut rb) = device(&s.core, "bob", &bob, 0);
+    reset(&s, &alice, 1, now());
+    assert!(s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap().is_none());
+    let entries: Vec<_> = drain(&mut rb)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FriendEntry(e) if e.login == "alice" => Some((e.state, e.offer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [(RosterState::PendingIn, None)],
+        "told, a plain request"
+    );
+}
+
+#[test]
+fn a_presentation_refused_before_it_was_recorded_holds_nothing() {
+    let (mut alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    s.core.inbox_block(b, "alice", true).unwrap();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (_, hidden) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert_eq!(
+        hidden[0].outcome,
+        Presented::AccountNotFound,
+        "its hash alone kept"
+    );
+    s.core.inbox_block(b, "alice", false).unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let (_, refused) = s.core.friendships_present(a2, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+}
+
+#[test]
+fn an_unlink_takes_the_presentation_only_it_held() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    s.core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&held));
+
+    s.core.friendships_unlinked(&fp(&alice));
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
         .unwrap()
         .is_none());
 }

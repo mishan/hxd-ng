@@ -6,19 +6,23 @@
 //! own API. The requests are built and the replies read by `hxproto`, as
 //! GtkHx builds and reads them. A friendship made with an ng client or
 //! another classic one is in place on the next server once both present
-//! it, a withdrawal on one ends it on the other, a rotation's records are
-//! fetched, and a session that did not negotiate bit 15, and a period
-//! client beside it all, see nothing new.
+//! it, a withdrawal on one ends it on the other, a device reset keeps
+//! only what was taken before it, a rotation's records are fetched, and a
+//! session that did not negotiate bit 15, and a period client beside it
+//! all, see nothing new.
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hl_identity::friendship::Pair;
 use hl_identity::{
-    cert, Acceptance, Card, DeviceCert, DeviceKey, DeviceProof, Fingerprint, Friendship,
-    IdentityKey, LoginProof, Offer, Rotation, ServerChallenge, Withdrawal,
+    cert, Acceptance, Card, DeviceCert, DeviceEpoch, DeviceKey, DeviceProof, Fingerprint,
+    Friendship, IdentityKey, LoginProof, Offer, Rotation, ServerChallenge, Withdrawal,
 };
+use hxd_core::identity_records::KeptEpoch;
+use hxd_core::{Core, Published};
 use hxd_testclient::device::{get_device_challenge, prove_device};
 use hxd_testclient::legacy::{push, Client, Frame, Login};
 use hxd_testclient::messaging::{self as im, reason};
@@ -44,6 +48,7 @@ const NOT_PROVED: &str = "This session has not proved a device that may make fri
 struct Server {
     plain: SocketAddr,
     ng: SocketAddr,
+    core: Arc<Core>,
 }
 
 /// An identity with two devices, each certified.
@@ -147,10 +152,15 @@ async fn start(dir: &Path) -> Server {
     let mut ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
     let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None).unwrap();
     ctx.device_proof = hxd::device::prover(ng_ctx.as_ref());
-    tokio::spawn(hxd::presence_flusher(ctx.core.clone()));
+    let core = ctx.core.clone();
+    tokio::spawn(hxd::presence_flusher(core.clone()));
     tokio::spawn(hxd_session::serve(plain, ctx));
     tokio::spawn(hxd_ng_session::serve(ngl, ng_ctx.unwrap()));
-    Server { plain: p, ng: n }
+    Server {
+        plain: p,
+        ng: n,
+        core,
+    }
 }
 
 fn login(account: &str, caps: u64) -> Login {
@@ -384,6 +394,30 @@ fn outcomes(f: &Frame) -> Vec<Outcome> {
         .collect()
 }
 
+/// `who` reset its devices to epoch 1 at `time`, as `s` keeps the record
+/// and installs the floor the lists publish.
+fn reset(s: &Server, who: &Person, time: u64) {
+    let record = DeviceEpoch {
+        identity: who.id.public(),
+        epoch: 1,
+        time,
+    }
+    .sign(&who.id)
+    .unwrap();
+    let kept = KeptEpoch {
+        epoch: 1,
+        time,
+        record,
+    };
+    let records = s.core.record_cache().unwrap();
+    records.keep_epoch(&fp(who).0, &kept).unwrap();
+    s.core.set_published_revocations(Published {
+        floors: [(fp(who).0, 1)].into(),
+        covered: [fp(who).0].into(),
+        ..Default::default()
+    });
+}
+
 async fn present(c: &mut Client, objects: &[Presentation<'_>]) -> Frame {
     ok(
         c,
@@ -585,6 +619,54 @@ async fn a_withdrawal_on_one_server_ends_a_classic_friendship_on_the_other() {
     assert_eq!(
         outcomes(&refused),
         vec![(hash(&f), Some(ReasonCode::Withdrawn), Some(again))]
+    );
+}
+
+#[tokio::test]
+async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
+    let (alice, bob) = (alice(), bob());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let s1 = start(d1.path()).await;
+    let s2 = start(d2.path()).await;
+    let mut alice1 = classic_device(&s1, "alice", &alice, 0).await;
+    let mut bob1 = classic_device(&s1, "bob", &bob, 0).await;
+    let f = befriend_classic(&mut alice1, &mut bob1, &alice, &bob).await;
+    // The second server takes it after the reset, before it learns of it.
+    let reset_at = now() + 1;
+    s2.core.clock().advance(Duration::from_secs(60));
+    let mut alice2 = classic_device(&s2, "alice", &alice, 1).await;
+    let mut bob2 = classic_device(&s2, "bob", &bob, 1).await;
+    present(&mut alice2, &[Presentation::Friendship(&f)]).await;
+    present(&mut bob2, &[Presentation::Friendship(&f)]).await;
+    told(
+        &mut bob2,
+        ServerHdr::RosterEntry,
+        "alice",
+        state(RosterState::Accepted),
+    )
+    .await;
+
+    reset(&s2, &alice, reset_at);
+    let gone = told(
+        &mut bob2,
+        ServerHdr::RosterEntry,
+        "alice",
+        state(RosterState::Removed),
+    )
+    .await;
+    assert_eq!(entry(&gone).withdrawal, None);
+    let refused = present(&mut bob2, &[Presentation::Friendship(&f)]).await;
+    assert_eq!(
+        outcomes(&refused),
+        vec![(hash(&f), Some(ReasonCode::AccountNotFound), None)]
+    );
+
+    reset(&s1, &alice, reset_at);
+    let kept = present(&mut bob1, &[Presentation::Friendship(&f)]).await;
+    assert_eq!(
+        outcomes(&kept),
+        vec![(hash(&f), Some(ReasonCode::Ok), None)],
+        "held"
     );
 }
 
