@@ -337,15 +337,74 @@ fn a_mint_waits_for_whoever_holds_the_holders_lock() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "minted under another's lock"
-    );
+    // Unlocked once the child says it is waiting, and not before.
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let (tx, waiting) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        while stderr.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.contains("waiting for another hlid") {
+                let _ = tx.send(());
+            }
+            line.clear();
+        }
+    });
+    waiting
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the mint did not wait for the lock");
+    assert!(!cert.exists(), "minted under another's lock");
     drop(lock);
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
     assert!(cert.is_file());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("waiting for another hlid"), "{err}");
+}
+
+#[test]
+fn a_certificate_is_minted_with_explicit_paths_and_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let cert = dir.path().join("web.cert");
+    let out = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env_remove("HLID_HOME")
+        .env_remove("HOME")
+        .args([
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+        ])
+        .args(["--device-pub", &key_hex(DEVICE_PUB), "--device-enc-pub"])
+        .args([&key_hex(DEVICE_ENC_PUB), "-o", cert.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap())
+            .unwrap()
+            .epoch,
+        0
+    );
+}
+
+#[test]
+fn devices_renew_renews_this_machines_certificate_at_the_kept_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let before =
+        hl_identity::DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    let kept = format!(
+        "{{\"{}\": {{\"epoch\": 3}}}}",
+        hl_identity::Fingerprint::of(&before.identity)
+    );
+    std::fs::write(home.join("holder.json"), kept).unwrap();
+    ok(&home, &["devices", "renew"]);
+    let after =
+        hl_identity::DeviceCert::parse(&std::fs::read(home.join("cert.bin")).unwrap()).unwrap();
+    assert_eq!((after.epoch, after.device), (3, before.device));
 }

@@ -402,6 +402,7 @@ fn with_holder(args: &[String], budget: Option<usize>) -> R<()> {
         id: &id,
         args: &a,
         floor: Default::default(),
+        signed_out: Default::default(),
         card: &card,
         card_name: &parsed_card.name,
         policy: &policy,
@@ -471,6 +472,7 @@ struct Holder<'a> {
     id: &'a IdentityKey,
     args: &'a crate::Args,
     floor: std::cell::RefCell<Option<(std::time::Instant, crate::devices::Floor)>>,
+    signed_out: std::cell::RefCell<Vec<hl_identity::PublicKey>>,
     card: &'a [u8],
     card_name: &'a str,
     policy: &'a Policy,
@@ -658,7 +660,17 @@ impl Holder<'_> {
                 return Ok(f.clone());
             }
         }
-        let f = crate::devices::sync(self.args, self.id, &mut |line| ui.tell(line))?;
+        let mut f = crate::devices::sync(self.args, self.id, &mut |line| ui.tell(line))?;
+        // A key a list showed signed out stays so when the next read of
+        // that list fails: what a reset or a revocation ends, it ends for
+        // good.
+        let mut known = self.signed_out.borrow_mut();
+        for k in f.reset_keys.drain(..) {
+            if !known.contains(&k) {
+                known.push(k);
+            }
+        }
+        f.reset_keys = known.clone();
         *self.floor.borrow_mut() = Some((std::time::Instant::now(), f.clone()));
         Ok(f)
     }
@@ -729,13 +741,6 @@ impl Holder<'_> {
                 return Err(e);
             }
         };
-        if floor.reset_keys.contains(&request.device) {
-            self.answer(s, json!({ "id": id_of_request, "denied": "key_reset" }))?;
-            return Err(format!(
-                "refused {}: its key was signed out by a device reset, and it must make a new one",
-                device_fp.short()
-            ));
-        }
         // Answered as a lapsed certificate is: the device enrolls afresh,
         // with a new key (§8).
         if renewal
@@ -748,6 +753,23 @@ impl Holder<'_> {
                  reset"
                     .into(),
             );
+        }
+        // A key the records show signed out, or one this holder
+        // certified below the floor, makes a new one (§8).
+        let certified = match crate::devices::Holder::load(&self.id.public()) {
+            Ok(h) => h.certified_at(&request.device),
+            Err(e) => {
+                self.answer(s, json!({ "id": id_of_request, "denied": "unavailable" }))?;
+                return Err(e);
+            }
+        };
+        if floor.reset_keys.contains(&request.device) || certified.is_some_and(|e| e < floor.epoch)
+        {
+            self.answer(s, json!({ "id": id_of_request, "denied": "key_reset" }))?;
+            return Err(format!(
+                "refused {}: its key was signed out by a device reset, and it must make a new one",
+                device_fp.short()
+            ));
         }
 
         let (mut caps, mut days) = grant(self.policy, request.caps, request.days);
@@ -812,7 +834,14 @@ impl Holder<'_> {
         // that moved the floor past what this request was checked against
         // is a reason to check it again, and a renewal below it is
         // signed out.
-        let mut kept = crate::devices::Holder::load(&self.id.public())?;
+        let unavailable = |e: String| -> R<()> {
+            self.answer(s, json!({ "id": id_of_request, "denied": "unavailable" }))?;
+            Err(e)
+        };
+        let mut kept = match crate::devices::Holder::load(&self.id.public()) {
+            Ok(kept) => kept,
+            Err(e) => return unavailable(e),
+        };
         let moved = kept.epoch();
         if moved > floor.epoch {
             drop(kept);
@@ -833,9 +862,19 @@ impl Holder<'_> {
             ));
         }
         cert.epoch = kept.epoch().max(floor.epoch);
-        let cert_bytes = crate::devices::mint(&cert, self.id)?;
+        let cert_bytes = match crate::devices::mint(&cert, self.id) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                drop(kept);
+                return unavailable(e);
+            }
+        };
         kept.minted(cert.epoch);
-        kept.save()?;
+        kept.certified(&cert.device, cert.epoch);
+        if let Err(e) = kept.save() {
+            drop(kept);
+            return unavailable(e);
+        }
         drop(kept);
         let bundle = Bundle {
             cert: cert_bytes,

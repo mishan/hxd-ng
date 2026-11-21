@@ -67,13 +67,30 @@ fn discover(a: &Args) -> R<Registrar> {
     discover_at(a.one("registrar")?)
 }
 
-/// `--registrar`'s value as the base URL it is reached at.
+/// `--registrar`'s value as the base URL it is reached at, spelled one
+/// way: scheme and host in lowercase, and no default port, so that two
+/// spellings of one origin are one registrar.
 pub(crate) fn base_of(target: &str) -> String {
-    if target.contains("://") {
+    let url = if target.contains("://") {
         target.trim_end_matches('/').to_owned()
     } else {
         format!("https://{target}")
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let mut authority = authority.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => "",
+    };
+    if !default.is_empty() && authority.ends_with(default) {
+        authority.truncate(authority.len() - default.len());
     }
+    format!("{scheme}://{authority}{path}")
 }
 
 pub(crate) fn discover_at(target: &str) -> R<Registrar> {
@@ -774,7 +791,8 @@ pub(crate) fn restore_cmd(args: &[String]) -> R<()> {
     // holds, or it is dead at first use (enrollment §8). Only this
     // registrar is read; the others the card names are read by the next
     // `agent`, `register` or reset.
-    let epoch = crate::devices::floor_at(&reg, &id.public())?;
+    let kept = Holder::load(&id.public())?.epoch();
+    let epoch = crate::devices::floor_at(&reg, &id.public())?.max(kept);
     crate::lay_out(
         &home,
         &id,
@@ -783,9 +801,15 @@ pub(crate) fn restore_cmd(args: &[String]) -> R<()> {
         epoch,
         &a,
     )?;
+    let device = DeviceCert::parse(&read_file(&home.join(crate::CERT_FILE))?)
+        .map_err(|e| format!("the certificate just written: {e}"))?
+        .device;
+    // Locked now the home is there. This machine's own certificate is
+    // not another device's, so it is not counted as minted.
     let mut holder = Holder::load(&id.public())?;
     holder.add_registrar(&reg.base, &reg.host);
     holder.raise(epoch);
+    holder.certified(&device, epoch);
     holder.save()?;
     println!(
         "identity {} restored to {}{}",

@@ -181,12 +181,56 @@ impl Holder {
         match r {
             Some(r) => {
                 let hashes: Vec<String> = r.hashes.iter().map(|h| b64(h)).collect();
+                let targets = e["reset"]["targets"].clone();
                 e["reset"] = json!({ "target": r.target, "hashes": hashes });
+                if targets.is_array() {
+                    e["reset"]["targets"] = targets;
+                }
             }
             None => {
                 e.as_object_mut().unwrap().remove("reset");
             }
         }
+    }
+
+    /// The registrars a reset in progress was started for, so a rerun
+    /// without the same `--registrar` leaves none of them out.
+    fn reset_targets(&self) -> Vec<Target> {
+        self.entry()["reset"]["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| Some((t[0].as_str()?.to_owned(), t[1].as_str().map(str::to_owned))))
+            .collect()
+    }
+
+    fn set_reset_targets(&mut self, targets: &[Target]) {
+        if self.entry()["reset"].is_object() {
+            self.entry_mut()["reset"]["targets"] = json!(targets);
+        }
+    }
+
+    /// The highest epoch this holder certified `device` at.
+    pub(crate) fn certified_at(&self, device: &PublicKey) -> Option<u64> {
+        self.entry()["devices"][crate::hex(device)].as_u64()
+    }
+
+    /// Record that `device` was certified at `epoch`, so that once a reset
+    /// passes it the key is refused (enrollment §8).
+    pub(crate) fn certified(&mut self, device: &PublicKey, epoch: u64) {
+        if self.certified_at(device).is_some_and(|e| e >= epoch) {
+            return;
+        }
+        let e = self.entry_mut();
+        if !e["devices"].is_object() {
+            e["devices"] = json!({});
+        }
+        e["devices"][crate::hex(device)] = json!(epoch);
+    }
+
+    /// Whether there is a `$HLID_HOME` to keep this in.
+    pub(crate) fn has_home(&self) -> bool {
+        self.path.is_some()
     }
 
     pub(crate) fn save(&self) -> R<()> {
@@ -457,9 +501,10 @@ fn post(reg: &Registrar, bytes: &[u8]) -> Answer {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Done,
-    /// Another holder reset meanwhile: read every list again and choose
-    /// the target afresh.
-    Again,
+    /// Another holder reset meanwhile, the registrar answering this
+    /// epoch: read every list again and choose the target afresh, at
+    /// least past it.
+    Again(u64),
     NotDone(String),
 }
 
@@ -511,7 +556,7 @@ pub(crate) fn drive(
                 // One above the target, or another holder's at it, leaves
                 // the devices minted since at that epoch signed in.
                 if e > target || (e == target && !ours) {
-                    return Ok(Outcome::Again);
+                    return Ok(Outcome::Again(e));
                 }
                 if e == target {
                     return Ok(Outcome::Done);
@@ -519,7 +564,7 @@ pub(crate) fn drive(
                 if !ours {
                     // Another holder's below the target, whose `time`
                     // this cannot know without the list.
-                    return Ok(Outcome::Again);
+                    return Ok(Outcome::Again(e));
                 }
                 at = Current {
                     epoch: e,
@@ -566,7 +611,8 @@ pub(crate) fn target(known: u64, minted: u64, pending: Option<&Reset>, held: &[C
 struct Round {
     done: Vec<String>,
     not_done: Vec<String>,
-    again: bool,
+    /// The highest epoch an `Again` answered.
+    again: Option<u64>,
 }
 
 /// Drive each of `bases` in turn. Another holder's reset found at one
@@ -584,8 +630,8 @@ fn round(
         match drive(i)? {
             Outcome::Done => r.done.push(base.to_string()),
             Outcome::NotDone(why) => r.not_done.push(format!("{base}: {why}")),
-            Outcome::Again => {
-                r.again = true;
+            Outcome::Again(e) => {
+                r.again = r.again.max(Some(e));
                 if !causes.iter().any(|c| c == base) {
                     causes.push(base.to_string());
                     break;
@@ -601,6 +647,7 @@ fn round(
 pub(crate) fn devices_cmd(args: &[String]) -> R<()> {
     match args.first().map(String::as_str) {
         Some("reset") => reset_cmd(&args[1..]),
+        Some("renew") => renew_cmd(&args[1..]),
         _ => crate::usage(),
     }
 }
@@ -614,7 +661,18 @@ fn reset_cmd(args: &[String]) -> R<()> {
     let a = parse(args);
     let id = identity(&a)?;
     let mut holder = Holder::load(&id.public())?;
-    let targets = targets(&a, &holder, &id.public());
+    let mut targets = targets(&a, &holder, &id.public());
+    // `--fresh` sets aside a reset in progress, for when another machine
+    // may have certified a device at its epoch since: `minted` is this
+    // holder's alone.
+    let mut pending = holder.reset().filter(|_| !a.has("fresh"));
+    if holder.reset().is_some() {
+        for t in holder.reset_targets() {
+            if !targets.iter().any(|(u, _)| *u == t.0) {
+                targets.push(t);
+            }
+        }
+    }
     if targets.is_empty() {
         return Err(
             "the identity is registered at no registrar this holder knows of; \
@@ -622,11 +680,12 @@ fn reset_cmd(args: &[String]) -> R<()> {
                 .into(),
         );
     }
-    // `--fresh` sets aside a reset in progress, for when another machine
-    // may have certified a device at its epoch since: `minted` is this
-    // holder's alone.
-    let mut pending = holder.reset().filter(|_| !a.has("fresh"));
     let mut causes = Vec::new();
+    // The highest epoch a registrar answered past the target. An answer
+    // is not signed, so it only sends this back to the lists: a target
+    // rises from what they verify, and none is posted while they show
+    // less than was answered.
+    let mut seen = 0;
     for _ in 0..8 {
         let (read, unread) = read_all(&targets, &id.public());
         for why in &unread {
@@ -640,7 +699,15 @@ fn reset_cmd(args: &[String]) -> R<()> {
             );
         }
         let held: Vec<Current> = read.iter().map(|(_, l)| l.current).collect();
-        holder.raise(held.iter().map(|c| c.epoch).max().unwrap_or(0));
+        let listed = held.iter().map(|c| c.epoch).max().unwrap_or(0);
+        if seen > listed {
+            return Err(format!(
+                "a registrar answered epoch {seen}, past what any list read shows ({listed}); \
+                 nothing more was posted. Run `hlid devices reset` again once its list can be \
+                 read"
+            ));
+        }
+        holder.raise(listed);
         let mut reset = Reset {
             target: target(holder.epoch(), holder.minted_at(), pending.as_ref(), &held),
             hashes: pending.take().map(|r| r.hashes).unwrap_or_default(),
@@ -649,6 +716,7 @@ fn reset_cmd(args: &[String]) -> R<()> {
             return Err("the identity has no epoch left to reset to; rotate it instead".into());
         }
         holder.set_reset(Some(&reset));
+        holder.set_reset_targets(&targets);
         holder.save()?;
 
         let bases: Vec<&str> = read.iter().map(|(reg, _)| reg.base.as_str()).collect();
@@ -659,26 +727,35 @@ fn reset_cmd(args: &[String]) -> R<()> {
         } = round(&bases, &mut causes, &mut |i| {
             let (reg, listed) = &read[i];
             let c = listed.current;
-            if c.epoch == reset.target && c.hash.is_some_and(|h| reset.hashes.contains(&h)) {
-                return Ok(Outcome::Done);
+            let outcome =
+                if c.epoch == reset.target && c.hash.is_some_and(|h| reset.hashes.contains(&h)) {
+                    Outcome::Done
+                } else {
+                    drive(
+                        reset.target,
+                        true,
+                        c,
+                        &mut reset,
+                        &id,
+                        &mut |bytes| post(reg, bytes),
+                        &mut |r| {
+                            holder.set_reset(Some(r));
+                            holder.save()
+                        },
+                    )?
+                };
+            // Kept before the next registrar is posted to, so a failure
+            // there leaves this holder minting at the floor this one holds.
+            if outcome == Outcome::Done {
+                holder.raise(reset.target);
+                holder.save()?;
             }
-            drive(
-                reset.target,
-                true,
-                c,
-                &mut reset,
-                &id,
-                &mut |bytes| post(reg, bytes),
-                &mut |r| {
-                    holder.set_reset(Some(r));
-                    holder.save()
-                },
-            )
+            Ok(outcome)
         })?;
-        if !done.is_empty() {
-            holder.raise(reset.target);
-        }
-        if again {
+        if let Some(e) = again {
+            // Equal to the target, it is another holder's record at it;
+            // past it, a reset past it. Either way the lists say which.
+            seen = seen.max(e);
             eprintln!("another holder reset meanwhile; resetting past it");
             pending = holder.reset();
             holder.save()?;
@@ -692,17 +769,24 @@ fn reset_cmd(args: &[String]) -> R<()> {
         for base in &done {
             println!("devices reset to epoch {} at {base}", reset.target);
         }
-        if !done.is_empty() {
-            renew_own(&a, &id, &holder);
-        }
+        let renewed = if done.is_empty() {
+            Ok(())
+        } else {
+            renew_own(&a, &id, &mut holder).map(drop)
+        };
         if complete {
             println!(
-                "every device certified below epoch {} is signed out wherever these \
-                 registrars' records are read; enroll each one you still use again, with a \
-                 new device key",
+                "these registrars publish epoch {}: a server that reads their records \
+                 refuses every device certified below it. Enroll each one you still use \
+                 again, with a new device key",
                 reset.target
             );
-            return Ok(());
+            return renewed.map_err(|e| {
+                format!("{e}; the reset is done, and `hlid devices renew` renews it")
+            });
+        }
+        if let Err(e) = renewed {
+            eprintln!("hlid: {e}; `hlid devices renew` renews it");
         }
         return Err(format!(
             "the reset to epoch {} is not done at {}; run `hlid devices reset` again to \
@@ -721,18 +805,30 @@ fn reset_cmd(args: &[String]) -> R<()> {
 
 /// This machine's own certificate again at the new floor, with the same
 /// key: the reset is not about the machine holding the identity key.
-fn renew_own(a: &Args, id: &IdentityKey, holder: &Holder) {
+/// Nothing to renew is not a failure; one that could not be written is.
+fn renew_own(a: &Args, id: &IdentityKey, holder: &mut Holder) -> R<Renewed> {
     let Some(path) = a.file_opt("cert", crate::CERT_FILE) else {
-        return;
+        return Ok(Renewed::Nothing("there is no cert.bin".into()));
     };
-    let Ok(old) = std::fs::read(&path)
-        .map_err(|_| ())
-        .and_then(|b| DeviceCert::parse(&b).map_err(|_| ()))
-    else {
-        return;
+    let old = match std::fs::read(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| DeviceCert::parse(&b).map_err(|e| e.to_string()))
+    {
+        Ok(old) if old.identity == id.public() => old,
+        Ok(_) => {
+            return Ok(Renewed::Nothing(format!(
+                "{} is another identity's",
+                path.display()
+            )))
+        }
+        Err(e) => return Ok(Renewed::Nothing(format!("{}: {e}", path.display()))),
     };
-    if old.identity != id.public() || old.epoch >= holder.epoch() {
-        return;
+    if old.epoch >= holder.epoch() {
+        return Ok(Renewed::Nothing(format!(
+            "{} is at epoch {} already",
+            path.display(),
+            old.epoch
+        )));
     }
     let renewed = DeviceCert::for_keys(
         id,
@@ -752,10 +848,32 @@ fn renew_own(a: &Args, id: &IdentityKey, holder: &Holder) {
     .and_then(|bytes| {
         hl_private_file::replace(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
     });
-    match renewed {
-        Ok(()) => println!("{} renewed at epoch {}", path.display(), holder.epoch()),
-        Err(e) => eprintln!("hlid: {} was not renewed: {e}", path.display()),
+    renewed.map_err(|e| format!("{} was not renewed: {e}", path.display()))?;
+    println!("{} renewed at epoch {}", path.display(), holder.epoch());
+    holder.certified(&old.device, holder.epoch());
+    holder.save()?;
+    Ok(Renewed::Done)
+}
+
+/// What [`renew_own`] did.
+enum Renewed {
+    Done,
+    /// Why there was nothing to do.
+    Nothing(String),
+}
+
+/// `hlid devices renew`: this machine's certificate at the floor the
+/// registrars hold, read first, with no reset, for when a reset's own
+/// renewal of it failed.
+fn renew_cmd(args: &[String]) -> R<()> {
+    let a = parse(args);
+    let id = identity(&a)?;
+    sync(&a, &id, &mut |line| eprintln!("hlid: {line}"))?;
+    let mut holder = Holder::load(&id.public())?;
+    if let Renewed::Nothing(why) = renew_own(&a, &id, &mut holder)? {
+        println!("nothing renewed: {why}");
     }
+    Ok(())
 }
 
 /// Sign a certificate, checked as every reader will check it, and warn
@@ -833,14 +951,35 @@ pub(crate) fn sync(a: &Args, id: &IdentityKey, tell: &mut dyn FnMut(&str)) -> R<
         if Holder::load(&id.public())?.epoch() > floor.epoch {
             break;
         }
+        // A post that brings a registrar to a reset in progress is that
+        // reset's own, so it is journaled with it, before it is sent: a
+        // rerun then knows the record for this holder's.
+        let mut posts = Reset {
+            target: floor.epoch,
+            hashes: Vec::new(),
+        };
         let outcome = drive(
             floor.epoch,
             false,
             l.current,
-            &mut Reset::default(),
+            &mut posts,
             id,
             &mut |bytes| post(reg, bytes),
-            &mut |_| Ok(()),
+            &mut |r| {
+                let mut holder = Holder::load(&id.public())?;
+                match holder.reset() {
+                    Some(mut pending) if pending.target == r.target => {
+                        for h in &r.hashes {
+                            if !pending.hashes.contains(h) {
+                                pending.hashes.push(*h);
+                            }
+                        }
+                        holder.set_reset(Some(&pending));
+                        holder.save()
+                    }
+                    _ => Ok(()),
+                }
+            },
         )?;
         match outcome {
             Outcome::NotDone(why) => tell(&format!(
@@ -851,7 +990,7 @@ pub(crate) fn sync(a: &Args, id: &IdentityKey, tell: &mut dyn FnMut(&str)) -> R<
                 "posted the device epoch {} to {}",
                 floor.epoch, reg.base
             )),
-            Outcome::Again => tell(&format!(
+            Outcome::Again(_) => tell(&format!(
                 "{} answered with a device epoch below {} that this holder did not post, \
                  and still lacks {}",
                 reg.base, floor.epoch, floor.epoch
@@ -958,10 +1097,10 @@ mod tests {
         // Another holder's reset to the same epoch first.
         let mut desk = Desk::at(4, 0);
         let mut reset = Reset::default();
-        assert_eq!(run(&mut desk, 4, &mut reset), Outcome::Again);
+        assert_eq!(run(&mut desk, 4, &mut reset), Outcome::Again(4));
         // And past it.
         let mut desk = Desk::at(9, 0);
-        assert_eq!(run(&mut desk, 5, &mut reset), Outcome::Again);
+        assert_eq!(run(&mut desk, 5, &mut reset), Outcome::Again(9));
         assert!(desk.posted.is_empty());
     }
 
@@ -1000,13 +1139,25 @@ mod tests {
                         c_posted = true;
                         Outcome::Done
                     }
-                    _ => Outcome::Again,
+                    _ => Outcome::Again(1),
                 })
             })
             .unwrap();
-            assert!(r.again);
+            assert_eq!(r.again, Some(1));
         }
         assert!(c_posted);
+    }
+
+    #[test]
+    fn spellings_of_one_registrar_are_one_target() {
+        for (a, b) in [
+            ("https://R.example:443/", "r.example"),
+            ("http://r.example:80", "http://r.example"),
+            ("HTTP://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+        ] {
+            assert_eq!(base_of(a), base_of(b), "{a} and {b}");
+        }
+        assert_ne!(base_of("https://r.example:8443"), base_of("r.example"));
     }
 
     #[test]

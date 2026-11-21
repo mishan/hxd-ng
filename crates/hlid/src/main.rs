@@ -34,7 +34,8 @@
 //! hlid rotate  --registrar HOST --to SUCCESSOR_KEY [--next-key FILE]
 //!              hand over, committing the successor to a key of its own
 //! hlid devices reset [--registrar HOST]... [--fresh]
-//!              sign out every device certified so far, at every registrar
+//!              publish a device epoch that signs out every device certified so far
+//! hlid devices renew this machine's certificate at the epoch kept
 //! hlid backup  --registrar HOST [--recovery | --delete [--recovery]]
 //!              the identity key sealed under a passphrase or a recovery code
 //! hlid restore --registrar HOST --handle S [--recovery]
@@ -126,6 +127,7 @@ pub(crate) fn usage() -> ! {
         "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
         "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--next-key FILE] [--identity K]\n",
         "  hlid devices reset [--registrar HOST|URL]... [--fresh] [--identity K] [--cert FILE]\n",
+        "  hlid devices renew [--identity K] [--cert FILE]\n",
         "  hlid backup --registrar HOST|URL [--recovery] [--delete] [--identity K] [--password-file F | --password-stdin]\n",
         "  hlid restore --registrar HOST|URL --handle S [--recovery] [--name S] (--password-file F | --password-stdin)\n",
         "\n",
@@ -169,11 +171,13 @@ pub(crate) fn usage() -> ! {
         "key is reused. `revoke` publishes a device's revocation, or with\n",
         "--identity-revoke the identity's own, which is final.\n",
         "\n",
-        "`hlid devices reset` signs out every device the identity has certified,\n",
-        "whether or not this machine remembers it, at every registrar it is\n",
-        "registered at and each --registrar, and renews this machine's own\n",
-        "certificate. Certificates are then minted at the new device epoch, kept\n",
-        "in $HLID_HOME/holder.json. A reset that could not reach every registrar\n",
+        "`hlid devices reset` publishes a device epoch at every registrar the\n",
+        "identity is registered at and each --registrar: a server that reads their\n",
+        "records refuses every device certified before it, whether or not this\n",
+        "machine remembers it. It renews this machine's own certificate, which\n",
+        "`hlid devices renew` also does alone. Certificates are then minted at\n",
+        "the new device epoch, kept in $HLID_HOME/holder.json; with no $HLID_HOME\n",
+        "or $HOME, `hlid cert` mints at epoch 0. A reset that could not reach every registrar\n",
         "is finished by running it again, unless this holder certified a device at\n",
         "its epoch meanwhile: then the rerun resets past it. A device certified at\n",
         "it on another machine is not known here, so when in doubt, --fresh starts\n",
@@ -707,11 +711,21 @@ fn make_cert(args: &[String]) -> R<()> {
         .map_err(|e| format!("--days: {e}"))?;
     c.caps = parse_caps(a.opt("caps"))?;
     c.name = a.opt("name").map(str::to_owned);
+    // With no $HLID_HOME or $HOME there is no epoch kept, so this mints
+    // at 0, as before device epochs, and records nothing.
     let mut holder = devices::Holder::load(&id.public())?;
     c.epoch = holder.epoch();
     let bytes = devices::mint(&c, &id)?;
-    holder.minted(c.epoch);
-    holder.save()?;
+    if holder.has_home() {
+        holder.minted(c.epoch);
+        holder.certified(&c.device, c.epoch);
+        holder.save()?;
+    } else {
+        eprintln!(
+            "hlid: no $HLID_HOME or $HOME to keep the device epoch in, so this is minted at \
+             epoch 0, which any device reset signs out"
+        );
+    }
 
     // `--bundle` writes the §5.4 object instead of a bare certificate:
     // the same bytes the enrollment mailbox carries, so a browser handed
