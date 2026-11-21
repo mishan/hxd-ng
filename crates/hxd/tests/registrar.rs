@@ -2980,6 +2980,51 @@ async fn a_token_below_a_floor_fetched_at_auth_does_not_outlive_the_next_sweep()
 }
 
 #[tokio::test]
+async fn a_floor_fetched_beside_a_revoked_device_is_installed_and_spares_one_renewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let (v, _, identity, core) =
+        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
+    let (phone, tablet, laptop) = (dev(101), dev(103), dev(102));
+    let card = attested(&r, &alice, "alice").await;
+    let token = auth_at(v, &alice, &phone, &card).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    core.set_revocations(hxd_core::Revocations {
+        devices: [hl_identity::Fingerprint::of(&tablet.public()).0].into(),
+        ..Default::default()
+    });
+    post_reset(&r, &alice, 1).await;
+    next_list().await;
+
+    // A device revoked here is told so, and the floor its auth fetched
+    // still goes into force.
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &tablet, &card).await),
+        (403, json!("revoked"), Value::Null)
+    );
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "a token below the floor no longer redeems"
+    );
+
+    // A device renewed at the floor keeps its place on file when its old
+    // certificate is refused.
+    let renewed = auth_cert(v, &laptop, &card, &cert_in(&alice, &laptop, 1), json!({})).await;
+    assert_eq!(renewed.status, 200);
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &laptop, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+    assert!(identity.identity_for_device(&laptop.public()).is_some());
+}
+
+#[tokio::test]
 async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
@@ -2989,7 +3034,30 @@ async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
         IdentityKey::from_seed(&[1; 32]),
         IdentityKey::from_seed(&[2; 32]),
     );
-    let card = attested_committing(&r, &old, "alice", &new, true).await;
+    let mut req = request(&old, "alice");
+    req.successor = Some(commitment(&new));
+    let reply = register(&r, req, &old).await.json();
+    let att = unb64(reply["attestation"].as_str().unwrap());
+    let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+    let committing = |atts| {
+        let mut card = Card::new(&old, "alice", now());
+        card.successor = Some(commitment(&new));
+        card.sign(&old, atts).unwrap()
+    };
+    let card = committing(vec![att.clone()]);
+    // Beside an attestation from a registrar banned here.
+    let key = hl_identity::ServerKey::from_seed(&[9; 32]);
+    let other = Attestation {
+        identity: old.public(),
+        registrar: "banned.example".into(),
+        registrar_key: key.public(),
+        handle: "alice".into(),
+        registered: now() - 120,
+        issued: now() - 120,
+        expires: now() + 3600,
+        level: None,
+    };
+    let banned = committing(vec![att, other.signed_value(&key)]);
     post_reset(&r, &old, 1).await;
     let posted = post(
         &r,
@@ -2998,9 +3066,20 @@ async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
     )
     .await;
     assert_eq!(posted.json()["published"], true);
-    let v = verifier(&there, &r, Trust::Key, &format!("http://{}", r.ng), "")
-        .await
-        .0;
+    let v = verifier(
+        &there,
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "banned_registrars = [\"banned.example\"]",
+    )
+    .await
+    .0;
+    // Refused for the banned registrar, the floor is told first.
+    assert_eq!(
+        refusal(&auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &banned).await),
+        (403, json!("revoked"), json!(1))
+    );
     let reply = auth_at(v, &old, &DeviceKey::from_seed(&[101; 32]), &card).await;
     assert_eq!(
         (

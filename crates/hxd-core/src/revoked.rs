@@ -389,10 +389,22 @@ impl Core {
     /// is that high already. The sweep's next install replaces it with
     /// what the lists it reads say. Called off the reactor.
     pub fn raise_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
+        let below = |refused: &Refused| {
+            refused
+                .published
+                .floors
+                .get(&identity)
+                .copied()
+                .unwrap_or(0)
+                < floor
+        };
+        // Every identity login asks: most are answered under the read lock.
+        if floor == 0 || !below(&self.revoked.read().unwrap()) {
+            return None;
+        }
         {
             let mut refused = self.revoked.write().unwrap();
-            let held = refused.published.floors.get(&identity).copied();
-            if held.unwrap_or(0) >= floor {
+            if !below(&refused) {
                 return None;
             }
             refused.published.floors.insert(identity, floor);

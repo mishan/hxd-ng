@@ -1494,8 +1494,31 @@ impl IdentityState {
         }
         self.finish_rotations(Some(&fingerprint));
         let device = Fingerprint::of(&cert.device);
-        // A freeze, or a rotation with no anchors to keep it, is refused
-        // too, but by the records below, which say which it is.
+        // The floor, the higher of the one installed and the one the lists
+        // just fetched publish, decided before any policy below. One the
+        // lists raise is installed now, as the sweep would install it: the
+        // sessions and tokens below it go before the sweep comes round,
+        // whatever this device is told.
+        let now = self.clock.unix();
+        let found = self.registrars.as_ref().map(|r| records_of(r, card, now));
+        let (listed, named) = found
+            .as_ref()
+            .map_or((0, Named::Nothing), |f| floor_of(f, cert));
+        if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
+            for (uid, nick) in ended {
+                info!(uid, nick = %nick, "session ended: below a floor fetched at auth");
+            }
+            // Dropped here too: an identity with no session the sweep
+            // keeps lists for is installed without its floor next time.
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.tokens.retain(|_, (ident, _)| {
+                ident.fingerprint != fingerprint || ident.device_epoch >= listed
+            });
+        }
+        // Read after the raise, so a floor another admission raised
+        // meanwhile counts too. A freeze, or a rotation with no anchors to
+        // keep it, is refused too, but by the records below, which say
+        // which it is.
         let installed = match self.core.key_refusal(&hxd_core::CertRef {
             identity: fingerprint.0,
             device: device.0,
@@ -1514,60 +1537,44 @@ impl IdentityState {
             Some(hxd_core::KeyRefusal::BelowFloor(floor)) => floor,
             Some(hxd_core::KeyRefusal::Unrevoked) | None => 0,
         };
-
-        // The floor, the higher of the one installed and the one the lists
-        // just fetched publish, decided before any policy below. One the
-        // lists raise is installed now, as the sweep would install it: the
-        // sessions and tokens below it go before the sweep comes round.
-        let now = self.clock.unix();
-        let found = self.registrars.as_ref().map(|r| records_of(r, card, now));
-        let (listed, named) = found
-            .as_ref()
-            .map_or((0, Named::Nothing), |f| floor_of(f, cert));
-        if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
-            for (uid, nick) in ended {
-                info!(uid, nick = %nick, "session ended: below a floor fetched at auth");
-            }
-            // Dropped here too: an identity with no session the sweep
-            // keeps lists for is installed without its floor next time.
-            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.tokens.retain(|_, (ident, _)| {
-                ident.fingerprint != fingerprint || ident.device_epoch >= listed
-            });
-        }
         let floor = installed.max(listed);
+        // A listed rotation is `apply_records`' to accept, which then
+        // meets the floor; but the banned-registrar refusal below comes
+        // first, and is told only after the floor.
+        let banned = card
+            .attestations
+            .iter()
+            .any(|a| self.cfg.banned_registrars.contains(&a.registrar));
         let refused = match named {
             Named::Revoked => Some(AuthRefused::Revoked),
-            Named::Rotated => None,
-            Named::Nothing => cert
+            Named::Rotated if !banned => None,
+            Named::Rotated | Named::Nothing => cert
                 .check_floor(floor)
                 .is_err()
                 .then_some(AuthRefused::BelowFloor { floor }),
         };
-        if let Some(refused) = refused {
-            match refused {
-                AuthRefused::Revoked => {
-                    info!(fingerprint = %fingerprint.short(), "identity auth refused: revoked at its registrar")
-                }
-                _ => {
-                    info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor")
-                }
+        match refused {
+            Some(AuthRefused::Revoked) => {
+                info!(fingerprint = %fingerprint.short(), "identity auth refused: revoked at its registrar");
+                let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                t.devices.remove(&cert.device);
+                return Err(AuthRefused::Revoked);
             }
-            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.devices.remove(&cert.device);
-            return Err(refused);
+            Some(refused) => {
+                info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
+                self.forget_below(&cert.device, floor);
+                return Err(refused);
+            }
+            None => {}
         }
 
         // A banned registrar refuses every identity that carries its
         // attestation, verified or not, and whatever else the card
         // carries: a card is its holder's own signature, so what is on it
         // its holder chose, and nobody can put it on another's. A
-        // rotation listed for it is answered `denied` here too.
-        if card
-            .attestations
-            .iter()
-            .any(|a| self.cfg.banned_registrars.contains(&a.registrar))
-        {
+        // rotation listed for it, past the floor above, is answered
+        // `denied` here too.
+        if banned {
             info!(fingerprint = %fingerprint.short(), "identity auth refused: a banned registrar's attestation");
             return Err(AuthRefused::Denied);
         }
@@ -1928,8 +1935,7 @@ impl IdentityState {
         }
         if cert.check_floor(floor).is_err() {
             info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
-            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.devices.remove(&cert.device);
+            self.forget_below(&cert.device, floor);
             return Err(AuthRefused::BelowFloor { floor });
         }
         if stale_denies {
@@ -1950,6 +1956,20 @@ impl IdentityState {
             }
         }
         Ok((!unattested).then_some(attestations))
+    }
+
+    /// Forget `device` on file if the certificate held for it is below
+    /// `floor`: one renewed at the floor since is kept.
+    fn forget_below(&self, device: &PublicKey, floor: u64) {
+        let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let below = t.devices.get(device).is_some_and(|rec| {
+            hl_identity::DeviceCert::parse(&rec.cert)
+                .ok()
+                .is_none_or(|c| c.check_floor(floor).is_err())
+        });
+        if below {
+            t.devices.remove(device);
+        }
     }
 
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
