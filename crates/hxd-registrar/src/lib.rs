@@ -355,7 +355,7 @@ pub enum Posted {
         until: u64,
     },
     /// A device epoch, whether it moved the floor or not: where the
-    /// identity stands here, its current record's `epoch` and digest.
+    /// identity stands here, its current record's `seq`, `epoch` and digest.
     DeviceEpoch {
         seq: u64,
         epoch: u64,
@@ -1014,7 +1014,7 @@ impl Registrar {
                         StoreError::new("a device epoch is held with no current one")
                     })?;
                     return Ok(Posted::DeviceEpoch {
-                        seq,
+                        seq: f.seq,
                         epoch: f.epoch,
                         hash: f.hash,
                     });

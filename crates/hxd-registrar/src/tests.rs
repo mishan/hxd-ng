@@ -2236,15 +2236,16 @@ fn a_retry_of_either_kind_is_answered_where_the_identity_stands() {
     let r = registrar();
     register(&r, &alice, "alice", T).unwrap();
     let one = reset(&alice, 1, T);
-    let Posted::DeviceEpoch { seq: first, .. } = r.post_record(&one, addr(1), T).unwrap() else {
+    r.post_record(&one, addr(1), T).unwrap();
+    let three = reset(&alice, 3, T + 1);
+    let Posted::DeviceEpoch { seq: current, .. } = r.post_record(&three, addr(1), T + 1).unwrap()
+    else {
         panic!("published")
     };
-    let three = reset(&alice, 3, T + 1);
-    r.post_record(&three, addr(1), T + 1).unwrap();
     assert_eq!(
         r.post_record(&one, addr(1), T + 2),
         Ok(Posted::DeviceEpoch {
-            seq: first,
+            seq: current,
             epoch: 3,
             hash: hash(&three),
         })
