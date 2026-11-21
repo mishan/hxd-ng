@@ -824,8 +824,9 @@ record (0 for none):
 
 1. the record parses and verifies, and a `time` in the future past the
    skew tolerance is refused, as for every record;
-2. the exact bytes already held are answered with their `seq` and
-   `"epoch": cur`, which may be higher than the one posted;
+2. the exact bytes already held are answered with the current
+   record's `seq` and `"epoch": cur`, which may be higher than the one
+   posted, so the answer names one record;
 3. `not_registered` and `frozen`, as for every record;
 4. an `epoch` at most `cur` is not a failure, and nothing is stored:
    `{ "seq": <the current record's seq>, "published": true, "epoch": cur }`.
