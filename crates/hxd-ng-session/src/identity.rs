@@ -594,6 +594,15 @@ fn records_of(
     registrars.lookup(&card.identity, &hosts, now)
 }
 
+/// `cert` as the core's lists judge it.
+fn cert_ref(cert: &hl_identity::DeviceCert) -> hxd_core::CertRef {
+    hxd_core::CertRef {
+        identity: Fingerprint::of(&cert.identity).0,
+        device: Fingerprint::of(&cert.device).0,
+        epoch: cert.epoch,
+    }
+}
+
 /// What the lists say of a certificate besides its floor, which is said
 /// in the floor's place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1006,7 +1015,7 @@ impl IdentityState {
                 {
                     return Err(AuthRefused::Banned);
                 }
-                match self.link_exclusive(&account.login, &fingerprint)? {
+                match self.link_exclusive(&account.login, &fingerprint, &cert_ref(&v.cert))? {
                     LinkOutcome::Linked(a) => {
                         info!(login = %a.login, fingerprint = %fingerprint.short(), "identity linked by device proof");
                         a
@@ -1266,7 +1275,7 @@ impl IdentityState {
                 // One call: the backend reads, decides and writes under
                 // its own lock, so two concurrent auths by this identity
                 // can't both conclude "not linked yet".
-                match self.link_exclusive(&account.login, &fingerprint)? {
+                match self.link_exclusive(&account.login, &fingerprint, &cert_ref(&cert))? {
                     LinkOutcome::Linked(a) => {
                         info!(login = %a.login, fingerprint = %fingerprint.short(), "identity linked at auth");
                         linked = Some(a);
@@ -1519,11 +1528,7 @@ impl IdentityState {
         // meanwhile counts too. A freeze, or a rotation with no anchors to
         // keep it, is refused too, but by the records below, which say
         // which it is.
-        let installed = match self.core.key_refusal(&hxd_core::CertRef {
-            identity: fingerprint.0,
-            device: device.0,
-            epoch: cert.epoch,
-        }) {
+        let installed = match self.core.key_refusal(&cert_ref(cert)) {
             Some(hxd_core::KeyRefusal::Revoked) => {
                 debug!(
                     fingerprint = %fingerprint.short(),
@@ -1562,7 +1567,7 @@ impl IdentityState {
             }
             Some(refused) => {
                 info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
-                self.forget_below(&cert.device, floor);
+                self.forget_below(cert, floor);
                 return Err(refused);
             }
             None => {}
@@ -1691,7 +1696,23 @@ impl IdentityState {
     /// gains a fingerprint. Called here rather than at each of the three
     /// link sites, so there is one place to forget it and it isn't
     /// forgotten.
-    fn link_exclusive(&self, login: &str, fp: &Fingerprint) -> Result<LinkOutcome, AuthRefused> {
+    ///
+    /// The key is asked again first, as close to the write as there is: a
+    /// revocation or a floor installed since it was admitted links nothing.
+    fn link_exclusive(
+        &self,
+        login: &str,
+        fp: &Fingerprint,
+        cert: &hxd_core::CertRef,
+    ) -> Result<LinkOutcome, AuthRefused> {
+        match self.core.key_refusal(cert) {
+            Some(hxd_core::KeyRefusal::Revoked) => return Err(AuthRefused::Revoked),
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => {
+                return Err(AuthRefused::BelowFloor { floor })
+            }
+            Some(hxd_core::KeyRefusal::Unrevoked) => return Err(AuthRefused::Denied),
+            None => {}
+        }
         let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
             tracing::warn!("link write failed: {e}");
             AuthRefused::Backend
@@ -1773,7 +1794,7 @@ impl IdentityState {
         {
             return Err(AuthRefused::Banned);
         }
-        match self.link_exclusive(&account.login, &ident.fingerprint)? {
+        match self.link_exclusive(&account.login, &ident.fingerprint, &ident.cert())? {
             LinkOutcome::Linked(a) => {
                 info!(login = %a.login, fingerprint = %ident.fingerprint.short(), "identity linked");
                 Ok(a)
@@ -1935,7 +1956,7 @@ impl IdentityState {
         }
         if cert.check_floor(floor).is_err() {
             info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
-            self.forget_below(&cert.device, floor);
+            self.forget_below(cert, floor);
             return Err(AuthRefused::BelowFloor { floor });
         }
         if stale_denies {
@@ -1958,14 +1979,17 @@ impl IdentityState {
         Ok((!unattested).then_some(attestations))
     }
 
-    /// Forget `device` on file if the certificate held for it is below
-    /// `floor`: one renewed at the floor since is kept.
-    fn forget_below(&self, device: &PublicKey, floor: u64) {
+    /// Forget `cert`'s device on file if the certificate held for it is
+    /// of the same identity and below `floor`: one renewed at the floor
+    /// since, or another identity's for the same key, is kept.
+    fn forget_below(&self, cert: &hl_identity::DeviceCert, floor: u64) {
+        let device = &cert.device;
         let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let below = t.devices.get(device).is_some_and(|rec| {
-            hl_identity::DeviceCert::parse(&rec.cert)
-                .ok()
-                .is_none_or(|c| c.check_floor(floor).is_err())
+            rec.identity == cert.identity
+                && hl_identity::DeviceCert::parse(&rec.cert)
+                    .ok()
+                    .is_none_or(|c| c.check_floor(floor).is_err())
         });
         if below {
             t.devices.remove(device);

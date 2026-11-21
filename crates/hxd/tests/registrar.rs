@@ -3013,6 +3013,18 @@ async fn a_floor_fetched_beside_a_revoked_device_is_installed_and_spares_one_ren
         "a token below the floor no longer redeems"
     );
 
+    // Another identity's certificate for the same key, on file, is not
+    // hers to forget.
+    let bob = IdentityKey::from_seed(&[2; 32]);
+    let shared = dev(105);
+    assert_eq!(auth_at(v, &bob, &shared, &bare(&bob)).await.status, 200);
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &shared, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+    let on_file = identity.identity_for_device(&shared.public()).unwrap();
+    assert_eq!(on_file.identity, bob.public());
+
     // A device renewed at the floor keeps its place on file when its old
     // certificate is refused.
     let renewed = auth_cert(v, &laptop, &card, &cert_in(&alice, &laptop, 1), json!({})).await;
