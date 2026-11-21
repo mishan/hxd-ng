@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use crate::identity::{AuthRefused, Outcome, TransportIdentity};
 use crate::proto::{
     b64url, blocked_json, event_json, history_line_json, parse_streams, participants_json,
-    reply_err, reply_err_account, reply_err_banned, reply_err_retry, reply_ok,
+    reply_err, reply_err_account, reply_err_banned, reply_err_retry, reply_err_revoked, reply_ok,
     reply_ok_with_roster, stored_msg_json, user_json, video_limits_json, video_reply_err,
     voice_reply_err, BlockParams, ChatParams, HistoryParams, InboxParams, LoginParams, MsgParams,
     MsgReadParams, NickParams, ReqEnvelope, ResumeParams, Signs, SignsParams, VideoStartParams,
@@ -898,11 +898,8 @@ async fn handle_login(
     // A key refused after this socket authenticated (`crate::identity`
     // refuses it at auth; this is the socket that got in first). `attach`
     // refuses it too, so asking here only buys the right error.
-    let refused = attach
-        .transport
-        .identity
-        .as_ref()
-        .and_then(|t| ctx.core.key_refusal(&t.fingerprint, &t.device));
+    let cert = attach.transport.identity.as_ref().map(|t| t.cert());
+    let refused = cert.and_then(|c| ctx.core.key_refusal(&c));
     let attach_friendships = attach.transport.friendships;
     let attach_guest_identities = attach.transport.guest_identities;
     let replies = attach.transport.replies;
@@ -920,14 +917,18 @@ async fn handle_login(
         ctx.core.attach(attach)
     };
     let Some((uid, events)) = attached else {
-        let (code, text) = match refused {
-            Some(hxd_core::KeyRefusal::Revoked) => {
-                ("revoked", "This key is revoked on this server.")
+        // Asked again: a list installed since the first asking refuses
+        // the attach too.
+        let refused = refused.or_else(|| cert.and_then(|c| ctx.core.key_refusal(&c)));
+        let reply = match refused {
+            Some(hxd_core::KeyRefusal::Revoked) => reply_err_revoked(req.id, None),
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => reply_err_revoked(req.id, Some(floor)),
+            Some(hxd_core::KeyRefusal::Unrevoked) => {
+                reply_err(req.id, "denied", "This key is not admitted here.")
             }
-            Some(hxd_core::KeyRefusal::Unrevoked) => ("denied", "This key is not admitted here."),
-            None => ("server_full", "Server full."),
+            None => reply_err(req.id, "server_full", "Server full."),
         };
-        let _ = send_frame(ws_tx, Message::Text(reply_err(req.id, code, text))).await;
+        let _ = send_frame(ws_tx, Message::Text(reply)).await;
         return None;
     };
     // Ended, not detached, until the client has its token: a session
@@ -1297,9 +1298,8 @@ fn resume_gone(id: u64, ended: Option<hxd_core::EndedBy>) -> String {
             "This device was ended by another of your devices.",
         ),
         Some(hxd_core::EndedBy::Kicked) => reply_err(id, "kicked", "You were disconnected."),
-        Some(hxd_core::EndedBy::Revoked) => {
-            reply_err(id, "revoked", "This key is revoked on this server.")
-        }
+        Some(hxd_core::EndedBy::Revoked) => reply_err_revoked(id, None),
+        Some(hxd_core::EndedBy::BelowFloor(floor)) => reply_err_revoked(id, Some(floor)),
         Some(hxd_core::EndedBy::Banned(hit)) => reply_err_banned(id, &hit),
         None => reply_err(id, "session_expired", "Session expired; log in again."),
     }

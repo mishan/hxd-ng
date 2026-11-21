@@ -148,6 +148,7 @@ fn session(
                     signs: false,
                     can_sign: false,
                     device_expires: expires,
+                    device_epoch: 0,
                     sealed: None,
                     device_cert: Some(Arc::new(cert.clone())),
                 }),
@@ -856,7 +857,12 @@ fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
                 ..Default::default()
             })
         });
-        while !s.core.is_revoked(&fp(&alice), &device) {
+        let cert = crate::CertRef {
+            identity: fp(&alice),
+            device,
+            epoch: 0,
+        };
+        while !s.core.refuses(&cert) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         drop(writing);

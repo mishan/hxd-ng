@@ -627,10 +627,10 @@ impl Registrars {
 
     /// What the held lists of `identities` (fingerprints) refuse, as one
     /// list: each identity revoked, each frozen when `frozen_refuses`
-    /// (refused, not revoked), and each device an identity revoked, as
-    /// that identity's; and, apart, the rotations away from them, for the
-    /// caller to accept or not, and the identities whose lists could not
-    /// be read.
+    /// (refused, not revoked), each device an identity revoked, as that
+    /// identity's, and each identity's device epoch floor; and, apart,
+    /// the rotations away from them, for the caller to accept or not, and
+    /// the identities whose lists could not be read.
     /// Reads the store and verifies: called off the reactor.
     pub fn refused(
         &self,
@@ -659,6 +659,10 @@ impl Registrars {
                     }
                     Record::Freeze(f) => {
                         frozen.insert(f.registrar, f.frozen);
+                    }
+                    Record::DeviceEpoch(e) => {
+                        let floor = refused.floors.entry(fp.0).or_default();
+                        *floor = (*floor).max(e.epoch);
                     }
                     Record::Rotate(r) if Fingerprint::of(&r.identity) == *fp => {
                         let to = Fingerprint::of(&r.successor);

@@ -608,6 +608,19 @@ pub fn reply_err(id: u64, code: &str, text: &str) -> String {
     json!({ "reply": id, "error": { "code": code, "text": text } }).to_string()
 }
 
+/// A login or resume refused as revoked, with the floor as `epoch` where
+/// the certificate was issued below it (§6.1).
+pub fn reply_err_revoked(id: u64, floor: Option<u64>) -> String {
+    let mut reply = json!({ "reply": id, "error": {
+        "code": "revoked",
+        "text": "This key is revoked on this server.",
+    } });
+    if let Some(floor) = floor {
+        reply["error"]["epoch"] = json!(floor);
+    }
+    reply.to_string()
+}
+
 /// A login refused by a ban: `banned`, with the ban's reason and when it
 /// runs out, if it does (`docs/moderation.md` §3.5).
 pub fn reply_err_banned(id: u64, hit: &hxd_core::ban::BanHit) -> String {
@@ -1449,6 +1462,7 @@ mod tests {
                     signs: false,
                     can_sign: false,
                     device_expires: u64::MAX,
+                    device_epoch: 0,
                     sealed: None,
                     device_cert: None,
                 }),

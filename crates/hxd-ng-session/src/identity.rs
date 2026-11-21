@@ -200,6 +200,8 @@ pub struct TransportIdentity {
     /// stops buzzing without anyone remembering to unregister it
     /// (push-notifications.md §5.1).
     pub device_expires: u64,
+    /// The device epoch that certificate was issued in (§3.3).
+    pub device_epoch: u64,
     /// The certificate as it was proved, and its `device_enc` key: what a
     /// sealed message to this device is sealed to
     /// (`docs/e2e-messages.md` §4.2).
@@ -228,6 +230,15 @@ impl TransportIdentity {
     pub fn may_message(&self) -> bool {
         self.allows(hl_identity::caps::MESSAGE)
     }
+
+    /// The certificate the socket proved, as the lists judge it.
+    pub fn cert(&self) -> hxd_core::CertRef {
+        hxd_core::CertRef {
+            identity: self.fingerprint.0,
+            device: Fingerprint::of(&self.device).0,
+            epoch: self.device_epoch,
+        }
+    }
 }
 
 impl TransportIdentity {
@@ -241,6 +252,7 @@ impl TransportIdentity {
             signs: false,
             can_sign: false,
             device_expires: self.device_expires,
+            device_epoch: self.device_epoch,
             sealed: None,
             device_cert: (self.may_message() && self.device_cert.len() <= 512)
                 .then(|| std::sync::Arc::new(self.device_cert.clone())),
@@ -274,6 +286,12 @@ pub enum AuthRefused {
     BadCert,
     BadProof,
     Revoked,
+    /// The device certificate was issued below its identity's device
+    /// epoch floor, `floor` (`identity-registrar.md` §7.3): revoked by a
+    /// reset, which the client is told so that it can say so.
+    BelowFloor {
+        floor: u64,
+    },
     Denied,
     CardTooLarge,
     UnknownChallenge,
@@ -319,7 +337,7 @@ impl AuthRefused {
             AuthRefused::BadCard => "bad_card",
             AuthRefused::BadCert => "bad_cert",
             AuthRefused::BadProof | AuthRefused::ClockSkew => "bad_proof",
-            AuthRefused::Revoked => "revoked",
+            AuthRefused::Revoked | AuthRefused::BelowFloor { .. } => "revoked",
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
@@ -343,6 +361,7 @@ impl AuthRefused {
         match self {
             AuthRefused::Denied
             | AuthRefused::Revoked
+            | AuthRefused::BelowFloor { .. }
             | AuthRefused::NoManage
             | AuthRefused::Banned
             | AuthRefused::Rotated { .. } => 403,
@@ -552,6 +571,66 @@ pub fn check_handovers(key: &PublicKey, h: &Handovers, now: u64) -> Result<(), S
     Ok(())
 }
 
+/// What the lists held say of `card`'s identity, and whether one of the
+/// registrars that attested it has none current. Reads the store: called
+/// off the reactor.
+fn records_of(
+    registrars: &crate::registrars::Registrars,
+    card: &hl_identity::Card,
+    now: u64,
+) -> crate::registrars::Lookup {
+    // Only an attestation under a key its registrar publishes was
+    // fetched for, so only its registrar can be stale.
+    let hosts: Vec<String> = card
+        .attestations
+        .iter()
+        .filter(|a| {
+            registrars
+                .keys(&a.registrar, &a.identity, now)
+                .contains(&a.registrar_key)
+        })
+        .map(|a| a.registrar.clone())
+        .collect();
+    registrars.lookup(&card.identity, &hosts, now)
+}
+
+/// `cert` as the core's lists judge it.
+fn cert_ref(cert: &hl_identity::DeviceCert) -> hxd_core::CertRef {
+    hxd_core::CertRef {
+        identity: Fingerprint::of(&cert.identity).0,
+        device: Fingerprint::of(&cert.device).0,
+        epoch: cert.epoch,
+    }
+}
+
+/// What the lists say of a certificate besides its floor, which is said
+/// in the floor's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    Nothing,
+    /// A rotation away from its identity, which `apply_records` decides.
+    Rotated,
+    /// A revocation of its identity or its device.
+    Revoked,
+}
+
+/// The highest device epoch in `found` (`identity-registrar.md` §7.3),
+/// and what else in it names `cert` outright.
+fn floor_of(found: &crate::registrars::Lookup, cert: &hl_identity::DeviceCert) -> (u64, Named) {
+    found
+        .records
+        .iter()
+        .fold((0, Named::Nothing), |(floor, named), r| match r {
+            Record::DeviceEpoch(e) => (floor.max(e.epoch), named),
+            Record::RevokeIdentity(_) => (floor, Named::Revoked),
+            Record::RevokeDevice(d) if d.device == cert.device => (floor, Named::Revoked),
+            Record::Rotate(r) if r.identity == cert.identity && named == Named::Nothing => {
+                (floor, Named::Rotated)
+            }
+            _ => (floor, named),
+        })
+}
+
 /// What `list` says of `fp` alone.
 fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Published {
     // Destructured, so a field added is one to say how to cut.
@@ -560,6 +639,7 @@ fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Publi
         devices,
         covered,
         unrevoked,
+        floors,
     } = list;
     let of = |i: &[u8; 32]| *i == fp.0;
     hxd_core::Published {
@@ -567,6 +647,11 @@ fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Publi
         devices: devices.iter().copied().filter(|(i, _)| of(i)).collect(),
         covered: covered.iter().copied().filter(of).collect(),
         unrevoked: unrevoked.iter().copied().filter(of).collect(),
+        floors: floors
+            .iter()
+            .map(|(i, f)| (*i, *f))
+            .filter(|(i, _)| of(i))
+            .collect(),
     }
 }
 
@@ -930,7 +1015,7 @@ impl IdentityState {
                 {
                     return Err(AuthRefused::Banned);
                 }
-                match self.link_exclusive(&account.login, &fingerprint)? {
+                match self.link_exclusive(&account.login, &fingerprint, &cert_ref(&v.cert))? {
                     LinkOutcome::Linked(a) => {
                         info!(login = %a.login, fingerprint = %fingerprint.short(), "identity linked by device proof");
                         a
@@ -953,6 +1038,7 @@ impl IdentityState {
             outcome: Outcome::Linked,
             device_caps: v.cert.caps,
             device_expires: v.cert.expires,
+            device_epoch: v.cert.epoch,
             device_cert: v.cert_bytes,
             device_enc: v.cert.device_enc,
             account: Some(account.login),
@@ -1189,7 +1275,7 @@ impl IdentityState {
                 // One call: the backend reads, decides and writes under
                 // its own lock, so two concurrent auths by this identity
                 // can't both conclude "not linked yet".
-                match self.link_exclusive(&account.login, &fingerprint)? {
+                match self.link_exclusive(&account.login, &fingerprint, &cert_ref(&cert))? {
                     LinkOutcome::Linked(a) => {
                         info!(login = %a.login, fingerprint = %fingerprint.short(), "identity linked at auth");
                         linked = Some(a);
@@ -1324,6 +1410,7 @@ impl IdentityState {
             outcome,
             device_caps: cert.caps,
             device_expires: cert.expires,
+            device_epoch: cert.epoch,
             device_cert: cert_bytes,
             device_enc: cert.device_enc,
             account,
@@ -1406,7 +1493,7 @@ impl IdentityState {
         // published records, when there is a registrar to fetch them
         // from, are consulted here too.
         // A key rotated away from is told where it went, which
-        // `is_revoked` would not say.
+        // `key_refusal` would not say.
         if let Some(successor) = self.rotated_to(&fingerprint) {
             debug!(fingerprint = %fingerprint.short(), successor = %successor.short(), "identity auth refused: rotated");
             return Err(AuthRefused::Rotated { successor });
@@ -1416,35 +1503,89 @@ impl IdentityState {
         }
         self.finish_rotations(Some(&fingerprint));
         let device = Fingerprint::of(&cert.device);
-        // A freeze, or a rotation with no anchors to keep it, is refused
-        // too, but by the records below, which say which it is.
-        if self.core.key_refusal(&fingerprint.0, &device.0) == Some(hxd_core::KeyRefusal::Revoked) {
-            debug!(
-                fingerprint = %fingerprint.short(),
-                device = %device.short(),
-                "identity auth refused: revoked here"
-            );
+        // The floor, the higher of the one installed and the one the lists
+        // just fetched publish, decided before any policy below. One the
+        // lists raise is installed now, as the sweep would install it: the
+        // sessions and tokens below it go before the sweep comes round,
+        // whatever this device is told.
+        let now = self.clock.unix();
+        let found = self.registrars.as_ref().map(|r| records_of(r, card, now));
+        let (listed, named) = found
+            .as_ref()
+            .map_or((0, Named::Nothing), |f| floor_of(f, cert));
+        if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
+            for (uid, nick) in ended {
+                info!(uid, nick = %nick, "session ended: below a floor fetched at auth");
+            }
+            // Dropped here too: an identity with no session the sweep
+            // keeps lists for is installed without its floor next time.
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            t.devices.remove(&cert.device);
-            return Err(AuthRefused::Revoked);
+            t.tokens.retain(|_, (ident, _)| {
+                ident.fingerprint != fingerprint || ident.device_epoch >= listed
+            });
+        }
+        // Read after the raise, so a floor another admission raised
+        // meanwhile counts too. A freeze, or a rotation with no anchors to
+        // keep it, is refused too, but by the records below, which say
+        // which it is.
+        let installed = match self.core.key_refusal(&cert_ref(cert)) {
+            Some(hxd_core::KeyRefusal::Revoked) => {
+                debug!(
+                    fingerprint = %fingerprint.short(),
+                    device = %device.short(),
+                    "identity auth refused: revoked here"
+                );
+                let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                t.devices.remove(&cert.device);
+                return Err(AuthRefused::Revoked);
+            }
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => floor,
+            Some(hxd_core::KeyRefusal::Unrevoked) | None => 0,
+        };
+        let floor = installed.max(listed);
+        // A listed rotation is `apply_records`' to accept, which then
+        // meets the floor; but the banned-registrar refusal below comes
+        // first, and is told only after the floor.
+        let banned = card
+            .attestations
+            .iter()
+            .any(|a| self.cfg.banned_registrars.contains(&a.registrar));
+        let refused = match named {
+            Named::Revoked => Some(AuthRefused::Revoked),
+            Named::Rotated if !banned => None,
+            Named::Rotated | Named::Nothing => cert
+                .check_floor(floor)
+                .is_err()
+                .then_some(AuthRefused::BelowFloor { floor }),
+        };
+        match refused {
+            Some(AuthRefused::Revoked) => {
+                info!(fingerprint = %fingerprint.short(), "identity auth refused: revoked at its registrar");
+                let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                t.devices.remove(&cert.device);
+                return Err(AuthRefused::Revoked);
+            }
+            Some(refused) => {
+                info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
+                self.forget_below(cert, floor);
+                return Err(refused);
+            }
+            None => {}
         }
 
         // A banned registrar refuses every identity that carries its
         // attestation, verified or not, and whatever else the card
         // carries: a card is its holder's own signature, so what is on it
-        // its holder chose, and nobody can put it on another's.
-        if card
-            .attestations
-            .iter()
-            .any(|a| self.cfg.banned_registrars.contains(&a.registrar))
-        {
+        // its holder chose, and nobody can put it on another's. A
+        // rotation listed for it, past the floor above, is answered
+        // `denied` here too.
+        if banned {
             info!(fingerprint = %fingerprint.short(), "identity auth refused: a banned registrar's attestation");
             return Err(AuthRefused::Denied);
         }
 
         // Step 4, continued: what the registrars that attested it publish.
-        let now = self.clock.unix();
-        let attestations = self.apply_records(card, cert, now)?;
+        let attestations = self.apply_records(card, cert, found, floor)?;
         // A rotation to this key whose moves have not all landed would
         // leave it to be admitted without the predecessor's account, and
         // `new_accounts = create` to make it another one; it is admitted
@@ -1555,7 +1696,23 @@ impl IdentityState {
     /// gains a fingerprint. Called here rather than at each of the three
     /// link sites, so there is one place to forget it and it isn't
     /// forgotten.
-    fn link_exclusive(&self, login: &str, fp: &Fingerprint) -> Result<LinkOutcome, AuthRefused> {
+    ///
+    /// The key is asked again first, as close to the write as there is: a
+    /// revocation or a floor installed since it was admitted links nothing.
+    fn link_exclusive(
+        &self,
+        login: &str,
+        fp: &Fingerprint,
+        cert: &hxd_core::CertRef,
+    ) -> Result<LinkOutcome, AuthRefused> {
+        match self.core.key_refusal(cert) {
+            Some(hxd_core::KeyRefusal::Revoked) => return Err(AuthRefused::Revoked),
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => {
+                return Err(AuthRefused::BelowFloor { floor })
+            }
+            Some(hxd_core::KeyRefusal::Unrevoked) => return Err(AuthRefused::Denied),
+            None => {}
+        }
         let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
             tracing::warn!("link write failed: {e}");
             AuthRefused::Backend
@@ -1637,7 +1794,7 @@ impl IdentityState {
         {
             return Err(AuthRefused::Banned);
         }
-        match self.link_exclusive(&account.login, &ident.fingerprint)? {
+        match self.link_exclusive(&account.login, &ident.fingerprint, &ident.cert())? {
             LinkOutcome::Linked(a) => {
                 info!(login = %a.login, fingerprint = %ident.fingerprint.short(), "identity linked");
                 Ok(a)
@@ -1711,32 +1868,22 @@ impl IdentityState {
     /// `identity-registrar.md` §7.3: the records the registrars that
     /// attested the identity publish against it, applied in time order.
     /// A revocation of it or of this device refuses; a freeze, or records
-    /// past their lifetime, refuse or downgrade as configured. Answers the
+    /// past their lifetime, refuse or downgrade as configured, and past a
+    /// rotation the anchors overrule, a certificate below `floor` is
+    /// refused. Answers the
     /// attestations that survive, or `None` when the identity is to be
     /// taken as unattested.
     fn apply_records(
         &self,
         card: &hl_identity::Card,
         cert: &hl_identity::DeviceCert,
-        now: u64,
+        found: Option<crate::registrars::Lookup>,
+        floor: u64,
     ) -> Result<Option<Vec<Attestation>>, AuthRefused> {
-        let Some(registrars) = &self.registrars else {
+        let (Some(registrars), Some(found)) = (&self.registrars, found) else {
             return Ok(Some(card.attestations.clone()));
         };
         let fingerprint = Fingerprint::of(&card.identity);
-        // Only an attestation under a key its registrar publishes was
-        // fetched for, so only its registrar can be stale.
-        let hosts: Vec<String> = card
-            .attestations
-            .iter()
-            .filter(|a| {
-                registrars
-                    .keys(&a.registrar, &a.identity, now)
-                    .contains(&a.registrar_key)
-            })
-            .map(|a| a.registrar.clone())
-            .collect();
-        let found = registrars.lookup(&card.identity, &hosts, now);
         // A list held damaged proves nothing either way, and so does a
         // store that could not be read for an identity a list could be
         // held for: refused once the lists that do say something have.
@@ -1748,13 +1895,15 @@ impl IdentityState {
                         .iter()
                         .any(|a| registrars.trusts(&a.registrar))));
         let mut unattested = false;
+        // Denied once what the records held say has been said.
+        let mut stale_denies = false;
         if found.stale && !unproven {
             match registrars.config().stale {
                 crate::registrars::Stale::Cached => {
                     info!(fingerprint = %fingerprint.short(), "registrar records past their lifetime; using what is held");
                 }
                 crate::registrars::Stale::Guest => unattested = true,
-                crate::registrars::Stale::Deny => return Err(AuthRefused::Denied),
+                crate::registrars::Stale::Deny => stale_denies = true,
             }
         }
         let mut attestations = card.attestations.clone();
@@ -1802,10 +1951,17 @@ impl IdentityState {
                         return Err(AuthRefused::Rotated { successor });
                     }
                 }
-                // Floors are not applied here yet: a device epoch is read
-                // as it was before the record existed, as nothing.
                 Record::RevokeDevice(_) | Record::DeviceEpoch(_) => {}
             }
+        }
+        if cert.check_floor(floor).is_err() {
+            info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
+            self.forget_below(cert, floor);
+            return Err(AuthRefused::BelowFloor { floor });
+        }
+        if stale_denies {
+            info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records past their lifetime");
+            return Err(AuthRefused::Denied);
         }
         if unproven {
             info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records held here could not be read whole");
@@ -1821,6 +1977,23 @@ impl IdentityState {
             }
         }
         Ok((!unattested).then_some(attestations))
+    }
+
+    /// Forget `cert`'s device on file if the certificate held for it is
+    /// of the same identity and below `floor`: one renewed at the floor
+    /// since, or another identity's for the same key, is kept.
+    fn forget_below(&self, cert: &hl_identity::DeviceCert, floor: u64) {
+        let device = &cert.device;
+        let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let below = t.devices.get(device).is_some_and(|rec| {
+            rec.identity == cert.identity
+                && hl_identity::DeviceCert::parse(&rec.cert)
+                    .ok()
+                    .is_none_or(|c| c.check_floor(floor).is_err())
+        });
+        if below {
+            t.devices.remove(device);
+        }
     }
 
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
@@ -1871,10 +2044,10 @@ impl IdentityState {
         }
         // A token minted before its key was revoked is not a way round the
         // revocation: it dies here, whichever caller holds it.
-        let revoked = t.tokens.get(&key).is_some_and(|(ident, _)| {
-            self.core
-                .is_revoked(&ident.fingerprint.0, &Fingerprint::of(&ident.device).0)
-        });
+        let revoked = t
+            .tokens
+            .get(&key)
+            .is_some_and(|(ident, _)| self.core.refuses(&ident.cert()));
         if revoked {
             t.tokens.remove(&key);
             return None;
@@ -3264,7 +3437,8 @@ mod tests {
         let bare = Card::parse(&Card::new(&id, "alice", now).sign(&id, vec![]).unwrap()).unwrap();
 
         let answer = |st: &IdentityState, card: &Card, dev| {
-            st.apply_records(card, &cert(dev), now)
+            let found = st.registrars.as_ref().map(|r| records_of(r, card, now));
+            st.apply_records(card, &cert(dev), found, 0)
                 .map(|_| ())
                 .map_err(AuthRefused::code)
         };
@@ -3987,6 +4161,7 @@ mod tests {
             outcome: Outcome::Guest,
             device_caps: None,
             device_expires: u64::MAX,
+            device_epoch: 0,
             device_cert: Vec::new(),
             device_enc: [0; 32],
             account: None,
