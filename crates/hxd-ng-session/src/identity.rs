@@ -200,6 +200,8 @@ pub struct TransportIdentity {
     /// stops buzzing without anyone remembering to unregister it
     /// (push-notifications.md §5.1).
     pub device_expires: u64,
+    /// The device epoch that certificate was issued in (§3.3).
+    pub device_epoch: u64,
     /// The certificate as it was proved, and its `device_enc` key: what a
     /// sealed message to this device is sealed to
     /// (`docs/e2e-messages.md` §4.2).
@@ -228,6 +230,15 @@ impl TransportIdentity {
     pub fn may_message(&self) -> bool {
         self.allows(hl_identity::caps::MESSAGE)
     }
+
+    /// The certificate the socket proved, as the lists judge it.
+    pub fn cert(&self) -> hxd_core::CertRef {
+        hxd_core::CertRef {
+            identity: self.fingerprint.0,
+            device: Fingerprint::of(&self.device).0,
+            epoch: self.device_epoch,
+        }
+    }
 }
 
 impl TransportIdentity {
@@ -241,6 +252,7 @@ impl TransportIdentity {
             signs: false,
             can_sign: false,
             device_expires: self.device_expires,
+            device_epoch: self.device_epoch,
             sealed: None,
             device_cert: (self.may_message() && self.device_cert.len() <= 512)
                 .then(|| std::sync::Arc::new(self.device_cert.clone())),
@@ -274,6 +286,12 @@ pub enum AuthRefused {
     BadCert,
     BadProof,
     Revoked,
+    /// The device certificate was issued below its identity's device
+    /// epoch floor, `floor` (`identity-registrar.md` §7.3): revoked by a
+    /// reset, which the client is told so that it can say so.
+    BelowFloor {
+        floor: u64,
+    },
     Denied,
     CardTooLarge,
     UnknownChallenge,
@@ -319,7 +337,7 @@ impl AuthRefused {
             AuthRefused::BadCard => "bad_card",
             AuthRefused::BadCert => "bad_cert",
             AuthRefused::BadProof | AuthRefused::ClockSkew => "bad_proof",
-            AuthRefused::Revoked => "revoked",
+            AuthRefused::Revoked | AuthRefused::BelowFloor { .. } => "revoked",
             AuthRefused::Denied => "denied",
             AuthRefused::CardTooLarge => "card_too_large",
             AuthRefused::UnknownChallenge => "unknown_challenge",
@@ -343,6 +361,7 @@ impl AuthRefused {
         match self {
             AuthRefused::Denied
             | AuthRefused::Revoked
+            | AuthRefused::BelowFloor { .. }
             | AuthRefused::NoManage
             | AuthRefused::Banned
             | AuthRefused::Rotated { .. } => 403,
@@ -560,6 +579,7 @@ fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Publi
         devices,
         covered,
         unrevoked,
+        floors,
     } = list;
     let of = |i: &[u8; 32]| *i == fp.0;
     hxd_core::Published {
@@ -567,6 +587,11 @@ fn published_of(list: &hxd_core::Published, fp: &Fingerprint) -> hxd_core::Publi
         devices: devices.iter().copied().filter(|(i, _)| of(i)).collect(),
         covered: covered.iter().copied().filter(of).collect(),
         unrevoked: unrevoked.iter().copied().filter(of).collect(),
+        floors: floors
+            .iter()
+            .map(|(i, f)| (*i, *f))
+            .filter(|(i, _)| of(i))
+            .collect(),
     }
 }
 
@@ -953,6 +978,7 @@ impl IdentityState {
             outcome: Outcome::Linked,
             device_caps: v.cert.caps,
             device_expires: v.cert.expires,
+            device_epoch: v.cert.epoch,
             device_cert: v.cert_bytes,
             device_enc: v.cert.device_enc,
             account: Some(account.login),
@@ -1324,6 +1350,7 @@ impl IdentityState {
             outcome,
             device_caps: cert.caps,
             device_expires: cert.expires,
+            device_epoch: cert.epoch,
             device_cert: cert_bytes,
             device_enc: cert.device_enc,
             account,
@@ -1406,7 +1433,7 @@ impl IdentityState {
         // published records, when there is a registrar to fetch them
         // from, are consulted here too.
         // A key rotated away from is told where it went, which
-        // `is_revoked` would not say.
+        // `key_refusal` would not say.
         if let Some(successor) = self.rotated_to(&fingerprint) {
             debug!(fingerprint = %fingerprint.short(), successor = %successor.short(), "identity auth refused: rotated");
             return Err(AuthRefused::Rotated { successor });
@@ -1418,7 +1445,20 @@ impl IdentityState {
         let device = Fingerprint::of(&cert.device);
         // A freeze, or a rotation with no anchors to keep it, is refused
         // too, but by the records below, which say which it is.
-        if self.core.key_refusal(&fingerprint.0, &device.0) == Some(hxd_core::KeyRefusal::Revoked) {
+        let refused = match self.core.key_refusal(&hxd_core::CertRef {
+            identity: fingerprint.0,
+            device: device.0,
+            epoch: cert.epoch,
+        }) {
+            Some(hxd_core::KeyRefusal::Revoked) => Some(AuthRefused::Revoked),
+            // Whatever the lists say now, told the higher of the two: they
+            // may have been fetched since the floor was installed.
+            Some(hxd_core::KeyRefusal::BelowFloor(floor)) => Some(AuthRefused::BelowFloor {
+                floor: floor.max(self.held_floor(&card.identity)),
+            }),
+            Some(hxd_core::KeyRefusal::Unrevoked) | None => None,
+        };
+        if let Some(refused) = refused {
             debug!(
                 fingerprint = %fingerprint.short(),
                 device = %device.short(),
@@ -1426,7 +1466,7 @@ impl IdentityState {
             );
             let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
             t.devices.remove(&cert.device);
-            return Err(AuthRefused::Revoked);
+            return Err(refused);
         }
 
         // A banned registrar refuses every identity that carries its
@@ -1711,7 +1751,8 @@ impl IdentityState {
     /// `identity-registrar.md` §7.3: the records the registrars that
     /// attested the identity publish against it, applied in time order.
     /// A revocation of it or of this device refuses; a freeze, or records
-    /// past their lifetime, refuse or downgrade as configured. Answers the
+    /// past their lifetime, refuse or downgrade as configured, and a
+    /// certificate below their floor is refused with it. Answers the
     /// attestations that survive, or `None` when the identity is to be
     /// taken as unattested.
     fn apply_records(
@@ -1761,6 +1802,7 @@ impl IdentityState {
         // A registrar's latest freeze record is its word; any registrar's
         // standing freeze holds.
         let mut frozen: HashMap<&str, bool> = HashMap::new();
+        let mut floor = 0;
         for record in &found.records {
             match record {
                 Record::RevokeIdentity(_) => {
@@ -1802,10 +1844,16 @@ impl IdentityState {
                         return Err(AuthRefused::Rotated { successor });
                     }
                 }
-                // Floors are not applied here yet: a device epoch is read
-                // as it was before the record existed, as nothing.
-                Record::RevokeDevice(_) | Record::DeviceEpoch(_) => {}
+                Record::DeviceEpoch(e) => floor = floor.max(e.epoch),
+                Record::RevokeDevice(_) => {}
             }
+        }
+        // Not in `time` order: the highest floor any registrar published.
+        if cert.check_floor(floor).is_err() {
+            info!(fingerprint = %fingerprint.short(), floor, "identity auth refused: device certificate below its identity's floor");
+            let mut t = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            t.devices.remove(&cert.device);
+            return Err(AuthRefused::BelowFloor { floor });
         }
         if unproven {
             info!(fingerprint = %fingerprint.short(), "identity auth refused: registrar records held here could not be read whole");
@@ -1821,6 +1869,24 @@ impl IdentityState {
             }
         }
         Ok((!unattested).then_some(attestations))
+    }
+
+    /// The highest device epoch in the lists held for `identity`. Reads
+    /// the store: called off the reactor.
+    fn held_floor(&self, identity: &PublicKey) -> u64 {
+        let Some(registrars) = &self.registrars else {
+            return 0;
+        };
+        let found = registrars.lookup(identity, &[], self.clock.unix());
+        found
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::DeviceEpoch(e) => Some(e.epoch),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn accept_attestations(&self, atts: &[Attestation], now: u64) -> (Option<String>, u64) {
@@ -1871,10 +1937,10 @@ impl IdentityState {
         }
         // A token minted before its key was revoked is not a way round the
         // revocation: it dies here, whichever caller holds it.
-        let revoked = t.tokens.get(&key).is_some_and(|(ident, _)| {
-            self.core
-                .is_revoked(&ident.fingerprint.0, &Fingerprint::of(&ident.device).0)
-        });
+        let revoked = t
+            .tokens
+            .get(&key)
+            .is_some_and(|(ident, _)| self.core.refuses(&ident.cert()));
         if revoked {
             t.tokens.remove(&key);
             return None;
@@ -3987,6 +4053,7 @@ mod tests {
             outcome: Outcome::Guest,
             device_caps: None,
             device_expires: u64::MAX,
+            device_epoch: 0,
             device_cert: Vec::new(),
             device_enc: [0; 32],
             account: None,

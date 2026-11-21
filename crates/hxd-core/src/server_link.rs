@@ -1667,6 +1667,7 @@ mod tests {
             signs: false,
             can_sign: false,
             device_expires: u64::MAX,
+            device_epoch: 0,
             sealed: None,
             device_cert: None,
         };

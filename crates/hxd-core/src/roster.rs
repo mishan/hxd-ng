@@ -326,6 +326,9 @@ pub struct IdentityTag {
     /// When the certificate of the device the session proved expires,
     /// as unix seconds: `signs`, `can_sign` and `sealed` end with it.
     pub device_expires: u64,
+    /// The device epoch that certificate was issued in: a reset to a
+    /// floor above it ends the session (`identity-registrar.md` §7.3).
+    pub device_epoch: u64,
     /// The session can open sealed messages, with the device it proved
     /// (`docs/e2e-messages.md` §4.1): shown as `sealed`, and what a box
     /// to it must be sealed to.
@@ -337,6 +340,15 @@ pub struct IdentityTag {
 }
 
 impl IdentityTag {
+    /// The certificate the session proved, as the lists judge it.
+    pub fn cert(&self) -> crate::CertRef {
+        crate::CertRef {
+            identity: self.fingerprint,
+            device: self.device,
+            epoch: self.device_epoch,
+        }
+    }
+
     /// This tag as a session on an account linking `linked` wears it: a
     /// key its account links is answered for, and waits for nothing,
     /// however lately the link was made (`identity-registrar.md` §7.3).

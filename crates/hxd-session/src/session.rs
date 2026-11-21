@@ -2657,7 +2657,7 @@ async fn login_phase(
         .transport
         .identity
         .as_ref()
-        .and_then(|t| ctx.core.key_refusal(&t.fingerprint, &t.device));
+        .and_then(|t| ctx.core.key_refusal(&t.cert()));
     let attached = if refused.is_some() {
         None
     } else {
@@ -2668,7 +2668,9 @@ async fn login_phase(
             tx,
             f.trans,
             match refused {
-                Some(hxd_core::KeyRefusal::Revoked) => "This key is revoked on this server.",
+                Some(hxd_core::KeyRefusal::Revoked | hxd_core::KeyRefusal::BelowFloor(_)) => {
+                    "This key is revoked on this server."
+                }
                 Some(hxd_core::KeyRefusal::Unrevoked) => "This key is not admitted here.",
                 None => "Server full.",
             },

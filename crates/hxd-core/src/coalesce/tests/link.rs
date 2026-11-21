@@ -50,6 +50,7 @@ fn proved(device: u8, signs: bool) -> Transport {
             signs,
             can_sign: true,
             device_expires: u64::MAX,
+            device_epoch: 0,
             sealed: None,
             device_cert: None,
         }),

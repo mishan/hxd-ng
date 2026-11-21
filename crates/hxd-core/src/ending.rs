@@ -25,6 +25,9 @@ pub enum EndedBy {
     /// Its identity or device key was revoked here, which a login with
     /// that key is told too.
     Revoked,
+    /// Its certificate was issued below its identity's device epoch
+    /// floor, this one, which a login with it is told too.
+    BelowFloor(u64),
     /// A kick with a ban, or a ban, that stands now.
     Banned(crate::ban::BanHit),
 }
@@ -35,7 +38,7 @@ impl EndedBy {
         match self {
             EndedBy::Ended => 0,
             EndedBy::Kicked => 1,
-            EndedBy::Revoked => 2,
+            EndedBy::Revoked | EndedBy::BelowFloor(_) => 2,
             EndedBy::Banned(_) => 3,
         }
     }
@@ -127,7 +130,10 @@ impl Core {
             let r = self.roster.lock().unwrap();
             r.endings.get((uid, serial), within, Instant::now())?
         };
-        if !matches!(why, EndedBy::Kicked | EndedBy::Revoked) {
+        if !matches!(
+            why,
+            EndedBy::Kicked | EndedBy::Revoked | EndedBy::BelowFloor(_)
+        ) {
             return Some(why);
         }
         // A kick's ban is placed after it, and a revocation may come
