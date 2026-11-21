@@ -312,19 +312,24 @@ makes a local edge, as the extension describes.
   which is the target's consent at this server. And the sender's own
   identity's half of that friendship must be below its floor (§6), which
   the server checks against the friendship the `Reset` record keeps.
-  Whether it qualifies is decided when the 802 arrives, and stays so. It
-  is checked first as any 802 with an offer is, so that it tests no
-  hidden link, and it is answered the same whether or not it qualifies:
-  as a friend request is, on this wire, and `pending_out` on the ng wire
-  (`hotline-ng.md` §7.5), so the answer says nothing of the target's
-  presentation; only that a qualifying one skips the friend-request
-  ledger and bounds could tell, a small leak to a party that already
-  holds the friendship. The target's client asks its user before
-  accepting, since the offer comes from a device the old friendship did
-  not name. Its acceptance makes the edge portable, presented by both
-  and active. It is then an active edge as any other, held to both
-  parties' `MaxRosterSize`, with §4.3's effects of activation, and the
-  `Reset` record goes.
+  Whether it qualifies is decided when the 802 arrives, and once more if
+  it is still pending when the target's presentation is later answered
+  `Reset`: an offer the sender made first, as a party answered `Reset`
+  before its friend presented does (§6), then becomes an upgrade offer,
+  leaving the friend-request bounds and ledger, and is delivered again
+  to the target's friendships sessions as one. Otherwise it stays as
+  decided. It is checked first as any 802 with an offer is, so that it
+  tests no hidden link, and it is answered the same whether it
+  qualifies: as a friend request is, on this wire, and `pending_out` on
+  the ng wire (`hotline-ng.md` §7.5), so the answer says nothing of the
+  target's presentation; only that a qualifying one skips the
+  friend-request ledger and bounds could tell, a small leak to a party
+  that already holds the friendship. The target's client asks its user
+  before accepting, since the offer comes from a device the old
+  friendship did not name. Its acceptance makes the edge portable,
+  presented by both and active. It is then an active edge as any other,
+  held to both parties' `MaxRosterSize`, with §4.3's effects of
+  activation, and the `Reset` record goes.
 - **Friend Response (805)** accepting carries the whole friendship,
   which the accepting client builds from the offer it was sent, from a
   device-proved session signing the acceptance with its own
@@ -444,11 +449,12 @@ For each friendship the server checks, in this order:
    the bound of step 1, shown to nobody, and does not make the
    friendship held. It goes when that upgrade offer's acceptance
    activates the edge, when the presenter presents another friendship
-   for the pair, or 30 days after the last presentation of it answered
-   `Reset`, or `AccountNotFound` in its place on the classic wire (§7),
-   which a client presenting the friendship again at each login keeps
-   restarting; while a qualifying upgrade offer for it is pending, it is
-   kept until the offer is answered or lapses;
+   for the pair, or 30 days after the last presentation of it that kept
+   the record, answered `Reset` or `AccountNotFound` in its place, for a
+   hidden party here or on the classic wire (§7), which a client
+   presenting the friendship again at each login keeps restarting; while
+   a qualifying upgrade offer for it is pending, it is kept until the
+   offer is answered or lapses;
 5. if the other party's link is one this server would not show the
    presenter, `AccountNotFound` too, but it records the presentation
    (below), since activation needs both parties and so shows nobody
@@ -561,7 +567,7 @@ friendship hash, or for a withdrawal its pair hash, and a reason code.
 | `RateLimited` (10) | past the rate below | tries again after the ng wire's `retry_after`, or on the classic wire, which carries no delay, backs off |
 | `RosterFull` (12) | step 1's bound, or activation past a cap, which may pass | tries again when it has room |
 | `BadSignature` (16) | step 1, or a withdrawal that does not verify or is not the presenter's | drops the object |
-| `Reset` (new) | step 4: a friendship whose signatures verify, with a half below its signer's floor, that is not held here (§6) | keeps its copy; where the half is its own identity's, remakes it from a current device (§6); where it is the friend's, waits for the friend's upgrade offer, which it asks its user about |
+| `Reset` (new) | step 4: a friendship whose signatures verify, with a half below its signer's floor, that is not held here (§6) | keeps its copy; where the half is its own identity's, remakes it from a current device (§6); where it is the friend's, answers the friend's pending offer, which this answer has just made an upgrade offer (§4.1), or waits for one, asking its user either way |
 | `Withdrawn` (new) | step 3, or a half at 802 or 805 that a withdrawal held here ends | with the withdrawal beside it, treats the friendship as withdrawn once it has checked that (§5.3); with none, the server's own (above), stops presenting it here; at 802 or 805, which carry none, tries again after `S` |
 | `Stale` (new) | an object whose `time` is not within `S` of the server's clock: a withdrawal here or at 803 and 806, an offer or an acceptance at 802 and 805 | signs it afresh, or tells the user its clock is off |
 
@@ -697,13 +703,15 @@ party's (§10). It also checks the signing device against the revocations
 and device epoch floors it knows, and does not spread one a revoked
 device signed, or one whose signer is below a floor it knows, since a
 dishonest server can hand it one signed after the theft (§6). Before
-spreading one it MUST fetch the withdrawer's records from the registrars
-of the attestations it holds for that identity, past any cache, and
-spreads nothing until one such fetch succeeds: a device that was reset
-can still sign one at a server that never learned the floor, and a
-spread of it, signed by the friend's own device, would pass everywhere.
-An identity it holds no attestation for has no registrar to ask and so
-no floor to learn, and its withdrawals are spread as before; that is the
+spreading one it MUST fetch the withdrawer's records, past any cache,
+from every registrar of the attestations it holds for that identity,
+spreads nothing until every one of those fetches has succeeded, and
+judges the signer by the highest floor among them and any it already
+holds, not by the first registrar to answer: a device that was reset can
+still sign one at a server that never learned the floor, and a spread of
+it, signed by the friend's own device, would pass everywhere. An
+identity it holds no attestation for has no registrar to ask and so no
+floor to learn, and its withdrawals are spread as before; that is the
 residual of an unattested identity. It never acts on one it has not
 checked, and a `Removed` without one changes nothing beyond that
 server's row.
@@ -898,7 +906,10 @@ replaces the old there. A party whose own presentation was answered
 `Reset` before the other party presented has no such edge to offer on:
 it sends an ordinary offer in Add Friend (802), a friend request held to
 the usual bounds, which the other party's client recognizes as the
-friendship it holds and asks its user about.
+friendship it holds and asks its user about. If the other party then
+presents the old friendship and is answered `Reset`, the offer, if still
+pending, becomes an upgrade offer (§4.1), so the two need not wait on
+each other.
 
 A device enrolled after a reset learns what to remake as a new device
 learns any friendship (§5.2): from the entries of servers where the

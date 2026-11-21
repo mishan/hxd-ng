@@ -1472,11 +1472,12 @@ What the family's existing requests take beside what they took:
   counts as an upgrade offer on a friendship a device reset left
   inactive here, where the account named by `login` presented it here
   and was answered `reset`, and the caller's own half of it is below its
-  identity's floor (portable-friends §4.1, §6). It is answered `{
-  "state": "pending_out" }`, as a friend request is, whether or not it
-  counts as one, so the answer says nothing of the friend's
-  presentation; its acceptance makes them friends here, held to the
-  roster bounds as any friend. An offer
+  identity's floor (portable-friends §4.1, §6); an offer still pending
+  when the friend's presentation is later answered `reset` becomes one
+  then. It is answered `{ "state": "pending_out" }`, as a friend request
+  is, whether it counts as one, so the answer says nothing of the
+  friend's presentation; its acceptance makes them friends here, held to
+  the roster bounds as any friend. An offer
   lapses at its `expires`: the request stays, plain, and an upgrade
   offer goes.
 - **`friend_respond` with a `friendship`** accepts the offer `login`
@@ -1538,7 +1539,7 @@ Two requests are added, answered to friendships sessions alone:
   | `no_such_user` | the other party has no account here, does not take part, or one of the two has blocked the other; counted toward the bound below as a presentation is | tries again at a later login |
   | `roster_full` | this account's own bound on friendships it presented whose friendship here is not active, or its roster as the friendship becomes active | tries again when it has room |
   | `bad_signature` | a friendship that fails its checks or names neither of this account's identity and a successor's, or a withdrawal that fails its checks or is not this session's own | drops the object |
-  | `reset` | a friendship whose signatures verify, with a half signed by a device below its identity's device epoch floor, that this server did not hold before the reset (portable-friends §4.3, §6) | keeps it; remakes it from a current device where the half is its own, and otherwise waits for the friend's upgrade offer |
+  | `reset` | a friendship whose signatures verify, with a half signed by a device below its identity's device epoch floor, that this server did not hold before the reset (portable-friends §4.3, §6) | keeps it; remakes it from a current device where the half is its own, and otherwise answers the friend's pending offer, which this `reset` makes an upgrade offer, or waits for one |
   | `withdrawn` | a withdrawal held here ends the friendship | with `withdraw`, checks it and treats the friendship as withdrawn; with none, stops presenting it here |
   | `stale` | a withdrawal whose `time` is not within ten minutes of the server's clock | signs it afresh |
 

@@ -928,15 +928,21 @@ up to 2.0.28 answers `UnknownUser` to every server's own request.
 
 **No revocation is applied to a fetched certificate.** A ghost's
 certificate is checked as `e2e-messages.md` §5 says, and against no
-revocation of any kind: not a device revocation, not its identity's,
-and not its identity's device epoch floor (`identity-registrar.md`
-§4.10). Applying them needs this server to fetch the ghost's records
-from its own trusted registrars, which is `identity-registrar.md` §7
-for ghosts and its own work, after device epochs, which the floor then
-rides on. Until then a ghost's lines and messages signed by a revoked
-device, or by one its identity reset, are shown here as signed. Its
+revocation of any kind: not a device revocation, not its identity's, and
+not its identity's device epoch floor (`identity-registrar.md` §4.10).
+Applying them needs this server to fetch and apply the ghost's records
+from its own trusted registrars, as `identity-registrar.md` §7.2 and
+§7.3 do for a local user's, which is work of its own, after device
+epochs. Until then a ghost's lines and messages signed by a revoked
+device, or by one its identity reset, are verified here as signed. Its
 home server applies all of it to its own users, and a session it ends
-there takes its ghost away here.
+there takes its ghost away here. Once records are applied to ghosts, a
+line or message a ghost signed before it is kept as it was verified,
+since signed lines and messages are judged at ingest and never by the
+floor (`hotline-ng-identity.md` §3.3); what changes is the traffic
+after, where a certificate fetched for a ghost that is revoked, or below
+its identity's floor, verifies nothing, so a reset device's later lines
+arrive unverified.
 
 **A sealed 905** to a local user is checked here as `e2e-messages.md`
 §5 says, `DATA_LINK_SEALED_TO` against the target's current `device_enc`

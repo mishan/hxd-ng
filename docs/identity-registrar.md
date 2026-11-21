@@ -829,8 +829,9 @@ record (0 for none):
 3. `not_registered` and `frozen`, as for every record;
 4. an `epoch` at most `cur` is not a failure, and nothing is stored:
    `{ "seq": <the current record's seq>, "published": true, "epoch": cur }`.
-   It is decided before the rate limits (§10) are checked or charged,
-   so a retry is answered even at the limit;
+   It is decided before the record-post and reset limits (§10) are
+   checked or charged, so a retry is answered even at those limits; it
+   is still charged as a lookup;
 5. an `epoch` past `cur + 16` is `bad_request`, "an epoch advances at
    most 16 at a time";
 6. a `time` earlier than the current record's is `bad_request`, "a reset
@@ -841,14 +842,29 @@ record (0 for none):
    the per-identity list keeps both. The answer is
    `{ "seq": n, "published": true, "epoch": epoch }`.
 
+Every answer to a device epoch, at steps 2, 4 and 7, also carries
+`"hash"`: the base64url SHA-256 of the current record's encoding, the
+one that set the identity's floor here.
+
 Step 4 makes a retry safe without a read first: a holder whose post
 landed and whose reply was lost signs the same `epoch` again with a
 fresh `time`, which is new bytes and passes step 2, and is answered as
-done. Two holders posting one `epoch` both see success. The `epoch` in
-every answer says where the identity stands: an answer equal to the
-`epoch` posted is done, and one above it is not, since another holder
-reset past it and the devices minted since at the higher epoch are not
-signed out. That holder resets again at the answer plus 1.
+done. The `epoch` in every answer says where the identity stands: one
+above the `epoch` posted is not done, since another holder reset past it
+and the devices minted since at the higher epoch are not signed out, and
+that holder resets again at the answer plus 1. One equal to it is done
+only if `hash` names bytes this holder posted for this reset. Two
+holders can choose the same `epoch`: the first's record is published, it
+may certify devices at that epoch, and the second is answered at step 4
+without the floor moving, so those devices are not signed out by the
+second's reset. A holder therefore keeps the hash of each record it
+posts for a reset, and a `hash` it does not recognize means another
+holder reset to that epoch first; it resets again at the answer plus 1.
+A retry of exact bytes is answered with their own hash, and one signed
+afresh with the hash of the post that landed, which the holder kept, so
+retries stay idempotent. A holder that lost its own hashes, as across a
+crash, takes an answer it cannot recognize as another's and resets once
+more, which is safe.
 
 The bound of step 5 rather than `cur + 1` is so one post catches up a
 registrar that missed resets, up to sixteen behind, while a buggy or
@@ -1127,7 +1143,7 @@ every registrar it fetched from, and never lower than the highest it has
 verified before. A server keeps that record durably, by the identity's
 fingerprint, and applies it whatever later lists say, so a list that no
 longer carries it lowers nothing, and it is consulted for every login of
-the identity whether or not the card shown carries attestations
+the identity, whatever attestations the card shown carries
 (`identity-records.md` §3). It also keeps, for each `epoch` it has seen,
 the earliest `time` it has seen for it, which decides what friendships
 it keeps (`proposals/portable-friends.md` §6).
@@ -1697,7 +1713,7 @@ ceiling is a setting with a default.
 | Epoch step per published device epoch | 16 | `bad_request` |
 | Answers that charge nothing (a device epoch at or below the current one, bytes already held), per minute, per address | counted as lookups | `rate_limited`, so a free answer is not a free amplifier |
 | Device revocations kept per identity | 256 | oldest-`until` pruned from the full list; per-identity list keeps all |
-| Superseded device epoch records kept per identity | 256 | the oldest dropped from the per-identity list; a server that read it keeps its earliest `time` for that `epoch` (§7.3); one that never did has only the later records' times, and so may hold presentations taken between the two, a residual of a reset that many resets back |
+| Superseded device epoch records kept per identity | 256 | the oldest dropped from the per-identity list; a server that read it keeps its earliest `time` for that `epoch` (§7.3); one that never did has only the later records' times, and so may hold presentations taken between the two, a residual of a reset that many resets back. A vouch withdrawal's test (§7.3) then reads the first record left above its signer's epoch, which has a higher `seq` than the dropped one, so it passes a withdrawal published between the two, one an honest registrar refused; only a registrar behind its identity's resets, already a residual (§6.2), could have published one there |
 | Envelope fetches per hour, per handle, per address | 10 | `rate_limited`, then lockout doubling from 1 hour, capped at 24 and forgotten a day after the last ends, or sooner if its slot is taken over (§9.2). Per kind, for any handle asked after, kept in the store |
 | Envelope fetches per day, per handle | 200 | `rate_limited` until the day turns; per kind, kept in the store |
 | Envelope fetches per hour, per address | 30, and 8 times that per IPv6 /48 | `rate_limited`. Counted in memory, apart from registrations and lookups so a flood of fetches leaves them their room; past 16384 addresses at once a new one goes uncounted rather than refused, since the stored counts are the bound on guessing. An IPv4-mapped IPv6 address counts as its IPv4 |
@@ -1919,13 +1935,15 @@ To fold into `identity-threat-model.md`:
   server already holds (§7.3); one that never publishes a reset is
   answered by the second attestation.
 - **Registrar operator, can additionally** see when an identity resets
-  its devices and roughly how often (the epoch); and, since a holder
-  fetches the identity's records before it mints, when and from which
-  addresses its holder and envelope devices certify devices. Not how
-  many devices exist, or which: a reset tells it less than revoking each
-  device would.
-- **Anyone shown a certificate** learns a lower bound on how many times
-  its identity has reset, from its `epoch`.
+  its devices, and when, from the records it publishes; and, since a
+  holder fetches the identity's records before it mints, when and from
+  which addresses its holder and envelope devices certify devices. Not
+  how many devices exist, or which: a reset tells it less than revoking
+  each device would.
+- **Anyone shown a certificate** learns from its `epoch` the floor its
+  identity had when it was minted: that it has reset at least once, if
+  the `epoch` is above 0, and not how many times, since one reset may
+  move the floor by up to 16 (§6.2).
 - **New scenario, a device after a reset.** A thief holding a device
   key and its certificate, still within its window, after its identity
   reset. Mitigation: the certificate is refused at login, and the

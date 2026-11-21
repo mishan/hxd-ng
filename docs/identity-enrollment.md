@@ -591,20 +591,24 @@ client that does not make a new key.
 to the highest floor it knows (`hotline-ng-identity.md` §3.3). Minting
 and resetting take one lock, and a mint reads the epoch under it as it
 signs, not when its session opened or its prompt was shown, so no
-certificate is signed at the old epoch after a reset. It SHOULD fetch
-the identity's records from each registrar that attests it
-(`identity-registrar.md` §6.2) before it answers any request while it is
-online, as `agent` is. A holder that renews its own certificate offline
-mints at the epoch it last learned, and if that is stale the certificate
-is refused at first use and minted again once the next fetch corrects
-it. An enrollee SHOULD check a delivered certificate against the records
-it can fetch, and tell its user that the holder that answered is behind
-a device reset rather than store a certificate that is already dead; it
-then makes a new device key and enrolls again with it, as one refused at
-login does, since a holder that recorded the dead certificate refuses
-that key (above). A device that certifies itself from an envelope
-(`identity-registrar.md` §9.4) MUST fetch the records first: it has just
-reached the registrar for the envelope, so this costs one more `GET`.
+certificate is signed at the old epoch after a reset that lock orders.
+The lock covers only the resets made through it, on that holder: another
+holder, or this one offline, signs at the last epoch it knew, and only
+its next fetch, or the certificate's refusal at first use, tells it
+otherwise. It SHOULD fetch the identity's records from each registrar
+that attests it (`identity-registrar.md` §6.2) before it answers any
+request while it is online, as `agent` is. A holder that renews its own
+certificate offline mints at the epoch it last learned, and if that is
+stale the certificate is refused at first use and minted again once the
+next fetch corrects it. An enrollee SHOULD check a delivered certificate
+against the records it can fetch, and tell its user that the holder that
+answered is behind a device reset rather than store a certificate that
+is already dead; it then makes a new device key and enrolls again with
+it, as one refused at login does, since a holder that recorded the dead
+certificate refuses that key (above). A device that certifies itself
+from an envelope (`identity-registrar.md` §9.4) MUST fetch the records
+first: it has just reached the registrar for the envelope, so this costs
+one more `GET`.
 
 ---
 
