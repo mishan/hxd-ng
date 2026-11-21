@@ -76,6 +76,9 @@ struct Discovered {
     keys: Vec<(PublicKey, Option<u64>)>,
     records: String,
     at: Instant,
+    /// How long it is believed: `DISCOVERY_TTL`, or for a stand-in made
+    /// when the document could not be had, `REDISCOVERY`.
+    ttl: Duration,
 }
 
 pub struct Registrars {
@@ -131,6 +134,11 @@ pub struct Lookup {
     pub complete: bool,
     /// The identity's lists could be read from the cache.
     pub read: bool,
+    /// A list held from a trusted registrar is not one whole list under
+    /// the keys it was fetched with. Unlike a list that is merely old, it
+    /// proves nothing either way, so admission refuses rather than take
+    /// it as stale.
+    pub damaged: bool,
 }
 
 impl Registrars {
@@ -282,6 +290,15 @@ impl Registrars {
         hosts.sort_unstable();
         hosts.dedup();
         Some(hosts)
+    }
+
+    /// Is a trusted registrar remembered as having attested `fp`?
+    pub fn attested(&self, fp: &Fingerprint) -> bool {
+        self.attested
+            .lock()
+            .unwrap()
+            .get(fp)
+            .is_some_and(|(hosts, _)| hosts.iter().any(|h| self.trusts(h)))
     }
 
     /// Forget the registrars that attested identities the sweep no longer
@@ -463,8 +480,9 @@ impl Registrars {
     /// The records path at `host`, discovering it, and its keys, when
     /// what is known of it is a day old, or a minute old and `again`.
     /// An operator-keyed registrar whose document cannot be had is asked
-    /// at the path a registrar serves by default, and not asked for the
-    /// document again until the day is out.
+    /// at the path last discovered, else the one a registrar serves by
+    /// default, and asked for the document again once that stand-in's
+    /// minute is out, whatever its records fetches did meanwhile.
     async fn discover(&self, host: &str, again: bool) -> Result<String, String> {
         let known = || {
             let fresh = if again { REDISCOVERY } else { DISCOVERY_TTL };
@@ -472,8 +490,16 @@ impl Registrars {
                 .lock()
                 .unwrap()
                 .get(host)
-                .filter(|d| self.clock.since(d.at) < fresh)
+                .filter(|d| self.clock.since(d.at) < fresh.min(d.ttl))
                 .map(|d| d.records.clone())
+        };
+        // The path last known, however old, else the default.
+        let last = || {
+            self.discovered
+                .lock()
+                .unwrap()
+                .get(host)
+                .map_or_else(|| RECORDS.into(), |d| d.records.clone())
         };
         if let Some(records) = known() {
             return Ok(records);
@@ -490,24 +516,40 @@ impl Registrars {
             return Ok(records);
         }
         let keyed = self.cfg.keys.contains_key(host);
-        if self
-            .failed
-            .lock()
-            .unwrap()
-            .get(host)
-            .is_some_and(|at| self.clock.since(*at) < REDISCOVERY)
+        // A keyed registrar's stand-in is its own minute: `failed`, which
+        // a records fetch at the wrong path renews, would hold it there.
+        if !keyed
+            && self
+                .failed
+                .lock()
+                .unwrap()
+                .get(host)
+                .is_some_and(|at| self.clock.since(*at) < REDISCOVERY)
         {
             return Err("discovery failed within the minute".into());
+        }
+        // A keyed registrar's stand-in, asked for again after the minute:
+        // a registrar serving its records elsewhere would otherwise be
+        // asked at the wrong path for a day, and a damaged list held from
+        // it never replaced. Written before the document is asked for, so
+        // an ask the handshake's wait cuts short is the minute's too.
+        if keyed {
+            let stand_in = Discovered {
+                keys: Vec::new(),
+                records: last(),
+                at: self.clock.now(),
+                ttl: REDISCOVERY,
+            };
+            self.discovered
+                .lock()
+                .unwrap()
+                .insert(host.to_owned(), stand_in);
         }
         let found = match (self.fetch_discovery(host).await, keyed) {
             (Ok(found), _) => found,
             (Err(e), true) => {
                 debug!(registrar = host, "discovery: {e}; using the configured key");
-                Discovered {
-                    keys: Vec::new(),
-                    records: RECORDS.into(),
-                    at: self.clock.now(),
-                }
+                return Ok(last());
             }
             (Err(e), false) => {
                 self.failed
@@ -559,6 +601,7 @@ impl Registrars {
             keys,
             records: records.trim_end_matches('/').to_owned(),
             at: self.clock.now(),
+            ttl: DISCOVERY_TTL,
         })
     }
 
@@ -669,10 +712,18 @@ impl Registrars {
             }
         }
         for l in held.iter().filter(|l| self.trusts(&l.registrar)) {
-            let Some(pages) = verified(l).filter(|_| self.under_configured_key(l)) else {
+            // Whole first: keys damaged beside a list can read as a key
+            // the operator replaced, while a list truly fetched under one
+            // still verifies under it, says nothing, and is stale.
+            let Some(pages) = verified(l) else {
+                lookup.damaged = true;
                 lookup.complete = false;
                 continue;
             };
+            if !self.under_configured_key(l) {
+                lookup.complete = false;
+                continue;
+            }
             let keys: Vec<PublicKey> = l.keys.iter().map(|(k, _)| *k).collect();
             let keys = RegistrarKeys {
                 host: &l.registrar,
@@ -795,7 +846,8 @@ mod tests {
     /// A cache that cannot be read, or a trusted list in it that does not
     /// verify or was fetched under a key the operator has since replaced,
     /// covers nobody: its silence is not a registrar's, and must not lift
-    /// a revocation it holds.
+    /// a revocation it holds. One that does not verify is damaged too,
+    /// which admission refuses.
     #[test]
     fn records_not_read_whole_cover_no_identity() {
         struct Unreadable;
@@ -861,7 +913,141 @@ mod tests {
                 i > 0,
                 "only the unreadable cache is unread"
             );
+            assert_eq!(
+                r.lookup_fp(fp, &[], 0).damaged,
+                i == 1,
+                "a list under a replaced key is stale, not damaged"
+            );
         }
+    }
+
+    /// An operator-keyed registrar whose discovery document could not be
+    /// had is asked for it again once the minute is out, however often its
+    /// records were asked for at the default path meanwhile, so a damaged
+    /// list held from one serving its records at a path of its own is
+    /// fetched whole there; and a document lost later keeps that path.
+    #[tokio::test]
+    async fn a_keyed_registrar_without_its_document_is_asked_again_after_the_minute() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const DOWN: u8 = 0;
+        const UP: u8 = 1;
+        const NO_DOCUMENT: u8 = 2;
+        let key = ServerKey::from_seed(&[3; 32]);
+        let fp = Fingerprint([7; 32]);
+        let cache = Arc::new(hxd_core::identity_records::MemoryRecordCache::default());
+        let damaged = CachedList {
+            registrar: "hl.example".into(),
+            pages: vec![],
+            keys: vec![(key.public(), None)],
+            fetched: 1,
+        };
+        cache.put(&fp.0, &damaged).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut r = registrars(cache);
+        r.cfg.keys.insert("hl.example".into(), key.public());
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        r.cfg.urls.insert("hl.example".into(), url);
+
+        let doc = serde_json::json!({ "registrar": {
+            "host": "hl.example",
+            "key": crate::identity::b64(&key.public()),
+            "endpoints": { "records": "/elsewhere" },
+        }})
+        .to_string();
+        let list = SignedList {
+            registrar: "hl.example".into(),
+            issued: r.clock.unix(),
+            expires: u64::MAX,
+            fingerprint: Some(fp.0),
+            since: None,
+            more: false,
+            entries: vec![],
+        }
+        .sign(ListKind::Records, &key);
+        let mode = Arc::new(AtomicU8::new(DOWN));
+        let serving = mode.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut c, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = c.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]);
+                let path = request.split(' ').nth(1).unwrap_or_default();
+                let mode = serving.load(Ordering::SeqCst);
+                let (status, body) = match path {
+                    _ if mode == DOWN => continue,
+                    "/.well-known/hotline" if mode == UP => ("200 OK", doc.as_bytes()),
+                    p if p.starts_with("/elsewhere/") => ("200 OK", &list[..]),
+                    _ => ("404 Not Found", &b""[..]),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = c.write_all(&[head.as_bytes(), body].concat()).await;
+            }
+        });
+        let whole = |r: &Registrars| !r.lookup_fp(fp, &[], 0).damaged;
+        async fn refresh(r: &Registrars, fp: Fingerprint) {
+            let now = r.clock.unix();
+            r.refresh_hosts(fp, &[("hl.example", Vec::new())], now, None)
+                .await;
+        }
+
+        // After a restart, with the registrar down.
+        refresh(&r, fp).await;
+        assert!(!whole(&r));
+        // Back, and asked at the default path within the minute, twice.
+        mode.store(UP, Ordering::SeqCst);
+        for _ in 0..2 {
+            r.clock.advance(REDISCOVERY / 2);
+            refresh(&r, fp).await;
+        }
+        assert!(whole(&r), "fetched whole once the minute was out");
+
+        mode.store(NO_DOCUMENT, Ordering::SeqCst);
+        r.clock.advance(DISCOVERY_TTL);
+        assert_eq!(r.discover("hl.example", false).await.unwrap(), "/elsewhere");
+    }
+
+    /// A keyed registrar's document asked for and never answered counts
+    /// as the minute's ask though the wait is cut short: a login within
+    /// the minute asks for it no more.
+    #[tokio::test]
+    async fn a_keyed_registrar_that_never_answers_is_asked_once_a_minute() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut r = registrars(Arc::new(
+            hxd_core::identity_records::MemoryRecordCache::default(),
+        ));
+        r.cfg
+            .keys
+            .insert("hl.example".into(), ServerKey::from_seed(&[3; 32]).public());
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        r.cfg.urls.insert("hl.example".into(), url);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (c, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                held.push(c);
+            }
+        });
+        let cut_short = Duration::from_millis(300);
+        for _ in 0..2 {
+            let _ = tokio::time::timeout(cut_short, r.discover("hl.example", false)).await;
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        r.clock.advance(REDISCOVERY);
+        let _ = tokio::time::timeout(cut_short, r.discover("hl.example", false)).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "and again after the minute"
+        );
     }
 
     #[test]

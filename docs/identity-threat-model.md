@@ -343,8 +343,9 @@ withhold, not forge; a stale or empty list is answered by the server's
 `revocation_stale` (`identity-registrar.md` §7.2) and by the user's
 second attestation elsewhere; the user may re-attest at a second
 registrar with the same key; servers keep cached attestations with a
-staleness limit rather than failing closed; the recovery code and key
-file do not depend on the registrar.
+staleness limit rather than failing closed, though a cached list that
+no longer verifies refuses, since it proves nothing either way; the
+recovery code and key file do not depend on the registrar.
 
 Residual risk: a withheld revocation leaves a stolen device key valid until
 expiry. A vanished registrar strands users who kept no other envelope.

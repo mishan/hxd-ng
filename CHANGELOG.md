@@ -242,6 +242,27 @@ as AGENTS.md's "Releasing" describes it.
   now apply to any card of an identity with a list held, whichever
   registrars the card names. An identity with no list on file, as one
   an operator linked by hand, is admitted as before.
+- A trusted registrar's list held damaged refuses the identity's every
+  device, `denied` at `/identity/auth` and refused at classic Prove
+  Device, whatever `revocation_stale` says, until the list is fetched
+  whole again; a revocation or rotation in another list it holds is
+  still answered as such. Under the default `cached`, such a list was
+  taken as stale and the login admitted on what it could read, so after
+  a restart, with the registrar out of reach, a device it had revoked
+  could sign in. While the records store cannot be read, an identity
+  whose card names a trusted registrar, or that one is remembered as
+  having attested, is refused the same way; any other is admitted as
+  before. The list is fetched again at each login, so the refusal ends
+  within a minute of the registrar answering (docs/identity-records.md
+  §3). A list never fetched, or past its lifetime, is
+  `revocation_stale`'s as before. For a registrar gone for good, take
+  it out of `trusted_registrars` and `registrar_keys`.
+- An operator-keyed registrar whose discovery document could not be had
+  is asked for it again after a minute rather than a day, however its
+  records fetches went meanwhile, keeping the records path last
+  discovered, so one serving its records at a path of its own is not
+  asked at the default one for a day. Without a document it is asked
+  for one once a minute while a list is due.
 - Push notifications to a revoked device. A device key revoked by the
   operator's list or by a trusted registrar's records, or one whose
   identity key is revoked, or frozen under `[identity] frozen = deny`,

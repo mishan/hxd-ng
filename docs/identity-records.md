@@ -67,7 +67,8 @@ is found, the records cache is durable, and the fetch is its own crate.
   keys they verified under and when they took effect, when fetched), so
   `revocation_stale = cached` still has something to use after a restart
   while the registrar is down. A list is re-verified as it is read back,
-  so a row damaged is a list refused; the keys beside it are trusted as
+  so a list whose bytes are damaged in place is refused, and its
+  identity's admission with it (§3); the keys beside it are trusted as
   the rest of the server's own files are.
 - **A revocation found ends sessions, as the local list's does.** §7
   fetches at three points, all of them admissions. A key revoked while
@@ -113,7 +114,43 @@ an identity with a list held, whichever registrars the card names. An
 identity with no list held here, no trusted registrar's attestation on
 its card and no trusted registrar remembered as having attested it at
 an earlier admission here, as one an operator linked by hand, has no
-registrar to ask and is never stale. What refuses a stolen key at a server that never
+registrar to ask and is never stale.
+
+A list held from a trusted registrar that does not verify as one whole
+list under the keys it was fetched with, its pages or the keys stored
+beside them damaged in place, is not stale but damaged (a row whose
+identity or registrar is damaged is lost, as a list never fetched): it
+proves nothing either way, a revocation it held included, so admission
+refuses every device of the identity `denied`, whatever
+`revocation_stale` says, once the identity's whole lists have had their
+say: a revocation or a rotation in one of them is still answered
+`revoked` or `rotated`. Not `revoked` for the damage itself, which a
+client takes as final and which nothing read here shows. So does a store
+that cannot be read, for an identity whose card names a trusted
+registrar or that one is remembered as having attested here; an identity
+with neither could have no list held, and is admitted as one with none,
+which after a restart includes a card that drops its attestations.
+Admission fetches a damaged list at once, as any list not current, and a
+whole one replaces it, so the refusal lasts until the registrar answers:
+the next login after, or within the minute a failed discovery holds off
+the next; an operator-keyed registrar without a discovery document is
+asked for it once a minute while a list is due. A whole list fetched
+under an operator key since replaced says nothing and is stale, as one
+never fetched; and a list never fetched or merely old is
+`revocation_stale`'s as before.
+
+A registrar gone for good leaves the lists held from it damaged or old
+for as long as it is trusted. The way out is to stop trusting it: take
+it out of `trusted_registrars` and `registrar_keys` and restart. Lists
+held from a registrar not trusted are not read, so what it published,
+revocations included, no longer applies, and an identity no other
+trusted registrar attests is unattested, so `unattested` decides its
+admission; a device it revoked that must stay out goes in
+`revoked_devices`. A rotation this server already took from it, kept in
+the successors file when there is one (§4), still stands: its
+predecessor is refused `rotated` after the restart.
+
+What refuses a stolen key at a server that never
 held its list is its holder revoking it, and the operator's own
 `revoked_identities`.
 
