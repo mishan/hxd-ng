@@ -78,15 +78,15 @@ as AGENTS.md's "Releasing" describes it.
   reset one past the highest epoch any of them verifies to every
   registrar the identity is registered at, each one its card's
   attestations name and each `--registrar`, catching up one more than 16
-  behind in steps. It is done at a registrar once its answer names a
-  record this run posted at that epoch; it names every registrar where
-  it is not, with `retry_after` when one is rate-limited, and a rerun
-  resets once more. This machine's own certificate is renewed at the new
-  epoch. `hlid cert` mints at the highest epoch learned, kept in
+  behind in steps. It is done at a registrar only once a signed read of
+  its list after the post shows the record this run posted at that
+  epoch; it names every registrar where it is not, with `retry_after`
+  when one is rate-limited, and a rerun resets once more. This machine's
+  own certificate is renewed at the new epoch once any list shows a floor
+  above it. `hlid cert` mints at the highest epoch learned, kept in
   `$HLID_HOME/holder.json` with the registrars `hlid register` registered
-  at. A reset is done at a registrar only once a read of its list shows
-  the record this run posted, and a registrar the identity is no longer
-  registered at is dropped with `--forget URL`. `enroll`, `agent` and
+  at, and a registrar the identity is no longer registered at is dropped
+  with `--forget URL`. `enroll`, `agent` and
   `restore` still mint at epoch 0, and `hlid register` does not yet post
   the current epoch to a registrar it registers at.
 

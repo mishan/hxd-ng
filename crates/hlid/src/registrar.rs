@@ -67,8 +67,9 @@ fn discover(a: &Args) -> R<Registrar> {
 }
 
 /// `--registrar`'s value as the base URL it is reached at, spelled one
-/// way: scheme and host in lowercase, no default port and no trailing
-/// slash, so that two spellings of one origin are one registrar.
+/// way: scheme and host in lowercase, the port as a number and none when
+/// it is the scheme's default, and no trailing slash, so that two
+/// spellings of one origin are one registrar.
 pub(crate) fn base_of(target: &str) -> String {
     let url = match target.contains("://") {
         true => target.to_owned(),
@@ -82,12 +83,25 @@ pub(crate) fn base_of(target: &str) -> String {
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
     let mut authority = authority.to_ascii_lowercase();
     let default = match scheme.as_str() {
-        "https" => Some(":443"),
-        "http" => Some(":80"),
+        "https" => Some(443),
+        "http" => Some(80),
         _ => None,
     };
-    if let Some(port) = default.filter(|p| authority.ends_with(p)) {
-        authority.truncate(authority.len() - port.len());
+    // After the last `:` outside an IPv6 address's brackets.
+    let port_at = authority
+        .rfind(':')
+        .filter(|&i| !authority[i..].contains(']'));
+    if let Some(i) = port_at {
+        let digits = &authority[i + 1..];
+        let port = Some(digits)
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<u16>().ok());
+        if let Some(port) = port {
+            authority.truncate(i);
+            if default != Some(port) {
+                authority.push_str(&format!(":{port}"));
+            }
+        }
     }
     format!("{scheme}://{authority}{path}")
 }
@@ -260,11 +274,16 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
     // Where `hlid devices reset` posts.
     let kept = crate::devices::Holder::open(&id.public(), true)
         .and_then(|h| h.map_or(Ok(()), |mut h| h.add_registrar(&reg.base, &reg.host)));
-    if let Err(e) = kept {
-        eprintln!("hlid: this registrar was not kept for `hlid devices reset`: {e}");
-    }
+    // Registered, but a reset would leave this registrar out, or still
+    // take it for forgotten: an exit that says so, once the card is put.
+    let kept = kept.map_err(|e| {
+        format!(
+            "registered, but this holder did not keep the registrar for `hlid devices \
+             reset` ({e}); run this `hlid register` again once that is fixed"
+        )
+    });
     if a.has("no-put") {
-        return Ok(());
+        return kept;
     }
     // The registrar serves the card; a server that has only a handle does
     // `lookup` and then `card` (§6.4). Putting it takes a device that can
@@ -276,7 +295,7 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
              it will be at your next login there"
         ),
     }
-    Ok(())
+    kept
 }
 
 /// Make — or reuse — the successor key, and commit to it. The key is

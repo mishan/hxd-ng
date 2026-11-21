@@ -70,13 +70,19 @@ pub(crate) struct Holder {
     path: PathBuf,
     doc: Value,
     fp: String,
-    _lock: std::fs::File,
+    /// `None` only for a mint from a home it cannot write (see [`open`]).
+    ///
+    /// [`open`]: Holder::open
+    _lock: Option<std::fs::File>,
 }
 
 impl Holder {
     /// `None` when there is no `$HLID_HOME` or `$HOME`, or with `make`
     /// unset, no such directory. With it, the directory is made if it is
-    /// not there, so the file is locked from the first.
+    /// not there, so the file is locked from the first. Without it, a home
+    /// that cannot be written, as on a read-only mount, is read unlocked,
+    /// and is `None` when it keeps no `holder.json`: a mint needs only the
+    /// floor, and nothing there can raise it.
     pub(crate) fn open(identity: &PublicKey, make: bool) -> R<Option<Holder>> {
         let Ok(home) = crate::hlid_home() else {
             return Ok(None);
@@ -85,8 +91,29 @@ impl Holder {
             return Ok(None);
         }
         crate::create_private_dir(&home)?;
-        let lock = lock(&home.join(LOCK_FILE))?;
         let path = home.join(HOLDER_FILE);
+        let lock = match lock(&home.join(LOCK_FILE)) {
+            Ok(f) => Some(f),
+            Err((e, _))
+                if !make
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::ReadOnlyFilesystem
+                    ) =>
+            {
+                if !path.exists() {
+                    return Ok(None);
+                }
+                eprintln!(
+                    "hlid: {} cannot be locked ({e}); reading the device epoch it keeps \
+                     without the lock",
+                    home.display()
+                );
+                None
+            }
+            Err((_, why)) => return Err(why),
+        };
         let failed = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
         let doc: Value = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| failed(&e))?,
@@ -123,6 +150,20 @@ impl Holder {
         }
         self.entry_mut()["epoch"] = json!(epoch);
         self.save()
+    }
+
+    /// One past the higher of the kept floor and `known`, kept as the
+    /// floor, read and raised under the one hold of the lock: a reset run
+    /// meanwhile in this home, and a mint at its epoch, are passed.
+    pub(crate) fn next(&mut self, known: u64) -> R<u64> {
+        let target = self
+            .floor()
+            .max(known)
+            .checked_add(1)
+            .filter(|t| *t <= hl_identity::cert::EPOCH_MAX)
+            .ok_or("the identity has no epoch left to reset to; rotate it instead")?;
+        self.raise(target)?;
+        Ok(target)
     }
 
     pub(crate) fn registrars(&self) -> Vec<(String, String)> {
@@ -190,21 +231,26 @@ impl Holder {
     }
 }
 
-/// Take `path`'s lock, saying so when this waits for whoever has it.
-fn lock(path: &std::path::Path) -> R<std::fs::File> {
-    let failed = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+/// Take `path`'s lock, saying so when this waits for whoever has it. A
+/// failure to open it comes with its error, so a caller can tell a home
+/// it may not write.
+fn lock(path: &std::path::Path) -> Result<std::fs::File, (std::io::Error, String)> {
+    let failed = |e: std::io::Error| {
+        let why = format!("{}: {e}", path.display());
+        (e, why)
+    };
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .map_err(|e| failed(&e))?;
+        .map_err(failed)?;
     #[cfg(unix)]
     {
         use rustix::fs::{flock, FlockOperation};
         if flock(&f, FlockOperation::NonBlockingLockExclusive).is_err() {
             eprintln!("hlid: waiting for another hlid ({})", path.display());
-            flock(&f, FlockOperation::LockExclusive).map_err(|e| failed(&e))?;
+            flock(&f, FlockOperation::LockExclusive).map_err(|e| failed(e.into()))?;
         }
     }
     Ok(f)
@@ -343,7 +389,7 @@ impl Desk for Remote {
             .map_err(|e| format!("{url}: {e}"))?;
             let list = SignedList::parse(&body, ListKind::Records, rk)
                 .map_err(|e| format!("{url}: the list does not verify: {e}"))?;
-            if list.fingerprint != Some(fp.0) {
+            if !answers(&list, &fp.0, since) {
                 return Err(format!("{url}: the list is not the one asked for"));
             }
             for (_, bytes) in &list.entries {
@@ -394,6 +440,12 @@ impl Desk for Remote {
     fn pause(&self) {
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Whether a page of a per-identity list is the one asked for: that
+/// identity's, from the cursor asked for, so no entries are passed over.
+fn answers(list: &SignedList, fingerprint: &[u8; 32], since: Option<u64>) -> bool {
+    list.fingerprint.as_ref() == Some(fingerprint) && list.since == since
 }
 
 /// A registrar's reply to a device epoch.
@@ -451,6 +503,8 @@ enum Step {
     /// It answered at the target with a record this run posted, which its
     /// list must bear out before it is done.
     Answered,
+    /// Every reply was lost, so a post may have landed: its list says.
+    Lost(String),
     NotDone(String),
     /// It answered above what was posted, or at it with a record this run
     /// did not post: another holder's reset, if its list bears it out.
@@ -507,7 +561,7 @@ fn drive(
             Answer::Lost(why) => {
                 lost += 1;
                 if lost >= TRIES {
-                    return Ok(Step::NotDone(why));
+                    return Ok(Step::Lost(why));
                 }
                 desk.pause();
             }
@@ -525,6 +579,8 @@ enum State {
     Open,
     /// Answered at the target; to be read again.
     Answered,
+    /// Its replies lost, with why; to be read again.
+    Lost(String),
     Done,
     Out(String),
 }
@@ -536,20 +592,46 @@ struct Slot<'a> {
     cur: Current,
     /// What it answered in the last round that its list must bear out.
     claim: Option<u64>,
+    /// Discovered as the registrar expected, so its list counts.
+    trusted: bool,
+}
+
+/// The floor a reset keeps, as `holder.json` does.
+pub(crate) trait Kept {
+    /// Raise it to at least `epoch`.
+    fn raise(&mut self, epoch: u64) -> R<()>;
+    /// A target past it and `known`, kept as it in the same step.
+    fn next(&mut self, known: u64) -> R<u64>;
+}
+
+struct HomeFloor(PublicKey);
+
+impl Kept for HomeFloor {
+    fn raise(&mut self, epoch: u64) -> R<()> {
+        holder(&self.0)?.raise(epoch)
+    }
+
+    fn next(&mut self, known: u64) -> R<u64> {
+        holder(&self.0)?.next(known)
+    }
 }
 
 /// What a reset came to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Report {
     pub(crate) target: u64,
+    /// The highest epoch a list read showed, done or not: a certificate
+    /// below it is refused already.
+    pub(crate) published: u64,
     pub(crate) done: Vec<String>,
     /// Each with why.
     pub(crate) not_done: Vec<String>,
 }
 
 /// Reset at every one of `desks`, from the floor this holder knows.
-/// `raise` keeps a floor learned: from the lists as they are read, and
-/// the target before anything is posted for it. With no list read there
+/// `kept` keeps a floor learned: from the lists as they are read, and
+/// the target before anything is posted for it, chosen past what it
+/// keeps then. With no list read there
 /// is no reset, and nothing raised. A registrar is done only once a read
 /// of its list shows the target with a record this run posted: answers
 /// are not signed.
@@ -557,7 +639,7 @@ pub(crate) fn reset_all(
     id: &IdentityKey,
     floor: u64,
     desks: Vec<(Target, &mut dyn Desk)>,
-    raise: &mut dyn FnMut(u64) -> R<()>,
+    kept: &mut dyn Kept,
     tell: &mut dyn FnMut(&str),
 ) -> R<Report> {
     let mut slots: Vec<Slot> = desks
@@ -575,6 +657,7 @@ pub(crate) fn reset_all(
             Slot {
                 base: t.base,
                 desk,
+                trusted: matches!(state, State::Open),
                 state,
                 cur: Current::default(),
                 claim: None,
@@ -587,6 +670,7 @@ pub(crate) fn reset_all(
     let mut target = 0;
     // The target last posted, which a re-target in the last round passed.
     let mut posted_at = None;
+    let mut published = 0;
     for round in 0..ROUNDS {
         let mut read = Vec::new();
         for (i, s) in slots.iter_mut().enumerate() {
@@ -617,14 +701,16 @@ pub(crate) fn reset_all(
         }
         let listed = read.iter().map(|&i| slots[i].cur.epoch).max().unwrap_or(0);
         known = known.max(listed);
-        raise(known)?;
+        published = published.max(listed);
+        kept.raise(known)?;
 
         // An answer is not signed: one its list does not bear out is
         // reported, and not chased.
         for s in &mut slots {
             let landed = s.cur.epoch == target && ours(&s.cur, &posted);
             match (&s.state, landed) {
-                (State::Open | State::Answered, true) => s.state = State::Done,
+                (State::Open | State::Answered | State::Lost(_), true) => s.state = State::Done,
+                (State::Lost(why), false) => s.state = State::Out(why.clone()),
                 // Read again and no longer there, as after a restore.
                 (State::Done, false) => s.state = State::Open,
                 _ => {}
@@ -654,12 +740,8 @@ pub(crate) fn reset_all(
             if round > 0 {
                 tell("another holder reset meanwhile; resetting past it");
             }
-            target = known
-                .checked_add(1)
-                .filter(|t| *t <= hl_identity::cert::EPOCH_MAX)
-                .ok_or("the identity has no epoch left to reset to; rotate it instead")?;
+            target = kept.next(known)?;
             known = target;
-            raise(target)?;
             for s in &mut slots {
                 if matches!(s.state, State::Done) {
                     s.state = State::Open;
@@ -677,6 +759,7 @@ pub(crate) fn reset_all(
             }
             match drive(&s.base, target, s.cur, id, &mut posted, &mut *s.desk)? {
                 Step::Answered => s.state = State::Answered,
+                Step::Lost(why) => s.state = State::Lost(why),
                 Step::NotDone(why) => s.state = State::Out(why),
                 Step::Claimed(e) => {
                     s.claim = Some(e);
@@ -689,15 +772,28 @@ pub(crate) fn reset_all(
             }
         }
     }
+    // What a registrar given up on published before it was is read once
+    // more, so the floor it shows counts.
+    for s in &mut slots {
+        if s.trusted && matches!(s.state, State::Out(_)) {
+            if let Ok(c) = s.desk.read() {
+                published = published.max(c.epoch);
+            }
+        }
+    }
+    kept.raise(published)?;
     let mut report = Report {
         target: posted_at.unwrap_or(target),
+        published,
         done: Vec::new(),
         not_done: Vec::new(),
     };
     for s in slots {
         match s.state {
             State::Done => report.done.push(s.base),
-            State::Out(why) => report.not_done.push(format!("{}: {why}", s.base)),
+            State::Out(why) | State::Lost(why) => {
+                report.not_done.push(format!("{}: {why}", s.base))
+            }
             State::Open | State::Answered => report.not_done.push(format!(
                 "{}: another holder reset past epoch {} meanwhile; run it again",
                 s.base, report.target
@@ -795,20 +891,22 @@ fn reset_cmd(args: &[String]) -> R<()> {
         &id,
         floor,
         desks,
-        &mut |epoch| holder(&id.public())?.raise(epoch),
+        &mut HomeFloor(id.public()),
         &mut |line| eprintln!("hlid: {line}"),
     )?;
     for base in &report.done {
         println!("epoch {} published at {base}", report.target);
     }
-    let renewed = match report.done.is_empty() {
-        true => Ok(()),
-        false => renew_own(&a, &id),
+    // Renewed once any list shows a floor, done here or not: a
+    // certificate below it is refused already.
+    let renewed = match report.published {
+        0 => Ok(()),
+        floor => renew_own(&a, &id, floor),
     };
     if report.not_done.is_empty() {
         println!(
             "{} {} epoch {}, and servers that enforce device epochs refuse certificates below \
-             it. Enroll each device you still use again, with a new device key",
+             it. Give each device you still use a new key, and certify it with `hlid cert`",
             report.done.join(", "),
             match report.done.len() {
                 1 => "publishes",
@@ -833,9 +931,11 @@ fn reset_cmd(args: &[String]) -> R<()> {
 /// caps, name and lifetime: the reset is not about the machine holding
 /// the identity key. Only this machine's: a certificate of another
 /// device renewed with its key would undo the reset for that key
-/// (enrollment §8). Nothing to renew is not a failure; a renewal that
-/// could not be made is.
-fn renew_own(a: &Args, id: &IdentityKey) -> R<()> {
+/// (enrollment §8), so this machine's is the one `device.key` in its
+/// home certifies, whatever `--device` names. It is renewed when it is
+/// below `published`, at the floor kept. Nothing to renew is not a
+/// failure; a renewal that could not be made is.
+fn renew_own(a: &Args, id: &IdentityKey, published: u64) -> R<()> {
     let Some(path) = a.file_opt("cert", CERT_FILE) else {
         return Ok(());
     };
@@ -846,10 +946,14 @@ fn renew_own(a: &Args, id: &IdentityKey) -> R<()> {
     if old.identity != id.public() {
         return Ok(());
     }
-    let own = a
-        .file_opt("device", crate::DEVICE_KEY)
-        .map(|p| crate::read_seed(&p).map(|seed| DeviceKey::from_seed(&seed).public()))
-        .transpose()?;
+    if old.epoch >= published {
+        return Ok(());
+    }
+    let own = crate::hlid_home()?.join(crate::DEVICE_KEY);
+    let own = match own.is_file() {
+        true => Some(DeviceKey::from_seed(&crate::read_seed(&own)?).public()),
+        false => None,
+    };
     let Some(own) = own else {
         println!(
             "no device key was found, so {} is not renewed",
@@ -867,6 +971,12 @@ fn renew_own(a: &Args, id: &IdentityKey) -> R<()> {
     }
     // Read under the lock, as every mint is.
     let holder = holder(&id.public())?;
+    if holder.floor() < published {
+        return Err(failed(&format!(
+            "the epoch kept, {}, is below the {published} a registrar shows",
+            holder.floor()
+        )));
+    }
     if old.epoch >= holder.floor() {
         return Ok(());
     }
@@ -915,6 +1025,10 @@ mod tests {
         below: bool,
         /// Answers `not_registered`.
         unregistered: bool,
+        /// Loses every post before it lands.
+        drop_posts: bool,
+        /// Reads that fail before one succeeds.
+        unread: usize,
         /// Drops its latest record at this read, as a restore would.
         rollback_at: Option<usize>,
         reads: usize,
@@ -971,6 +1085,10 @@ mod tests {
 
         fn read(&mut self) -> R<Current> {
             self.reads += 1;
+            if self.unread > 0 {
+                self.unread -= 1;
+                return Err("connection reset".into());
+            }
             if self.rollback_at == Some(self.reads) {
                 self.held.pop();
             }
@@ -986,6 +1104,9 @@ mod tests {
 
         fn post(&mut self, record: &[u8]) -> Result<(u16, Value), String> {
             self.posts += 1;
+            if self.drop_posts {
+                return Err("connection reset".into());
+            }
             if let Some(epoch) = self.lie {
                 return Ok((
                     200,
@@ -1026,8 +1147,40 @@ mod tests {
         IdentityKey::from_seed(&[1; 32])
     }
 
+    /// A kept floor, raised by another reset in the same home just as this
+    /// one chooses its target, when `bump` is set.
+    struct Mem {
+        floor: u64,
+        bump: Option<u64>,
+    }
+
+    impl Mem {
+        fn at(floor: u64) -> Mem {
+            Mem { floor, bump: None }
+        }
+    }
+
+    impl Kept for Mem {
+        fn raise(&mut self, epoch: u64) -> R<()> {
+            self.floor = self.floor.max(epoch);
+            Ok(())
+        }
+
+        fn next(&mut self, known: u64) -> R<u64> {
+            if let Some(b) = self.bump.take() {
+                self.floor = self.floor.max(b);
+            }
+            self.floor = self.floor.max(known) + 1;
+            Ok(self.floor)
+        }
+    }
+
     fn reset(floor: u64, sims: &mut [&mut Sim]) -> (R<Report>, u64) {
-        let mut kept = floor;
+        reset_with(&mut Mem::at(floor), sims)
+    }
+
+    fn reset_with(kept: &mut Mem, sims: &mut [&mut Sim]) -> (R<Report>, u64) {
+        let floor = kept.floor;
         let desks = sims
             .iter_mut()
             .enumerate()
@@ -1039,17 +1192,8 @@ mod tests {
                 (t, &mut **s as &mut dyn Desk)
             })
             .collect();
-        let report = reset_all(
-            &alice(),
-            floor,
-            desks,
-            &mut |e| {
-                kept = kept.max(e);
-                Ok(())
-            },
-            &mut |_| {},
-        );
-        (report, kept)
+        let report = reset_all(&alice(), floor, desks, kept, &mut |_| {});
+        (report, kept.floor)
     }
 
     fn signed(epoch: u64, time: u64) -> Vec<u8> {
@@ -1065,6 +1209,7 @@ mod tests {
     fn all_done(target: u64, n: usize) -> Report {
         Report {
             target,
+            published: target,
             done: (0..n).map(|i| format!("r{i}")).collect(),
             not_done: vec![],
         }
@@ -1092,11 +1237,84 @@ mod tests {
         assert_eq!(report.unwrap(), all_done(1, 1));
         assert_eq!((sim.epochs(), sim.posts), (vec![1], 2));
 
+        // Every reply lost, the post that landed is found in the list.
         let mut sim = Sim::named("a");
         sim.lose = TRIES;
+        let (report, _) = reset(0, &mut [&mut sim]);
+        assert_eq!(report.unwrap(), all_done(1, 1));
+        assert_eq!(sim.posts, TRIES);
+
+        let mut sim = Sim::named("a");
+        sim.drop_posts = true;
         let report = reset(0, &mut [&mut sim]).0.unwrap();
         assert_eq!(report.done, Vec::<String>::new());
         assert_eq!(report.not_done, vec!["r0: connection reset".to_string()]);
+    }
+
+    #[test]
+    fn the_target_is_past_a_floor_another_reset_here_kept_meanwhile() {
+        let mut kept = Mem {
+            floor: 0,
+            bump: Some(5),
+        };
+        let mut sim = Sim::named("a");
+        let (report, floor) = reset_with(&mut kept, &mut [&mut sim]);
+        assert_eq!(report.unwrap(), all_done(6, 1));
+        assert_eq!((sim.epochs(), floor), (vec![6], 6));
+    }
+
+    #[test]
+    fn what_a_reset_cut_short_published_is_reported() {
+        let mut sim = Sim::named("a");
+        sim.allowance = Some(4);
+        let report = reset(100, &mut [&mut sim]).0.unwrap();
+        assert_eq!(sim.epochs(), vec![16, 32, 48, 64]);
+        assert_eq!((report.target, report.published), (101, 64));
+        assert_eq!(report.done, Vec::<String>::new());
+
+        let mut sim = Sim::named("a");
+        sim.allowance = Some(0);
+        assert_eq!(reset(100, &mut [&mut sim]).0.unwrap().published, 0);
+    }
+
+    #[test]
+    fn a_floor_a_registrar_given_up_on_shows_is_kept() {
+        let mut ahead = Sim::named("a");
+        ahead.held.push((50, 0, [9; 32]));
+        ahead.unread = 1;
+        let mut other = Sim::named("b");
+        let (report, kept) = reset(10, &mut [&mut ahead, &mut other]);
+        let report = report.unwrap();
+        assert_eq!((report.target, report.published), (11, 50));
+        assert_eq!(kept, 50);
+    }
+
+    #[test]
+    fn a_page_is_the_identitys_from_the_cursor_asked() {
+        let page = |fingerprint, since| SignedList {
+            registrar: "r".into(),
+            issued: 0,
+            expires: 0,
+            fingerprint: Some(fingerprint),
+            since,
+            more: false,
+            entries: vec![],
+        };
+        let (fp, other) = ([1; 32], [2; 32]);
+        for (list, asked, ok) in [
+            (page(fp, None), None, true),
+            (page(fp, Some(9)), Some(9), true),
+            (page(fp, Some(3)), Some(9), false),
+            (page(fp, Some(9)), None, false),
+            (page(other, None), None, false),
+        ] {
+            assert_eq!(
+                answers(&list, &fp, asked),
+                ok,
+                "{:?} asked {asked:?}",
+                list.since
+            );
+        }
     }
 
     #[test]
@@ -1126,6 +1344,7 @@ mod tests {
             report.unwrap(),
             Report {
                 target: 1,
+                published: 1,
                 done: vec!["r1".into()],
                 not_done: vec!["r0: it answered epoch 1000000, and its list shows 0".into()],
             }
@@ -1172,7 +1391,7 @@ mod tests {
                 &mut b as &mut dyn Desk,
             ),
         ];
-        let report = reset_all(&alice(), 0, desks, &mut |_| Ok(()), &mut |_| {}).unwrap();
+        let report = reset_all(&alice(), 0, desks, &mut Mem::at(0), &mut |_| {}).unwrap();
         assert_eq!(report.done, vec!["r1".to_string()]);
         assert_eq!(
             report.not_done,
@@ -1220,6 +1439,7 @@ mod tests {
             report,
             Report {
                 target: 1,
+                published: 1,
                 done: vec![],
                 not_done: vec![
                     "r0: it answered epoch 1, and its list shows 0".into(),
@@ -1238,9 +1458,11 @@ mod tests {
         let named = [
             "R.example:443/",
             "s.example/",
-            "HTTP://127.0.0.1:80/",
+            "HTTP://127.0.0.1:080/",
             "http://127.0.0.1",
-            "https://r.example:8443",
+            "https://r.example:08443",
+            "https://R.example:0443",
+            "https://r.example:8443/",
         ];
         assert_eq!(
             targets(&kept, &attested, &named, &[]),
@@ -1263,6 +1485,8 @@ mod tests {
                 },
             ]
         );
+        // A port is digits alone.
+        assert_ne!(base_of("https://r.example:+443"), base_of("r.example"));
         // A card's attestation of a registrar forgotten is left out,
         // by the host it was registered under or by its URL.
         let forgotten = [

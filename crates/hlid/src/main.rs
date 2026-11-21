@@ -125,7 +125,7 @@ pub(crate) fn usage() -> ! {
         "  hlid revoke --registrar HOST|URL (--device-cert FILE | --device-pub HEX) [--reason lost|stolen|retired] [--by-device]\n",
         "  hlid revoke --registrar HOST|URL --identity-revoke --yes [--reason retired|compromised]\n",
         "  hlid rotate --registrar HOST|URL --to SUCCESSOR_KEY [--next-key FILE] [--identity K]\n",
-        "  hlid devices reset [--registrar HOST|URL]... [--forget URL]... [--identity K] [--card FILE] [--cert FILE] [--device K]\n",
+        "  hlid devices reset [--registrar HOST|URL]... [--forget URL]... [--identity K] [--card FILE] [--cert FILE]\n",
         "  hlid backup --registrar HOST|URL [--recovery] [--delete] [--identity K] [--password-file F | --password-stdin]\n",
         "  hlid restore --registrar HOST|URL --handle S [--recovery] [--name S] (--password-file F | --password-stdin)\n",
         "\n",
@@ -173,9 +173,9 @@ pub(crate) fn usage() -> ! {
         "registrar holds, at every registrar the identity is registered at or its\n",
         "card's attestations name, and at each --registrar: servers that enforce\n",
         "device epochs then refuse every certificate below it, whether or not this\n",
-        "machine remembers minting it. Each device you still use enrolls again,\n",
-        "with a new key; this machine's own certificate is renewed at the new\n",
-        "epoch. A run that is not done everywhere says where; running it again\n",
+        "machine remembers minting it. Each device you still use gets a new key,\n",
+        "certified with `hlid cert`; this machine's own certificate is renewed at\n",
+        "the new epoch. A run that is not done everywhere says where; running it again\n",
         "resets once more. --forget drops a registrar the identity is no longer\n",
         "registered at, for this run and the ones after. `hlid cert` mints at the highest epoch learned, kept in\n",
         "$HLID_HOME/holder.json, or at 0 with no $HLID_HOME or $HOME. Off Unix\n",
@@ -713,8 +713,8 @@ fn make_cert(args: &[String]) -> R<()> {
         Some(h) => h.floor(),
         None => {
             eprintln!(
-                "hlid: no $HLID_HOME or $HOME directory keeps a device epoch, so this is \
-                 minted at epoch 0, which servers that enforce device epochs refuse after any reset"
+                "hlid: no device epoch is kept for this identity in $HLID_HOME (or ~/.hlid), so \
+                 this is minted at epoch 0, which servers that enforce device epochs refuse after any reset"
             );
             0
         }

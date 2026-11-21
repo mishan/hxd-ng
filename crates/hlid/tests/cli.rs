@@ -321,6 +321,59 @@ fn a_certificate_minted_with_explicit_paths_makes_no_home() {
     assert!(!elsewhere.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_minted_from_a_home_it_cannot_write_at_the_epoch_kept_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    let init = ok(&home, &["init", "--name", "alice"]);
+    let fp = init
+        .lines()
+        .find_map(|l| l.strip_prefix("fingerprint:"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mint = |home: &Path| {
+        let out = hlid(
+            home,
+            &[
+                "cert",
+                "--identity",
+                home.join("identity.key").to_str().unwrap(),
+                "--device-pub",
+                &key_hex(DEVICE_PUB),
+                "--device-enc-pub",
+                &key_hex(DEVICE_ENC_PUB),
+                "-o",
+                cert.to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stderr}");
+        let epoch = hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap())
+            .unwrap()
+            .epoch;
+        (epoch, stderr)
+    };
+    mode(0o500);
+    let (epoch, stderr) = mint(&home);
+    assert_eq!(epoch, 0);
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    mode(0o700);
+    std::fs::write(
+        home.join("holder.json"),
+        format!("{{\"{fp}\": {{\"epoch\": 7}}}}"),
+    )
+    .unwrap();
+    mode(0o500);
+    let (epoch, stderr) = mint(&home);
+    mode(0o700);
+    assert_eq!(epoch, 7, "{stderr}");
+}
+
 #[test]
 fn a_reset_refuses_a_card_named_that_is_another_identitys() {
     let dir = tempfile::tempdir().unwrap();

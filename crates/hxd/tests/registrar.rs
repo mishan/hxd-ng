@@ -1850,12 +1850,21 @@ async fn hlid_resets_devices_at_every_registrar_and_a_rerun_past_a_daily_limit_r
     assert_eq!(epochs_at(&b, &alice).await, vec![4, 5]);
     assert_eq!(own().epoch, 5);
 
-    // The next day a rerun resets once more, past what `b` took. Named
-    // with --cert, another device's certificate is not renewed with its
-    // key: that would undo the reset for it.
+    // The next day a rerun resets once more, past what `b` took. Another
+    // device's certificate is not renewed with its key, even named with
+    // --cert and its key with --device: that would undo the reset for it.
     a.clock.advance(Duration::from_secs(86_400));
-    let web_arg = web.to_str().unwrap();
-    let (ok, out, err) = hlid(&bin, &home, &["devices", "reset", "--cert", web_arg]).await;
+    let (other_key, other_cert) = (dir.path().join("other.key"), dir.path().join("other.cert"));
+    let (other_key, other_cert) = (other_key.to_str().unwrap(), other_cert.to_str().unwrap());
+    assert!(hlid(&bin, &home, &["keygen", "device", other_key]).await.0);
+    let mint_other = ["cert", "--device", other_key, "-o", other_cert];
+    assert!(hlid(&bin, &home, &mint_other).await.0);
+    let other = || DeviceCert::parse(&std::fs::read(other_cert).unwrap()).unwrap();
+    assert_eq!(other().epoch, 5);
+    let args = [
+        "devices", "reset", "--cert", other_cert, "--device", other_key,
+    ];
+    let (ok, out, err) = hlid(&bin, &home, &args).await;
     assert!(ok, "{err}");
     assert!(
         out.contains(&format!("{ua}, {ub} publish epoch 6")),
@@ -1865,7 +1874,7 @@ async fn hlid_resets_devices_at_every_registrar_and_a_rerun_past_a_daily_limit_r
         out.contains("is not this machine's device's certificate"),
         "{out}"
     );
-    assert_eq!(minted().epoch, 4);
+    assert_eq!(other().epoch, 5);
     assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4, 6]);
     assert_eq!(epochs_at(&b, &alice).await, vec![4, 5, 6]);
     assert!(hlid(&bin, &home, &mint).await.0);
@@ -1881,6 +1890,33 @@ async fn hlid_resets_devices_at_every_registrar_and_a_rerun_past_a_daily_limit_r
     assert!(out.contains(&format!("{ua} publishes epoch 8")), "{out}");
     assert_eq!(epochs_at(&a, &alice).await, vec![1, 2, 3, 4, 6, 7, 8]);
     assert_eq!(epochs_at(&b, &alice).await, vec![4, 5, 6]);
+}
+
+#[tokio::test]
+async fn hlid_register_fails_when_it_cannot_keep_the_registrar_for_a_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "signup = \"open\"").await;
+    let bin = hlid_binary();
+    let home = dir.path().join("hlid");
+    assert!(hlid(&bin, &home, &["init", "--name", "Alice"]).await.0);
+    // A holder.json nothing can read or replace.
+    std::fs::create_dir(home.join("holder.json")).unwrap();
+    let url = format!("http://{}", s.ng);
+    let args = [
+        "register",
+        "--registrar",
+        &url,
+        "--handle",
+        "alice",
+        "--no-put",
+    ];
+    let (ok, out, err) = hlid(&bin, &home, &args).await;
+    assert!(!ok);
+    assert!(out.contains("card updated at"), "{out}");
+    assert!(
+        err.contains("did not keep the registrar for `hlid devices reset`"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
