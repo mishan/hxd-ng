@@ -2173,6 +2173,10 @@ pub struct Core {
     /// what it changed, and across loading a mailbox's friends, so the
     /// two agree. Taken before `roster`, never while it is held.
     pub(crate) friend_writes: Mutex<()>,
+    /// The device epochs each identity's stored friendships were last
+    /// judged by (`Core::judge_floors`). Taken last, and held for no
+    /// other lock.
+    pub(crate) floors_judged: Mutex<HashMap<[u8; 32], crate::messaging::Epochs>>,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,

@@ -653,8 +653,10 @@ Three layers, all `cargo test --workspace`:
   keys: one made on a server and in place on the next once both
   present it, a withdrawal on one ending it on the other and refusing
   it there after, a revoked device's presentations dropped and brought
-  back by the device that stays, an offer refused from a password
-  session, under another device's signature or out of time, an
+  back by the device that stays, a friendship taken before a device
+  reset kept and presented again while one taken after it is dropped
+  when the floor is learned and refused after, an offer refused from a
+  password session, under another device's signature or out of time, an
   unlinked identity's session making no more acts, a block standing
   whatever becomes of its withdrawal, a rotation's record fetched and
   the friendship moved to the successor by an upgrade offer, and a
@@ -683,7 +685,10 @@ Three layers, all `cargo test --workspace`:
   on one server ending it on the other, its `Removed` 801 carrying the
   withdrawal, and its presentation refused `Withdrawn` there after; 802,
   805, 803 and 806 answering `Stale` and `Withdrawn`, the removal and
-  the block standing; 834 answering a rotation's record in chain order;
+  the block standing; a friendship taken before a device reset kept,
+  and one taken after it told `Removed` with no withdrawal when the
+  floor is learned and answered `AccountNotFound` after; 834 answering
+  a rotation's record in chain order;
   bit 15 confirmed only beside bits 6 and 13 where a device can be
   proved, and never bit 13; a session without bit 15 sent plain
   requests and entries, answered 833 as unimplemented and its offer

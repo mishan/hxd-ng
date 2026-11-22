@@ -4,8 +4,9 @@
 //! offers, acceptances and withdrawals with hl-identity's own API. A
 //! friendship made on one server is in place on the next with no new
 //! request, a withdrawal on one ends it on the other, a revoked device's
-//! presentations go with it, a rotation is followed, and a client that
-//! never asks, and a period client beside it all, see nothing new.
+//! presentations go with it, a device reset keeps only what was taken
+//! before it, a rotation is followed, and a client that never asks, and a
+//! period client beside it all, see nothing new.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -14,10 +15,11 @@ use std::time::Duration;
 
 use hl_identity::friendship::Pair;
 use hl_identity::{
-    cert, Acceptance, Card, DeviceCert, DeviceKey, Fingerprint, Friendship, IdentityKey,
-    LoginProof, Offer, Rotation, ServerKey, Withdrawal,
+    cert, Acceptance, Card, DeviceCert, DeviceEpoch, DeviceKey, Fingerprint, Friendship,
+    IdentityKey, LoginProof, Offer, Rotation, ServerKey, Withdrawal,
 };
-use hxd_core::{Core, MessagingPolicy, Revocations};
+use hxd_core::identity_records::KeptEpoch;
+use hxd_core::{Core, MessagingPolicy, Published, Revocations};
 use hxd_ng_session::{IdentityConfig, IdentityState, NgConfig, NgCtx, Registry};
 use hxd_session::{ServerConfig, ServerCtx};
 use hxd_store_sqlite::{SqliteStore, Synchronous};
@@ -100,7 +102,8 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
                 auth.clone(),
                 hxd_core::InboxPolicy::default(),
             )
-            .with_relationships(store)
+            .with_relationships(store.clone())
+            .with_record_cache(store)
             .with_messaging(MessagingPolicy {
                 enabled: messaging,
                 presence_debounce: Duration::from_millis(50),
@@ -386,6 +389,30 @@ async fn befriend(
     f
 }
 
+/// `who` reset its devices to epoch 1 at `time`, as `s` keeps the record
+/// and installs the floor the lists publish.
+fn reset(s: &Server, who: &Person, time: u64) {
+    let record = DeviceEpoch {
+        identity: who.id.public(),
+        epoch: 1,
+        time,
+    }
+    .sign(&who.id)
+    .unwrap();
+    let kept = KeptEpoch {
+        epoch: 1,
+        time,
+        record,
+    };
+    let records = s.core.record_cache().unwrap();
+    records.keep_epoch(&fp(who).0, &kept).unwrap();
+    s.core.set_published_revocations(Published {
+        floors: [(fp(who).0, 1)].into(),
+        covered: [fp(who).0].into(),
+        ..Default::default()
+    });
+}
+
 async fn present(c: &mut Client, withdrawals: &[&[u8]], friendships: &[&[u8]]) -> Value {
     let w: Vec<String> = withdrawals.iter().map(|b| b64(b)).collect();
     let f: Vec<String> = friendships.iter().map(|b| b64(b)).collect();
@@ -544,6 +571,37 @@ async fn a_revoked_device_takes_its_presentations_with_it() {
     let back = present(&mut alice2, &[], &[&f]).await;
     assert_eq!(back["friendships"][0]["result"], "ok");
     event(&mut bob1, "friend", |d| is_entry(d, "alice", "accepted")).await;
+}
+
+#[tokio::test]
+async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
+    let (alice, bob) = (person(1), person(2));
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let s1 = start(d1.path(), &alice, &bob, false, true).await;
+    let s2 = start(d2.path(), &alice, &bob, false, true).await;
+    let mut alice1 = device(&s1, &alice, 0, "alice").await;
+    let mut bob1 = device(&s1, &bob, 0, "bob").await;
+    let f = befriend(&mut alice1, &mut bob1, &alice, &bob).await;
+    // The second server takes it after the reset, before it learns of it.
+    let reset_at = now() + 1;
+    s2.core.clock().advance(Duration::from_secs(60));
+    let mut alice2 = device(&s2, &alice, 1, "alice").await;
+    let mut bob2 = device(&s2, &bob, 1, "bob").await;
+    present(&mut alice2, &[], &[&f]).await;
+    present(&mut bob2, &[], &[&f]).await;
+    event(&mut bob2, "friend", |d| is_entry(d, "alice", "accepted")).await;
+
+    reset(&s2, &alice, reset_at);
+    let gone = event(&mut bob2, "friend", |d| is_entry(d, "alice", "removed")).await;
+    assert!(gone["friend"].get("withdraw").is_none(), "{gone}");
+    let refused = present(&mut bob2, &[], &[&f]).await;
+    assert_eq!(refused["friendships"][0]["result"], "no_such_user");
+
+    reset(&s1, &alice, reset_at);
+    let kept = present(&mut bob1, &[], &[&f]).await;
+    assert_eq!(kept["friendships"][0]["result"], "ok", "held");
+    let listed = ok(&mut bob1, "friends", json!({})).await;
+    assert_eq!(listed["friends"][0]["friendships"], json!([hash(&f)]));
 }
 
 #[tokio::test]

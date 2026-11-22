@@ -74,8 +74,7 @@ as AGENTS.md's "Releasing" describes it.
   floor rose is dropped when the identity's records are next read
   whole, so the device it named is let back in once certified at the
   floor. A floor first learned at an admission leaves such a revocation
-  refusing until the next records sweep. Friendship objects are not yet
-  judged by it.
+  refusing until the next records sweep.
 
 - Schema 38 keeps each identity's device epoch records apart from the
   lists that carried them, by fingerprint, in a new
@@ -118,6 +117,25 @@ as AGENTS.md's "Releasing" describes it.
   it registers again at its next login. The main SQLite store migrates
   from schema 38 on first start; a build from before refuses the
   migrated file.
+
+- Schema 40 keeps when each portable friendship presentation was first
+  taken, and friendship objects are now judged by device epoch floors
+  (docs/proposals/portable-friends.md §6): an offer, an acceptance or a
+  withdrawal signed below its identity's floor is refused, a withdrawal
+  held here from a device since reset ends nothing, and a friendship with
+  a half below the floor stands only where this server took it before
+  that half's reset `time`. One presented that was not is answered
+  `AccountNotFound` on the classic wire and `no_such_user` on ng until
+  `Reset` has its answer, and the presenter's client keeps its copy.
+  When a floor is installed or rises, or a reset's earliest `time`
+  moves earlier, the presentations of friendships no longer held are
+  dropped, and an edge they kept active is told `Removed` with no
+  withdrawal, as are offers a device below the floor signed, leaving
+  their requests plain. Presentations from before read as taken when they were
+  last presented, so a friendship presented again after a reset the
+  server had not yet learned of may need remaking. The main SQLite store
+  migrates from schema 39 on first start; a build from before refuses
+  the migrated file.
 
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]

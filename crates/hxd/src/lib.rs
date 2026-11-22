@@ -4939,10 +4939,13 @@ pub fn build_ctx(
             .unwrap_or_else(|| Arc::new(hxd_core::MemoryModeration::default())),
         moderation::policy(config),
     );
-    let core = match stores.records {
-        Some(records) => core.with_record_cache(records),
-        None => core,
-    };
+    // One cache, the registrars' and the core's, which reads the device
+    // epochs kept in it.
+    let core = core.with_record_cache(
+        stores
+            .records
+            .unwrap_or_else(|| Arc::new(hxd_core::identity_records::MemoryRecordCache::default())),
+    );
     let core = match (stores.emoji, config.emoji.as_ref().filter(|e| e.enabled)) {
         (Some(store), Some(emoji)) => core
             .with_emoji(store, emoji.policy()?)

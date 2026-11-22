@@ -134,6 +134,14 @@ struct Inner {
 #[derive(Default)]
 pub struct MemoryRelationships {
     inner: Mutex<Inner>,
+    /// The next `unfriend`, `present` or `rotation_from` fails, for a
+    /// test of what a failed write or read leaves.
+    #[cfg(test)]
+    pub(crate) fail_unfriend: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_present: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_rotation_from: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryRelationships {
@@ -607,6 +615,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn unfriend(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<RelationId>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_unfriend
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("unfriend failed".into()));
+        }
         let mut inner = self.inner.lock().unwrap();
         let mut ended = Vec::new();
         for (x, y) in [(a, b), (b, a)] {
@@ -678,6 +693,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_present
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("present failed".into()));
+        }
         let mut inner = self.inner.lock().unwrap();
         let p = floor_presentation(p);
         let old = inner
@@ -845,6 +867,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn rotation_from(&self, from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_rotation_from
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("rotation_from failed".into()));
+        }
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .rotations
@@ -1167,6 +1196,7 @@ impl RelationshipStore for MemoryRelationships {
 fn floor_presentation(p: &Presentation) -> Presentation {
     Presentation {
         at: floor(p.at),
+        taken: floor(p.taken),
         ..p.clone()
     }
 }
