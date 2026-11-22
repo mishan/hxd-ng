@@ -820,11 +820,20 @@ impl Registrars {
                         seen.push((e, bytes));
                     }
                 }
-                let kept = keep_epochs(&*self.cache, fp, &seen)?;
-                if !held.is_empty() {
-                    self.cache.release_superseded(&fp.0)?;
-                }
-                Ok(kept)
+                let kept = keep_epochs(&*self.cache, fp, &seen).and_then(|kept| {
+                    if !held.is_empty() {
+                        self.cache.release_superseded(&fp.0)?;
+                    }
+                    Ok(kept)
+                });
+                // A store that reads and cannot write has lost nothing:
+                // the resets seen refuse beside what is kept, and the
+                // lists held stay held for a later lookup to keep.
+                kept.or_else(|e| {
+                    let rows = self.cache.epochs(&fp.0)?;
+                    warn!("identity device floor: {}; using what was read", e.0);
+                    Ok(kept_verified(fp, rows))
+                })
             })
         };
         match kept {
@@ -905,24 +914,29 @@ fn superseded_epochs(list: &CachedList, fp: Fingerprint) -> Vec<(DeviceEpoch, Ve
 }
 
 /// Hold `list` as superseded for `fp`, one list a registrar: in place of
-/// the one held unless that one carries every epoch `list` does, or a
-/// higher one, so that a registrar alternating lists piles nothing up
-/// and the higher floor stands.
+/// the one held unless that one carries every epoch `list` does, each
+/// reset as early, or a higher one, so that a registrar alternating
+/// lists piles nothing up, the higher floor stands, and failing that the
+/// earlier reset.
 fn hold_superseded(
     cache: &dyn RecordCache,
     fp: Fingerprint,
     list: &CachedList,
 ) -> Result<(), hxd_core::StoreError> {
-    let epochs = |l: &CachedList| -> Vec<u64> {
+    let epochs = |l: &CachedList| -> Vec<(u64, u64)> {
         superseded_epochs(l, fp)
             .into_iter()
-            .map(|(e, _)| e.epoch)
+            .map(|(e, _)| (e.epoch, e.time))
             .collect()
     };
     let new = epochs(list);
     let keeps = |held: &CachedList| {
         let held = epochs(held);
-        new.iter().all(|e| held.contains(e)) || held.iter().max() > new.iter().max()
+        let max = |l: &[(u64, u64)]| l.iter().map(|(e, _)| *e).max();
+        max(&held) > max(&new)
+            || new
+                .iter()
+                .all(|(e, t)| held.iter().any(|(h, at)| h == e && at <= t))
     };
     let held = cache.superseded(&fp.0)?;
     if held
@@ -1519,46 +1533,56 @@ mod tests {
         assert_eq!(kept_floor(&cache, &fp).unwrap(), 1);
     }
 
+    /// A whole list from hl.example carrying `alice`'s resets, each an
+    /// `(epoch, time)`.
+    fn resets(alice: &hl_identity::IdentityKey, resets: &[(u64, u64)], issued: u64) -> CachedList {
+        let (key, fp) = (
+            ServerKey::from_seed(&[3; 32]),
+            Fingerprint::of(&alice.public()),
+        );
+        let entries = resets
+            .iter()
+            .zip(1..)
+            .map(|(&(epoch, time), seq)| {
+                let e = DeviceEpoch {
+                    identity: alice.public(),
+                    epoch,
+                    time,
+                };
+                (seq, e.sign(alice).unwrap())
+            })
+            .collect();
+        let page = SignedList {
+            registrar: "hl.example".into(),
+            issued,
+            expires: u64::MAX,
+            fingerprint: Some(fp.0),
+            since: None,
+            more: false,
+            entries,
+        }
+        .sign(ListKind::Records, &key);
+        CachedList {
+            registrar: "hl.example".into(),
+            pages: vec![page],
+            keys: vec![(key.public(), None)],
+            fetched: issued,
+        }
+    }
+
     /// One superseded list a registrar: a list carrying no epoch the held
-    /// one lacks, or only lower ones, is not held over it; one carrying
-    /// more replaces it.
+    /// one lacks, nor an earlier reset of one, or only lower ones, is not
+    /// held over it; one carrying more, or an earlier reset without
+    /// lowering the floor, replaces it.
     #[test]
     fn a_superseded_list_is_held_once_a_registrar() {
         use hl_identity::IdentityKey;
         let cache = hxd_core::identity_records::MemoryRecordCache::default();
-        let (alice, key) = (
-            IdentityKey::from_seed(&[1; 32]),
-            ServerKey::from_seed(&[3; 32]),
-        );
+        let alice = IdentityKey::from_seed(&[1; 32]);
         let fp = Fingerprint::of(&alice.public());
         let list = |epochs: &[u64], issued| {
-            let entries = epochs
-                .iter()
-                .map(|&epoch| {
-                    let e = DeviceEpoch {
-                        identity: alice.public(),
-                        epoch,
-                        time: 10,
-                    };
-                    (epoch, e.sign(&alice).unwrap())
-                })
-                .collect();
-            let page = SignedList {
-                registrar: "hl.example".into(),
-                issued,
-                expires: u64::MAX,
-                fingerprint: Some(fp.0),
-                since: None,
-                more: false,
-                entries,
-            }
-            .sign(ListKind::Records, &key);
-            CachedList {
-                registrar: "hl.example".into(),
-                pages: vec![page],
-                keys: vec![(key.public(), None)],
-                fetched: issued,
-            }
+            let at: Vec<_> = epochs.iter().map(|&e| (e, 10)).collect();
+            resets(&alice, &at, issued)
         };
         let held = || cache.superseded(&fp.0).unwrap();
         hold_superseded(&cache, fp, &list(&[1], 1)).unwrap();
@@ -1571,6 +1595,93 @@ mod tests {
         hold_superseded(&cache, fp, &list(&[1], 5)).unwrap();
         assert_eq!(held(), [list(&[1, 2], 4)], "nor a lower floor over it");
         assert_eq!(kept_floor(&cache, &fp).unwrap(), 2);
+
+        let earlier = resets(&alice, &[(1, 5), (2, 10)], 6);
+        hold_superseded(&cache, fp, &earlier).unwrap();
+        assert_eq!(
+            held(),
+            std::slice::from_ref(&earlier),
+            "an earlier reset replaces it"
+        );
+        hold_superseded(&cache, fp, &resets(&alice, &[(1, 1)], 7)).unwrap();
+        assert_eq!(held(), [earlier], "but not by lowering the floor");
+    }
+
+    /// Resets read whole refuse though they cannot be kept, and the list
+    /// held for them stays held for a later lookup to keep: a store that
+    /// reads and cannot write damages nothing it read.
+    #[test]
+    fn resets_that_cannot_be_kept_refuse_as_read() {
+        use hl_identity::IdentityKey;
+        use hxd_core::identity_records::MemoryRecordCache;
+        struct Unwritable(MemoryRecordCache);
+        impl RecordCache for Unwritable {
+            fn put(&self, _: &[u8; 32], _: &CachedList) -> Result<(), hxd_core::StoreError> {
+                Err(hxd_core::StoreError("read-only".into()))
+            }
+            fn lists(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.lists(i)
+            }
+            fn hold_superseded(
+                &self,
+                _: &[u8; 32],
+                _: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                Err(hxd_core::StoreError("read-only".into()))
+            }
+            fn superseded(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.superseded(i)
+            }
+            fn release_superseded(&self, _: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                Err(hxd_core::StoreError("read-only".into()))
+            }
+            fn first_seen(&self, i: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
+                self.0.first_seen(i, now)
+            }
+            fn keep_epoch(&self, _: &[u8; 32], _: &KeptEpoch) -> Result<(), hxd_core::StoreError> {
+                Err(hxd_core::StoreError("read-only".into()))
+            }
+            fn replace_epoch(
+                &self,
+                _: &[u8; 32],
+                _: &KeptEpoch,
+            ) -> Result<(), hxd_core::StoreError> {
+                Err(hxd_core::StoreError("read-only".into()))
+            }
+            fn epochs(&self, i: &[u8; 32]) -> Result<Vec<KeptEpoch>, hxd_core::StoreError> {
+                self.0.epochs(i)
+            }
+        }
+        let alice = IdentityKey::from_seed(&[1; 32]);
+        let fp = Fingerprint::of(&alice.public());
+        let cache = Arc::new(Unwritable(MemoryRecordCache::default()));
+        cache.0.put(&fp.0, &resets(&alice, &[(1, 10)], 1)).unwrap();
+        let superseded = resets(&alice, &[(2, 10)], 1);
+        cache.0.hold_superseded(&fp.0, &superseded).unwrap();
+        let kept = DeviceEpoch {
+            identity: alice.public(),
+            epoch: 3,
+            time: 10,
+        };
+        let kept = KeptEpoch {
+            epoch: 3,
+            time: 10,
+            record: kept.sign(&alice).unwrap(),
+        };
+        cache.0.keep_epoch(&fp.0, &kept).unwrap();
+        let found = registrars(cache.clone()).lookup_fp(fp, &[], 0);
+        assert!(found.read && !found.damaged, "nothing failed to read");
+        let mut floors: Vec<u64> = found
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::DeviceEpoch(e) => Some(e.epoch),
+                _ => None,
+            })
+            .collect();
+        floors.sort_unstable();
+        assert_eq!(floors, [1, 2, 3]);
+        assert_eq!(cache.0.superseded(&fp.0).unwrap(), [superseded]);
     }
 
     /// A reset held only in a list from a registrar no longer trusted

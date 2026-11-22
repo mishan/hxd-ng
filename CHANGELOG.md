@@ -84,7 +84,9 @@ as AGENTS.md's "Releasing" describes it.
   identity shows, even once its registrar, or every registrar, is no
   longer trusted; a certificate below it is told `revoked` with `epoch`
   under `revocation_stale = "deny"` too, not `denied`. A floor that
-  cannot be read refuses the identity `denied`. The main SQLite store
+  cannot be read refuses the identity `denied`; one that cannot be
+  written is applied as read, and a sweep that cannot read the store
+  keeps the floor installed. The main SQLite store
   migrates from schema 37 on first start, and a build from before
   refuses the migrated file: take a backup first (docs/operating.md,
   "Backups").
