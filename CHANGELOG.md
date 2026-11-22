@@ -69,8 +69,13 @@ as AGENTS.md's "Releasing" describes it.
   sweep ends its sessions on both wires, connected or detached, and a
   resume or a login on a socket that authenticated first is refused
   `revoked` with `epoch`. Nothing is sealed to it. With no reset every
-  certificate is admitted as before. A reset device's push
-  registrations and friendship presentations are not yet judged by it.
+  certificate is admitted as before. A device revocation signed by a
+  device below the floor is not applied, and one applied before the
+  floor rose is dropped when the identity's records are next read
+  whole, so the device it named is let back in once certified at the
+  floor. A floor first learned at an admission leaves such a revocation
+  refusing until the next records sweep. Friendship objects are not yet
+  judged by it.
 
 - Schema 38 keeps each identity's device epoch records apart from the
   lists that carried them, by fingerprint, in a new
@@ -102,6 +107,17 @@ as AGENTS.md's "Releasing" describes it.
   with `--forget URL`. `enroll`, `agent` and
   `restore` still mint at epoch 0, and `hlid register` does not yet post
   the current epoch to a registrar it registers at.
+- Schema 39 records the device epoch of each push registration's
+  certificate, and a reset takes the registrations its identity's
+  devices made below the floor, as a device revocation takes that
+  device's (docs/push-notifications.md §5.1). Registrations from before
+  read as epoch 0, so the first floor this server installs for an
+  identity takes them all, devices certified at or above it included:
+  for a reset already published or kept here, that is the first records
+  sweep after the upgrade. Such a device is sent no notifications until
+  it registers again at its next login. The main SQLite store migrates
+  from schema 38 on first start; a build from before refuses the
+  migrated file.
 
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]

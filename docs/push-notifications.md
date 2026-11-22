@@ -583,10 +583,15 @@ server revokes, on the operator's list or in what a trusted registrar
 publishes, is unsubscribed when that list is applied, and every device of
 a revoked identity with it, or of one frozen under `[identity] frozen =
 deny`, which fails closed: its devices register again at their next login
-once the freeze lifts. A password device of the same account is not
-unsubscribed, since its password is not the key revoked, and if it
-registered the same subscription, that endpoint is still pushed through
-its row.
+once the freeze lifts. A reset (identity-registrar.md §4.10) unsubscribes
+the same way every registration its identity's devices made under a
+certificate below the new floor: the index records each certificate's
+epoch. A registration from before it did reads as epoch 0, so the
+first floor a server installs for the identity takes it whatever its
+certificate, and that device is sent nothing until its next login. A
+password device of the same account is not unsubscribed, since its
+password is not the key revoked, and if it registered the same
+subscription, that endpoint is still pushed through its row.
 
 A registrar's revocation is applied by the records sweep
 (identity-records.md §2), each minute. It refreshes the lists of the

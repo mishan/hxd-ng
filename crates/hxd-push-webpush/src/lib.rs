@@ -634,6 +634,7 @@ mod tests {
             registered_at: SystemTime::now(),
             last_push_at: None,
             delivery_point: None,
+            epoch: 0,
         }
     }
 

@@ -25,6 +25,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn PushStore>) {
     linking_claims_and_deleting_purges(&*new_store());
     rotation_drops_what_the_successor_never_vouched_for(&*new_store());
     a_revoked_key_takes_the_rows_its_devices_made(&*new_store());
+    a_reset_takes_the_rows_its_devices_made_below_its_floor(&*new_store());
     the_identities_whose_devices_hold_rows_are_listed_once(&*new_store());
     a_mailbox_holds_a_bounded_number_of_devices(&*new_store());
     a_gone_answer_retires_only_the_endpoint_it_was_about(&*new_store());
@@ -70,6 +71,7 @@ fn device(owner: Mailbox, id: &str, endpoint: &str, at: u64) -> Device {
         registered_at: t(at),
         last_push_at: None,
         delivery_point: None,
+        epoch: 0,
     }
 }
 
@@ -386,6 +388,53 @@ fn a_revoked_key_takes_the_rows_its_devices_made(s: &dyn PushStore) {
         left(&theirs).is_empty(),
         "the operator's revocation is anyone's"
     );
+}
+
+fn a_reset_takes_the_rows_its_devices_made_below_its_floor(s: &dyn PushStore) {
+    let (old, kept, renewed) = (
+        DeviceId::of_device(&[1; 32]),
+        DeviceId::of_device(&[2; 32]),
+        DeviceId::of_device(&[3; 32]),
+    );
+    let mine = Mailbox::identified("bob", fp());
+    let theirs = Mailbox::identified("carol", [8; 32]);
+    for (owner, id, epoch, at) in [
+        (&mine, old.as_str(), 1, 100),
+        (&mine, kept.as_str(), 2, 101),
+        (&mine, renewed.as_str(), 3, 102),
+        (&mine, "bobs-password", 0, 103),
+        (&theirs, old.as_str(), 0, 104),
+    ] {
+        let d = Device {
+            epoch,
+            ..device(owner.clone(), id, "https://a.example/1", at)
+        };
+        s.register(&d, CAP).unwrap();
+    }
+    let left = |m: &Mailbox| -> Vec<String> {
+        let mut ids: Vec<_> = s
+            .devices(m, t(200))
+            .unwrap()
+            .into_iter()
+            .map(|d| d.devid.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let taken = s.devices_revoke_below(&fp(), 2).unwrap();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|d| (&d.devid, d.epoch))
+            .collect::<Vec<_>>(),
+        [(&old, 1)],
+        "the row below the floor, as it was"
+    );
+    let mut want = vec![kept.as_str(), renewed.as_str(), "bobs-password"];
+    want.sort();
+    assert_eq!(left(&mine), want, "the floor itself, and a password device");
+    assert_eq!(left(&theirs), [old.as_str()], "another identity's floor");
 }
 
 fn the_identities_whose_devices_hold_rows_are_listed_once(s: &dyn PushStore) {

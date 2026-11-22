@@ -77,6 +77,11 @@ impl Unrevoked {
             Unrevoked::LocalIdentity(i) | Unrevoked::PublishedIdentity(i) => {
                 d.owner.fingerprint == Some(*i) && d.devid.is_device_fingerprint()
             }
+            Unrevoked::PublishedFloor(i, floor) => {
+                d.owner.fingerprint == Some(*i)
+                    && d.devid.is_device_fingerprint()
+                    && d.epoch < *floor
+            }
         }
     }
 }
@@ -155,6 +160,14 @@ impl PushStore for Revoking {
         self.store.devices_revoke_identity(identity)
     }
 
+    fn devices_revoke_below(
+        &self,
+        identity: &[u8; 32],
+        floor: u64,
+    ) -> Result<Vec<Device>, StoreError> {
+        self.store.devices_revoke_below(identity, floor)
+    }
+
     fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
         self.store.device_identities()
     }
@@ -197,5 +210,48 @@ impl PushStore for Revoking {
 
     fn set_sidecar(&self, record: &SidecarRecord) -> Result<(), StoreError> {
         self.store.set_sidecar(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::push::MemoryDevices;
+    use crate::revoked::Published;
+
+    /// A row below a floor the lists hold is hidden with no key pending,
+    /// as between a floor's install and the delete that takes its rows.
+    #[test]
+    fn a_floor_installed_hides_the_rows_below_it() {
+        let identity = [7; 32];
+        let store = Arc::new(MemoryDevices::new());
+        let owner = Mailbox::identified("bob", identity);
+        for (device, epoch) in [([1; 32], 1), ([2; 32], 2)] {
+            let row = Device {
+                owner: owner.clone(),
+                devid: DeviceId::of_device(&device),
+                endpoint: "https://push.example/1".into(),
+                p256dh: [4; 65],
+                auth: [9; 16],
+                expires: None,
+                registered_at: SystemTime::now(),
+                last_push_at: None,
+                delivery_point: None,
+                epoch,
+            };
+            store.register(&row, 8).unwrap();
+        }
+        let refused = Arc::new(RwLock::new(Refused::default()));
+        refused.write().unwrap().published = Published {
+            floors: [(identity, 2)].into(),
+            ..Published::default()
+        };
+        let revoking = Revoking::new(store, refused);
+        let rows = revoking.devices(&owner, SystemTime::now()).unwrap();
+        assert_eq!(
+            rows.iter().map(|d| d.epoch).collect::<Vec<_>>(),
+            [2],
+            "the row at the floor alone"
+        );
     }
 }

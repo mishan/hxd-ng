@@ -182,6 +182,14 @@ impl Refused {
                 self.local.identities.contains(&i)
                     || self.rotated.contains(&i)
                     || self.published.is_revoked(&i, &dev)
+                    || self
+                        .published
+                        .below_floor(&CertRef {
+                            identity: i,
+                            device: dev,
+                            epoch: d.epoch,
+                        })
+                        .is_some()
             })
     }
 
@@ -203,6 +211,9 @@ impl Refused {
                 .devices
                 .contains(&(i, d))
                 .then_some(Unrevoked::PublishedDevice(i, d)),
+            self.published
+                .below_floor(&tag.cert())
+                .map(|floor| Unrevoked::PublishedFloor(i, floor)),
         ]
         .into_iter()
         .flatten()
@@ -221,6 +232,9 @@ impl Refused {
             }
             Unrevoked::PublishedDevice(i, d) => p.covered.contains(i) && !p.is_revoked(i, d),
             Unrevoked::PublishedIdentity(i) => p.covered.contains(i) && !p.refuses_identity(i),
+            Unrevoked::PublishedFloor(i, floor) => {
+                p.covered.contains(i) && p.floors.get(i).is_none_or(|held| held < floor)
+            }
         }
     }
 
@@ -346,8 +360,14 @@ impl Core {
     /// [`Self::set_revocations`] does for the operator's own list.
     /// Called off the reactor, as [`Self::set_revocations`] is.
     pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
-        let (identities, devices): (Vec<_>, Vec<_>) = {
+        let (identities, devices, floors): (Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
+            let risen = list
+                .floors
+                .iter()
+                .filter(|(i, floor)| refused.published.floors.get(*i) < Some(*floor))
+                .map(|(i, floor)| Unrevoked::PublishedFloor(*i, *floor))
+                .collect();
             let new = list
                 .devices
                 .difference(&refused.published.devices)
@@ -360,7 +380,7 @@ impl Core {
                 .copied()
                 .collect();
             refused.published = list.clone();
-            (ids, new)
+            (ids, new, risen)
         };
         let keys = devices
             .iter()
@@ -376,7 +396,7 @@ impl Core {
             ),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.take_revoked(keys.chain(ids).collect());
+        self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
         }
@@ -385,7 +405,8 @@ impl Core {
 
     /// Raise `identity`'s device epoch floor to `floor`, as a list fetched
     /// at an admission publishes it before the sweep installs it, and end
-    /// the sessions below it as the sweep would. `None` if the floor held
+    /// the sessions below it, and take their push registrations, as the
+    /// sweep would. `None` if the floor held
     /// is that high already. The sweep's next install replaces it with
     /// what the lists it reads say. Called off the reactor.
     pub fn raise_floor(&self, identity: [u8; 32], floor: u64) -> Option<Vec<(Uid, String)>> {
@@ -409,10 +430,12 @@ impl Core {
             }
             refused.published.floors.insert(identity, floor);
         }
-        Some(self.end_revoked(
+        let ended = self.end_revoked(
             |tag| tag.fingerprint == identity && tag.device_epoch < floor,
             |_| Some(EndedBy::BelowFloor(floor)),
-        ))
+        );
+        self.take_revoked(vec![Unrevoked::PublishedFloor(identity, floor)]);
+        Some(ended)
     }
 
     /// Refuse `identity` from now on, as a key its holder rotated away

@@ -255,6 +255,20 @@ impl PushStore for MemoryDevices {
         }))
     }
 
+    fn devices_revoke_below(
+        &self,
+        identity: &[u8; 32],
+        floor: u64,
+    ) -> Result<Vec<Device>, StoreError> {
+        self.failing()?;
+        let mut rows = self.rows.lock().unwrap();
+        Ok(take(&mut rows, |r| {
+            r.owner.fingerprint.as_ref() == Some(identity)
+                && r.devid.is_device_fingerprint()
+                && r.epoch < floor
+        }))
+    }
+
     fn device_identities(&self) -> Result<Vec<[u8; 32]>, StoreError> {
         let rows = self.rows.lock().unwrap();
         let mut ids: Vec<[u8; 32]> = rows

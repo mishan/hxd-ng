@@ -239,6 +239,7 @@ fn device(owner: &Mailbox, id: &str, endpoint: &str) -> Device {
         registered_at: SystemTime::now(),
         last_push_at: None,
         delivery_point: None,
+        epoch: 0,
     }
 }
 
