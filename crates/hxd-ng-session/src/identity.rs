@@ -2241,7 +2241,17 @@ impl IdentityState {
                     here.remove(&fp);
                 }
                 for fp in &live_ids {
-                    let part = slice_of(&refused, fp, here.get(fp));
+                    let mut part = slice_of(&refused, fp, here.get(fp));
+                    // One whose lists could not be read keeps the floor
+                    // installed, which an admission since the last sweep
+                    // may have raised.
+                    let installed = unread
+                        .contains(fp)
+                        .then(|| this.core.published_floor(&fp.0));
+                    if let Some(installed) = installed.flatten() {
+                        let floor = part.floors.entry(fp.0).or_default();
+                        *floor = (*floor).max(installed);
+                    }
                     here.insert(*fp, part);
                 }
                 for part in here.values().chain(found.values().map(|(_, p)| p)) {

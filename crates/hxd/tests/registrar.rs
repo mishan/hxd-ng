@@ -3582,14 +3582,49 @@ async fn the_sweep_installs_a_floor_held_in_a_list_no_longer_trusted() {
         30,
     )
     .await;
-    let _laptop_here = session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
-    identity.sweep_records().await;
     let below = hxd_core::CertRef {
         identity: alice.fingerprint().0,
         device: hl_identity::Fingerprint::of(&phone.public()).0,
         epoch: 0,
     };
+    let _laptop_here = session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
+    core.set_published_revocations(hxd_core::Published::default());
+    assert!(!core.refuses(&below));
+    identity.sweep_records().await;
     assert!(core.refuses(&below), "the sweep installed the floor");
+}
+
+#[tokio::test]
+async fn a_sweep_that_cannot_read_the_store_keeps_the_floor_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, core) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    let _laptop_here = session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
+    let below = hxd_core::CertRef {
+        identity: alice.fingerprint().0,
+        device: hl_identity::Fingerprint::of(&phone.public()).0,
+        epoch: 0,
+    };
+    assert!(core.refuses(&below), "the login installed the floor");
+
+    // Neither the lists nor the floor kept can be read.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE identity_records RENAME TO unreadable_records;
+             ALTER TABLE identity_device_floor RENAME TO unreadable_floor;",
+        )
+        .unwrap();
+    identity.sweep_records().await;
+    assert!(core.refuses(&below), "the sweep kept the floor installed");
 }
 
 #[tokio::test]

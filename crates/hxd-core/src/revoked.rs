@@ -403,6 +403,12 @@ impl Core {
         ended
     }
 
+    /// `identity`'s device epoch floor installed, if one is.
+    pub fn published_floor(&self, identity: &[u8; 32]) -> Option<u64> {
+        let refused = self.revoked.read().unwrap();
+        refused.published.floors.get(identity).copied()
+    }
+
     /// Raise `identity`'s device epoch floor to `floor`, as a list fetched
     /// at an admission publishes it before the sweep installs it, and end
     /// the sessions below it, and take their push registrations, as the
