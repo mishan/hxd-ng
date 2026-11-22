@@ -31,17 +31,26 @@ use crate::{
 const SUCCESSOR_KEY: &str = "successor.key";
 
 /// A registrar as discovery describes it.
-struct Registrar {
-    base: String,
-    host: String,
+pub(crate) struct Registrar {
+    pub(crate) base: String,
+    pub(crate) host: String,
     key: [u8; 32],
     retiring: Vec<[u8; 32]>,
     register: String,
-    records: String,
+    pub(crate) records: String,
     envelopes: Option<String>,
 }
 
-fn agent() -> ureq::Agent {
+impl Registrar {
+    /// Every key its lists and records may be signed by.
+    pub(crate) fn keys(&self) -> Vec<[u8; 32]> {
+        std::iter::once(self.key)
+            .chain(self.retiring.iter().copied())
+            .collect()
+    }
+}
+
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -54,12 +63,51 @@ fn key32(v: &Value, what: &str) -> R<[u8; 32]> {
 }
 
 fn discover(a: &Args) -> R<Registrar> {
-    let target = a.one("registrar")?;
-    let base = if target.contains("://") {
-        target.trim_end_matches('/').to_owned()
-    } else {
-        format!("https://{target}")
+    discover_at(a.one("registrar")?)
+}
+
+/// `--registrar`'s value as the base URL it is reached at, spelled one
+/// way: scheme and host in lowercase, the port as a number and none when
+/// it is the scheme's default, and no trailing slash, so that two
+/// spellings of one origin are one registrar.
+pub(crate) fn base_of(target: &str) -> String {
+    let url = match target.contains("://") {
+        true => target.to_owned(),
+        false => format!("https://{target}"),
     };
+    let url = url.trim_end_matches('/');
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let mut authority = authority.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    // After the last `:` outside an IPv6 address's brackets.
+    let port_at = authority
+        .rfind(':')
+        .filter(|&i| !authority[i..].contains(']'));
+    if let Some(i) = port_at {
+        let digits = &authority[i + 1..];
+        let port = Some(digits)
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<u16>().ok());
+        if let Some(port) = port {
+            authority.truncate(i);
+            if default != Some(port) {
+                authority.push_str(&format!(":{port}"));
+            }
+        }
+    }
+    format!("{scheme}://{authority}{path}")
+}
+
+pub(crate) fn discover_at(target: &str) -> R<Registrar> {
+    let base = base_of(target);
     let doc: Value = agent()
         .get(&format!("{base}/.well-known/hotline"))
         .call()
@@ -125,7 +173,7 @@ fn post(url: &str, field: &str, bytes: &[u8]) -> R<Value> {
     send(agent().post(url), json!({ field: b64(bytes) })).map_err(|(_, e)| e)
 }
 
-fn identity(a: &Args) -> R<IdentityKey> {
+pub(crate) fn identity(a: &Args) -> R<IdentityKey> {
     Ok(IdentityKey::from_seed(&read_seed(
         &a.file("identity", IDENTITY_KEY)?,
     )?))
@@ -180,9 +228,7 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
             .ok_or("reply has no attestation")?,
     )?;
     let att = Attestation::parse(&att_bytes).map_err(|e| format!("attestation: {e}"))?;
-    let keys: Vec<[u8; 32]> = std::iter::once(reg.key)
-        .chain(reg.retiring.iter().copied())
-        .collect();
+    let keys = reg.keys();
     if att.identity != id.public()
         || att.registrar != reg.host
         || !keys.contains(&att.registrar_key)
@@ -225,8 +271,19 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
         att.expires,
         card_path.display()
     );
+    // Where `hlid devices reset` posts.
+    let kept = crate::devices::Holder::open(&id.public(), true)
+        .and_then(|h| h.map_or(Ok(()), |mut h| h.add_registrar(&reg.base, &reg.host)));
+    // Registered, but a reset would leave this registrar out, or still
+    // take it for forgotten: an exit that says so, once the card is put.
+    let kept = kept.map_err(|e| {
+        format!(
+            "registered, but this holder did not keep the registrar for `hlid devices \
+             reset` ({e}); run this `hlid register` again once that is fixed"
+        )
+    });
     if a.has("no-put") {
-        return Ok(());
+        return kept;
     }
     // The registrar serves the card; a server that has only a handle does
     // `lookup` and then `card` (§6.4). Putting it takes a device that can
@@ -238,7 +295,7 @@ pub(crate) fn register_cmd(args: &[String]) -> R<()> {
              it will be at your next login there"
         ),
     }
-    Ok(())
+    kept
 }
 
 /// Make — or reuse — the successor key, and commit to it. The key is

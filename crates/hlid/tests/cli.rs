@@ -264,3 +264,236 @@ fn a_bundle_will_not_be_built_from_someone_elses_card() {
     );
     assert!(err.contains("card of"), "{err}");
 }
+
+#[test]
+fn a_certificate_minted_with_nowhere_to_keep_an_epoch_is_at_epoch_0_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let cert = dir.path().join("web.cert");
+    let out = Command::new(env!("CARGO_BIN_EXE_hlid"))
+        .env_remove("HLID_HOME")
+        .env_remove("HOME")
+        .args([
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    let cert = hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap()).unwrap();
+    assert_eq!(cert.epoch, 0);
+}
+
+#[test]
+fn a_certificate_minted_with_explicit_paths_makes_no_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let elsewhere = dir.path().join("never");
+    let cert = dir.path().join("web.cert");
+    let out = hlid(
+        &elsewhere,
+        &[
+            "cert",
+            "--identity",
+            home.join("identity.key").to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    assert!(!elsewhere.exists());
+}
+
+/// Whether `dir`'s mode stops this process, which it does not where the
+/// process may override it (root, or `CAP_DAC_OVERRIDE`). A test of a
+/// refusal says so and checks nothing when it does not.
+#[cfg(unix)]
+fn modes_hold(dir: &Path, test: &str) -> bool {
+    let probe = dir.join(".probe");
+    let held = std::fs::write(&probe, b"").is_err() && std::fs::metadata(&probe).is_err();
+    if !held {
+        let _ = std::fs::remove_file(&probe);
+        eprintln!(
+            "{test}: this process is not held to {}'s mode (root, or CAP_DAC_OVERRIDE), \
+             so the refusal cannot be checked here",
+            dir.display()
+        );
+    }
+    held
+}
+
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_minted_from_a_home_it_cannot_write_at_the_epoch_kept_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    let init = ok(&home, &["init", "--name", "alice"]);
+    let fp = init
+        .lines()
+        .find_map(|l| l.strip_prefix("fingerprint:"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mint = |home: &Path| {
+        let out = hlid(
+            home,
+            &[
+                "cert",
+                "--identity",
+                home.join("identity.key").to_str().unwrap(),
+                "--device-pub",
+                &key_hex(DEVICE_PUB),
+                "--device-enc-pub",
+                &key_hex(DEVICE_ENC_PUB),
+                "-o",
+                cert.to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stderr}");
+        let epoch = hl_identity::DeviceCert::parse(&std::fs::read(&cert).unwrap())
+            .unwrap()
+            .epoch;
+        (epoch, stderr)
+    };
+    mode(0o500);
+    if !modes_hold(&home, "a home it cannot write") {
+        mode(0o700);
+        return;
+    }
+    let (epoch, stderr) = mint(&home);
+    assert_eq!(epoch, 0);
+    assert!(stderr.contains("minted at epoch 0"), "{stderr}");
+    mode(0o700);
+    std::fs::write(
+        home.join("holder.json"),
+        format!("{{\"{fp}\": {{\"epoch\": 7}}}}"),
+    )
+    .unwrap();
+    mode(0o500);
+    let (epoch, stderr) = mint(&home);
+    mode(0o700);
+    assert_eq!(epoch, 7, "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_not_minted_from_a_home_it_cannot_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let key = dir.path().join("identity.key");
+    std::fs::copy(home.join("identity.key"), &key).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o600);
+    if !modes_hold(&home, "a home it cannot search") {
+        mode(0o700);
+        return;
+    }
+    let out = hlid(
+        &home,
+        &[
+            "cert",
+            "--identity",
+            key.to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    mode(0o700);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("holder.json"), "{stderr}");
+    assert!(!cert.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_not_minted_from_a_home_under_a_directory_it_cannot_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let key = dir.path().join("identity.key");
+    std::fs::copy(home.join("identity.key"), &key).unwrap();
+    let parent = dir.path().join("closed");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::rename(&home, parent.join("hlid")).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mode = |m| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o600);
+    if !modes_hold(&parent, "a home under a directory it cannot search") {
+        mode(0o700);
+        return;
+    }
+    let out = hlid(
+        &parent.join("hlid"),
+        &[
+            "cert",
+            "--identity",
+            key.to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    mode(0o700);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("closed/hlid"), "{stderr}");
+    assert!(!cert.exists());
+}
+
+#[test]
+fn a_reset_refuses_a_card_named_that_is_another_identitys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (home, other) = (dir.path().join("alice"), dir.path().join("bob"));
+    ok(&home, &["init", "--name", "alice"]);
+    ok(&other, &["init", "--name", "bob"]);
+    let bobs = other.join("card.bin");
+    let stderr = fails(
+        &home,
+        &[
+            "devices",
+            "reset",
+            "--card",
+            bobs.to_str().unwrap(),
+            "--registrar",
+            "http://127.0.0.1:1",
+        ],
+    );
+    assert!(stderr.contains("another identity's card"), "{stderr}");
+    assert!(
+        !stderr.contains("no registrar could be reached"),
+        "{stderr}"
+    );
+}
