@@ -75,7 +75,8 @@ as AGENTS.md's "Releasing" describes it.
 
 - `hlid devices reset` is the holder's side of device epochs. Each run
   reads every registrar's per-identity list, past any cache, and posts a
-  reset one past the highest epoch any of them verifies to every
+  reset one past the greater of the highest epoch any of them verifies
+  and the epoch this holder keeps to every
   registrar the identity is registered at, each one its card's
   attestations name and each `--registrar`, catching up one more than 16
   behind in steps. It is done at a registrar only once a signed read of

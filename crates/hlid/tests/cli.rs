@@ -321,6 +321,24 @@ fn a_certificate_minted_with_explicit_paths_makes_no_home() {
     assert!(!elsewhere.exists());
 }
 
+/// Whether `dir`'s mode stops this process, which it does not where the
+/// process may override it (root, or `CAP_DAC_OVERRIDE`). A test of a
+/// refusal says so and checks nothing when it does not.
+#[cfg(unix)]
+fn modes_hold(dir: &Path, test: &str) -> bool {
+    let probe = dir.join(".probe");
+    let held = std::fs::write(&probe, b"").is_err() && std::fs::metadata(&probe).is_err();
+    if !held {
+        let _ = std::fs::remove_file(&probe);
+        eprintln!(
+            "{test}: this process is not held to {}'s mode (root, or CAP_DAC_OVERRIDE), \
+             so the refusal cannot be checked here",
+            dir.display()
+        );
+    }
+    held
+}
+
 #[cfg(unix)]
 #[test]
 fn a_certificate_is_minted_from_a_home_it_cannot_write_at_the_epoch_kept_there() {
@@ -359,6 +377,10 @@ fn a_certificate_is_minted_from_a_home_it_cannot_write_at_the_epoch_kept_there()
         (epoch, stderr)
     };
     mode(0o500);
+    if !modes_hold(&home, "a home it cannot write") {
+        mode(0o700);
+        return;
+    }
     let (epoch, stderr) = mint(&home);
     assert_eq!(epoch, 0);
     assert!(stderr.contains("minted at epoch 0"), "{stderr}");
@@ -386,6 +408,10 @@ fn a_certificate_is_not_minted_from_a_home_it_cannot_search() {
     let cert = dir.path().join("web.cert");
     let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
     mode(0o600);
+    if !modes_hold(&home, "a home it cannot search") {
+        mode(0o700);
+        return;
+    }
     let out = hlid(
         &home,
         &[
@@ -404,6 +430,46 @@ fn a_certificate_is_not_minted_from_a_home_it_cannot_search() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("holder.json"), "{stderr}");
+    assert!(!cert.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_not_minted_from_a_home_under_a_directory_it_cannot_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let key = dir.path().join("identity.key");
+    std::fs::copy(home.join("identity.key"), &key).unwrap();
+    let parent = dir.path().join("closed");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::rename(&home, parent.join("hlid")).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mode = |m| std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o600);
+    if !modes_hold(&parent, "a home under a directory it cannot search") {
+        mode(0o700);
+        return;
+    }
+    let out = hlid(
+        &parent.join("hlid"),
+        &[
+            "cert",
+            "--identity",
+            key.to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    mode(0o700);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("closed/hlid"), "{stderr}");
     assert!(!cert.exists());
 }
 

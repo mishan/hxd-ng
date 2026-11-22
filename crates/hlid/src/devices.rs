@@ -87,8 +87,15 @@ impl Holder {
         let Ok(home) = crate::hlid_home() else {
             return Ok(None);
         };
-        if !make && !home.is_dir() {
-            return Ok(None);
+        // Only a home known to be absent is none: one under a directory
+        // that cannot be searched may keep a floor.
+        if !make {
+            match std::fs::metadata(&home) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(format!("{}: {e}", home.display())),
+            }
         }
         crate::create_private_dir(&home)?;
         let path = home.join(HOLDER_FILE);
@@ -741,20 +748,27 @@ pub(crate) fn reset_all(
                 let c = &slots[i].cur;
                 c.epoch > target || (c.epoch == target && !ours(c, &posted))
             });
+        // The last round only reads: past its target, it keeps the floor
+        // it read and reserves no target it would not post.
+        let last = round + 1 == ROUNDS;
         if stale {
-            if round > 0 {
-                tell("another holder reset meanwhile; resetting past it");
+            if last {
+                tell("another holder reset past this run's target meanwhile");
+            } else {
+                if round > 0 {
+                    tell("another holder reset meanwhile; resetting past it");
+                }
+                target = kept.next(known)?;
+                known = target;
             }
-            target = kept.next(known)?;
-            known = target;
             for s in &mut slots {
                 if matches!(s.state, State::Done) {
                     s.state = State::Open;
                 }
             }
         }
-        // The last round only reads, so every answer is read back.
-        if round + 1 == ROUNDS || !slots.iter().any(|s| matches!(s.state, State::Open)) {
+        // So every answer is read back.
+        if last || !slots.iter().any(|s| matches!(s.state, State::Open)) {
             break;
         }
         posted_at = Some(target);
@@ -778,11 +792,15 @@ pub(crate) fn reset_all(
         }
     }
     // What a registrar given up on published before it was is read once
-    // more, so the floor it shows counts.
+    // more, so the floor it shows counts, and its list may show this
+    // run's record after all.
     for s in &mut slots {
         if s.trusted && matches!(s.state, State::Out(_)) {
             if let Ok(c) = s.desk.read() {
                 published = published.max(c.epoch);
+                if posted_at == Some(c.epoch) && ours(&c, &posted) {
+                    s.state = State::Done;
+                }
             }
         }
     }
@@ -1027,7 +1045,7 @@ mod tests {
         allowance: Option<usize>,
         /// Publishes nothing, and answers each post as if it had.
         pretend: bool,
-        /// Answers one below what it publishes, naming the record posted.
+        /// Publishes nothing, and answers one below each post, naming it.
         below: bool,
         /// Answers `not_registered`.
         unregistered: bool,
@@ -1035,6 +1053,10 @@ mod tests {
         drop_posts: bool,
         /// Reads that fail before one succeeds.
         unread: usize,
+        /// The read, counted from 1, that fails.
+        fail_read: Option<usize>,
+        /// Published just before each of the next posts lands, in turn.
+        races: Vec<Vec<u8>>,
         /// Drops its latest record at this read, as a restore would.
         rollback_at: Option<usize>,
         reads: usize,
@@ -1091,8 +1113,8 @@ mod tests {
 
         fn read(&mut self) -> R<Current> {
             self.reads += 1;
-            if self.unread > 0 {
-                self.unread -= 1;
+            if self.unread > 0 || self.fail_read == Some(self.reads) {
+                self.unread = self.unread.saturating_sub(1);
                 return Err("connection reset".into());
             }
             if self.rollback_at == Some(self.reads) {
@@ -1124,9 +1146,16 @@ mod tests {
             if self.pretend {
                 return Ok((200, json!({ "seq": 1, "epoch": epoch, "hash": hash })));
             }
+            if self.below {
+                return Ok((200, json!({ "seq": 1, "epoch": epoch - 1, "hash": hash })));
+            }
             if self.unregistered {
                 let body = json!({ "error": "not_registered", "text": "not registered here" });
                 return Ok((404, body));
+            }
+            if !self.races.is_empty() {
+                let theirs = self.races.remove(0);
+                self.land(&theirs).unwrap();
             }
             if let Some(theirs) = self.race.take() {
                 self.land(&theirs).unwrap();
@@ -1137,9 +1166,6 @@ mod tests {
             if self.lose > 0 {
                 self.lose -= 1;
                 return Err("connection reset".into());
-            }
-            if self.below {
-                return Ok((200, json!({ "seq": 1, "epoch": epoch - 1, "hash": hash })));
             }
             let (epoch, _, hash) = self.cur();
             Ok((
@@ -1296,6 +1322,30 @@ mod tests {
     }
 
     #[test]
+    fn a_registrar_whose_list_shows_this_runs_record_at_the_end_is_done() {
+        let mut sim = Sim::named("a");
+        sim.fail_read = Some(2);
+        let (report, _) = reset(0, &mut [&mut sim]);
+        assert_eq!(report.unwrap(), all_done(1, 1));
+        assert_eq!(sim.posts, 1);
+    }
+
+    #[test]
+    fn the_read_only_round_keeps_the_floor_it_reads_and_reserves_no_target() {
+        // Another holder resets `b` to each target just ahead of this one,
+        // the last time in the round before the reads alone.
+        let mut a = Sim::named("a");
+        let mut b = Sim::named("b");
+        let last = ROUNDS as u64 - 1;
+        b.races = (1..=last).map(|e| signed(e, now() + 5 + e)).collect();
+        let (report, kept) = reset(0, &mut [&mut a, &mut b]);
+        let report = report.unwrap();
+        assert_eq!((report.target, report.published, kept), (last, last, last));
+        assert_eq!(report.done, Vec::<String>::new());
+        assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn a_page_is_the_identitys_from_the_cursor_asked() {
         let page = |fingerprint, since| SignedList {
             registrar: "r".into(),
@@ -1445,7 +1495,7 @@ mod tests {
             report,
             Report {
                 target: 1,
-                published: 1,
+                published: 0,
                 done: vec![],
                 not_done: vec![
                     "r0: it answered epoch 1, and its list shows 0".into(),
