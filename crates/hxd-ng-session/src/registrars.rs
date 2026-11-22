@@ -101,15 +101,10 @@ pub struct Registrars {
     attested: Mutex<HashMap<Fingerprint, (HashSet<String>, Instant)>>,
     /// Held across comparing a fetched list with the one held and
     /// replacing it, so two fetches finishing together cannot leave the
-    /// older one. Under it, the resets a replaced list carried that could
-    /// not be kept: applied by each lookup, and kept by the first whose
-    /// write succeeds. A restart forgets them.
-    storing: Arc<Mutex<Unkept>>,
+    /// older one.
+    storing: Arc<Mutex<()>>,
     cache: Arc<dyn RecordCache>,
 }
-
-/// Device epoch records, as signed, that a store could not keep.
-type Unkept = HashMap<Fingerprint, Vec<(DeviceEpoch, Vec<u8>)>>;
 
 /// A rotation found: the predecessor, the successor and the record as
 /// it was published.
@@ -161,7 +156,7 @@ impl Registrars {
             discovering: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             attested: Mutex::new(HashMap::new()),
-            storing: Arc::new(Mutex::new(HashMap::new())),
+            storing: Arc::new(Mutex::new(())),
             cache,
         }
     }
@@ -454,7 +449,7 @@ impl Registrars {
         crate::spawn_blocking("identity", move || {
             let issued = |l: &CachedList| verified(l).map(|pages| pages[0].issued);
             let fetched = issued(&list).ok_or("record list is not one whole list")?;
-            let mut unkept = storing.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = storing.lock().unwrap_or_else(|e| e.into_inner());
             let held = cache.lists(&fp.0).map_err(|e| e.0)?;
             // A list issued before the one held, as a replay or a stale
             // cache in between would bring, says less than what is held;
@@ -472,8 +467,9 @@ impl Registrars {
             // A reset the list replaced carries and this one does not is
             // kept first, as a list from before the floor table, or one
             // whose resets could not be kept, may hold; or, if it cannot
-            // be, held here, so that the fetched list, which may revoke
-            // what the held one did not, is stored all the same.
+            // be, the list is held as superseded until it is, so that the
+            // fetched list, which may revoke what the held one did not, is
+            // stored all the same.
             let dropped: Vec<_> = replaced
                 .and_then(verified)
                 .map(|pages| epochs_in(&pages, fp))
@@ -483,8 +479,9 @@ impl Registrars {
                 .collect();
             if !dropped.is_empty() {
                 if let Err(e) = keep_epochs(&*cache, fp, &dropped) {
-                    warn!("identity device floor: {}; held until it can be kept", e.0);
-                    unkept.entry(fp).or_default().extend(dropped);
+                    warn!("identity device floor: {}; the list it was in is held", e.0);
+                    let replaced = replaced.expect("its resets were read from it");
+                    hold_superseded(&*cache, fp, replaced).map_err(|e| e.0)?;
                 }
             }
             cache.put(&fp.0, &list).map_err(|e| e.0)?;
@@ -793,21 +790,26 @@ impl Registrars {
         // What was kept of the identity's device epochs, raised with what
         // the lists carry now: a list that no longer carries one lowers
         // no floor. One that cannot be read proves nothing either way.
+        // And those of the lists held as superseded until their resets are
+        // kept, which a restart does not forget.
         let kept = {
-            let mut unkept = self.storing.lock().unwrap_or_else(|e| e.into_inner());
-            let held = unkept.get(&fp).cloned().unwrap_or_default();
-            for (e, _) in &held {
-                let e = Record::DeviceEpoch(e.clone());
-                if !lookup.records.contains(&e) {
-                    lookup.records.push(e);
+            let _one = self.storing.lock().unwrap_or_else(|e| e.into_inner());
+            self.cache.superseded(&fp.0).and_then(|held| {
+                for list in &held {
+                    for (e, bytes) in superseded_epochs(list, fp) {
+                        let record = Record::DeviceEpoch(e.clone());
+                        if !lookup.records.contains(&record) {
+                            lookup.records.push(record);
+                        }
+                        seen.push((e, bytes));
+                    }
                 }
-            }
-            seen.extend(held);
-            let kept = keep_epochs(&*self.cache, fp, &seen);
-            if kept.is_ok() {
-                unkept.remove(&fp);
-            }
-            kept
+                let kept = keep_epochs(&*self.cache, fp, &seen)?;
+                if !held.is_empty() {
+                    self.cache.release_superseded(&fp.0)?;
+                }
+                Ok(kept)
+            })
         };
         match kept {
             Ok(kept) => {
@@ -837,12 +839,55 @@ impl Registrars {
 /// The device epoch floor kept in `cache` for `fp`, as far as what is
 /// kept verifies. Reads the store and verifies: called off the reactor.
 pub fn kept_floor(cache: &dyn RecordCache, fp: &Fingerprint) -> Result<u64, hxd_core::StoreError> {
-    let rows = cache.epochs(&fp.0)?;
-    Ok(kept_verified(*fp, rows)
-        .iter()
+    let kept = kept_verified(*fp, cache.epochs(&fp.0)?);
+    let held = cache.superseded(&fp.0)?;
+    let held = held.iter().flat_map(|l| superseded_epochs(l, *fp));
+    Ok(kept
+        .into_iter()
+        .chain(held.map(|(e, _)| e))
         .map(|e| e.epoch)
         .max()
         .unwrap_or(0))
+}
+
+/// `fp`'s device epoch records in `list`, held as superseded; none, and
+/// said so, if it no longer verifies.
+fn superseded_epochs(list: &CachedList, fp: Fingerprint) -> Vec<(DeviceEpoch, Vec<u8>)> {
+    let Some(pages) = verified(list) else {
+        warn!(fingerprint = %fp.short(), registrar = %list.registrar, "a superseded record list did not verify; ignored");
+        return Vec::new();
+    };
+    epochs_in(&pages, fp)
+}
+
+/// Hold `list` as superseded for `fp`, one list a registrar: in place of
+/// the one held unless that one carries every epoch `list` does, or a
+/// higher one, so that a registrar alternating lists piles nothing up
+/// and the higher floor stands.
+fn hold_superseded(
+    cache: &dyn RecordCache,
+    fp: Fingerprint,
+    list: &CachedList,
+) -> Result<(), hxd_core::StoreError> {
+    let epochs = |l: &CachedList| -> Vec<u64> {
+        superseded_epochs(l, fp)
+            .into_iter()
+            .map(|(e, _)| e.epoch)
+            .collect()
+    };
+    let new = epochs(list);
+    let keeps = |held: &CachedList| {
+        let held = epochs(held);
+        new.iter().all(|e| held.contains(e)) || held.iter().max() > new.iter().max()
+    };
+    let held = cache.superseded(&fp.0)?;
+    if held
+        .iter()
+        .any(|h| h.registrar == list.registrar && keeps(h))
+    {
+        return Ok(());
+    }
+    cache.hold_superseded(&fp.0, list)
 }
 
 /// `fp`'s device epoch records among the entries of `pages`, as signed.
@@ -1011,6 +1056,19 @@ mod tests {
             }
             fn lists(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
                 Err(hxd_core::StoreError("unreadable".into()))
+            }
+            fn hold_superseded(
+                &self,
+                _: &[u8; 32],
+                _: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn superseded(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                Ok(Vec::new())
+            }
+            fn release_superseded(&self, _: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                Ok(())
             }
             fn first_seen(&self, _: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
                 Ok(now)
@@ -1415,5 +1473,59 @@ mod tests {
         let bytes = e.sign(&alice).unwrap();
         keep_epochs(&cache, fp, &[(e, bytes)]).unwrap();
         assert_eq!(kept_floor(&cache, &fp).unwrap(), 1);
+    }
+
+    /// One superseded list a registrar: a list carrying no epoch the held
+    /// one lacks, or only lower ones, is not held over it; one carrying
+    /// more replaces it.
+    #[test]
+    fn a_superseded_list_is_held_once_a_registrar() {
+        use hl_identity::IdentityKey;
+        let cache = hxd_core::identity_records::MemoryRecordCache::default();
+        let (alice, key) = (
+            IdentityKey::from_seed(&[1; 32]),
+            ServerKey::from_seed(&[3; 32]),
+        );
+        let fp = Fingerprint::of(&alice.public());
+        let list = |epochs: &[u64], issued| {
+            let entries = epochs
+                .iter()
+                .map(|&epoch| {
+                    let e = DeviceEpoch {
+                        identity: alice.public(),
+                        epoch,
+                        time: 10,
+                    };
+                    (epoch, e.sign(&alice).unwrap())
+                })
+                .collect();
+            let page = SignedList {
+                registrar: "hl.example".into(),
+                issued,
+                expires: u64::MAX,
+                fingerprint: Some(fp.0),
+                since: None,
+                more: false,
+                entries,
+            }
+            .sign(ListKind::Records, &key);
+            CachedList {
+                registrar: "hl.example".into(),
+                pages: vec![page],
+                keys: vec![(key.public(), None)],
+                fetched: issued,
+            }
+        };
+        let held = || cache.superseded(&fp.0).unwrap();
+        hold_superseded(&cache, fp, &list(&[1], 1)).unwrap();
+        for (lesser, issued) in [(&[][..], 2), (&[1][..], 3)] {
+            hold_superseded(&cache, fp, &list(lesser, issued)).unwrap();
+            assert_eq!(held(), [list(&[1], 1)]);
+        }
+        hold_superseded(&cache, fp, &list(&[1, 2], 4)).unwrap();
+        assert_eq!(held(), [list(&[1, 2], 4)]);
+        hold_superseded(&cache, fp, &list(&[1], 5)).unwrap();
+        assert_eq!(held(), [list(&[1, 2], 4)], "nor a lower floor over it");
+        assert_eq!(kept_floor(&cache, &fp).unwrap(), 2);
     }
 }

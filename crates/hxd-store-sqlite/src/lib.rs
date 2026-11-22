@@ -1075,7 +1075,9 @@ ALTER TABLE message ADD COLUMN emoji BLOB;
 /// The device epoch records seen for each identity, by its fingerprint,
 /// apart from the lists that carried them (`docs/identity-records.md`
 /// §3): for each `epoch`, the record with the earliest `time` seen. The
-/// highest `epoch` is the identity's floor.
+/// highest `epoch` is the identity's floor. Beside it, the lists a
+/// fetched one replaced while their resets could not be kept there, as
+/// `identity_records` keeps lists, until they are.
 const SCHEMA_V38: &str = "
 CREATE TABLE identity_device_floor (
   identity BLOB    NOT NULL,
@@ -1083,6 +1085,14 @@ CREATE TABLE identity_device_floor (
   time     INTEGER NOT NULL,
   record   BLOB    NOT NULL,
   PRIMARY KEY (identity, epoch)
+) WITHOUT ROWID;
+CREATE TABLE identity_records_superseded (
+  identity  BLOB    NOT NULL,
+  registrar TEXT    NOT NULL,
+  list      BLOB    NOT NULL,
+  fetched   INTEGER NOT NULL,
+  keys      BLOB    NOT NULL,
+  PRIMARY KEY (identity, registrar)
 ) WITHOUT ROWID;
 ";
 

@@ -56,37 +56,84 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedList> {
     })
 }
 
+/// Write `list` for `identity` with `insert`, whose parameters are
+/// identity, registrar, list, fetched and keys.
+fn write(
+    store: &SqliteStore,
+    insert: &str,
+    identity: &[u8; 32],
+    list: &CachedList,
+) -> Result<(), StoreError> {
+    let conn = store.conn.lock().unwrap();
+    sql(conn.execute(
+        insert,
+        params![
+            identity.to_vec(),
+            list.registrar,
+            encode(&list.pages),
+            i64::try_from(list.fetched).unwrap_or(i64::MAX),
+            list.keys
+                .iter()
+                .flat_map(|(k, until)| [&k[..], &until.unwrap_or(u64::MAX).to_be_bytes()].concat())
+                .collect::<Vec<u8>>(),
+        ],
+    ))?;
+    Ok(())
+}
+
+/// Every list `table` holds for `identity`.
+fn read(
+    store: &SqliteStore,
+    table: &str,
+    identity: &[u8; 32],
+) -> Result<Vec<CachedList>, StoreError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = sql(conn.prepare_cached(&format!(
+        "SELECT registrar, list, fetched, keys FROM {table} WHERE identity = ?1"
+    )))?;
+    let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
+    rows.map(sql).collect()
+}
+
 impl RecordCache for SqliteStore {
     fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
+        write(
+            self,
             "INSERT INTO identity_records (identity, registrar, list, fetched, keys)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (identity, registrar) DO UPDATE
                SET list = excluded.list, fetched = excluded.fetched, keys = excluded.keys",
-            params![
-                identity.to_vec(),
-                list.registrar,
-                encode(&list.pages),
-                i64::try_from(list.fetched).unwrap_or(i64::MAX),
-                list.keys
-                    .iter()
-                    .flat_map(
-                        |(k, until)| [&k[..], &until.unwrap_or(u64::MAX).to_be_bytes()].concat()
-                    )
-                    .collect::<Vec<u8>>(),
-            ],
-        ))?;
-        Ok(())
+            identity,
+            list,
+        )
     }
 
     fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        read(self, "identity_records", identity)
+    }
+
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        write(
+            self,
+            "INSERT OR REPLACE INTO identity_records_superseded
+               (identity, registrar, list, fetched, keys)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            identity,
+            list,
+        )
+    }
+
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        read(self, "identity_records_superseded", identity)
+    }
+
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = sql(conn.prepare_cached(
-            "SELECT registrar, list, fetched, keys FROM identity_records WHERE identity = ?1",
+        sql(conn.execute(
+            "DELETE FROM identity_records_superseded WHERE identity = ?1",
+            params![identity.to_vec()],
         ))?;
-        let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
-        rows.map(sql).collect()
+        Ok(())
     }
 
     fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {

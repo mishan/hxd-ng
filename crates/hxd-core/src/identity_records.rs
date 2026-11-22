@@ -50,6 +50,13 @@ pub trait RecordCache: Send + Sync {
     /// one said.
     fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError>;
     fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError>;
+    /// Keep `list`, which a list fetched for `identity` replaced while the
+    /// resets it carries could not be kept, until [`Self::release_superseded`],
+    /// in place of the one held from its registrar.
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError>;
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError>;
+    /// Forget what is held for `identity`: its resets are kept.
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError>;
     /// When `identity` was first seen, in unix seconds: the sighting kept,
     /// if it is younger than [`FIRST_SEEN_KEPT`], or `now`, kept from here.
     fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError>;
@@ -69,6 +76,7 @@ pub struct MemoryRecordCache {
     lists: Mutex<HashMap<([u8; 32], String), CachedList>>,
     seen: Mutex<HashMap<[u8; 32], u64>>,
     epochs: Mutex<HashMap<([u8; 32], u64), KeptEpoch>>,
+    superseded: Mutex<HashMap<[u8; 32], Vec<CachedList>>>,
 }
 
 impl RecordCache for MemoryRecordCache {
@@ -87,6 +95,24 @@ impl RecordCache for MemoryRecordCache {
             .filter(|((id, _), _)| id == identity)
             .map(|(_, list)| list.clone())
             .collect())
+    }
+
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        let mut held = self.superseded.lock().unwrap();
+        let lists = held.entry(*identity).or_default();
+        lists.retain(|l| l.registrar != list.registrar);
+        lists.push(list.clone());
+        Ok(())
+    }
+
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        let held = self.superseded.lock().unwrap();
+        Ok(held.get(identity).cloned().unwrap_or_default())
+    }
+
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError> {
+        self.superseded.lock().unwrap().remove(identity);
+        Ok(())
     }
 
     fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {
@@ -148,6 +174,31 @@ pub mod conformance {
     /// Run every case against a freshly built store.
     pub fn run(new_store: &dyn Fn() -> Box<dyn RecordCache>) {
         an_epoch_kept_is_replaced_by_an_earlier_time_or_in_place(&*new_store());
+        a_superseded_list_is_held_one_a_registrar_until_released(&*new_store());
+    }
+
+    fn a_superseded_list_is_held_one_a_registrar_until_released(store: &dyn RecordCache) {
+        let list = |registrar: &str, fetched| CachedList {
+            registrar: registrar.into(),
+            pages: vec![vec![fetched as u8]],
+            keys: vec![([1; 32], None)],
+            fetched,
+        };
+        let (alice, bob) = ([1; 32], [2; 32]);
+        for l in [list("a", 1), list("b", 1), list("a", 2)] {
+            store.hold_superseded(&alice, &l).unwrap();
+        }
+        store.hold_superseded(&bob, &list("a", 3)).unwrap();
+        let mut held = store.superseded(&alice).unwrap();
+        held.sort_by(|x, y| x.registrar.cmp(&y.registrar));
+        assert_eq!(held, [list("a", 2), list("b", 1)], "one a registrar");
+        assert!(
+            store.lists(&alice).unwrap().is_empty(),
+            "apart from the lists"
+        );
+        store.release_superseded(&alice).unwrap();
+        assert!(store.superseded(&alice).unwrap().is_empty());
+        assert_eq!(store.superseded(&bob).unwrap(), [list("a", 3)]);
     }
 
     fn an_epoch_kept_is_replaced_by_an_earlier_time_or_in_place(store: &dyn RecordCache) {

@@ -3366,6 +3366,19 @@ mod tests {
             fn lists(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
                 Err(hxd_core::StoreError("unreadable".into()))
             }
+            fn hold_superseded(
+                &self,
+                _: &[u8; 32],
+                _: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn superseded(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                Ok(Vec::new())
+            }
+            fn release_superseded(&self, _: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
             fn first_seen(&self, _: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
                 Ok(now)
             }
@@ -3529,6 +3542,19 @@ mod tests {
             }
             fn lists(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
                 self.0.lists(i)
+            }
+            fn hold_superseded(
+                &self,
+                i: &[u8; 32],
+                l: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                self.0.hold_superseded(i, l)
+            }
+            fn superseded(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.superseded(i)
+            }
+            fn release_superseded(&self, i: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                self.0.release_superseded(i)
             }
             fn first_seen(&self, i: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
                 self.0.first_seen(i, now)

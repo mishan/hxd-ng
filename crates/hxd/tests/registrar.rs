@@ -3516,9 +3516,35 @@ async fn a_list_is_stored_while_the_resets_it_replaces_cannot_be_kept() {
     // reset it dropped is still the floor.
     identity.sweep_records().await;
     phone_here.event("kicked").await.unwrap();
+    let below = (403, json!("revoked"), json!(1));
+    let tablet_below = cert_in(&alice, &tablet, 0);
     assert_eq!(
-        refusal(&auth_cert(v, &tablet, &card, &cert_in(&alice, &tablet, 0), json!({})).await),
-        (403, json!("revoked"), json!(1))
+        refusal(&auth_cert(v, &tablet, &card, &tablet_below, json!({})).await),
+        below
+    );
+
+    // Nor does a restart forget either, the floor table still refusing.
+    let restarted = verifier(&dir.path().join("verifier"), &r, Trust::Key, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_cert(restarted, &tablet, &card, &tablet_below, json!({})).await),
+        below
+    );
+    let phone_cert = cert_in(&alice, &phone, 1);
+    let reply = auth_cert(restarted, &phone, &card, &phone_cert, json!({})).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
+
+    // Nor does trusting no registrar at all.
+    let alone = verifier(&dir.path().join("verifier"), &r, Trust::Nobody, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_cert(alone, &tablet, &card, &tablet_below, json!({})).await),
+        below
     );
 }
 
