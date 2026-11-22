@@ -1287,12 +1287,10 @@ impl Core {
             if matches!(taken, Err(MessagingError::ServerError)) {
                 return Err(MessagingError::ServerError);
             }
-            let still = store
-                .relationship(&me.mailbox, &them, now)
-                .map_err(store_failed)?
-                .is_some_and(|m| m.friendship.is_some());
-            if !still {
-                return taken.map(|_| ());
+            // Answered from what the withdrawal committed: one that ended
+            // the friendship is the whole removal.
+            if matches!(taken, Ok(Some((_, true)))) {
+                return Ok(());
             }
             let mut end = self
                 .end_here(store, &me.mailbox, &them)
@@ -1303,7 +1301,7 @@ impl Core {
                 .end_friendship(&me.mailbox, &them, &end)
                 .map_err(store_failed)?;
             if let Some(e) = ended.ended {
-                let withdraw = taken.as_ref().ok().cloned().flatten();
+                let withdraw = taken.as_ref().ok().cloned().flatten().map(|(w, _)| w);
                 self.edge_ended(&e, withdraw.as_deref());
             }
             return taken.map(|_| ());

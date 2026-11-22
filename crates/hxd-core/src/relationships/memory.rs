@@ -432,18 +432,19 @@ impl Inner {
                 && k.party == w.party
                 && k.withdrawal.is_none() == w.withdrawal.is_none()
         };
-        if self
+        // One whose cutoff is older replaces nothing, and the cap holds
+        // all the same.
+        let older = self
             .withdrawals
             .iter()
-            .any(|k| same(k) && k.before > w.before)
-        {
-            return;
+            .any(|k| same(k) && k.before > w.before);
+        if !older {
+            self.withdrawals.retain(|k| !same(k));
+            self.withdrawals.push(HeldWithdrawal {
+                at: floor(w.at),
+                ..w.clone()
+            });
         }
-        self.withdrawals.retain(|k| !same(k));
-        self.withdrawals.push(HeldWithdrawal {
-            at: floor(w.at),
-            ..w.clone()
-        });
         loop {
             let owned: Vec<usize> = (0..self.withdrawals.len())
                 .filter(|&i| self.withdrawals[i].owner == w.owner)

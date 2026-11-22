@@ -43,6 +43,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     rotation_moves_the_portable_part_and_purging_keeps_withdrawals(&*new_store());
     a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
     ending_a_friendship_is_one_step(&*new_store());
+    an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -473,6 +474,31 @@ fn ending_a_friendship_is_one_step(s: &dyn RelationshipStore) {
     assert!(
         !s.is_held(&e, &Requester::Account(f), at(4)).unwrap(),
         "{case}: nothing ended"
+    );
+}
+
+fn an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(s: &dyn RelationshipStore) {
+    let case = "an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap";
+    s.keep_withdrawal(&withdrawal(1, 20, 50, true, 1), 2)
+        .unwrap();
+    s.keep_withdrawal(&withdrawal(1, 21, 50, true, 2), 2)
+        .unwrap();
+    let end = Ending {
+        withdrawals: vec![withdrawal(1, 21, 40, true, 3)],
+        cap: 1,
+        ..Ending::default()
+    };
+    s.end_friendship(&Mailbox::login("a"), &Mailbox::login("b"), &end)
+        .unwrap();
+    assert_eq!(
+        s.withdrawals(&[20; 32]).unwrap(),
+        [],
+        "{case}: the oldest past the cap"
+    );
+    assert_eq!(
+        s.withdrawals(&[21; 32]).unwrap(),
+        [withdrawal(1, 21, 50, true, 2)],
+        "{case}: the later cutoff kept"
     );
 }
 

@@ -1853,3 +1853,120 @@ fn a_removal_by_fingerprint_of_one_outside_messaging_ends_the_friendship_here() 
     assert_eq!(again[0].outcome, Presented::Withdrawn(None));
     assert_eq!(friendship_of(&s, &alice, &bob), None);
 }
+
+#[test]
+fn a_reset_of_both_presentations_ends_the_pair_in_one_step() {
+    for on_presenting in [false, true] {
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let reset_at = s.core.clock().unix() - 30;
+        let (_, _, _, _, f) = made(&s, &alice, &bob);
+        s.fail.fail_nth_of("drop_presentations", 2);
+        if on_presenting {
+            keep(&s, &alice, 1, reset_at);
+            let (b1, _) = device(&s.core, "bob", &bob, 1);
+            let _ = s.core.friendships_present(b1, vec![], vec![f]);
+        } else {
+            reset(&s, &alice, 1, reset_at);
+        }
+        let evidence = |p: &Person, q: &Person| {
+            let pres = s.rel.presentation(&fp(p), &fp(q)).unwrap();
+            pres.is_some_and(|p| p.evidence())
+        };
+        let pair = (
+            evidence(&alice, &bob),
+            evidence(&bob, &alice),
+            friendship_of(&s, &alice, &bob).is_some(),
+        );
+        assert_eq!(pair, (false, false, false), "presenting {on_presenting}");
+        assert_eq!(
+            s.fail.failed(),
+            None,
+            "one drop, presenting {on_presenting}"
+        );
+    }
+}
+
+#[test]
+fn a_withdrawal_that_ended_the_friendship_is_answered_by_what_it_committed() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, _, _, _) = made(&s, &alice, &bob);
+    // A read after the ending's commit and its tells fails.
+    s.fail.fail_nth_of("relationship", 7);
+    let w = withdraw(&alice, 0, &bob, now());
+    assert_eq!(s.core.friend_unfriend(a, "bob", Some(w)), Ok(()));
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+}
+
+#[test]
+fn a_withdrawal_that_cuts_nothing_tells_both_the_entry_again() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, mut ra, _, mut rb, f) = made(&s, &alice, &bob);
+    let early = withdraw_at(&alice, 0, &bob, now() - 120, now());
+    let (taken, _) = s.core.friendships_present(a, vec![early], vec![]).unwrap();
+    assert!(ok_all(&taken));
+    assert!(friendship_of(&s, &alice, &bob).is_some());
+    assert_eq!(
+        told(&mut ra),
+        [("bob".into(), RosterState::Accepted, vec![hash(&f)], None)]
+    );
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Accepted, vec![hash(&f)], None)]
+    );
+}
+
+#[test]
+fn a_reset_leaves_no_id_for_a_friendship_made_after_it() {
+    let (mut alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let reset_at = s.core.clock().unix() - 30;
+    let (_, _, _, _, f) = made(&s, &alice, &bob);
+    let id = friendship_of(&s, &alice, &bob).unwrap();
+    // Alice's presentation goes with her device, leaving the id on Bob's
+    // for what was queued on it.
+    s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&alice.devices[0].0.public()).0].into(),
+        ..Default::default()
+    });
+    let edge = |s: &Server| {
+        let pres = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap();
+        pres.and_then(|p| p.edge)
+    };
+    assert_eq!(edge(&s), Some(id));
+
+    // Alice reset before it was taken, and Bob presents it again.
+    keep(&s, &alice, 1, reset_at);
+    let (b1, _) = device(&s.core, "bob", &bob, 1);
+    let (_, judged) = s.core.friendships_present(b1, vec![], vec![f]).unwrap();
+    assert_eq!(judged[0].outcome, Presented::AccountNotFound);
+    assert_eq!(
+        edge(&s),
+        None,
+        "the reset took the id with the presentation"
+    );
+
+    // A friendship made since is a new one.
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let f2 = accept(
+        &offer(&alice, renewed, &bob, now() - 30),
+        &bob,
+        1,
+        now() - 30,
+    );
+    for uid in [b1, a2] {
+        let (_, presented) = s
+            .core
+            .friendships_present(uid, vec![], vec![f2.clone()])
+            .unwrap();
+        assert!(ok_all(&presented));
+    }
+    assert!(friendship_of(&s, &alice, &bob).is_some_and(|new| new != id));
+    assert!(
+        !s.rel.is_live(id),
+        "what was queued before the reset stays held"
+    );
+}

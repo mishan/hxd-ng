@@ -44,9 +44,9 @@ enum Plan {
     Off,
     /// This many calls from now, the last fails.
     Nth(usize),
-    /// The next call of this method fails.
+    /// The call of this method this many calls of it from now fails.
     #[cfg(test)]
-    Next(&'static str),
+    Next(&'static str, usize),
     /// This many writes from now, the last fails.
     NthWrite(usize),
 }
@@ -75,7 +75,13 @@ impl Failing {
     /// The next call of `method` fails.
     #[cfg(test)]
     pub(crate) fn fail_next(&self, method: &'static str) {
-        *self.plan.lock().unwrap() = Plan::Next(method);
+        self.fail_nth_of(method, 1);
+    }
+
+    /// The `n`-th call of `method` from now fails; 1 is the next.
+    #[cfg(test)]
+    pub(crate) fn fail_nth_of(&self, method: &'static str, n: usize) {
+        *self.plan.lock().unwrap() = Plan::Next(method, n);
     }
 
     /// The `n`-th write from now fails, whichever method it is.
@@ -97,7 +103,12 @@ impl Failing {
                 *n == 0
             }
             #[cfg(test)]
-            Plan::Next(m) => *m == method,
+            Plan::Next(m, n) if *m == method => {
+                *n -= 1;
+                *n == 0
+            }
+            #[cfg(test)]
+            Plan::Next(..) => false,
             Plan::NthWrite(n) if !READS.contains(&method) => {
                 *n -= 1;
                 *n == 0

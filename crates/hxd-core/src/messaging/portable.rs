@@ -227,6 +227,21 @@ pub struct Fetched {
 /// What a withdrawal held here ends, and its object where it has one.
 type HeldCutoff = (Cutoff, Option<Vec<u8>>);
 
+/// A pair, and those of its parties whose presentations go.
+type Going = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
+
+/// What applying a withdrawal left of the pair's friendship.
+enum Applied {
+    /// Ended, and told.
+    Ended,
+    /// Active, each party's presentation standing, under the mailboxes
+    /// its rows keep.
+    Standing([Mailbox; 2]),
+    /// Neither: there was none, or it is this server's alone and made
+    /// after the cutoff.
+    Untouched,
+}
+
 /// The device a friendships session proved, as the gate admitted it.
 pub(super) struct Device {
     /// The SHA-256 of its key.
@@ -440,12 +455,11 @@ impl Core {
             }
         }
         floors.failed()?;
-        for p in held
-            .iter()
-            .filter(|p| p.evidence() && gone.contains(&p.hash))
-        {
-            self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
-        }
+        self.drop_pairs(
+            store,
+            held.iter()
+                .filter(|p| p.evidence() && gone.contains(&p.hash)),
+        )?;
         Ok(whole)
     }
 
@@ -730,7 +744,8 @@ impl Core {
 
     /// A withdrawal `me` gives as its own act about `them`, at 803 or 806
     /// (§4.3): checked whole against the pair it names, kept, and applied.
-    /// Answers its bytes, for the `Removed` it is told with.
+    /// Answers its bytes, for the `Removed` it is told with, and whether
+    /// it ended the friendship.
     pub(super) fn take_withdrawal(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -738,7 +753,7 @@ impl Core {
         device: &Device,
         them: &Mailbox,
         bytes: Vec<u8>,
-    ) -> Result<Vec<u8>, MessagingError> {
+    ) -> Result<(Vec<u8>, bool), MessagingError> {
         let now = self.clock.unix();
         let floors = Floors::new(self);
         let parsed = Withdrawal::parse(&bytes, now, |k| floors.floor(k));
@@ -771,8 +786,8 @@ impl Core {
         } else {
             (theirs, mine)
         };
-        self.apply_cutoff(store, keep, party, other)?;
-        Ok(bytes)
+        let applied = self.apply_cutoff(store, keep, party, other)?;
+        Ok((bytes, matches!(applied, Applied::Ended)))
     }
 
     fn cutoff_held(
@@ -803,7 +818,7 @@ impl Core {
         keep: HeldWithdrawal,
         party: [u8; 32],
         other: [u8; 32],
-    ) -> Result<(), MessagingError> {
+    ) -> Result<Applied, MessagingError> {
         let cut = Cutoff {
             pair: keep.pair,
             party: Fingerprint(keep.party),
@@ -838,11 +853,8 @@ impl Core {
             Mailbox::identified("", party),
             Mailbox::identified("", other),
         );
-        if let Some(id) = store
-            .relationship(&x, &y, wall)
-            .map_err(store_failed)?
-            .and_then(|r| r.friendship)
-        {
+        let row = store.relationship(&x, &y, wall).map_err(store_failed)?;
+        if let Some(id) = row.as_ref().and_then(|r| r.friendship) {
             end.friendship = if had == 2 {
                 !end.presentations.is_empty()
             } else {
@@ -858,8 +870,12 @@ impl Core {
         let ended = store.end_friendship(&x, &y, &end).map_err(store_failed)?;
         if let Some(e) = ended.ended {
             self.edge_ended(&e, withdraw.as_deref());
+            return Ok(Applied::Ended);
         }
-        Ok(())
+        Ok(match row.filter(|r| r.friendship.is_some()) {
+            Some(r) if had == 2 => Applied::Standing([r.owner, r.other]),
+            _ => Applied::Untouched,
+        })
     }
 
     /// What `me` removing or blocking `them` without a withdrawal of its
@@ -936,6 +952,29 @@ impl Core {
             self.edge_ended(e, None);
         }
         Ok(dropped.gone)
+    }
+
+    /// Drop `gone`, presentations made with no withdrawal, as one step
+    /// for each pair, so that one pair's both are never half dropped.
+    fn drop_pairs<'p>(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        gone: impl IntoIterator<Item = &'p Presentation>,
+    ) -> Result<(), StoreError> {
+        let mut pairs: Vec<Going> = Vec::new();
+        for p in gone {
+            let pair = pairs.iter_mut().find(|(a, b, _)| {
+                (*a, *b) == (p.presenter, p.other) || (*a, *b) == (p.other, p.presenter)
+            });
+            match pair {
+                Some((_, _, presenters)) => presenters.push(p.presenter),
+                None => pairs.push((p.presenter, p.other, vec![p.presenter])),
+            }
+        }
+        for (a, b, presenters) in pairs {
+            self.drop_presented(store, &a, &b, &presenters)?;
+        }
+        Ok(())
     }
 
     /// An edge's ending, told once it is committed: the roster, then both
@@ -1290,7 +1329,11 @@ impl Core {
         } else {
             (other, presenter)
         };
-        self.apply_cutoff(store, keep, party, other)?;
+        // An edge that stays active is told to both again (§4.3).
+        if let Applied::Standing([x, y]) = self.apply_cutoff(store, keep, party, other)? {
+            self.tell_entry(&x, &y);
+            self.tell_entry(&y, &x);
+        }
         refused(w.pair, Presented::Ok)
     }
 
@@ -1364,8 +1407,10 @@ impl Core {
                 return answer(Presented::RosterFull);
             }
         }
+        // The row as stored now, which a reset's drop may have taken
+        // since `held` was read.
         let record = |friendship: Option<Vec<u8>>| {
-            let old = presented(&mine, &theirs);
+            let old = store.presentation(&mine, &theirs).map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
                 .filter(|p| p.hash == hash && p.evidence() && friendship.is_some())
@@ -1427,10 +1472,11 @@ impl Core {
             Judged::Reset => {
                 // What is stored of it is not held either, and goes now
                 // rather than at the next judging.
-                for p in held.iter().filter(|p| p.hash == hash && p.evidence()) {
-                    self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])
-                        .map_err(store_failed)?;
-                }
+                self.drop_pairs(
+                    store,
+                    held.iter().filter(|p| p.hash == hash && p.evidence()),
+                )
+                .map_err(store_failed)?;
                 if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
                     record(None)?;
                 }
