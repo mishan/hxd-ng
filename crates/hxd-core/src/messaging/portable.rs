@@ -53,6 +53,11 @@ pub const MAX_OBJECTS: usize = 32;
 /// rotates, and short of a loop's cost.
 const MAX_CHAIN: usize = 16;
 
+/// The `now` an object stored here is checked at: its `time` was checked
+/// against the clock when it was taken, and a clock set back since must
+/// not refuse it.
+const STORED: u64 = u64::MAX;
+
 /// Every floor taken as 0: for an object whose signatures must verify
 /// whatever the floors, which are tested after them (§4.3 step 1, §6),
 /// or one stored here and read only for what it says.
@@ -164,7 +169,7 @@ impl<'a> Floors<'a> {
         let Some(bytes) = withdrawal else {
             return true;
         };
-        Withdrawal::parse(bytes, u64::MAX, zero_floor).is_ok_and(|k| {
+        Withdrawal::parse(bytes, STORED, zero_floor).is_ok_and(|k| {
             let w = k.withdrawal();
             DeviceCert::parse(&w.cert).is_ok_and(|c| c.check_floor(self.floor(&w.from)).is_ok())
         })
@@ -382,7 +387,6 @@ impl Core {
         fp: &[u8; 32],
         floors: &Floors,
     ) -> Result<bool, StoreError> {
-        let now = self.clock.unix();
         let wall = self.clock.wall();
         if let Some(me) = self.mailbox_of(fp) {
             for r in store.relationships(&me, wall)? {
@@ -392,7 +396,7 @@ impl Core {
                 let Some(o) = store.offer(fp, &other, wall)? else {
                     continue;
                 };
-                if Offer::check(&o.offer, now, &[], zero_floor).is_ok_and(|o| floors.below(&o)) {
+                if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| floors.below(&o)) {
                     store.set_offer(fp, &other, None)?;
                     self.tell_entry(&r.other, &me);
                 }
@@ -400,7 +404,7 @@ impl Core {
         }
         // A rotated identity's friendships are presented under its
         // successor's key.
-        let successors = self.chain_from(store, *fp);
+        let successors = self.chain_from(store, *fp)?;
         let keys =
             std::iter::once(*fp).chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0));
         let mut held: Vec<Presentation> = Vec::new();
@@ -426,7 +430,7 @@ impl Core {
         let mut whole = true;
         let mut gone: Vec<[u8; 32]> = Vec::new();
         for (hash, (taken, bytes)) in &friendships {
-            let Ok(f) = Friendship::check(bytes, now, &[], zero_floor) else {
+            let Ok(f) = Friendship::check(bytes, STORED, &[], zero_floor) else {
                 continue;
             };
             match floors.judge(&f, *taken) {
@@ -456,11 +460,15 @@ impl Core {
 
     /// The rotations this server applied from `fp` on, in chain order,
     /// each verified again as it is read.
-    fn chain_from(&self, store: &Arc<dyn RelationshipStore>, fp: [u8; 32]) -> Vec<Rotation> {
+    fn chain_from(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fp: [u8; 32],
+    ) -> Result<Vec<Rotation>, StoreError> {
         let mut out = Vec::new();
         let mut key = fp;
         for _ in 0..MAX_CHAIN {
-            let Ok(Some((to, record))) = store.rotation_from(&key) else {
+            let Some((to, record)) = store.rotation_from(&key)? else {
                 break;
             };
             match Rotation::parse(&record) {
@@ -472,14 +480,18 @@ impl Core {
             }
             key = to;
         }
-        out
+        Ok(out)
     }
 
-    fn rotations_for(&self, store: &Arc<dyn RelationshipStore>, pair: &Pair) -> Vec<Rotation> {
+    fn rotations_for(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        pair: &Pair,
+    ) -> Result<Vec<Rotation>, MessagingError> {
         let (lo, hi) = pair.fingerprints();
-        let mut out = self.chain_from(store, lo.0);
-        out.extend(self.chain_from(store, hi.0));
-        out
+        let mut out = self.chain_from(store, lo.0).map_err(store_failed)?;
+        out.extend(self.chain_from(store, hi.0).map_err(store_failed)?);
+        Ok(out)
     }
 
     /// What the withdrawals held for `pair` that stand at the current
@@ -582,7 +594,7 @@ impl Core {
             return Err(MessagingError::AccountNotFound);
         }
         let pair = offer.pair();
-        let rotations = self.rotations_for(store, &pair);
+        let rotations = self.rotations_for(store, &pair)?;
         let cuts = self.cutoffs(store, &pair, &rotations, &floors)?;
         floors.failed().map_err(store_failed)?;
         if cuts.iter().any(|(c, _)| offer.cut_by(c)) {
@@ -649,7 +661,7 @@ impl Core {
         own(device, me, &f.acceptance.from, &f.acceptance.cert)?;
         fresh(f.acceptance.time, now)?;
         let pair = f.pair();
-        let rotations = self.rotations_for(store, &pair);
+        let rotations = self.rotations_for(store, &pair)?;
         let cuts = self.cutoffs(store, &pair, &rotations, &floors)?;
         floors.failed().map_err(store_failed)?;
         if cuts.iter().any(|(c, _)| f.cut_by(c)) {
@@ -751,7 +763,7 @@ impl Core {
             .into_iter()
             .find(|p| p.hash() == named)
             .ok_or(MessagingError::BadSignature)?;
-        let rotations = self.rotations_for(store, &pair);
+        let rotations = self.rotations_for(store, &pair)?;
         let held = kept
             .check_pair(&pair, &rotations)
             .map_err(|_| MessagingError::BadSignature)?;
@@ -907,17 +919,21 @@ impl Core {
                 party: Fingerprint(named),
                 before,
             };
-            // Needless where a signed one the remover gave already cuts as
-            // far; it stands beside one that does not.
+            // Needless where a signed one the remover gave, checked and
+            // standing at the floors, already cuts as far; kept beside any
+            // other.
+            let floors = Floors::new(self);
             let signed = store.withdrawals(&pres.pair).is_ok_and(|held| {
                 held.iter().any(|w| {
                     w.owner == mine
                         && w.party == named
+                        && w.checked
                         && w.withdrawal.is_some()
                         && w.before >= before
+                        && floors.stands(w.withdrawal.as_deref())
                 })
             });
-            if signed {
+            if signed && floors.failed().is_ok() {
                 continue;
             }
             if let Err(e) = self.keep_cutoff(store, &mine, &cut, None) {
@@ -967,7 +983,7 @@ impl Core {
         let Some(Ok(f)) = p
             .friendship
             .as_deref()
-            .map(|b| Friendship::check(b, self.clock.unix(), &[], zero_floor))
+            .map(|b| Friendship::check(b, STORED, &[], zero_floor))
         else {
             return Ok(());
         };
@@ -1277,7 +1293,7 @@ impl Core {
             return refused(w.pair, Presented::Ok);
         };
         let pair = Pair::new(Fingerprint(names[0]), Fingerprint(names[1]));
-        let rotations = self.rotations_for(store, &pair);
+        let rotations = self.rotations_for(store, &pair)?;
         let Ok(held) = kept.check_pair(&pair, &rotations) else {
             return refused(w.pair, Presented::BadSignature);
         };
@@ -1332,7 +1348,7 @@ impl Core {
             return answer(Presented::BadSignature);
         };
         let pair = f.pair();
-        let rotations = self.rotations_for(store, &pair);
+        let rotations = self.rotations_for(store, &pair)?;
         let names = [f.offer.offerer(), f.offer.to];
         let at = |k: Fingerprint| chain_end(k, &rotations).map(|e| e.0);
         let (my_name, their_name) = match (at(names[0]) == Some(mine), at(names[1]) == Some(mine)) {
@@ -1455,7 +1471,7 @@ impl Core {
         {
             self.judged_alone(store, &p).map_err(store_failed)?;
         }
-        match self.activate(store, me, &them, wall) {
+        match self.activate(store, me, &them, floors, wall) {
             Ok(()) => answer(Presented::Ok),
             Err(MessagingError::RosterFull) => answer(Presented::RosterFull),
             Err(e) => Err(e),
@@ -1466,12 +1482,15 @@ impl Core {
     /// presented a friendship for it (§4.3), under the id it had where a
     /// dropped presentation kept one; or tell both its entry again where
     /// it is active already. `RosterFull` where `me`'s roster has no room
-    /// for it; where `them`'s has none it stays inactive, unanswered.
+    /// for it; where `them`'s has none it stays inactive, unanswered. A
+    /// presentation stored here counts only where its friendship stands at
+    /// the floors, as it must where presented now (§6).
     fn activate(
         &self,
         store: &Arc<dyn RelationshipStore>,
         me: &Mailbox,
         them: &Mailbox,
+        floors: &Floors,
         now: SystemTime,
     ) -> Result<(), MessagingError> {
         let (Some(a), Some(b)) = (me.fingerprint, them.fingerprint) else {
@@ -1489,6 +1508,18 @@ impl Core {
         if friends {
             self.tell_entry(me, them);
             self.tell_entry(them, me);
+            return Ok(());
+        }
+        let rows: Vec<Presentation> = pa.iter().chain(&pb).cloned().collect();
+        let stands = rows.iter().all(|p| {
+            p.friendship
+                .as_deref()
+                .and_then(|b| Friendship::check(b, STORED, &[], zero_floor).ok())
+                .zip(taken_of(&rows, &p.hash))
+                .is_some_and(|(f, taken)| floors.judge(&f, taken) == Judged::Stands)
+        });
+        floors.failed().map_err(store_failed)?;
+        if !stands {
             return Ok(());
         }
         let max = self.messaging_policy.max_roster;

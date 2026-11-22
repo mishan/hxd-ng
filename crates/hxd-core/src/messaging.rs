@@ -1274,6 +1274,11 @@ impl Core {
                 (_, Some(Err(e))) => Err(e),
                 _ => Ok(None),
             };
+            // A store's failure is not a refusal: nothing ends, so a retry
+            // finds the friendship still there to withdraw.
+            if matches!(taken, Err(MessagingError::ServerError)) {
+                return Err(MessagingError::ServerError);
+            }
             let still = store
                 .relationship(&me.mailbox, &them, now)
                 .map_err(store_failed)?

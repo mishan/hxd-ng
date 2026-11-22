@@ -134,12 +134,14 @@ struct Inner {
 #[derive(Default)]
 pub struct MemoryRelationships {
     inner: Mutex<Inner>,
-    /// The next `unfriend`, or `present`, fails, for a test of what a
-    /// failed write leaves.
+    /// The next `unfriend`, `present` or `rotation_from` fails, for a
+    /// test of what a failed write or read leaves.
     #[cfg(test)]
     pub(crate) fail_unfriend: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) fail_present: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_rotation_from: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryRelationships {
@@ -865,6 +867,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn rotation_from(&self, from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_rotation_from
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("rotation_from failed".into()));
+        }
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .rotations
