@@ -134,6 +134,12 @@ struct Inner {
 #[derive(Default)]
 pub struct MemoryRelationships {
     inner: Mutex<Inner>,
+    /// The next `unfriend`, or `present`, fails, for a test of what a
+    /// failed write leaves.
+    #[cfg(test)]
+    pub(crate) fail_unfriend: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) fail_present: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryRelationships {
@@ -607,6 +613,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn unfriend(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<RelationId>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_unfriend
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("unfriend failed".into()));
+        }
         let mut inner = self.inner.lock().unwrap();
         let mut ended = Vec::new();
         for (x, y) in [(a, b), (b, a)] {
@@ -678,6 +691,13 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_present
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(StoreError("present failed".into()));
+        }
         let mut inner = self.inner.lock().unwrap();
         let p = floor_presentation(p);
         let old = inner

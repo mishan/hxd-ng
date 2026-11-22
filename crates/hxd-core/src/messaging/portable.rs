@@ -250,6 +250,12 @@ fn whole(p: &Option<Presentation>) -> bool {
     p.as_ref().is_some_and(|p| p.friendship.is_some())
 }
 
+fn logged(what: &str, r: Result<(), StoreError>) {
+    if let Err(e) = r {
+        warn!("relationships: {what}: {e}");
+    }
+}
+
 fn unix_time(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
@@ -358,7 +364,10 @@ impl Core {
                 Ok(false) => {
                     self.floors_judged.lock().unwrap().remove(&fp);
                 }
-                Err(e) => warn!("relationships: judging presentations by a device floor: {e}"),
+                Err(e) => {
+                    self.floors_judged.lock().unwrap().remove(&fp);
+                    warn!("relationships: judging presentations by a device floor: {e}");
+                }
             }
         }
     }
@@ -427,13 +436,14 @@ impl Core {
             }
         }
         floors.failed()?;
+        // The edge goes before the presentations that are its evidence, so
+        // a failure leaves them to judge again.
         for p in held
             .iter()
             .filter(|p| p.friendship.is_some() && gone.contains(&p.hash))
         {
-            if let Some(dropped) = store.unpresent(&p.presenter, &p.other)? {
-                self.edge_dropped(store, &dropped);
-            }
+            self.edge_dropped(store, p)?;
+            store.unpresent(&p.presenter, &p.other)?;
         }
         Ok(whole)
     }
@@ -723,12 +733,12 @@ impl Core {
     ) -> Result<Vec<u8>, MessagingError> {
         let now = self.clock.unix();
         let floors = Floors::new(self);
-        let kept =
-            Withdrawal::parse(&bytes, now, |k| floors.floor(k)).map_err(|r| match r.error {
-                IdError::ClockSkew => MessagingError::Stale,
-                _ => MessagingError::BadSignature,
-            })?;
+        let parsed = Withdrawal::parse(&bytes, now, |k| floors.floor(k));
         floors.failed().map_err(store_failed)?;
+        let kept = parsed.map_err(|r| match r.error {
+            IdError::ClockSkew => MessagingError::Stale,
+            _ => MessagingError::BadSignature,
+        })?;
         let w = kept.withdrawal();
         own(device, me, &w.from, &w.cert)?;
         fresh(w.time, now)?;
@@ -921,78 +931,88 @@ impl Core {
     /// goes inactive, its id kept on the other party's presentation, and
     /// both are told it is gone here (§6), and its orphan judged.
     fn presentation_dropped(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
-        self.edge_dropped(store, gone);
-        self.orphan_judged(store, gone);
+        logged("an edge going inactive", self.edge_dropped(store, gone));
+        logged("judging an orphan", self.orphan_judged(store, gone));
     }
 
     /// The other party's presentation of the friendship `gone` was of,
     /// dropped where only `gone` held it, taken itself after a half's
     /// reset (§6). A withdrawal or a removal ends the edge, and whatever
     /// would make it active again is judged at its own presentation.
-    fn orphan_judged(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
-        let Some(theirs) = store
-            .presentation(&gone.other, &gone.presenter)
-            .ok()
-            .flatten()
-            .filter(|p| p.hash == gone.hash && gone.friendship.is_some())
-        else {
-            return;
-        };
-        let Some(Ok(f)) = theirs
+    fn orphan_judged(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        gone: &Presentation,
+    ) -> Result<(), StoreError> {
+        if gone.friendship.is_none() {
+            return Ok(());
+        }
+        match store
+            .presentation(&gone.other, &gone.presenter)?
+            .filter(|p| p.hash == gone.hash)
+        {
+            Some(theirs) => self.judged_alone(store, &theirs),
+            None => Ok(()),
+        }
+    }
+
+    /// `p`, held by its own taking alone, dropped where that came after
+    /// a half's reset: its edge first, as at a reset, so a failure
+    /// leaves it to judge again.
+    fn judged_alone(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        p: &Presentation,
+    ) -> Result<(), StoreError> {
+        let Some(Ok(f)) = p
             .friendship
             .as_deref()
             .map(|b| Friendship::check(b, self.clock.unix(), &[], zero_floor))
         else {
-            return;
+            return Ok(());
         };
         let floors = Floors::new(self);
-        if floors.judge(&f, secs(theirs.taken)) != Judged::Reset || floors.failed().is_err() {
-            return;
+        let judged = floors.judge(&f, secs(p.taken));
+        floors.failed()?;
+        if judged == Judged::Reset {
+            self.edge_dropped(store, p)?;
+            store.unpresent(&p.presenter, &p.other)?;
         }
-        match store.unpresent(&theirs.presenter, &theirs.other) {
-            Ok(Some(orphan)) => self.edge_dropped(store, &orphan),
-            Ok(None) => {}
-            Err(e) => warn!("relationships: dropping a presentation no longer held: {e}"),
-        }
+        Ok(())
     }
 
-    fn edge_dropped(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
+    fn edge_dropped(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        gone: &Presentation,
+    ) -> Result<(), StoreError> {
         if gone.friendship.is_none() {
-            return;
+            return Ok(());
         }
         let (Some(a), Some(b)) = (
             self.mailbox_of(&gone.presenter),
             self.mailbox_of(&gone.other),
         ) else {
-            return;
+            return Ok(());
         };
         let wall = self.clock.wall();
-        let id = store
-            .relationship(&a, &b, wall)
-            .ok()
-            .flatten()
-            .and_then(|r| r.friendship);
+        let id = store.relationship(&a, &b, wall)?.and_then(|r| r.friendship);
         let theirs = store
-            .presentation(&gone.other, &gone.presenter)
-            .ok()
-            .flatten()
+            .presentation(&gone.other, &gone.presenter)?
             .filter(|p| p.friendship.is_some());
         let (Some(id), Some(theirs)) = (id, theirs) else {
-            return;
+            return Ok(());
         };
-        let kept = store.unfriend(&a, &b).and_then(|_| {
-            store.present(&Presentation {
-                edge: Some(id),
-                ..theirs
-            })
-        });
-        if let Err(e) = kept {
-            warn!("relationships: an edge going inactive: {e}");
-            return;
-        }
+        // The id kept first: a retry finds the edge still active.
+        store.present(&Presentation {
+            edge: Some(id),
+            ..theirs
+        })?;
+        store.unfriend(&a, &b)?;
         self.roster.lock().unwrap().friends_changed(&a, &b, false);
         self.tell_entry(&a, &b);
         self.tell_entry(&b, &a);
+        Ok(())
     }
 
     /// Fill in what only a friendships session is shown of an entry
@@ -1066,7 +1086,9 @@ impl Core {
         }
         if let Some(mine) = me.mailbox.fingerprint {
             let _writing = self.friend_writes();
-            store.unpresent(&mine, fingerprint).map_err(store_failed)?;
+            if let Some(gone) = store.unpresent(&mine, fingerprint).map_err(store_failed)? {
+                logged("judging an orphan", self.orphan_judged(store, &gone));
+            }
         }
         Ok(())
     }
@@ -1114,12 +1136,12 @@ impl Core {
         // is looked up, so that its answer is the same whoever it names.
         let now = self.clock.unix();
         let floors = Floors::new(self);
-        let kept =
-            Withdrawal::parse(&withdraw, now, |k| floors.floor(k)).map_err(|r| match r.error {
-                IdError::ClockSkew => MessagingError::Stale,
-                _ => MessagingError::BadSignature,
-            })?;
+        let parsed = Withdrawal::parse(&withdraw, now, |k| floors.floor(k));
         floors.failed().map_err(store_failed)?;
+        let kept = parsed.map_err(|r| match r.error {
+            IdError::ClockSkew => MessagingError::Stale,
+            _ => MessagingError::BadSignature,
+        })?;
         let w = kept.withdrawal();
         own(&device, &me.mailbox, &w.from, &w.cert)?;
         fresh(w.time, now)?;
@@ -1411,12 +1433,10 @@ impl Core {
                     .iter()
                     .filter(|p| p.hash == hash && p.friendship.is_some())
                 {
-                    if let Some(gone) = store
+                    self.edge_dropped(store, p).map_err(store_failed)?;
+                    store
                         .unpresent(&p.presenter, &p.other)
-                        .map_err(store_failed)?
-                    {
-                        self.edge_dropped(store, &gone);
-                    }
+                        .map_err(store_failed)?;
                 }
                 if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
                     record(None)?;
@@ -1424,8 +1444,17 @@ impl Core {
                 return answer(Presented::AccountNotFound);
             }
         }
-        // Step 6, there being no hidden links for step 5.
+        // Step 6, there being no hidden links for step 5. The other
+        // party's presentation of another friendship is held by its own
+        // taking alone.
         record(Some(bytes))?;
+        if let Some(p) = store
+            .presentation(&theirs, &mine)
+            .map_err(store_failed)?
+            .filter(|p| p.hash != hash)
+        {
+            self.judged_alone(store, &p).map_err(store_failed)?;
+        }
         match self.activate(store, me, &them, wall) {
             Ok(()) => answer(Presented::Ok),
             Err(MessagingError::RosterFull) => answer(Presented::RosterFull),
@@ -1641,7 +1670,7 @@ impl Core {
         let made = store.presentations(fingerprint).unwrap_or_default();
         for p in made.iter().filter(|p| p.presenter == *fingerprint) {
             match store.unpresent(&p.presenter, &p.other) {
-                Ok(Some(gone)) => self.orphan_judged(store, &gone),
+                Ok(Some(gone)) => logged("judging an orphan", self.orphan_judged(store, &gone)),
                 Ok(None) => {}
                 Err(e) => warn!("relationships: dropping an unlinked account's presentation: {e}"),
             }

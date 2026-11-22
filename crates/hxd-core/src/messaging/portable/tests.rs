@@ -4,6 +4,7 @@
 //! device epoch floor, and refused to any act the device-act gate does
 //! not admit.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use hl_identity::friendship::Pair;
@@ -15,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::tests::{messaging_bits, policy, server_of, Directory, Server};
 use super::super::*;
-use crate::identity_records::KeptEpoch;
-use crate::inbox::Mailbox;
+use crate::identity_records::{CachedList, KeptEpoch, MemoryRecordCache, RecordCache};
+use crate::inbox::{Mailbox, StoreError};
 use crate::roster::{drain, AttachInfo};
 use crate::{Events, IdentityTag, InboxPolicy, Published, Revocations};
 
@@ -1196,6 +1197,202 @@ fn an_unlink_takes_the_presentation_only_it_held() {
     assert!(ok_all(&held));
 
     s.core.friendships_unlinked(&fp(&alice));
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_reset_whose_cleanup_fails_ends_the_friendship_when_judged_again() {
+    for write in ["unfriend", "present"] {
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let reset_at = s.core.clock().unix() - 30;
+        let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
+        match write {
+            "unfriend" => &s.rel.fail_unfriend,
+            _ => &s.rel.fail_present,
+        }
+        .store(true, Ordering::Relaxed);
+        reset(&s, &alice, 1, reset_at);
+        install(&s, &alice, 1);
+        assert_eq!(
+            told(&mut rb),
+            [("alice".into(), RosterState::Removed, vec![], None)],
+            "removed once judged again, {write} failing"
+        );
+        let wall = std::time::SystemTime::now();
+        let (ma, mb) = (
+            Mailbox::identified("alice", fp(&alice)),
+            Mailbox::identified("bob", fp(&bob)),
+        );
+        assert!(s
+            .rel
+            .relationship(&ma, &mb, wall)
+            .unwrap()
+            .is_none_or(|r| r.friendship.is_none()));
+    }
+}
+
+/// The in-memory record cache, its epochs unreadable while `fail` is set.
+#[derive(Default)]
+struct Flaky {
+    inner: MemoryRecordCache,
+    fail: AtomicBool,
+}
+
+impl RecordCache for Flaky {
+    fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        self.inner.put(identity, list)
+    }
+    fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        self.inner.lists(identity)
+    }
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        self.inner.hold_superseded(identity, list)
+    }
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        self.inner.superseded(identity)
+    }
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError> {
+        self.inner.release_superseded(identity)
+    }
+    fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {
+        self.inner.first_seen(identity, now)
+    }
+    fn keep_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        self.inner.keep_epoch(identity, kept)
+    }
+    fn replace_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        self.inner.replace_epoch(identity, kept)
+    }
+    fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError> {
+        if self.fail.load(Ordering::Relaxed) {
+            return Err(StoreError("unreadable".into()));
+        }
+        self.inner.epochs(identity)
+    }
+}
+
+#[test]
+fn a_withdrawal_whose_floor_cannot_be_read_is_a_server_error() {
+    for block in [false, true] {
+        let (mut alice, bob) = (person(1), person(2));
+        let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let cache = Arc::new(Flaky::default());
+        Arc::get_mut(&mut s.core).unwrap().record_cache = Some(cache.clone());
+        install(&s, &alice, 1);
+        let renewed = enroll(&mut alice, 1);
+        let (a, _) = device(&s.core, "alice", &alice, renewed);
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let o = offer(&alice, renewed, &bob, now() - 60);
+        assert_eq!(
+            s.core.friend_ask(a, "bob", None, Some(o.clone())),
+            Ok(RosterState::PendingOut)
+        );
+        let f = accept(&o, &bob, 0, now() - 60);
+        assert_eq!(
+            s.core.friend_answer(b, "alice", true, Some(f)),
+            Ok(RosterState::Accepted)
+        );
+
+        // Signed by a certificate below the floor installed, which alone
+        // cannot say what the records would.
+        cache.fail.store(true, Ordering::Relaxed);
+        let w = withdraw(&alice, 0, &bob, now());
+        let got = if block {
+            s.core.block_withdrawing(a, "bob", w)
+        } else {
+            s.core.friend_unfriend(a, "bob", Some(w))
+        };
+        assert_eq!(got, Err(MessagingError::ServerError), "block: {block}");
+    }
+}
+
+#[test]
+fn a_presentation_replaced_takes_the_other_partys_only_it_held() {
+    let (mut alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    s.core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+    let (b, mut rb) = device(&s.core, "bob", &bob, 1);
+    let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&held));
+    drain(&mut rb);
+
+    // Alice presents a friendship made since, from a device that stays.
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let o = offer(&alice, renewed, &bob, now() - 30);
+    let f2 = accept(&o, &bob, 0, now() - 30);
+    s.rel.fail_unfriend.store(true, Ordering::Relaxed);
+    assert_eq!(
+        s.core.friendships_present(a2, vec![], vec![f2.clone()]),
+        Err(MessagingError::ServerError)
+    );
+    let (_, replaced) = s.core.friendships_present(a2, vec![], vec![f2]).unwrap();
+    assert!(ok_all(&replaced), "{replaced:?}");
+    assert!(
+        s.rel
+            .presentation(&fp(&bob), &fp(&alice))
+            .unwrap()
+            .is_none(),
+        "Bob's was held by Alice's alone"
+    );
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+}
+
+#[test]
+fn a_removal_by_fingerprint_takes_the_presentation_only_it_held() {
+    let (mut alice, bob, carol) = (person(1), person(2), person(3));
+    let accounts = [
+        ("alice", &fp(&alice)),
+        ("bob", &fp(&bob)),
+        ("carol", &fp(&carol)),
+    ];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked_with(
+        MessagingPolicy {
+            max_roster: 1,
+            ..policy()
+        },
+        &accounts,
+    );
+    let t = s.core.clock().unix();
+    // Alice's roster is full, so the friendship stays inactive here.
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    s.core.inbox_block(a, "carol", true).unwrap();
+    s.core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&held));
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_some());
+
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    assert_eq!(s.core.friend_remove_by_key(a2, &fp(&bob), None), Ok(()));
     assert!(s
         .rel
         .presentation(&fp(&bob), &fp(&alice))
