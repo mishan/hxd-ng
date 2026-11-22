@@ -1,7 +1,8 @@
 # Applying a registrar's records: the verifying server
 
 Status: R1, R2 and R3 built; R4 is designed further before it is
-staged; R5, device epochs, is specified and not built. §6 stages it.
+staged; R5, device epochs, is built but for its last part, what a reset
+device signed and registered. §6 stages it.
 
 `identity-registrar.md` §7 says what a server that trusts a registrar
 does with what the registrar publishes: resolve its key, fetch the
@@ -146,7 +147,10 @@ held from a registrar not trusted are not read, so what it published,
 revocations included, no longer applies, and an identity no other
 trusted registrar attests is unattested, so `unattested` decides its
 admission; a device it revoked that must stay out goes in
-`revoked_devices`. A rotation this server already took from it, kept in
+`revoked_devices`. A device epoch floor kept here (below) is the
+identity's own signature, not the registrar's, so it outlives
+untrusting the registrar that published it, and removing every
+registrar too. A rotation this server already took from it, kept in
 the successors file when there is one (§4), still stands: its
 predecessor is refused `rotated` after the restart.
 
@@ -168,7 +172,11 @@ or equal floor and does nothing. Beside it the server keeps, for each
 for that `epoch`, kept only ever earlier, since registrars prune
 superseded records from the full list and one `epoch` can be posted to
 two registrars with two times; that time decides which friendship
-presentations it keeps (`proposals/portable-friends.md` §6).
+presentations it keeps (`proposals/portable-friends.md` §6). Nothing
+in the table is ever pruned: its rows are bounded by the resets an
+identity's key has signed and its trusted registrars have published,
+which their daily limit bounds, not by anything a caller of `auth` can
+grow (`hotline-ng-identity.md` §13).
 
 ## 4. Rotation at the server
 

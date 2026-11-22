@@ -1954,6 +1954,8 @@ enum Trust {
     Key,
     /// On the key the registrar's discovery document publishes.
     Discovery,
+    /// Not at all: no registrar is trusted.
+    Nobody,
 }
 
 /// A server that trusts the registrar `r` and reaches it at `url`,
@@ -1965,11 +1967,12 @@ async fn verifier(
     url: &str,
     extra: &str,
 ) -> (SocketAddr, Arc<hxd_ng_session::IdentityState>) {
-    let (ng, identity, _) = verifier_serving(dir, r, trust, url, extra, None).await;
+    let (ng, identity, _) = verifier_serving(dir, r, trust, url, extra, None, 1).await;
     (ng, identity)
 }
 
-/// [`verifier`], serving the classic wire on `classic` too, and its core.
+/// [`verifier`], serving the classic wire on `classic` too, with lists current
+/// for `max_age` seconds, and its core.
 async fn verifier_serving(
     dir: &Path,
     r: &Server,
@@ -1977,18 +1980,26 @@ async fn verifier_serving(
     url: &str,
     extra: &str,
     classic: Option<tokio::net::TcpListener>,
+    max_age: u64,
 ) -> (
     SocketAddr,
     Arc<hxd_ng_session::IdentityState>,
     Arc<hxd_core::Core>,
 ) {
     let d = dir.display();
-    let trust = match trust {
-        Trust::Key => format!(
-            "[identity.registrar_keys]\n\"{HOST}\" = \"{}\"\n",
-            b64(&r.registrar.public_key())
+    let (trusted, trust) = match trust {
+        Trust::Key => (
+            format!("trusted_registrars = [\"{HOST}\"]\n"),
+            format!(
+                "[identity.registrar_keys]\n\"{HOST}\" = \"{}\"\n",
+                b64(&r.registrar.public_key())
+            ),
         ),
-        Trust::Discovery => String::new(),
+        Trust::Discovery => (
+            format!("trusted_registrars = [\"{HOST}\"]\n"),
+            String::new(),
+        ),
+        Trust::Nobody => (String::new(), String::new()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ng = listener.local_addr().unwrap();
@@ -1998,7 +2009,7 @@ async fn verifier_serving(
          [ng]\nbind = \"127.0.0.1:0\"\n\
          [identity]\nkey = \"{d}/server.key\"\nsuccessors = \"{d}/successors\"\nenroll = false\n\
          hosts = [\"{ng}\"]\n\
-         revocation_max_age = 1\ntrusted_registrars = [\"{HOST}\"]\n{extra}\n\
+         revocation_max_age = {max_age}\n{trusted}{extra}\n\
          {trust}\
          [identity.registrar_urls]\n\"{HOST}\" = \"{url}\"\n"
     );
@@ -2113,7 +2124,8 @@ fn rotation(from: &IdentityKey, to: &IdentityKey) -> Vec<u8> {
     .unwrap()
 }
 
-/// A list fetched is current for `revocation_max_age`, a second here.
+/// A list fetched is current for `revocation_max_age`, a second here
+/// unless a test asks for longer.
 async fn next_list() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
@@ -2332,14 +2344,16 @@ async fn open_registrar(dir: &Path) -> Server {
 
 /// A server trusting `r` and reaching it at `url`, on both wires, whose
 /// accounts `alice` and `bob` are linked to those identities, seeds 1
-/// and 2, with `extra` after its `[identity]` keys: the ng port, the
-/// classic port, the identity state and the core.
+/// and 2, with `extra` after its `[identity]` keys, holding a list
+/// current for `max_age` seconds: the ng port, the classic port, the
+/// identity state and the core.
 async fn linked_verifier(
     dir: &Path,
     r: &Server,
     trust: Trust,
     url: &str,
     extra: &str,
+    max_age: u64,
 ) -> (
     SocketAddr,
     SocketAddr,
@@ -2365,6 +2379,7 @@ async fn linked_verifier(
         url,
         &format!("classic_hosts = [\"{plain}\"]\n{extra}"),
         Some(classic),
+        max_age,
     )
     .await;
     (ng, plain, identity, core)
@@ -2377,7 +2392,7 @@ async fn linked_verifier(
 async fn phone_revoked(dir: &Path) -> (Server, SocketAddr, SocketAddr, Vec<u8>) {
     let r = open_registrar(dir).await;
     let (v, plain, _, _) =
-        linked_verifier(dir, &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+        linked_verifier(dir, &r, Trust::Key, &format!("http://{}", r.ng), "", 1).await;
     let (alice, phone) = (
         IdentityKey::from_seed(&[1; 32]),
         DeviceKey::from_seed(&[101; 32]),
@@ -2614,7 +2629,7 @@ async fn a_held_list_is_fetched_for_a_retired_key_while_discovery_fails() {
         Arc::new(AtomicUsize::new(0)),
     );
     without_discovery(proxy, r.ng, down.clone(), refused.clone());
-    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Discovery, &url, "").await;
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Discovery, &url, "", 1).await;
     let (alice, phone) = (
         IdentityKey::from_seed(&[1; 32]),
         DeviceKey::from_seed(&[101; 32]),
@@ -2813,8 +2828,15 @@ fn refusal(reply: &Reply) -> (u16, Value, Value) {
 async fn a_reset_refuses_the_certificates_below_its_floor_and_admits_the_rest() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
-    let (v, _, identity, _) =
-        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let (v, _, identity, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "",
+        1,
+    )
+    .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
     let (phone, laptop, tablet) = (
         DeviceKey::from_seed(&[101; 32]),
@@ -2892,8 +2914,15 @@ async fn a_reset_refuses_the_certificates_below_its_floor_and_admits_the_rest() 
 async fn a_reset_ends_the_sessions_below_its_floor_on_both_wires() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
-    let (v, plain, identity, core) =
-        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let (v, plain, identity, core) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "",
+        1,
+    )
+    .await;
     let (alice, bob) = (
         IdentityKey::from_seed(&[1; 32]),
         IdentityKey::from_seed(&[2; 32]),
@@ -3058,6 +3087,7 @@ async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
         Trust::Key,
         &url,
         "revocation_stale = \"deny\"",
+        30,
     )
     .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
@@ -3069,7 +3099,7 @@ async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
     let mut laptop_here =
         session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
     post_reset(&r, &alice, 1).await;
-    next_list().await;
+    identity.clock().advance(Duration::from_secs(31));
     assert!(identity.sweep_records().await.is_empty());
     laptop_here.request("ping", json!({})).await.unwrap();
 
@@ -3078,7 +3108,7 @@ async fn a_floor_installed_is_told_whatever_the_lists_held_say() {
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     *to.lock().unwrap() = closed.local_addr().unwrap();
     drop(closed);
-    next_list().await;
+    identity.clock().advance(Duration::from_secs(31));
     assert_eq!(
         refusal(&auth_at(v, &alice, &phone, &card).await),
         (403, json!("revoked"), json!(1))
@@ -3095,6 +3125,7 @@ async fn a_floor_auth_fetches_is_applied_before_any_sweep() {
         Trust::Key,
         &format!("http://{}", r.ng),
         "banned_registrars = [\"banned.example\"]",
+        1,
     )
     .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
@@ -3163,8 +3194,15 @@ async fn a_floor_auth_fetches_is_applied_before_any_sweep() {
 async fn a_token_below_a_floor_fetched_at_auth_does_not_outlive_the_next_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
-    let (v, _, identity, _) =
-        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let (v, _, identity, _) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "",
+        1,
+    )
+    .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
     let (phone, tablet) = (
         DeviceKey::from_seed(&[101; 32]),
@@ -3196,8 +3234,15 @@ async fn a_token_below_a_floor_fetched_at_auth_does_not_outlive_the_next_sweep()
 async fn a_floor_fetched_beside_a_revoked_device_is_installed_and_spares_one_renewed() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
-    let (v, _, identity, core) =
-        linked_verifier(dir.path(), &r, Trust::Key, &format!("http://{}", r.ng), "").await;
+    let (v, _, identity, core) = linked_verifier(
+        dir.path(),
+        &r,
+        Trust::Key,
+        &format!("http://{}", r.ng),
+        "",
+        1,
+    )
+    .await;
     let alice = IdentityKey::from_seed(&[1; 32]);
     let dev = |seed| DeviceKey::from_seed(&[seed; 32]);
     let (phone, tablet, laptop) = (dev(101), dev(103), dev(102));
@@ -3332,6 +3377,288 @@ async fn a_rotation_listed_beside_a_floor_is_told_as_a_rotation() {
             reply.json()["successor"].clone()
         ),
         (403, json!("rotated"), json!(new.fingerprint().to_string()))
+    );
+}
+
+/// Every device epoch record in the store of the registrar in `dir`,
+/// deleted from under it, as a registrar that has lost them would.
+fn delete_resets(dir: &Path) {
+    let conn = rusqlite::Connection::open(dir.join("registrar/registrar.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let deleted = conn
+        .execute(
+            "DELETE FROM registrar_record WHERE kind = 'device_epoch'",
+            [],
+        )
+        .unwrap();
+    assert!(deleted > 0);
+}
+
+#[tokio::test]
+async fn a_floor_seen_outlives_its_record_and_a_restart_whatever_the_card_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 1).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let below = (403, json!("revoked"), json!(1));
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    // The registrar's lists no longer carry the reset, and a sweep has
+    // replaced the floor installed at auth: the floor kept stands.
+    delete_resets(dir.path());
+    next_list().await;
+    identity.sweep_records().await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    // Nor does a restart forget it, for a card without attestations too,
+    // while a certificate at the floor is let in on it.
+    let restarted = verifier(&dir.path().join("verifier"), &r, Trust::Key, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_at(restarted, &alice, &phone, &bare(&alice)).await),
+        below
+    );
+    let at_floor = cert_in(&alice, &laptop, 1);
+    let reply = auth_cert(restarted, &laptop, &bare(&alice), &at_floor, json!({})).await;
+    assert_eq!(reply.json()["outcome"], "linked");
+
+    // Nor does trusting no registrar at all.
+    let alone = verifier(&dir.path().join("verifier"), &r, Trust::Nobody, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_at(alone, &alice, &phone, &bare(&alice)).await),
+        below
+    );
+
+    // A server that never saw the reset admits that card onto the
+    // account linked to her: the residual a floor leaves.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other = linked_verifier(elsewhere.path(), &r, Trust::Key, &url, "", 1)
+        .await
+        .0;
+    let reply = auth_at(other, &alice, &phone, &bare(&alice)).await;
+    assert_eq!(reply.json()["outcome"], "linked");
+}
+
+#[tokio::test]
+async fn a_reset_only_a_held_list_carries_is_kept_when_the_list_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let phone = DeviceKey::from_seed(&[101; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let below = (403, json!("revoked"), json!(1));
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    // The held list carries the reset and the floor table does not, as a
+    // store from before it would; the registrar then lists it no more.
+    let db = dir.path().join("verifier/server.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DELETE FROM identity_device_floor")
+        .unwrap();
+    delete_resets(dir.path());
+    identity.clock().advance(Duration::from_secs(31));
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    let restarted = verifier(&dir.path().join("verifier"), &r, Trust::Key, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_at(restarted, &alice, &phone, &card).await),
+        below
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_installs_a_floor_held_in_a_list_no_longer_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let v = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30)
+        .await
+        .0;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+
+    // The reset in no floor row, and its registrar trusted no more while
+    // another is.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch("DELETE FROM identity_device_floor")
+        .unwrap();
+    let (v, identity, core) = verifier_serving(
+        &dir.path().join("verifier"),
+        &r,
+        Trust::Nobody,
+        &url,
+        "trusted_registrars = [\"other.example\"]",
+        None,
+        30,
+    )
+    .await;
+    let _laptop_here = session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
+    identity.sweep_records().await;
+    let below = hxd_core::CertRef {
+        identity: alice.fingerprint().0,
+        device: hl_identity::Fingerprint::of(&phone.public()).0,
+        epoch: 0,
+    };
+    assert!(core.refuses(&below), "the sweep installed the floor");
+}
+
+#[tokio::test]
+async fn a_reset_stored_in_a_list_alone_is_the_floor_trusting_no_registrar() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let v = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30)
+        .await
+        .0;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let phone = DeviceKey::from_seed(&[101; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let below = (403, json!("revoked"), json!(1));
+
+    // The list carrying the reset is stored and the reset never kept.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON identity_device_floor
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        )
+        .unwrap();
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    let alone = verifier(&dir.path().join("verifier"), &r, Trust::Nobody, &url, "")
+        .await
+        .0;
+    assert_eq!(refusal(&auth_at(alone, &alice, &phone, &card).await), below);
+}
+
+#[tokio::test]
+async fn a_list_is_stored_while_the_resets_it_replaces_cannot_be_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, tablet) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[103; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    let mut phone_here = session_in(v, &phone, &cert_in(&alice, &phone, 1), &card, json!({})).await;
+
+    // The held list's reset is in no floor row, and none can be written,
+    // while the lists still can be; the registrar drops the reset and
+    // revokes the phone.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM identity_device_floor;
+             CREATE TRIGGER no_floor BEFORE INSERT ON identity_device_floor
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        )
+        .unwrap();
+    delete_resets(dir.path());
+    post_device_revocation(&r, &alice, &phone).await;
+    identity.clock().advance(Duration::from_secs(31));
+
+    // The fetched list is stored and its revocation applied, and the
+    // reset it dropped is still the floor.
+    identity.sweep_records().await;
+    phone_here.event("kicked").await.unwrap();
+    let below = (403, json!("revoked"), json!(1));
+    let tablet_below = cert_in(&alice, &tablet, 0);
+    assert_eq!(
+        refusal(&auth_cert(v, &tablet, &card, &tablet_below, json!({})).await),
+        below
+    );
+
+    // Nor does a restart forget either, the floor table still refusing.
+    let restarted = verifier(&dir.path().join("verifier"), &r, Trust::Key, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_cert(restarted, &tablet, &card, &tablet_below, json!({})).await),
+        below
+    );
+    let phone_cert = cert_in(&alice, &phone, 1);
+    let reply = auth_cert(restarted, &phone, &card, &phone_cert, json!({})).await;
+    assert_eq!(
+        (reply.status, reply.json()["error"].clone()),
+        (403, json!("revoked"))
+    );
+
+    // Nor does trusting no registrar at all.
+    let alone = verifier(&dir.path().join("verifier"), &r, Trust::Nobody, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_cert(alone, &tablet, &card, &tablet_below, json!({})).await),
+        below
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_floor_refuses_once_the_lists_floor_is_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    let below = cert_in(&alice, &phone, 0);
+    let mut phone_here = session_in(v, &phone, &below, &card, json!({})).await;
+    let token = auth_cert(v, &phone, &card, &below, json!({})).await.json()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    post_reset(&r, &alice, 1).await;
+    identity.clock().advance(Duration::from_secs(31));
+
+    // The kept floor can no longer be read, while the lists can: the
+    // floor they fetch is put in force, and the login is still refused.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE identity_device_floor")
+        .unwrap();
+    let reply = auth_cert(v, &laptop, &card, &cert_in(&alice, &laptop, 1), json!({})).await;
+    assert_eq!(refusal(&reply), (403, json!("denied"), Value::Null));
+    phone_here.event("kicked").await.unwrap();
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{v}/ng?token={token}"))
+            .await
+            .is_err(),
+        "the token below the floor is refused"
     );
 }
 
@@ -3552,7 +3879,8 @@ impl Away {
                 });
             }
         });
-        let (v, _, identity, core) = linked_verifier(dir.path(), &r, Trust::Key, &url, &push).await;
+        let (v, _, identity, core) =
+            linked_verifier(dir.path(), &r, Trust::Key, &url, &push, 1).await;
         let alice = IdentityKey::from_seed(&[1; 32]);
         let card = attested(&r, &alice, "alice").await;
         Away {

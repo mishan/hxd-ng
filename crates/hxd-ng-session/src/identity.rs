@@ -1513,6 +1513,13 @@ impl IdentityState {
         let (listed, named) = found
             .as_ref()
             .map_or((0, Named::Nothing), |f| floor_of(f, cert));
+        // With the floor kept here by fingerprint, which the lists held or
+        // the card shown do not lower, a restart does not forget, and no
+        // registrar need be trusted to read: one that cannot be read may
+        // hold a floor, and refuses once the lists' floor is in force and
+        // what else refuses has been told.
+        let kept = self.kept_floor(&fingerprint);
+        let listed = listed.max(*kept.as_ref().unwrap_or(&0));
         if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
             for (uid, nick) in ended {
                 info!(uid, nick = %nick, "session ended: below a floor fetched at auth");
@@ -1571,6 +1578,11 @@ impl IdentityState {
                 return Err(refused);
             }
             None => {}
+        }
+        // Told after what is known refuses, so a revoked key is told so.
+        if let Err(e) = kept {
+            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its device floor could not be read: {}", e.0);
+            return Err(AuthRefused::Denied);
         }
 
         // A banned registrar refuses every identity that carries its
@@ -1993,6 +2005,17 @@ impl IdentityState {
         });
         if below {
             t.devices.remove(device);
+        }
+    }
+
+    /// The device epoch floor kept for `fp`, with registrars trusted or
+    /// none: removing the last is no way under it. Reads the store:
+    /// called off the reactor.
+    fn kept_floor(&self, fp: &Fingerprint) -> Result<u64, hxd_core::StoreError> {
+        match (&self.registrars, self.core.record_cache()) {
+            (Some(registrars), _) => registrars.kept_floor(fp),
+            (None, Some(cache)) => crate::registrars::kept_floor(&*cache, fp),
+            (None, None) => Ok(0),
         }
     }
 
@@ -3345,8 +3368,42 @@ mod tests {
             fn lists(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
                 Err(hxd_core::StoreError("unreadable".into()))
             }
+            fn hold_superseded(
+                &self,
+                _: &[u8; 32],
+                _: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn superseded(&self, _: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                Ok(Vec::new())
+            }
+            fn release_superseded(&self, _: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
             fn first_seen(&self, _: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
                 Ok(now)
+            }
+            fn keep_epoch(
+                &self,
+                _: &[u8; 32],
+                _: &hxd_core::identity_records::KeptEpoch,
+            ) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn replace_epoch(
+                &self,
+                _: &[u8; 32],
+                _: &hxd_core::identity_records::KeptEpoch,
+            ) -> Result<(), hxd_core::StoreError> {
+                Ok(())
+            }
+            fn epochs(
+                &self,
+                _: &[u8; 32],
+            ) -> Result<Vec<hxd_core::identity_records::KeptEpoch>, hxd_core::StoreError>
+            {
+                Ok(Vec::new())
             }
         }
         let (a, b) = (
@@ -3472,6 +3529,104 @@ mod tests {
             .unwrap();
         let attested = Card::parse(&attested).unwrap();
         assert_eq!(answer(&unreadable, &attested, &laptop), Err("denied"));
+    }
+
+    /// A device floor that cannot be read refuses, with registrars trusted
+    /// or none, while the lists beside it read: it may hold a floor.
+    #[test]
+    fn a_floor_that_cannot_be_read_refuses() {
+        use crate::registrars::{Registrars, RegistrarsConfig, Stale};
+        use hxd_core::identity_records::{CachedList, KeptEpoch, MemoryRecordCache, RecordCache};
+        struct NoFloor(MemoryRecordCache, bool);
+        impl RecordCache for NoFloor {
+            fn put(&self, i: &[u8; 32], l: &CachedList) -> Result<(), hxd_core::StoreError> {
+                self.0.put(i, l)
+            }
+            fn lists(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.lists(i)
+            }
+            fn hold_superseded(
+                &self,
+                i: &[u8; 32],
+                l: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                self.0.hold_superseded(i, l)
+            }
+            fn superseded(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.superseded(i)
+            }
+            fn release_superseded(&self, i: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                self.0.release_superseded(i)
+            }
+            fn first_seen(&self, i: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
+                self.0.first_seen(i, now)
+            }
+            fn keep_epoch(&self, i: &[u8; 32], k: &KeptEpoch) -> Result<(), hxd_core::StoreError> {
+                self.0.keep_epoch(i, k)
+            }
+            fn replace_epoch(
+                &self,
+                i: &[u8; 32],
+                k: &KeptEpoch,
+            ) -> Result<(), hxd_core::StoreError> {
+                self.0.replace_epoch(i, k)
+            }
+            fn epochs(&self, i: &[u8; 32]) -> Result<Vec<KeptEpoch>, hxd_core::StoreError> {
+                match self.1 {
+                    true => self.0.epochs(i),
+                    false => Err(hxd_core::StoreError("unreadable".into())),
+                }
+            }
+        }
+        let id = IdentityKey::from_seed(&[1; 32]);
+        let now = hxd_core::clock::Clock::default().unix();
+        let signed = DeviceCert::for_device(
+            &id,
+            &DeviceKey::from_seed(&[101; 32]),
+            now - 5,
+            cert::RECOMMENDED_LIFETIME,
+        )
+        .unwrap()
+        .sign(&id);
+        let cert = DeviceCert::parse(&signed).unwrap();
+        let card = Card::parse(&Card::new(&id, "alice", now).sign(&id, vec![]).unwrap()).unwrap();
+        for readable in [true, false] {
+            let cache = Arc::new(NoFloor(MemoryRecordCache::default(), readable));
+            let core = Arc::new(hxd_core::Core::new().with_record_cache(cache.clone()));
+            let mut cfg = IdentityConfig::default();
+            cfg.hosts.push(TEST_HOST.into());
+            let bare =
+                IdentityState::new(ServerKey::from_seed(&[5; 32]), cfg, MemAuth::new(), core);
+            let registrars = Registrars::new(
+                RegistrarsConfig {
+                    keys: HashMap::new(),
+                    trusted: vec!["a.example".into()],
+                    urls: HashMap::new(),
+                    timeout: Duration::from_secs(1),
+                    max_age: Duration::from_secs(3600),
+                    stale: Stale::Cached,
+                    user_agent: String::new(),
+                },
+                cache,
+                hxd_core::clock::Clock::default(),
+            );
+            let mut cfg = IdentityConfig::default();
+            cfg.hosts.push(TEST_HOST.into());
+            let trusting = IdentityState::new(
+                ServerKey::from_seed(&[5; 32]),
+                cfg,
+                MemAuth::new(),
+                Arc::new(hxd_core::Core::new()),
+            )
+            .with_registrars(Arc::new(registrars));
+            for (case, st) in [("no registrar", bare), ("a registrar", trusting)] {
+                let answer = st
+                    .standing(&card, &cert, None, Assoc::ReadOnly)
+                    .err()
+                    .map(AuthRefused::code);
+                assert_eq!(answer == Some("denied"), !readable, "{case}: {answer:?}");
+            }
+        }
     }
 
     /// Compacting rewrites the file owner-only beside a stray temporary

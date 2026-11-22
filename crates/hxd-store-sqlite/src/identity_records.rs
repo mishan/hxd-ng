@@ -1,7 +1,8 @@
 //! Registrars' record lists on SQLite (`docs/identity-records.md` §2):
-//! one row per identity and registrar, the last list fetched.
+//! one row per identity and registrar, the last list fetched; and one
+//! per identity and device epoch, the earliest record of it seen.
 
-use hxd_core::identity_records::{CachedList, RecordCache, FIRST_SEEN_KEPT};
+use hxd_core::identity_records::{CachedList, KeptEpoch, RecordCache, FIRST_SEEN_KEPT};
 use hxd_core::inbox::StoreError;
 use rusqlite::{params, OptionalExtension};
 
@@ -55,37 +56,84 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CachedList> {
     })
 }
 
+/// Write `list` for `identity` with `insert`, whose parameters are
+/// identity, registrar, list, fetched and keys.
+fn write(
+    store: &SqliteStore,
+    insert: &str,
+    identity: &[u8; 32],
+    list: &CachedList,
+) -> Result<(), StoreError> {
+    let conn = store.conn.lock().unwrap();
+    sql(conn.execute(
+        insert,
+        params![
+            identity.to_vec(),
+            list.registrar,
+            encode(&list.pages),
+            i64::try_from(list.fetched).unwrap_or(i64::MAX),
+            list.keys
+                .iter()
+                .flat_map(|(k, until)| [&k[..], &until.unwrap_or(u64::MAX).to_be_bytes()].concat())
+                .collect::<Vec<u8>>(),
+        ],
+    ))?;
+    Ok(())
+}
+
+/// Every list `table` holds for `identity`.
+fn read(
+    store: &SqliteStore,
+    table: &str,
+    identity: &[u8; 32],
+) -> Result<Vec<CachedList>, StoreError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = sql(conn.prepare_cached(&format!(
+        "SELECT registrar, list, fetched, keys FROM {table} WHERE identity = ?1"
+    )))?;
+    let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
+    rows.map(sql).collect()
+}
+
 impl RecordCache for SqliteStore {
     fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
+        write(
+            self,
             "INSERT INTO identity_records (identity, registrar, list, fetched, keys)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (identity, registrar) DO UPDATE
                SET list = excluded.list, fetched = excluded.fetched, keys = excluded.keys",
-            params![
-                identity.to_vec(),
-                list.registrar,
-                encode(&list.pages),
-                i64::try_from(list.fetched).unwrap_or(i64::MAX),
-                list.keys
-                    .iter()
-                    .flat_map(
-                        |(k, until)| [&k[..], &until.unwrap_or(u64::MAX).to_be_bytes()].concat()
-                    )
-                    .collect::<Vec<u8>>(),
-            ],
-        ))?;
-        Ok(())
+            identity,
+            list,
+        )
     }
 
     fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        read(self, "identity_records", identity)
+    }
+
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        write(
+            self,
+            "INSERT OR REPLACE INTO identity_records_superseded
+               (identity, registrar, list, fetched, keys)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            identity,
+            list,
+        )
+    }
+
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        read(self, "identity_records_superseded", identity)
+    }
+
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = sql(conn.prepare_cached(
-            "SELECT registrar, list, fetched, keys FROM identity_records WHERE identity = ?1",
+        sql(conn.execute(
+            "DELETE FROM identity_records_superseded WHERE identity = ?1",
+            params![identity.to_vec()],
         ))?;
-        let rows = sql(stmt.query_map(params![identity.to_vec()], row))?;
-        rows.map(sql).collect()
+        Ok(())
     }
 
     fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {
@@ -115,11 +163,67 @@ impl RecordCache for SqliteStore {
         sql(tx.commit())?;
         Ok(now)
     }
+
+    fn keep_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT INTO identity_device_floor (identity, epoch, time, record)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (identity, epoch) DO UPDATE
+               SET time = excluded.time, record = excluded.record
+               WHERE excluded.time < identity_device_floor.time",
+            params![
+                identity.to_vec(),
+                i64::try_from(kept.epoch).unwrap_or(i64::MAX),
+                i64::try_from(kept.time).unwrap_or(i64::MAX),
+                kept.record,
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn replace_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        sql(conn.execute(
+            "INSERT OR REPLACE INTO identity_device_floor (identity, epoch, time, record)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                identity.to_vec(),
+                i64::try_from(kept.epoch).unwrap_or(i64::MAX),
+                i64::try_from(kept.time).unwrap_or(i64::MAX),
+                kept.record,
+            ],
+        ))?;
+        Ok(())
+    }
+
+    fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT epoch, time, record FROM identity_device_floor WHERE identity = ?1",
+        ))?;
+        let rows = sql(stmt.query_map(params![identity.to_vec()], |r| {
+            let (epoch, time): (i64, i64) = (r.get(0)?, r.get(1)?);
+            Ok(KeptEpoch {
+                epoch: u64::try_from(epoch).unwrap_or(0),
+                time: u64::try_from(time).unwrap_or(0),
+                record: r.get(2)?,
+            })
+        }))?;
+        rows.map(sql).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passes_the_conformance_suite() {
+        hxd_core::identity_records::conformance::run(&|| {
+            Box::new(SqliteStore::in_memory().unwrap())
+        });
+    }
 
     #[test]
     fn a_list_comes_back_with_its_keys_deadlines() {
