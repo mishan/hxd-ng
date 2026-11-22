@@ -374,6 +374,39 @@ fn a_certificate_is_minted_from_a_home_it_cannot_write_at_the_epoch_kept_there()
     assert_eq!(epoch, 7, "{stderr}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_certificate_is_not_minted_from_a_home_it_cannot_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("hlid");
+    ok(&home, &["init", "--name", "alice"]);
+    let key = dir.path().join("identity.key");
+    std::fs::copy(home.join("identity.key"), &key).unwrap();
+    let cert = dir.path().join("web.cert");
+    let mode = |m| std::fs::set_permissions(&home, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o600);
+    let out = hlid(
+        &home,
+        &[
+            "cert",
+            "--identity",
+            key.to_str().unwrap(),
+            "--device-pub",
+            &key_hex(DEVICE_PUB),
+            "--device-enc-pub",
+            &key_hex(DEVICE_ENC_PUB),
+            "-o",
+            cert.to_str().unwrap(),
+        ],
+    );
+    mode(0o700);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("holder.json"), "{stderr}");
+    assert!(!cert.exists());
+}
+
 #[test]
 fn a_reset_refuses_a_card_named_that_is_another_identitys() {
     let dir = tempfile::tempdir().unwrap();

@@ -102,7 +102,12 @@ impl Holder {
                             | std::io::ErrorKind::ReadOnlyFilesystem
                     ) =>
             {
-                if !path.exists() {
+                // Only a holder.json known to be absent is none; a home
+                // that cannot be searched may keep one.
+                if !path
+                    .try_exists()
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                {
                     return Ok(None);
                 }
                 eprintln!(
@@ -906,7 +911,8 @@ fn reset_cmd(args: &[String]) -> R<()> {
     if report.not_done.is_empty() {
         println!(
             "{} {} epoch {}, and servers that enforce device epochs refuse certificates below \
-             it. Give each device you still use a new key, and certify it with `hlid cert`",
+             it. Give each device you still use a new key, and certify it with `hlid cert` \
+             here, where that epoch is kept",
             report.done.join(", "),
             match report.done.len() {
                 1 => "publishes",
