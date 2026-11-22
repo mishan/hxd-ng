@@ -844,7 +844,15 @@ impl Registrars {
         }
         // A device revocation its device signed below the floor is void,
         // whatever its `time` (`identity-registrar.md` §4.4), so one
-        // applied before the floor rose goes with the next lookup.
+        // applied before the floor rose goes with the next lookup. It is
+        // the floor admission reads, which untrusting a registrar does not
+        // lower; one that cannot be read voids every one a device signed.
+        let held = kept_floor(&*self.cache, &fp).unwrap_or_else(|e| {
+            warn!("identity device floor: {}", e.0);
+            lookup.read = false;
+            lookup.complete = false;
+            u64::MAX
+        });
         let floor = lookup
             .records
             .iter()
@@ -852,8 +860,7 @@ impl Registrars {
                 Record::DeviceEpoch(e) => Some(e.epoch),
                 _ => None,
             })
-            .max()
-            .unwrap_or(0);
+            .fold(held, u64::max);
         lookup.records.retain(|r| match r {
             Record::RevokeDevice(d) => d.check_signer_floor(floor).is_ok(),
             _ => true,
@@ -1564,5 +1571,131 @@ mod tests {
         hold_superseded(&cache, fp, &list(&[1], 5)).unwrap();
         assert_eq!(held(), [list(&[1, 2], 4)], "nor a lower floor over it");
         assert_eq!(kept_floor(&cache, &fp).unwrap(), 2);
+    }
+
+    /// A reset held only in a list from a registrar no longer trusted
+    /// still voids what a device reset away signed: the floor outlives
+    /// trust in the registrar that published it. A floor that cannot be
+    /// read voids every revocation a device signed, and none the
+    /// identity did.
+    #[test]
+    fn a_reset_from_an_untrusted_list_voids_a_device_revocation() {
+        use hl_identity::{DeviceCert, DeviceKey, DeviceRevocation, IdentityKey};
+        use hxd_core::identity_records::MemoryRecordCache;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Reads its lists once, then fails to.
+        #[derive(Default)]
+        struct ReadOnce(MemoryRecordCache, AtomicBool);
+        impl RecordCache for ReadOnce {
+            fn put(&self, i: &[u8; 32], l: &CachedList) -> Result<(), hxd_core::StoreError> {
+                self.0.put(i, l)
+            }
+            fn lists(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                match self.1.swap(true, Ordering::SeqCst) {
+                    false => self.0.lists(i),
+                    true => Err(hxd_core::StoreError("unreadable".into())),
+                }
+            }
+            fn hold_superseded(
+                &self,
+                i: &[u8; 32],
+                l: &CachedList,
+            ) -> Result<(), hxd_core::StoreError> {
+                self.0.hold_superseded(i, l)
+            }
+            fn superseded(&self, i: &[u8; 32]) -> Result<Vec<CachedList>, hxd_core::StoreError> {
+                self.0.superseded(i)
+            }
+            fn release_superseded(&self, i: &[u8; 32]) -> Result<(), hxd_core::StoreError> {
+                self.0.release_superseded(i)
+            }
+            fn first_seen(&self, i: &[u8; 32], now: u64) -> Result<u64, hxd_core::StoreError> {
+                self.0.first_seen(i, now)
+            }
+            fn keep_epoch(&self, i: &[u8; 32], k: &KeptEpoch) -> Result<(), hxd_core::StoreError> {
+                self.0.keep_epoch(i, k)
+            }
+            fn replace_epoch(
+                &self,
+                i: &[u8; 32],
+                k: &KeptEpoch,
+            ) -> Result<(), hxd_core::StoreError> {
+                self.0.replace_epoch(i, k)
+            }
+            fn epochs(&self, i: &[u8; 32]) -> Result<Vec<KeptEpoch>, hxd_core::StoreError> {
+                self.0.epochs(i)
+            }
+        }
+        let (alice, key) = (
+            IdentityKey::from_seed(&[1; 32]),
+            ServerKey::from_seed(&[3; 32]),
+        );
+        let fp = Fingerprint::of(&alice.public());
+        let old = DeviceKey::from_seed(&[2; 32]);
+        let cert = DeviceCert::for_device(&alice, &old, 5, 10).unwrap();
+        let revoke = |device| DeviceRevocation {
+            identity: alice.public(),
+            device: [device; 32],
+            time: 10,
+            until: 20,
+            reason: None,
+            signer: None,
+            signer_cert: None,
+        };
+        let by_device = revoke(8).sign_as_device(&old, cert.sign(&alice)).unwrap();
+        let by_identity = revoke(9).sign(&alice).unwrap();
+        let reset = DeviceEpoch {
+            identity: alice.public(),
+            epoch: 1,
+            time: 11,
+        }
+        .sign(&alice)
+        .unwrap();
+        let revoked = |found: &Lookup| -> Vec<bool> {
+            found
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::RevokeDevice(d) => Some(d.signer.is_some()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let caches: [Arc<dyn RecordCache>; 2] = [
+            Arc::new(MemoryRecordCache::default()),
+            Arc::new(ReadOnce::default()),
+        ];
+        for (i, cache) in caches.into_iter().enumerate() {
+            for (host, records) in [
+                ("hl.example", vec![by_device.clone(), by_identity.clone()]),
+                ("gone.example", vec![reset.clone()]),
+            ] {
+                let page = SignedList {
+                    registrar: host.into(),
+                    issued: 1,
+                    expires: u64::MAX,
+                    fingerprint: Some(fp.0),
+                    since: None,
+                    more: false,
+                    entries: (1..).zip(records).collect(),
+                }
+                .sign(ListKind::Records, &key);
+                let list = CachedList {
+                    registrar: host.into(),
+                    pages: vec![page],
+                    keys: vec![(key.public(), None)],
+                    fetched: 1,
+                };
+                cache.put(&fp.0, &list).unwrap();
+            }
+            let found = registrars(cache).lookup_fp(fp, &[], 0);
+            assert_eq!(found.read, i == 0);
+            assert!(!found.damaged);
+            assert_eq!(
+                revoked(&found),
+                [false],
+                "revoked by a device below the floor"
+            );
+        }
     }
 }
