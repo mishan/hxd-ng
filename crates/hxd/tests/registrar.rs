@@ -3483,6 +3483,52 @@ async fn a_reset_only_a_held_list_carries_is_kept_when_the_list_is_replaced() {
 }
 
 #[tokio::test]
+async fn the_sweep_installs_a_floor_held_in_a_list_no_longer_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let v = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30)
+        .await
+        .0;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, laptop) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[102; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(
+        refusal(&auth_at(v, &alice, &phone, &card).await),
+        (403, json!("revoked"), json!(1))
+    );
+
+    // The reset in no floor row, and its registrar trusted no more while
+    // another is.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch("DELETE FROM identity_device_floor")
+        .unwrap();
+    let (v, identity, core) = verifier_serving(
+        &dir.path().join("verifier"),
+        &r,
+        Trust::Nobody,
+        &url,
+        "trusted_registrars = [\"other.example\"]",
+        None,
+        30,
+    )
+    .await;
+    let _laptop_here = session_in(v, &laptop, &cert_in(&alice, &laptop, 1), &card, json!({})).await;
+    identity.sweep_records().await;
+    let below = hxd_core::CertRef {
+        identity: alice.fingerprint().0,
+        device: hl_identity::Fingerprint::of(&phone.public()).0,
+        epoch: 0,
+    };
+    assert!(core.refuses(&below), "the sweep installed the floor");
+}
+
+#[tokio::test]
 async fn a_reset_stored_in_a_list_alone_is_the_floor_trusting_no_registrar() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;

@@ -706,6 +706,22 @@ impl Registrars {
             if frozen_refuses && frozen.values().any(|f| *f) {
                 refused.unrevoked.insert(fp.0);
             }
+            // And the floor admission reads, from every list held, trusted
+            // or not; one that cannot be read leaves what was installed.
+            match kept_floor(&*self.cache, fp) {
+                Ok(0) => {}
+                Ok(kept) => {
+                    let floor = refused.floors.entry(fp.0).or_default();
+                    *floor = (*floor).max(kept);
+                }
+                Err(e) => {
+                    warn!(fingerprint = %fp.short(), "identity device floor: {}", e.0);
+                    refused.covered.remove(&fp.0);
+                    if !unread.contains(fp) {
+                        unread.push(*fp);
+                    }
+                }
+            }
         }
         (refused, rotations, unread)
     }
