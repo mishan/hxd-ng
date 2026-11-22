@@ -505,14 +505,13 @@ impl Core {
         rotations: &[Rotation],
         floors: &Floors,
     ) -> Result<Vec<HeldCutoff>, MessagingError> {
-        let now = self.clock.unix();
         let mut out = Vec::new();
         for w in store.withdrawals(&pair.hash()).map_err(store_failed)? {
             if !w.checked {
                 let passes = w
                     .withdrawal
                     .as_deref()
-                    .and_then(|b| Withdrawal::parse(b, now, zero_floor).ok())
+                    .and_then(|b| Withdrawal::parse(b, STORED, zero_floor).ok())
                     .is_some_and(|k| k.check_pair(pair, rotations).is_ok());
                 if !passes {
                     store
@@ -814,7 +813,6 @@ impl Core {
         let (Some(x), Some(y)) = (party.fingerprint, other.fingerprint) else {
             return Ok(());
         };
-        let now = self.clock.unix();
         let wall = self.clock.wall();
         let (mut had, mut ended) = (0, 0);
         for (p, q) in [(x, y), (y, x)] {
@@ -826,7 +824,7 @@ impl Core {
                 continue;
             };
             had += 1;
-            if Friendship::check(&bytes, now, &[], zero_floor).is_ok_and(|f| f.cut_by(cut)) {
+            if Friendship::check(&bytes, STORED, &[], zero_floor).is_ok_and(|f| f.cut_by(cut)) {
                 store.unpresent(&p, &q).map_err(store_failed)?;
                 ended += 1;
             }
@@ -835,7 +833,7 @@ impl Core {
             let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? else {
                 continue;
             };
-            if Offer::check(&o.offer, now, &[], zero_floor).is_ok_and(|o| o.cut_by(cut)) {
+            if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| o.cut_by(cut)) {
                 store.set_offer(&p, &q, None).map_err(store_failed)?;
             }
         }

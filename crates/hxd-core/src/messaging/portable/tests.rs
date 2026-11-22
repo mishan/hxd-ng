@@ -1359,6 +1359,63 @@ fn a_reset_judges_what_was_taken_while_the_clock_ran_ahead() {
 }
 
 #[test]
+fn a_withdrawal_kept_while_the_clock_ran_ahead_still_refuses_the_friendship() {
+    let (alice, bob) = (person(1), person(2));
+    let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    s.core.clock().advance(std::time::Duration::from_secs(3600));
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    // Nothing here names the pair yet, so it is kept unchecked.
+    let w = withdraw_at(&alice, 0, &bob, t, t);
+    let (taken, _) = s
+        .core
+        .friendships_present(a, vec![w.clone()], vec![])
+        .unwrap();
+    assert!(ok_all(&taken));
+
+    Arc::get_mut(&mut s.core).unwrap().clock = crate::clock::Clock::default();
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Withdrawn(Some(w)));
+}
+
+#[test]
+fn a_withdrawal_ends_a_friendship_taken_while_the_clock_ran_ahead() {
+    let (alice, bob) = (person(1), person(2));
+    let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    s.core.clock().advance(std::time::Duration::from_secs(3600));
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, mut rb) = device(&s.core, "bob", &bob, 0);
+    // Alice's half by the right time, Bob's by the clock ahead of it.
+    let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, t - 60);
+    for uid in [a, b] {
+        let (_, presented) = s
+            .core
+            .friendships_present(uid, vec![], vec![f.clone()])
+            .unwrap();
+        assert!(ok_all(&presented));
+    }
+    assert!(told(&mut rb)
+        .iter()
+        .any(|(_, state, _, _)| *state == RosterState::Accepted));
+
+    Arc::get_mut(&mut s.core).unwrap().clock = crate::clock::Clock::default();
+    let w = withdraw(&alice, 1, &bob, now());
+    let (a1, _) = device(&s.core, "alice", &alice, 1);
+    let (taken, _) = s
+        .core
+        .friendships_present(a1, vec![w.clone()], vec![])
+        .unwrap();
+    assert!(ok_all(&taken));
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], Some(w))]
+    );
+}
+
+#[test]
 fn a_reset_whose_rotations_cannot_be_read_is_judged_again() {
     let (alice, bob, successor) = (person(1), person(2), person(4));
     let s = linked(&[("alice", &fp(&successor)), ("bob", &fp(&bob))]);

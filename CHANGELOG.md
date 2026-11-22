@@ -133,7 +133,9 @@ as AGENTS.md's "Releasing" describes it.
   moves earlier, the presentations of friendships no longer held are
   dropped, and an edge they kept active is told `Removed` with no
   withdrawal, as are offers a device below the floor signed, leaving
-  their requests plain. Presentations from before read as taken when they were
+  their requests plain. What is held here is judged whatever the clock
+  says, so a clock set back neither drops a withdrawal nor keeps one from
+  ending a friendship. Presentations from before read as taken when they were
   last presented, so a friendship presented again after a reset the
   server had not yet learned of may need remaking. The main SQLite store
   migrates from schema 39 on first start; a build from before refuses
