@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount, PendingOut, Presentation,
-    Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, RequestKind, Requester,
-    RotationRecord, StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Ended, EndedEdge, Ending, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount,
+    PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore,
+    RequestKind, Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
@@ -134,14 +134,6 @@ struct Inner {
 #[derive(Default)]
 pub struct MemoryRelationships {
     inner: Mutex<Inner>,
-    /// The next `unfriend`, `present` or `rotation_from` fails, for a
-    /// test of what a failed write or read leaves.
-    #[cfg(test)]
-    pub(crate) fail_unfriend: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    pub(crate) fail_present: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    pub(crate) fail_rotation_from: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryRelationships {
@@ -433,6 +425,155 @@ impl Inner {
         n
     }
 
+    fn keep_withdrawal(&mut self, w: &HeldWithdrawal, cap: usize) {
+        let same = |k: &HeldWithdrawal| {
+            k.owner == w.owner
+                && k.pair == w.pair
+                && k.party == w.party
+                && k.withdrawal.is_none() == w.withdrawal.is_none()
+        };
+        if self
+            .withdrawals
+            .iter()
+            .any(|k| same(k) && k.before > w.before)
+        {
+            return;
+        }
+        self.withdrawals.retain(|k| !same(k));
+        self.withdrawals.push(HeldWithdrawal {
+            at: floor(w.at),
+            ..w.clone()
+        });
+        loop {
+            let owned: Vec<usize> = (0..self.withdrawals.len())
+                .filter(|&i| self.withdrawals[i].owner == w.owner)
+                .collect();
+            if owned.len() <= cap {
+                break;
+            }
+            // The oldest, signed ones first, by the order they were kept.
+            let victim = owned
+                .iter()
+                .copied()
+                .min_by_key(|&i| {
+                    let k = &self.withdrawals[i];
+                    (k.withdrawal.is_none(), secs(k.at), i)
+                })
+                .expect("past its cap, so it holds some");
+            self.withdrawals.remove(victim);
+        }
+    }
+
+    /// Whether each of `a` and `b` holds a presentation of the other with
+    /// evidence.
+    fn evidence_both_ways(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+        [(a, b), (b, a)].into_iter().all(|(p, q)| {
+            self.presentations
+                .iter()
+                .any(|x| x.presenter == *p && x.other == *q && x.evidence())
+        })
+    }
+
+    fn unpresent_pair(
+        &mut self,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        presenters: &[[u8; 32]],
+    ) -> Vec<Presentation> {
+        let mut gone = Vec::new();
+        self.presentations.retain(|p| {
+            let go = presenters.contains(&p.presenter)
+                && ((p.presenter == *a && p.other == *b) || (p.presenter == *b && p.other == *a));
+            if go {
+                gone.push(p.clone());
+            }
+            !go
+        });
+        gone
+    }
+
+    fn set_edge(&mut self, a: &[u8; 32], b: &[u8; 32], edge: Option<RelationId>) {
+        for p in self.presentations.iter_mut().filter(|p| {
+            (p.presenter == *a && p.other == *b) || (p.presenter == *b && p.other == *a)
+        }) {
+            p.edge = edge;
+        }
+    }
+
+    /// The friendship on the pair's rows, ended.
+    fn end_edge(&mut self, a: &Mailbox, b: &Mailbox) -> Option<EndedEdge> {
+        let (ab, ba) = (self.find(a, b), self.find(b, a));
+        let id = [ab, ba]
+            .into_iter()
+            .flatten()
+            .find_map(|i| self.rows[i].rel.friendship)?;
+        let row = |i: usize| &self.rows[i].rel;
+        let parties = match (ab, ba) {
+            (Some(i), _) => [row(i).owner.clone(), row(i).other.clone()],
+            (None, i) => [row(i?).other.clone(), row(i?).owner.clone()],
+        };
+        let mut ended = Vec::new();
+        for (x, y) in [(a, b), (b, a)] {
+            if self.find(x, y).is_some() {
+                ended.extend(self.edit(x, y, |r| r.friendship.take()));
+            }
+        }
+        self.forget(ended);
+        Some(EndedEdge { id, parties })
+    }
+
+    fn drop_presentations(&mut self, a: &[u8; 32], b: &[u8; 32], presenters: &[[u8; 32]]) -> Ended {
+        let had = self.evidence_both_ways(a, b);
+        let gone = self.unpresent_pair(a, b, presenters);
+        let mut ended = None;
+        if had && !self.evidence_both_ways(a, b) {
+            ended = self.end_edge(&Mailbox::identified("", *a), &Mailbox::identified("", *b));
+            if let Some(e) = &ended {
+                self.set_edge(a, b, Some(e.id));
+            }
+        }
+        Ended { gone, ended }
+    }
+
+    fn end_friendship(&mut self, a: &Mailbox, b: &Mailbox, end: &Ending) -> Ended {
+        assert!(
+            end.withdrawals.is_empty() || end.cap > 0,
+            "a cap to keep under"
+        );
+        for w in &end.withdrawals {
+            self.keep_withdrawal(w, end.cap);
+        }
+        let fps = a.fingerprint.zip(b.fingerprint);
+        let mut gone = Vec::new();
+        if let Some((x, y)) = fps {
+            gone = self.unpresent_pair(&x, &y, &end.presentations);
+            self.offers.retain(|(o, t, _)| {
+                !(end.offers.contains(o) && ((*o == x && *t == y) || (*o == y && *t == x)))
+            });
+        }
+        if let Some(at) = end.block {
+            self.edit(a, b, |r| r.blocked_at = r.blocked_at.or(Some(at)));
+        }
+        let ended = if end.friendship {
+            self.end_edge(a, b)
+        } else {
+            None
+        };
+        if let Some(e) = &ended {
+            if let Some((x, y)) = fps {
+                self.set_edge(&x, &y, None);
+            }
+            if let Some(until) = end.hold {
+                self.holds.push(Hold {
+                    owner: HoldKey::of(&e.parties[0]),
+                    held: Held::of(&Requester::Account(e.parties[1].clone())),
+                    until: floor(until),
+                });
+            }
+        }
+        Ended { gone, ended }
+    }
+
     fn purge(&mut self, of: &Mailbox) -> usize {
         let doomed = |r: &Relationship| is(&r.owner, of) || is(&r.other, of);
         let ids: Vec<RelationId> = self
@@ -615,13 +756,6 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn unfriend(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<RelationId>, StoreError> {
-        #[cfg(test)]
-        if self
-            .fail_unfriend
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(StoreError("unfriend failed".into()));
-        }
         let mut inner = self.inner.lock().unwrap();
         let mut ended = Vec::new();
         for (x, y) in [(a, b), (b, a)] {
@@ -693,13 +827,6 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
-        #[cfg(test)]
-        if self
-            .fail_present
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(StoreError("present failed".into()));
-        }
         let mut inner = self.inner.lock().unwrap();
         let p = floor_presentation(p);
         let old = inner
@@ -747,6 +874,23 @@ impl RelationshipStore for MemoryRelationships {
             .map(|i| inner.presentations.remove(i)))
     }
 
+    fn drop_presentations(
+        &self,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        presenters: &[[u8; 32]],
+    ) -> Result<Ended, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .drop_presentations(a, b, presenters))
+    }
+
+    fn end_friendship(&self, a: &Mailbox, b: &Mailbox, end: &Ending) -> Result<Ended, StoreError> {
+        Ok(self.inner.lock().unwrap().end_friendship(a, b, end))
+    }
+
     fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -758,43 +902,7 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn keep_withdrawal(&self, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        let same = |k: &HeldWithdrawal| {
-            k.owner == w.owner
-                && k.pair == w.pair
-                && k.party == w.party
-                && k.withdrawal.is_none() == w.withdrawal.is_none()
-        };
-        if inner
-            .withdrawals
-            .iter()
-            .any(|k| same(k) && k.before > w.before)
-        {
-            return Ok(());
-        }
-        inner.withdrawals.retain(|k| !same(k));
-        inner.withdrawals.push(HeldWithdrawal {
-            at: floor(w.at),
-            ..w.clone()
-        });
-        loop {
-            let owned: Vec<usize> = (0..inner.withdrawals.len())
-                .filter(|&i| inner.withdrawals[i].owner == w.owner)
-                .collect();
-            if owned.len() <= cap {
-                break;
-            }
-            // The oldest, signed ones first, by the order they were kept.
-            let victim = owned
-                .iter()
-                .copied()
-                .min_by_key(|&i| {
-                    let k = &inner.withdrawals[i];
-                    (k.withdrawal.is_none(), secs(k.at), i)
-                })
-                .expect("past its cap, so it holds some");
-            inner.withdrawals.remove(victim);
-        }
+        self.inner.lock().unwrap().keep_withdrawal(w, cap);
         Ok(())
     }
 
@@ -867,13 +975,6 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn rotation_from(&self, from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
-        #[cfg(test)]
-        if self
-            .fail_rotation_from
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(StoreError("rotation_from failed".into()));
-        }
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .rotations

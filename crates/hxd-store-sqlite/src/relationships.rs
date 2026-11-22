@@ -10,9 +10,10 @@ use std::time::SystemTime;
 
 use hxd_core::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 use hxd_core::relationships::{
-    AccountUpdate, Birthdate, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry, MessagingAccount,
-    PendingOut, Presentation, Profile, Recorded, Rekeyed, RelationId, Relationship,
-    RelationshipStore, RequestKind, Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Birthdate, Ended, EndedEdge, Ending, HeldWithdrawal, Ignore, IgnoreMode,
+    LedgerEntry, MessagingAccount, PendingOut, Presentation, Profile, Recorded, Rekeyed,
+    RelationId, Relationship, RelationshipStore, RequestKind, Requester, RotationRecord,
+    StoredOffer, MAX_LANGUAGES,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -474,6 +475,132 @@ fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, Store
     Ok(n)
 }
 
+fn hold(
+    conn: &Connection,
+    owner: &Mailbox,
+    held: &Requester,
+    until: SystemTime,
+) -> Result<(), StoreError> {
+    let (login, fp, address) = match held {
+        Requester::Account(m) => (Some(&m.login), m.fingerprint.as_ref().map(fp_hex), None),
+        Requester::Address(a) => (None, None, Some(a)),
+        Requester::Identity(fp) => (None, Some(fp_hex(fp)), None),
+    };
+    sql(conn.execute(
+        "INSERT INTO request_hold (owner, owner_fp, held, held_fp, held_address, until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            owner.login,
+            owner.fingerprint.as_ref().map(fp_hex),
+            login,
+            fp,
+            address,
+            unix(until)
+        ],
+    ))?;
+    Ok(())
+}
+
+fn keep_withdrawal(tx: &Connection, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError> {
+    let owner = fp_hex(&w.owner);
+    let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+    sql(tx.execute(
+        "INSERT INTO friend_withdrawal
+                (owner, pair, party, before, withdrawal, own, checked, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (owner, pair, party, own) DO UPDATE SET
+           before = excluded.before, withdrawal = excluded.withdrawal,
+           checked = excluded.checked, at = excluded.at
+         WHERE excluded.before >= friend_withdrawal.before",
+        params![
+            owner,
+            w.pair.as_slice(),
+            w.party.as_slice(),
+            w.before as i64,
+            w.withdrawal,
+            w.withdrawal.is_none(),
+            w.checked,
+            unix(w.at),
+        ],
+    ))?;
+    sql(tx.execute(
+        "DELETE FROM friend_withdrawal WHERE id IN
+           (SELECT id FROM friend_withdrawal WHERE owner = ?1
+             ORDER BY withdrawal IS NULL, at, id
+             LIMIT MAX(0, (SELECT COUNT(*) FROM friend_withdrawal WHERE owner = ?1) - ?2))",
+        params![owner, cap],
+    ))?;
+    Ok(())
+}
+
+/// The presentations of the pair `a`, `b`, either way.
+const PAIR: &str = "(presenter = ?1 AND other = ?2) OR (presenter = ?2 AND other = ?1)";
+
+fn evidence_both_ways(tx: &Connection, a: &str, b: &str) -> Result<bool, StoreError> {
+    let held = presentations_where(tx, PAIR, &[&a, &b])?;
+    Ok([(a, b), (b, a)].into_iter().all(|(p, q)| {
+        held.iter()
+            .any(|x| fp_hex(&x.presenter) == p && fp_hex(&x.other) == q && x.evidence())
+    }))
+}
+
+fn unpresent_pair(
+    tx: &Connection,
+    a: &str,
+    b: &str,
+    presenters: &[[u8; 32]],
+) -> Result<Vec<Presentation>, StoreError> {
+    let mut gone = Vec::new();
+    for presenter in presenters.iter().map(fp_hex) {
+        let other = if presenter == a {
+            b
+        } else if presenter == b {
+            a
+        } else {
+            continue;
+        };
+        let clause = "presenter = ?1 AND other = ?2";
+        gone.extend(presentations_where(tx, clause, &[&presenter, &other])?);
+        sql(tx.execute(
+            "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
+            params![presenter, other],
+        ))?;
+    }
+    Ok(gone)
+}
+
+fn set_edge(tx: &Connection, a: &str, b: &str, edge: Option<RelationId>) -> Result<(), StoreError> {
+    sql(tx.execute(
+        &format!("UPDATE friend_presentation SET edge = ?3 WHERE {PAIR}"),
+        params![a, b, edge.map(|n| n as i64)],
+    ))?;
+    Ok(())
+}
+
+/// The friendship on the pair's rows, ended.
+fn end_edge(tx: &Connection, a: &Mailbox, b: &Mailbox) -> Result<Option<EndedEdge>, StoreError> {
+    let (ab, ba) = (load_pair(tx, a, b)?, load_pair(tx, b, a)?);
+    let Some(id) = [&ab, &ba]
+        .into_iter()
+        .flatten()
+        .find_map(|(_, r)| r.friendship)
+    else {
+        return Ok(None);
+    };
+    let parties = match (&ab, &ba) {
+        (Some((_, r)), _) => [r.owner.clone(), r.other.clone()],
+        (None, Some((_, r))) => [r.other.clone(), r.owner.clone()],
+        (None, None) => return Ok(None),
+    };
+    let mut ended = Vec::new();
+    for (rid, mut rel) in [ab, ba].into_iter().flatten() {
+        ended.extend(rel.friendship.take());
+        write(tx, Some(rid), &mut rel)?;
+    }
+    forget(tx, ended)?;
+    Ok(Some(EndedEdge { id, parties }))
+}
+
 impl SqliteStore {
     fn with_tx<T>(
         &self,
@@ -813,25 +940,7 @@ impl RelationshipStore for SqliteStore {
     }
 
     fn hold(&self, owner: &Mailbox, held: &Requester, until: SystemTime) -> Result<(), StoreError> {
-        let (login, fp, address) = match held {
-            Requester::Account(m) => (Some(&m.login), m.fingerprint.as_ref().map(fp_hex), None),
-            Requester::Address(a) => (None, None, Some(a)),
-            Requester::Identity(fp) => (None, Some(fp_hex(fp)), None),
-        };
-        let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
-            "INSERT INTO request_hold (owner, owner_fp, held, held_fp, held_address, until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                owner.login,
-                owner.fingerprint.as_ref().map(fp_hex),
-                login,
-                fp,
-                address,
-                unix(until)
-            ],
-        ))?;
-        Ok(())
+        hold(&self.conn.lock().unwrap(), owner, held, until)
     }
 
     fn is_held(
@@ -1188,43 +1297,94 @@ impl RelationshipStore for SqliteStore {
         })
     }
 
+    fn drop_presentations(
+        &self,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        presenters: &[[u8; 32]],
+    ) -> Result<Ended, StoreError> {
+        let (x, y) = (fp_hex(a), fp_hex(b));
+        self.with_tx(|tx| {
+            let had = evidence_both_ways(tx, &x, &y)?;
+            let gone = unpresent_pair(tx, &x, &y, presenters)?;
+            let mut ended = None;
+            if had && !evidence_both_ways(tx, &x, &y)? {
+                ended = end_edge(
+                    tx,
+                    &Mailbox::identified("", *a),
+                    &Mailbox::identified("", *b),
+                )?;
+                if let Some(e) = &ended {
+                    set_edge(tx, &x, &y, Some(e.id))?;
+                }
+            }
+            Ok(Ended { gone, ended })
+        })
+    }
+
+    fn end_friendship(&self, a: &Mailbox, b: &Mailbox, end: &Ending) -> Result<Ended, StoreError> {
+        assert!(
+            end.withdrawals.is_empty() || end.cap > 0,
+            "a cap to keep under"
+        );
+        let fps = a
+            .fingerprint
+            .zip(b.fingerprint)
+            .map(|(x, y)| (fp_hex(&x), fp_hex(&y)));
+        self.with_tx(|tx| {
+            for w in &end.withdrawals {
+                keep_withdrawal(tx, w, end.cap)?;
+            }
+            let mut gone = Vec::new();
+            if let Some((x, y)) = &fps {
+                gone = unpresent_pair(tx, x, y, &end.presentations)?;
+                for owner in end.offers.iter().map(fp_hex) {
+                    let other = if owner == *x {
+                        y
+                    } else if owner == *y {
+                        x
+                    } else {
+                        continue;
+                    };
+                    sql(tx.execute(
+                        "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
+                        params![owner, other],
+                    ))?;
+                }
+            }
+            if let Some(at) = end.block {
+                let (rid, mut rel) = match load_pair(tx, a, b)? {
+                    Some((rid, rel)) => (Some(rid), rel),
+                    None => (None, Relationship::new(a, b)),
+                };
+                rel.blocked_at = rel.blocked_at.or(Some(at));
+                write(tx, rid, &mut rel)?;
+            }
+            let ended = if end.friendship {
+                end_edge(tx, a, b)?
+            } else {
+                None
+            };
+            if let Some(e) = &ended {
+                if let Some((x, y)) = &fps {
+                    set_edge(tx, x, y, None)?;
+                }
+                if let Some(until) = end.hold {
+                    let held = Requester::Account(e.parties[1].clone());
+                    hold(tx, &e.parties[0], &held, until)?;
+                }
+            }
+            Ok(Ended { gone, ended })
+        })
+    }
+
     fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError> {
         let conn = self.conn.lock().unwrap();
         presentations_where(&conn, "device = ?1", &[&device.as_slice()])
     }
 
     fn keep_withdrawal(&self, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError> {
-        let owner = fp_hex(&w.owner);
-        let cap = i64::try_from(cap).unwrap_or(i64::MAX);
-        self.with_tx(|tx| {
-            sql(tx.execute(
-                "INSERT INTO friend_withdrawal
-                        (owner, pair, party, before, withdrawal, own, checked, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT (owner, pair, party, own) DO UPDATE SET
-                   before = excluded.before, withdrawal = excluded.withdrawal,
-                   checked = excluded.checked, at = excluded.at
-                 WHERE excluded.before >= friend_withdrawal.before",
-                params![
-                    owner,
-                    w.pair.as_slice(),
-                    w.party.as_slice(),
-                    w.before as i64,
-                    w.withdrawal,
-                    w.withdrawal.is_none(),
-                    w.checked,
-                    unix(w.at),
-                ],
-            ))?;
-            sql(tx.execute(
-                "DELETE FROM friend_withdrawal WHERE id IN
-                   (SELECT id FROM friend_withdrawal WHERE owner = ?1
-                     ORDER BY withdrawal IS NULL, at, id
-                     LIMIT MAX(0, (SELECT COUNT(*) FROM friend_withdrawal WHERE owner = ?1) - ?2))",
-                params![owner, cap],
-            ))?;
-            Ok(())
-        })
+        self.with_tx(|tx| keep_withdrawal(tx, w, cap))
     }
 
     fn withdrawals(&self, pair: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError> {

@@ -15,6 +15,9 @@ metrics = ["dep:metrics"]
 # `[server] coalesce` on unless a config or a `Core` says otherwise, so CI
 # can run every suite with it on before it becomes the default.
 coalesce-default = []
+# The sequence harness (`messaging::sequence`) and the store that fails
+# when asked, for another crate's tests to run a store under.
+test-support = []
 
 [dependencies]
 # tokio::sync only — the domain layer schedules nothing itself.
@@ -39,5 +42,7 @@ metrics = { version = "0.24", optional = true }
 hl-identity = { workspace = true }
 
 [dev-dependencies]
+# Sequences of friendship acts drawn and shrunk (`messaging::sequence`).
+proptest = "1"
 # A test waits on a lag signal, which takes a runtime and a clock.
 tokio = { version = "1", default-features = false, features = ["sync", "rt", "time"] }

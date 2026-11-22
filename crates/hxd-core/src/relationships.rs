@@ -32,6 +32,8 @@ use std::time::SystemTime;
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
 pub mod conformance;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod failing;
 pub mod memory;
 
 pub use memory::MemoryRelationships;
@@ -437,6 +439,55 @@ pub struct Presentation {
     pub taken: SystemTime,
 }
 
+impl Presentation {
+    /// Whether it counts toward an edge: a friendship's bytes, not a hash
+    /// kept toward the bound alone.
+    pub fn evidence(&self) -> bool {
+        self.friendship.is_some()
+    }
+}
+
+/// A friendship a portable store op ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedEdge {
+    pub id: RelationId,
+    /// The parties as their rows keep them, the op's `a` first: what the
+    /// tells name, whether or not either account takes part now.
+    pub parties: [Mailbox; 2],
+}
+
+/// What [`RelationshipStore::drop_presentations`] or
+/// [`RelationshipStore::end_friendship`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ended {
+    pub gone: Vec<Presentation>,
+    pub ended: Option<EndedEdge>,
+}
+
+/// What [`RelationshipStore::end_friendship`] ends of a pair, as one
+/// step: a withdrawal or a removal never leaves an edge active without
+/// its evidence, nor a block written beside a friendship it did not end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ending {
+    /// Kept as [`RelationshipStore::keep_withdrawal`] keeps them, under
+    /// `cap` each, which must be set where there are any.
+    pub withdrawals: Vec<HeldWithdrawal>,
+    pub cap: usize,
+    /// The parties, `a` or `b`, whose presentations of the pair go.
+    pub presentations: Vec<[u8; 32]>,
+    /// The parties whose offers to the other go.
+    pub offers: Vec<[u8; 32]>,
+    /// `a` blocks `b`, at this time unless it already had.
+    pub block: Option<SystemTime>,
+    /// End the friendship, where there is one: its id goes with it, off
+    /// whatever presentations of the pair are left, since what makes the
+    /// edge active again is a friendship made after this.
+    pub friendship: bool,
+    /// Where the friendship ends, `b` held from requests to `a` until
+    /// then.
+    pub hold: Option<SystemTime>,
+}
+
 /// A withdrawal this server holds (§4.3): what it ends, and the signed
 /// object where there is one, which is handed to those it ended things
 /// for. A server's own, which ends things here alone, has none.
@@ -699,6 +750,24 @@ pub trait RelationshipStore: Send + Sync + 'static {
         presenter: &[u8; 32],
         other: &[u8; 32],
     ) -> Result<Option<Presentation>, StoreError>;
+
+    /// Drop the presentations of the pair `a`, `b` that `presenters`
+    /// made, as one step: where the pair had evidence both ways before and
+    /// not after, and its rows, found by fingerprint, carry a friendship,
+    /// that friendship ends, its id kept on the presentation left if
+    /// there is one (§4.3, §6). An edge that never had evidence both ways
+    /// is left as it is.
+    fn drop_presentations(
+        &self,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        presenters: &[[u8; 32]],
+    ) -> Result<Ended, StoreError>;
+
+    /// End what `end` names between `a` and `b`, as one step. The
+    /// presentations and offers are by fingerprint and go only where
+    /// both mailboxes have one.
+    fn end_friendship(&self, a: &Mailbox, b: &Mailbox, end: &Ending) -> Result<Ended, StoreError>;
 
     /// The presentations a device made, oldest first.
     fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError>;

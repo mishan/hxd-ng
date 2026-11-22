@@ -38,7 +38,7 @@ use tracing::warn;
 use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    HeldWithdrawal, Presentation, RelationshipStore, Requester, StoredOffer,
+    EndedEdge, Ending, HeldWithdrawal, Presentation, RelationshipStore, StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -186,7 +186,7 @@ impl<'a> Floors<'a> {
 /// of the presentations of it among `held` (§6).
 fn taken_of(held: &[Presentation], hash: &[u8; 32]) -> Option<u64> {
     held.iter()
-        .filter(|p| p.hash == *hash && p.friendship.is_some())
+        .filter(|p| p.hash == *hash && p.evidence())
         .map(|p| secs(p.taken))
         .min()
 }
@@ -252,7 +252,7 @@ fn own(device: &Device, me: &Mailbox, from: &[u8; 32], cert: &[u8]) -> Result<()
 }
 
 fn whole(p: &Option<Presentation>) -> bool {
-    p.as_ref().is_some_and(|p| p.friendship.is_some())
+    p.as_ref().is_some_and(Presentation::evidence)
 }
 
 fn logged(what: &str, r: Result<(), StoreError>) {
@@ -440,14 +440,11 @@ impl Core {
             }
         }
         floors.failed()?;
-        // The edge goes before the presentations that are its evidence, so
-        // a failure leaves them to judge again.
         for p in held
             .iter()
-            .filter(|p| p.friendship.is_some() && gone.contains(&p.hash))
+            .filter(|p| p.evidence() && gone.contains(&p.hash))
         {
-            self.edge_dropped(store, p)?;
-            store.unpresent(&p.presenter, &p.other)?;
+            self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
         }
         Ok(whole)
     }
@@ -679,7 +676,7 @@ impl Core {
                 .map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == f.hash && p.friendship.is_some())
+                .filter(|p| p.hash == f.hash && p.evidence())
                 .map_or(at, |p| p.taken);
             store
                 .present(&Presentation {
@@ -767,146 +764,130 @@ impl Core {
             .check_pair(&pair, &rotations)
             .map_err(|_| MessagingError::BadSignature)?;
         let cut = held.cutoff();
-        self.keep_cutoff(store, &mine, &cut, Some(bytes.clone()))?;
+        let keep = self.cutoff_held(&mine, &cut, Some(bytes.clone()));
         let party_mine = chain_end(cut.party, &rotations).map(|f| f.0) == Some(mine);
-        let (party, other) = if party_mine { (me, them) } else { (them, me) };
-        self.apply_cutoff(store, &cut, Some(&bytes), party, other)?;
+        let (party, other) = if party_mine {
+            (mine, theirs)
+        } else {
+            (theirs, mine)
+        };
+        self.apply_cutoff(store, keep, party, other)?;
         Ok(bytes)
     }
 
-    fn keep_cutoff(
+    fn cutoff_held(
         &self,
-        store: &Arc<dyn RelationshipStore>,
         owner: &[u8; 32],
         cut: &Cutoff,
         withdrawal: Option<Vec<u8>>,
-    ) -> Result<(), MessagingError> {
-        store
-            .keep_withdrawal(
-                &HeldWithdrawal {
-                    owner: *owner,
-                    pair: cut.pair,
-                    party: cut.party.0,
-                    before: cut.before,
-                    withdrawal,
-                    checked: true,
-                    at: self.clock.wall(),
-                },
-                self.messaging_policy.max_roster,
-            )
-            .map_err(store_failed)
+    ) -> HeldWithdrawal {
+        HeldWithdrawal {
+            owner: *owner,
+            pair: cut.pair,
+            party: cut.party.0,
+            before: cut.before,
+            withdrawal,
+            checked: true,
+            at: self.clock.wall(),
+        }
     }
 
-    /// Apply a withdrawal held here to what `party`, whose side it
-    /// measures, and `other` hold of each other: the presentations and
-    /// offers it ends dropped, and the edge following what is left
-    /// (§4.3). A friendship of this server alone ends where it was made
-    /// before the cutoff (§2).
+    /// Apply a withdrawal held here, `keep`, to what `party`, whose side
+    /// it measures, and `other` hold of each other, as one step: the
+    /// withdrawal kept, the presentations and offers it ends dropped, and
+    /// the edge following what is left (§4.3). A friendship of this
+    /// server alone ends where it was made before the cutoff (§2).
     fn apply_cutoff(
         &self,
         store: &Arc<dyn RelationshipStore>,
-        cut: &Cutoff,
-        withdraw: Option<&[u8]>,
-        party: &Mailbox,
-        other: &Mailbox,
+        keep: HeldWithdrawal,
+        party: [u8; 32],
+        other: [u8; 32],
     ) -> Result<(), MessagingError> {
-        let (Some(x), Some(y)) = (party.fingerprint, other.fingerprint) else {
-            return Ok(());
+        let cut = Cutoff {
+            pair: keep.pair,
+            party: Fingerprint(keep.party),
+            before: keep.before,
         };
         let wall = self.clock.wall();
-        let (mut had, mut ended) = (0, 0);
-        for (p, q) in [(x, y), (y, x)] {
-            let Some(bytes) = store
+        let mut end = Ending {
+            cap: self.messaging_policy.max_roster,
+            ..Ending::default()
+        };
+        let mut had = 0;
+        for (p, q) in [(party, other), (other, party)] {
+            if let Some(bytes) = store
                 .presentation(&p, &q)
                 .map_err(store_failed)?
+                .filter(Presentation::evidence)
                 .and_then(|pres| pres.friendship)
-            else {
-                continue;
-            };
-            had += 1;
-            if Friendship::check(&bytes, STORED, &[], zero_floor).is_ok_and(|f| f.cut_by(cut)) {
-                store.unpresent(&p, &q).map_err(store_failed)?;
-                ended += 1;
+            {
+                had += 1;
+                if Friendship::check(&bytes, STORED, &[], zero_floor).is_ok_and(|f| f.cut_by(&cut))
+                {
+                    end.presentations.push(p);
+                }
             }
-        }
-        for (p, q) in [(x, y), (y, x)] {
-            let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? else {
-                continue;
-            };
-            if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| o.cut_by(cut)) {
-                store.set_offer(&p, &q, None).map_err(store_failed)?;
-            }
-        }
-        let Some(id) = store
-            .relationship(party, other, wall)
-            .map_err(store_failed)?
-            .and_then(|r| r.friendship)
-        else {
-            return Ok(());
-        };
-        let ends = if had == 2 {
-            ended > 0
-        } else {
-            let made = store.made_at(id).map_err(store_failed)?;
-            made.is_some_and(|t| t < unix_time(cut.before))
-        };
-        if !ends {
-            return Ok(());
-        }
-        store.unfriend(party, other).map_err(store_failed)?;
-        self.roster
-            .lock()
-            .unwrap()
-            .friends_changed(party, other, false);
-        // A friendship that makes it active again is made after the
-        // withdrawal, and takes a new id.
-        for (p, q) in [(x, y), (y, x)] {
-            if let Some(pres) = store.presentation(&p, &q).map_err(store_failed)? {
-                if pres.edge.is_some() {
-                    store
-                        .present(&Presentation { edge: None, ..pres })
-                        .map_err(store_failed)?;
+            if let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? {
+                if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| o.cut_by(&cut)) {
+                    end.offers.push(p);
                 }
             }
         }
-        if had == ended {
-            store
-                .hold(
-                    party,
-                    &Requester::Account(other.clone()),
-                    wall + self.messaging_policy.request_retention,
-                )
-                .map_err(store_failed)?;
+        let (x, y) = (
+            Mailbox::identified("", party),
+            Mailbox::identified("", other),
+        );
+        if let Some(id) = store
+            .relationship(&x, &y, wall)
+            .map_err(store_failed)?
+            .and_then(|r| r.friendship)
+        {
+            end.friendship = if had == 2 {
+                !end.presentations.is_empty()
+            } else {
+                let made = store.made_at(id).map_err(store_failed)?;
+                made.is_some_and(|t| t < unix_time(cut.before))
+            };
+            if had == end.presentations.len() {
+                end.hold = Some(wall + self.messaging_policy.request_retention);
+            }
         }
-        self.tell_entry_with(party, other, withdraw);
-        self.tell_entry_with(other, party, withdraw);
+        let withdraw = keep.withdrawal.clone();
+        end.withdrawals.push(keep);
+        let ended = store.end_friendship(&x, &y, &end).map_err(store_failed)?;
+        if let Some(e) = ended.ended {
+            self.edge_ended(&e, withdraw.as_deref());
+        }
         Ok(())
     }
 
-    /// `me` removes or blocks `them` without a withdrawal of its own,
-    /// where they had presented friendships: the server keeps one of its
-    /// own for `me`, dated now, that applies here alone, so that `me`'s
-    /// other devices do not present the friendship straight back, and the
-    /// presentations it ends go (§4.3). Ending the edge is the caller's.
+    /// What `me` removing or blocking `them` without a withdrawal of its
+    /// own ends of what they presented: the presentations either way and
+    /// the offers, and a withdrawal of the server's own for `me`, dated
+    /// now, that applies here alone, so that `me`'s other devices do not
+    /// present the friendship straight back (§4.3). The caller adds what
+    /// else it ends, and applies it as one step.
     pub(super) fn end_here(
         &self,
         store: &Arc<dyn RelationshipStore>,
         me: &Mailbox,
         them: &Mailbox,
-    ) {
-        let (Some(mine), Some(theirs)) = (me.fingerprint, them.fingerprint) else {
-            return;
+    ) -> Result<Ending, StoreError> {
+        let mut end = Ending {
+            cap: self.messaging_policy.max_roster,
+            ..Ending::default()
         };
+        let (Some(mine), Some(theirs)) = (me.fingerprint, them.fingerprint) else {
+            return Ok(end);
+        };
+        end.offers = vec![mine, theirs];
         let before = self.clock.unix();
         for (p, q) in [(mine, theirs), (theirs, mine)] {
-            let pres = match store.unpresent(&p, &q) {
-                Ok(Some(pres)) => pres,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!("relationships: ending a presentation: {e}");
-                    continue;
-                }
+            let Some(pres) = store.presentation(&p, &q)? else {
+                continue;
             };
+            end.presentations.push(p);
             let named = if p == mine {
                 pres.names[0]
             } else {
@@ -934,19 +915,37 @@ impl Core {
             if signed && floors.failed().is_ok() {
                 continue;
             }
-            if let Err(e) = self.keep_cutoff(store, &mine, &cut, None) {
-                warn!("relationships: keeping a removal's withdrawal: {e:?}");
-            }
+            end.withdrawals.push(self.cutoff_held(&mine, &cut, None));
         }
-        self.drop_offers(store, me, them);
+        Ok(end)
     }
 
-    /// A presentation went without a withdrawal: an edge it kept active
-    /// goes inactive, its id kept on the other party's presentation, and
-    /// both are told it is gone here (§6), and its orphan judged.
-    fn presentation_dropped(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
-        logged("an edge going inactive", self.edge_dropped(store, gone));
-        logged("judging an orphan", self.orphan_judged(store, gone));
+    /// Drop the presentations of the pair `a`, `b` that `presenters` made,
+    /// with no withdrawal, as one step, and tell the edge where that ended
+    /// it: its id stays on what is left, so the messages queued on it are
+    /// released when it is active again (§6).
+    fn drop_presented(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        presenters: &[[u8; 32]],
+    ) -> Result<Vec<Presentation>, StoreError> {
+        let dropped = store.drop_presentations(a, b, presenters)?;
+        if let Some(e) = &dropped.ended {
+            self.edge_ended(e, None);
+        }
+        Ok(dropped.gone)
+    }
+
+    /// An edge's ending, told once it is committed: the roster, then both
+    /// parties' entries, by the mailboxes their rows keep, so a party the
+    /// directory no longer names is told too.
+    pub(super) fn edge_ended(&self, e: &EndedEdge, withdraw: Option<&[u8]>) {
+        let [a, b] = &e.parties;
+        self.roster.lock().unwrap().friends_changed(a, b, false);
+        self.tell_entry_with(a, b, withdraw);
+        self.tell_entry_with(b, a, withdraw);
     }
 
     /// The other party's presentation of the friendship `gone` was of,
@@ -958,7 +957,7 @@ impl Core {
         store: &Arc<dyn RelationshipStore>,
         gone: &Presentation,
     ) -> Result<(), StoreError> {
-        if gone.friendship.is_none() {
+        if !gone.evidence() {
             return Ok(());
         }
         match store
@@ -971,8 +970,7 @@ impl Core {
     }
 
     /// `p`, held by its own taking alone, dropped where that came after
-    /// a half's reset: its edge first, as at a reset, so a failure
-    /// leaves it to judge again.
+    /// a half's reset.
     fn judged_alone(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -989,43 +987,8 @@ impl Core {
         let judged = floors.judge(&f, secs(p.taken));
         floors.failed()?;
         if judged == Judged::Reset {
-            self.edge_dropped(store, p)?;
-            store.unpresent(&p.presenter, &p.other)?;
+            self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
         }
-        Ok(())
-    }
-
-    fn edge_dropped(
-        &self,
-        store: &Arc<dyn RelationshipStore>,
-        gone: &Presentation,
-    ) -> Result<(), StoreError> {
-        if gone.friendship.is_none() {
-            return Ok(());
-        }
-        let (Some(a), Some(b)) = (
-            self.mailbox_of(&gone.presenter),
-            self.mailbox_of(&gone.other),
-        ) else {
-            return Ok(());
-        };
-        let wall = self.clock.wall();
-        let id = store.relationship(&a, &b, wall)?.and_then(|r| r.friendship);
-        let theirs = store
-            .presentation(&gone.other, &gone.presenter)?
-            .filter(|p| p.friendship.is_some());
-        let (Some(id), Some(theirs)) = (id, theirs) else {
-            return Ok(());
-        };
-        // The id kept first: a retry finds the edge still active.
-        store.present(&Presentation {
-            edge: Some(id),
-            ..theirs
-        })?;
-        store.unfriend(&a, &b)?;
-        self.roster.lock().unwrap().friends_changed(&a, &b, false);
-        self.tell_entry(&a, &b);
-        self.tell_entry(&b, &a);
         Ok(())
     }
 
@@ -1100,8 +1063,33 @@ impl Core {
         }
         if let Some(mine) = me.mailbox.fingerprint {
             let _writing = self.friend_writes();
-            if let Some(gone) = store.unpresent(&mine, fingerprint).map_err(store_failed)? {
-                logged("judging an orphan", self.orphan_judged(store, &gone));
+            // A friend the directory no longer names is removed as one
+            // it does, so its other devices do not present it back.
+            let them = Mailbox::identified("", *fingerprint);
+            let wall = self.clock.wall();
+            let friends = store
+                .relationship(&me.mailbox, &them, wall)
+                .map_err(store_failed)?
+                .is_some_and(|r| r.friendship.is_some());
+            if friends {
+                let mut end = self
+                    .end_here(store, &me.mailbox, &them)
+                    .map_err(store_failed)?;
+                end.friendship = true;
+                end.hold = Some(wall + self.messaging_policy.request_retention);
+                let ended = store
+                    .end_friendship(&me.mailbox, &them, &end)
+                    .map_err(store_failed)?;
+                if let Some(e) = ended.ended {
+                    self.edge_ended(&e, None);
+                }
+                return Ok(());
+            }
+            let gone = self
+                .drop_presented(store, &mine, fingerprint, &[mine])
+                .map_err(store_failed)?;
+            for gone in &gone {
+                logged("judging an orphan", self.orphan_judged(store, gone));
             }
         }
         Ok(())
@@ -1296,17 +1284,13 @@ impl Core {
             return refused(w.pair, Presented::BadSignature);
         };
         let cut = held.cutoff();
-        self.keep_cutoff(store, &mine, &cut, Some(bytes.clone()))?;
-        let party_key = chain_end(cut.party, &rotations).map(|f| f.0);
-        let accounts = (self.mailbox_of(&presenter), self.mailbox_of(&other));
-        if let (Some(a), Some(b)) = accounts {
-            let (party, other) = if a.fingerprint == party_key {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            self.apply_cutoff(store, &cut, Some(&bytes), &party, &other)?;
-        }
+        let keep = self.cutoff_held(&mine, &cut, Some(bytes));
+        let (party, other) = if chain_end(cut.party, &rotations).map(|f| f.0) == Some(presenter) {
+            (presenter, other)
+        } else {
+            (other, presenter)
+        };
+        self.apply_cutoff(store, keep, party, other)?;
         refused(w.pair, Presented::Ok)
     }
 
@@ -1384,7 +1368,7 @@ impl Core {
             let old = presented(&mine, &theirs);
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == hash && p.friendship.is_some() && friendship.is_some())
+                .filter(|p| p.hash == hash && p.evidence() && friendship.is_some())
                 .map_or(wall, |p| p.taken);
             store
                 .present(&Presentation {
@@ -1443,13 +1427,8 @@ impl Core {
             Judged::Reset => {
                 // What is stored of it is not held either, and goes now
                 // rather than at the next judging.
-                for p in held
-                    .iter()
-                    .filter(|p| p.hash == hash && p.friendship.is_some())
-                {
-                    self.edge_dropped(store, p).map_err(store_failed)?;
-                    store
-                        .unpresent(&p.presenter, &p.other)
+                for p in held.iter().filter(|p| p.hash == hash && p.evidence()) {
+                    self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])
                         .map_err(store_failed)?;
                 }
                 if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
@@ -1668,8 +1647,12 @@ impl Core {
                 .into_iter()
                 .filter(|p| identity.is_none_or(|i| p.presenter == i))
             {
-                match store.unpresent(&p.presenter, &p.other) {
-                    Ok(_) => self.presentation_dropped(store, &p),
+                match self.drop_presented(store, &p.presenter, &p.other, &[p.presenter]) {
+                    Ok(gone) => {
+                        for gone in &gone {
+                            logged("judging an orphan", self.orphan_judged(store, gone));
+                        }
+                    }
                     Err(e) => warn!("relationships: dropping a revoked device's presentation: {e}"),
                 }
             }
@@ -1677,8 +1660,9 @@ impl Core {
     }
 
     /// An account gave up its link to `fingerprint`: what it presented
-    /// under it goes (§4.4). A link made again starts from the
-    /// presentations its clients make then.
+    /// under it goes, and with it each edge that was its evidence (§4.3,
+    /// §4.4). A link made again starts from the presentations its clients
+    /// make then.
     pub fn friendships_unlinked(&self, fingerprint: &[u8; 32]) {
         let Some(store) = self.relationships.as_ref() else {
             return;
@@ -1698,9 +1682,12 @@ impl Core {
         let _writing = self.friend_writes();
         let made = store.presentations(fingerprint).unwrap_or_default();
         for p in made.iter().filter(|p| p.presenter == *fingerprint) {
-            match store.unpresent(&p.presenter, &p.other) {
-                Ok(Some(gone)) => logged("judging an orphan", self.orphan_judged(store, &gone)),
-                Ok(None) => {}
+            match self.drop_presented(store, &p.presenter, &p.other, &[p.presenter]) {
+                Ok(gone) => {
+                    for gone in &gone {
+                        logged("judging an orphan", self.orphan_judged(store, gone));
+                    }
+                }
                 Err(e) => warn!("relationships: dropping an unlinked account's presentation: {e}"),
             }
         }

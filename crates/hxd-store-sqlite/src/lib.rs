@@ -4702,6 +4702,65 @@ mod tests {
         hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+        #[test]
+        fn keeps_every_step_of_a_friendship_whole(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..40)
+        ) {
+            hxd_core::messaging::sequence::run(
+                &|| std::sync::Arc::new(SqliteStore::in_memory().unwrap()),
+                &steps,
+            );
+        }
+    }
+
+    /// An ending that fails at its last write leaves the pair as it was:
+    /// no edge active without its evidence, no block beside a friendship.
+    #[test]
+    fn an_ending_that_fails_part_way_changes_nothing() {
+        use hxd_core::relationships::{Ending, Presentation};
+        let s = SqliteStore::in_memory().unwrap();
+        let (a, b) = (
+            Mailbox::identified("a", [1; 32]),
+            Mailbox::identified("b", [2; 32]),
+        );
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let id = s.befriend(&a, &b, at).unwrap();
+        let mine = Presentation {
+            presenter: [1; 32],
+            other: [2; 32],
+            names: [[1; 32], [2; 32]],
+            pair: [3; 32],
+            hash: [4; 32],
+            friendship: Some(vec![4]),
+            device: [5; 32],
+            edge: None,
+            at,
+            taken: at,
+        };
+        s.present(&mine).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refused BEFORE INSERT ON request_hold
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+        let end = Ending {
+            presentations: vec![[1; 32]],
+            block: Some(at),
+            friendship: true,
+            hold: Some(at),
+            ..Ending::default()
+        };
+        assert!(s.end_friendship(&a, &b, &end).is_err());
+        let row = s.relationship(&a, &b, at).unwrap().unwrap();
+        assert_eq!((row.friendship, row.blocked_at), (Some(id), None));
+        assert_eq!(s.presentation(&[1; 32], &[2; 32]).unwrap(), Some(mine));
+    }
+
     /// The inbox's block list moves into the relationship store: a pair
     /// a merge left blocked twice becomes one row, keeping the older
     /// block, and every block reads as it did.

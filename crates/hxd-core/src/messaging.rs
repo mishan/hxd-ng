@@ -37,8 +37,8 @@ use tracing::warn;
 use crate::access::bit;
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    AccountUpdate, LedgerEntry, PendingOut, Profile, RelationId, Relationship, RelationshipStore,
-    RequestKind, Requester,
+    AccountUpdate, Ending, LedgerEntry, PendingOut, Profile, RelationId, Relationship,
+    RelationshipStore, RequestKind, Requester,
 };
 use crate::roster::{Announced, Event, RosterInner, SessionStatus, Uid, UserSession};
 use crate::Core;
@@ -46,6 +46,9 @@ use crate::Core;
 mod im;
 mod portable;
 mod requests;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod sequence;
 #[cfg(test)]
 mod tests;
 
@@ -759,13 +762,18 @@ impl Core {
             return;
         };
         let now = self.clock.wall();
-        let row = store.relationship(of, other, now).ok().flatten();
-        let asked = store
-            .relationship(other, of, now)
-            .ok()
-            .flatten()
-            .and_then(|t| t.pending_out)
-            .filter(|p| p.delivered);
+        // A row that cannot be read is not told as gone.
+        let (row, theirs) = match (
+            store.relationship(of, other, now),
+            store.relationship(other, of, now),
+        ) {
+            (Ok(row), Ok(theirs)) => (row, theirs),
+            (Err(e), _) | (_, Err(e)) => {
+                warn!("relationships: reading {}'s entry: {e}", of.login);
+                return;
+            }
+        };
+        let asked = theirs.and_then(|t| t.pending_out).filter(|p| p.delivered);
         let text = self.shown_text(row.as_ref());
         let mut entry = {
             let r = self.roster.lock().unwrap();
@@ -1286,22 +1294,18 @@ impl Core {
             if !still {
                 return taken.map(|_| ());
             }
-            self.end_here(store, &me.mailbox, &them);
-            store.unfriend(&me.mailbox, &them).map_err(store_failed)?;
-            store
-                .hold(
-                    &me.mailbox,
-                    &Requester::Account(them.clone()),
-                    now + p.request_retention,
-                )
+            let mut end = self
+                .end_here(store, &me.mailbox, &them)
                 .map_err(store_failed)?;
-            self.roster
-                .lock()
-                .unwrap()
-                .friends_changed(&me.mailbox, &them, false);
-            let withdraw = taken.as_ref().ok().cloned().flatten();
-            self.tell_entry_with(&me.mailbox, &them, withdraw.as_deref());
-            self.tell_entry_with(&them, &me.mailbox, withdraw.as_deref());
+            end.friendship = true;
+            end.hold = Some(now + p.request_retention);
+            let ended = store
+                .end_friendship(&me.mailbox, &them, &end)
+                .map_err(store_failed)?;
+            if let Some(e) = ended.ended {
+                let withdraw = taken.as_ref().ok().cloned().flatten();
+                self.edge_ended(&e, withdraw.as_deref());
+            }
             return taken.map(|_| ());
         }
         if let Some(sent) = mine.and_then(|m| m.pending_out) {
@@ -1479,16 +1483,25 @@ impl Core {
 
     // --- Blocks --------------------------------------------------------
 
-    /// `blocker` has blocked `blocked`, or unblocked it: what a block
-    /// ends, ended, and each party told as the extension tells it. The
-    /// blocked party hears only that the row is gone, never of the
-    /// block. Called with the block already written.
-    pub(crate) fn block_changed(&self, blocker: &Mailbox, blocked: &Mailbox, now_blocked: bool) {
-        let Ok(store) = self.friends_store() else {
-            return;
-        };
+    /// `blocker` blocks `blocked`, or unblocks it: the block written, what
+    /// it ends ended in the same step, and each party told as the
+    /// extension tells it. The blocked party hears only that the row is
+    /// gone, never of the block.
+    pub(crate) fn block_changed(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        blocker: &Mailbox,
+        blocked: &Mailbox,
+        now_blocked: bool,
+    ) -> Result<(), StoreError> {
+        let at = self.clock.wall();
+        if self.friends_store().is_err() {
+            return store.set_blocked(blocker, blocked, now_blocked, at);
+        }
         let _writing = self.friend_writes();
-        if now_blocked {
+        if !now_blocked {
+            store.set_blocked(blocker, blocked, false, at)?;
+        } else {
             let ended = |r: Result<Option<RelationId>, StoreError>| match r {
                 Ok(id) => id.is_some(),
                 Err(e) => {
@@ -1504,14 +1517,13 @@ impl Core {
                 .flatten()
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
-            self.end_here(store, blocker, blocked);
-            self.drop_offers(store, blocker, blocked);
-            let unfriended = ended(store.unfriend(blocker, blocked));
-            if unfriended {
-                self.roster
-                    .lock()
-                    .unwrap()
-                    .friends_changed(blocker, blocked, false);
+            let mut end = self.end_here(store, blocker, blocked)?;
+            end.block = Some(at);
+            end.friendship = true;
+            let unfriended = store.end_friendship(blocker, blocked, &end)?.ended;
+            if let Some(e) = &unfriended {
+                let [a, b] = &e.parties;
+                self.roster.lock().unwrap().friends_changed(a, b, false);
             }
             // An approval ends silently: it is never in 800 or 801 (§4.6).
             ended(store.end_approval(blocker, blocked));
@@ -1521,12 +1533,13 @@ impl Core {
                     warn!("relationships: ending a request a block ends: {e}");
                 }
             }
-            if unfriended || shown {
+            if unfriended.is_some() || shown {
                 self.tell_entry(blocked, blocker);
             }
             self.block_deletes_requests(blocker, blocked);
         }
         self.tell_entry(blocker, blocked);
+        Ok(())
     }
 
     /// The fold a claim or a rotation made can leave a block beside a
@@ -1549,7 +1562,16 @@ impl Core {
         let mut told = Vec::new();
         for mine in rows {
             let other = mine.other.clone();
-            let theirs = store.relationship(&other, me, now).ok().flatten();
+            let theirs = match store.relationship(&other, me, now) {
+                Ok(theirs) => theirs,
+                Err(e) => {
+                    warn!(
+                        "relationships: reading {}'s after a merge: {e}",
+                        other.login
+                    );
+                    continue;
+                }
+            };
             // A rotation the directory has no account for names the
             // successor by its key alone; the friend's row has the login
             // it is known by.
@@ -1562,18 +1584,21 @@ impl Core {
             let blocked = mine.blocked_at.is_some()
                 || theirs.as_ref().is_some_and(|t| t.blocked_at.is_some());
             let mut changed = false;
-            let mut fix = |r: Result<(), StoreError>| {
-                if let Err(e) = r {
-                    warn!("relationships: settling a merge: {e}");
-                }
-                changed = true;
+            let mut fix = |r: Result<(), StoreError>| match r {
+                Ok(()) => changed = true,
+                Err(e) => warn!("relationships: settling a merge: {e}"),
             };
             if blocked && mine.friendship.is_some() {
-                fix(store.unfriend(me, &other).map(|_| ()));
-                self.roster
-                    .lock()
-                    .unwrap()
-                    .friends_changed(me, &other, false);
+                let end = Ending {
+                    friendship: true,
+                    ..Ending::default()
+                };
+                fix(store.end_friendship(me, &other, &end).map(|ended| {
+                    if let Some(e) = ended.ended {
+                        let [a, b] = &e.parties;
+                        self.roster.lock().unwrap().friends_changed(a, b, false);
+                    }
+                }));
             }
             if blocked && mine.approval.is_some() {
                 fix(store.end_approval(me, &other).map(|_| ()));

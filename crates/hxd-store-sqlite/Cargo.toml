@@ -20,6 +20,9 @@ sha2 = "0.10"
 tracing = { workspace = true }
 
 [dev-dependencies]
+hxd-core = { workspace = true, features = ["test-support"] }
+# Sequences of friendship acts drawn and shrunk (`messaging::sequence`).
+proptest = "1"
 # `progress_handler`, which the timeline's work bound counts with.
 rusqlite = { version = "0.40", features = ["hooks"] }
 tempfile = "3"

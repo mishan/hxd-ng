@@ -309,6 +309,18 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Fixed
 
+- Portable friendships end in one store write: a removal, a block, a
+  withdrawal or a dropped presentation that fails part way changes
+  nothing, and Remove Friend and Block User answer a server error rather
+  than OK over half of one. An identity unlinked from its account ends
+  the friendships its presentations held, telling both parties, as does
+  a revoked device's presentation where the other party no longer takes
+  part in messaging; messages queued on them wait for the friendship to
+  be made again (docs/proposals/portable-friends.md §4.3, §4.4). A
+  presented withdrawal now applies where a party has no account here
+  that takes part, and Remove Friend by fingerprint of such a friend
+  ends the friendship here as a removal by login does. A roster entry
+  the server cannot read is no longer told as removed.
 - A client that may use any name logging in, agreeing or changing its
   info with an empty name, or one a classic client reads as empty (a
   leading NUL, or nothing but control characters), and shown with none:

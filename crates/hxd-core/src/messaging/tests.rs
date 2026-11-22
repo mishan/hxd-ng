@@ -46,6 +46,8 @@ pub(super) fn messaging_bits() -> AccessBits {
 pub(super) struct Server {
     pub(super) core: Arc<Core>,
     pub(super) rel: Arc<MemoryRelationships>,
+    /// What the core reaches `rel` through, to fail a call of it.
+    pub(super) fail: Arc<crate::relationships::failing::Failing>,
     pub(super) inbox: Arc<MemoryStore>,
 }
 
@@ -68,16 +70,17 @@ fn server_notifying(
 }
 
 pub(super) fn server_of(
-    dir: Directory,
+    dir: impl AccountDirectory + 'static,
     policy: MessagingPolicy,
     inbox_policy: InboxPolicy,
     gateway: Option<Arc<dyn crate::NotificationGateway>>,
 ) -> Server {
     let rel = Arc::new(MemoryRelationships::new());
     let inbox = Arc::new(MemoryStore::gated(rel.clone()));
+    let fail = Arc::new(crate::relationships::failing::Failing::new(rel.clone()));
     let mut core = Core::new()
         .with_inbox(inbox.clone(), Arc::new(dir), inbox_policy)
-        .with_relationships(rel.clone())
+        .with_relationships(fail.clone())
         .with_messaging(policy)
         .with_record_cache(Arc::new(
             crate::identity_records::MemoryRecordCache::default(),
@@ -88,6 +91,7 @@ pub(super) fn server_of(
     Server {
         core: Arc::new(core),
         rel,
+        fail,
         inbox,
     }
 }
@@ -3730,9 +3734,10 @@ fn reacting_on(
     let dir = Directory(logins.iter().map(|l| (Mailbox::login(*l), bits)).collect());
     let rel = Arc::new(MemoryRelationships::new());
     let inbox = Arc::new(MemoryStore::gated(rel.clone()));
+    let fail = Arc::new(crate::relationships::failing::Failing::new(rel.clone()));
     let mut core = Core::new()
         .with_inbox(inbox.clone(), Arc::new(dir), InboxPolicy::default())
-        .with_relationships(rel.clone())
+        .with_relationships(fail.clone())
         .with_messaging(policy());
     if let Some(log) = history {
         core = core.with_history(log, crate::history::HistoryPolicy::default());
@@ -3741,6 +3746,7 @@ fn reacting_on(
     Server {
         core: Arc::new(core),
         rel,
+        fail,
         inbox,
     }
 }

@@ -18,6 +18,7 @@ use super::super::tests::{messaging_bits, policy, server_of, Directory, Server};
 use super::super::*;
 use crate::identity_records::{CachedList, KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
+use crate::relationships::{Presentation, RelationId};
 use crate::roster::{drain, AttachInfo};
 use crate::{Events, IdentityTag, InboxPolicy, Published, Revocations};
 
@@ -1206,17 +1207,14 @@ fn an_unlink_takes_the_presentation_only_it_held() {
 
 #[test]
 fn a_reset_whose_cleanup_fails_ends_the_friendship_when_judged_again() {
-    for write in ["unfriend", "present"] {
+    for write in ["presentations", "drop_presentations"] {
         let (alice, bob) = (person(1), person(2));
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let reset_at = s.core.clock().unix() - 30;
         let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
-        match write {
-            "unfriend" => &s.rel.fail_unfriend,
-            _ => &s.rel.fail_present,
-        }
-        .store(true, Ordering::Relaxed);
+        s.fail.fail_next(write);
         reset(&s, &alice, 1, reset_at);
+        assert_eq!(s.fail.failed(), Some(write));
         install(&s, &alice, 1);
         assert_eq!(
             told(&mut rb),
@@ -1440,8 +1438,9 @@ fn a_reset_whose_rotations_cannot_be_read_is_judged_again() {
     }
     drain(&mut rb);
 
-    s.rel.fail_rotation_from.store(true, Ordering::Relaxed);
+    s.fail.fail_next("rotation_from");
     reset(&s, &alice, 1, now() - 30);
+    assert_eq!(s.fail.failed(), Some("rotation_from"));
     install(&s, &alice, 1);
     assert_eq!(
         told(&mut rb),
@@ -1533,11 +1532,12 @@ fn a_presentation_replaced_takes_the_other_partys_only_it_held() {
     let (a2, _) = device(&s.core, "alice", &alice, renewed);
     let o = offer(&alice, renewed, &bob, now() - 30);
     let f2 = accept(&o, &bob, 0, now() - 30);
-    s.rel.fail_unfriend.store(true, Ordering::Relaxed);
+    s.fail.fail_next("drop_presentations");
     assert_eq!(
         s.core.friendships_present(a2, vec![], vec![f2.clone()]),
         Err(MessagingError::ServerError)
     );
+    assert_eq!(s.fail.failed(), Some("drop_presentations"));
     let (_, replaced) = s.core.friendships_present(a2, vec![], vec![f2]).unwrap();
     assert!(ok_all(&replaced), "{replaced:?}");
     assert!(
@@ -1596,4 +1596,260 @@ fn a_removal_by_fingerprint_takes_the_presentation_only_it_held() {
         .presentation(&fp(&bob), &fp(&alice))
         .unwrap()
         .is_none());
+}
+
+fn friendship_of(s: &Server, alice: &Person, bob: &Person) -> Option<RelationId> {
+    s.rel
+        .relationship(
+            &Mailbox::identified("alice", fp(alice)),
+            &Mailbox::identified("bob", fp(bob)),
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .and_then(|r| r.friendship)
+}
+
+fn presented_both_ways(s: &Server, alice: &Person, bob: &Person) -> bool {
+    [(fp(alice), fp(bob)), (fp(bob), fp(alice))]
+        .iter()
+        .all(|(p, q)| s.rel.presentation(p, q).unwrap().is_some())
+}
+
+#[test]
+fn an_unlink_ends_the_friendship_its_presentations_held() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
+    let id = friendship_of(&s, &alice, &bob).unwrap();
+    s.core.friendships_unlinked(&fp(&alice));
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+    assert_eq!(
+        s.rel
+            .presentation(&fp(&bob), &fp(&alice))
+            .unwrap()
+            .and_then(|p| p.edge),
+        Some(id),
+        "the id kept, so what was queued on it waits"
+    );
+}
+
+#[test]
+fn a_dropped_presentation_ends_its_edge_where_a_party_takes_no_part() {
+    let (alice, bob) = (person(1), person(2));
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    let dir = Directory(vec![
+        (ma.clone(), messaging_bits()),
+        (mb.clone(), crate::AccessBits::empty()),
+    ]);
+    let s = server_of(dir, policy(), InboxPolicy::default(), None);
+    let (_, mut ra) = device(&s.core, "alice", &alice, 0);
+    let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
+    let at = std::time::SystemTime::now();
+    s.rel.befriend(&ma, &mb, at).unwrap();
+    for (p, q, who) in [(&alice, &bob, &alice), (&bob, &alice, &bob)] {
+        s.rel
+            .present(&Presentation {
+                presenter: fp(p),
+                other: fp(q),
+                names: [fp(p), fp(q)],
+                pair: Pair::new(Fingerprint(fp(p)), Fingerprint(fp(q))).hash(),
+                hash: hash(&f),
+                friendship: Some(f.clone()),
+                device: Fingerprint::of(&who.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+    }
+    s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&alice.devices[0].0.public()).0].into(),
+        ..Default::default()
+    });
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    assert!(told(&mut ra).contains(&("bob".into(), RosterState::Removed, vec![], None)));
+}
+
+#[test]
+fn a_removal_that_fails_leaves_the_friendship_whole() {
+    for method in ["presentation", "withdrawals", "end_friendship"] {
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
+        let (password, _) = session(&s.core, "alice", &alice, 1, false, u64::MAX);
+        s.fail.fail_next(method);
+        let removed = s.core.friend_remove(password, "bob");
+        assert_eq!(s.fail.failed(), Some(method));
+        match removed {
+            Ok(()) => {
+                assert_eq!(friendship_of(&s, &alice, &bob), None, "{method}");
+                assert!(s.rel.presentations(&fp(&alice)).unwrap().is_empty());
+            }
+            Err(e) => {
+                assert_eq!(e, MessagingError::ServerError, "{method}");
+                assert!(friendship_of(&s, &alice, &bob).is_some(), "{method}");
+                assert!(presented_both_ways(&s, &alice, &bob), "{method}");
+                assert!(told(&mut rb).is_empty(), "{method}: nothing told");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_block_that_fails_blocks_nothing() {
+    for method in ["presentation", "end_friendship", "end_approval"] {
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let (a, _, _, _, _) = made(&s, &alice, &bob);
+        let (ma, mb) = (
+            Mailbox::identified("alice", fp(&alice)),
+            Mailbox::identified("bob", fp(&bob)),
+        );
+        s.fail.fail_next(method);
+        let blocked = s.core.inbox_block(a, "bob", true);
+        assert_eq!(s.fail.failed(), Some(method));
+        let is_blocked = s.rel.is_blocked(&ma, &mb).unwrap();
+        let friends = friendship_of(&s, &alice, &bob).is_some();
+        match blocked {
+            Ok(()) => assert!(is_blocked && !friends, "{method}: blocked, so ended"),
+            Err(_) => {
+                assert!(!is_blocked && friends, "{method}: nothing written");
+                assert!(presented_both_ways(&s, &alice, &bob), "{method}");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_entry_whose_read_fails_is_not_told() {
+    for nth in [1, 2] {
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let (_, mut ra, _, _, _) = made(&s, &alice, &bob);
+        s.fail.fail_nth(nth);
+        s.core.tell_entry(
+            &Mailbox::identified("alice", fp(&alice)),
+            &Mailbox::identified("bob", fp(&bob)),
+        );
+        assert_eq!(s.fail.failed(), Some("relationship"));
+        assert_eq!(told(&mut ra), [], "read {nth} failing");
+    }
+}
+
+#[test]
+fn a_withdrawal_retried_after_a_failure_ends_a_friendship_made_while_the_clock_ran_ahead() {
+    for method in ["presentation", "end_friendship"] {
+        let (alice, bob) = (person(1), person(2));
+        let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        s.core.clock().advance(std::time::Duration::from_secs(3600));
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
+        for uid in [a, b] {
+            let (_, presented) = s
+                .core
+                .friendships_present(uid, vec![], vec![f.clone()])
+                .unwrap();
+            assert!(ok_all(&presented));
+        }
+        assert!(friendship_of(&s, &alice, &bob).is_some());
+
+        // The edge was made later than the cutoff now reads.
+        Arc::get_mut(&mut s.core).unwrap().clock = crate::clock::Clock::default();
+        let w = withdraw(&alice, 0, &bob, now());
+        s.fail.fail_next(method);
+        let _ = s.core.friendships_present(a, vec![w.clone()], vec![]);
+        assert_eq!(s.fail.failed(), Some(method));
+        let (taken, _) = s.core.friendships_present(a, vec![w], vec![]).unwrap();
+        assert!(ok_all(&taken), "{method}");
+        assert_eq!(friendship_of(&s, &alice, &bob), None, "{method}: retried");
+    }
+}
+
+#[test]
+fn a_merge_whose_ending_fails_changes_and_tells_nothing() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (_, mut ra, _, mut rb, _) = made(&s, &alice, &bob);
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    // A fold left a block beside the friendship.
+    s.rel
+        .set_blocked(&ma, &mb, true, std::time::SystemTime::now())
+        .unwrap();
+    let befriended = |s: &Server| {
+        let r = s.core.roster.lock().unwrap();
+        let e = r.presences.by.get(&Key::of(&ma));
+        e.is_some_and(|e| e.friends.contains(&Key::of(&mb)))
+    };
+    s.fail.fail_next("end_friendship");
+    s.core.after_merge(&ma);
+    assert!(s.fail.failed().is_some());
+    assert!(friendship_of(&s, &alice, &bob).is_some());
+    assert!(befriended(&s), "the roster as the store left it");
+    assert_eq!(told(&mut ra), []);
+    assert_eq!(told(&mut rb), []);
+
+    s.core.after_merge(&ma);
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    assert!(!befriended(&s));
+}
+
+/// Accounts whose bits a test changes as it goes.
+#[derive(Clone)]
+struct Switch(Arc<std::sync::Mutex<Vec<(Mailbox, crate::AccessBits)>>>);
+
+impl crate::AccountDirectory for Switch {
+    fn inbox_account(&self, login: &str) -> Option<Mailbox> {
+        let accounts = self.0.lock().unwrap();
+        let found = accounts.iter().find(|(m, _)| m.login == login);
+        found.map(|(m, _)| m.clone())
+    }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<crate::AccessBits> {
+        let accounts = self.0.lock().unwrap();
+        let found = accounts
+            .iter()
+            .find(|(m, _)| who.matches(&m.login, m.fingerprint.as_ref()));
+        found.map(|(_, a)| *a)
+    }
+
+    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, crate::AccessBits)> {
+        let accounts = self.0.lock().unwrap();
+        accounts
+            .iter()
+            .find(|(m, _)| m.fingerprint == Some(*fp))
+            .cloned()
+    }
+}
+
+#[test]
+fn a_removal_by_fingerprint_of_one_outside_messaging_ends_the_friendship_here() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _, _, _, f) = made(&s, &alice, &bob);
+    let bits = |b| accounts.0.lock().unwrap()[1].1 = b;
+    bits(crate::AccessBits::empty());
+    assert_eq!(s.core.friend_remove_by_key(a, &fp(&bob), None), Ok(()));
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+
+    // Bob takes part again, and Alice's other device presents it back.
+    bits(messaging_bits());
+    let (a1, _) = device(&s.core, "alice", &alice, 1);
+    let (_, again) = s.core.friendships_present(a1, vec![], vec![f]).unwrap();
+    assert_eq!(again[0].outcome, Presented::Withdrawn(None));
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
 }
