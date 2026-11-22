@@ -1248,7 +1248,8 @@ impl Core {
 
     /// [`Self::friend_remove`], withdrawing where `withdraw` is a
     /// withdrawal: a device act that ends the friendship wherever the
-    /// withdrawal reaches (`docs/proposals/portable-friends.md` §4.3).
+    /// withdrawal reaches (`docs/proposals/portable-friends.md` §4.3),
+    /// and keeps one it leaves each party's presentation standing for.
     /// Without one, a portable friendship ends here alone, under a
     /// withdrawal of the server's own; and so it does where the one it
     /// carries is refused, the removal standing and the refusal answered,
@@ -1288,9 +1289,17 @@ impl Core {
                 return Err(MessagingError::ServerError);
             }
             // Answered from what the withdrawal committed: one that ended
-            // the friendship is the whole removal.
-            if matches!(taken, Ok(Some((_, true)))) {
-                return Ok(());
+            // the friendship is the whole removal, and one that leaves each
+            // party's presentation standing keeps it, told to both again
+            // (§4.3). Otherwise it ends here alone.
+            match &taken {
+                Ok(Some((_, portable::Applied::Ended))) => return Ok(()),
+                Ok(Some((_, portable::Applied::Standing([x, y])))) => {
+                    self.tell_entry(x, y);
+                    self.tell_entry(y, x);
+                    return Ok(());
+                }
+                _ => {}
             }
             let mut end = self
                 .end_here(store, &me.mailbox, &them)
@@ -1301,7 +1310,10 @@ impl Core {
                 .end_friendship(&me.mailbox, &them, &end)
                 .map_err(store_failed)?;
             if let Some(e) = ended.ended {
-                let withdraw = taken.as_ref().ok().cloned().flatten().map(|(w, _)| w);
+                let withdraw = taken
+                    .as_ref()
+                    .ok()
+                    .and_then(|t| t.as_ref().map(|(w, _)| w.clone()));
                 self.edge_ended(&e, withdraw.as_deref());
             }
             return taken.map(|_| ());

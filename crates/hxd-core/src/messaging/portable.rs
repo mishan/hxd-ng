@@ -231,7 +231,7 @@ type HeldCutoff = (Cutoff, Option<Vec<u8>>);
 type Going = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
 
 /// What applying a withdrawal left of the pair's friendship.
-enum Applied {
+pub(super) enum Applied {
     /// Ended, and told.
     Ended,
     /// Active, each party's presentation standing, under the mailboxes
@@ -744,8 +744,8 @@ impl Core {
 
     /// A withdrawal `me` gives as its own act about `them`, at 803 or 806
     /// (§4.3): checked whole against the pair it names, kept, and applied.
-    /// Answers its bytes, for the `Removed` it is told with, and whether
-    /// it ended the friendship.
+    /// Answers its bytes, for the `Removed` it is told with, and what it
+    /// left of the friendship.
     pub(super) fn take_withdrawal(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -753,7 +753,7 @@ impl Core {
         device: &Device,
         them: &Mailbox,
         bytes: Vec<u8>,
-    ) -> Result<(Vec<u8>, bool), MessagingError> {
+    ) -> Result<(Vec<u8>, Applied), MessagingError> {
         let now = self.clock.unix();
         let floors = Floors::new(self);
         let parsed = Withdrawal::parse(&bytes, now, |k| floors.floor(k));
@@ -787,7 +787,7 @@ impl Core {
             (theirs, mine)
         };
         let applied = self.apply_cutoff(store, keep, party, other)?;
-        Ok((bytes, matches!(applied, Applied::Ended)))
+        Ok((bytes, applied))
     }
 
     fn cutoff_held(

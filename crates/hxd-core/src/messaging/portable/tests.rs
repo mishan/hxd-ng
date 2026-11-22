@@ -1970,3 +1970,22 @@ fn a_reset_leaves_no_id_for_a_friendship_made_after_it() {
         "what was queued before the reset stays held"
     );
 }
+
+#[test]
+fn a_removal_whose_withdrawal_cuts_nothing_keeps_the_friendship() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, mut ra, _, mut rb, f) = made(&s, &alice, &bob);
+    let id = friendship_of(&s, &alice, &bob);
+    let early = withdraw_at(&alice, 0, &bob, now() - 120, now());
+    assert_eq!(s.core.friend_unfriend(a, "bob", Some(early)), Ok(()));
+    assert_eq!(friendship_of(&s, &alice, &bob), id, "the edge stands");
+    assert_eq!(
+        told(&mut ra),
+        [("bob".into(), RosterState::Accepted, vec![hash(&f)], None)]
+    );
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Accepted, vec![hash(&f)], None)]
+    );
+}
