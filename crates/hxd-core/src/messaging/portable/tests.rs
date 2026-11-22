@@ -1704,7 +1704,7 @@ fn a_removal_that_fails_leaves_the_friendship_whole() {
 
 #[test]
 fn a_block_that_fails_blocks_nothing() {
-    for method in ["presentation", "end_friendship", "end_approval"] {
+    for method in ["presentation", "end_friendship"] {
         let (alice, bob) = (person(1), person(2));
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let (a, _, _, _, _) = made(&s, &alice, &bob);

@@ -1512,13 +1512,6 @@ impl Core {
         if !now_blocked {
             store.set_blocked(blocker, blocked, false, at)?;
         } else {
-            let ended = |r: Result<Option<RelationId>, StoreError>| match r {
-                Ok(id) => id.is_some(),
-                Err(e) => {
-                    warn!("relationships: ending what a block ends: {e}");
-                    false
-                }
-            };
             // Whether the blocked had a row to see go: only then is it
             // told, so a block on a stranger tells it nothing.
             let shown = store
@@ -1528,20 +1521,14 @@ impl Core {
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
             let mut end = self.end_here(store, blocker, blocked)?;
+            // Its requests and approvals end with it, an approval silently:
+            // one is never in 800 or 801 (§4.6).
             end.block = Some(at);
             end.friendship = true;
             let unfriended = store.end_friendship(blocker, blocked, &end)?.ended;
             if let Some(e) = &unfriended {
                 let [a, b] = &e.parties;
                 self.roster.lock().unwrap().friends_changed(a, b, false);
-            }
-            // An approval ends silently: it is never in 800 or 801 (§4.6).
-            ended(store.end_approval(blocker, blocked));
-            ended(store.end_approval(blocked, blocker));
-            for (a, b) in [(blocker, blocked), (blocked, blocker)] {
-                if let Err(e) = store.set_pending_out(a, b, None) {
-                    warn!("relationships: ending a request a block ends: {e}");
-                }
             }
             if unfriended.is_some() || shown {
                 self.tell_entry(blocked, blocker);

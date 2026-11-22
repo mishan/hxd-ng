@@ -1359,6 +1359,15 @@ impl RelationshipStore for SqliteStore {
                 };
                 rel.blocked_at = rel.blocked_at.or(Some(at));
                 write(tx, rid, &mut rel)?;
+                let mut lost = Vec::new();
+                for (x, y) in [(a, b), (b, a)] {
+                    if let Some((rid, mut rel)) = load_pair(tx, x, y)? {
+                        rel.pending_out = None;
+                        lost.extend(rel.approval.take());
+                        write(tx, Some(rid), &mut rel)?;
+                    }
+                }
+                forget(tx, lost)?;
             }
             let ended = if end.friendship {
                 end_edge(tx, a, b)?

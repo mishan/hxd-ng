@@ -554,6 +554,16 @@ impl Inner {
         }
         if let Some(at) = end.block {
             self.edit(a, b, |r| r.blocked_at = r.blocked_at.or(Some(at)));
+            let mut lost = Vec::new();
+            for (x, y) in [(a, b), (b, a)] {
+                if self.find(x, y).is_some() {
+                    lost.extend(self.edit(x, y, |r| {
+                        r.pending_out = None;
+                        r.approval.take()
+                    }));
+                }
+            }
+            self.forget(lost);
         }
         let ended = if end.friendship {
             self.end_edge(a, b)

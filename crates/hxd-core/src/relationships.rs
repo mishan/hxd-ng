@@ -477,7 +477,8 @@ pub struct Ending {
     pub presentations: Vec<[u8; 32]>,
     /// The parties whose offers to the other go.
     pub offers: Vec<[u8; 32]>,
-    /// `a` blocks `b`, at this time unless it already had.
+    /// `a` blocks `b`, at this time unless it already had, and the
+    /// requests and approvals either way end with it.
     pub block: Option<SystemTime>,
     /// End the friendship, where there is one: its id goes with it, off
     /// whatever presentations of the pair are left, since what makes the

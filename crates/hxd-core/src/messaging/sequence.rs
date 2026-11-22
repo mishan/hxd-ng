@@ -630,6 +630,9 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
     (uid, rx)
 }
 
+/// Sequences a property test once found failing, run on every store.
+pub const FOUND: &[&[u32]] = &[&[3653138233, 1083754464, 736438803, 2139438085]];
+
 /// Run `steps` against a store from `new_store`, each step held to the
 /// invariants above.
 pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
@@ -656,6 +659,13 @@ mod tests {
             steps in proptest::collection::vec(any::<u32>(), 1..40)
         ) {
             super::run(&|| std::sync::Arc::new(MemoryRelationships::new()), &steps);
+        }
+    }
+
+    #[test]
+    fn the_memory_store_keeps_the_sequences_found_before() {
+        for steps in super::FOUND {
+            super::run(&|| std::sync::Arc::new(MemoryRelationships::new()), steps);
         }
     }
 }

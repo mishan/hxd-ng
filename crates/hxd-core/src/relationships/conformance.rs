@@ -44,6 +44,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
     ending_a_friendship_is_one_step(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
+    a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -500,6 +501,31 @@ fn an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(s: &dyn Re
         [withdrawal(1, 21, 50, true, 2)],
         "{case}: the later cutoff kept"
     );
+}
+
+fn a_block_ends_the_requests_and_approvals_either_way(s: &dyn RelationshipStore) {
+    let case = "a_block_ends_the_requests_and_approvals_either_way";
+    let (a, b) = (Mailbox::login("a"), Mailbox::login("b"));
+    let ids = [
+        s.approve(&a, &b, at(1)).unwrap(),
+        s.approve(&b, &a, at(1)).unwrap(),
+    ];
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        s.set_pending_out(x, y, Some(&pending(2, 1000, true)))
+            .unwrap();
+    }
+    let end = Ending {
+        block: Some(at(3)),
+        ..Ending::default()
+    };
+    s.end_friendship(&a, &b, &end).unwrap();
+    let mine = s.relationship(&a, &b, at(4)).unwrap().unwrap();
+    assert_eq!(mine.blocked_at, Some(at(3)), "{case}");
+    assert_eq!((mine.approval, mine.pending_out), (None, None), "{case}");
+    assert_eq!(s.relationship(&b, &a, at(4)).unwrap(), None, "{case}");
+    for id in ids {
+        assert_eq!(s.made_at(id).unwrap(), None, "{case}: {id} ended");
+    }
 }
 
 fn at(secs: u64) -> SystemTime {

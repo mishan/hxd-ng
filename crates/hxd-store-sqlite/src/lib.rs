@@ -4702,6 +4702,16 @@ mod tests {
         hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    #[test]
+    fn keeps_the_friendship_sequences_found_before() {
+        for steps in hxd_core::messaging::sequence::FOUND {
+            hxd_core::messaging::sequence::run(
+                &|| std::sync::Arc::new(SqliteStore::in_memory().unwrap()),
+                steps,
+            );
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
         #[test]
