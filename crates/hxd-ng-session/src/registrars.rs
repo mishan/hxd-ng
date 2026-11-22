@@ -101,10 +101,15 @@ pub struct Registrars {
     attested: Mutex<HashMap<Fingerprint, (HashSet<String>, Instant)>>,
     /// Held across comparing a fetched list with the one held and
     /// replacing it, so two fetches finishing together cannot leave the
-    /// older one.
-    storing: Arc<Mutex<()>>,
+    /// older one. Under it, the resets a replaced list carried that could
+    /// not be kept: applied by each lookup, and kept by the first whose
+    /// write succeeds. A restart forgets them.
+    storing: Arc<Mutex<Unkept>>,
     cache: Arc<dyn RecordCache>,
 }
+
+/// Device epoch records, as signed, that a store could not keep.
+type Unkept = HashMap<Fingerprint, Vec<(DeviceEpoch, Vec<u8>)>>;
 
 /// A rotation found: the predecessor, the successor and the record as
 /// it was published.
@@ -156,7 +161,7 @@ impl Registrars {
             discovering: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             attested: Mutex::new(HashMap::new()),
-            storing: Arc::new(Mutex::new(())),
+            storing: Arc::new(Mutex::new(HashMap::new())),
             cache,
         }
     }
@@ -449,23 +454,41 @@ impl Registrars {
         crate::spawn_blocking("identity", move || {
             let issued = |l: &CachedList| verified(l).map(|pages| pages[0].issued);
             let fetched = issued(&list).ok_or("record list is not one whole list")?;
-            let _one = storing.lock().unwrap_or_else(|e| e.into_inner());
+            let mut unkept = storing.lock().unwrap_or_else(|e| e.into_inner());
             let held = cache.lists(&fp.0).map_err(|e| e.0)?;
             // A list issued before the one held, as a replay or a stale
             // cache in between would bring, says less than what is held;
             // unless the one held claims to be from the future, which a
             // registrar's clock briefly ahead would otherwise make final.
-            if held
-                .iter()
-                .find(|l| l.registrar == list.registrar)
+            let replaced = held.iter().find(|l| l.registrar == list.registrar);
+            if replaced
                 .and_then(issued)
                 .is_some_and(|held| held > fetched && held <= now)
             {
                 return Err("record list is older than the one held".into());
             }
-            cache.put(&fp.0, &list).map_err(|e| e.0)?;
             let pages = verified(&list).unwrap_or_default();
-            keep_epochs(&*cache, fp, &epochs_in(&pages, fp))
+            let fresh = epochs_in(&pages, fp);
+            // A reset the list replaced carries and this one does not is
+            // kept first, as a list from before the floor table, or one
+            // whose resets could not be kept, may hold; or, if it cannot
+            // be, held here, so that the fetched list, which may revoke
+            // what the held one did not, is stored all the same.
+            let dropped: Vec<_> = replaced
+                .and_then(verified)
+                .map(|pages| epochs_in(&pages, fp))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, bytes)| !fresh.iter().any(|(_, b)| b == bytes))
+                .collect();
+            if !dropped.is_empty() {
+                if let Err(e) = keep_epochs(&*cache, fp, &dropped) {
+                    warn!("identity device floor: {}; held until it can be kept", e.0);
+                    unkept.entry(fp).or_default().extend(dropped);
+                }
+            }
+            cache.put(&fp.0, &list).map_err(|e| e.0)?;
+            keep_epochs(&*cache, fp, &fresh)
                 .map(|_| ())
                 .map_err(|e| e.0)
         })
@@ -771,8 +794,20 @@ impl Registrars {
         // the lists carry now: a list that no longer carries one lowers
         // no floor. One that cannot be read proves nothing either way.
         let kept = {
-            let _one = self.storing.lock().unwrap_or_else(|e| e.into_inner());
-            keep_epochs(&*self.cache, fp, &seen)
+            let mut unkept = self.storing.lock().unwrap_or_else(|e| e.into_inner());
+            let held = unkept.get(&fp).cloned().unwrap_or_default();
+            for (e, _) in &held {
+                let e = Record::DeviceEpoch(e.clone());
+                if !lookup.records.contains(&e) {
+                    lookup.records.push(e);
+                }
+            }
+            seen.extend(held);
+            let kept = keep_epochs(&*self.cache, fp, &seen);
+            if kept.is_ok() {
+                unkept.remove(&fp);
+            }
+            kept
         };
         match kept {
             Ok(kept) => {

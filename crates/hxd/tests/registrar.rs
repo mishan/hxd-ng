@@ -3450,6 +3450,79 @@ async fn a_floor_seen_outlives_its_record_and_a_restart_whatever_the_card_shows(
 }
 
 #[tokio::test]
+async fn a_reset_only_a_held_list_carries_is_kept_when_the_list_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let phone = DeviceKey::from_seed(&[101; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let below = (403, json!("revoked"), json!(1));
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    // The held list carries the reset and the floor table does not, as a
+    // store from before it would; the registrar then lists it no more.
+    let db = dir.path().join("verifier/server.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DELETE FROM identity_device_floor")
+        .unwrap();
+    delete_resets(dir.path());
+    identity.clock().advance(Duration::from_secs(31));
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    let restarted = verifier(&dir.path().join("verifier"), &r, Trust::Key, &url, "")
+        .await
+        .0;
+    assert_eq!(
+        refusal(&auth_at(restarted, &alice, &phone, &card).await),
+        below
+    );
+}
+
+#[tokio::test]
+async fn a_list_is_stored_while_the_resets_it_replaces_cannot_be_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let (v, _, identity, _) = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30).await;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let (phone, tablet) = (
+        DeviceKey::from_seed(&[101; 32]),
+        DeviceKey::from_seed(&[103; 32]),
+    );
+    let card = attested(&r, &alice, "alice").await;
+    post_reset(&r, &alice, 1).await;
+    let mut phone_here = session_in(v, &phone, &cert_in(&alice, &phone, 1), &card, json!({})).await;
+
+    // The held list's reset is in no floor row, and none can be written,
+    // while the lists still can be; the registrar drops the reset and
+    // revokes the phone.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM identity_device_floor;
+             CREATE TRIGGER no_floor BEFORE INSERT ON identity_device_floor
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        )
+        .unwrap();
+    delete_resets(dir.path());
+    post_device_revocation(&r, &alice, &phone).await;
+    identity.clock().advance(Duration::from_secs(31));
+
+    // The fetched list is stored and its revocation applied, and the
+    // reset it dropped is still the floor.
+    identity.sweep_records().await;
+    phone_here.event("kicked").await.unwrap();
+    assert_eq!(
+        refusal(&auth_cert(v, &tablet, &card, &cert_in(&alice, &tablet, 0), json!({})).await),
+        (403, json!("revoked"), json!(1))
+    );
+}
+
+#[tokio::test]
 async fn an_unreadable_floor_refuses_once_the_lists_floor_is_in_force() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;
