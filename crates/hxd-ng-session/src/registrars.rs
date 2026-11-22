@@ -837,11 +837,16 @@ impl Registrars {
 }
 
 /// The device epoch floor kept in `cache` for `fp`, as far as what is
-/// kept verifies. Reads the store and verifies: called off the reactor.
+/// kept verifies, with the resets in the lists held, current or
+/// superseded, whose keeping may have failed. The lists are read before
+/// the rows, so a lookup keeping a list's resets and releasing it
+/// meanwhile leaves them in one or the other. Reads the store and
+/// verifies: called off the reactor.
 pub fn kept_floor(cache: &dyn RecordCache, fp: &Fingerprint) -> Result<u64, hxd_core::StoreError> {
+    let mut lists = cache.lists(&fp.0)?;
+    lists.extend(cache.superseded(&fp.0)?);
     let kept = kept_verified(*fp, cache.epochs(&fp.0)?);
-    let held = cache.superseded(&fp.0)?;
-    let held = held.iter().flat_map(|l| superseded_epochs(l, *fp));
+    let held = lists.iter().flat_map(|l| superseded_epochs(l, *fp));
     Ok(kept
         .into_iter()
         .chain(held.map(|(e, _)| e))
@@ -850,11 +855,11 @@ pub fn kept_floor(cache: &dyn RecordCache, fp: &Fingerprint) -> Result<u64, hxd_
         .unwrap_or(0))
 }
 
-/// `fp`'s device epoch records in `list`, held as superseded; none, and
-/// said so, if it no longer verifies.
+/// `fp`'s device epoch records in `list`, held; none, and said so, if it
+/// no longer verifies.
 fn superseded_epochs(list: &CachedList, fp: Fingerprint) -> Vec<(DeviceEpoch, Vec<u8>)> {
     let Some(pages) = verified(list) else {
-        warn!(fingerprint = %fp.short(), registrar = %list.registrar, "a superseded record list did not verify; ignored");
+        warn!(fingerprint = %fp.short(), registrar = %list.registrar, "a record list held did not verify; ignored");
         return Vec::new();
     };
     epochs_in(&pages, fp)

@@ -3483,6 +3483,36 @@ async fn a_reset_only_a_held_list_carries_is_kept_when_the_list_is_replaced() {
 }
 
 #[tokio::test]
+async fn a_reset_stored_in_a_list_alone_is_the_floor_trusting_no_registrar() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = open_registrar(dir.path()).await;
+    let url = format!("http://{}", r.ng);
+    let v = linked_verifier(dir.path(), &r, Trust::Key, &url, "", 30)
+        .await
+        .0;
+    let alice = IdentityKey::from_seed(&[1; 32]);
+    let phone = DeviceKey::from_seed(&[101; 32]);
+    let card = attested(&r, &alice, "alice").await;
+    let below = (403, json!("revoked"), json!(1));
+
+    // The list carrying the reset is stored and the reset never kept.
+    rusqlite::Connection::open(dir.path().join("verifier/server.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_floor BEFORE INSERT ON identity_device_floor
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        )
+        .unwrap();
+    post_reset(&r, &alice, 1).await;
+    assert_eq!(refusal(&auth_at(v, &alice, &phone, &card).await), below);
+
+    let alone = verifier(&dir.path().join("verifier"), &r, Trust::Nobody, &url, "")
+        .await
+        .0;
+    assert_eq!(refusal(&auth_at(alone, &alice, &phone, &card).await), below);
+}
+
+#[tokio::test]
 async fn a_list_is_stored_while_the_resets_it_replaces_cannot_be_kept() {
     let dir = tempfile::tempdir().unwrap();
     let r = open_registrar(dir.path()).await;

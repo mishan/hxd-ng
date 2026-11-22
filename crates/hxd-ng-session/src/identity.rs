@@ -1516,7 +1516,8 @@ impl IdentityState {
         // With the floor kept here by fingerprint, which the lists held or
         // the card shown do not lower, a restart does not forget, and no
         // registrar need be trusted to read: one that cannot be read may
-        // hold a floor, and refuses once the lists' floor is in force.
+        // hold a floor, and refuses once the lists' floor is in force and
+        // what else refuses has been told.
         let kept = self.kept_floor(&fingerprint);
         let listed = listed.max(*kept.as_ref().unwrap_or(&0));
         if let Some(ended) = self.core.raise_floor(fingerprint.0, listed) {
@@ -1529,10 +1530,6 @@ impl IdentityState {
             t.tokens.retain(|_, (ident, _)| {
                 ident.fingerprint != fingerprint || ident.device_epoch >= listed
             });
-        }
-        if let Err(e) = kept {
-            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its device floor could not be read: {}", e.0);
-            return Err(AuthRefused::Denied);
         }
         // Read after the raise, so a floor another admission raised
         // meanwhile counts too. A freeze, or a rotation with no anchors to
@@ -1581,6 +1578,11 @@ impl IdentityState {
                 return Err(refused);
             }
             None => {}
+        }
+        // Told after what is known refuses, so a revoked key is told so.
+        if let Err(e) = kept {
+            tracing::warn!(fingerprint = %fingerprint.short(), "identity auth refused: its device floor could not be read: {}", e.0);
+            return Err(AuthRefused::Denied);
         }
 
         // A banned registrar refuses every identity that carries its
