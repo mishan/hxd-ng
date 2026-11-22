@@ -1278,7 +1278,7 @@ impl Core {
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
             let taken = match (withdraw, device) {
                 (Some(bytes), Some(Ok(device))) => self
-                    .take_withdrawal(store, &me.mailbox, &device, &them, bytes)
+                    .take_withdrawal(store, &me.mailbox, &device, &them, bytes, false)
                     .map(Some),
                 (_, Some(Err(e))) => Err(e),
                 _ => Ok(None),
@@ -1302,7 +1302,7 @@ impl Core {
                 _ => {}
             }
             let mut end = self
-                .end_here(store, &me.mailbox, &them)
+                .end_here(store, &me.mailbox, &them, &[])
                 .map_err(store_failed)?;
             end.friendship = true;
             end.hold = Some(now + p.request_retention);
@@ -1520,7 +1520,7 @@ impl Core {
                 .flatten()
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
-            let mut end = self.end_here(store, blocker, blocked)?;
+            let mut end = self.end_here(store, blocker, blocked, &[])?;
             // Its requests and approvals end with it, an approval silently:
             // one is never in 800 or 801 (§4.6).
             end.block = Some(at);
@@ -1585,29 +1585,36 @@ impl Core {
                 Ok(()) => changed = true,
                 Err(e) => warn!("relationships: settling a merge: {e}"),
             };
-            if blocked && mine.friendship.is_some() {
+            // A block ends the friendship, the approvals and the requests
+            // either way, written as the block it already is.
+            let ends = mine.friendship.is_some()
+                || mine.approval.is_some()
+                || mine.pending_out.is_some()
+                || theirs
+                    .as_ref()
+                    .is_some_and(|t| t.approval.is_some() || t.pending_out.is_some());
+            let block = mine.blocked_at.map(|at| (me, &other, at)).or_else(|| {
+                let at = theirs.as_ref().and_then(|t| t.blocked_at)?;
+                Some((&other, me, at))
+            });
+            if let Some((x, y, at)) = block.filter(|_| ends) {
                 let end = Ending {
+                    block: Some(at),
                     friendship: true,
                     ..Ending::default()
                 };
-                fix(store.end_friendship(me, &other, &end).map(|ended| {
+                fix(store.end_friendship(x, y, &end).map(|ended| {
                     if let Some(e) = ended.ended {
                         let [a, b] = &e.parties;
                         self.roster.lock().unwrap().friends_changed(a, b, false);
                     }
                 }));
             }
-            if blocked && mine.approval.is_some() {
-                fix(store.end_approval(me, &other).map(|_| ()));
-            }
-            if blocked && theirs.as_ref().is_some_and(|t| t.approval.is_some()) {
-                fix(store.end_approval(&other, me).map(|_| ()));
-            }
             let friends = mine.friendship.is_some() && !blocked;
-            if (friends || blocked) && mine.pending_out.is_some() {
+            if friends && mine.pending_out.is_some() {
                 fix(store.set_pending_out(me, &other, None));
             }
-            if (friends || blocked) && theirs.as_ref().is_some_and(|t| t.pending_out.is_some()) {
+            if friends && theirs.as_ref().is_some_and(|t| t.pending_out.is_some()) {
                 fix(store.set_pending_out(&other, me, None));
             }
             if changed {

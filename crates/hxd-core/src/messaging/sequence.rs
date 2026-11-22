@@ -162,7 +162,7 @@ enum Step {
     Remove {
         withdraw: bool,
     },
-    /// Block User (806)'s withdrawal, taken alone.
+    /// Block User (806)'s withdrawal, which blocks with it.
     BlockWithdrawal,
     Block,
     Unblock,

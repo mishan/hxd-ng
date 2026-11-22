@@ -745,7 +745,8 @@ impl Core {
     /// A withdrawal `me` gives as its own act about `them`, at 803 or 806
     /// (§4.3): checked whole against the pair it names, kept, and applied.
     /// Answers its bytes, for the `Removed` it is told with, and what it
-    /// left of the friendship.
+    /// left of the friendship. With `block`, `me` blocks `them` in the
+    /// same step, as Block User (806) carrying it does.
     pub(super) fn take_withdrawal(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -753,6 +754,7 @@ impl Core {
         device: &Device,
         them: &Mailbox,
         bytes: Vec<u8>,
+        block: bool,
     ) -> Result<(Vec<u8>, Applied), MessagingError> {
         let now = self.clock.unix();
         let floors = Floors::new(self);
@@ -786,7 +788,8 @@ impl Core {
         } else {
             (theirs, mine)
         };
-        let applied = self.apply_cutoff(store, keep, party, other)?;
+        let blocking = block.then_some((me, them));
+        let applied = self.apply_cutoff(store, keep, party, other, blocking)?;
         Ok((bytes, applied))
     }
 
@@ -818,6 +821,7 @@ impl Core {
         keep: HeldWithdrawal,
         party: [u8; 32],
         other: [u8; 32],
+        block: Option<(&Mailbox, &Mailbox)>,
     ) -> Result<Applied, MessagingError> {
         let cut = Cutoff {
             pair: keep.pair,
@@ -867,10 +871,40 @@ impl Core {
         }
         let withdraw = keep.withdrawal.clone();
         end.withdrawals.push(keep);
-        let ended = store.end_friendship(&x, &y, &end).map_err(store_failed)?;
+        // A block takes what a removal here takes besides, and is written
+        // with it: what the withdrawal ends never stands without it.
+        let mut shown = false;
+        if let Some((blocker, blocked)) = block {
+            let here = self
+                .end_here(store, blocker, blocked, &end.presentations)
+                .map_err(store_failed)?;
+            for p in here.presentations {
+                if !end.presentations.contains(&p) {
+                    end.presentations.push(p);
+                }
+            }
+            for o in here.offers {
+                if !end.offers.contains(&o) {
+                    end.offers.push(o);
+                }
+            }
+            end.withdrawals.extend(here.withdrawals);
+            end.block = Some(wall);
+            end.friendship = true;
+            shown = store
+                .relationship(blocker, blocked, wall)
+                .map_err(store_failed)?
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.delivered);
+        }
+        let (a, b) = block.unwrap_or((&x, &y));
+        let ended = store.end_friendship(a, b, &end).map_err(store_failed)?;
         if let Some(e) = ended.ended {
             self.edge_ended(&e, withdraw.as_deref());
             return Ok(Applied::Ended);
+        }
+        if shown {
+            self.tell_entry(b, a);
         }
         Ok(match row.filter(|r| r.friendship.is_some()) {
             Some(r) if had == 2 => Applied::Standing([r.owner, r.other]),
@@ -882,13 +916,15 @@ impl Core {
     /// own ends of what they presented: the presentations either way and
     /// the offers, and a withdrawal of the server's own for `me`, dated
     /// now, that applies here alone, so that `me`'s other devices do not
-    /// present the friendship straight back (§4.3). The caller adds what
-    /// else it ends, and applies it as one step.
+    /// present the friendship straight back (§4.3), but for the parties
+    /// whose presentations a withdrawal in the same step ends, `withdrawn`.
+    /// The caller adds what else it ends, and applies it as one step.
     pub(super) fn end_here(
         &self,
         store: &Arc<dyn RelationshipStore>,
         me: &Mailbox,
         them: &Mailbox,
+        withdrawn: &[[u8; 32]],
     ) -> Result<Ending, StoreError> {
         let mut end = Ending {
             cap: self.messaging_policy.max_roster,
@@ -904,6 +940,9 @@ impl Core {
                 continue;
             };
             end.presentations.push(p);
+            if withdrawn.contains(&p) {
+                continue;
+            }
             let named = if p == mine {
                 pres.names[0]
             } else {
@@ -1112,7 +1151,7 @@ impl Core {
                 .is_some_and(|r| r.friendship.is_some());
             if friends {
                 let mut end = self
-                    .end_here(store, &me.mailbox, &them)
+                    .end_here(store, &me.mailbox, &them, &[])
                     .map_err(store_failed)?;
                 end.friendship = true;
                 end.hold = Some(wall + self.messaging_policy.request_retention);
@@ -1159,9 +1198,11 @@ impl Core {
         }
     }
 
-    /// The withdrawal a Block User (806) carries, taken before the block
-    /// is (§4.3), so the friend's other servers hear of a removal and
-    /// never of a block. The block itself is the caller's to make next.
+    /// The withdrawal a Block User (806) carries, taken with the block
+    /// in one step, and handed on as a removal (§4.3), so the friend's
+    /// other servers hear of a removal and never of a block. Where it
+    /// names no friendship here, the block is the caller's to make next,
+    /// as it makes one again after this.
     pub fn block_withdrawing(
         &self,
         uid: Uid,
@@ -1205,7 +1246,7 @@ impl Core {
         {
             return Ok(());
         }
-        self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw)
+        self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw, true)
             .map(|_| ())
     }
 
@@ -1330,7 +1371,7 @@ impl Core {
             (other, presenter)
         };
         // An edge that stays active is told to both again (§4.3).
-        if let Applied::Standing([x, y]) = self.apply_cutoff(store, keep, party, other)? {
+        if let Applied::Standing([x, y]) = self.apply_cutoff(store, keep, party, other, None)? {
             self.tell_entry(&x, &y);
             self.tell_entry(&y, &x);
         }

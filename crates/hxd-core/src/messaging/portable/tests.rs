@@ -1989,3 +1989,55 @@ fn a_removal_whose_withdrawal_cuts_nothing_keeps_the_friendship() {
         [("alice".into(), RosterState::Accepted, vec![hash(&f)], None)]
     );
 }
+
+#[test]
+fn a_merge_ends_a_blocked_friendship_with_its_requests() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    made(&s, &alice, &bob);
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    // A fold left Alice's block beside the friendship and Bob's request.
+    let at = std::time::SystemTime::now();
+    s.rel.set_blocked(&ma, &mb, true, at).unwrap();
+    let asked = crate::relationships::PendingOut {
+        sent_at: at,
+        lapses_at: at + std::time::Duration::from_secs(DAY),
+        delivered: true,
+        note: None,
+    };
+    s.rel.set_pending_out(&mb, &ma, Some(&asked)).unwrap();
+    s.fail.fail_nth_write(2);
+    s.core.after_merge(&ma);
+    let asking = s.rel.relationship(&mb, &ma, at).unwrap();
+    assert_eq!(
+        friendship_of(&s, &alice, &bob).is_some(),
+        asking.is_some_and(|r| r.pending_out.is_some()),
+        "ended with the request, or neither"
+    );
+    assert!(s.rel.is_blocked(&ma, &mb).unwrap());
+}
+
+#[test]
+fn a_block_withdrawing_is_blocked_with_what_it_ends() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, _, _, _) = made(&s, &alice, &bob);
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    s.fail.fail_nth_write(2);
+    // As Block User (806) carrying a withdrawal does.
+    let _ = s
+        .core
+        .block_withdrawing(a, "bob", withdraw(&alice, 0, &bob, now()));
+    let _ = s.core.inbox_block(a, "bob", true);
+    assert_eq!(
+        s.rel.is_blocked(&ma, &mb).unwrap(),
+        friendship_of(&s, &alice, &bob).is_none(),
+        "the friendship ended with the block, or neither"
+    );
+}
