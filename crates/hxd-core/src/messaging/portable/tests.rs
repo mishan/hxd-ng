@@ -2304,3 +2304,48 @@ fn a_friendship_by_request_takes_the_id_a_dropped_presentation_kept() {
     assert_eq!(friendship_of(&s, &alice, &bob), Some(id));
     assert!(s.rel.is_live(id), "what was queued on it is released");
 }
+
+#[test]
+fn a_friendship_is_dated_by_the_takings_of_its_own_bytes() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (_, by_alice) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&by_alice));
+    let mut corrupt = s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap().unwrap();
+    corrupt.friendship = Some(b"not a friendship".to_vec());
+    s.rel.present(&corrupt).unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, by_bob) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&by_bob));
+    assert_eq!(friendship_of(&s, &alice, &bob), None, "not over Alice's");
+
+    // Reset after Alice's copy was taken and before Bob's.
+    keep(&s, &alice, 1, t + 5);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    assert!(friendship_of(&s, &alice, &bob).is_some());
+    for (who, p, q) in [
+        ("alice", fp(&alice), fp(&bob)),
+        ("bob", fp(&bob), fp(&alice)),
+    ] {
+        assert!(
+            s.rel.presentation(&p, &q).unwrap().is_none(),
+            "{who}'s not held: a copy that does not check dates nothing"
+        );
+    }
+}

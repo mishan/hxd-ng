@@ -139,8 +139,8 @@ impl<'a> Floors<'a> {
 
     /// Whether the friendship `hash`, `bytes`, is held (§6): each half
     /// below its floor reset after this server first took the friendship,
-    /// the earliest taking of the evidence of it in `stored`, or `now` for
-    /// one not stored yet. What every grant and every judging of what is
+    /// the earliest taking of a presentation in `stored` of these bytes, or
+    /// `now` for one not stored yet. What every grant and every judging of what is
     /// stored asks. One stored that no longer checks is not held.
     fn held(&self, hash: &[u8; 32], bytes: &[u8], stored: &[Presentation], now: u64) -> Judged {
         let f = match Friendship::check(bytes, STORED, &[], zero_floor) {
@@ -151,7 +151,7 @@ impl<'a> Floors<'a> {
                 return Judged::Reset;
             }
         };
-        let taken = taken_of(stored, hash).unwrap_or(now);
+        let taken = taken_of(stored, bytes).unwrap_or(now);
         let mut out = Judged::Stands;
         for (from, cert) in [
             (&f.offer.from, &f.offer.cert),
@@ -194,11 +194,12 @@ impl<'a> Floors<'a> {
     }
 }
 
-/// When this server first took the friendship `hash`: the earliest taking
-/// of the presentations of it among `held` (§6).
-fn taken_of(held: &[Presentation], hash: &[u8; 32]) -> Option<u64> {
+/// When this server first took the friendship `bytes`: the earliest
+/// taking of the presentations among `held` that stored those bytes (§6),
+/// so that a copy of its hash that does not check dates nothing.
+fn taken_of(held: &[Presentation], bytes: &[u8]) -> Option<u64> {
     held.iter()
-        .filter(|p| p.hash == *hash && p.evidence())
+        .filter(|p| p.friendship.as_deref() == Some(bytes))
         .map(|p| secs(p.taken))
         .min()
 }
@@ -445,24 +446,19 @@ impl Core {
                 }
             }
         }
-        // Each stored copy once, judged at the takings of the presentations
-        // holding it: one that no longer checks goes alone, and holds
-        // nothing for a copy of its hash that does.
-        let mut copies: Vec<&[u8]> = Vec::new();
-        for bytes in held.iter().filter_map(|p| p.friendship.as_deref()) {
-            if !copies.contains(&bytes) {
-                copies.push(bytes);
+        // Each stored copy once: one that no longer checks goes alone.
+        let mut copies: Vec<(&[u8; 32], &[u8])> = Vec::new();
+        for p in &held {
+            if let Some(bytes) = p.friendship.as_deref() {
+                if !copies.iter().any(|(_, b)| *b == bytes) {
+                    copies.push((&p.hash, bytes));
+                }
             }
         }
         let mut whole = true;
         let mut gone: Vec<&[u8]> = Vec::new();
-        for bytes in copies {
-            let holding: Vec<Presentation> = held
-                .iter()
-                .filter(|p| p.friendship.as_deref() == Some(bytes))
-                .cloned()
-                .collect();
-            match floors.held(&holding[0].hash, bytes, &holding, STORED) {
+        for (hash, bytes) in copies {
+            match floors.held(hash, bytes, &held, STORED) {
                 Judged::Stands => {}
                 Judged::Reset => gone.push(bytes),
                 Judged::Unknown => whole = false,
