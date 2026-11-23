@@ -664,7 +664,10 @@ impl Core {
         offered: &StoredOffer,
         bytes: Vec<u8>,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.unix();
+        // One reading of the clock, so the evidence is stamped with the time
+        // it was judged at.
+        let at = self.clock.wall();
+        let now = secs(at);
         let floors = Floors::new(self);
         let f = Friendship::check(&bytes, now, &[], zero_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
@@ -705,7 +708,6 @@ impl Core {
         if judged != Judged::Stands {
             return Err(MessagingError::BadSignature);
         }
-        let at = self.clock.wall();
         for ((presenter, other, dev), old) in rows.into_iter().zip(olds) {
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
