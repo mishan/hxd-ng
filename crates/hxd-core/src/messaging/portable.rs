@@ -529,7 +529,10 @@ impl Core {
         };
         for fp in identities {
             if let Err(e) = self.reconcile(store, fp) {
-                self.reconciled.lock().unwrap().at.remove(&fp);
+                // A pass under way may have read before what this one
+                // could not judge.
+                let _writing = self.friend_writes();
+                self.unjudge([fp]);
                 warn!("relationships: judging presentations by a device floor: {e}");
             }
         }
@@ -558,21 +561,6 @@ impl Core {
             return Ok(());
         }
         let wall = self.clock.wall();
-        // Every presentation of the chain's keys, each pair's once.
-        let chain = |keys: &[[u8; 32]]| -> Result<Vec<Presentation>, StoreError> {
-            let mut held: Vec<Presentation> = Vec::new();
-            for key in keys {
-                for p in store.presentations(key)? {
-                    if !held
-                        .iter()
-                        .any(|h| h.presenter == p.presenter && h.other == p.other)
-                    {
-                        held.push(p);
-                    }
-                }
-            }
-            Ok(held)
-        };
         let (key, rows, keys, stamp, cleared, held, offers) = {
             let _writing = self.friend_writes();
             let (key, rows) = self.epoch_key(&fp)?;
@@ -584,7 +572,16 @@ impl Core {
                 let r = self.reconciled.lock().unwrap();
                 (r.of(&keys), r.cleared)
             };
-            let held = chain(&keys)?;
+            // Every presentation of the chain's keys, each pair's once.
+            let mut held: Vec<Presentation> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for key in &keys {
+                for p in store.presentations(key)? {
+                    if seen.insert((p.presenter, p.other)) {
+                        held.push(p);
+                    }
+                }
+            }
             let mut offers = Vec::new();
             for key in &keys {
                 for (other, o) in store.offers_from(key, wall)? {
@@ -657,22 +654,40 @@ impl Core {
         }
 
         let mut own = vec![0; keys.len()];
+        let mut whole = true;
         for (a, b) in ending {
             let _writing = self.friend_writes();
             let before = self.reconciled.lock().unwrap().of(&keys);
-            // The whole chain's, as a taking under any key dates the bytes.
-            let held = chain(&keys)?;
+            let pair = [store.presentation(&a, &b)?, store.presentation(&b, &a)?];
             let floors = Floors::after(&floors);
-            let gone: Vec<&Presentation> = (held.iter())
-                .filter(|p| (p.presenter, p.other) == (a, b) || (p.presenter, p.other) == (b, a))
-                .filter(|p| judge(&floors, p, &held) == Some(Judged::Reset))
-                .collect();
+            let mut gone = Vec::new();
+            for p in pair.iter().flatten() {
+                let Some(bytes) = p.friendship.as_deref() else {
+                    continue;
+                };
+                let Some((_, f)) = checked.iter().find(|(b, _)| *b == bytes) else {
+                    continue;
+                };
+                // Its copies under every key of both chains date it.
+                let copies = match f {
+                    Ok(f) => self.copies(store, f, bytes)?,
+                    Err(_) => Vec::new(),
+                };
+                if floors.judged(&p.hash, bytes, f.as_ref(), &copies, STORED) == Judged::Reset {
+                    gone.push(p);
+                }
+            }
             floors.failed()?;
             self.drop_pairs(store, gone)?;
-            // Under the hold every bump is this pass's own.
-            let after = self.reconciled.lock().unwrap().of(&keys);
-            for (own, (b, a)) in own.iter_mut().zip(before.iter().zip(&after)) {
-                *own += a.1.wrapping_sub(b.1);
+            // Under the hold every bump is this pass's own, unless the
+            // generations were forgotten meanwhile.
+            let r = self.reconciled.lock().unwrap();
+            if r.cleared != cleared {
+                whole = false;
+                continue;
+            }
+            for (own, (b, a)) in own.iter_mut().zip(before.iter().zip(&r.of(&keys))) {
+                *own += a.1 - b.1;
             }
         }
         #[cfg(test)]
@@ -685,7 +700,7 @@ impl Core {
         let ours = moved
             .into_iter()
             .all(|((g, s), own)| g.1 == s.1.wrapping_add(*own));
-        if now == key && reconciled.cleared == cleared && ours {
+        if whole && now == key && reconciled.cleared == cleared && ours {
             reconciled.at.insert(fp, (key, gens));
         }
         Ok(())
@@ -1459,6 +1474,37 @@ impl Core {
         }
     }
 
+    /// The presentations of `f`, `bytes`, under any key of its parties'
+    /// chains: what dates its taking here, read pair by pair rather than
+    /// every row naming a key.
+    fn copies(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        f: &Friendship,
+        bytes: &[u8],
+    ) -> Result<Vec<Presentation>, StoreError> {
+        let chain = |fp: Fingerprint| -> Result<Vec<[u8; 32]>, StoreError> {
+            let successors = self.chain_from(store, fp.0)?;
+            let keys = successors.iter().map(|r| Fingerprint::of(&r.successor).0);
+            Ok(std::iter::once(fp.0).chain(keys).collect())
+        };
+        let (lo, hi) = f.pair().fingerprints();
+        let (xs, ys) = (chain(lo)?, chain(hi)?);
+        let mut out = Vec::new();
+        for x in &xs {
+            for y in &ys {
+                for (p, q) in [(x, y), (y, x)] {
+                    out.extend(
+                        store
+                            .presentation(p, q)?
+                            .filter(|c| c.friendship.as_deref() == Some(bytes)),
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `p`, held by its own taking and those of its bytes under the other
     /// keys of its parties' chains alone, dropped where that came after a
     /// half's reset.
@@ -1470,16 +1516,13 @@ impl Core {
         let Some(bytes) = p.friendship.as_deref() else {
             return Ok(());
         };
-        let mut stored = vec![p.clone()];
-        for name in p.names {
-            let successors = self.chain_from(store, name)?;
-            let keys = successors.iter().map(|r| Fingerprint::of(&r.successor).0);
-            for key in std::iter::once(name).chain(keys) {
-                stored.extend(store.presentations(&key)?);
-            }
-        }
+        let f = Friendship::check(bytes, STORED, &[], zero_floor);
+        let copies = match &f {
+            Ok(f) => self.copies(store, f, bytes)?,
+            Err(_) => Vec::new(),
+        };
         let floors = Floors::new(self);
-        let judged = floors.held(&p.hash, bytes, &stored, STORED);
+        let judged = floors.judged(&p.hash, bytes, f.as_ref(), &copies, STORED);
         floors.failed()?;
         if judged == Judged::Reset {
             self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;

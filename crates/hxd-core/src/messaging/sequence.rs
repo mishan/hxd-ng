@@ -517,7 +517,12 @@ impl Run {
     /// after a restart makes of that.
     fn quiescent(&mut self, what: &str) {
         let fps = [self.people[0].fp(), self.people[1].fp()];
+        let before = self.pairing();
         self.core.judge_floors(fps);
+        let after = self.pairing();
+        let told = self.told();
+        let ended = before.friendship.is_some() && after.friendship != before.friendship;
+        self.told_once(&format!("{what}, then a pass"), &after, ended, &told);
         let all = self.presentations();
         for p in all.iter().filter(|p| p.evidence()) {
             assert!(
@@ -526,7 +531,6 @@ impl Run {
                 row_of(p)
             );
         }
-        self.told();
         let before = self.reconcilable();
         self.core.unjudge_all();
         self.core.judge_floors(fps);
@@ -536,6 +540,42 @@ impl Run {
             told.iter().flatten().all(Vec::is_empty),
             "{what}: a pass judged again told {told:?}"
         );
+    }
+
+    /// Each session told of a removal at most once and only where the
+    /// store holds none, and, where an ending was `owed`, told of it once.
+    fn told_once(
+        &self,
+        what: &str,
+        after: &Pairing,
+        owed: bool,
+        told: &[[Vec<RosterState>; 2]; 2],
+    ) {
+        for (q, sessions) in told.iter().enumerate() {
+            for (d, told) in sessions.iter().enumerate() {
+                if self.ended.contains(&self.sessions[q][d].0) {
+                    continue;
+                }
+                let removed = told.iter().filter(|s| **s == RosterState::Removed).count();
+                assert!(removed <= 1, "{what}: {} told twice: {told:?}", LOGINS[q]);
+                if removed > 0 {
+                    assert_eq!(
+                        after.friendship, None,
+                        "{what}: {} told of a removal the store does not hold",
+                        LOGINS[q]
+                    );
+                }
+                if owed && self.takes_part(q) {
+                    let ending = told.iter().filter(|s| **s != RosterState::Accepted);
+                    assert_eq!(
+                        ending.count(),
+                        1,
+                        "{what}: {} told of the ending: {told:?}",
+                        LOGINS[q]
+                    );
+                }
+            }
+        }
     }
 
     /// Whether `p`'s account takes part now, and so can be told anything.
@@ -741,31 +781,7 @@ impl Run {
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
         );
-        for (q, sessions) in told.iter().enumerate() {
-            for (d, told) in sessions.iter().enumerate() {
-                if self.ended.contains(&self.sessions[q][d].0) {
-                    continue;
-                }
-                let removed = told.iter().filter(|s| **s == RosterState::Removed).count();
-                assert!(removed <= 1, "{what}: {} told twice: {told:?}", LOGINS[q]);
-                if removed > 0 {
-                    assert_eq!(
-                        after.friendship, None,
-                        "{what}: {} told of a removal the store does not hold",
-                        LOGINS[q]
-                    );
-                }
-                if ended && !read_failed && self.takes_part(q) {
-                    let ending = told.iter().filter(|s| **s != RosterState::Accepted);
-                    assert_eq!(
-                        ending.count(),
-                        1,
-                        "{what}: {} told of the ending: {told:?}",
-                        LOGINS[q]
-                    );
-                }
-            }
-        }
+        self.told_once(&what, &after, ended && !read_failed, &told);
 
         // An active edge stands on held evidence wherever a step made it
         // active, made it portable or wrote evidence for it, and an

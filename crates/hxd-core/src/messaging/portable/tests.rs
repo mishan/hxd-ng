@@ -2996,3 +2996,81 @@ fn an_orphan_is_dated_by_its_taking_under_every_key_of_the_chain() {
         "still held by the taking under Alice's key"
     );
 }
+
+#[test]
+fn a_pass_whose_ends_meet_the_generations_forgotten_records_nothing() {
+    let (alice, bob, carol) = (person(1), person(2), person(3));
+    let s = linked(&[
+        ("alice", &fp(&alice)),
+        ("bob", &fp(&bob)),
+        ("carol", &fp(&carol)),
+    ]);
+    let t = now();
+    for (other, at) in [(&bob, t - 300), (&carol, t - 250)] {
+        let f = accept(&offer(&alice, 0, other, at), other, 0, at);
+        for (presenter, to) in [(&alice, other), (other, &alice)] {
+            let taken = super::unix_time(t);
+            s.rel
+                .present(&Presentation {
+                    presenter: fp(presenter),
+                    other: fp(to),
+                    names: [fp(presenter), fp(to)],
+                    pair: pair_of(presenter, to),
+                    hash: hash(&f),
+                    friendship: Some(f.clone()),
+                    device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                    edge: None,
+                    at: taken,
+                    taken,
+                })
+                .unwrap();
+        }
+    }
+    // The first pair's end leaves the generations one short of their
+    // bound, and the second's passes it.
+    let filler = (0..super::GENERATIONS as u32 - 2).map(|i| {
+        let mut k = [0xee; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k
+    });
+    s.core.unjudge(filler);
+    reset(&s, &alice, 1, t - 100);
+    for other in [&bob, &carol] {
+        assert!(s
+            .rel
+            .presentation(&fp(&alice), &fp(other))
+            .unwrap()
+            .is_none());
+    }
+    assert!(!s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+}
+
+#[test]
+fn a_pass_that_fails_keeps_one_under_way_from_recording() {
+    let alice = person(1);
+    let s = linked(&[("alice", &fp(&alice))]);
+    keep(&s, &alice, 1, now());
+    let parked = s.core.reconciling.arm("ended");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.fail.fail_next("presentations");
+    s.core.judge_floors([fp(&alice)]);
+    assert_eq!(s.fail.failed(), Some("presentations"));
+    parked.release();
+    pass.join().unwrap();
+    assert!(!s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+}
