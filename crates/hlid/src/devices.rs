@@ -35,6 +35,10 @@ const TRIES: usize = 3;
 /// a catch-up long before this; the bound is for one that never says so.
 const POSTS_MAX: usize = 64;
 
+/// How far ahead of this clock a registrar's last reset may be dated and
+/// still be signed after: a later one would date this reset ahead with it.
+const AHEAD: u64 = 300;
+
 /// Times the lists are read in one run: a re-read follows an answer
 /// above what was posted, and another holder resetting each time is
 /// given up on rather than chased.
@@ -526,7 +530,7 @@ enum Step {
 /// Bring a registrar whose current record is `cur` to `target`, `cur +
 /// 16` at a time, each post signed afresh at the later of now and the
 /// registrar's current record's `time`, its hash kept in `posted` before
-/// it is sent.
+/// it is sent; none past a record dated more than [`AHEAD`] ahead.
 fn drive(
     base: &str,
     target: u64,
@@ -537,8 +541,14 @@ fn drive(
 ) -> R<Step> {
     let mut lost = 0;
     for _ in 0..POSTS_MAX {
+        let now = now();
+        if cur.time > now.saturating_add(AHEAD) {
+            return Ok(Step::NotDone(
+                "its last reset is dated ahead of this clock".into(),
+            ));
+        }
         let epoch = target.min(cur.epoch.saturating_add(STEP_MAX));
-        let time = now().max(cur.time);
+        let time = now.max(cur.time);
         let bytes = DeviceEpoch {
             identity: id.public(),
             epoch,
@@ -1249,7 +1259,7 @@ mod tests {
 
     #[test]
     fn a_registrar_far_behind_is_caught_up_sixteen_at_a_time_and_dated_after_its_last() {
-        let later = now() + 1_000;
+        let later = now() + 100;
         let mut behind = Sim::named("a");
         behind.land(&signed(3, later)).unwrap();
         let mut ahead = Sim::named("b");
@@ -1259,6 +1269,24 @@ mod tests {
         assert_eq!(behind.epochs(), vec![3, 19, 35, 40]);
         assert_eq!(ahead.epochs(), vec![39, 40]);
         assert_eq!(kept, 40);
+    }
+
+    #[test]
+    fn a_registrar_whose_last_reset_is_dated_ahead_is_not_signed_after() {
+        for (ahead, signed_after) in [(AHEAD, true), (AHEAD + 600, false)] {
+            let mut dated = Sim::named("a");
+            dated.land(&signed(3, now() + ahead)).unwrap();
+            let mut other = Sim::named("b");
+            let report = reset(0, &mut [&mut dated, &mut other]).0.unwrap();
+            assert_eq!(report.target, 4, "{ahead}");
+            assert_eq!(
+                report.done.contains(&"r0".to_string()),
+                signed_after,
+                "{ahead}"
+            );
+            let epochs = if signed_after { vec![3, 4] } else { vec![3] };
+            assert_eq!(dated.epochs(), epochs, "{ahead}");
+        }
     }
 
     #[test]
