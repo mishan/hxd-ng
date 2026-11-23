@@ -504,14 +504,23 @@ fn hold(
 fn keep_withdrawal(tx: &Connection, w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError> {
     let owner = fp_hex(&w.owner);
     let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+    // A replacement is a new row, so that it is the owner's newest, as
+    // the cap reads them; one whose cutoff is older is refused by the key.
     sql(tx.execute(
-        "INSERT INTO friend_withdrawal
+        "DELETE FROM friend_withdrawal
+          WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND own = ?4 AND before <= ?5",
+        params![
+            owner,
+            w.pair.as_slice(),
+            w.party.as_slice(),
+            w.withdrawal.is_none(),
+            w.before as i64,
+        ],
+    ))?;
+    sql(tx.execute(
+        "INSERT OR IGNORE INTO friend_withdrawal
                 (owner, pair, party, before, withdrawal, own, checked, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT (owner, pair, party, own) DO UPDATE SET
-           before = excluded.before, withdrawal = excluded.withdrawal,
-           checked = excluded.checked, at = excluded.at
-         WHERE excluded.before >= friend_withdrawal.before",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             owner,
             w.pair.as_slice(),

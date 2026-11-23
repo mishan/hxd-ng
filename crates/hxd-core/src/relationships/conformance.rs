@@ -176,6 +176,16 @@ fn a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(s: &dyn Relationsh
     s.drop_withdrawal(&fp(3), &[4; 32], &fp(4), &[4, 5])
         .unwrap();
     assert!(befores(4).is_empty(), "{case}: unchecked, dropped");
+
+    s.keep_withdrawal(&withdrawal(5, 7, 5, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 8, 5, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 7, 6, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 8, 4, true, 1), 3).unwrap();
+    assert_eq!(
+        pairs(5),
+        [8, 7],
+        "{case}: a replacement kept as the newest, a refused one not"
+    );
 }
 
 fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
