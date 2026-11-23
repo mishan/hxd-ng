@@ -2423,13 +2423,18 @@ fn presenting_again_judges_the_other_partys_copy_that_does_not_check() {
     let mut theirs = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
     theirs.friendship = Some(b"not a friendship".to_vec());
     s.rel.present(&theirs).unwrap();
-    let (_, again) = s.core.friendships_present(a, vec![], vec![f]).unwrap();
+    let (_, again) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
     assert!(ok_all(&again));
     assert!(s
         .rel
         .presentation(&fp(&bob), &fp(&alice))
         .unwrap()
         .is_none());
+    let mine = s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap();
+    assert_eq!(mine.and_then(|p| p.friendship), Some(f), "Alice's stays");
     assert_eq!(
         told(&mut rb),
         [("alice".into(), RosterState::Removed, vec![], None)],
