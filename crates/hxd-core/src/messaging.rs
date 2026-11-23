@@ -54,7 +54,7 @@ mod tests;
 
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
-pub(crate) use portable::Epochs;
+pub(crate) use portable::{Epochs, KeptFloors};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
@@ -745,7 +745,7 @@ impl Core {
         Ok(them)
     }
 
-    fn friend_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn friend_writes(&self) -> std::sync::MutexGuard<'_, ()> {
         self.friend_writes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1306,8 +1306,8 @@ impl Core {
                 .map_err(store_failed)?;
             end.friendship = true;
             end.hold = Some(now + p.request_retention);
-            let ended = store
-                .end_friendship(&me.mailbox, &them, &end)
+            let ended = self
+                .end_friendship(store, &me.mailbox, &them, &end)
                 .map_err(store_failed)?;
             if let Some(e) = ended.ended {
                 let withdraw = taken
@@ -1528,7 +1528,7 @@ impl Core {
             // one is never in 800 or 801 (§4.6).
             end.block = Some(at);
             end.friendship = true;
-            let unfriended = store.end_friendship(blocker, blocked, &end)?.ended;
+            let unfriended = self.end_friendship(store, blocker, blocked, &end)?.ended;
             if let Some(e) = &unfriended {
                 let [a, b] = &e.parties;
                 self.roster.lock().unwrap().friends_changed(a, b, false);
@@ -1607,7 +1607,7 @@ impl Core {
                     ..here
                 });
                 fix(ending
-                    .and_then(|end| store.end_friendship(x, y, &end))
+                    .and_then(|end| self.end_friendship(store, x, y, &end))
                     .map(|ended| {
                         if let Some(e) = ended.ended {
                             let [a, b] = &e.parties;

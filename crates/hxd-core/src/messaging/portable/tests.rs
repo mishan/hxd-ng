@@ -2441,3 +2441,199 @@ fn presenting_again_judges_the_other_partys_copy_that_does_not_check() {
         "an edge stands on no copy that does not check"
     );
 }
+
+fn pair_of(a: &Person, b: &Person) -> [u8; 32] {
+    Pair::new(Fingerprint(fp(a)), Fingerprint(fp(b))).hash()
+}
+
+#[test]
+fn a_withdrawal_a_reset_device_signed_shadows_no_earlier_one_that_stands() {
+    // Kept unchecked, where nothing here names the pair, and applied,
+    // where a presentation does.
+    for named in [false, true] {
+        let (mut alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let renewed = enroll(&mut alice, 1);
+        let f = accept(
+            &offer(&alice, renewed, &bob, now() - 60),
+            &bob,
+            0,
+            now() - 60,
+        );
+        // A stolen device's, cutting later than the owner's will.
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        let stolen = withdraw(&alice, 0, &bob, now() - 10);
+        let (taken, _) = s.core.friendships_present(a, vec![stolen], vec![]).unwrap();
+        assert!(ok_all(&taken));
+        reset(&s, &alice, 1, now());
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        if named {
+            let g = accept(&offer(&alice, renewed, &bob, now() - 5), &bob, 0, now() - 5);
+            let (_, presented) = s.core.friendships_present(b, vec![], vec![g]).unwrap();
+            assert!(ok_all(&presented));
+        }
+        let (a2, _) = device(&s.core, "alice", &alice, renewed);
+        let w = withdraw(&alice, renewed, &bob, now() - 30);
+        let (taken, _) = s
+            .core
+            .friendships_present(a2, vec![w.clone()], vec![])
+            .unwrap();
+        assert!(ok_all(&taken));
+        let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+        assert_eq!(
+            refused[0].outcome,
+            Presented::Withdrawn(Some(w)),
+            "named {named}"
+        );
+    }
+}
+
+#[test]
+fn past_its_cap_an_owner_loses_a_withdrawal_that_no_longer_stands_first() {
+    let (mut alice, carol, dave, erin) = (person(1), person(3), person(4), person(5));
+    let cap = MessagingPolicy {
+        max_roster: 2,
+        ..policy()
+    };
+    let s = linked_with(cap, &[("alice", &fp(&alice))]);
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let keep = |uid, dev, other: &Person| {
+        let w = withdraw(&alice, dev, other, now());
+        let (taken, _) = s.core.friendships_present(uid, vec![w], vec![]).unwrap();
+        assert!(ok_all(&taken));
+    };
+    keep(a2, renewed, &carol);
+    keep(a, 0, &dave);
+    reset(&s, &alice, 1, now());
+    keep(a2, renewed, &erin);
+    let held = |other: &Person| s.rel.withdrawals(&pair_of(&alice, other)).unwrap().len();
+    assert_eq!(
+        [held(&carol), held(&dave), held(&erin)],
+        [1, 0, 1],
+        "the reset device's goes, not the oldest"
+    );
+}
+
+#[test]
+fn a_rotation_keeps_the_successors_withdrawal_over_one_that_no_longer_stands() {
+    // Where the records cannot be read, the rotation fails rather than
+    // merge by cutoff alone, and a retry merges.
+    for unreadable in [false, true] {
+        let (alice, bob, successor) = (person(1), person(2), person(4));
+        let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+            (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+            (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+        ])));
+        let mut s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+        let cache = Arc::new(Flaky::default());
+        Arc::get_mut(&mut s.core).unwrap().record_cache = Some(cache.clone());
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        let dead = withdraw(&alice, 0, &bob, now() - 10);
+        let (taken, _) = s.core.friendships_present(a, vec![dead], vec![]).unwrap();
+        assert!(ok_all(&taken));
+        reset(&s, &alice, 1, now());
+
+        let record = Rotation {
+            identity: alice.id.public(),
+            successor: successor.id.public(),
+            time: now(),
+            next: None,
+        }
+        .sign(&alice.id, &successor.id)
+        .unwrap();
+        s.core.keep_rotation_record(&record);
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+        let (key, cert) = &successor.devices[0];
+        let theirs = Withdrawal {
+            from: successor.id.public(),
+            pair: pair_of(&alice, &bob),
+            party: Some(Fingerprint(fp(&alice))),
+            before: now() - 30,
+            time: now(),
+            cert: cert.clone(),
+        }
+        .sign(key)
+        .unwrap();
+        let (t, _) = device(&s.core, "alice", &successor, 0);
+        let (taken, _) = s
+            .core
+            .friendships_present(t, vec![theirs.clone()], vec![])
+            .unwrap();
+        assert!(ok_all(&taken));
+
+        let held = || -> Vec<_> {
+            s.rel
+                .withdrawals(&pair_of(&alice, &bob))
+                .unwrap()
+                .into_iter()
+                .map(|w| w.withdrawal)
+                .collect()
+        };
+        if unreadable {
+            cache.fail.store(true, Ordering::Relaxed);
+            assert!(s
+                .core
+                .rotate_identity(&fp(&alice), &fp(&successor))
+                .is_err());
+            assert!(held().contains(&Some(theirs.clone())), "nothing merged");
+            cache.fail.store(false, Ordering::Relaxed);
+        }
+        s.core
+            .rotate_identity(&fp(&alice), &fp(&successor))
+            .unwrap();
+        assert_eq!(held(), [Some(theirs)], "unreadable {unreadable}");
+    }
+}
+
+#[test]
+fn an_owner_past_its_cap_is_judged_whole_again_only_once_a_floor_rises() {
+    let mut alice = person(1);
+    let others: Vec<Person> = (3..8).map(person).collect();
+    let cap = MessagingPolicy {
+        max_roster: 2,
+        ..policy()
+    };
+    let s = linked_with(cap, &[("alice", &fp(&alice))]);
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, renewed);
+    let withdraw_from = |other: &Person| {
+        let w = withdraw(&alice, renewed, other, now());
+        let (taken, _) = s.core.friendships_present(a, vec![w], vec![]).unwrap();
+        assert!(ok_all(&taken));
+    };
+    let scans = || s.core.withdrawal_scans.load(Ordering::Relaxed);
+    for other in &others[..4] {
+        withdraw_from(other);
+    }
+    assert_eq!(scans(), 1, "judged once past the cap");
+    keep(&s, &alice, 1, now());
+    withdraw_from(&others[4]);
+    assert_eq!(scans(), 2, "and again once a kept floor rose");
+}
+
+#[test]
+fn a_withdrawal_below_a_floor_installed_alone_is_kept_past_the_cap() {
+    // That floor can fall, and a withdrawal dropped cannot come back.
+    let (mut alice, carol, dave, erin) = (person(1), person(3), person(4), person(5));
+    let cap = MessagingPolicy {
+        max_roster: 2,
+        ..policy()
+    };
+    let s = linked_with(cap, &[("alice", &fp(&alice))]);
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let keep = |uid, dev, other: &Person| {
+        let w = withdraw(&alice, dev, other, now());
+        let (taken, _) = s.core.friendships_present(uid, vec![w], vec![]).unwrap();
+        assert!(ok_all(&taken));
+    };
+    keep(a2, renewed, &carol);
+    keep(a, 0, &dave);
+    install(&s, &alice, 1);
+    keep(a2, renewed, &erin);
+    let held = |other: &Person| s.rel.withdrawals(&pair_of(&alice, other)).unwrap().len();
+    assert_eq!([held(&carol), held(&dave), held(&erin)], [0, 1, 1]);
+}

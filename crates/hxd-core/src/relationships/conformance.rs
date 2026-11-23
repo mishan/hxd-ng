@@ -159,10 +159,33 @@ fn a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(s: &dyn Relationsh
         ..withdrawal(3, 4, 5, true, 6)
     };
     s.keep_withdrawal(&unchecked, 3).unwrap();
-    s.drop_withdrawal(&fp(1), &[8; 32], &fp(1)).unwrap();
-    assert_eq!(befores(8), [5], "{case}: only an unchecked one is dropped");
-    s.drop_withdrawal(&fp(3), &[4; 32], &fp(4)).unwrap();
+    let pairs = |owner: u8| -> Vec<u8> {
+        s.withdrawals_by(&fp(owner))
+            .unwrap()
+            .iter()
+            .map(|w| w.pair[0])
+            .collect()
+    };
+    assert_eq!(pairs(1), [8, 7, 6], "{case}: an owner's, in the order kept");
+    s.drop_withdrawal(&fp(4), &[3; 32], &fp(4), &[3, 9])
+        .unwrap();
+    assert_eq!(befores(3), [10, 20], "{case}: other bytes drop nothing");
+    s.drop_withdrawal(&fp(4), &[3; 32], &fp(4), &[3, 10])
+        .unwrap();
+    assert_eq!(befores(3), [20], "{case}: checked, dropped by its bytes");
+    s.drop_withdrawal(&fp(3), &[4; 32], &fp(4), &[4, 5])
+        .unwrap();
     assert!(befores(4).is_empty(), "{case}: unchecked, dropped");
+
+    s.keep_withdrawal(&withdrawal(5, 7, 5, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 8, 5, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 7, 6, true, 1), 3).unwrap();
+    s.keep_withdrawal(&withdrawal(5, 8, 4, true, 1), 3).unwrap();
+    assert_eq!(
+        pairs(5),
+        [8, 7],
+        "{case}: a replacement kept as the newest, a refused one not"
+    );
 }
 
 fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {

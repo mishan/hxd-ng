@@ -2177,6 +2177,10 @@ pub struct Core {
     /// judged by (`Core::judge_floors`). Taken last, and held for no
     /// other lock.
     pub(crate) floors_judged: Mutex<HashMap<[u8; 32], crate::messaging::Epochs>>,
+    /// The kept floor of each signer of an owner's withdrawals when they
+    /// were last judged whole (`Core::make_room`). Taken last, and held
+    /// for no other lock.
+    pub(crate) withdrawals_judged: Mutex<HashMap<[u8; 32], crate::messaging::KeptFloors>>,
     /// Where push notifications go, or `None` — which is the no-op, and
     /// the default. See [`crate::notify`].
     pub(crate) gateway: Option<Arc<dyn crate::notify::NotificationGateway>>,
@@ -2260,6 +2264,10 @@ pub struct Core {
     /// go, so a kick that does not wait cannot pass for one that does.
     #[cfg(test)]
     pub(crate) waiting_out: std::sync::atomic::AtomicUsize,
+    /// How many times an owner's every withdrawal was judged
+    /// (`Core::make_room`), for the domain's tests of its memo.
+    #[cfg(test)]
+    pub(crate) withdrawal_scans: std::sync::atomic::AtomicUsize,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

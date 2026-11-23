@@ -954,16 +954,30 @@ impl RelationshipStore for MemoryRelationships {
             .collect())
     }
 
+    fn withdrawals_by(&self, owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .withdrawals
+            .iter()
+            .filter(|w| w.owner == *owner)
+            .cloned()
+            .collect())
+    }
+
     fn drop_withdrawal(
         &self,
         owner: &[u8; 32],
         pair: &[u8; 32],
         party: &[u8; 32],
+        withdrawal: &[u8],
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .withdrawals
-            .retain(|w| !(w.owner == *owner && w.pair == *pair && w.party == *party && !w.checked));
+        inner.withdrawals.retain(|w| {
+            !(w.owner == *owner
+                && w.pair == *pair
+                && w.party == *party
+                && w.withdrawal.as_deref() == Some(withdrawal))
+        });
         Ok(())
     }
 

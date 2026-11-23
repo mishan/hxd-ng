@@ -12,7 +12,11 @@
 //! - a request hold exists exactly where a removal or a withdrawal that
 //!   ended both sides' evidence placed one;
 //! - an edge is made active only over evidence held at the floors, and an
-//!   accepted friendship takes the id a dropped presentation kept.
+//!   accepted friendship takes the id a dropped presentation kept;
+//! - a withdrawal kept stands at the floors, and one taken stays held, or
+//!   one of its key cutting as far, that its signer's kept floor has not
+//!   passed, until that floor rises: one that no longer stands never
+//!   costs one that does.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -25,7 +29,7 @@ use hl_identity::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{Key, RosterState};
+use super::{Key, Presented, RosterState};
 use crate::access::bit;
 use crate::identity_records::{KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, MemoryStore};
@@ -98,13 +102,13 @@ impl Person {
         Friendship::encode(offer, &acceptance)
     }
 
-    fn withdraw(&self, d: usize, other: &Person, time: u64) -> Vec<u8> {
+    fn withdraw(&self, d: usize, other: &Person, before: u64, time: u64) -> Vec<u8> {
         let (key, cert) = &self.devices[d];
         Withdrawal {
             from: self.id.public(),
             pair: Pair::new(Fingerprint(self.fp()), Fingerprint(other.fp())).hash(),
             party: None,
-            before: time,
+            before,
             time,
             cert: cert.clone(),
         }
@@ -165,15 +169,20 @@ enum Step {
     Present {
         k: usize,
     },
-    /// Remove Friend (803), plain or with a withdrawal.
+    /// Remove Friend (803), plain or with a withdrawal. Each withdrawal
+    /// cuts at its time, or `early`, before the friendships made in the
+    /// run.
     Remove {
         withdraw: bool,
+        early: bool,
     },
     /// Block User (806)'s withdrawal, which blocks with it.
     BlockWithdrawal,
     Block,
     Unblock,
-    PresentWithdrawal,
+    PresentWithdrawal {
+        early: bool,
+    },
     /// Unlink the identity and link it again.
     Link,
     RemoveByKey,
@@ -214,11 +223,14 @@ impl Step {
             10..=15 => Step::Present { k: arg as usize },
             16 | 17 => Step::Remove {
                 withdraw: arg & 1 == 1,
+                early: arg & 2 == 2,
             },
             18 => Step::BlockWithdrawal,
             19 => Step::Block,
             20 | 21 => Step::Unblock,
-            22 | 23 => Step::PresentWithdrawal,
+            22 | 23 => Step::PresentWithdrawal {
+                early: arg & 1 == 1,
+            },
             24 => Step::Link,
             25 => Step::RemoveByKey,
             26 => Step::Messaging,
@@ -288,6 +300,11 @@ struct Run {
     revoked: HashSet<[u8; 32]>,
     /// Ids that were active with evidence both ways.
     portable: HashSet<RelationId>,
+    /// The withdrawals answered as taken, with their signer, while one
+    /// that stands holds as far.
+    withdrawn: Vec<(usize, Vec<u8>)>,
+    /// The withdrawal a removal or a block carried this step.
+    carried: Option<(usize, Vec<u8>)>,
     /// The holds this run expects, alice's first.
     holds: [bool; 2],
 }
@@ -368,6 +385,8 @@ impl Run {
             offers: [None, None],
             revoked: HashSet::new(),
             portable: HashSet::new(),
+            withdrawn: Vec::new(),
+            carried: None,
             holds: [false, false],
         }
     }
@@ -477,6 +496,8 @@ impl Run {
         let (uid, other) = (self.sessions[p][d].0, LOGINS[1 - p]);
         let (me, them) = (&self.people[p], &self.people[1 - p]);
         let now = core.clock.unix();
+        let base = self.base;
+        let cut = |early: bool| if early { base - 30 } else { now };
         match step {
             Step::Ask { offer } => {
                 let o = offer.then(|| me.offer(d, them, now));
@@ -500,18 +521,29 @@ impl Run {
                 let f = self.friendships[k % self.friendships.len()].clone();
                 core.friendships_present(uid, vec![], vec![f]).is_ok()
             }
-            Step::Remove { withdraw } => {
-                let w = withdraw.then(|| me.withdraw(d, them, now));
+            Step::Remove { withdraw, early } => {
+                let w = withdraw.then(|| me.withdraw(d, them, cut(early), now));
+                self.carried = w.clone().map(|w| (p, w));
                 core.friend_unfriend(uid, other, w).is_ok()
             }
-            Step::BlockWithdrawal => core
-                .block_withdrawing(uid, other, me.withdraw(d, them, now))
-                .is_ok(),
+            Step::BlockWithdrawal => {
+                let w = me.withdraw(d, them, now, now);
+                self.carried = Some((p, w.clone()));
+                core.block_withdrawing(uid, other, w).is_ok()
+            }
             Step::Block => core.inbox_block(uid, other, true).is_ok(),
             Step::Unblock => core.inbox_block(uid, other, false).is_ok(),
-            Step::PresentWithdrawal => core
-                .friendships_present(uid, vec![me.withdraw(d, them, now)], vec![])
-                .is_ok(),
+            Step::PresentWithdrawal { early } => {
+                let w = me.withdraw(d, them, cut(early), now);
+                let taken = core.friendships_present(uid, vec![w.clone()], vec![]);
+                if taken
+                    .as_ref()
+                    .is_ok_and(|(t, _)| t[0].outcome == Presented::Ok)
+                {
+                    self.withdrawn.push((p, w));
+                }
+                taken.is_ok()
+            }
             Step::Link => {
                 // Linked again at once, so no row is ever keyed by the
                 // bare login, which a link would have to claim.
@@ -595,6 +627,11 @@ impl Run {
         self.told();
         let (step, p, d, failure) = Step::of(n);
         let before = self.pairing();
+        let signed_before = self.signed();
+        // Whether a removal or a block would name the other party: one
+        // that blocked it, or takes no part, is answered as no account.
+        let (me, them) = (self.mailbox(p), self.mailbox(1 - p));
+        let named = self.takes_part(1 - p) && !self.store.is_blocked(&them, &me).unwrap();
         match failure {
             Failure::None => {}
             Failure::Call(k) => self.fail.fail_nth(k),
@@ -607,7 +644,8 @@ impl Run {
         let told = self.told();
         // A failed read can cost an ending its tell, never a tell its
         // ending.
-        let read_failed = self.fail.failed().is_some_and(|m| READS.contains(&m));
+        let failed = self.fail.failed();
+        let read_failed = failed.is_some_and(|m| READS.contains(&m));
         let what = format!("{step:?} by {} on device {d}, {failure:?}", LOGINS[p]);
 
         // An edge made active by presentations keeps its evidence both
@@ -639,7 +677,7 @@ impl Run {
             Step::Remove { .. }
                 | Step::BlockWithdrawal
                 | Step::Block
-                | Step::PresentWithdrawal
+                | Step::PresentWithdrawal { .. }
                 | Step::RemoveByKey
                 | Step::Present { .. }
         ) || (matches!(step, Step::Link | Step::Revoke | Step::Floor { .. })
@@ -722,7 +760,7 @@ impl Run {
             step,
             Step::Remove { .. }
                 | Step::BlockWithdrawal
-                | Step::PresentWithdrawal
+                | Step::PresentWithdrawal { .. }
                 | Step::RemoveByKey
         );
         let left = (0..2).any(|q| before.evidence[q] && after.evidence[q]);
@@ -740,6 +778,86 @@ impl Run {
             after.held, self.holds,
             "{what}: holds, {before:?} -> {after:?}"
         );
+
+        // A withdrawal kept stands, and one that stands by its signer's
+        // kept floor is never lost to one that does not.
+        let signed = self.signed();
+        for (q, epoch, ..) in signed.iter().filter(|w| !signed_before.contains(w)) {
+            let floor = self.floors.get(&self.people[*q].fp()).copied();
+            assert!(
+                *epoch >= floor.unwrap_or(0).max(self.kept_floor(*q)),
+                "{what}: kept {}'s withdrawal below the floor",
+                LOGINS[*q]
+            );
+        }
+        // One a removal of a friend or a block took, whatever it ended.
+        let took = match step {
+            Step::Remove { .. } => before.friendship.is_some(),
+            _ => named,
+        };
+        if let Some(w) = self.carried.take() {
+            if ok && took && failed.is_none() {
+                self.withdrawn.push(w);
+            }
+        }
+        let mut withdrawn = std::mem::take(&mut self.withdrawn);
+        let covered = |rows: &[(usize, u64, u64, Vec<u8>)], (q, w): &(usize, Vec<u8>)| {
+            let (_, epoch, cutoff, _) = self.signed_of(*q, w);
+            let kept = self.kept_floor(*q);
+            epoch >= kept
+                && rows
+                    .iter()
+                    .any(|(r, e, b, _)| r == q && *e >= kept && *b >= cutoff)
+        };
+        // A floor rising forgives only what no row it left standing held.
+        if matches!(step, Step::Floor { how } if how != 0) {
+            withdrawn.retain(|w| covered(&signed, w) || covered(&signed_before, w));
+        }
+        for w in &withdrawn {
+            assert!(
+                covered(&signed, w),
+                "{what}: {}'s withdrawal lost: {signed:?}",
+                LOGINS[w.0]
+            );
+        }
+        self.withdrawn = withdrawn;
+    }
+
+    /// The floor `q`'s kept records show.
+    fn kept_floor(&self, q: usize) -> u64 {
+        self.resets[q].iter().map(|(e, _)| *e).max().unwrap_or(0)
+    }
+
+    /// A signed withdrawal by `q`, as `(q, its certificate's epoch, its
+    /// cutoff, its bytes)`.
+    fn signed_of(&self, q: usize, bytes: &[u8]) -> (usize, u64, u64, Vec<u8>) {
+        let k = Withdrawal::parse(bytes, u64::MAX, |_| 0).expect("a withdrawal kept");
+        let w = k.withdrawal();
+        assert_eq!(w.from, self.people[q].id.public(), "signed by its owner");
+        let epoch = DeviceCert::parse(&w.cert).expect("a certificate").epoch;
+        (q, epoch, w.before, bytes.to_vec())
+    }
+
+    /// The signed withdrawals held for the pair, each party's own.
+    fn signed(&self) -> Vec<(usize, u64, u64, Vec<u8>)> {
+        let pair = Pair::new(
+            Fingerprint(self.people[0].fp()),
+            Fingerprint(self.people[1].fp()),
+        );
+        let mut out = Vec::new();
+        for w in self.store.withdrawals(&pair.hash()).unwrap() {
+            let Some(bytes) = w.withdrawal else {
+                continue;
+            };
+            let q = (0..2)
+                .find(|&q| self.people[q].fp() == w.owner)
+                .expect("one of the pair's");
+            assert_eq!(w.party, w.owner, "its signer's own cutoff");
+            // By the cutoff the row keeps, which is what it ends.
+            let (q, epoch, _, bytes) = self.signed_of(q, &bytes);
+            out.push((q, epoch, w.before, bytes));
+        }
+        out
     }
 }
 
@@ -793,8 +911,9 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
 /// Sequences run on every store: ones a property test once found
 /// failing, and ones that reach what it rarely draws: an edge made active
 /// beside a presentation no record shows held, a friendship accepted
-/// where a dropped presentation kept the id, and an upgrade offer a reset
-/// device signed, accepted.
+/// where a dropped presentation kept the id, an upgrade offer a reset
+/// device signed, accepted, a withdrawal cutting earlier than one a
+/// reset device signed, and one below a floor installed alone.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741852, 1073741989],
     &[1073741979, 1073741980, 1073742026],
@@ -803,6 +922,8 @@ pub const FOUND: &[&[u32]] = &[
     &[
         3598185087, 4667, 535997, 1755425304, 1160182336, 1648425276, 1769223613,
     ],
+    &[1088533014, 3701201436, 2985964758],
+    &[2586569270, 334638460, 3275716080],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the

@@ -796,13 +796,18 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// The withdrawals held for a pair hash.
     fn withdrawals(&self, pair: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
 
-    /// Drop an unchecked withdrawal that failed its check against the
-    /// pair it names.
+    /// The withdrawals counted toward `owner`, in the order kept.
+    fn withdrawals_by(&self, owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
+
+    /// Drop `owner`'s signed withdrawal for `pair` and `party` where it is
+    /// still `withdrawal`, checked or not: one that failed its check
+    /// against the pair it names, or that will never stand again.
     fn drop_withdrawal(
         &self,
         owner: &[u8; 32],
         pair: &[u8; 32],
         party: &[u8; 32],
+        withdrawal: &[u8],
     ) -> Result<(), StoreError>;
 
     /// Set or clear `owner`'s offer to `other`.

@@ -342,6 +342,11 @@ as AGENTS.md's "Releasing" describes it.
   `BadSignature`. A stored friendship that no longer checks is not held,
   so judging it again drops it and ends the edge it kept active, logged
   as an error.
+- A withdrawal signed by a device since reset, as a record kept here
+  shows, no longer stops a later one that stands being kept: one with an
+  earlier cutoff, past an account's cap of them, or meeting it in a
+  rotation's merge. Such a withdrawal is dropped first instead
+  (docs/proposals/portable-friends.md §4.3).
 - A client that may use any name logging in, agreeing or changing its
   info with an empty name, or one a classic client reads as empty (a
   leading NUL, or nothing but control characters), and shown with none:

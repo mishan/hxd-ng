@@ -520,7 +520,10 @@ pair of which it holds nothing cannot be checked whole (the objects,
 §4), and is kept unapplied until a friendship for that pair is
 presented, against which it is then checked. At
 most `MaxRosterSize` of an account's are kept, its oldest dropped
-first, the server's own (below) last. An evicted withdrawal no longer
+first, the server's own (below) last, but for one signed below its
+signer's floor as the records kept here show it (§6), which never
+stands again and goes before any, as it does before one that stands is
+kept or merged by a rotation (§10). An evicted withdrawal no longer
 stops another device bringing back what it ended, which is why the
 bound is generous.
 

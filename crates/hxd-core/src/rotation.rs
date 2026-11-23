@@ -31,7 +31,14 @@ impl Core {
             self.pm_announce(&lost);
         }
         if let Some(store) = self.relationships.as_ref() {
-            let rekeyed = store.rotate(from, to)?;
+            // Held through the merge, which keeps the later cutoff of two
+            // for one key whichever stands, so that no keep lands between
+            // the judging and the merge.
+            let rekeyed = {
+                let _writing = self.friend_writes();
+                self.drop_dead_withdrawals(&[*from, *to])?;
+                store.rotate(from, to)?
+            };
             if let Err(e) = self.restamp(&rekeyed.merged) {
                 tracing::warn!("inbox: re-stamping a rotation's merged friendships: {e}");
             }
