@@ -475,6 +475,44 @@ impl Inner {
         })
     }
 
+    fn befriend(&mut self, a: &Mailbox, b: &Mailbox, at: SystemTime) -> RelationId {
+        let of = |inner: &Inner, x: &Mailbox, y: &Mailbox| {
+            inner.find(x, y).and_then(|i| inner.rows[i].rel.friendship)
+        };
+        let (ab, ba) = (of(self, a, b), of(self, b, a));
+        if let (Some(x), Some(y)) = (ab, ba) {
+            if x == y {
+                return x;
+            }
+        }
+        let id = self.mint();
+        self.made.insert(id, floor(at));
+        let mut ended: Vec<RelationId> = ab.into_iter().chain(ba).collect();
+        for (x, y) in [(a, b), (b, a)] {
+            ended.extend(self.edit(x, y, |r| {
+                r.friendship = Some(id);
+                r.pending_out = None;
+                r.approval.take()
+            }));
+        }
+        self.forget(ended);
+        id
+    }
+
+    fn refriend(&mut self, a: &Mailbox, b: &Mailbox, id: RelationId, at: SystemTime) {
+        self.relations.insert(id);
+        self.made.entry(id).or_insert(floor(at));
+        let mut ended = Vec::new();
+        for (x, y) in [(a, b), (b, a)] {
+            ended.extend(self.edit(x, y, |r| {
+                let old = r.friendship.replace(id);
+                r.pending_out = None;
+                [old, r.approval.take()]
+            }));
+        }
+        self.forget(ended.into_iter().flatten().filter(|e| *e != id));
+    }
+
     fn unpresent_pair(
         &mut self,
         a: &[u8; 32],
@@ -742,28 +780,7 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn befriend(&self, a: &Mailbox, b: &Mailbox, at: SystemTime) -> Result<RelationId, StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        let of = |inner: &Inner, x: &Mailbox, y: &Mailbox| {
-            inner.find(x, y).and_then(|i| inner.rows[i].rel.friendship)
-        };
-        let (ab, ba) = (of(&inner, a, b), of(&inner, b, a));
-        if let (Some(x), Some(y)) = (ab, ba) {
-            if x == y {
-                return Ok(x);
-            }
-        }
-        let id = inner.mint();
-        inner.made.insert(id, floor(at));
-        let mut ended: Vec<RelationId> = ab.into_iter().chain(ba).collect();
-        for (x, y) in [(a, b), (b, a)] {
-            ended.extend(inner.edit(x, y, |r| {
-                r.friendship = Some(id);
-                r.pending_out = None;
-                r.approval.take()
-            }));
-        }
-        inner.forget(ended);
-        Ok(id)
+        Ok(self.inner.lock().unwrap().befriend(a, b, at))
     }
 
     fn unfriend(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<RelationId>, StoreError> {
@@ -818,19 +835,29 @@ impl RelationshipStore for MemoryRelationships {
         id: RelationId,
         at: SystemTime,
     ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.relations.insert(id);
-        inner.made.entry(id).or_insert(floor(at));
-        let mut ended = Vec::new();
-        for (x, y) in [(a, b), (b, a)] {
-            ended.extend(inner.edit(x, y, |r| {
-                let old = r.friendship.replace(id);
-                r.pending_out = None;
-                [old, r.approval.take()]
-            }));
-        }
-        inner.forget(ended.into_iter().flatten().filter(|e| *e != id));
+        self.inner.lock().unwrap().refriend(a, b, id, at);
         Ok(())
+    }
+
+    fn befriend_dropping(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        at: SystemTime,
+        id: Option<RelationId>,
+        drop: &[[u8; 32]],
+    ) -> Result<RelationId, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
+            inner.unpresent_pair(&x, &y, drop);
+        }
+        Ok(match id {
+            Some(id) => {
+                inner.refriend(a, b, id, at);
+                id
+            }
+            None => inner.befriend(a, b, at),
+        })
     }
 
     fn made_at(&self, id: RelationId) -> Result<Option<SystemTime>, StoreError> {

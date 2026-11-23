@@ -2064,3 +2064,380 @@ fn a_merges_block_ends_what_a_block_ends() {
     assert_eq!(again[0].outcome, Presented::Withdrawn(None));
     assert_eq!(friendship_of(&s, &alice, &bob), None, "not friends again");
 }
+
+/// How a reset of Alice's first devices reads against what was taken of
+/// a friendship before it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Taking {
+    Held,
+    Reset,
+    Unknown,
+}
+
+#[test]
+fn a_plain_befriend_drops_what_is_not_held_before_the_friendship_is_made() {
+    for crossing in [false, true] {
+        for taking in [Taking::Held, Taking::Reset, Taking::Unknown] {
+            let case = format!("{taking:?}, crossing {crossing}");
+            let (alice, bob) = (person(1), person(2));
+            let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+            let s1 = linked(&accounts);
+            let (_, _, _, _, f) = made(&s1, &alice, &bob);
+            let s = linked(&accounts);
+            let t = s.core.clock().unix();
+            let (a, _) = device(&s.core, "alice", &alice, 1);
+            let (_, presented) = s.core.friendships_present(a, vec![], vec![f]).unwrap();
+            assert!(ok_all(&presented), "{case}");
+            let (b, _) = device(&s.core, "bob", &bob, 1);
+            s.core
+                .set_presence(
+                    b,
+                    PresenceUpdate {
+                        takes_requests: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                s.core.friend_add(a, "bob", None),
+                Ok(RosterState::PendingOut),
+                "{case}"
+            );
+            s.core.clock().advance(std::time::Duration::from_secs(10));
+            // Kept, or installed, alone: nothing judges the presentation
+            // again until the grant does.
+            match taking {
+                Taking::Held => keep(&s, &alice, 1, t + 5),
+                Taking::Reset => keep(&s, &alice, 1, t - 5),
+                Taking::Unknown => install(&s, &alice, 1),
+            }
+            let answered = if crossing {
+                s.core.friend_add(b, "alice", None)
+            } else {
+                s.core.friend_respond(b, "alice", true)
+            };
+            assert_eq!(answered, Ok(RosterState::Accepted), "{case}");
+            assert!(friendship_of(&s, &alice, &bob).is_some(), "{case}");
+            assert_eq!(
+                s.rel
+                    .presentation(&fp(&alice), &fp(&bob))
+                    .unwrap()
+                    .is_some(),
+                taking == Taking::Held,
+                "{case}: only a held presentation stays beside the friendship"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_friendship_accepted_here_takes_the_id_a_dropped_presentation_kept() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    made(&s, &alice, &bob);
+    let id = friendship_of(&s, &alice, &bob).unwrap();
+    s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&bob.devices[0].0.public()).0].into(),
+        ..Default::default()
+    });
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let o = offer(&alice, 1, &bob, now());
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 1, now()))),
+        Ok(RosterState::Accepted)
+    );
+    assert_eq!(friendship_of(&s, &alice, &bob), Some(id));
+    assert!(s.rel.is_live(id), "what was queued on it is released");
+}
+
+#[test]
+fn a_stored_friendship_that_no_longer_checks_is_not_held() {
+    // Which presentations' copies of the friendship are corrupted, Alice's
+    // and Bob's.
+    for corrupted in [[true, true], [true, false], [false, true]] {
+        let case = format!("corrupted {corrupted:?}");
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let t = s.core.clock().unix();
+        let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
+        let pairs = [(fp(&alice), fp(&bob)), (fp(&bob), fp(&alice))];
+        for ((p, q), bad) in pairs.iter().zip(corrupted) {
+            if bad {
+                let mut pres = s.rel.presentation(p, q).unwrap().unwrap();
+                pres.friendship = Some(b"not a friendship".to_vec());
+                s.rel.present(&pres).unwrap();
+            }
+        }
+        // A reset after it was taken, which holds a copy that checks.
+        reset(&s, &alice, 1, t + 5);
+        assert_eq!(
+            told(&mut rb),
+            [("alice".into(), RosterState::Removed, vec![], None)],
+            "{case}"
+        );
+        for ((p, q), bad) in pairs.iter().zip(corrupted) {
+            assert_eq!(
+                s.rel.presentation(p, q).unwrap().is_some(),
+                !bad,
+                "{case}: a copy is dropped where it does not check, and only there"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_acceptance_whose_offer_a_reset_device_signed_changes_nothing() {
+    for upgrade in [false, true] {
+        let case = format!("upgrade {upgrade}");
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let (a, b) = if upgrade {
+            let (a, _, b, _, _) = made(&s, &alice, &bob);
+            (a, b)
+        } else {
+            (
+                device(&s.core, "alice", &alice, 0).0,
+                device(&s.core, "bob", &bob, 0).0,
+            )
+        };
+        let before = |p: &Person, q: &Person| s.rel.presentation(&fp(p), &fp(q)).unwrap();
+        let held = [before(&alice, &bob), before(&bob, &alice)];
+        let o = offer(&alice, 0, &bob, now());
+        let asked = s.core.friend_ask(a, "bob", None, Some(o.clone()));
+        assert!(asked.is_ok(), "{case}: {asked:?}");
+        // A record of a reset kept since, with no floor installed, so
+        // nothing has judged the offer.
+        keep(&s, &alice, 1, now() - 5);
+        let f = accept(&o, &bob, 0, now());
+        assert_eq!(
+            s.core.friend_answer(b, "alice", true, Some(f)),
+            Err(MessagingError::BadSignature),
+            "{case}"
+        );
+        assert_eq!(
+            [before(&alice, &bob), before(&bob, &alice)],
+            held,
+            "{case}: the presentations as they were"
+        );
+        assert_eq!(friendship_of(&s, &alice, &bob).is_some(), upgrade, "{case}");
+    }
+}
+
+#[test]
+fn a_local_edge_is_made_portable_over_held_evidence_alone() {
+    let (mut alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f1) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, by_bob) = s.core.friendships_present(b, vec![], vec![f1]).unwrap();
+    assert!(ok_all(&by_bob));
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    // Bob's presentation was held beside the local edge, and is no longer
+    // shown held.
+    install(&s, &alice, 1);
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_some());
+
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    let f2 = accept(
+        &offer(&alice, renewed, &bob, now() - 30),
+        &bob,
+        1,
+        now() - 30,
+    );
+    let (_, by_alice) = s.core.friendships_present(a2, vec![], vec![f2]).unwrap();
+    assert!(ok_all(&by_alice));
+    assert!(friendship_of(&s, &alice, &bob).is_some(), "still friends");
+    assert!(
+        s.rel
+            .presentation(&fp(&bob), &fp(&alice))
+            .unwrap()
+            .is_none(),
+        "not portable over Bob's"
+    );
+}
+
+#[test]
+fn a_friendship_by_request_takes_the_id_a_dropped_presentation_kept() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    made(&s, &alice, &bob);
+    let id = friendship_of(&s, &alice, &bob).unwrap();
+    s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&bob.devices[0].0.public()).0].into(),
+        ..Default::default()
+    });
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    assert_eq!(friendship_of(&s, &alice, &bob), Some(id));
+    assert!(s.rel.is_live(id), "what was queued on it is released");
+}
+
+#[test]
+fn a_friendship_is_dated_by_the_takings_of_its_own_bytes() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    let (_, by_alice) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&by_alice));
+    let mut corrupt = s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap().unwrap();
+    corrupt.friendship = Some(b"not a friendship".to_vec());
+    s.rel.present(&corrupt).unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, by_bob) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&by_bob));
+    assert_eq!(friendship_of(&s, &alice, &bob), None, "not over Alice's");
+
+    // Reset after Alice's copy was taken and before Bob's.
+    keep(&s, &alice, 1, t + 5);
+    assert_eq!(
+        s.core.friend_add(a, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(
+        s.core.friend_respond(b, "alice", true),
+        Ok(RosterState::Accepted)
+    );
+    assert!(friendship_of(&s, &alice, &bob).is_some());
+    for (who, p, q) in [
+        ("alice", fp(&alice), fp(&bob)),
+        ("bob", fp(&bob), fp(&alice)),
+    ] {
+        assert!(
+            s.rel.presentation(&p, &q).unwrap().is_none(),
+            "{who}'s not held: a copy that does not check dates nothing"
+        );
+    }
+}
+
+#[test]
+fn a_taking_is_carried_only_to_the_bytes_it_dated() {
+    for accepted in [false, true] {
+        let case = format!("accepted {accepted}");
+        let (alice, bob) = (person(1), person(2));
+        let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+        let s = linked(&accounts);
+        let t = s.core.clock().unix();
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let o = offer(&alice, 0, &bob, t);
+        let f = if accepted {
+            assert_eq!(
+                s.core.friend_ask(a, "bob", None, Some(o.clone())),
+                Ok(RosterState::PendingOut),
+                "{case}"
+            );
+            accept(&o, &bob, 0, t + 20)
+        } else {
+            let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
+            f
+        };
+        // A copy of its hash whose bytes do not check, taken at t.
+        let (p, q) = if accepted {
+            (fp(&bob), fp(&alice))
+        } else {
+            (fp(&alice), fp(&bob))
+        };
+        s.rel
+            .present(&Presentation {
+                presenter: p,
+                other: q,
+                names: [p, q],
+                pair: Pair::new(Fingerprint(p), Fingerprint(q)).hash(),
+                hash: hash(&f),
+                friendship: Some(b"not a friendship".to_vec()),
+                device: [0; 32],
+                edge: None,
+                at: super::unix_time(t),
+                taken: super::unix_time(t),
+            })
+            .unwrap();
+        s.core.clock().advance(std::time::Duration::from_secs(20));
+        if accepted {
+            assert_eq!(
+                s.core.friend_answer(b, "alice", true, Some(f)),
+                Ok(RosterState::Accepted),
+                "{case}"
+            );
+        } else {
+            let (_, again) = s.core.friendships_present(a, vec![], vec![f]).unwrap();
+            assert!(ok_all(&again), "{case}");
+        }
+        assert!(s.rel.presentation(&p, &q).unwrap().is_some(), "{case}");
+
+        // Reset after the copy that does not check was taken, and before
+        // the one that does.
+        reset(&s, &alice, 1, t + 10);
+        assert!(
+            s.rel.presentation(&p, &q).unwrap().is_none(),
+            "{case}: not held"
+        );
+    }
+}
+
+#[test]
+fn presenting_again_judges_the_other_partys_copy_that_does_not_check() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, _, mut rb, f) = made(&s, &alice, &bob);
+    let mut theirs = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    theirs.friendship = Some(b"not a friendship".to_vec());
+    s.rel.present(&theirs).unwrap();
+    let (_, again) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert!(ok_all(&again));
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_none());
+    let mine = s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap();
+    assert_eq!(mine.and_then(|p| p.friendship), Some(f), "Alice's stays");
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)],
+        "an edge stands on no copy that does not check"
+    );
+}

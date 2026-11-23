@@ -33,12 +33,12 @@ use hl_identity::{
     Withdrawal,
 };
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    EndedEdge, Ending, HeldWithdrawal, Presentation, RelationshipStore, StoredOffer,
+    EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore, StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -137,9 +137,21 @@ impl<'a> Floors<'a> {
         self.of(&Fingerprint::of(key).0).floor
     }
 
-    /// `f` against its halves' floors, for when this server first took
-    /// it, `taken`: held where each half below its floor was reset after.
-    fn judge(&self, f: &Friendship, taken: u64) -> Judged {
+    /// Whether the friendship `hash`, `bytes`, is held (§6): each half
+    /// below its floor reset after this server first took the friendship,
+    /// the earliest taking of a presentation in `stored` of these bytes, or
+    /// `now` for one not stored yet. What every grant and every judging of what is
+    /// stored asks. One stored that no longer checks is not held.
+    fn held(&self, hash: &[u8; 32], bytes: &[u8], stored: &[Presentation], now: u64) -> Judged {
+        let f = match Friendship::check(bytes, STORED, &[], zero_floor) {
+            Ok(f) => f,
+            Err(e) => {
+                let hash: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+                error!("relationships: the friendship {hash} held here does not check: {e}");
+                return Judged::Reset;
+            }
+        };
+        let taken = taken_of(stored, bytes).unwrap_or(now);
         let mut out = Judged::Stands;
         for (from, cert) in [
             (&f.offer.from, &f.offer.cert),
@@ -182,11 +194,12 @@ impl<'a> Floors<'a> {
     }
 }
 
-/// When this server first took the friendship `hash`: the earliest taking
-/// of the presentations of it among `held` (§6).
-fn taken_of(held: &[Presentation], hash: &[u8; 32]) -> Option<u64> {
+/// When this server first took the friendship `bytes`: the earliest
+/// taking of the presentations among `held` that stored those bytes (§6),
+/// so that a copy of its hash that does not check dates nothing.
+fn taken_of(held: &[Presentation], bytes: &[u8]) -> Option<u64> {
     held.iter()
-        .filter(|p| p.hash == *hash && p.evidence())
+        .filter(|p| p.friendship.as_deref() == Some(bytes))
         .map(|p| secs(p.taken))
         .min()
 }
@@ -433,24 +446,21 @@ impl Core {
                 }
             }
         }
-        // Each friendship once, by the earliest taking stored under it.
-        let mut friendships: HashMap<[u8; 32], (u64, &[u8])> = HashMap::new();
+        // Each stored copy once: one that no longer checks goes alone.
+        let mut copies: Vec<(&[u8; 32], &[u8])> = Vec::new();
         for p in &held {
-            let Some(bytes) = p.friendship.as_deref() else {
-                continue;
-            };
-            let e = friendships.entry(p.hash).or_insert((u64::MAX, bytes));
-            e.0 = e.0.min(secs(p.taken));
+            if let Some(bytes) = p.friendship.as_deref() {
+                if !copies.iter().any(|(_, b)| *b == bytes) {
+                    copies.push((&p.hash, bytes));
+                }
+            }
         }
         let mut whole = true;
-        let mut gone: Vec<[u8; 32]> = Vec::new();
-        for (hash, (taken, bytes)) in &friendships {
-            let Ok(f) = Friendship::check(bytes, STORED, &[], zero_floor) else {
-                continue;
-            };
-            match floors.judge(&f, *taken) {
+        let mut gone: Vec<&[u8]> = Vec::new();
+        for (hash, bytes) in copies {
+            match floors.held(hash, bytes, &held, STORED) {
                 Judged::Stands => {}
-                Judged::Reset => gone.push(*hash),
+                Judged::Reset => gone.push(bytes),
                 Judged::Unknown => whole = false,
             }
         }
@@ -458,7 +468,7 @@ impl Core {
         self.drop_pairs(
             store,
             held.iter()
-                .filter(|p| p.evidence() && gone.contains(&p.hash)),
+                .filter(|p| p.friendship.as_deref().is_some_and(|b| gone.contains(&b))),
         )?;
         Ok(whole)
     }
@@ -657,11 +667,12 @@ impl Core {
         offered: &StoredOffer,
         bytes: Vec<u8>,
     ) -> Result<(), MessagingError> {
-        let now = self.clock.unix();
+        // One reading of the clock, so the evidence is stamped with the time
+        // it was judged at.
+        let at = self.clock.wall();
+        let now = secs(at);
         let floors = Floors::new(self);
-        let checked = Friendship::check(&bytes, now, &[], |k| floors.floor(k));
-        floors.failed().map_err(store_failed)?;
-        let f = checked.map_err(|r| match r.error {
+        let f = Friendship::check(&bytes, now, &[], zero_floor).map_err(|r| match r.error {
             IdError::ClockSkew => MessagingError::Stale,
             _ => MessagingError::BadSignature,
         })?;
@@ -683,14 +694,27 @@ impl Core {
         let offerer = DeviceCert::parse(&f.offer.cert)
             .map(|c| Fingerprint::of(&c.device).0)
             .map_err(|_| MessagingError::BadSignature)?;
-        let at = self.clock.wall();
-        for (presenter, other, dev) in [(mine, theirs, device.key), (theirs, mine, offerer)] {
-            let old = store
-                .presentation(&presenter, &other)
-                .map_err(store_failed)?;
+        let rows = [(mine, theirs, device.key), (theirs, mine, offerer)];
+        let mut olds = Vec::new();
+        for (presenter, other, _) in rows {
+            olds.push(
+                store
+                    .presentation(&presenter, &other)
+                    .map_err(store_failed)?,
+            );
+        }
+        // Judged before anything is recorded, so that one not held leaves
+        // nothing stored.
+        let stored: Vec<Presentation> = olds.iter().flatten().cloned().collect();
+        let judged = floors.held(&f.hash, &bytes, &stored, now);
+        floors.failed().map_err(store_failed)?;
+        if judged != Judged::Stands {
+            return Err(MessagingError::BadSignature);
+        }
+        for ((presenter, other, dev), old) in rows.into_iter().zip(olds) {
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == f.hash && p.evidence())
+                .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
                 .map_or(at, |p| p.taken);
             store
                 .present(&Presentation {
@@ -715,10 +739,10 @@ impl Core {
             self.drop_offers(store, me, them);
             self.tell_entry(me, them);
             self.tell_entry(them, me);
+            Ok(())
         } else {
-            self.befriend(store, me, them, at)?;
+            self.activate(store, me, them, &floors, at)
         }
-        Ok(())
     }
 
     /// The pairs two accounts' friendships name: their own fingerprints,
@@ -1054,20 +1078,54 @@ impl Core {
         store: &Arc<dyn RelationshipStore>,
         p: &Presentation,
     ) -> Result<(), StoreError> {
-        let Some(Ok(f)) = p
-            .friendship
-            .as_deref()
-            .map(|b| Friendship::check(b, STORED, &[], zero_floor))
-        else {
+        let Some(bytes) = p.friendship.as_deref() else {
             return Ok(());
         };
         let floors = Floors::new(self);
-        let judged = floors.judge(&f, secs(p.taken));
+        let judged = floors.held(&p.hash, bytes, std::slice::from_ref(p), STORED);
         floors.failed()?;
         if judged == Judged::Reset {
             self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
         }
         Ok(())
+    }
+
+    /// Judge what `a` and `b` have presented of each other, for a
+    /// friendship by request or a local one made portable (§6): the
+    /// presenters of what is not held, to drop first, and the id a
+    /// presentation left keeps, to make the friendship under. One no
+    /// record shows held goes too: beside the friendship it would count as
+    /// evidence never shown held, and judging it again keeps it.
+    pub(super) fn unheld_between(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &Mailbox,
+        b: &Mailbox,
+    ) -> Result<(Vec<[u8; 32]>, Option<RelationId>), StoreError> {
+        let (Some(x), Some(y)) = (a.fingerprint, b.fingerprint) else {
+            return Ok((Vec::new(), None));
+        };
+        let mut stored = Vec::new();
+        for (p, q) in [(x, y), (y, x)] {
+            stored.extend(store.presentation(&p, &q)?);
+        }
+        let floors = Floors::new(self);
+        let now = self.clock.unix();
+        let gone: Vec<[u8; 32]> = stored
+            .iter()
+            .filter(|p| {
+                p.friendship
+                    .as_deref()
+                    .is_some_and(|b| floors.held(&p.hash, b, &stored, now) != Judged::Stands)
+            })
+            .map(|p| p.presenter)
+            .collect();
+        floors.failed()?;
+        let kept = stored
+            .iter()
+            .filter(|p| !gone.contains(&p.presenter))
+            .find_map(|p| p.edge);
+        Ok((gone, kept))
     }
 
     /// Fill in what only a friendships session is shown of an entry
@@ -1454,7 +1512,7 @@ impl Core {
             let old = store.presentation(&mine, &theirs).map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == hash && p.evidence() && friendship.is_some())
+                .filter(|p| friendship.is_some() && p.friendship == friendship)
                 .map_or(wall, |p| p.taken);
             store
                 .present(&Presentation {
@@ -1502,7 +1560,7 @@ impl Core {
         // not take the friendship, by either party, before that half was
         // reset. Until `Reset` has a code, it is answered as the classic
         // wire answers it meanwhile (§7), keeping the hash as step 2 does.
-        let judged = floors.judge(&f, taken_of(&held, &hash).unwrap_or(now));
+        let judged = floors.held(&hash, &bytes, &held, now);
         floors.failed().map_err(store_failed)?;
         match judged {
             Judged::Stands => {}
@@ -1524,14 +1582,27 @@ impl Core {
                 return answer(Presented::AccountNotFound);
             }
         }
-        // Step 6, there being no hidden links for step 5. The other
-        // party's presentation of another friendship is held by its own
+        // Step 6, there being no hidden links for step 5. A local edge this
+        // makes portable stands on held evidence alone; on any other, the
+        // other party's presentation of other bytes is held by its own
         // taking alone.
-        record(Some(bytes))?;
+        let both = [(mine, theirs), (theirs, mine)]
+            .iter()
+            .all(|(p, q)| presented(p, q).is_some_and(|x| x.evidence()));
+        if friends.contains(&theirs) && !both {
+            let (gone, _) = self
+                .unheld_between(store, me, &them)
+                .map_err(store_failed)?;
+            if !gone.is_empty() {
+                self.drop_presented(store, &mine, &theirs, &gone)
+                    .map_err(store_failed)?;
+            }
+        }
+        record(Some(bytes.clone()))?;
         if let Some(p) = store
             .presentation(&theirs, &mine)
             .map_err(store_failed)?
-            .filter(|p| p.hash != hash)
+            .filter(|p| p.friendship.as_ref() != Some(&bytes))
         {
             self.judged_alone(store, &p).map_err(store_failed)?;
         }
@@ -1578,9 +1649,7 @@ impl Core {
         let stands = rows.iter().all(|p| {
             p.friendship
                 .as_deref()
-                .and_then(|b| Friendship::check(b, STORED, &[], zero_floor).ok())
-                .zip(taken_of(&rows, &p.hash))
-                .is_some_and(|(f, taken)| floors.judge(&f, taken) == Judged::Stands)
+                .is_some_and(|b| floors.held(&p.hash, b, &rows, STORED) == Judged::Stands)
         });
         floors.failed().map_err(store_failed)?;
         if !stands {
@@ -1601,7 +1670,7 @@ impl Core {
             return Ok(());
         }
         let edge = pa.and_then(|p| p.edge).or(pb.and_then(|p| p.edge));
-        self.befriend_as(store, me, them, now, edge)?;
+        self.befriend_as(store, me, them, now, edge, &[])?;
         Ok(())
     }
 

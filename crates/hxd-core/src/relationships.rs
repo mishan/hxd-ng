@@ -724,6 +724,20 @@ pub trait RelationshipStore: Send + Sync + 'static {
         at: SystemTime,
     ) -> Result<(), StoreError>;
 
+    /// Make `a` and `b` friends as [`RelationshipStore::befriend`] does,
+    /// or again under `id` as [`RelationshipStore::refriend`] does, and
+    /// drop in the same step the presentations of the pair, found by the
+    /// mailboxes' fingerprints, that `drop` made: what a friendship by
+    /// request makes over what the two presented that is not held (§6).
+    fn befriend_dropping(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        at: SystemTime,
+        id: Option<RelationId>,
+        drop: &[[u8; 32]],
+    ) -> Result<RelationId, StoreError>;
+
     /// When the friendship or approval `id` was made, while it is live: a
     /// withdrawal ends a friendship of this server alone that was made
     /// before its cutoff (`docs/proposals/portable-friends.md` §2).

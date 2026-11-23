@@ -42,6 +42,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     an_offer_lapses_and_a_refriend_keeps_the_id(&*new_store());
     rotation_moves_the_portable_part_and_purging_keeps_withdrawals(&*new_store());
     a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
+    a_friendship_by_request_drops_the_presentations_named(&*new_store());
     ending_a_friendship_is_one_step(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
@@ -371,6 +372,39 @@ fn a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(s: &dyn Relationship
     let left = s.drop_presentations(&fp(6), &fp(5), &[fp(6)]).unwrap();
     assert_eq!(left.ended, None, "{case}: a hash is no evidence");
     assert!(friends(5, 6).is_some(), "{case}");
+}
+
+fn a_friendship_by_request_drops_the_presentations_named(s: &dyn RelationshipStore) {
+    let case = "a_friendship_by_request_drops_the_presentations_named";
+    let mailbox = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let friends = |x: u8, y: u8| {
+        s.relationship(&mailbox(x), &mailbox(y), at(9))
+            .unwrap()
+            .and_then(|r| r.friendship)
+    };
+    for (x, y) in [(1, 2), (3, 4)] {
+        s.present(&presentation(x, y, x, 7)).unwrap();
+        s.present(&presentation(y, x, y, 8)).unwrap();
+    }
+    let made = s
+        .befriend_dropping(&mailbox(1), &mailbox(2), at(2), None, &[fp(1)])
+        .unwrap();
+    assert_eq!(friends(1, 2), Some(made), "{case}");
+    assert_eq!(friends(2, 1), Some(made), "{case}");
+    assert_eq!(s.presentation(&fp(1), &fp(2)).unwrap(), None, "{case}");
+    assert!(s.presentation(&fp(2), &fp(1)).unwrap().is_some(), "{case}");
+
+    // Again under an id the pair had.
+    let id = s.befriend(&mailbox(3), &mailbox(4), at(1)).unwrap();
+    s.unfriend(&mailbox(3), &mailbox(4)).unwrap();
+    let again = s
+        .befriend_dropping(&mailbox(3), &mailbox(4), at(2), Some(id), &[fp(3), fp(4)])
+        .unwrap();
+    assert_eq!(again, id, "{case}");
+    assert_eq!(friends(4, 3), Some(id), "{case}");
+    for (p, q) in [(3, 4), (4, 3)] {
+        assert_eq!(s.presentation(&fp(p), &fp(q)).unwrap(), None, "{case}");
+    }
 }
 
 fn ending_a_friendship_is_one_step(s: &dyn RelationshipStore) {

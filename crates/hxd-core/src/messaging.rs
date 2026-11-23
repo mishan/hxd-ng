@@ -1365,6 +1365,8 @@ impl Core {
         Ok(())
     }
 
+    /// A friendship by request alone, over whatever the two presented of
+    /// each other that is held, and under the id one of them kept.
     fn befriend(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -1372,13 +1374,15 @@ impl Core {
         b: &Mailbox,
         now: SystemTime,
     ) -> Result<RelationId, MessagingError> {
-        self.befriend_as(store, a, b, now, None)
+        let (gone, kept) = self.unheld_between(store, a, b).map_err(store_failed)?;
+        self.befriend_as(store, a, b, now, kept, &gone)
     }
 
-    /// [`Self::befriend`], under `id` where the pair had a friendship that
-    /// a dropped presentation left waiting (`docs/proposals/
-    /// portable-friends.md` §4.3). Either way the offers between them go:
-    /// the first acceptance answers them all.
+    /// Make `a` and `b` friends, under `id` where the pair had a
+    /// friendship that a dropped presentation left waiting (`docs/
+    /// proposals/portable-friends.md` §4.3), dropping in the same step the
+    /// presentations of the pair that `drop` made. Either way the offers
+    /// between them go: the first acceptance answers them all.
     fn befriend_as(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -1386,6 +1390,7 @@ impl Core {
         b: &Mailbox,
         now: SystemTime,
         id: Option<RelationId>,
+        drop: &[[u8; 32]],
     ) -> Result<RelationId, MessagingError> {
         let mut approvals = Vec::new();
         for (x, y) in [(a, b), (b, a)] {
@@ -1397,11 +1402,9 @@ impl Core {
                 approvals.push(id);
             }
         }
-        let id = match id {
-            Some(id) => store.refriend(a, b, id, now).map(|()| id),
-            None => store.befriend(a, b, now),
-        }
-        .map_err(store_failed)?;
+        let id = store
+            .befriend_dropping(a, b, now, id, drop)
+            .map_err(store_failed)?;
         self.drop_offers(store, a, b);
         self.roster.lock().unwrap().friends_changed(a, b, true);
         self.tell_entry(a, b);
