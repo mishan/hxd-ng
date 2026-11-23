@@ -121,6 +121,13 @@ never detach), detached sessions are capped per source address, and
 kicking a detached session must end it directly — there is no connection
 to observe the `Kicked` event.
 
+**A change of state that touches more than one row is one store
+operation**: one transaction in the SQLite store, one lock hold in the
+memory store, with a conformance case run against both. In new and
+changed code, a domain sequence of separate writes that must all happen
+is a defect, not an ordering to get right. A friendship ends only
+through `end_friendship` or `drop_presentations`.
+
 **Outbox seqs are gapless.** Every event a session should see consumes a
 seq, including events the ng protocol can't express yet — those become
 placeholder frames, never holes, or resume's `last_seq` accounting breaks.

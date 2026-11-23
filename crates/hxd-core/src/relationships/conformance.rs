@@ -8,9 +8,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Birthdate, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry, MessagingAccount,
-    PendingOut, Presentation, Profile, Recorded, RelationshipStore, RequestKind, Requester,
-    StoredOffer,
+    AccountUpdate, Birthdate, Ending, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry,
+    MessagingAccount, PendingOut, Presentation, Profile, Recorded, RelationshipStore, RequestKind,
+    Requester, StoredOffer,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent};
 
@@ -41,6 +41,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(&*new_store());
     an_offer_lapses_and_a_refriend_keeps_the_id(&*new_store());
     rotation_moves_the_portable_part_and_purging_keeps_withdrawals(&*new_store());
+    a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
+    ending_a_friendship_is_one_step(&*new_store());
+    an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
+    a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -305,6 +309,223 @@ fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn Relati
         1,
         "{case}: withdrawals stay"
     );
+}
+
+fn a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(s: &dyn RelationshipStore) {
+    let case = "a_drop_ends_an_edge_only_where_it_had_evidence_both_ways";
+    let hash_only = |p: Presentation| Presentation {
+        friendship: None,
+        ..p
+    };
+    // Pairs (1, 2), (3, 4) and (5, 6), each friends, with presentations
+    // both ways, one way, and one way beside a hash.
+    let mut ids = Vec::new();
+    for (x, y) in [(1, 2), (3, 4), (5, 6)] {
+        let a = Mailbox::identified(format!("a{x}"), fp(x));
+        let b = Mailbox::identified(format!("b{y}"), fp(y));
+        ids.push(s.befriend(&a, &b, at(1)).unwrap());
+        s.present(&presentation(x, y, x, 7)).unwrap();
+    }
+    s.present(&presentation(2, 1, 1, 8)).unwrap();
+    s.present(&hash_only(presentation(6, 5, 5, 8))).unwrap();
+    let friends = |x: u8, y: u8| {
+        s.relationship(
+            &Mailbox::identified("", fp(x)),
+            &Mailbox::identified("", fp(y)),
+            at(2),
+        )
+        .unwrap()
+        .and_then(|r| r.friendship)
+    };
+
+    let ended = s
+        .drop_presentations(&fp(1), &fp(2), &[fp(1), fp(9)])
+        .unwrap();
+    assert_eq!(
+        ended.gone,
+        [presentation(1, 2, 1, 7)],
+        "{case}: the one named"
+    );
+    let e = ended.ended.expect("ended");
+    assert_eq!(e.id, ids[0], "{case}");
+    let logins = e.parties.map(|m| (m.login, m.fingerprint));
+    assert_eq!(
+        logins,
+        [("a1".into(), Some(fp(1))), ("b2".into(), Some(fp(2)))],
+        "{case}: the parties as their rows keep them"
+    );
+    assert_eq!(friends(1, 2), None, "{case}");
+    assert_eq!(friends(2, 1), None, "{case}");
+    assert_eq!(
+        s.presentation(&fp(2), &fp(1)).unwrap().and_then(|p| p.edge),
+        Some(ids[0]),
+        "{case}: the id kept on what is left"
+    );
+
+    for (x, y) in [(3, 4), (5, 6)] {
+        let ended = s.drop_presentations(&fp(x), &fp(y), &[fp(x)]).unwrap();
+        assert_eq!(ended.gone.len(), 1, "{case}: ({x}, {y})");
+        assert_eq!(ended.ended, None, "{case}: ({x}, {y}) never had both");
+        assert!(friends(x, y).is_some(), "{case}: ({x}, {y}) left as it was");
+    }
+    let left = s.drop_presentations(&fp(6), &fp(5), &[fp(6)]).unwrap();
+    assert_eq!(left.ended, None, "{case}: a hash is no evidence");
+    assert!(friends(5, 6).is_some(), "{case}");
+}
+
+fn ending_a_friendship_is_one_step(s: &dyn RelationshipStore) {
+    let case = "ending_a_friendship_is_one_step";
+    let (a, b) = (
+        Mailbox::identified("a", fp(1)),
+        Mailbox::identified("b", fp(2)),
+    );
+    let id = s.befriend(&a, &b, at(1)).unwrap();
+    s.present(&presentation(1, 2, 10, 7)).unwrap();
+    s.present(&Presentation {
+        edge: Some(id),
+        ..presentation(2, 1, 11, 7)
+    })
+    .unwrap();
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+    };
+    for (x, y) in [(1, 2), (2, 1), (1, 3)] {
+        s.set_offer(&fp(x), &fp(y), Some(&offer)).unwrap();
+    }
+    let w = withdrawal(1, 12, 5, true, 1);
+    let keep_edge = Ending {
+        presentations: vec![fp(1)],
+        ..Ending::default()
+    };
+    let kept = s.end_friendship(&a, &b, &keep_edge).unwrap();
+    assert_eq!(kept.gone.len(), 1, "{case}");
+    assert_eq!(kept.ended, None, "{case}: the edge not asked for");
+    s.present(&presentation(1, 2, 10, 7)).unwrap();
+
+    let end = Ending {
+        withdrawals: vec![w.clone()],
+        cap: 10,
+        presentations: vec![fp(1)],
+        offers: vec![fp(1), fp(2)],
+        block: Some(at(3)),
+        friendship: true,
+        hold: Some(at(500)),
+    };
+    let ended = s
+        .end_friendship(
+            &Mailbox::identified("", fp(1)),
+            &Mailbox::identified("", fp(2)),
+            &end,
+        )
+        .unwrap();
+    assert_eq!(ended.ended.as_ref().map(|e| e.id), Some(id), "{case}");
+    assert_eq!(ended.gone, [presentation(1, 2, 10, 7)], "{case}");
+    assert_eq!(s.withdrawals(&[12; 32]).unwrap(), [w], "{case}: kept");
+    assert_eq!(
+        s.presentation(&fp(2), &fp(1)).unwrap().map(|p| p.edge),
+        Some(None),
+        "{case}: no id left for the edge"
+    );
+    assert_eq!(s.offer(&fp(1), &fp(2), at(4)).unwrap(), None, "{case}");
+    assert_eq!(s.offer(&fp(2), &fp(1), at(4)).unwrap(), None, "{case}");
+    assert!(
+        s.offer(&fp(1), &fp(3), at(4)).unwrap().is_some(),
+        "{case}: another pair's"
+    );
+    assert!(s.is_blocked(&a, &b).unwrap(), "{case}");
+    assert_eq!(
+        s.relationship(&b, &a, at(4)).unwrap(),
+        None,
+        "{case}: the friendship gone"
+    );
+    assert_eq!(
+        s.relationship(&a, &b, at(4)).unwrap().map(|r| r.friendship),
+        Some(None),
+        "{case}: the block stays"
+    );
+    assert!(
+        s.is_held(&a, &Requester::Account(b.clone()), at(499))
+            .unwrap(),
+        "{case}: held under the rows' mailboxes"
+    );
+    assert!(
+        !s.is_held(&a, &Requester::Account(b), at(500)).unwrap(),
+        "{case}"
+    );
+
+    // Without fingerprints, a friendship of logins alone; and no hold
+    // where nothing ended.
+    let (c, d) = (Mailbox::login("c"), Mailbox::login("d"));
+    s.befriend(&c, &d, at(1)).unwrap();
+    let plain = Ending {
+        friendship: true,
+        presentations: vec![fp(1)],
+        hold: Some(at(500)),
+        ..Ending::default()
+    };
+    assert!(s.end_friendship(&c, &d, &plain).unwrap().ended.is_some());
+    assert_eq!(s.relationship(&c, &d, at(4)).unwrap(), None, "{case}");
+    assert!(
+        s.is_held(&c, &Requester::Account(d), at(4)).unwrap(),
+        "{case}"
+    );
+    let (e, f) = (Mailbox::login("e"), Mailbox::login("f"));
+    assert!(s.end_friendship(&e, &f, &plain).unwrap().ended.is_none());
+    assert!(
+        !s.is_held(&e, &Requester::Account(f), at(4)).unwrap(),
+        "{case}: nothing ended"
+    );
+}
+
+fn an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(s: &dyn RelationshipStore) {
+    let case = "an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap";
+    s.keep_withdrawal(&withdrawal(1, 20, 50, true, 1), 2)
+        .unwrap();
+    s.keep_withdrawal(&withdrawal(1, 21, 50, true, 2), 2)
+        .unwrap();
+    let end = Ending {
+        withdrawals: vec![withdrawal(1, 21, 40, true, 3)],
+        cap: 1,
+        ..Ending::default()
+    };
+    s.end_friendship(&Mailbox::login("a"), &Mailbox::login("b"), &end)
+        .unwrap();
+    assert_eq!(
+        s.withdrawals(&[20; 32]).unwrap(),
+        [],
+        "{case}: the oldest past the cap"
+    );
+    assert_eq!(
+        s.withdrawals(&[21; 32]).unwrap(),
+        [withdrawal(1, 21, 50, true, 2)],
+        "{case}: the later cutoff kept"
+    );
+}
+
+fn a_block_ends_the_requests_and_approvals_either_way(s: &dyn RelationshipStore) {
+    let case = "a_block_ends_the_requests_and_approvals_either_way";
+    let (a, b) = (Mailbox::login("a"), Mailbox::login("b"));
+    let ids = [
+        s.approve(&a, &b, at(1)).unwrap(),
+        s.approve(&b, &a, at(1)).unwrap(),
+    ];
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        s.set_pending_out(x, y, Some(&pending(2, 1000, true)))
+            .unwrap();
+    }
+    let end = Ending {
+        block: Some(at(3)),
+        ..Ending::default()
+    };
+    s.end_friendship(&a, &b, &end).unwrap();
+    let mine = s.relationship(&a, &b, at(4)).unwrap().unwrap();
+    assert_eq!(mine.blocked_at, Some(at(3)), "{case}");
+    assert_eq!((mine.approval, mine.pending_out), (None, None), "{case}");
+    assert_eq!(s.relationship(&b, &a, at(4)).unwrap(), None, "{case}");
+    for id in ids {
+        assert_eq!(s.made_at(id).unwrap(), None, "{case}: {id} ended");
+    }
 }
 
 fn at(secs: u64) -> SystemTime {

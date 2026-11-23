@@ -3613,10 +3613,8 @@ impl Core {
             // question waiting to happen.
             return Err(ChatError::NoSuchUser);
         }
-        store
-            .set_blocked(&mailbox, &other, blocked, SystemTime::now())
+        self.block_changed(store, &mailbox, &other, blocked)
             .map_err(store_failed)?;
-        self.block_changed(&mailbox, &other, blocked);
         Ok(())
     }
 
@@ -3642,10 +3640,8 @@ impl Core {
         if other == mailbox {
             return Err(ChatError::NoSuchUser);
         }
-        store
-            .set_blocked(&mailbox, &other, blocked, SystemTime::now())
+        self.block_changed(store, &mailbox, &other, blocked)
             .map_err(store_failed)?;
-        self.block_changed(&mailbox, &other, blocked);
         Ok(())
     }
 
@@ -3677,10 +3673,8 @@ impl Core {
             .into_iter()
             .find(|m| m.fingerprint.as_ref() == Some(fingerprint))
             .ok_or(ChatError::NoSuchUser)?;
-        store
-            .set_blocked(&mailbox, &other, false, SystemTime::now())
+        self.block_changed(store, &mailbox, &other, false)
             .map_err(store_failed)?;
-        self.block_changed(&mailbox, &other, false);
         Ok(())
     }
 
