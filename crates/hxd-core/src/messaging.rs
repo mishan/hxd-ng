@@ -710,9 +710,9 @@ impl Core {
     /// Refused for a session on its way out, which acts no more: what it
     /// wrote now could land under a key its account no longer has.
     pub(crate) fn staying(&self, uid: Uid) -> Result<(), MessagingError> {
-        match self.roster.lock().unwrap().users.get(&uid) {
-            Some(s) if !s.kicked => Ok(()),
-            _ => Err(MessagingError::NotEnabled),
+        match self.roster.lock().unwrap().leaving(uid) {
+            false => Ok(()),
+            true => Err(MessagingError::NotEnabled),
         }
     }
 

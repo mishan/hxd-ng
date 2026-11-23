@@ -2737,6 +2737,9 @@ impl Core {
             }
             // A recipient with no session cannot be reached this way.
             let mut r = self.roster.lock().unwrap();
+            if r.leaving(sender.uid) {
+                return Err(ChatError::Flooding);
+            }
             // The same resolution the durable path does, for the same
             // reasons and in the same order: the session the sender named
             // if it is attached (§15 — clicking a name in a user list is
@@ -2880,6 +2883,9 @@ impl Core {
         let quota = crate::relationships::Requester::Account(from_mailbox.clone());
         if self.send_quota_spent(&**store, &quota, text.len(), now)? && !retry(&guid)? {
             let mut r = self.roster.lock().unwrap();
+            if r.leaving(sender.uid) {
+                return Err(ChatError::Flooding);
+            }
             // Attached only: a detached session's outbox is not a place
             // to leave what the store was just refused.
             let uids = named_sessions(&r, &to.mailbox, to.uid, from);

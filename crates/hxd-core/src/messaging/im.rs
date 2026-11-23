@@ -315,6 +315,9 @@ impl Core {
             // Behind any hand-over under way, so it overtakes nothing older.
             let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
             let mut r = self.roster.lock().unwrap();
+            if r.leaving(uid) {
+                return Err(MessagingError::NotEnabled);
+            }
             let (messengers, plain): (Vec<Uid>, Vec<Uid>) = im_sessions(&r, them)
                 .into_iter()
                 .filter(|u| r.users.get(u).is_some_and(is_live))

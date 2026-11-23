@@ -2558,6 +2558,103 @@ fn an_unfriend_beside_a_claim_leaves_the_roster_as_the_store() {
 }
 
 #[test]
+fn a_device_of_a_person_being_kicked_acts_no_more() {
+    let fp = [7u8; 32];
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", fp), messaging_bits()),
+        (Mailbox::login("bob"), messaging_bits()),
+    ]);
+    let s = server_of(dir, policy(), InboxPolicy::default(), None);
+    s.core.roster.lock().unwrap().persons.on = true;
+    let device = |addr: &str| {
+        let mut info =
+            crate::coalesce::tests::session("alice", Some(fp), Some(fp), Default::default());
+        info.access = messaging_bits();
+        info.addr = Some(addr.parse().unwrap());
+        let (uid, _rx) = s.core.attach(info).unwrap();
+        s.core.announce(uid);
+        uid
+    };
+    let (first, second) = (device("192.0.2.1"), device("198.51.100.1"));
+    assert_eq!(
+        s.core.friend_add(second, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    s.core.friend_unfriend(second, "bob", None).unwrap();
+    // A kick's first step: the person is ending, its members not yet
+    // marked.
+    s.core.roster.lock().unwrap().person_ending(first);
+    assert_eq!(
+        s.core.friend_add(second, "bob", None),
+        Err(MessagingError::NotEnabled)
+    );
+}
+
+#[test]
+fn a_sender_on_its_way_out_hands_nothing_over_live() {
+    let quota = InboxPolicy {
+        max_sent_per_day: 1,
+        ..InboxPolicy::default()
+    };
+    let dir = Directory(
+        ["alice", "bob", "carol"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let s = server_of(dir, policy(), quota, None);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    // A session with no mailbox, which a message reaches live alone.
+    let (c, mut rc) = attach_as(&s.core, "carol", messaging_bits(), "10.0.0.3");
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&c)
+        .unwrap()
+        .has_inbox = false;
+    s.core
+        .im_send(a, "bob", "stored".into(), None, None)
+        .unwrap();
+    drain(&mut rb);
+    drain(&mut rc);
+    let kick = || {
+        s.core
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&a)
+            .unwrap()
+            .kicked = true
+    };
+    // Kicked once its friendship is read, past the quota.
+    let parked = s.fail.park.arm("relationship");
+    let im = std::thread::scope(|t| {
+        let im = t.spawn(|| s.core.im_send(a, "bob", "live".into(), None, None));
+        parked.arrived();
+        kick();
+        parked.release();
+        im.join().unwrap()
+    });
+    assert!(im.is_err(), "an instant message past the quota: {im:?}");
+    for (case, to) in [("past the quota", b), ("to no mailbox", c)] {
+        let sent = s.core.msg(a, to, "live".into(), None, None);
+        assert!(sent.is_err(), "a private message {case}: {sent:?}");
+    }
+    let heard = |rx: &mut Events| {
+        drain(rx)
+            .into_iter()
+            .filter(|e| matches!(e, Event::Msg { .. } | Event::Im(_)))
+            .count()
+    };
+    assert_eq!((heard(&mut rb), heard(&mut rc)), (0, 0), "heard nothing");
+}
+
+#[test]
 fn an_act_a_rotation_overtakes_writes_nothing_under_the_old_key() {
     let (old, new) = ([4u8; 32], [5u8; 32]);
     let (alice, bob) = (Mailbox::identified("alice", old), Mailbox::login("bob"));
