@@ -1,5 +1,7 @@
 # Hotline-ng transport authentication
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: partial — built in hxd-ng except the `bindings` setting, rate
 limits on the endpoints (§12), the cleartext restriction policy (§8), and
 any binding other than the two of §6. `hlrelay` is a relay (§10.2) that

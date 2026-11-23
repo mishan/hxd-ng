@@ -1,5 +1,7 @@
 # Identity registrar — handles, revocation, rotation and key backup
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: draft; the registrar is built, and so is the verifying server but for §7.5.
 hxd-ng is a registrar when `[registrar]` is configured (§11): discovery
 (§3), the objects of §4 in `hl-identity` with their test vectors (§15),
