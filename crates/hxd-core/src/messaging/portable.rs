@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hl_identity::friendship::{chain_end, Cutoff, Pair};
+use hl_identity::friendship::{chain_end, Cutoff, Pair, Refused};
 use hl_identity::message::SKEW;
 use hl_identity::{
     DeviceCert, DeviceEpoch, Error as IdError, Fingerprint, Friendship, Offer, PublicKey, Rotation,
@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
+use crate::identity_records::KeptEpoch;
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
     Ended, EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore,
@@ -69,13 +70,31 @@ fn zero_floor(_: &PublicKey) -> u64 {
 /// What this server holds of an identity's device epochs (§6): its
 /// floor, and for each epoch the earliest `time` of a record of it seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Epochs {
+struct Epochs {
     floor: u64,
     /// `(epoch, time)`, by epoch.
     times: Vec<(u64, u64)>,
 }
 
 impl Epochs {
+    /// `fp`'s records kept, as far as they verify, and the floor
+    /// installed, whichever is higher.
+    fn of(fp: &[u8; 32], installed: Option<u64>, rows: &[KeptEpoch]) -> Self {
+        let mut times: Vec<(u64, u64)> = rows
+            .iter()
+            .filter_map(|row| {
+                DeviceEpoch::parse(&row.record)
+                    .ok()
+                    .filter(|e| e.epoch == row.epoch && Fingerprint::of(&e.identity).0 == *fp)
+                    .map(|e| (e.epoch, e.time))
+            })
+            .collect();
+        times.sort_unstable();
+        let kept = times.last().map_or(0, |(e, _)| *e);
+        let floor = kept.max(installed.unwrap_or(0));
+        Epochs { floor, times }
+    }
+
     /// For a certificate of `epoch` below the floor, when it was reset:
     /// the earliest `time` of a record above it, or `None` where no such
     /// record is kept, as where the floor came from a list whose records
@@ -100,6 +119,68 @@ impl Epochs {
 /// Identities, each with the floor the records kept here showed for it.
 pub(crate) type KeptFloors = Vec<([u8; 32], u64)>;
 
+/// An identity's device epochs as stored, unverified: its kept records,
+/// each as `(epoch, time, hash)`, and the floor installed. Two reads that
+/// match held the same epochs, so a pass compares them without verifying
+/// a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpochKey {
+    installed: Option<u64>,
+    rows: Vec<(u64, u64, [u8; 32])>,
+}
+
+impl EpochKey {
+    fn of(installed: Option<u64>, rows: &[KeptEpoch]) -> Self {
+        let mut key: Vec<_> = rows
+            .iter()
+            .map(|r| (r.epoch, r.time, Sha256::digest(&r.record).into()))
+            .collect();
+        key.sort_unstable();
+        EpochKey {
+            installed,
+            rows: key,
+        }
+    }
+}
+
+/// So many generations kept, past which every identity's is forgotten
+/// at once rather than the map growing with every key ever changed.
+const GENERATIONS: usize = 1 << 16;
+
+/// What [`Core::judge_floors`] reconciled: each identity whose stored
+/// friendships and offers were all judged at its epochs, with the
+/// generation of each key of its chain then, and a generation for each
+/// key, which every change that can leave a row under it no longer held
+/// without moving an epoch bumps, so a pass that read the key before the
+/// change records nothing and one recorded before it is passed over no
+/// more.
+#[derive(Default)]
+pub(crate) struct Reconciled {
+    at: HashMap<[u8; 32], (EpochKey, Generations)>,
+    generation: HashMap<[u8; 32], u64>,
+    /// Bumped where every identity's is forgotten at once.
+    cleared: u64,
+}
+
+/// The keys of a chain, each with its generation.
+type Generations = Vec<([u8; 32], u64)>;
+
+impl Reconciled {
+    fn of(&self, keys: &[[u8; 32]]) -> Generations {
+        let generation = |k| self.generation.get(k).copied().unwrap_or(0);
+        keys.iter().map(|k| (*k, generation(k))).collect()
+    }
+
+    /// Whether `fp` was recorded at `key`, nothing under its chain changed
+    /// since.
+    fn holds(&self, fp: &[u8; 32], key: &EpochKey) -> bool {
+        self.at.get(fp).is_some_and(|(at, gens)| {
+            let keys: Vec<[u8; 32]> = gens.iter().map(|(k, _)| *k).collect();
+            at == key && self.of(&keys) == *gens
+        })
+    }
+}
+
 /// What a friendship comes to against the floors (§6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Judged {
@@ -113,10 +194,17 @@ enum Judged {
     Unknown,
 }
 
+/// An identity's epochs, and the rows they were read from where the read
+/// succeeded.
+type Read = (Option<EpochKey>, Epochs);
+
 /// The device epochs one act reads, each identity's read once.
 struct Floors<'a> {
     core: &'a Core,
-    read: RefCell<HashMap<[u8; 32], Epochs>>,
+    read: RefCell<HashMap<[u8; 32], Read>>,
+    /// Epochs verified by an earlier read, taken again where the rows
+    /// read the same.
+    known: HashMap<[u8; 32], (EpochKey, Epochs)>,
     failed: RefCell<Option<StoreError>>,
 }
 
@@ -125,19 +213,53 @@ impl<'a> Floors<'a> {
         Floors {
             core,
             read: RefCell::default(),
+            known: HashMap::new(),
             failed: RefCell::default(),
         }
     }
 
+    /// A fresh read, verifying again only the epochs whose rows have
+    /// changed since `earlier` read them.
+    fn after(earlier: &Floors<'a>) -> Self {
+        let known = (earlier.read.borrow().iter())
+            .filter_map(|(fp, (key, e))| Some((*fp, (key.clone()?, e.clone()))))
+            .collect();
+        Floors {
+            known,
+            ..Floors::new(earlier.core)
+        }
+    }
+
+    /// `fp`'s epochs: its records kept by fingerprint, as far as they
+    /// verify, and the floor the lists installed publish, whichever is
+    /// higher; on a store's failure, the floor installed alone.
     fn of(&self, fp: &[u8; 32]) -> Epochs {
-        if let Some(e) = self.read.borrow().get(fp) {
+        if let Some((_, e)) = self.read.borrow().get(fp) {
             return e.clone();
         }
-        let e = self.core.epochs_of(fp).unwrap_or_else(|(e, err)| {
-            *self.failed.borrow_mut() = Some(err);
-            e
-        });
-        self.read.borrow_mut().insert(*fp, e.clone());
+        let (installed, rows) = self.core.epoch_rows(fp);
+        let (key, e) = match rows {
+            Ok(rows) => {
+                let key = EpochKey::of(installed, &rows);
+                let e = match self.known.get(fp) {
+                    Some((k, e)) if *k == key => e.clone(),
+                    _ => Epochs::of(fp, installed, &rows),
+                };
+                (Some(key), e)
+            }
+            Err(err) => {
+                *self.failed.borrow_mut() = Some(err);
+                let floor = installed.unwrap_or(0);
+                (
+                    None,
+                    Epochs {
+                        floor,
+                        times: Vec::new(),
+                    },
+                )
+            }
+        };
+        self.read.borrow_mut().insert(*fp, (key, e.clone()));
         e
     }
 
@@ -153,7 +275,20 @@ impl<'a> Floors<'a> {
     /// `now` for one not stored yet. What every grant and every judging of what is
     /// stored asks. One stored that no longer checks is not held.
     fn held(&self, hash: &[u8; 32], bytes: &[u8], stored: &[Presentation], now: u64) -> Judged {
-        let f = match Friendship::check(bytes, STORED, &[], zero_floor) {
+        let f = Friendship::check(bytes, STORED, &[], zero_floor);
+        self.judged(hash, bytes, f.as_ref(), stored, now)
+    }
+
+    /// [`Self::held`], for a friendship already checked.
+    fn judged(
+        &self,
+        hash: &[u8; 32],
+        bytes: &[u8],
+        f: Result<&Friendship, &Refused>,
+        stored: &[Presentation],
+        now: u64,
+    ) -> Judged {
+        let f = match f {
             Ok(f) => f,
             Err(e) => {
                 let hash: String = hash.iter().map(|b| format!("{b:02x}")).collect();
@@ -357,11 +492,7 @@ impl Core {
         Ok((me, Device { key, cert }))
     }
 
-    /// `fp`'s device epochs: its records kept by fingerprint, as far as
-    /// they verify, and the floor the lists installed publish, whichever
-    /// is higher. On a store's failure, the floor installed alone, with
-    /// the error.
-    fn epochs_of(&self, fp: &[u8; 32]) -> Result<Epochs, (Epochs, StoreError)> {
+    fn epoch_rows(&self, fp: &[u8; 32]) -> (Option<u64>, Result<Vec<KeptEpoch>, StoreError>) {
         let installed = self
             .revoked
             .read()
@@ -370,134 +501,218 @@ impl Core {
             .floors
             .get(fp)
             .copied();
-        let rows = match self.record_cache.as_ref().map(|c| c.epochs(fp)) {
-            Some(Err(e)) => {
-                let floor = installed.unwrap_or(0);
-                let times = Vec::new();
-                return Err((Epochs { floor, times }, e));
-            }
-            Some(Ok(rows)) => rows,
-            None => Vec::new(),
-        };
-        let mut times: Vec<(u64, u64)> = rows
-            .iter()
-            .filter_map(|row| {
-                DeviceEpoch::parse(&row.record)
-                    .ok()
-                    .filter(|e| e.epoch == row.epoch && Fingerprint::of(&e.identity).0 == *fp)
-                    .map(|e| (e.epoch, e.time))
-            })
-            .collect();
-        times.sort_unstable();
-        let kept = times.last().map_or(0, |(e, _)| *e);
-        let floor = kept.max(installed.unwrap_or(0));
-        Ok(Epochs { floor, times })
+        let rows = self
+            .record_cache
+            .as_ref()
+            .map_or(Ok(Vec::new()), |c| c.epochs(fp));
+        (installed, rows)
+    }
+
+    /// `fp`'s epochs as stored, and the rows they were read from.
+    fn epoch_key(&self, fp: &[u8; 32]) -> Result<(EpochKey, Vec<KeptEpoch>), StoreError> {
+        let (installed, rows) = self.epoch_rows(fp);
+        let rows = rows?;
+        Ok((EpochKey::of(installed, &rows), rows))
     }
 
     /// Judge again what is stored of friendships with a half by any of
     /// `identities`, by their device epochs as held now (§6): the
     /// presentations of each friendship no longer held go, as a revoked
-    /// device's do. For when a floor is installed or rises, or a reset's
-    /// earliest `time` moves earlier: an identity whose epochs read as
-    /// they did when it was last judged is passed over. Store work, so
-    /// called off the reactor.
+    /// device's do, and the offers its devices below the floor signed,
+    /// which no acceptance could now make a friendship of. For when a
+    /// floor is installed or rises, or a reset's earliest `time` moves
+    /// earlier: an identity reconciled whole at the epochs it reads now is
+    /// passed over. Store work, so called off the reactor.
     pub(crate) fn judge_floors(&self, identities: impl IntoIterator<Item = [u8; 32]>) {
         let Some(store) = self.relationships.as_ref() else {
             return;
         };
         for fp in identities {
-            let floors = Floors::new(self);
-            let epochs = floors.of(&fp);
-            if epochs.floor == 0 {
-                self.floors_judged.lock().unwrap().remove(&fp);
-                continue;
-            }
-            if self.floors_judged.lock().unwrap().get(&fp) == Some(&epochs) {
-                continue;
-            }
-            let _writing = self.friend_writes();
-            match self.drop_unheld(store, &fp, &floors) {
-                // Kept only where judged whole.
-                Ok(true) => {
-                    self.floors_judged.lock().unwrap().insert(fp, epochs);
-                }
-                Ok(false) => {
-                    self.floors_judged.lock().unwrap().remove(&fp);
-                }
-                Err(e) => {
-                    self.floors_judged.lock().unwrap().remove(&fp);
-                    warn!("relationships: judging presentations by a device floor: {e}");
-                }
+            if let Err(e) = self.reconcile(store, fp) {
+                self.reconciled.lock().unwrap().at.remove(&fp);
+                warn!("relationships: judging presentations by a device floor: {e}");
             }
         }
     }
 
-    /// Drop what is stored of `fp`'s friendships that are no longer held,
-    /// and the offers its devices below the floor signed, which no
-    /// acceptance could now make a friendship of. Answers whether it
-    /// judged all of it.
-    fn drop_unheld(
+    /// [`Self::judge_floors`] for one identity, its key and each key it
+    /// rotated to. What is stored is read under the hold, so a grant
+    /// judged at the epochs before an install is read as committed; every
+    /// object is checked outside it, so a pass costs messaging the reads
+    /// alone; and each pair that may end is judged again at the epochs as
+    /// they are and ended under a hold of its own. The pass is recorded
+    /// only where it judged at the epochs read now and nothing has changed
+    /// what it read but its own ends.
+    fn reconcile(
         &self,
         store: &Arc<dyn RelationshipStore>,
-        fp: &[u8; 32],
-        floors: &Floors,
-    ) -> Result<bool, StoreError> {
+        fp: [u8; 32],
+    ) -> Result<(), StoreError> {
+        let (seen, rows) = self.epoch_key(&fp)?;
+        if self.reconciled.lock().unwrap().holds(&fp, &seen) {
+            return Ok(());
+        }
+        let epochs = Epochs::of(&fp, seen.installed, &rows);
+        if epochs.floor == 0 {
+            self.reconciled.lock().unwrap().at.remove(&fp);
+            return Ok(());
+        }
         let wall = self.clock.wall();
-        if let Some(me) = self.mailbox_of(fp) {
-            for r in store.relationships(&me, wall)? {
-                let Some(other) = r.other.fingerprint else {
-                    continue;
-                };
-                let Some(o) = store.offer(fp, &other, wall)? else {
-                    continue;
-                };
-                if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| floors.below(&o)) {
-                    store.set_offer(fp, &other, None)?;
-                    self.tell_entry(&r.other, &me);
+        // Every presentation of the chain's keys, each pair's once.
+        let chain = |keys: &[[u8; 32]]| -> Result<Vec<Presentation>, StoreError> {
+            let mut held: Vec<Presentation> = Vec::new();
+            for key in keys {
+                for p in store.presentations(key)? {
+                    if !held
+                        .iter()
+                        .any(|h| h.presenter == p.presenter && h.other == p.other)
+                    {
+                        held.push(p);
+                    }
                 }
             }
-        }
-        // A rotated identity's friendships are presented under its
-        // successor's key.
-        let successors = self.chain_from(store, *fp)?;
-        let keys =
-            std::iter::once(*fp).chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0));
-        let mut held: Vec<Presentation> = Vec::new();
-        for key in keys {
-            for p in store.presentations(&key)? {
-                if !held
-                    .iter()
-                    .any(|h| h.presenter == p.presenter && h.other == p.other)
-                {
-                    held.push(p);
+            Ok(held)
+        };
+        let (key, rows, keys, stamp, cleared, held, offers) = {
+            let _writing = self.friend_writes();
+            let (key, rows) = self.epoch_key(&fp)?;
+            let successors = self.chain_from(store, fp)?;
+            let keys: Vec<[u8; 32]> = std::iter::once(fp)
+                .chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0))
+                .collect();
+            let (stamp, cleared) = {
+                let r = self.reconciled.lock().unwrap();
+                (r.of(&keys), r.cleared)
+            };
+            let held = chain(&keys)?;
+            let mut offers = Vec::new();
+            for key in &keys {
+                for (other, o) in store.offers_from(key, wall)? {
+                    offers.push((*key, other, o));
                 }
             }
-        }
-        // Each stored copy once: one that no longer checks goes alone.
-        let mut copies: Vec<(&[u8; 32], &[u8])> = Vec::new();
+            (key, rows, keys, stamp, cleared, held, offers)
+        };
+
+        let floors = Floors::new(self);
+        let epochs = if key == seen {
+            epochs
+        } else {
+            Epochs::of(&fp, key.installed, &rows)
+        };
+        floors
+            .read
+            .borrow_mut()
+            .insert(fp, (Some(key.clone()), epochs));
+        // Each stored copy checked once.
+        let mut checked: Vec<(&[u8], Result<Friendship, Refused>)> = Vec::new();
         for p in &held {
             if let Some(bytes) = p.friendship.as_deref() {
-                if !copies.iter().any(|(_, b)| *b == bytes) {
-                    copies.push((&p.hash, bytes));
+                if !checked.iter().any(|(b, _)| *b == bytes) {
+                    checked.push((bytes, Friendship::check(bytes, STORED, &[], zero_floor)));
                 }
             }
         }
-        let mut whole = true;
-        let mut gone: Vec<&[u8]> = Vec::new();
-        for (hash, bytes) in copies {
-            match floors.held(hash, bytes, &held, STORED) {
-                Judged::Stands => {}
-                Judged::Reset => gone.push(bytes),
-                Judged::Unknown => whole = false,
+        let judge = |floors: &Floors, p: &Presentation, stored: &[Presentation]| {
+            let bytes = p.friendship.as_deref()?;
+            let (_, f) = checked.iter().find(|(b, _)| *b == bytes)?;
+            Some(floors.judged(&p.hash, bytes, f.as_ref(), stored, STORED))
+        };
+        let mut ending: Vec<([u8; 32], [u8; 32])> = Vec::new();
+        for p in &held {
+            let pair = |(a, b): &([u8; 32], [u8; 32])| {
+                (*a, *b) == (p.presenter, p.other) || (*a, *b) == (p.other, p.presenter)
+            };
+            if judge(&floors, p, &held) == Some(Judged::Reset) && !ending.iter().any(pair) {
+                ending.push((p.presenter, p.other));
             }
         }
+        let dropping: Vec<_> = offers
+            .into_iter()
+            .filter_map(|(owner, other, stored)| {
+                let o = Offer::check(&stored.offer, STORED, &[], zero_floor).ok()?;
+                floors.below(&o).then_some((owner, other, stored, o))
+            })
+            .collect();
         floors.failed()?;
-        self.drop_pairs(
-            store,
-            held.iter()
-                .filter(|p| p.friendship.as_deref().is_some_and(|b| gone.contains(&b))),
-        )?;
-        Ok(whole)
+
+        // Offers first, so the entry each tells is the one before an end.
+        for (owner, other, stored, o) in dropping {
+            let _writing = self.friend_writes();
+            if store
+                .offer(&owner, &other, wall)?
+                .is_none_or(|now| now.offer != stored.offer)
+            {
+                continue;
+            }
+            let floors = Floors::after(&floors);
+            let below = floors.below(&o);
+            floors.failed()?;
+            if below {
+                store.set_offer(&owner, &other, None)?;
+                if let (Some(me), Some(them)) = (self.mailbox_of(&owner), self.mailbox_of(&other)) {
+                    self.tell_entry(&them, &me);
+                }
+            }
+        }
+
+        let mut own = vec![0; keys.len()];
+        for (a, b) in ending {
+            let _writing = self.friend_writes();
+            let before = self.reconciled.lock().unwrap().of(&keys);
+            // The whole chain's, as a taking under any key dates the bytes.
+            let held = chain(&keys)?;
+            let floors = Floors::after(&floors);
+            let gone: Vec<&Presentation> = (held.iter())
+                .filter(|p| (p.presenter, p.other) == (a, b) || (p.presenter, p.other) == (b, a))
+                .filter(|p| judge(&floors, p, &held) == Some(Judged::Reset))
+                .collect();
+            floors.failed()?;
+            self.drop_pairs(store, gone)?;
+            // Under the hold every bump is this pass's own.
+            let after = self.reconciled.lock().unwrap().of(&keys);
+            for (own, (b, a)) in own.iter_mut().zip(before.iter().zip(&after)) {
+                *own += a.1.wrapping_sub(b.1);
+            }
+        }
+        #[cfg(test)]
+        self.reconciling.at("ended");
+        let _writing = self.friend_writes();
+        let (now, _) = self.epoch_key(&fp)?;
+        let mut reconciled = self.reconciled.lock().unwrap();
+        let gens = reconciled.of(&keys);
+        let moved = gens.iter().zip(&stamp).zip(&own);
+        let ours = moved
+            .into_iter()
+            .all(|((g, s), own)| g.1 == s.1.wrapping_add(*own));
+        if now == key && reconciled.cleared == cleared && ours {
+            reconciled.at.insert(fp, (key, gens));
+        }
+        Ok(())
+    }
+
+    /// Forget every pass recorded, as a restart does.
+    pub(crate) fn unjudge_all(&self) {
+        let mut reconciled = self.reconciled.lock().unwrap();
+        reconciled.at.clear();
+        reconciled.generation.clear();
+        reconciled.cleared += 1;
+    }
+
+    /// Forget what was reconciled of the friendships under `fps`, in
+    /// every identity's pass whose chain holds one of them: for a change
+    /// that can leave a row no longer held without moving an epoch, such
+    /// as an evidence drop or replacement. Under the hold the change was
+    /// made in.
+    pub(crate) fn unjudge(&self, fps: impl IntoIterator<Item = [u8; 32]>) {
+        let mut reconciled = self.reconciled.lock().unwrap();
+        for fp in fps {
+            *reconciled.generation.entry(fp).or_default() += 1;
+        }
+        if reconciled.generation.len() > GENERATIONS {
+            drop(reconciled);
+            self.unjudge_all();
+        }
     }
 
     /// The account linked to `fp` that takes part, if there is one.
@@ -646,7 +861,9 @@ impl Core {
         end: &Ending,
     ) -> Result<Ended, StoreError> {
         self.make_room(store, &Floors::new(self), &end.withdrawals)?;
-        store.end_friendship(a, b, end)
+        let ended = store.end_friendship(a, b, end)?;
+        self.unjudge([a.fingerprint, b.fingerprint].into_iter().flatten());
+        Ok(ended)
     }
 
     /// What the withdrawals held for `pair` that stand at the current
@@ -852,7 +1069,7 @@ impl Core {
             let taken = old
                 .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
                 .map_or(at, |p| p.taken);
-            store
+            let replaced = store
                 .present(&Presentation {
                     presenter,
                     other,
@@ -866,6 +1083,7 @@ impl Core {
                     taken,
                 })
                 .map_err(store_failed)?;
+            self.replaced(replaced, Some(&bytes));
         }
         let friends = store
             .relationship(me, them, at)
@@ -1062,6 +1280,7 @@ impl Core {
         self.make_room(store, floors, &end.withdrawals)
             .map_err(store_failed)?;
         let ended = store.end_friendship(a, b, &end).map_err(store_failed)?;
+        self.unjudge([party, other]);
         if let Some(e) = ended.ended {
             self.edge_ended(&e, withdraw.as_deref());
             return Ok(Applied::Ended);
@@ -1150,10 +1369,22 @@ impl Core {
         presenters: &[[u8; 32]],
     ) -> Result<Vec<Presentation>, StoreError> {
         let dropped = store.drop_presentations(a, b, presenters)?;
+        if !dropped.gone.is_empty() {
+            self.unjudge([*a, *b]);
+        }
         if let Some(e) = &dropped.ended {
             self.edge_ended(e, None);
         }
         Ok(dropped.gone)
+    }
+
+    /// A presentation `present` answered as replaced, where its evidence
+    /// was other than `now`'s: what it held is judged again.
+    fn replaced(&self, old: Option<Presentation>, now: Option<&[u8]>) {
+        if let Some(old) = old.filter(|o| o.friendship.is_some() && o.friendship.as_deref() != now)
+        {
+            self.unjudge([old.presenter, old.other]);
+        }
     }
 
     /// Drop `gone`, presentations made with no withdrawal, as one step
@@ -1228,8 +1459,9 @@ impl Core {
         }
     }
 
-    /// `p`, held by its own taking alone, dropped where that came after
-    /// a half's reset.
+    /// `p`, held by its own taking and those of its bytes under the other
+    /// keys of its parties' chains alone, dropped where that came after a
+    /// half's reset.
     fn judged_alone(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -1238,8 +1470,16 @@ impl Core {
         let Some(bytes) = p.friendship.as_deref() else {
             return Ok(());
         };
+        let mut stored = vec![p.clone()];
+        for name in p.names {
+            let successors = self.chain_from(store, name)?;
+            let keys = successors.iter().map(|r| Fingerprint::of(&r.successor).0);
+            for key in std::iter::once(name).chain(keys) {
+                stored.extend(store.presentations(&key)?);
+            }
+        }
         let floors = Floors::new(self);
-        let judged = floors.held(&p.hash, bytes, std::slice::from_ref(p), STORED);
+        let judged = floors.held(&p.hash, bytes, &stored, STORED);
         floors.failed()?;
         if judged == Judged::Reset {
             self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
@@ -1682,13 +1922,13 @@ impl Core {
                     names: [my_name.0, their_name.0],
                     pair: pair.hash(),
                     hash,
-                    friendship,
+                    friendship: friendship.clone(),
                     device: device.key,
                     edge,
                     at: wall,
                     taken,
                 })
-                .map(|_| ())
+                .map(|old| self.replaced(old, friendship.as_deref()))
                 .map_err(store_failed)
         };
         // Step 2's refusal keeps the hash alone toward the bound, as the
@@ -1943,8 +2183,9 @@ impl Core {
         // A new link in a chain changes which rows an act judges as the
         // identity's, so it lands between acts.
         let _writing = self.friend_writes();
-        if let Err(e) = store.keep_rotation(&from, &to, record) {
-            warn!("relationships: keeping a rotation record: {e}");
+        match store.keep_rotation(&from, &to, record) {
+            Ok(()) => self.unjudge([from, to]),
+            Err(e) => warn!("relationships: keeping a rotation record: {e}"),
         }
     }
 

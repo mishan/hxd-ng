@@ -2174,9 +2174,9 @@ pub struct Core {
     /// two agree. Taken before `roster`, never while it is held.
     pub(crate) friend_writes: Mutex<()>,
     /// The device epochs each identity's stored friendships were last
-    /// judged by (`Core::judge_floors`). Taken last, and held for no
-    /// other lock.
-    pub(crate) floors_judged: Mutex<HashMap<[u8; 32], crate::messaging::Epochs>>,
+    /// reconciled whole at, and what has changed them since
+    /// (`Core::judge_floors`). Taken last, and held for no other lock.
+    pub(crate) reconciled: Mutex<crate::messaging::Reconciled>,
     /// The kept floor of each signer of an owner's withdrawals when they
     /// were last judged whole (`Core::make_room`). Taken last, and held
     /// for no other lock.
@@ -2272,6 +2272,10 @@ pub struct Core {
     /// for the domain's tests of what lands beside it.
     #[cfg(test)]
     pub(crate) rotated: crate::relationships::failing::Park,
+    /// Where a reconciling pass waits between its ends and its record
+    /// of them, for the domain's tests of what lands between.
+    #[cfg(test)]
+    pub(crate) reconciling: crate::relationships::failing::Park,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

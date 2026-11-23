@@ -200,7 +200,7 @@ fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
     s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
     assert_eq!(
         s.offer(&fp(1), &fp(2), at(99)).unwrap(),
-        Some(offer),
+        Some(offer.clone()),
         "{case}"
     );
     assert_eq!(
@@ -213,6 +213,26 @@ fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
         None,
         "{case}: lapsed"
     );
+    let later = StoredOffer {
+        offer: vec![4],
+        lapses_at: at(300),
+    };
+    s.set_offer(&fp(1), &fp(3), Some(&later)).unwrap();
+    s.set_offer(&fp(3), &fp(1), Some(&later)).unwrap();
+    let mut from = s.offers_from(&fp(1), at(99)).unwrap();
+    from.sort_by_key(|(other, _)| *other);
+    assert_eq!(
+        from,
+        [(fp(2), offer.clone()), (fp(3), later.clone())],
+        "{case}: an owner's, by the party each is to"
+    );
+    assert_eq!(
+        s.offers_from(&fp(1), at(100)).unwrap(),
+        [(fp(3), later)],
+        "{case}: none lapsed"
+    );
+    s.set_offer(&fp(1), &fp(3), None).unwrap();
+    s.set_offer(&fp(3), &fp(1), None).unwrap();
     s.cleanup(at(200), at(0), 10).unwrap();
     assert_eq!(
         s.offer(&fp(1), &fp(2), at(0)).unwrap(),

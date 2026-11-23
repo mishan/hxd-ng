@@ -16,7 +16,10 @@
 //! - a withdrawal kept stands at the floors, and one taken stays held, or
 //!   one of its key cutting as far, that its signer's kept floor has not
 //!   passed, until that floor rises: one that no longer stands never
-//!   costs one that does.
+//!   costs one that does;
+//! - with nothing failing, a pass over both parties leaves no evidence
+//!   that a reset shows is not held, and a second, with nothing of the
+//!   first remembered, changes and tells nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -450,12 +453,18 @@ impl Run {
     /// at or above its signer's floor, or was reset by a record kept after
     /// the friendship was first taken here, by either party.
     fn held(&self, p: &Presentation, all: &[Presentation]) -> bool {
+        self.judged(p, all) == Some(true)
+    }
+
+    /// [`Self::held`], or `None` where a half is below its floor and no
+    /// record kept shows when it was reset.
+    fn judged(&self, p: &Presentation, all: &[Presentation]) -> Option<bool> {
         let Some(Ok(f)) = p
             .friendship
             .as_deref()
             .map(|b| Friendship::check(b, u64::MAX, &[], |_| 0))
         else {
-            return false;
+            return Some(false);
         };
         let taken = all
             .iter()
@@ -463,24 +472,70 @@ impl Run {
             .map(|x| secs(x.taken))
             .min()
             .expect("p is evidence");
-        [&f.offer.cert, &f.acceptance.cert].iter().all(|cert| {
-            let cert = DeviceCert::parse(cert).expect("a certificate");
-            let q = (0..2)
-                .find(|&q| self.people[q].id.public() == cert.identity)
-                .expect("one of the pair");
-            let kept = &self.resets[q];
-            let installed = self.floors.get(&self.people[q].fp()).copied();
-            let floor = kept.iter().map(|(e, _)| *e).chain(installed).max();
-            if floor.is_none_or(|floor| cert.epoch >= floor) {
-                return true;
-            }
-            let reset = kept
-                .iter()
-                .filter(|(e, _)| *e > cert.epoch)
-                .map(|(_, t)| *t)
-                .min();
-            reset.is_some_and(|at| taken < at)
-        })
+        let halves: Vec<Option<bool>> = [&f.offer.cert, &f.acceptance.cert]
+            .iter()
+            .map(|cert| {
+                let cert = DeviceCert::parse(cert).expect("a certificate");
+                let q = (0..2)
+                    .find(|&q| self.people[q].id.public() == cert.identity)
+                    .expect("one of the pair");
+                let kept = &self.resets[q];
+                let installed = self.floors.get(&self.people[q].fp()).copied();
+                let floor = kept.iter().map(|(e, _)| *e).chain(installed).max();
+                if floor.is_none_or(|floor| cert.epoch >= floor) {
+                    return Some(true);
+                }
+                let reset = kept
+                    .iter()
+                    .filter(|(e, _)| *e > cert.epoch)
+                    .map(|(_, t)| *t)
+                    .min();
+                reset.map(|at| taken < at)
+            })
+            .collect();
+        match () {
+            _ if halves.contains(&Some(false)) => Some(false),
+            _ if halves.contains(&None) => None,
+            _ => Some(true),
+        }
+    }
+
+    /// What a pass can change: the pair, its withdrawals, and the offers
+    /// either way.
+    fn reconcilable(&self) -> impl PartialEq + std::fmt::Debug {
+        let wall = self.core.clock.wall();
+        let (fa, fb) = (self.people[0].fp(), self.people[1].fp());
+        let offers: Vec<_> = [(fa, fb), (fb, fa)]
+            .iter()
+            .map(|(p, q)| self.store.offer(p, q, wall).unwrap().map(|o| o.offer))
+            .collect();
+        (self.pairing(), self.signed(), offers)
+    }
+
+    /// With nothing failing, a pass over both parties, as the sweep makes
+    /// over the identities it covers: what it leaves, and what a pass
+    /// after a restart makes of that.
+    fn quiescent(&mut self, what: &str) {
+        let fps = [self.people[0].fp(), self.people[1].fp()];
+        self.core.judge_floors(fps);
+        let all = self.presentations();
+        for p in all.iter().filter(|p| p.evidence()) {
+            assert!(
+                self.judged(p, &all) != Some(false),
+                "{what}: a pass left {:?}, which is not held",
+                row_of(p)
+            );
+        }
+        self.told();
+        let before = self.reconcilable();
+        self.core.unjudge_all();
+        self.core.judge_floors(fps);
+        assert_eq!(self.reconcilable(), before, "{what}: a pass judged again");
+        let told = self.told();
+        assert!(
+            told.iter().flatten().all(Vec::is_empty),
+            "{what}: a pass judged again told {told:?}"
+        );
     }
 
     /// Whether `p`'s account takes part now, and so can be told anything.
@@ -821,6 +876,7 @@ impl Run {
             );
         }
         self.withdrawn = withdrawn;
+        self.quiescent(&what);
     }
 
     /// The floor `q`'s kept records show.

@@ -1051,6 +1051,20 @@ impl RelationshipStore for MemoryRelationships {
             .map(|(_, _, o)| o.clone()))
     }
 
+    fn offers_from(
+        &self,
+        owner: &[u8; 32],
+        now: SystemTime,
+    ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .offers
+            .iter()
+            .filter(|(a, _, o)| a == owner && o.lapses_at > floor(now))
+            .map(|(_, b, o)| (*b, o.clone()))
+            .collect())
+    }
+
     fn keep_rotation(
         &self,
         from: &[u8; 32],
