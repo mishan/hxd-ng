@@ -569,6 +569,62 @@ fn unpresent_pair(
     Ok(gone)
 }
 
+fn befriend(
+    tx: &Connection,
+    a: &Mailbox,
+    b: &Mailbox,
+    at: SystemTime,
+) -> Result<RelationId, StoreError> {
+    let ab = load_pair(tx, a, b)?;
+    let ba = load_pair(tx, b, a)?;
+    let held = |x: &Option<(i64, Relationship)>| x.as_ref().and_then(|(_, r)| r.friendship);
+    let (old_ab, old_ba) = (held(&ab), held(&ba));
+    if let (Some(x), Some(y)) = (old_ab, old_ba) {
+        if x == y {
+            return Ok(x);
+        }
+    }
+    let id = mint(tx, FRIENDSHIP, at)?;
+    let mut ended: Vec<RelationId> = old_ab.into_iter().chain(old_ba).collect();
+    for (row, (x, y)) in [(ab, (a, b)), (ba, (b, a))] {
+        let (rid, mut rel) = match row {
+            Some((rid, rel)) => (Some(rid), rel),
+            None => (None, Relationship::new(x, y)),
+        };
+        rel.friendship = Some(id);
+        rel.pending_out = None;
+        ended.extend(rel.approval.take());
+        write(tx, rid, &mut rel)?;
+    }
+    forget(tx, ended)?;
+    Ok(id)
+}
+
+fn refriend(
+    tx: &Connection,
+    a: &Mailbox,
+    b: &Mailbox,
+    id: RelationId,
+    at: SystemTime,
+) -> Result<(), StoreError> {
+    sql(tx.execute(
+        "INSERT OR IGNORE INTO relation (id, kind, made_at) VALUES (?1, ?2, ?3)",
+        params![id as i64, FRIENDSHIP, unix(at)],
+    ))?;
+    let mut ended = Vec::new();
+    for (x, y) in [(a, b), (b, a)] {
+        let (rid, mut rel) = match load_pair(tx, x, y)? {
+            Some((rid, rel)) => (Some(rid), rel),
+            None => (None, Relationship::new(x, y)),
+        };
+        ended.extend(rel.friendship.replace(id).filter(|old| *old != id));
+        rel.pending_out = None;
+        ended.extend(rel.approval.take());
+        write(tx, rid, &mut rel)?;
+    }
+    forget(tx, ended)
+}
+
 fn set_edge(tx: &Connection, a: &str, b: &str, edge: Option<RelationId>) -> Result<(), StoreError> {
     sql(tx.execute(
         &format!("UPDATE friend_presentation SET edge = ?3 WHERE {PAIR}"),
@@ -861,31 +917,7 @@ impl RelationshipStore for SqliteStore {
     }
 
     fn befriend(&self, a: &Mailbox, b: &Mailbox, at: SystemTime) -> Result<RelationId, StoreError> {
-        self.with_tx(|tx| {
-            let ab = load_pair(tx, a, b)?;
-            let ba = load_pair(tx, b, a)?;
-            let held = |x: &Option<(i64, Relationship)>| x.as_ref().and_then(|(_, r)| r.friendship);
-            let (old_ab, old_ba) = (held(&ab), held(&ba));
-            if let (Some(x), Some(y)) = (old_ab, old_ba) {
-                if x == y {
-                    return Ok(x);
-                }
-            }
-            let id = mint(tx, FRIENDSHIP, at)?;
-            let mut ended: Vec<RelationId> = old_ab.into_iter().chain(old_ba).collect();
-            for (row, (x, y)) in [(ab, (a, b)), (ba, (b, a))] {
-                let (rid, mut rel) = match row {
-                    Some((rid, rel)) => (Some(rid), rel),
-                    None => (None, Relationship::new(x, y)),
-                };
-                rel.friendship = Some(id);
-                rel.pending_out = None;
-                ended.extend(rel.approval.take());
-                write(tx, rid, &mut rel)?;
-            }
-            forget(tx, ended)?;
-            Ok(id)
-        })
+        self.with_tx(|tx| befriend(tx, a, b, at))
     }
 
     fn unfriend(&self, a: &Mailbox, b: &Mailbox) -> Result<Option<RelationId>, StoreError> {
@@ -1196,23 +1228,25 @@ impl RelationshipStore for SqliteStore {
         id: RelationId,
         at: SystemTime,
     ) -> Result<(), StoreError> {
+        self.with_tx(|tx| refriend(tx, a, b, id, at))
+    }
+
+    fn befriend_dropping(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        at: SystemTime,
+        id: Option<RelationId>,
+        drop: &[[u8; 32]],
+    ) -> Result<RelationId, StoreError> {
         self.with_tx(|tx| {
-            sql(tx.execute(
-                "INSERT OR IGNORE INTO relation (id, kind, made_at) VALUES (?1, ?2, ?3)",
-                params![id as i64, FRIENDSHIP, unix(at)],
-            ))?;
-            let mut ended = Vec::new();
-            for (x, y) in [(a, b), (b, a)] {
-                let (rid, mut rel) = match load_pair(tx, x, y)? {
-                    Some((rid, rel)) => (Some(rid), rel),
-                    None => (None, Relationship::new(x, y)),
-                };
-                ended.extend(rel.friendship.replace(id).filter(|old| *old != id));
-                rel.pending_out = None;
-                ended.extend(rel.approval.take());
-                write(tx, rid, &mut rel)?;
+            if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
+                unpresent_pair(tx, &fp_hex(&x), &fp_hex(&y), drop)?;
             }
-            forget(tx, ended)
+            match id {
+                Some(id) => refriend(tx, a, b, id, at).map(|()| id),
+                None => befriend(tx, a, b, at),
+            }
         })
     }
 

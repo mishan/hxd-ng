@@ -163,6 +163,7 @@ through! {
     fn request_dropped(owner: &Mailbox) -> Result<(), StoreError>;
     fn requests_listed(owner: &Mailbox) -> Result<u64, StoreError>;
     fn refriend(a: &Mailbox, b: &Mailbox, id: RelationId, at: SystemTime) -> Result<(), StoreError>;
+    fn befriend_dropping(a: &Mailbox, b: &Mailbox, at: SystemTime, id: Option<RelationId>, drop: &[[u8; 32]]) -> Result<RelationId, StoreError>;
     fn made_at(id: RelationId) -> Result<Option<SystemTime>, StoreError>;
     fn present(p: &Presentation) -> Result<Option<Presentation>, StoreError>;
     fn presentation(presenter: &[u8; 32], other: &[u8; 32]) -> Result<Option<Presentation>, StoreError>;

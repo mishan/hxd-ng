@@ -874,6 +874,22 @@ without a withdrawal, as for a revocation, and an inactive presentation,
 shown to nobody, is dropped without a word. Without this, a server slow
 to learn of a reset would keep for good an edge a thief made after it.
 
+**An edge stands only on held friendships where it is granted.** An
+act that makes an edge active or portable, a presentation (§4.3) or an
+805, or that re-bases an active one on a new friendship, an upgrade
+offer's acceptance (§4.1), judges what it stands on as above, at the
+floors and records held then, and grants nothing over one not held. A
+half below its floor reset after the server took the friendship passes,
+as when presented. A half whose reset `time` no record here shows
+counts as not held for this, though judging again keeps it, since
+nothing shows that it was. A plain 805, or an 802 meeting the other's
+request, making a local edge between two accounts that have presented
+friendships of each other first drops the presentations not held, and a
+presentation that makes a local edge portable drops the other party's
+not held; dropping one no record shows held loses its time of taking
+for good, so a later record showing it held cannot bring it back. A
+friendship stored here that no longer checks is not held.
+
 A presentation taken before the reset's `time`, as a thief's while it
 still had the device can be, is held, and a friendship the thief made
 then stands at that server. That is the residual of grandfathering.

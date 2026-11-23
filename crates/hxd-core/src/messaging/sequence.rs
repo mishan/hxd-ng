@@ -10,26 +10,31 @@
 //!   told as removed while the store still holds the friendship;
 //! - each party's friend set in the roster is the store's;
 //! - a request hold exists exactly where a removal or a withdrawal that
-//!   ended both sides' evidence placed one.
+//!   ended both sides' evidence placed one;
+//! - an edge is made active only over evidence held at the floors, and an
+//!   accepted friendship takes the id a dropped presentation kept.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hl_identity::friendship::Pair;
 use hl_identity::{
-    Acceptance, DeviceCert, DeviceKey, Fingerprint, Friendship, IdentityKey, Offer, Withdrawal,
+    Acceptance, DeviceCert, DeviceEpoch, DeviceKey, Fingerprint, Friendship, IdentityKey, Offer,
+    Withdrawal,
 };
 use sha2::{Digest, Sha256};
 
 use super::{Key, RosterState};
 use crate::access::bit;
+use crate::identity_records::{KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, MemoryStore};
 use crate::relationships::failing::{Failing, READS};
-use crate::relationships::{RelationId, RelationshipStore, Requester};
+use crate::relationships::{Presentation, RelationId, RelationshipStore, Requester};
 use crate::roster::{AttachInfo, Event, InboxPolicy, Uid};
 use crate::{
-    AccessBits, AccountDirectory, Core, Events, IdentityTag, MessagingPolicy, Revocations,
+    AccessBits, AccountDirectory, Core, Events, IdentityTag, MessagingPolicy, Published,
+    Revocations,
 };
 
 const LOGINS: [&str; 2] = ["alice", "bob"];
@@ -40,15 +45,17 @@ struct Person {
 }
 
 impl Person {
+    /// Its first device certified in epoch 0, which a reset ends, and its
+    /// second in epoch 1, which stays.
     fn new(seed: u8, now: u64) -> Self {
         let id = IdentityKey::from_seed(&[seed; 32]);
         let devices = (0..2u8)
             .map(|n| {
                 let dev = DeviceKey::from_seed(&[seed * 16 + n + 1; 32]);
-                let cert = DeviceCert::for_device(&id, &dev, now - 3600, 90 * 24 * 3600)
-                    .expect("a certificate")
-                    .sign(&id);
-                (dev, cert)
+                let mut cert = DeviceCert::for_device(&id, &dev, now - 3600, 90 * 24 * 3600)
+                    .expect("a certificate");
+                cert.epoch = n.into();
+                (dev, cert.sign(&id))
             })
             .collect();
         Person { id, devices }
@@ -173,6 +180,13 @@ enum Step {
     /// The messaging bit lost, or given back.
     Messaging,
     Revoke,
+    /// The party reset its first device: a floor of 1 installed with no
+    /// record, a record from before the run kept and installed, or a
+    /// record dated now kept with nothing installed, which nothing judges
+    /// by until an act does.
+    Floor {
+        how: u32,
+    },
 }
 
 /// What fails while a step runs.
@@ -209,7 +223,8 @@ impl Step {
             25 => Step::RemoveByKey,
             26 => Step::Messaging,
             27 => Step::Revoke,
-            28 | 29 => Step::Answer {
+            28 | 30 => Step::Floor { how: arg % 3 },
+            29 => Step::Answer {
                 friendship: arg & 1 == 1,
             },
             _ => Step::Present { k: arg as usize },
@@ -235,6 +250,21 @@ struct Pairing {
     held: [bool; 2],
     /// Whether each has a request to the other waiting, delivered.
     asking: [bool; 2],
+    /// The ids the pair's presentations keep.
+    kept: Vec<RelationId>,
+    /// Each presentation with evidence, as `(presenter, hash, taken)`.
+    rows: Vec<Row>,
+}
+
+type Row = ([u8; 32], [u8; 32], u64);
+
+fn row_of(p: &Presentation) -> Row {
+    (p.presenter, p.hash, secs(p.taken))
+}
+
+fn secs(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 struct Run {
@@ -242,9 +272,17 @@ struct Run {
     store: Arc<dyn RelationshipStore>,
     fail: Arc<Failing>,
     dir: Arc<Directory>,
+    records: Arc<MemoryRecordCache>,
     people: [Person; 2],
     /// Each party's two device sessions.
     sessions: [[(Uid, Events); 2]; 2],
+    /// The sessions a floor ended.
+    ended: HashSet<Uid>,
+    /// The floors installed, and each party's reset records kept, as
+    /// `(epoch, time)`.
+    floors: HashMap<[u8; 32], u64>,
+    resets: [Vec<(u64, u64)>; 2],
+    base: u64,
     friendships: Vec<Vec<u8>>,
     offers: [Option<Vec<u8>>; 2],
     revoked: HashSet<[u8; 32]>,
@@ -266,6 +304,7 @@ impl Run {
             .expect("after 1970")
             .as_secs();
         let people = [Person::new(1, base), Person::new(2, base)];
+        let records = Arc::new(MemoryRecordCache::default());
         let dir = Arc::new(Directory(Mutex::new(
             LOGINS
                 .iter()
@@ -286,9 +325,7 @@ impl Run {
                     presence_debounce: Duration::ZERO,
                     ..MessagingPolicy::default()
                 })
-                .with_record_cache(Arc::new(
-                    crate::identity_records::MemoryRecordCache::default(),
-                )),
+                .with_record_cache(records.clone()),
         );
         let sessions = [0, 1].map(|p| [0, 1].map(|d| attach(&core, LOGINS[p], &people[p], d)));
         // Two friendships made elsewhere a minute before the run.
@@ -320,8 +357,13 @@ impl Run {
             store,
             fail,
             dir,
+            records,
             people,
             sessions,
+            ended: HashSet::new(),
+            floors: HashMap::new(),
+            resets: [Vec::new(), Vec::new()],
+            base,
             friendships,
             offers: [None, None],
             revoked: HashSet::new(),
@@ -365,7 +407,61 @@ impl Run {
             evidence: [evidence(&fa, &fb), evidence(&fb, &fa)],
             held: [held(&a, &b), held(&b, &a)],
             asking: [asking(&ab), asking(&ba)],
+            kept: self.presentations().iter().filter_map(|p| p.edge).collect(),
+            rows: self
+                .presentations()
+                .iter()
+                .filter(|p| p.evidence())
+                .map(row_of)
+                .collect(),
         }
+    }
+
+    /// The pair's presentations, alice's first.
+    fn presentations(&self) -> Vec<Presentation> {
+        let (fa, fb) = (self.people[0].fp(), self.people[1].fp());
+        [(fa, fb), (fb, fa)]
+            .iter()
+            .filter_map(|(p, q)| self.store.presentation(p, q).unwrap())
+            .collect()
+    }
+
+    /// Whether `p`'s friendship is held at the floors and records this run
+    /// installed and kept, judged from first principles: each half stands
+    /// at or above its signer's floor, or was reset by a record kept after
+    /// the friendship was first taken here, by either party.
+    fn held(&self, p: &Presentation, all: &[Presentation]) -> bool {
+        let Some(Ok(f)) = p
+            .friendship
+            .as_deref()
+            .map(|b| Friendship::check(b, u64::MAX, &[], |_| 0))
+        else {
+            return false;
+        };
+        let taken = all
+            .iter()
+            .filter(|x| x.hash == p.hash && x.evidence())
+            .map(|x| secs(x.taken))
+            .min()
+            .expect("p is evidence");
+        [&f.offer.cert, &f.acceptance.cert].iter().all(|cert| {
+            let cert = DeviceCert::parse(cert).expect("a certificate");
+            let q = (0..2)
+                .find(|&q| self.people[q].id.public() == cert.identity)
+                .expect("one of the pair");
+            let kept = &self.resets[q];
+            let installed = self.floors.get(&self.people[q].fp()).copied();
+            let floor = kept.iter().map(|(e, _)| *e).chain(installed).max();
+            if floor.is_none_or(|floor| cert.epoch >= floor) {
+                return true;
+            }
+            let reset = kept
+                .iter()
+                .filter(|(e, _)| *e > cert.epoch)
+                .map(|(_, t)| *t)
+                .min();
+            reset.is_some_and(|at| taken < at)
+        })
     }
 
     /// Whether `p`'s account takes part now, and so can be told anything.
@@ -444,6 +540,36 @@ impl Run {
                 });
                 true
             }
+            Step::Floor { how } => {
+                let fp = me.fp();
+                if how != 0 {
+                    let time = if how == 1 { self.base - 120 } else { now };
+                    let record = DeviceEpoch {
+                        identity: me.id.public(),
+                        epoch: 1,
+                        time,
+                    }
+                    .sign(&me.id)
+                    .expect("a record");
+                    let kept = KeptEpoch {
+                        epoch: 1,
+                        time,
+                        record,
+                    };
+                    self.records.keep_epoch(&fp, &kept).expect("kept");
+                    self.resets[p].push((1, time));
+                }
+                if how != 2 {
+                    self.floors.insert(fp, 1);
+                    let ended = core.set_published_revocations(Published {
+                        floors: self.floors.clone(),
+                        covered: self.floors.keys().copied().collect(),
+                        ..Default::default()
+                    });
+                    self.ended.extend(ended.into_iter().map(|(uid, _)| uid));
+                }
+                true
+            }
         }
     }
 
@@ -485,8 +611,15 @@ impl Run {
         let what = format!("{step:?} by {} on device {d}, {failure:?}", LOGINS[p]);
 
         // An edge made active by presentations keeps its evidence both
-        // ways while it is active.
+        // ways while it is active; one a request made active again under
+        // its id, beside one party's alone, is local.
+        let accepted =
+            matches!(step, Step::Answer { friendship: true }) && self.offers[1 - p].is_some();
+        let requested = matches!(step, Step::Ask { .. } | Step::Answer { .. }) && !accepted;
         if let Some(id) = after.friendship {
+            if requested && before.friendship.is_none() && after.evidence != [true, true] {
+                self.portable.remove(&id);
+            }
             if after.evidence == [true, true] {
                 self.portable.insert(id);
             }
@@ -497,7 +630,8 @@ impl Run {
         }
 
         // An ending is told to each session of both once, a removal only
-        // once committed, and only what removes or withdraws ends an edge
+        // once committed, and only what removes or withdraws, or a
+        // presentation, which judges the other party's (§6), ends an edge
         // that was not its presentations' alone.
         let ended = before.friendship.is_some() && after.friendship != before.friendship;
         let ends = matches!(
@@ -507,14 +641,18 @@ impl Run {
                 | Step::Block
                 | Step::PresentWithdrawal
                 | Step::RemoveByKey
-        ) || (matches!(step, Step::Link | Step::Revoke)
+                | Step::Present { .. }
+        ) || (matches!(step, Step::Link | Step::Revoke | Step::Floor { .. })
             && before.evidence == [true, true]);
         assert!(
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
         );
         for (q, sessions) in told.iter().enumerate() {
-            for told in sessions {
+            for (d, told) in sessions.iter().enumerate() {
+                if self.ended.contains(&self.sessions[q][d].0) {
+                    continue;
+                }
                 let removed = told.iter().filter(|s| **s == RosterState::Removed).count();
                 assert!(removed <= 1, "{what}: {} told twice: {told:?}", LOGINS[q]);
                 if removed > 0 {
@@ -534,6 +672,28 @@ impl Run {
                     );
                 }
             }
+        }
+
+        // An active edge stands on held evidence wherever a step made it
+        // active, made it portable or wrote evidence for it, and an
+        // accepted friendship takes the id a dropped presentation kept.
+        if let Some(id) = after.friendship {
+            let granted = before.friendship.is_none()
+                || (before.evidence != [true, true] && after.evidence == [true, true]);
+            let all = self.presentations();
+            for pres in all.iter().filter(|p| p.evidence()) {
+                let written = !before.rows.contains(&row_of(pres));
+                assert!(
+                    !(granted || written) || self.held(pres, &all),
+                    "{what}: active over {pres:?}, which is not held"
+                );
+            }
+            let reused = !accepted
+                || before.friendship.is_some()
+                || after.evidence != [true, true]
+                || before.kept.is_empty()
+                || before.kept.contains(&id);
+            assert!(reused, "{what}: made {id} over kept {:?}", before.kept);
         }
 
         // The roster's friend sets are the store's.
@@ -630,8 +790,20 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
     (uid, rx)
 }
 
-/// Sequences a property test once found failing, run on every store.
-pub const FOUND: &[&[u32]] = &[&[3653138233, 1083754464, 736438803, 2139438085]];
+/// Sequences run on every store: ones a property test once found
+/// failing, and ones that reach what it rarely draws: an edge made active
+/// beside a presentation no record shows held, a friendship accepted
+/// where a dropped presentation kept the id, and an upgrade offer a reset
+/// device signed, accepted.
+pub const FOUND: &[&[u32]] = &[
+    &[1073741952, 1073741852, 1073741989],
+    &[1073741979, 1073741980, 1073742026],
+    &[1073741883, 1073742016, 1073742053],
+    &[3653138233, 1083754464, 736438803, 2139438085],
+    &[
+        3598185087, 4667, 535997, 1755425304, 1160182336, 1648425276, 1769223613,
+    ],
+];
 
 /// Run `steps` against a store from `new_store`, each step held to the
 /// invariants above.

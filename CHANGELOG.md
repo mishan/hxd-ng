@@ -326,6 +326,21 @@ as AGENTS.md's "Releasing" describes it.
   id of one the reset ended, so messages queued before the reset stay
   held. A roster entry the server cannot read is no longer told as
   removed.
+- Portable friendships are granted only over friendships held at the
+  device epoch floors (docs/proposals/portable-friends.md §6): a
+  friendship made by a plain Friend Response (805), or by an Add Friend
+  (802) meeting the other's request, first drops what either party
+  presented that is not held, or that no record shows held, losing that
+  presentation's time of taking for good, so it stays local rather than
+  becoming portable over it; so does a presentation that makes a local
+  friendship portable, for the other party's. A friendship made by
+  request or accepted with an 805 takes the id a dropped presentation
+  kept, so messages queued on it are released. An 805 or an upgrade
+  offer's acceptance now takes a half below its floor that was reset
+  after this server took the friendship, where it answered
+  `BadSignature`. A stored friendship that no longer checks is not held,
+  so judging it again drops it and ends the edge it kept active, logged
+  as an error.
 - A client that may use any name logging in, agreeing or changing its
   info with an empty name, or one a classic client reads as empty (a
   leading NUL, or nothing but control characters), and shown with none:
