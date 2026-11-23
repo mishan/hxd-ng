@@ -97,8 +97,9 @@ as AGENTS.md's "Releasing" describes it.
   and the epoch this holder keeps to every
   registrar the identity is registered at, each one its card's
   attestations name and each `--registrar`, catching up one more than 16
-  behind in steps. It is done at a registrar only once a signed read of
-  its list after the post shows the record this run posted at that
+  behind in steps, and signing nothing after a registrar's last reset
+  dated more than five minutes ahead. It is done at a registrar only
+  once a signed read of its list after the post shows the record this run posted at that
   epoch; it names every registrar where it is not, with `retry_after`
   when one is rate-limited, and a rerun resets once more. This machine's
   own certificate is renewed at the new epoch once any list shows a floor
