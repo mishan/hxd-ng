@@ -325,7 +325,7 @@ impl Core {
     /// its account links now, not only at login, unexpired, and not
     /// revoked here.
     pub(super) fn device_act(&self, uid: Uid) -> Result<(super::Me, Device), MessagingError> {
-        let me = self.messenger(uid)?;
+        let me = self.caller(uid, true)?;
         let now = self.clock.unix();
         let (identity, key, cert, refused) = {
             let r = self.roster.lock().unwrap();
@@ -353,6 +353,7 @@ impl Core {
         if linked != Some(identity) || self.refuses(&refused) {
             return Err(MessagingError::NotDeviceProved);
         }
+        self.staying(uid)?;
         Ok((me, Device { key, cert }))
     }
 
@@ -1188,6 +1189,24 @@ impl Core {
         self.tell_entry_with(b, a, withdraw);
     }
 
+    /// What a rotation's merge dropped, told and judged as any drop is:
+    /// each edge it ended, then the other party's presentation each
+    /// dropped one leaves held by its own taking alone. Under the hold the
+    /// merge was made in, once the roster has followed it.
+    pub(crate) fn merge_dropped(
+        &self,
+        _writing: &super::FriendWrites<'_>,
+        store: &Arc<dyn RelationshipStore>,
+        rekeyed: &crate::relationships::Rekeyed,
+    ) {
+        for e in &rekeyed.ended {
+            self.edge_ended(e, None);
+        }
+        for gone in &rekeyed.dropped {
+            logged("judging an orphan", self.orphan_judged(store, gone));
+        }
+    }
+
     /// The other party's presentation of the friendship `gone` was of,
     /// dropped where only `gone` held it, taken itself after a half's
     /// reset (§6). A withdrawal or a removal ends the edge, and whatever
@@ -1336,7 +1355,7 @@ impl Core {
             }
         }
         if let Some(mine) = me.mailbox.fingerprint {
-            let _writing = self.friend_writes();
+            let _writing = self.friend_act(uid)?;
             // A friend the directory no longer names is removed as one
             // it does, so its other devices do not present it back.
             let them = Mailbox::identified("", *fingerprint);
@@ -1380,7 +1399,7 @@ impl Core {
         let me = self.messenger(uid)?;
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         let now = self.clock.wall();
         match self.offer_between(store, &me.mailbox, &them, now) {
             Some(o) if o.offer == offer => {
@@ -1921,6 +1940,9 @@ impl Core {
             Fingerprint::of(&r.identity).0,
             Fingerprint::of(&r.successor).0,
         );
+        // A new link in a chain changes which rows an act judges as the
+        // identity's, so it lands between acts.
+        let _writing = self.friend_writes();
         if let Err(e) = store.keep_rotation(&from, &to, record) {
             warn!("relationships: keeping a rotation record: {e}");
         }

@@ -369,8 +369,11 @@ impl Core {
             });
         }
         // Held from the write to this send's own hand-over, so no roster
-        // read hands the row over in between as one that waited.
+        // read hands the row over in between as one that waited. And
+        // asked under it whether the sender is on its way out, as a
+        // rotation moves mail under it once it has ended its sessions.
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        self.staying(uid)?;
         let pushed = store
             .push(
                 &NewMessage {

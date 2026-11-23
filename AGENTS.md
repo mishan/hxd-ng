@@ -126,7 +126,19 @@ operation**: one transaction in the SQLite store, one lock hold in the
 memory store, with a conformance case run against both. In new and
 changed code, a domain sequence of separate writes that must all happen
 is a defect, not an ordering to get right. A friendship ends only
-through `end_friendship` or `drop_presentations`.
+through `end_friendship`, `drop_presentations` or a rotation's merge
+(`rotate`).
+
+**Relationship state is written under `Core::friend_writes`**, a claim
+and a rotation too: the store op, the roster's friend sets following it
+and what it tells, in one hold, so no act finds the store moved and the
+roster not. An act asks under the hold whether its session is being
+ended (`Core::friend_act`), as a send does under `flushing`, so a
+rotation that ends its sessions and then holds both leaves none of
+their writes behind. Locks go `friend_writes`, then `flushing`, then
+`pm_reacting`, then the roster or a store (the publication lock read
+beneath it); nothing holding one of those takes `friend_writes`. A step
+that must share its caller's hold takes the guard (`FriendWrites`).
 
 **Outbox seqs are gapless.** Every event a session should see consumes a
 seq, including events the ng protocol can't express yet — those become

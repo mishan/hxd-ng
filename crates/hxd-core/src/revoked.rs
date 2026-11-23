@@ -360,8 +360,27 @@ impl Core {
     /// [`Self::set_revocations`] does for the operator's own list.
     /// Called off the reactor, as [`Self::set_revocations`] is.
     pub fn set_published_revocations(&self, list: Published) -> Vec<(Uid, String)> {
+        self.set_published_revocations_keeping(list, &[])
+    }
+
+    /// [`Self::set_published_revocations`], keeping the floor installed
+    /// for each of `kept` where it is higher than the list's: the
+    /// identities whose lists could not be read, whose floor an
+    /// admission may have raised since. Read under the write, so no raise
+    /// lands between the read and the install.
+    pub fn set_published_revocations_keeping(
+        &self,
+        mut list: Published,
+        kept: &[[u8; 32]],
+    ) -> Vec<(Uid, String)> {
         let (identities, devices, floors): (Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
+            for id in kept {
+                if let Some(&installed) = refused.published.floors.get(id) {
+                    let floor = list.floors.entry(*id).or_default();
+                    *floor = (*floor).max(installed);
+                }
+            }
             let risen = list
                 .floors
                 .iter()
@@ -496,14 +515,16 @@ impl Core {
     /// rotation has moved that account, what such a session writes
     /// under the old key would be stranded there.
     pub(crate) fn end_identity(&self, identity: [u8; 32]) -> Vec<(Uid, String)> {
+        // One already on its way out has been told so.
         self.end_sessions(
             |s| {
-                s.identity == Some(identity)
-                    || s.info
-                        .transport
-                        .identity
-                        .as_ref()
-                        .is_some_and(|t| t.fingerprint == identity)
+                !s.kicked
+                    && (s.identity == Some(identity)
+                        || s.info
+                            .transport
+                            .identity
+                            .as_ref()
+                            .is_some_and(|t| t.fingerprint == identity))
             },
             |_| None,
         )
@@ -745,6 +766,26 @@ mod tests {
             core.key_refusal(&at(1, 13, 1).cert()),
             Some(KeyRefusal::Revoked),
             "a revoked device is told so, whatever its epoch"
+        );
+    }
+
+    #[test]
+    fn an_install_keeps_a_floor_raised_since_its_list_was_read_where_asked() {
+        let core = Core::new();
+        // Both lists read at floor 1; an admission raised both since.
+        let read = Published {
+            floors: [([1; 32], 1), ([2; 32], 1)].into(),
+            ..Published::default()
+        };
+        core.set_published_revocations(read.clone());
+        for id in [[1; 32], [2; 32]] {
+            core.raise_floor(id, 3);
+        }
+        core.set_published_revocations_keeping(read, &[[1; 32]]);
+        assert_eq!(
+            [[1; 32], [2; 32]].map(|id| core.published_floor(&id)),
+            [Some(3), Some(1)],
+            "the one kept keeps the raise; the other takes the list's"
         );
     }
 

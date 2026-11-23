@@ -1,8 +1,9 @@
 //! A [`RelationshipStore`] that fails a call when asked to, for what a
-//! failed read or write leaves: the domain's tests and
-//! [`crate::messaging::sequence`] wrap either store in it.
+//! failed read or write leaves, or holds one, for what lands beside it:
+//! the domain's tests and [`crate::messaging::sequence`] wrap either store
+//! in it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use super::{
@@ -38,6 +39,7 @@ pub(crate) const READS: &[&str] = &[
     "rotation_from",
     "rotation_to",
     "account",
+    "claimable",
     "purge_count",
 ];
 
@@ -56,6 +58,63 @@ pub(crate) struct Failing {
     inner: Arc<dyn RelationshipStore>,
     plan: Mutex<Plan>,
     failed: Mutex<Option<&'static str>>,
+    /// Held once its call is made, at the method's name.
+    pub(crate) park: Park,
+}
+
+/// A named point the next call to reach it waits at, until the test lets
+/// it go: for what another thread does while it waits.
+#[derive(Default)]
+pub(crate) struct Park(Mutex<Option<Waiting>>);
+
+/// The point, how the call says it arrived, and what it waits on.
+type Waiting = (&'static str, mpsc::Sender<()>, mpsc::Receiver<()>);
+
+/// The test's side of a held call.
+#[cfg(test)]
+pub(crate) struct Parked {
+    arrived: mpsc::Receiver<()>,
+    go: mpsc::Sender<()>,
+}
+
+impl Park {
+    /// The next call to reach `point` waits there until what this
+    /// answers is released or dropped.
+    #[cfg(test)]
+    pub(crate) fn arm(&self, point: &'static str) -> Parked {
+        let (arrive, arrived) = mpsc::channel();
+        let (go, wait) = mpsc::channel();
+        *self.0.lock().unwrap() = Some((point, arrive, wait));
+        Parked { arrived, go }
+    }
+
+    pub(crate) fn at(&self, point: &'static str) {
+        let held = {
+            let mut armed = self.0.lock().unwrap();
+            match armed.as_ref() {
+                Some((p, ..)) if *p == point => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, arrive, wait)) = held {
+            let _ = arrive.send(());
+            let _ = wait.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Parked {
+    /// Wait for the call to arrive.
+    pub(crate) fn arrived(&self) {
+        self.arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the call arrives at its point");
+    }
+
+    pub(crate) fn release(self) {
+        let _ = self.go.send(());
+    }
 }
 
 impl Failing {
@@ -64,6 +123,7 @@ impl Failing {
             inner,
             plan: Mutex::new(Plan::Off),
             failed: Mutex::new(None),
+            park: Park::default(),
         }
     }
 
@@ -130,7 +190,9 @@ macro_rules! through {
         impl RelationshipStore for Failing {
             $(fn $name(&self, $($arg: $ty),*) -> $ret {
                 self.call(stringify!($name))?;
-                self.inner.$name($($arg),*)
+                let out = self.inner.$name($($arg),*);
+                self.park.at(stringify!($name));
+                out
             })*
         }
     };
@@ -185,6 +247,7 @@ through! {
     fn account(of: &Mailbox) -> Result<MessagingAccount, StoreError>;
     fn update_account(of: &Mailbox, update: &AccountUpdate) -> Result<(), StoreError>;
     fn claim(login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
+    fn claimable(login: &str) -> Result<bool, StoreError>;
     fn rotate(from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
     fn purge(of: &Mailbox) -> Result<usize, StoreError>;
     fn purge_count(of: &Mailbox) -> Result<usize, StoreError>;

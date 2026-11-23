@@ -1792,14 +1792,14 @@ fn a_merge_whose_ending_fails_changes_and_tells_nothing() {
         e.is_some_and(|e| e.friends.contains(&Key::of(&mb)))
     };
     s.fail.fail_next("end_friendship");
-    s.core.after_merge(&ma);
+    s.core.after_merge(&s.core.friend_writes(), &ma);
     assert!(s.fail.failed().is_some());
     assert!(friendship_of(&s, &alice, &bob).is_some());
     assert!(befriended(&s), "the roster as the store left it");
     assert_eq!(told(&mut ra), []);
     assert_eq!(told(&mut rb), []);
 
-    s.core.after_merge(&ma);
+    s.core.after_merge(&s.core.friend_writes(), &ma);
     assert_eq!(friendship_of(&s, &alice, &bob), None);
     assert!(!befriended(&s));
 }
@@ -2010,7 +2010,7 @@ fn a_merge_ends_a_blocked_friendship_with_its_requests() {
     };
     s.rel.set_pending_out(&mb, &ma, Some(&asked)).unwrap();
     s.fail.fail_nth_write(2);
-    s.core.after_merge(&ma);
+    s.core.after_merge(&s.core.friend_writes(), &ma);
     let asking = s.rel.relationship(&mb, &ma, at).unwrap();
     assert_eq!(
         friendship_of(&s, &alice, &bob).is_some(),
@@ -2055,7 +2055,7 @@ fn a_merges_block_ends_what_a_block_ends() {
     s.rel
         .set_blocked(&ma, &mb, true, std::time::SystemTime::now())
         .unwrap();
-    s.core.after_merge(&ma);
+    s.core.after_merge(&s.core.friend_writes(), &ma);
     assert_eq!(friendship_of(&s, &alice, &bob), None);
     s.core.inbox_block(a, "bob", false).unwrap();
 
@@ -2584,6 +2584,75 @@ fn a_rotation_keeps_the_successors_withdrawal_over_one_that_no_longer_stands() {
             .rotate_identity(&fp(&alice), &fp(&successor))
             .unwrap();
         assert_eq!(held(), [Some(theirs)], "unreadable {unreadable}");
+    }
+}
+
+#[test]
+fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
+    // The successor already holds a presentation of Bob, so Alice's moved
+    // one goes. As a hash alone it leaves the edge evidence one way; whole,
+    // it leaves Bob's held by his own taking alone, after Alice's reset.
+    for whole in [false, true] {
+        let (alice, bob, successor) = (person(1), person(2), person(4));
+        let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+        let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
+        let s = linked(&accounts);
+        let t = s.core.clock().unix();
+        let (a, _) = device(&s.core, "alice", &alice, 1);
+        let (_, first) = s
+            .core
+            .friendships_present(a, vec![], vec![f.clone()])
+            .unwrap();
+        assert!(ok_all(&first));
+        s.core.clock().advance(std::time::Duration::from_secs(10));
+        reset(&s, &alice, 1, t + 5);
+        let (b, mut rb) = device(&s.core, "bob", &bob, 1);
+        let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+        assert!(ok_all(&held));
+        let id = friendship_of(&s, &alice, &bob).expect("friends");
+        let theirs = accept(&offer(&successor, 0, &bob, now() - 30), &bob, 0, now() - 30);
+        let at = super::unix_time(t);
+        s.rel
+            .present(&Presentation {
+                presenter: fp(&successor),
+                other: fp(&bob),
+                names: [fp(&successor), fp(&bob)],
+                pair: pair_of(&successor, &bob),
+                hash: hash(&theirs),
+                friendship: whole.then_some(theirs),
+                device: Fingerprint::of(&successor.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+        drain(&mut rb);
+
+        s.core
+            .rotate_identity(&fp(&alice), &fp(&successor))
+            .unwrap();
+        let rows = s
+            .rel
+            .relationship(
+                &Mailbox::identified("bob", fp(&bob)),
+                &Mailbox::identified("alice", fp(&successor)),
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(rows.and_then(|r| r.friendship), None, "whole {whole}");
+        assert_eq!(
+            told(&mut rb),
+            [("alice".into(), RosterState::Removed, vec![], None)],
+            "whole {whole}"
+        );
+        let kept: Vec<_> = s
+            .rel
+            .presentations(&fp(&successor))
+            .unwrap()
+            .into_iter()
+            .map(|p| p.edge)
+            .collect();
+        assert!(kept.contains(&Some(id)), "whole {whole}: {kept:?}");
     }
 }
 

@@ -272,8 +272,14 @@ pub struct Rekeyed {
     pub moved: usize,
     /// `(lost, kept)`: a friendship or approval id that a merge ended,
     /// and the one of the same pair that stands in its place, once each,
-    /// in order.
+    /// in order. A presentation's kept id follows it.
     pub merged: Vec<(RelationId, RelationId)>,
+    /// A rotation's: the predecessor's presentations dropped for one the
+    /// successor holds for the same pair, keyed as they would have moved.
+    pub dropped: Vec<Presentation>,
+    /// The edges those drops ended, by the drop rule
+    /// [`RelationshipStore::drop_presentations`] keeps.
+    pub ended: Vec<EndedEdge>,
 }
 
 /// Who sent a request, as its bounds and holds count it: an account by
@@ -859,10 +865,14 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// record already on the fingerprint is the one kept. Idempotent.
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
+    /// Whether `claim` would find anything keyed by `login` alone.
+    fn claimable(&self, login: &str) -> Result<bool, StoreError>;
+
     /// The identity rotated to a successor key: re-stamp everything keyed
     /// by `from` with `to`, merging as `claim` does, presentations,
     /// offers and the withdrawals it counts toward among it; a successor
-    /// already holding one for the same other party keeps its own.
+    /// already holding one for the same other party keeps its own, and a
+    /// pair that had evidence both ways and has it no more ends its edge.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the

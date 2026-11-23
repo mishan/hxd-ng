@@ -347,6 +347,14 @@ as AGENTS.md's "Releasing" describes it.
   earlier cutoff, past an account's cap of them, or meeting it in a
   rotation's merge. Such a withdrawal is dropped first instead
   (docs/proposals/portable-friends.md §4.3).
+- A rotation whose successor already presented a friend keeps the
+  successor's presentation as before, and now judges the friendship as
+  any dropped presentation does: one left without the friendship both
+  ways, or held only by what was dropped, ends, both parties told. An
+  unfriend made while an identity rotates or an account links one no
+  longer leaves the friend shown online to the other, and a session of a
+  key rotated away sends, asks and changes nothing once it is being
+  ended, so nothing it does is left under the old key.
 - A client that may use any name logging in, agreeing or changing its
   info with an empty name, or one a classic client reads as empty (a
   leading NUL, or nothing but control characters), and shown with none:

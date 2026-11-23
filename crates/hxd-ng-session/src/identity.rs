@@ -2241,26 +2241,35 @@ impl IdentityState {
                     here.remove(&fp);
                 }
                 for fp in &live_ids {
-                    let mut part = slice_of(&refused, fp, here.get(fp));
-                    // One whose lists could not be read keeps the floor
-                    // installed, which an admission since the last sweep
-                    // may have raised.
-                    let installed = unread
-                        .contains(fp)
-                        .then(|| this.core.published_floor(&fp.0));
-                    if let Some(installed) = installed.flatten() {
-                        let floor = part.floors.entry(fp.0).or_default();
-                        *floor = (*floor).max(installed);
-                    }
+                    let part = slice_of(&refused, fp, here.get(fp));
                     here.insert(*fp, part);
                 }
                 for part in here.values().chain(found.values().map(|(_, p)| p)) {
                     refused.merge(part);
                 }
             }
+            // One whose lists could not be read keeps the floor installed,
+            // which an admission since the last sweep may have raised.
+            let kept: Vec<Fingerprint> = live_ids
+                .iter()
+                .filter(|fp| unread.contains(fp))
+                .copied()
+                .collect();
+            let keys: Vec<[u8; 32]> = kept.iter().map(|fp| fp.0).collect();
             // Here too: installing it drops what newly revoked devices
             // presented, from the store.
-            this.core.set_published_revocations(refused)
+            let ended = this.core.set_published_revocations_keeping(refused, &keys);
+            // And its part keeps it, for the ticks it is read no better.
+            let mut held = this.offline.lock().unwrap_or_else(|e| e.into_inner());
+            for fp in &kept {
+                if let (Some(floor), Some(part)) =
+                    (this.core.published_floor(&fp.0), held.live.get_mut(fp))
+                {
+                    let kept = part.floors.entry(fp.0).or_default();
+                    *kept = (*kept).max(floor);
+                }
+            }
+            ended
         })
         .await
         .unwrap_or_default()
