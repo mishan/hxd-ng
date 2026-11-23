@@ -445,19 +445,26 @@ impl Core {
                 }
             }
         }
-        // Each friendship once.
-        let mut friendships: HashMap<[u8; 32], &[u8]> = HashMap::new();
-        for p in &held {
-            if let Some(bytes) = p.friendship.as_deref() {
-                friendships.entry(p.hash).or_insert(bytes);
+        // Each stored copy once, judged at the takings of the presentations
+        // holding it: one that no longer checks goes alone, and holds
+        // nothing for a copy of its hash that does.
+        let mut copies: Vec<&[u8]> = Vec::new();
+        for bytes in held.iter().filter_map(|p| p.friendship.as_deref()) {
+            if !copies.contains(&bytes) {
+                copies.push(bytes);
             }
         }
         let mut whole = true;
-        let mut gone: Vec<[u8; 32]> = Vec::new();
-        for (hash, bytes) in &friendships {
-            match floors.held(hash, bytes, &held, STORED) {
+        let mut gone: Vec<&[u8]> = Vec::new();
+        for bytes in copies {
+            let holding: Vec<Presentation> = held
+                .iter()
+                .filter(|p| p.friendship.as_deref() == Some(bytes))
+                .cloned()
+                .collect();
+            match floors.held(&holding[0].hash, bytes, &holding, STORED) {
                 Judged::Stands => {}
-                Judged::Reset => gone.push(*hash),
+                Judged::Reset => gone.push(bytes),
                 Judged::Unknown => whole = false,
             }
         }
@@ -465,7 +472,7 @@ impl Core {
         self.drop_pairs(
             store,
             held.iter()
-                .filter(|p| p.evidence() && gone.contains(&p.hash)),
+                .filter(|p| p.friendship.as_deref().is_some_and(|b| gone.contains(&b))),
         )?;
         Ok(whole)
     }

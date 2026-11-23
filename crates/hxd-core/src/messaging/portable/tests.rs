@@ -2160,22 +2160,37 @@ fn a_friendship_accepted_here_takes_the_id_a_dropped_presentation_kept() {
 
 #[test]
 fn a_stored_friendship_that_no_longer_checks_is_not_held() {
-    let (alice, bob) = (person(1), person(2));
-    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
-    let t = s.core.clock().unix();
-    let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
-    for (p, q) in [(fp(&alice), fp(&bob)), (fp(&bob), fp(&alice))] {
-        let mut pres = s.rel.presentation(&p, &q).unwrap().unwrap();
-        pres.friendship = Some(b"not a friendship".to_vec());
-        s.rel.present(&pres).unwrap();
+    // Which presentations' copies of the friendship are corrupted, Alice's
+    // and Bob's.
+    for corrupted in [[true, true], [true, false], [false, true]] {
+        let case = format!("corrupted {corrupted:?}");
+        let (alice, bob) = (person(1), person(2));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let t = s.core.clock().unix();
+        let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
+        let pairs = [(fp(&alice), fp(&bob)), (fp(&bob), fp(&alice))];
+        for ((p, q), bad) in pairs.iter().zip(corrupted) {
+            if bad {
+                let mut pres = s.rel.presentation(p, q).unwrap().unwrap();
+                pres.friendship = Some(b"not a friendship".to_vec());
+                s.rel.present(&pres).unwrap();
+            }
+        }
+        // A reset after it was taken, which holds a copy that checks.
+        reset(&s, &alice, 1, t + 5);
+        assert_eq!(
+            told(&mut rb),
+            [("alice".into(), RosterState::Removed, vec![], None)],
+            "{case}"
+        );
+        for ((p, q), bad) in pairs.iter().zip(corrupted) {
+            assert_eq!(
+                s.rel.presentation(p, q).unwrap().is_some(),
+                !bad,
+                "{case}: a copy is dropped where it does not check, and only there"
+            );
+        }
     }
-    // A reset after it was taken, which would hold it.
-    reset(&s, &alice, 1, t + 5);
-    assert_eq!(
-        told(&mut rb),
-        [("alice".into(), RosterState::Removed, vec![], None)]
-    );
-    assert!(!presented_both_ways(&s, &alice, &bob));
 }
 
 #[test]
