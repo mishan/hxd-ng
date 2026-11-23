@@ -1,5 +1,7 @@
 # Applying a registrar's records: the verifying server
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: R1, R2 and R3 built; R4 is designed further before it is
 staged; R5, device epochs, is built but for its last part, what a reset
 device signed and registered. §6 stages it.

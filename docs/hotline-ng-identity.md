@@ -1,5 +1,7 @@
 # Hotline identity — portable identity, and the identity profile for hotline-ng
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: partial. Built in hxd-ng: the identity objects (§3, in
 hx-libs' `hl-identity`, with test vectors in its
 `vectors/identity-test-vectors.json`),

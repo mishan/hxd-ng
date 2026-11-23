@@ -1,5 +1,7 @@
 # Signed and sealed messages
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: draft, 2026-10. `hl-identity` has the signed objects of §3.1 to
 §3.5, their detached and link forms (§5), and sealing and opening both
 kinds of box (§3.7 to §3.11), with §13's vectors for them. hxd-ng

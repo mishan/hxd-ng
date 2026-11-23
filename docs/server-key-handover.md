@@ -1,5 +1,7 @@
 # Server key handover
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: draft, 2026-10. Built in hl-identity (`handover`): the
 handover object (§3), the challenge's `next` (§2), and a client's
 checks (§5) as functions over what it remembers, with vectors (§10).

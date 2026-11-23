@@ -1,5 +1,7 @@
 # Identity enrollment — certifying a device without the paste
 
+License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), unlike the GPL-2.0-or-later code beside it.
+
 Status: partial. Done in hxd-ng: the §4 request and the §5.4
 bundle in `hl-identity`, with test vectors; `hlid cert --bundle`, which
 writes a bundle for the paste path; the §5 mailbox, served under
