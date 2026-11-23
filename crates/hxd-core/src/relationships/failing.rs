@@ -33,6 +33,7 @@ pub(crate) const READS: &[&str] = &[
     "presentations",
     "presented_by",
     "withdrawals",
+    "withdrawals_by",
     "offer",
     "rotation_from",
     "rotation_to",
@@ -174,7 +175,8 @@ through! {
     fn presented_by(device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError>;
     fn keep_withdrawal(w: &HeldWithdrawal, cap: usize) -> Result<(), StoreError>;
     fn withdrawals(pair: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
-    fn drop_withdrawal(owner: &[u8; 32], pair: &[u8; 32], party: &[u8; 32]) -> Result<(), StoreError>;
+    fn withdrawals_by(owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
+    fn drop_withdrawal(owner: &[u8; 32], pair: &[u8; 32], party: &[u8; 32], withdrawal: &[u8]) -> Result<(), StoreError>;
     fn set_offer(owner: &[u8; 32], other: &[u8; 32], offer: Option<&StoredOffer>) -> Result<(), StoreError>;
     fn offer(owner: &[u8; 32], other: &[u8; 32], now: SystemTime) -> Result<Option<StoredOffer>, StoreError>;
     fn keep_rotation(from: &[u8; 32], to: &[u8; 32], record: &[u8]) -> Result<(), StoreError>;

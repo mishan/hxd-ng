@@ -1442,17 +1442,30 @@ impl RelationshipStore for SqliteStore {
             .collect()
     }
 
+    fn withdrawals_by(&self, owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT owner, pair, party, before, withdrawal, checked, at
+               FROM friend_withdrawal WHERE owner = ?1 ORDER BY id",
+        ))?;
+        let found = sql(stmt.query_map(params![fp_hex(owner)], withdrawal_row))?;
+        found
+            .map(|r| r.map_err(StoreError::new).and_then(|inner| inner))
+            .collect()
+    }
+
     fn drop_withdrawal(
         &self,
         owner: &[u8; 32],
         pair: &[u8; 32],
         party: &[u8; 32],
+        withdrawal: &[u8],
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         sql(conn.execute(
             "DELETE FROM friend_withdrawal
-              WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND NOT checked",
-            params![fp_hex(owner), pair.as_slice(), party.as_slice()],
+              WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND withdrawal = ?4",
+            params![fp_hex(owner), pair.as_slice(), party.as_slice(), withdrawal],
         ))?;
         Ok(())
     }

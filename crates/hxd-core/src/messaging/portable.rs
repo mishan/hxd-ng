@@ -38,7 +38,8 @@ use tracing::{error, warn};
 use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore, StoredOffer,
+    Ended, EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore,
+    StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -88,7 +89,16 @@ impl Epochs {
                 .min()
         })
     }
+
+    /// The floor the records kept here alone show, which never falls, as
+    /// one installed from a list can.
+    fn kept(&self) -> u64 {
+        self.times.iter().map(|(e, _)| *e).max().unwrap_or(0)
+    }
 }
+
+/// Identities, each with the floor the records kept here showed for it.
+pub(crate) type KeptFloors = Vec<([u8; 32], u64)>;
 
 /// What a friendship comes to against the floors (§6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +195,22 @@ impl<'a> Floors<'a> {
             let w = k.withdrawal();
             DeviceCert::parse(&w.cert).is_ok_and(|c| c.check_floor(self.floor(&w.from)).is_ok())
         })
+    }
+
+    /// The floor the records kept here show for an identity, which a
+    /// withdrawal held here is dropped below, since it will never stand
+    /// again (§6). Never a floor installed alone, which can fall: a
+    /// withdrawal dropped cannot come back.
+    fn kept(&self, fp: &[u8; 32]) -> u64 {
+        self.of(fp).kept()
+    }
+
+    /// A withdrawal held here's signer and its certificate.
+    fn signed_by(&self, withdrawal: &[u8]) -> Option<([u8; 32], DeviceCert)> {
+        let k = Withdrawal::parse(withdrawal, STORED, zero_floor).ok()?;
+        let w = k.withdrawal();
+        let cert = DeviceCert::parse(&w.cert).ok()?;
+        Some((Fingerprint::of(&w.from).0, cert))
     }
 
     /// A read of the epochs that failed, for an act that must not go on
@@ -515,6 +541,113 @@ impl Core {
         Ok(out)
     }
 
+    /// Drop the withdrawals counted toward the owners of `keeping` that
+    /// will never stand again where they would cost what is kept next: a
+    /// signed one of a signed keep's key, whose later cutoff would refuse
+    /// it, and, where the keep passes its owner's cap, any, so that the
+    /// cap takes them before one that stands. Dropping them changes no
+    /// answer, so the keep need not be the same step.
+    fn make_room(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        floors: &Floors,
+        keeping: &[HeldWithdrawal],
+    ) -> Result<(), StoreError> {
+        let same = |a: &HeldWithdrawal, b: &HeldWithdrawal| {
+            (a.owner, a.pair, a.party, a.withdrawal.is_none())
+                == (b.owner, b.pair, b.party, b.withdrawal.is_none())
+        };
+        let mut owners: Vec<[u8; 32]> = keeping.iter().map(|w| w.owner).collect();
+        owners.sort_unstable();
+        owners.dedup();
+        for owner in owners {
+            let held = store.withdrawals_by(&owner)?;
+            let new = keeping
+                .iter()
+                .filter(|k| k.owner == owner && !held.iter().any(|h| same(h, k)))
+                .count();
+            // A withdrawal is kept only at or above its signer's floor, its
+            // owner's own key, so none falls below the kept floors an
+            // owner's were last judged whole at until one of them rises.
+            let judged = self.withdrawals_judged.lock().unwrap().get(&owner).cloned();
+            let whole = judged.is_some_and(|j| j.iter().all(|(fp, kept)| floors.kept(fp) == *kept));
+            if held.len() + new > self.messaging_policy.max_roster && !whole {
+                #[cfg(test)]
+                self.withdrawal_scans
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut signers = self.drop_dead(store, floors, &held)?;
+                signers.push((owner, floors.kept(&owner)));
+                floors.failed()?;
+                self.withdrawals_judged
+                    .lock()
+                    .unwrap()
+                    .insert(owner, signers);
+            } else {
+                let shadowed = |h: &&HeldWithdrawal| {
+                    keeping.iter().any(|k| k.withdrawal.is_some() && same(h, k))
+                };
+                self.drop_dead(store, floors, held.iter().filter(shadowed))?;
+            }
+        }
+        floors.failed()
+    }
+
+    /// Drop those of `held` signed below their signer's kept floor,
+    /// answering each signer's kept floor as read.
+    fn drop_dead<'w>(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        floors: &Floors,
+        held: impl IntoIterator<Item = &'w HeldWithdrawal>,
+    ) -> Result<KeptFloors, StoreError> {
+        let mut signers = KeptFloors::new();
+        for w in held {
+            let Some(bytes) = w.withdrawal.as_deref() else {
+                continue;
+            };
+            let Some((signer, cert)) = floors.signed_by(bytes) else {
+                continue;
+            };
+            let kept = floors.kept(&signer);
+            if !signers.iter().any(|(fp, _)| *fp == signer) {
+                signers.push((signer, kept));
+            }
+            if cert.check_floor(kept).is_err() {
+                store.drop_withdrawal(&w.owner, &w.pair, &w.party, bytes)?;
+            }
+        }
+        Ok(signers)
+    }
+
+    /// Drop every withdrawal counted toward `owners` that will never
+    /// stand again, and forget their judging: before a rotation's merge,
+    /// which keeps the later cutoff of two for one key without asking
+    /// which stands, and moves in withdrawals other keys signed.
+    pub(crate) fn drop_dead_withdrawals(&self, owners: &[[u8; 32]]) -> Result<(), StoreError> {
+        let Some(store) = self.relationships.as_ref() else {
+            return Ok(());
+        };
+        let floors = Floors::new(self);
+        for owner in owners {
+            self.withdrawals_judged.lock().unwrap().remove(owner);
+            self.drop_dead(store, &floors, &store.withdrawals_by(owner)?)?;
+        }
+        floors.failed()
+    }
+
+    /// End what `end` names between `a` and `b`, as one step, room made
+    /// first for the withdrawals it keeps.
+    pub(super) fn end_friendship(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &Mailbox,
+        b: &Mailbox,
+        end: &Ending,
+    ) -> Result<Ended, StoreError> {
+        self.make_room(store, &Floors::new(self), &end.withdrawals)?;
+        store.end_friendship(a, b, end)
+    }
+
     /// What the withdrawals held for `pair` that stand at the current
     /// floors end, each with its object to hand on: one kept unchecked is
     /// checked against the pair now, kept checked if it passes and
@@ -535,9 +668,11 @@ impl Core {
                     .and_then(|b| Withdrawal::parse(b, STORED, zero_floor).ok())
                     .is_some_and(|k| k.check_pair(pair, rotations).is_ok());
                 if !passes {
-                    store
-                        .drop_withdrawal(&w.owner, &w.pair, &w.party)
-                        .map_err(store_failed)?;
+                    if let Some(bytes) = &w.withdrawal {
+                        store
+                            .drop_withdrawal(&w.owner, &w.pair, &w.party, bytes)
+                            .map_err(store_failed)?;
+                    }
                     continue;
                 }
                 let checked = HeldWithdrawal {
@@ -813,7 +948,7 @@ impl Core {
             (theirs, mine)
         };
         let blocking = block.then_some((me, them));
-        let applied = self.apply_cutoff(store, keep, party, other, blocking)?;
+        let applied = self.apply_cutoff(store, &floors, keep, party, other, blocking)?;
         Ok((bytes, applied))
     }
 
@@ -842,6 +977,7 @@ impl Core {
     fn apply_cutoff(
         &self,
         store: &Arc<dyn RelationshipStore>,
+        floors: &Floors,
         keep: HeldWithdrawal,
         party: [u8; 32],
         other: [u8; 32],
@@ -922,6 +1058,8 @@ impl Core {
                 .is_some_and(|p| p.delivered);
         }
         let (a, b) = block.unwrap_or((&x, &y));
+        self.make_room(store, floors, &end.withdrawals)
+            .map_err(store_failed)?;
         let ended = store.end_friendship(a, b, &end).map_err(store_failed)?;
         if let Some(e) = ended.ended {
             self.edge_ended(&e, withdraw.as_deref());
@@ -1213,8 +1351,8 @@ impl Core {
                     .map_err(store_failed)?;
                 end.friendship = true;
                 end.hold = Some(wall + self.messaging_policy.request_retention);
-                let ended = store
-                    .end_friendship(&me.mailbox, &them, &end)
+                let ended = self
+                    .end_friendship(store, &me.mailbox, &them, &end)
                     .map_err(store_failed)?;
                 if let Some(e) = ended.ended {
                     self.edge_ended(&e, None);
@@ -1411,6 +1549,8 @@ impl Core {
                 checked: false,
                 at: self.clock.wall(),
             };
+            self.make_room(store, floors, std::slice::from_ref(&cut))
+                .map_err(store_failed)?;
             store
                 .keep_withdrawal(&cut, self.messaging_policy.max_roster)
                 .map_err(store_failed)?;
@@ -1429,7 +1569,9 @@ impl Core {
             (other, presenter)
         };
         // An edge that stays active is told to both again (§4.3).
-        if let Applied::Standing([x, y]) = self.apply_cutoff(store, keep, party, other, None)? {
+        if let Applied::Standing([x, y]) =
+            self.apply_cutoff(store, floors, keep, party, other, None)?
+        {
             self.tell_entry(&x, &y);
             self.tell_entry(&y, &x);
         }
