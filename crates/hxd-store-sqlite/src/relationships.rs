@@ -358,6 +358,17 @@ fn rotate_moves(r: &str, col: &str) -> String {
     format!("({r}.{col}_fp IS NOT NULL AND {r}.{col}_fp = ?2)")
 }
 
+/// Every mailbox column a re-key stamps, by its table.
+const REKEYED: [(&str, &str); 7] = [
+    ("relationship", "owner"),
+    ("relationship", "other"),
+    ("request_hold", "owner"),
+    ("request_hold", "held"),
+    ("request_ledger", "sender"),
+    ("request_ledger", "recipient"),
+    ("messaging_account", "owner"),
+];
+
 const PRESENTATION_COLUMNS: &str =
     "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at, taken";
 
@@ -426,9 +437,30 @@ fn withdrawal_row(r: &Row<'_>) -> rusqlite::Result<Result<HeldWithdrawal, StoreE
 }
 
 /// The portable part of a rotation, as the in-memory store does it: what
-/// moves onto a pair the successor already holds is dropped.
-fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, StoreError> {
+/// moves onto a pair the successor already holds is dropped, and the edge
+/// of each pair that loses its evidence both ways so, ended.
+fn rotate_portable(
+    tx: &Connection,
+    from: &str,
+    to: &str,
+    rekeyed: &mut Rekeyed,
+) -> Result<(), StoreError> {
     let mut n = 0;
+    let moving = presentations_where(tx, "presenter = ?1 OR other = ?1", &[&from])?;
+    let other = |p: &Presentation| {
+        let (x, y) = (fp_hex(&p.presenter), fp_hex(&p.other));
+        if x == from || x == to {
+            y
+        } else {
+            x
+        }
+    };
+    let mut had = Vec::new();
+    for o in moving.iter().map(other) {
+        if evidence_both_ways(tx, from, &o)? || evidence_both_ways(tx, to, &o)? {
+            had.push(o);
+        }
+    }
     for (table, a, b) in [
         ("friend_presentation", "presenter", "other"),
         ("friend_offer", "owner", "other"),
@@ -455,6 +487,37 @@ fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, Store
             ))?;
         }
     }
+    let successor = fp_from_hex(to)?;
+    for mut p in moving {
+        for k in [&mut p.presenter, &mut p.other] {
+            if fp_hex(k) == from {
+                *k = successor;
+            }
+        }
+        let now = presentations_where(
+            tx,
+            "presenter = ?1 AND other = ?2",
+            &[&fp_hex(&p.presenter), &fp_hex(&p.other)],
+        )?;
+        if !now.contains(&p) {
+            rekeyed.dropped.push(p);
+        }
+    }
+    let mut ended: Vec<String> = Vec::new();
+    for o in rekeyed.dropped.iter().map(other) {
+        if ended.contains(&o) || !had.contains(&o) || evidence_both_ways(tx, to, &o)? {
+            continue;
+        }
+        let (a, b) = (
+            Mailbox::identified("", successor),
+            Mailbox::identified("", fp_from_hex(&o)?),
+        );
+        if let Some(e) = end_edge(tx, &a, &b)? {
+            set_edge(tx, to, &o, Some(e.id))?;
+            rekeyed.ended.push(e);
+        }
+        ended.push(o);
+    }
     // Of a successor's withdrawal and a moved one for the same pair,
     // party and kind, the later cutoff stands, with its object.
     for (kept, gone, wins) in [("?2", "?1", ">="), ("?1", "?2", ">")] {
@@ -472,7 +535,8 @@ fn rotate_portable(tx: &Connection, from: &str, to: &str) -> Result<usize, Store
         "UPDATE friend_withdrawal SET owner = ?1 WHERE owner = ?2",
         params![to, from],
     ))?;
-    Ok(n)
+    rekeyed.moved += n;
+    Ok(())
 }
 
 fn hold(
@@ -758,6 +822,12 @@ impl SqliteStore {
                 let lost = k.absorb(d);
                 write(tx, Some(kept), &mut k)?;
                 forget(tx, lost.iter().map(|(l, _)| *l))?;
+                for (l, k) in &lost {
+                    sql(tx.execute(
+                        "UPDATE friend_presentation SET edge = ?2 WHERE edge = ?1",
+                        params![*l as i64, *k as i64],
+                    ))?;
+                }
                 merged.extend(lost);
                 n += 1;
             }
@@ -769,15 +839,7 @@ impl SqliteStore {
                 ),
                 params![to, from],
             ))?;
-            for (table, col) in [
-                ("relationship", "owner"),
-                ("relationship", "other"),
-                ("request_hold", "owner"),
-                ("request_hold", "held"),
-                ("request_ledger", "sender"),
-                ("request_ledger", "recipient"),
-                ("messaging_account", "owner"),
-            ] {
+            for (table, col) in REKEYED {
                 n += sql(tx.execute(
                     &format!(
                         "UPDATE {table} AS r SET {col}_fp = ?1 WHERE {}",
@@ -786,12 +848,17 @@ impl SqliteStore {
                     params![to, from],
                 ))?;
             }
-            if portable {
-                n += rotate_portable(tx, from, to)?;
-            }
             merged.sort_unstable();
             merged.dedup();
-            Ok(Rekeyed { moved: n, merged })
+            let mut rekeyed = Rekeyed {
+                moved: n,
+                merged,
+                ..Rekeyed::default()
+            };
+            if portable {
+                rotate_portable(tx, from, to, &mut rekeyed)?;
+            }
+            Ok(rekeyed)
         })
     }
 }
@@ -1569,6 +1636,19 @@ impl RelationshipStore for SqliteStore {
 
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         self.rekey(claim_moves, &fp_hex(fingerprint), login, false)
+    }
+
+    fn claimable(&self, login: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        for (table, col) in REKEYED {
+            let text = format!(
+                "SELECT EXISTS (SELECT 1 FROM {table} WHERE {col}_fp IS NULL AND {col} = ?1)"
+            );
+            if sql(conn.query_row(&text, params![login], |r| r.get::<_, bool>(0)))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {

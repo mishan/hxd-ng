@@ -1,11 +1,13 @@
 //! Friends, presence and discovery against the in-memory stores
 //! (`docs/instant-messaging.md` §3, §4.4, §6).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
 use crate::inbox::{MemoryStore, MessageGuid, MessageKind, MessageStore, NewMessage};
+use crate::relationships::failing::{Park, Parked};
 use crate::relationships::{MemoryRelationships, SentOn};
 use crate::roster::{drain, AttachInfo, InboxPolicy};
 use crate::{AccessBits, AccountDirectory, Events};
@@ -2427,6 +2429,398 @@ fn a_rotation_tells_a_friend_with_no_row_naming_the_successor() {
     assert_eq!(
         entries(&drain(&mut rb)),
         [("alice".into(), RosterState::Removed)]
+    );
+}
+
+/// A directory whose lookups can be held: by login, as an act names
+/// another, and by key, as a rotation looks up its successor.
+struct Holding(Directory, Arc<Park>);
+
+impl AccountDirectory for Holding {
+    fn inbox_account(&self, login: &str) -> Option<Mailbox> {
+        self.1.at("inbox_account");
+        self.0.inbox_account(login)
+    }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<AccessBits> {
+        self.0.mailbox_access(who)
+    }
+
+    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+        self.1.at("account_by_key");
+        self.0.account_by_key(fp)
+    }
+}
+
+/// `act`, run while `held`'s call waits where `parked` holds it, given a
+/// moment to finish should it wait on nothing that call holds; then the
+/// call is let go and both finish. What `act` answered.
+fn beside<T: Send>(
+    held: impl FnOnce() + Send,
+    parked: Parked,
+    act: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|t| {
+        let held = t.spawn(held);
+        parked.arrived();
+        let act = t.spawn(act);
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while !act.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        parked.release();
+        held.join().unwrap();
+        act.join().unwrap()
+    })
+}
+
+/// `of`'s friends as the roster holds them, beside the store's.
+fn friend_sets(s: &Server, of: &Mailbox) -> (HashSet<Key>, HashSet<Key>) {
+    let stored = s
+        .rel
+        .relationships(of, s.core.clock.wall())
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.friendship.is_some() && r.blocked_at.is_none())
+        .map(|r| Key::of(&r.other))
+        .collect();
+    let roster = s.core.roster.lock().unwrap();
+    let shown = roster
+        .presences
+        .by
+        .get(&Key::of(of))
+        .map(|e| e.friends.clone());
+    (shown.unwrap_or_default(), stored)
+}
+
+/// A server where Alice's account links `new`, and Bob, her friend
+/// under `old`, is on with a roster loaded.
+fn rotating(old: [u8; 32], new: [u8; 32], park: &Arc<Park>) -> (Server, Uid, Events) {
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", new), messaging_bits()),
+        (Mailbox::login("bob"), messaging_bits()),
+    ]);
+    let s = server_of(
+        Holding(dir, park.clone()),
+        policy(),
+        InboxPolicy::default(),
+        None,
+    );
+    let alice = Mailbox::identified("alice", old);
+    s.rel
+        .befriend(&alice, &Mailbox::login("bob"), s.core.clock.wall())
+        .unwrap();
+    let (b, rb) = messenger(&s.core, "bob");
+    (s, b, rb)
+}
+
+#[test]
+fn an_unfriend_beside_a_rotation_leaves_the_roster_as_the_store() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, b, _rb) = rotating(old, new, &park);
+    let unfriended = beside(
+        || s.core.rotate_identity(&old, &new).unwrap(),
+        s.core.rotated.arm("rotated"),
+        || s.core.friend_unfriend(b, "alice", None),
+    );
+    assert_eq!(unfriended, Ok(()));
+    let (shown, stored) = friend_sets(&s, &Mailbox::login("bob"));
+    assert!(stored.is_empty(), "unfriended: {stored:?}");
+    assert_eq!(shown, stored, "no friend in the roster the store lacks");
+}
+
+#[test]
+fn an_unfriend_beside_a_claim_leaves_the_roster_as_the_store() {
+    let fp = [7u8; 32];
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", fp), messaging_bits()),
+        (Mailbox::login("bob"), messaging_bits()),
+    ]);
+    let s = server_of(dir, policy(), InboxPolicy::default(), None);
+    let bob = Mailbox::login("bob");
+    // Friends while Alice's account linked no identity.
+    s.rel
+        .befriend(&Mailbox::login("alice"), &bob, s.core.clock.wall())
+        .unwrap();
+    let (b, _rb) = messenger(&s.core, "bob");
+    let unfriended = beside(
+        || {
+            s.core.inbox_claim("alice", &fp);
+        },
+        s.fail.park.arm("claim"),
+        || s.core.friend_unfriend(b, "alice", None),
+    );
+    assert_eq!(unfriended, Ok(()));
+    let (shown, stored) = friend_sets(&s, &bob);
+    assert!(stored.is_empty(), "unfriended: {stored:?}");
+    assert_eq!(shown, stored, "no friend in the roster the store lacks");
+}
+
+#[test]
+fn a_device_of_a_person_being_kicked_acts_no_more() {
+    let fp = [7u8; 32];
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", fp), messaging_bits()),
+        (Mailbox::login("bob"), messaging_bits()),
+    ]);
+    let s = server_of(dir, policy(), InboxPolicy::default(), None);
+    s.core.roster.lock().unwrap().persons.on = true;
+    let device = |addr: &str| {
+        let mut info =
+            crate::coalesce::tests::session("alice", Some(fp), Some(fp), Default::default());
+        info.access = messaging_bits();
+        info.addr = Some(addr.parse().unwrap());
+        let (uid, _rx) = s.core.attach(info).unwrap();
+        s.core.announce(uid);
+        uid
+    };
+    let (first, second) = (device("192.0.2.1"), device("198.51.100.1"));
+    assert_eq!(
+        s.core.friend_add(second, "bob", None),
+        Ok(RosterState::PendingOut)
+    );
+    s.core.friend_unfriend(second, "bob", None).unwrap();
+    // A kick's first step: the person is ending, its members not yet
+    // marked.
+    s.core.roster.lock().unwrap().person_ending(first);
+    assert_eq!(
+        s.core.friend_add(second, "bob", None),
+        Err(MessagingError::NotEnabled)
+    );
+}
+
+#[test]
+fn a_sender_on_its_way_out_hands_nothing_over_live() {
+    let quota = InboxPolicy {
+        max_sent_per_day: 1,
+        ..InboxPolicy::default()
+    };
+    let dir = Directory(
+        ["alice", "bob", "carol"]
+            .iter()
+            .map(|l| (Mailbox::login(*l), messaging_bits()))
+            .collect(),
+    );
+    let s = server_of(dir, policy(), quota, None);
+    let (a, mut ra) = messenger(&s.core, "alice");
+    let (b, mut rb) = messenger(&s.core, "bob");
+    friends(&s, a, &mut ra, b, &mut rb);
+    // A session with no mailbox, which a message reaches live alone.
+    let (c, mut rc) = attach_as(&s.core, "carol", messaging_bits(), "10.0.0.3");
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&c)
+        .unwrap()
+        .has_inbox = false;
+    s.core
+        .im_send(a, "bob", "stored".into(), None, None)
+        .unwrap();
+    drain(&mut rb);
+    drain(&mut rc);
+    let kick = || {
+        s.core
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get_mut(&a)
+            .unwrap()
+            .kicked = true
+    };
+    // Kicked once its friendship is read, past the quota.
+    let parked = s.fail.park.arm("relationship");
+    let im = std::thread::scope(|t| {
+        let im = t.spawn(|| s.core.im_send(a, "bob", "live".into(), None, None));
+        parked.arrived();
+        kick();
+        parked.release();
+        im.join().unwrap()
+    });
+    assert!(im.is_err(), "an instant message past the quota: {im:?}");
+    for (case, to) in [("past the quota", b), ("to no mailbox", c)] {
+        let sent = s.core.msg(a, to, "live".into(), None, None);
+        assert!(sent.is_err(), "a private message {case}: {sent:?}");
+    }
+    let heard = |rx: &mut Events| {
+        drain(rx)
+            .into_iter()
+            .filter(|e| matches!(e, Event::Msg { .. } | Event::Im(_)))
+            .count()
+    };
+    assert_eq!((heard(&mut rb), heard(&mut rc)), (0, 0), "heard nothing");
+}
+
+#[test]
+fn an_act_a_rotation_overtakes_writes_nothing_under_the_old_key() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let (alice, bob) = (Mailbox::identified("alice", old), Mailbox::login("bob"));
+    // Each held after the last read it makes before writing: a request
+    // to Bob, who blocked the old key and whose block the rotation
+    // moves; an instant message to a friend; a block; and a private
+    // message.
+    for act in ["request", "instant message", "block", "private message"] {
+        let park = Arc::new(Park::default());
+        let (s, b, _rb) = rotating(old, new, &park);
+        let now = s.core.clock.wall();
+        let (a, mut ra) = attach_identified(&s.core, "alice", old);
+        if act == "request" {
+            s.rel.unfriend(&alice, &bob).unwrap();
+            s.rel.set_blocked(&bob, &alice, true, now).unwrap();
+            let takes = AccountUpdate {
+                takes_requests: Some(Some(now)),
+                ..AccountUpdate::default()
+            };
+            s.rel.update_account(&bob, &takes).unwrap();
+            s.core.requests_list(a).unwrap();
+        } else {
+            s.core.friends_roster(a).unwrap();
+        }
+        drain(&mut ra);
+        let parked = match act {
+            "instant message" => s.fail.park.arm("relationship"),
+            "private message" => s.fail.park.arm("is_blocked"),
+            _ => park.arm("inbox_account"),
+        };
+        let done = std::thread::scope(|t| {
+            let act = t.spawn(|| match act {
+                "request" => s
+                    .core
+                    .im_send_login(a, "bob", "hi".into(), None, None, &[])
+                    .is_ok(),
+                "instant message" => s.core.im_send(a, "bob", "hi".into(), None, None).is_ok(),
+                "block" => s.core.inbox_block(a, "bob", true).is_ok(),
+                _ => s.core.msg(a, b, "hi".into(), None, None).is_ok(),
+            });
+            parked.arrived();
+            s.core.rotate_identity(&old, &new).unwrap();
+            parked.release();
+            act.join().unwrap()
+        });
+        assert!(!done, "{act}: refused");
+        assert!(
+            s.inbox
+                .all()
+                .iter()
+                .all(|m| m.sender.as_ref().and_then(|m| m.fingerprint) != Some(old)),
+            "{act}: no message from the old key"
+        );
+        assert_eq!(
+            s.rel
+                .recipients_since(&Requester::Account(alice.clone()), std::time::UNIX_EPOCH)
+                .unwrap(),
+            0,
+            "{act}: no request counted to it"
+        );
+        assert_eq!(
+            s.rel.relationships(&alice, now).unwrap(),
+            [],
+            "{act}: no row"
+        );
+    }
+}
+
+#[test]
+fn a_session_of_the_old_key_admitted_during_a_rotation_is_ended_too() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, _b, _rb) = rotating(old, new, &park);
+    // A login that read the account before its link moved.
+    let parked = park.arm("account_by_key");
+    let late = std::thread::scope(|t| {
+        let rotation = t.spawn(|| s.core.rotate_identity(&old, &new).unwrap());
+        parked.arrived();
+        let (late, _rx) = attach_identified(&s.core, "alice", old);
+        parked.release();
+        rotation.join().unwrap();
+        late
+    });
+    let r = s.core.roster.lock().unwrap();
+    assert!(r.users.get(&late).is_none_or(|u| u.kicked), "ended");
+}
+
+#[test]
+fn a_session_of_the_old_key_is_ended_once_and_takes_no_place_in_presence() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, _b, _rb) = rotating(old, new, &park);
+    let (live, mut rx) = attach_identified(&s.core, "alice", old);
+    // Attached, and announced only once the rotation has ended it.
+    let (pending, _) = unannounced(
+        &s.core,
+        "alice",
+        messaging_bits(),
+        "10.0.0.7",
+        crate::Transport::default(),
+        false,
+    );
+    s.core
+        .roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&pending)
+        .unwrap()
+        .identity = Some(old);
+    drain(&mut rx);
+    s.core.rotate_identity(&old, &new).unwrap();
+    s.core.announce(pending);
+    let kicks = drain(&mut rx)
+        .iter()
+        .filter(|e| matches!(e, Event::Kicked))
+        .count();
+    assert_eq!(kicks, 1, "{live} told once");
+    let r = s.core.roster.lock().unwrap();
+    let key = Key::of(&Mailbox::identified("alice", old));
+    assert!(
+        r.presences
+            .by
+            .get(&key)
+            .is_none_or(|e| !e.uids.contains(&pending)),
+        "no place under the old key"
+    );
+}
+
+#[test]
+fn a_claim_with_nothing_keyed_by_the_login_alone_waits_on_no_friendship_act() {
+    let s = server(&["alice"]);
+    let writing = s.core.friend_writes();
+    let core = s.core.clone();
+    let claim = std::thread::spawn(move || core.inbox_claim("alice", &[7; 32]));
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while !claim.is_finished() && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let finished = claim.is_finished();
+    drop(writing);
+    claim.join().unwrap();
+    assert!(finished, "a routine login's claim takes no hold");
+}
+
+#[test]
+fn a_session_of_a_rotated_key_writes_nothing_under_it_while_the_rest_moves() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, _b, _rb) = rotating(old, new, &park);
+    // Logged in before the account's link moved.
+    let (a, mut ra) = attach_identified(&s.core, "alice", old);
+    s.core.friends_roster(a).unwrap();
+    drain(&mut ra);
+    let asked = beside(
+        || s.core.rotate_identity(&old, &new).unwrap(),
+        park.arm("account_by_key"),
+        || s.core.friend_add(a, "bob", None),
+    );
+    assert_eq!(asked, Err(MessagingError::NotEnabled));
+    assert_eq!(
+        s.rel
+            .relationships(&Mailbox::identified("alice", old), s.core.clock.wall())
+            .unwrap(),
+        [],
+        "nothing left under the old key"
     );
 }
 

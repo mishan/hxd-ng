@@ -2268,6 +2268,10 @@ pub struct Core {
     /// (`Core::make_room`), for the domain's tests of its memo.
     #[cfg(test)]
     pub(crate) withdrawal_scans: std::sync::atomic::AtomicUsize,
+    /// Where a rotation waits once the store has moved its friendships,
+    /// for the domain's tests of what lands beside it.
+    #[cfg(test)]
+    pub(crate) rotated: crate::relationships::failing::Park,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

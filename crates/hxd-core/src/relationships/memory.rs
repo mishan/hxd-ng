@@ -343,19 +343,39 @@ impl Inner {
         }
         merged.sort_unstable();
         merged.dedup();
-        Rekeyed { moved: n, merged }
+        for p in self.presentations.iter_mut() {
+            if let Some((_, kept)) = merged.iter().find(|(lost, _)| p.edge == Some(*lost)) {
+                p.edge = Some(*kept);
+            }
+        }
+        Rekeyed {
+            moved: n,
+            merged,
+            ..Rekeyed::default()
+        }
     }
 
     /// The portable part of a rotation: presentations and offers by or
     /// naming `from`, and withdrawals counted toward it, re-stamped, where
-    /// the successor holds none of its own for the same other party.
-    fn rotate_portable(&mut self, from: &[u8; 32], to: &[u8; 32]) -> usize {
+    /// the successor holds none of its own for the same other party; and
+    /// the edge of each pair that loses its evidence both ways so, ended.
+    fn rotate_portable(&mut self, from: &[u8; 32], to: &[u8; 32], rekeyed: &mut Rekeyed) {
         let mut n = 0;
         let swap = |k: &mut [u8; 32]| {
             if k == from {
                 *k = *to;
             }
         };
+        let had: Vec<[u8; 32]> = self
+            .presentations
+            .iter()
+            .filter_map(|p| match (p.presenter == *from, p.other == *from) {
+                (true, false) => Some(p.other),
+                (false, true) => Some(p.presenter),
+                _ => None,
+            })
+            .filter(|o| self.evidence_both_ways(from, o) || self.evidence_both_ways(to, o))
+            .collect();
         let mut held: Vec<([u8; 32], [u8; 32])> = self
             .presentations
             .iter()
@@ -369,6 +389,7 @@ impl Inner {
                 swap(&mut p.other);
                 n += 1;
                 if held.contains(&(p.presenter, p.other)) {
+                    rekeyed.dropped.push(p);
                     continue;
                 }
                 held.push((p.presenter, p.other));
@@ -376,6 +397,23 @@ impl Inner {
             kept.push(p);
         }
         self.presentations = kept;
+        let mut ended: Vec<[u8; 32]> = Vec::new();
+        for p in &rekeyed.dropped {
+            let o = if p.presenter == *to {
+                p.other
+            } else {
+                p.presenter
+            };
+            if ended.contains(&o) || !had.contains(&o) || self.evidence_both_ways(to, &o) {
+                continue;
+            }
+            ended.push(o);
+            let (a, b) = (Mailbox::identified("", *to), Mailbox::identified("", o));
+            if let Some(e) = self.end_edge(&a, &b) {
+                self.set_edge(to, &o, Some(e.id));
+                rekeyed.ended.push(e);
+            }
+        }
         let mut held: Vec<([u8; 32], [u8; 32])> = self
             .offers
             .iter()
@@ -422,7 +460,7 @@ impl Inner {
                 n += 1;
             }
         }
-        n
+        rekeyed.moved += n;
     }
 
     fn keep_withdrawal(&mut self, w: &HeldWithdrawal, cap: usize) {
@@ -1253,10 +1291,29 @@ impl RelationshipStore for MemoryRelationships {
         Ok(inner.rekey(|m| m.fingerprint.is_none() && m.login == login, fingerprint))
     }
 
+    fn claimable(&self, login: &str) -> Result<bool, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let bare = |m: &Mailbox| m.fingerprint.is_none() && m.login == login;
+        let held = |k: &HoldKey| k.fingerprint.is_none() && k.login.as_deref() == Some(login);
+        Ok(inner
+            .rows
+            .iter()
+            .any(|r| bare(&r.rel.owner) || bare(&r.rel.other))
+            || inner
+                .holds
+                .iter()
+                .any(|h| held(&h.owner) || matches!(&h.held, Held::Account(k) if held(k)))
+            || inner
+                .ledger
+                .iter()
+                .any(|e| bare(&e.recipient) || e.sender.as_ref().is_some_and(bare))
+            || inner.accounts.iter().any(|a| bare(&a.owner)))
+    }
+
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
-        rekeyed.moved += inner.rotate_portable(from, to);
+        inner.rotate_portable(from, to, &mut rekeyed);
         Ok(rekeyed)
     }
 

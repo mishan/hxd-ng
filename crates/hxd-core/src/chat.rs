@@ -2737,6 +2737,9 @@ impl Core {
             }
             // A recipient with no session cannot be reached this way.
             let mut r = self.roster.lock().unwrap();
+            if r.leaving(sender.uid) {
+                return Err(ChatError::Flooding);
+            }
             // The same resolution the durable path does, for the same
             // reasons and in the same order: the session the sender named
             // if it is attached (§15 — clicking a name in a user list is
@@ -2880,6 +2883,9 @@ impl Core {
         let quota = crate::relationships::Requester::Account(from_mailbox.clone());
         if self.send_quota_spent(&**store, &quota, text.len(), now)? && !retry(&guid)? {
             let mut r = self.roster.lock().unwrap();
+            if r.leaving(sender.uid) {
+                return Err(ChatError::Flooding);
+            }
             // Attached only: a detached session's outbox is not a place
             // to leave what the store was just refused.
             let uids = named_sessions(&r, &to.mailbox, to.uid, from);
@@ -2924,8 +2930,12 @@ impl Core {
         let (sender_nick, body) = (sender.nick.clone(), text);
         // Held from the write to this send's own flush, so no other flush
         // (the recipient's login flush above all) hands the row over in
-        // between as one that waited.
+        // between as one that waited. And asked under it whether the
+        // sender is on its way out, as an instant message is.
         let flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
+        if self.staying(sender.uid).is_err() {
+            return Err(ChatError::Flooding);
+        }
         let (id, reference, cursor) = match store
             .push(
                 &NewMessage {
@@ -3613,7 +3623,8 @@ impl Core {
             // question waiting to happen.
             return Err(ChatError::NoSuchUser);
         }
-        self.block_changed(store, &mailbox, &other, blocked)
+        let writing = self.friend_act(uid).map_err(|_| ChatError::Flooding)?;
+        self.block_changed(&writing, store, &mailbox, &other, blocked)
             .map_err(store_failed)?;
         Ok(())
     }
@@ -3640,7 +3651,8 @@ impl Core {
         if other == mailbox {
             return Err(ChatError::NoSuchUser);
         }
-        self.block_changed(store, &mailbox, &other, blocked)
+        let writing = self.friend_act(uid).map_err(|_| ChatError::Flooding)?;
+        self.block_changed(&writing, store, &mailbox, &other, blocked)
             .map_err(store_failed)?;
         Ok(())
     }
@@ -3673,7 +3685,8 @@ impl Core {
             .into_iter()
             .find(|m| m.fingerprint.as_ref() == Some(fingerprint))
             .ok_or(ChatError::NoSuchUser)?;
-        self.block_changed(store, &mailbox, &other, false)
+        let writing = self.friend_act(uid).map_err(|_| ChatError::Flooding)?;
+        self.block_changed(&writing, store, &mailbox, &other, false)
             .map_err(store_failed)?;
         Ok(())
     }
@@ -3696,19 +3709,8 @@ impl Core {
     pub fn inbox_claim(&self, login: &str, fingerprint: &[u8; 32]) -> usize {
         self.news_subs_claim(login, fingerprint);
         self.devices_claim(login, fingerprint);
-        let rekeyed = match self
-            .relationships
-            .as_ref()
-            .map(|s| s.claim(login, fingerprint))
-        {
-            Some(Ok(rekeyed)) => rekeyed,
-            Some(Err(e)) => {
-                warn!("relationships: claiming {login}'s: {e}");
-                crate::relationships::Rekeyed::default()
-            }
-            None => crate::relationships::Rekeyed::default(),
-        };
         let claimed = Mailbox::identified(login, *fingerprint);
+        self.claim_relationships(&claimed);
         let moved = match self.inbox.as_ref() {
             Some(store) => {
                 // A reaction falls before the move and its rekey, or after
@@ -3729,16 +3731,7 @@ impl Core {
             }
             None => 0,
         };
-        if let Err(e) = self.restamp(&rekeyed.merged) {
-            warn!("inbox: re-stamping {login}'s merged friendships: {e}");
-        }
         self.rekey_reactions(&Mailbox::login(login), &claimed);
-        self.rekey_friends(&Mailbox::login(login), &claimed);
-        // A claim runs at every login of a linked account; only one
-        // that moved rows can have folded a block beside a friendship.
-        if rekeyed.moved > 0 {
-            self.after_merge(&claimed);
-        }
         moved
     }
 

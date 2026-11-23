@@ -408,7 +408,7 @@ impl Core {
                 .iter()
                 .any(|s| Key::of(s) == Key::of(&them))
         {
-            let id = self.approve_requests(&me.mailbox, &them)?;
+            let id = self.approve_requests(uid, &me.mailbox, &them)?;
             return store((id, true));
         }
         // The sender understands requests, a classic sender aside, which
@@ -462,7 +462,7 @@ impl Core {
         // Under the lock a block's cleanup takes, so a block made since
         // `route` looked is seen here or deletes what this stores, and
         // the bounds are read and the ledger written as one.
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         if rel.is_blocked(them, me).map_err(store_failed)? {
             return Err(MessagingError::AccountNotFound);
         }
@@ -603,6 +603,7 @@ impl Core {
     /// approval's and are handed over (§4.6).
     fn approve_requests(
         &self,
+        uid: Uid,
         me: &Mailbox,
         them: &Mailbox,
     ) -> Result<crate::RelationId, MessagingError> {
@@ -610,7 +611,7 @@ impl Core {
         let inbox = self.inbox_store()?;
         let now = self.clock.wall();
         // Under the lock a block's cleanup takes, as a request is stored.
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         if rel.is_blocked(them, me).map_err(store_failed)?
             || rel.is_blocked(me, them).map_err(store_failed)?
         {
@@ -691,7 +692,7 @@ impl Core {
         let dropped = if first {
             // Under the lock 808 writes with, so a 0 sent meanwhile is
             // never undone by renewing what it turned off.
-            let _writing = self.friend_writes();
+            let _writing = self.friend_act(uid)?;
             if rel
                 .account(&me.mailbox)
                 .map_err(store_failed)?
@@ -766,12 +767,12 @@ impl Core {
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
         if login.eq_ignore_ascii_case("guest") {
-            return self.answer_guests(&me.mailbox, &Mailbox::login("guest"), action);
+            return self.answer_guests(uid, &me.mailbox, &Mailbox::login("guest"), action);
         }
         let them = self
             .any_account(login)
             .ok_or(MessagingError::NoSuchRequest)?;
-        self.answer_account(&me, them, action)
+        self.answer_account(uid, &me, them, action)
     }
 
     /// [`Self::request_answer`] naming the sender by fingerprint: the
@@ -789,17 +790,18 @@ impl Core {
             .as_ref()
             .and_then(|d| d.account_by_key(fingerprint))
         {
-            return self.answer_account(&me, them, action);
+            return self.answer_account(uid, &me, them, action);
         }
         if !self.names_identities(uid) {
             return Err(MessagingError::NoSuchRequest);
         }
         let group = Mailbox::identified("guest", *fingerprint);
-        self.answer_guests(&me.mailbox, &group, action)
+        self.answer_guests(uid, &me.mailbox, &group, action)
     }
 
     fn answer_account(
         &self,
+        uid: Uid,
         me: &Me,
         them: Mailbox,
         action: RequestAction,
@@ -812,9 +814,10 @@ impl Core {
             .any(|s| Key::of(s) == Key::of(&them));
         match action {
             RequestAction::Approve if waiting => {
-                self.approve_requests(&me.mailbox, &them)?;
+                self.approve_requests(uid, &me.mailbox, &them)?;
             }
             RequestAction::Delete if waiting => {
+                let _writing = self.friend_act(uid)?;
                 inbox
                     .delete_requests(&me.mailbox, &them)
                     .map_err(store_failed)?;
@@ -822,6 +825,7 @@ impl Core {
                 self.requests_changed(&me.mailbox);
             }
             RequestAction::End => {
+                let _writing = self.friend_act(uid)?;
                 rel.end_approval(&me.mailbox, &them)
                     .map_err(store_failed)?
                     .ok_or(MessagingError::NoSuchRequest)?;
@@ -840,6 +844,7 @@ impl Core {
     /// turns what each of them has waiting into mail.
     fn answer_guests(
         &self,
+        uid: Uid,
         me: &Mailbox,
         group: &Mailbox,
         action: RequestAction,
@@ -847,7 +852,7 @@ impl Core {
         // Under the lock a request is stored with, as an account's answer
         // is: an approval ended and its hold written are one act to a
         // reply that would let the guest in again.
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         let rel = self.friends_store()?;
         let inbox = self.inbox_store()?;
         let waiting = self
@@ -987,7 +992,9 @@ impl Core {
         if replier().is_none() {
             return;
         }
-        let _writing = self.friend_writes();
+        let Ok(_writing) = self.friend_act(from) else {
+            return;
+        };
         let Some((me, group)) = replier() else {
             return;
         };
@@ -1068,6 +1075,7 @@ impl Core {
         let inbox = self.inbox_store()?;
         let now = self.clock.wall();
         let names = self.names_identities(uid);
+        let _writing = self.friend_act(uid)?;
         let within = |t: SystemTime| since.is_none_or(|s| t >= s) && before.is_none_or(|b| t < b);
         let mut cleared = Cleared::default();
         let guests = Mailbox::login("guest");
@@ -1109,7 +1117,6 @@ impl Core {
             self.hold_sender(&me.mailbox, &from)?;
             cleared.deleted += 1;
         }
-        let _writing = self.friend_writes();
         for theirs in rel.pending_in(&me.mailbox, now).map_err(store_failed)? {
             if theirs
                 .pending_out

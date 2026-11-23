@@ -739,6 +739,12 @@ impl RosterInner {
             .is_some_and(|p| p.ending)
     }
 
+    /// Whether `uid` is on its way out or gone: kicked itself, or a
+    /// member of a person a kick has begun to end.
+    pub(crate) fn leaving(&self, uid: Uid) -> bool {
+        self.ending(uid) || self.users.get(&uid).is_none_or(|s| s.kicked)
+    }
+
     /// Mark `uid`'s person as being kicked: from here every member is on
     /// its way out, and a login of the account forms a person of its own.
     /// The sessions to end: every member, or `uid` alone for a session

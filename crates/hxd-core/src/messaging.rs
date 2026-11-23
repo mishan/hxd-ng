@@ -58,6 +58,10 @@ pub(crate) use portable::{Epochs, KeptFloors};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
+/// [`Core::friend_writes`] held: what a step that must share its caller's
+/// hold takes.
+pub(crate) type FriendWrites<'a> = std::sync::MutexGuard<'a, ()>;
+
 /// What `[messaging]` says, as far as the domain is concerned.
 #[derive(Debug, Clone, Copy)]
 pub struct MessagingPolicy {
@@ -698,7 +702,18 @@ impl Core {
 
     /// The caller, marked a messenger session, if it takes part.
     fn messenger(&self, uid: Uid) -> Result<Me, MessagingError> {
-        self.caller(uid, true)
+        let me = self.caller(uid, true)?;
+        self.staying(uid)?;
+        Ok(me)
+    }
+
+    /// Refused for a session on its way out, which acts no more: what it
+    /// wrote now could land under a key its account no longer has.
+    pub(crate) fn staying(&self, uid: Uid) -> Result<(), MessagingError> {
+        match self.roster.lock().unwrap().leaving(uid) {
+            false => Ok(()),
+            true => Err(MessagingError::NotEnabled),
+        }
     }
 
     /// The caller, if it takes part, marked a messenger session only when
@@ -745,8 +760,51 @@ impl Core {
         Ok(them)
     }
 
-    pub(crate) fn friend_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn friend_writes(&self) -> FriendWrites<'_> {
         self.friend_writes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`Self::friend_writes`] for an act of `uid`'s, refused once the
+    /// session is on its way out. Asked under the hold, so a rotation,
+    /// which ends its sessions before it takes the hold, finds no act of
+    /// one still to write.
+    pub(crate) fn friend_act(&self, uid: Uid) -> Result<FriendWrites<'_>, MessagingError> {
+        let writing = self.friend_writes();
+        self.staying(uid)?;
+        Ok(writing)
+    }
+
+    /// Claim what `claimed`'s login keeps alone for its fingerprint, and
+    /// settle the fold, under one hold. A login with nothing so keyed
+    /// takes none: a row written after the read is claimed at its next
+    /// login.
+    pub(crate) fn claim_relationships(&self, claimed: &Mailbox) {
+        let (Some(store), Some(fp)) = (self.relationships.as_ref(), claimed.fingerprint) else {
+            return;
+        };
+        let login = claimed.login.as_str();
+        match store.claimable(login) {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(e) => warn!("relationships: reading what {login} keeps alone: {e}"),
+        }
+        let writing = self.friend_writes();
+        let rekeyed = match store.claim(login, &fp) {
+            Ok(rekeyed) => rekeyed,
+            Err(e) => {
+                warn!("relationships: claiming {login}'s: {e}");
+                return;
+            }
+        };
+        if let Err(e) = self.restamp(&rekeyed.merged) {
+            warn!("inbox: re-stamping {login}'s merged friendships: {e}");
+        }
+        self.rekey_friends(&writing, &Mailbox::login(login), claimed);
+        // Only a claim that moved rows can have folded a block beside a
+        // friendship.
+        if rekeyed.moved > 0 {
+            self.after_merge(&writing, claimed);
+        }
     }
 
     /// `of`'s roster row about `other`, sent to `of`'s messenger
@@ -820,8 +878,10 @@ impl Core {
         };
         // Read whether or not the mailbox has an entry now: one in the
         // roster may be gone by the join, when its last session's
-        // announcement is told, and the join would build it empty.
-        let guard = self.friend_writes();
+        // announcement is told, and the join would build it empty. One on
+        // its way out loads nothing, and writes nothing under a key it
+        // may no longer have.
+        let guard = self.friend_act(uid).ok()?;
         let fresh = {
             let store = self.relationships.as_ref()?;
             let now = self.clock.wall();
@@ -872,7 +932,7 @@ impl Core {
         let store = self.friends_store()?;
         // So two updates land in the store and in the entry in one order,
         // and an entry being loaded reads the text either before or after.
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         let key = Key::of(&me.mailbox);
         // What friends read once the account has no session follows only
         // what it shows them while visible. Going Invisible keeps what
@@ -1350,7 +1410,7 @@ impl Core {
         let me = self.messenger(uid)?;
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
-        let _writing = self.friend_writes();
+        let _writing = self.friend_act(uid)?;
         let friends = store
             .relationship(&me.mailbox, &them, self.clock.wall())
             .map_err(store_failed)?
@@ -1499,9 +1559,10 @@ impl Core {
     /// `blocker` blocks `blocked`, or unblocks it: the block written, what
     /// it ends ended in the same step, and each party told as the
     /// extension tells it. The blocked party hears only that the row is
-    /// gone, never of the block.
+    /// gone, never of the block. Under the hold the blocker's act took.
     pub(crate) fn block_changed(
         &self,
+        _writing: &FriendWrites<'_>,
         store: &Arc<dyn RelationshipStore>,
         blocker: &Mailbox,
         blocked: &Mailbox,
@@ -1511,7 +1572,6 @@ impl Core {
         if self.friends_store().is_err() {
             return store.set_blocked(blocker, blocked, now_blocked, at);
         }
-        let _writing = self.friend_writes();
         if !now_blocked {
             store.set_blocked(blocker, blocked, false, at)?;
         } else {
@@ -1545,13 +1605,13 @@ impl Core {
     /// The fold a claim or a rotation made can leave a block beside a
     /// live friendship or approval, or a request beside a friendship:
     /// end each, and tell both parties, as the act that would have ended
-    /// it would have (`docs/instant-messaging.md` §6).
-    pub(crate) fn after_merge(&self, me: &Mailbox) {
+    /// it would have (`docs/instant-messaging.md` §6). Under the hold the
+    /// fold was made in.
+    pub(crate) fn after_merge(&self, _writing: &FriendWrites<'_>, me: &Mailbox) {
         let Some(store) = self.relationships.as_ref() else {
             return;
         };
         let now = self.clock.wall();
-        let _writing = self.friend_writes();
         let rows = match store.relationships(me, now) {
             Ok(rows) => rows,
             Err(e) => {
@@ -1637,10 +1697,11 @@ impl Core {
     }
 
     /// Everything a claim or a rotation re-keyed from `from` to `to` is
-    /// known by `to` in the roster's friend sets too.
-    pub(crate) fn rekey_friends(&self, from: &Mailbox, to: &Mailbox) {
+    /// known by `to` in the roster's friend sets too: under the hold the
+    /// store moved in, or an act between the two would change a set the
+    /// rekey then undoes.
+    pub(crate) fn rekey_friends(&self, _writing: &FriendWrites<'_>, from: &Mailbox, to: &Mailbox) {
         let (from, to) = (Key::of(from), Key::of(to));
-        let _writing = self.friend_writes();
         let mut r = self.roster.lock().unwrap();
         for e in r.presences.by.values_mut() {
             if e.friends.remove(&from) {

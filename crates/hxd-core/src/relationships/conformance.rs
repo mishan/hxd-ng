@@ -41,6 +41,9 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_withdrawal_keeps_the_latest_cutoff_and_its_owners_newest(&*new_store());
     an_offer_lapses_and_a_refriend_keeps_the_id(&*new_store());
     rotation_moves_the_portable_part_and_purging_keeps_withdrawals(&*new_store());
+    a_rotation_ends_an_edge_its_merge_leaves_without_evidence_both_ways(&*new_store());
+    a_merge_carries_a_kept_edge_id_to_the_friendship_kept(&*new_store());
+    claimable_finds_whatever_a_claim_moves(&*new_store());
     a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
     a_friendship_by_request_drops_the_presentations_named(&*new_store());
     ending_a_friendship_is_one_step(&*new_store());
@@ -333,6 +336,145 @@ fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn Relati
         1,
         "{case}: withdrawals stay"
     );
+}
+
+fn a_rotation_ends_an_edge_its_merge_leaves_without_evidence_both_ways(s: &dyn RelationshipStore) {
+    let case = "a_rotation_ends_an_edge_its_merge_leaves_without_evidence_both_ways";
+    // Party 1 rotates to 5, friends with 2 and 3 over presentations both
+    // ways; 5 already holds a hash of 2's and the whole of 3's.
+    let old = Mailbox::identified("old", fp(1));
+    let mut ids = Vec::new();
+    for other in [2, 3] {
+        let them = Mailbox::identified(format!("p{other}"), fp(other));
+        ids.push(s.befriend(&old, &them, at(1)).unwrap());
+        s.present(&presentation(1, other, other, 7)).unwrap();
+        s.present(&presentation(other, 1, other, 8)).unwrap();
+    }
+    s.present(&Presentation {
+        friendship: None,
+        ..presentation(5, 2, 20, 9)
+    })
+    .unwrap();
+    s.present(&presentation(5, 3, 30, 9)).unwrap();
+
+    let rotated = s.rotate(&fp(1), &fp(5)).unwrap();
+    let dropped: Vec<_> = rotated
+        .dropped
+        .iter()
+        .map(|p| (p.presenter, p.other, p.hash))
+        .collect();
+    assert_eq!(
+        dropped,
+        [(fp(5), fp(2), [2; 32]), (fp(5), fp(3), [3; 32])],
+        "{case}: each moved one the successor held its own for, as it would have moved"
+    );
+    let ended: Vec<_> = rotated.ended.iter().map(|e| e.id).collect();
+    assert_eq!(ended, [ids[0]], "{case}: only the pair left one way");
+    let friendship = |other: u8| {
+        s.relationship(
+            &Mailbox::identified("new", fp(5)),
+            &Mailbox::identified("x", fp(other)),
+            at(2),
+        )
+        .unwrap()
+        .and_then(|r| r.friendship)
+    };
+    assert_eq!(friendship(2), None, "{case}: ended");
+    assert_eq!(friendship(3), Some(ids[1]), "{case}: kept");
+    for (p, q) in [(5, 2), (2, 5)] {
+        assert_eq!(
+            s.presentation(&fp(p), &fp(q)).unwrap().and_then(|p| p.edge),
+            Some(ids[0]),
+            "{case}: the id kept on what is left"
+        );
+    }
+}
+
+fn a_merge_carries_a_kept_edge_id_to_the_friendship_kept(s: &dyn RelationshipStore) {
+    let case = "a_merge_carries_a_kept_edge_id_to_the_friendship_kept";
+    for (n, rotation) in [(1u8, false), (2, true)] {
+        let bob = Mailbox::login(format!("bob{n}"));
+        let (from, to) = match rotation {
+            false => (
+                Mailbox::login(format!("alice{n}")),
+                Mailbox::identified(format!("alice{n}"), fp(10 + n)),
+            ),
+            true => (
+                Mailbox::identified("dave", fp(20 + n)),
+                Mailbox::identified("dave", fp(30 + n)),
+            ),
+        };
+        let lost = s.befriend(&from, &bob, at(1)).unwrap();
+        let kept = s.befriend(&to, &bob, at(2)).unwrap();
+        s.present(&Presentation {
+            edge: Some(lost),
+            ..presentation(40 + n, 50 + n, n, 7)
+        })
+        .unwrap();
+        let merged = match rotation {
+            false => s.claim(&from.login, &fp(10 + n)),
+            true => s.rotate(&fp(20 + n), &fp(30 + n)),
+        }
+        .unwrap()
+        .merged;
+        assert_eq!(merged, [(lost, kept)], "{case}: rotation {rotation}");
+        assert_eq!(
+            s.presentation(&fp(40 + n), &fp(50 + n))
+                .unwrap()
+                .and_then(|p| p.edge),
+            Some(kept),
+            "{case}: rotation {rotation}"
+        );
+    }
+}
+
+fn claimable_finds_whatever_a_claim_moves(s: &dyn RelationshipStore) {
+    let case = "claimable_finds_whatever_a_claim_moves";
+    let them = Mailbox::identified("them", fp(9));
+    let held = |m: &Mailbox| Requester::Account(m.clone());
+    type Keep<'a> = &'a dyn Fn(&Mailbox);
+    let kinds: [(&str, Keep); 7] = [
+        ("a row it owns", &|m| {
+            s.set_blocked(m, &them, true, at(1)).unwrap()
+        }),
+        ("a row naming it", &|m| {
+            s.set_blocked(&them, m, true, at(1)).unwrap()
+        }),
+        ("a hold it placed", &|m| {
+            s.hold(m, &held(&them), at(100)).unwrap()
+        }),
+        ("a hold on it", &|m| {
+            s.hold(&them, &held(m), at(100)).unwrap()
+        }),
+        ("a request it sent", &|m| {
+            s.record_request(&entry(RequestKind::Message, Some(m), &them, 1))
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("a request to it", &|m| {
+            s.record_request(&entry(RequestKind::Message, Some(&them), m, 1))
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("its account", &|m| {
+            s.update_account(
+                m,
+                &AccountUpdate {
+                    discoverable: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        }),
+    ];
+    for (n, (kind, keep)) in kinds.iter().enumerate() {
+        let login = format!("c{n}");
+        assert!(!s.claimable(&login).unwrap(), "{case}: {kind}, before");
+        keep(&Mailbox::login(login.clone()));
+        assert!(s.claimable(&login).unwrap(), "{case}: {kind}");
+        s.claim(&login, &fp(60 + n as u8)).unwrap();
+        assert!(!s.claimable(&login).unwrap(), "{case}: {kind}, claimed");
+    }
 }
 
 fn a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(s: &dyn RelationshipStore) {
