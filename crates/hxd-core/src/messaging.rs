@@ -1585,8 +1585,8 @@ impl Core {
                 Ok(()) => changed = true,
                 Err(e) => warn!("relationships: settling a merge: {e}"),
             };
-            // A block ends the friendship, the approvals and the requests
-            // either way, written as the block it already is.
+            // A block ends what a block made now ends (`block_changed`),
+            // written as the block it already is.
             let ends = mine.friendship.is_some()
                 || mine.approval.is_some()
                 || mine.pending_out.is_some()
@@ -1598,17 +1598,19 @@ impl Core {
                 Some((&other, me, at))
             });
             if let Some((x, y, at)) = block.filter(|_| ends) {
-                let end = Ending {
+                let ending = self.end_here(store, x, y, &[]).map(|here| Ending {
                     block: Some(at),
                     friendship: true,
-                    ..Ending::default()
-                };
-                fix(store.end_friendship(x, y, &end).map(|ended| {
-                    if let Some(e) = ended.ended {
-                        let [a, b] = &e.parties;
-                        self.roster.lock().unwrap().friends_changed(a, b, false);
-                    }
-                }));
+                    ..here
+                });
+                fix(ending
+                    .and_then(|end| store.end_friendship(x, y, &end))
+                    .map(|ended| {
+                        if let Some(e) = ended.ended {
+                            let [a, b] = &e.parties;
+                            self.roster.lock().unwrap().friends_changed(a, b, false);
+                        }
+                    }));
             }
             let friends = mine.friendship.is_some() && !blocked;
             if friends && mine.pending_out.is_some() {

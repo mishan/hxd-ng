@@ -2041,3 +2041,26 @@ fn a_block_withdrawing_is_blocked_with_what_it_ends() {
         "the friendship ended with the block, or neither"
     );
 }
+
+#[test]
+fn a_merges_block_ends_what_a_block_ends() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, _, _, f) = made(&s, &alice, &bob);
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    // A fold left Alice's block beside the friendship both presented.
+    s.rel
+        .set_blocked(&ma, &mb, true, std::time::SystemTime::now())
+        .unwrap();
+    s.core.after_merge(&ma);
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    s.core.inbox_block(a, "bob", false).unwrap();
+
+    let (a1, _) = device(&s.core, "alice", &alice, 1);
+    let (_, again) = s.core.friendships_present(a1, vec![], vec![f]).unwrap();
+    assert_eq!(again[0].outcome, Presented::Withdrawn(None));
+    assert_eq!(friendship_of(&s, &alice, &bob), None, "not friends again");
+}
