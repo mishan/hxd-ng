@@ -714,7 +714,7 @@ impl Core {
         for ((presenter, other, dev), old) in rows.into_iter().zip(olds) {
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == f.hash && p.evidence())
+                .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
                 .map_or(at, |p| p.taken);
             store
                 .present(&Presentation {
@@ -1512,7 +1512,7 @@ impl Core {
             let old = store.presentation(&mine, &theirs).map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
-                .filter(|p| p.hash == hash && p.evidence() && friendship.is_some())
+                .filter(|p| friendship.is_some() && p.friendship == friendship)
                 .map_or(wall, |p| p.taken);
             store
                 .present(&Presentation {
@@ -1584,8 +1584,8 @@ impl Core {
         }
         // Step 6, there being no hidden links for step 5. A local edge this
         // makes portable stands on held evidence alone; on any other, the
-        // other party's presentation of another friendship is held by its
-        // own taking alone.
+        // other party's presentation of other bytes is held by its own
+        // taking alone.
         let both = [(mine, theirs), (theirs, mine)]
             .iter()
             .all(|(p, q)| presented(p, q).is_some_and(|x| x.evidence()));
@@ -1598,11 +1598,11 @@ impl Core {
                     .map_err(store_failed)?;
             }
         }
-        record(Some(bytes))?;
+        record(Some(bytes.clone()))?;
         if let Some(p) = store
             .presentation(&theirs, &mine)
             .map_err(store_failed)?
-            .filter(|p| p.hash != hash)
+            .filter(|p| p.friendship.as_ref() != Some(&bytes))
         {
             self.judged_alone(store, &p).map_err(store_failed)?;
         }

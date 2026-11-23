@@ -2349,3 +2349,90 @@ fn a_friendship_is_dated_by_the_takings_of_its_own_bytes() {
         );
     }
 }
+
+#[test]
+fn a_taking_is_carried_only_to_the_bytes_it_dated() {
+    for accepted in [false, true] {
+        let case = format!("accepted {accepted}");
+        let (alice, bob) = (person(1), person(2));
+        let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+        let s = linked(&accounts);
+        let t = s.core.clock().unix();
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let o = offer(&alice, 0, &bob, t);
+        let f = if accepted {
+            assert_eq!(
+                s.core.friend_ask(a, "bob", None, Some(o.clone())),
+                Ok(RosterState::PendingOut),
+                "{case}"
+            );
+            accept(&o, &bob, 0, t + 20)
+        } else {
+            let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
+            f
+        };
+        // A copy of its hash whose bytes do not check, taken at t.
+        let (p, q) = if accepted {
+            (fp(&bob), fp(&alice))
+        } else {
+            (fp(&alice), fp(&bob))
+        };
+        s.rel
+            .present(&Presentation {
+                presenter: p,
+                other: q,
+                names: [p, q],
+                pair: Pair::new(Fingerprint(p), Fingerprint(q)).hash(),
+                hash: hash(&f),
+                friendship: Some(b"not a friendship".to_vec()),
+                device: [0; 32],
+                edge: None,
+                at: super::unix_time(t),
+                taken: super::unix_time(t),
+            })
+            .unwrap();
+        s.core.clock().advance(std::time::Duration::from_secs(20));
+        if accepted {
+            assert_eq!(
+                s.core.friend_answer(b, "alice", true, Some(f)),
+                Ok(RosterState::Accepted),
+                "{case}"
+            );
+        } else {
+            let (_, again) = s.core.friendships_present(a, vec![], vec![f]).unwrap();
+            assert!(ok_all(&again), "{case}");
+        }
+        assert!(s.rel.presentation(&p, &q).unwrap().is_some(), "{case}");
+
+        // Reset after the copy that does not check was taken, and before
+        // the one that does.
+        reset(&s, &alice, 1, t + 10);
+        assert!(
+            s.rel.presentation(&p, &q).unwrap().is_none(),
+            "{case}: not held"
+        );
+    }
+}
+
+#[test]
+fn presenting_again_judges_the_other_partys_copy_that_does_not_check() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, _, mut rb, f) = made(&s, &alice, &bob);
+    let mut theirs = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    theirs.friendship = Some(b"not a friendship".to_vec());
+    s.rel.present(&theirs).unwrap();
+    let (_, again) = s.core.friendships_present(a, vec![], vec![f]).unwrap();
+    assert!(ok_all(&again));
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)],
+        "an edge stands on no copy that does not check"
+    );
+}
