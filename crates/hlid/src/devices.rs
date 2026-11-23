@@ -687,6 +687,8 @@ pub(crate) fn reset_all(
         })
         .collect();
     let mut posted: Vec<[u8; 32]> = Vec::new();
+    // The target posted was found stale and not posted past.
+    let mut passed = false;
     let ours = |c: &Current, posted: &[[u8; 32]]| c.hash.is_some_and(|h| posted.contains(&h));
     let mut known = floor;
     let mut target = 0;
@@ -761,6 +763,7 @@ pub(crate) fn reset_all(
         // The last round only reads: past its target, it keeps the floor
         // it read and reserves no target it would not post.
         let last = round + 1 == ROUNDS;
+        passed |= stale && posted_at.is_some();
         if stale {
             if last {
                 tell("another holder reset past this run's target meanwhile");
@@ -782,6 +785,7 @@ pub(crate) fn reset_all(
             break;
         }
         posted_at = Some(target);
+        passed = false;
         for s in &mut slots {
             if !matches!(s.state, State::Open) {
                 continue;
@@ -811,7 +815,16 @@ pub(crate) fn reset_all(
                 if posted_at == Some(c.epoch) && ours(&c, &posted) {
                     s.state = State::Done;
                 }
+                // Past the target, or at it with another's record, the
+                // target signs out nothing, here as in a round.
+                passed |=
+                    posted_at.is_some_and(|t| c.epoch > t || (c.epoch == t && !ours(&c, &posted)));
             }
+        }
+    }
+    for s in &mut slots {
+        if passed && matches!(s.state, State::Done) {
+            s.state = State::Open;
         }
     }
     kept.raise(published)?;
@@ -1347,6 +1360,8 @@ mod tests {
         let report = report.unwrap();
         assert_eq!((report.target, report.published), (11, 50));
         assert_eq!(kept, 50);
+        // Its floor leaves epoch 11 signing nothing out: done nowhere.
+        assert_eq!(report.done, Vec::<String>::new());
     }
 
     #[test]
@@ -1361,16 +1376,21 @@ mod tests {
     #[test]
     fn the_read_only_round_keeps_the_floor_it_reads_and_reserves_no_target() {
         // Another holder resets `b` to each target just ahead of this one,
-        // the last time in the round before the reads alone.
-        let mut a = Sim::named("a");
-        let mut b = Sim::named("b");
+        // the last time in the round before the reads alone; `a` is read
+        // in that round, or only once it is given up on, and is not done at
+        // a target found stale either way.
         let last = ROUNDS as u64 - 1;
-        b.races = (1..=last).map(|e| signed(e, now() + 5 + e)).collect();
-        let (report, kept) = reset(0, &mut [&mut a, &mut b]);
-        let report = report.unwrap();
-        assert_eq!((report.target, report.published, kept), (last, last, last));
-        assert_eq!(report.done, Vec::<String>::new());
-        assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
+        for fail_read in [None, Some(ROUNDS)] {
+            let mut a = Sim::named("a");
+            a.fail_read = fail_read;
+            let mut b = Sim::named("b");
+            b.races = (1..=last).map(|e| signed(e, now() + 5 + e)).collect();
+            let (report, kept) = reset(0, &mut [&mut a, &mut b]);
+            let report = report.unwrap();
+            assert_eq!((report.target, report.published, kept), (last, last, last));
+            assert_eq!(report.done, Vec::<String>::new(), "{fail_read:?}");
+            assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
+        }
     }
 
     #[test]
