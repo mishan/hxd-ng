@@ -2176,7 +2176,7 @@ pub struct Core {
     /// The device epochs each identity's stored friendships were last
     /// reconciled whole at, and what has changed them since
     /// (`Core::judge_floors`). Taken last, and held for no other lock.
-    pub(crate) reconciled: Mutex<crate::messaging::Reconciled>,
+    pub(crate) reconciled: Arc<Mutex<crate::messaging::Reconciled>>,
     /// The kept floor of each signer of an owner's withdrawals when they
     /// were last judged whole (`Core::make_room`). Taken last, and held
     /// for no other lock.

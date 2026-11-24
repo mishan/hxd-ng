@@ -805,7 +805,7 @@ impl IdentityState {
             handovers: Mutex::default(),
             offline: Mutex::default(),
         };
-        state.finish_rotations(None);
+        state.finish_rotations(None, true);
         state
     }
 
@@ -1501,7 +1501,7 @@ impl IdentityState {
         if let Some(bytes) = rotation {
             self.rotation_shown(bytes, &fingerprint);
         }
-        self.finish_rotations(Some(&fingerprint));
+        self.finish_rotations(Some(&fingerprint), false);
         let device = Fingerprint::of(&cert.device);
         // The floor, the higher of the one installed and the one the lists
         // just fetched publish, decided before any policy below. One the
@@ -2564,7 +2564,7 @@ impl IdentityState {
             t.tokens.retain(|_, (ident, _)| ident.fingerprint != from);
         }
         if !held {
-            self.finish_rotation(from, to);
+            self.finish_rotation(from, to, false);
         }
     }
 
@@ -2572,8 +2572,9 @@ impl IdentityState {
     /// §4): its account link, then what the core keeps under its key. It
     /// is noted done only once all of it has moved; until then it is
     /// asked again at each start and at every admission of the successor,
-    /// which every step allows.
-    fn finish_rotation(&self, from: Fingerprint, to: Fingerprint) {
+    /// which every step allows. `at_start` for a caller on the reactor as
+    /// the server starts, whose start judges the friendships after it.
+    fn finish_rotation(&self, from: Fingerprint, to: Fingerprint, at_start: bool) {
         let Some(anchors) = &self.anchors else {
             return;
         };
@@ -2584,7 +2585,11 @@ impl IdentityState {
                 return;
             }
         };
-        if let Err(e) = self.core.rotate_identity(&from.0, &to.0) {
+        let moved = match at_start {
+            true => self.core.rotate_identity_at_start(&from.0, &to.0),
+            false => self.core.rotate_identity(&from.0, &to.0),
+        };
+        if let Err(e) = moved {
             tracing::warn!(predecessor = %from.short(), "rotation: what the server keeps did not all move: {e}");
             return;
         }
@@ -2596,9 +2601,9 @@ impl IdentityState {
 
     /// [`Self::finish_rotation`] for each rotation, to `to` or to
     /// anyone, whose moves have not all landed.
-    fn finish_rotations(&self, to: Option<&Fingerprint>) {
+    fn finish_rotations(&self, to: Option<&Fingerprint>, at_start: bool) {
         for (from, to) in self.anchors.iter().flat_map(|a| a.unmoved(to)) {
-            self.finish_rotation(from, to);
+            self.finish_rotation(from, to, at_start);
         }
     }
 }
@@ -3424,6 +3429,9 @@ mod tests {
             {
                 Ok(Vec::new())
             }
+            fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, hxd_core::StoreError> {
+                Ok(Vec::new())
+            }
         }
         let (a, b) = (
             ServerKey::from_seed(&[3; 32]),
@@ -3595,6 +3603,9 @@ mod tests {
                     true => self.0.epochs(i),
                     false => Err(hxd_core::StoreError("unreadable".into())),
                 }
+            }
+            fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, hxd_core::StoreError> {
+                self.0.identities_with_epochs()
             }
         }
         let id = IdentityKey::from_seed(&[1; 32]);

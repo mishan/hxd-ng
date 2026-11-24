@@ -681,7 +681,9 @@ Three layers, all `cargo test --workspace`:
   it there after, a revoked device's presentations dropped and brought
   back by the device that stays, a friendship taken before a device
   reset kept and presented again while one taken after it is dropped
-  when the floor is learned and refused after, an offer refused from a
+  when the floor is learned and refused after, one taken after a reset
+  kept while its identity was away dropped when the server starts again
+  and one taken before kept, an offer refused from a
   password session, under another device's signature or out of time, an
   unlinked identity's session making no more acts, a block standing
   whatever becomes of its withdrawal, a rotation's record fetched and

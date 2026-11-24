@@ -418,8 +418,8 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
-            self.judge_floors(list.floors.keys().copied());
         }
+        self.reconcile_due(list.floors.keys().copied());
         ended
     }
 

@@ -55,7 +55,7 @@ mod tests;
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
-pub(crate) use portable::{KeptFloors, Reconciled};
+pub(crate) use portable::{KeptFloors, Reconciled, Watched};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// [`Core::friend_writes`] held: what a step that must share its caller's

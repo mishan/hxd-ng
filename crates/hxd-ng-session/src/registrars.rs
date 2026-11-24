@@ -964,6 +964,8 @@ fn epochs_in(pages: &[SignedList], fp: Fingerprint) -> Vec<(DeviceEpoch, Vec<u8>
 /// verify, and answer every one kept that verifies. A `time` the store
 /// cannot hold is not kept. Called with the store's writes held, so two
 /// readers cannot each keep a later record over the other's earlier one.
+/// The core's cache marks each identity kept for as due, so the next tick
+/// judges it whichever caller kept it (`Core::reconcile_due`).
 fn keep_epochs(
     cache: &dyn RecordCache,
     fp: Fingerprint,
@@ -1150,6 +1152,9 @@ mod tests {
                 _: &[u8; 32],
             ) -> Result<Vec<hxd_core::identity_records::KeptEpoch>, hxd_core::StoreError>
             {
+                Ok(Vec::new())
+            }
+            fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, hxd_core::StoreError> {
                 Ok(Vec::new())
             }
         }
@@ -1651,6 +1656,9 @@ mod tests {
             fn epochs(&self, i: &[u8; 32]) -> Result<Vec<KeptEpoch>, hxd_core::StoreError> {
                 self.0.epochs(i)
             }
+            fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, hxd_core::StoreError> {
+                self.0.identities_with_epochs()
+            }
         }
         let alice = IdentityKey::from_seed(&[1; 32]);
         let fp = Fingerprint::of(&alice.public());
@@ -1735,6 +1743,9 @@ mod tests {
             }
             fn epochs(&self, i: &[u8; 32]) -> Result<Vec<KeptEpoch>, hxd_core::StoreError> {
                 self.0.epochs(i)
+            }
+            fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, hxd_core::StoreError> {
+                self.0.identities_with_epochs()
             }
         }
         let (alice, key) = (

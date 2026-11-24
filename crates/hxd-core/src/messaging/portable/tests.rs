@@ -1234,11 +1234,13 @@ fn a_reset_whose_cleanup_fails_ends_the_friendship_when_judged_again() {
     }
 }
 
-/// The in-memory record cache, its epochs unreadable while `fail` is set.
+/// The in-memory record cache, its epochs unreadable while `fail` is set,
+/// and whose epochs were asked for.
 #[derive(Default)]
 struct Flaky {
     inner: MemoryRecordCache,
     fail: AtomicBool,
+    read: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 impl RecordCache for Flaky {
@@ -1267,10 +1269,14 @@ impl RecordCache for Flaky {
         self.inner.replace_epoch(identity, kept)
     }
     fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError> {
+        self.read.lock().unwrap().push(*identity);
         if self.fail.load(Ordering::Relaxed) {
             return Err(StoreError("unreadable".into()));
         }
         self.inner.epochs(identity)
+    }
+    fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        self.inner.identities_with_epochs()
     }
 }
 
@@ -3138,25 +3144,36 @@ fn a_reset_dated_after_a_pass_kept_the_friendship_unknown_ends_it() {
 
 #[test]
 fn an_offer_moved_while_a_pass_judged_it_is_judged_again() {
-    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let (mut alice, bob, successor) = (person(1), person(2), person(4));
     let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
-    let (a, _) = device(&s.core, "alice", &alice, 0);
+    // Recorded once, at the reset before the one the offer goes with.
+    reset(&s, &alice, 1, now() - 600);
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, renewed);
     assert_eq!(
         s.core
-            .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now()))),
+            .friend_ask(a, "bob", None, Some(offer(&alice, renewed, &bob, now()))),
         Ok(RosterState::PendingOut)
     );
-    keep(&s, &alice, 1, now());
+    assert!(s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+    keep(&s, &alice, 2, now());
     let parked = s.core.reconciling.arm("read");
     let core = s.core.clone();
     let alice_fp = fp(&alice);
-    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 2));
     parked.arrived();
     s.core.keep_rotation_record(&rotation(&bob, &successor));
     s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
     parked.release();
     pass.join().unwrap();
-    s.core.judge_floors([fp(&alice)]);
+    // A tick that does not name her.
+    s.core.reconcile_due([]);
     let wall = std::time::SystemTime::now();
     assert!(s
         .rel
@@ -3213,10 +3230,111 @@ fn a_pair_moved_while_a_pass_judged_it_is_judged_again() {
     s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
     parked.release();
     pass.join().unwrap();
-    s.core.judge_floors([fp(&alice)]);
+    // Bob, of no floor, judged with his successor's rows by the rotation.
     assert!(s
         .rel
         .presentation(&fp(&alice), &fp(&successor))
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn a_tick_reads_the_epochs_only_of_identities_it_names_or_no_pass_recorded() {
+    let (alice, bob) = (person(1), person(2));
+    let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let cache = Arc::new(Flaky::default());
+    Arc::get_mut(&mut s.core).unwrap().record_cache = Some(cache.clone());
+    keep(&s, &alice, 1, now());
+    keep(&s, &bob, 1, now());
+    s.core.raise_floor(fp(&alice), 1);
+    let read = || std::mem::take(&mut *cache.read.lock().unwrap());
+    read();
+    s.core.reconcile_due([]);
+    let first = read();
+    assert!(first.contains(&fp(&bob)), "never recorded");
+    assert!(!first.contains(&fp(&alice)), "recorded and not named");
+    s.core.reconcile_due([]);
+    assert!(read().is_empty(), "both recorded");
+    s.core.reconcile_due([fp(&alice)]);
+    assert!(read().contains(&fp(&alice)), "named");
+}
+
+#[test]
+fn a_tick_reaches_every_identity_no_pass_recorded_so_many_at_a_time() {
+    let mut s = linked(&[]);
+    let cache = Arc::new(Flaky::default());
+    Arc::get_mut(&mut s.core).unwrap().record_cache = Some(cache.clone());
+    // Every pass fails, so that none is recorded.
+    cache.fail.store(true, Ordering::Relaxed);
+    let ids: Vec<[u8; 32]> = (0..=super::UNRECORDED_PER_TICK as u16)
+        .map(|n| {
+            let mut id = [0; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            id
+        })
+        .collect();
+    for id in &ids {
+        let kept = KeptEpoch {
+            epoch: 1,
+            time: 1,
+            record: Vec::new(),
+        };
+        cache.keep_epoch(id, &kept).unwrap();
+    }
+    let tick = || {
+        s.core.reconcile_due([]);
+        let read = std::mem::take(&mut *cache.read.lock().unwrap());
+        read.into_iter().collect::<std::collections::BTreeSet<_>>()
+    };
+    let first = tick();
+    assert_eq!(first.len(), super::UNRECORDED_PER_TICK);
+    let reached: Vec<_> = first.union(&tick()).copied().collect();
+    assert_eq!(reached, ids, "the next tick goes on from where it stopped");
+}
+
+#[test]
+fn an_epoch_kept_with_no_floor_raised_is_judged_at_the_next_tick() {
+    let (mut alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let renewed = enroll(&mut alice, 1);
+    let f = accept(&offer(&alice, renewed, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&alice, &bob],
+        &[(&alice, &bob, t), (&bob, &alice, t)],
+    );
+    // Bob's floor with no record of when he reset: Unknown, and recorded.
+    install(&s, &bob, 1);
+    assert!(s.core.reconciled.lock().unwrap().at.contains_key(&fp(&bob)));
+    // The record kept as an admission refused before its floor is raised.
+    keep(&s, &bob, 1, t - 100);
+    s.core.reconcile_due([]);
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&alice))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_pass_of_no_floor_is_recorded() {
+    let mut s = linked(&[]);
+    let cache = Arc::new(Flaky::default());
+    Arc::get_mut(&mut s.core).unwrap().record_cache = Some(cache.clone());
+    let kept = KeptEpoch {
+        epoch: 1,
+        time: 1,
+        record: Vec::new(),
+    };
+    cache.keep_epoch(&[1; 32], &kept).unwrap();
+    let read = || std::mem::take(&mut *cache.read.lock().unwrap());
+    s.core.reconcile_due([]);
+    assert!(read().contains(&[1; 32]));
+    s.core.reconcile_due([]);
+    assert!(
+        read().is_empty(),
+        "a record that does not verify, judged once"
+    );
 }

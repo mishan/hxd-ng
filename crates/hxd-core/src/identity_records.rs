@@ -68,6 +68,8 @@ pub trait RecordCache: Send + Sync {
     fn replace_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError>;
     /// The device epoch records kept for `identity`, unverified.
     fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError>;
+    /// Every identity with a device epoch record kept, once each.
+    fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, StoreError>;
 }
 
 /// A [`RecordCache`] a restart forgets, for a server without a store.
@@ -151,13 +153,23 @@ impl RecordCache for MemoryRecordCache {
             .map(|(_, kept)| kept.clone())
             .collect())
     }
+
+    fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        let epochs = self.epochs.lock().unwrap();
+        let ids: std::collections::BTreeSet<[u8; 32]> = epochs.keys().map(|(id, _)| *id).collect();
+        Ok(ids.into_iter().collect())
+    }
 }
 
 impl crate::Core {
     /// Keep the registrars' record lists in `cache`, which outlives a
     /// restart.
     pub fn with_record_cache(mut self, cache: std::sync::Arc<dyn RecordCache>) -> Self {
-        self.record_cache = Some(cache);
+        let reconciled = self.reconciled.clone();
+        self.record_cache = Some(std::sync::Arc::new(crate::messaging::Watched {
+            inner: cache,
+            reconciled,
+        }));
         self
     }
 
@@ -225,6 +237,9 @@ pub mod conformance {
         assert_eq!(store.epochs(&bob).unwrap(), [kept(5, 50)]);
         store.replace_epoch(&bob, &kept(5, 60)).unwrap();
         assert_eq!(store.epochs(&bob).unwrap(), [kept(5, 60)]);
+        let mut ids = store.identities_with_epochs().unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, [alice, bob], "each once");
     }
 }
 

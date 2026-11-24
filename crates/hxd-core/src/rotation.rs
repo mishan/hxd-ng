@@ -20,6 +20,26 @@ impl Core {
     /// still keyed by `from` before anything moves, so nothing is written
     /// there while the rest does.
     pub fn rotate_identity(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<(), StoreError> {
+        self.rotate_identity_judging(from, to, true)
+    }
+
+    /// [`Self::rotate_identity`], leaving the predecessor's friendships to
+    /// the pass a start makes over them ([`Self::reconcile_kept`]): for a
+    /// caller on the reactor as the server starts.
+    pub fn rotate_identity_at_start(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        self.rotate_identity_judging(from, to, false)
+    }
+
+    fn rotate_identity_judging(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        judging: bool,
+    ) -> Result<(), StoreError> {
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");
         }
@@ -65,6 +85,9 @@ impl Core {
             self.after_merge(&writing, &successor);
         }
         drop(writing);
+        if judging {
+            self.reconcile_predecessor(*from);
+        }
         self.news_rotate(from, to)?;
         self.rekey_all_reactions(&old, &new)?;
         if let Some(store) = self.devices.as_ref() {
