@@ -1466,7 +1466,7 @@ impl Core {
             .befriend_dropping(a, b, now, id, drop)
             .map_err(store_failed)?;
         if !drop.is_empty() {
-            self.unjudge([a.fingerprint, b.fingerprint].into_iter().flatten());
+            self.unjudge(store, [a.fingerprint, b.fingerprint].into_iter().flatten());
         }
         self.drop_offers(store, a, b);
         self.roster.lock().unwrap().friends_changed(a, b, true);

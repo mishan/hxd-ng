@@ -54,7 +54,7 @@ impl Core {
             self.drop_dead_withdrawals(&[*from, *to])?;
             let rekeyed = store.rotate(from, to)?;
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
-            self.unjudge([*from, *to].into_iter().chain(merged));
+            self.unjudge(store, [*from, *to].into_iter().chain(merged));
             #[cfg(test)]
             self.rotated.at("rotated");
             if let Err(e) = self.restamp(&rekeyed.merged) {

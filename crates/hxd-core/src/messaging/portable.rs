@@ -204,7 +204,7 @@ struct Floors<'a> {
     read: RefCell<HashMap<[u8; 32], Read>>,
     /// Epochs verified by an earlier read, taken again where the rows
     /// read the same.
-    known: HashMap<[u8; 32], (EpochKey, Epochs)>,
+    known: Option<&'a HashMap<[u8; 32], Read>>,
     failed: RefCell<Option<StoreError>>,
 }
 
@@ -213,20 +213,17 @@ impl<'a> Floors<'a> {
         Floors {
             core,
             read: RefCell::default(),
-            known: HashMap::new(),
+            known: None,
             failed: RefCell::default(),
         }
     }
 
     /// A fresh read, verifying again only the epochs whose rows have
-    /// changed since `earlier` read them.
-    fn after(earlier: &Floors<'a>) -> Self {
-        let known = (earlier.read.borrow().iter())
-            .filter_map(|(fp, (key, e))| Some((*fp, (key.clone()?, e.clone()))))
-            .collect();
+    /// changed since an earlier read, `known`.
+    fn after(core: &'a Core, known: &'a HashMap<[u8; 32], Read>) -> Self {
         Floors {
-            known,
-            ..Floors::new(earlier.core)
+            known: Some(known),
+            ..Floors::new(core)
         }
     }
 
@@ -241,8 +238,8 @@ impl<'a> Floors<'a> {
         let (key, e) = match rows {
             Ok(rows) => {
                 let key = EpochKey::of(installed, &rows);
-                let e = match self.known.get(fp) {
-                    Some((k, e)) if *k == key => e.clone(),
+                let e = match self.known.and_then(|k| k.get(fp)) {
+                    Some((Some(k), e)) if *k == key => e.clone(),
                     _ => Epochs::of(fp, installed, &rows),
                 };
                 (Some(key), e)
@@ -532,7 +529,7 @@ impl Core {
                 // A pass under way may have read before what this one
                 // could not judge.
                 let _writing = self.friend_writes();
-                self.unjudge([fp]);
+                self.unjudge(store, [fp]);
                 warn!("relationships: judging presentations by a device floor: {e}");
             }
         }
@@ -590,6 +587,8 @@ impl Core {
             }
             (key, rows, keys, stamp, cleared, held, offers)
         };
+        #[cfg(test)]
+        self.reconciling.at("read");
 
         let floors = Floors::new(self);
         let epochs = if key == seen {
@@ -632,7 +631,9 @@ impl Core {
             })
             .collect();
         floors.failed()?;
+        let known = floors.read.into_inner();
 
+        let mut whole = true;
         // Offers first, so the entry each tells is the one before an end.
         for (owner, other, stored, o) in dropping {
             let _writing = self.friend_writes();
@@ -640,9 +641,12 @@ impl Core {
                 .offer(&owner, &other, wall)?
                 .is_none_or(|now| now.offer != stored.offer)
             {
+                // Moved or replaced since: judged by a pass that reads it
+                // where it is now.
+                whole = false;
                 continue;
             }
-            let floors = Floors::after(&floors);
+            let floors = Floors::after(self, &known);
             let below = floors.below(&o);
             floors.failed()?;
             if below {
@@ -654,12 +658,11 @@ impl Core {
         }
 
         let mut own = vec![0; keys.len()];
-        let mut whole = true;
         for (a, b) in ending {
             let _writing = self.friend_writes();
             let before = self.reconciled.lock().unwrap().of(&keys);
             let pair = [store.presentation(&a, &b)?, store.presentation(&b, &a)?];
-            let floors = Floors::after(&floors);
+            let floors = Floors::after(self, &known);
             let mut gone = Vec::new();
             for p in pair.iter().flatten() {
                 let Some(bytes) = p.friendship.as_deref() else {
@@ -714,14 +717,31 @@ impl Core {
         reconciled.cleared += 1;
     }
 
-    /// Forget what was reconciled of the friendships under `fps`, in
-    /// every identity's pass whose chain holds one of them: for a change
-    /// that can leave a row no longer held without moving an epoch, such
-    /// as an evidence drop or replacement. Under the hold the change was
-    /// made in.
-    pub(crate) fn unjudge(&self, fps: impl IntoIterator<Item = [u8; 32]>) {
-        let mut reconciled = self.reconciled.lock().unwrap();
+    /// Forget what was reconciled of the friendships under `fps`, and
+    /// under each key they rotated to, whose copies they date, in every
+    /// identity's pass whose chain holds one of them: for a change that
+    /// can leave a row no longer held without moving an epoch, such as an
+    /// evidence drop or replacement. Under the hold the change was made
+    /// in. Where a chain cannot be read, every identity's is forgotten.
+    pub(crate) fn unjudge(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fps: impl IntoIterator<Item = [u8; 32]>,
+    ) {
+        let mut keys = Vec::new();
         for fp in fps {
+            keys.push(fp);
+            match self.chain_from(store, fp) {
+                Ok(chain) => keys.extend(chain.iter().map(|r| Fingerprint::of(&r.successor).0)),
+                Err(e) => {
+                    warn!("relationships: reading a rotation to forget its judging: {e}");
+                    self.unjudge_all();
+                    return;
+                }
+            }
+        }
+        let mut reconciled = self.reconciled.lock().unwrap();
+        for fp in keys {
             *reconciled.generation.entry(fp).or_default() += 1;
         }
         if reconciled.generation.len() > GENERATIONS {
@@ -877,7 +897,7 @@ impl Core {
     ) -> Result<Ended, StoreError> {
         self.make_room(store, &Floors::new(self), &end.withdrawals)?;
         let ended = store.end_friendship(a, b, end)?;
-        self.unjudge([a.fingerprint, b.fingerprint].into_iter().flatten());
+        self.unjudge(store, [a.fingerprint, b.fingerprint].into_iter().flatten());
         Ok(ended)
     }
 
@@ -1098,7 +1118,7 @@ impl Core {
                     taken,
                 })
                 .map_err(store_failed)?;
-            self.replaced(replaced, Some(&bytes));
+            self.replaced(store, replaced, Some(&bytes));
         }
         let friends = store
             .relationship(me, them, at)
@@ -1295,7 +1315,7 @@ impl Core {
         self.make_room(store, floors, &end.withdrawals)
             .map_err(store_failed)?;
         let ended = store.end_friendship(a, b, &end).map_err(store_failed)?;
-        self.unjudge([party, other]);
+        self.unjudge(store, [party, other]);
         if let Some(e) = ended.ended {
             self.edge_ended(&e, withdraw.as_deref());
             return Ok(Applied::Ended);
@@ -1385,7 +1405,7 @@ impl Core {
     ) -> Result<Vec<Presentation>, StoreError> {
         let dropped = store.drop_presentations(a, b, presenters)?;
         if !dropped.gone.is_empty() {
-            self.unjudge([*a, *b]);
+            self.unjudge(store, [*a, *b]);
         }
         if let Some(e) = &dropped.ended {
             self.edge_ended(e, None);
@@ -1395,10 +1415,15 @@ impl Core {
 
     /// A presentation `present` answered as replaced, where its evidence
     /// was other than `now`'s: what it held is judged again.
-    fn replaced(&self, old: Option<Presentation>, now: Option<&[u8]>) {
+    fn replaced(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        old: Option<Presentation>,
+        now: Option<&[u8]>,
+    ) {
         if let Some(old) = old.filter(|o| o.friendship.is_some() && o.friendship.as_deref() != now)
         {
-            self.unjudge([old.presenter, old.other]);
+            self.unjudge(store, [old.presenter, old.other]);
         }
     }
 
@@ -1971,7 +1996,7 @@ impl Core {
                     at: wall,
                     taken,
                 })
-                .map(|old| self.replaced(old, friendship.as_deref()))
+                .map(|old| self.replaced(store, old, friendship.as_deref()))
                 .map_err(store_failed)
         };
         // Step 2's refusal keeps the hash alone toward the bound, as the
@@ -2227,7 +2252,7 @@ impl Core {
         // identity's, so it lands between acts.
         let _writing = self.friend_writes();
         match store.keep_rotation(&from, &to, record) {
-            Ok(()) => self.unjudge([from, to]),
+            Ok(()) => self.unjudge(store, [from, to]),
             Err(e) => warn!("relationships: keeping a rotation record: {e}"),
         }
     }

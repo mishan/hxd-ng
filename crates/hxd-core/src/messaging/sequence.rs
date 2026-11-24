@@ -523,6 +523,20 @@ impl Run {
         let told = self.told();
         let ended = before.friendship.is_some() && after.friendship != before.friendship;
         self.told_once(&format!("{what}, then a pass"), &after, ended, &told);
+        let wall = self.core.clock.wall();
+        for (q, login) in LOGINS.iter().enumerate() {
+            let (me, them) = (self.people[q].fp(), self.people[1 - q].fp());
+            let Some(o) = self.store.offer(&me, &them, wall).unwrap() else {
+                continue;
+            };
+            let o = Offer::check(&o.offer, u64::MAX, &[], |_| 0).expect("an offer kept");
+            let epoch = DeviceCert::parse(&o.cert).expect("a certificate").epoch;
+            let floor = self.floors.get(&me).copied().unwrap_or(0);
+            assert!(
+                epoch >= floor.max(self.kept_floor(q)),
+                "{what}: a pass left {login}'s offer below the floor"
+            );
+        }
         let all = self.presentations();
         for p in all.iter().filter(|p| p.evidence()) {
             assert!(

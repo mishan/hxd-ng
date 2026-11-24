@@ -3033,7 +3033,8 @@ fn a_pass_whose_ends_meet_the_generations_forgotten_records_nothing() {
         k[..4].copy_from_slice(&i.to_be_bytes());
         k
     });
-    s.core.unjudge(filler);
+    s.core
+        .unjudge(s.core.relationships.as_ref().unwrap(), filler);
     reset(&s, &alice, 1, t - 100);
     for other in [&bob, &carol] {
         assert!(s
@@ -3073,4 +3074,119 @@ fn a_pass_that_fails_keeps_one_under_way_from_recording() {
         .unwrap()
         .at
         .contains_key(&fp(&alice)));
+}
+
+/// Presentations of `bytes` by each `(presenter, other)`, named by
+/// `names` and taken at its time.
+fn stored(s: &Server, bytes: &[u8], names: [&Person; 2], rows: &[(&Person, &Person, u64)]) {
+    for (presenter, other, taken) in rows {
+        let at = super::unix_time(*taken);
+        s.rel
+            .present(&Presentation {
+                presenter: fp(presenter),
+                other: fp(other),
+                names: [fp(names[0]), fp(names[1])],
+                pair: pair_of(names[0], names[1]),
+                hash: hash(bytes),
+                friendship: Some(bytes.to_vec()),
+                device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_reset_dated_after_a_pass_kept_the_friendship_unknown_ends_it() {
+    let (mut alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let renewed = enroll(&mut alice, 1);
+    let f = accept(&offer(&alice, renewed, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&alice, &bob],
+        &[(&alice, &bob, t), (&bob, &alice, t)],
+    );
+    // Bob's floor with no record of when he reset: Unknown to both passes.
+    install(&s, &bob, 1);
+    keep(&s, &alice, 1, t - 1000);
+    s.core.raise_floor(fp(&alice), 1);
+    let theirs = || s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap();
+    assert!(theirs().is_some());
+    assert!(s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+
+    // The record arrives as an admission fetches it.
+    keep(&s, &bob, 1, t - 100);
+    s.core.raise_floor(fp(&bob), 1);
+    assert!(theirs().is_none());
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn an_offer_moved_while_a_pass_judged_it_is_judged_again() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    assert_eq!(
+        s.core
+            .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now()))),
+        Ok(RosterState::PendingOut)
+    );
+    keep(&s, &alice, 1, now());
+    let parked = s.core.reconciling.arm("read");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.core.keep_rotation_record(&rotation(&bob, &successor));
+    s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
+    parked.release();
+    pass.join().unwrap();
+    s.core.judge_floors([fp(&alice)]);
+    let wall = std::time::SystemTime::now();
+    assert!(s
+        .rel
+        .offer(&fp(&alice), &fp(&successor), wall)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_copy_dropped_under_a_predecessor_judges_its_successors_again() {
+    let (old, new, bob) = (person(1), person(4), person(2));
+    let s = linked(&[("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&old, 0, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&old, &bob],
+        &[(&old, &bob, t - 200), (&new, &bob, t)],
+    );
+    s.core.keep_rotation_record(&rotation(&old, &new));
+    keep(&s, &old, 1, t - 100);
+    keep(&s, &new, 1, t - 1000);
+    s.core.judge_floors([fp(&new)]);
+    let later = || s.rel.presentation(&fp(&new), &fp(&bob)).unwrap();
+    assert!(later().is_some(), "dated by the copy under the old key");
+
+    let device = Fingerprint::of(&old.devices[0].0.public()).0;
+    s.core
+        .drop_revoked_presentations(&[(Some(fp(&old)), device)]);
+    s.core.judge_floors([fp(&new)]);
+    assert!(later().is_none());
 }

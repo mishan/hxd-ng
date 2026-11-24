@@ -2272,8 +2272,9 @@ pub struct Core {
     /// for the domain's tests of what lands beside it.
     #[cfg(test)]
     pub(crate) rotated: crate::relationships::failing::Park,
-    /// Where a reconciling pass waits between its ends and its record
-    /// of them, for the domain's tests of what lands between.
+    /// Where a reconciling pass waits once it has read what it judges,
+    /// and between its ends and its record of them, for the domain's
+    /// tests of what lands between.
     #[cfg(test)]
     pub(crate) reconciling: crate::relationships::failing::Park,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
