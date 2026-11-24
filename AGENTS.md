@@ -30,9 +30,11 @@ License is **GPL-2.0-or-later** — forced by `hxproto`'s hxd ancestry,
 and kept. The identity specifications (`hotline-ng-identity.md`,
 `hotline-ng-auth.md`, `identity-registrar.md`, `e2e-messages.md`,
 `server-key-handover.md`, `identity-enrollment.md`,
-`identity-records.md`) are CC BY 4.0, and hx-libs' `hl-identity` is MIT
-OR Apache-2.0, so other implementations can build on them; a new spec
-of that family carries the same notice under its title.
+`identity-records.md`) are CC BY 4.0, and hx-libs' `hl-identity` and
+the registrar's core, `hxd-registrar` (its own `LICENSE-MIT` and
+`LICENSE-APACHE`), are MIT OR Apache-2.0, so other implementations can
+build on them; a new spec of that family carries the same notice under
+its title.
 
 ## Build and run
 
