@@ -1086,6 +1086,30 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
+    fn ask(
+        &self,
+        owner: &Mailbox,
+        other: &Mailbox,
+        pending: &PendingOut,
+        offer: Option<&StoredOffer>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.edit(owner, other, |r| r.pending_out = Some(pending.clone()));
+        if let Some((x, y)) = owner.fingerprint.zip(other.fingerprint) {
+            inner
+                .offers
+                .retain(|(o, t, kept)| (*o, *t) != (x, y) || (offer.is_none() && kept.upgrade));
+            if let Some(o) = offer {
+                let o = StoredOffer {
+                    lapses_at: floor(o.lapses_at),
+                    ..o.clone()
+                };
+                inner.offers.push((x, y, o));
+            }
+        }
+        Ok(())
+    }
+
     fn take_as_upgrade(&self, owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         if inner.find(owner, other).is_some() {
@@ -1470,9 +1494,11 @@ impl RelationshipStore for MemoryRelationships {
                 }
             }
         }
+        let before = inner.offers.len();
         inner
             .offers
             .retain(|(o, t, offer)| offer.upgrade || !asked.contains(&(*o, *t)));
+        n += before - inner.offers.len();
         n += lapsing.len();
         let mut old = 0;
         inner.ledger.retain(|e| {

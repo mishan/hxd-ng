@@ -51,6 +51,8 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_friendship_an_acceptance_makes_is_one_step(&*new_store());
     a_reset_record_lapses_unless_an_offer_waits_on_it(&*new_store());
     a_lapsed_request_takes_its_offer_and_an_upgrade_is_taken_whole(&*new_store());
+    a_request_takes_the_place_of_an_offer_an_earlier_one_left(&*new_store());
+    cleanup_counts_the_offers_lapsed_requests_take(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
@@ -1977,4 +1979,67 @@ fn a_lapsed_request_takes_its_offer_and_an_upgrade_is_taken_whole(s: &dyn Relati
             "{case}: an upgrade, no request's"
         );
     }
+}
+
+fn a_request_takes_the_place_of_an_offer_an_earlier_one_left(s: &dyn RelationshipStore) {
+    let case = "a_request_takes_the_place_of_an_offer_an_earlier_one_left";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let asked = PendingOut {
+        sent_at: at(1),
+        lapses_at: at(500),
+        delivered: true,
+        note: None,
+    };
+    let offer = |b: u8, upgrade| StoredOffer {
+        offer: vec![b],
+        lapses_at: at(1000),
+        upgrade,
+    };
+    s.set_offer(&fp(1), &fp(2), Some(&offer(1, false))).unwrap();
+    s.ask(&mb(1), &mb(2), &asked, None).unwrap();
+    assert_eq!(s.offer(&fp(1), &fp(2), at(10)).unwrap(), None, "{case}");
+    let row = s.relationship(&mb(1), &mb(2), at(10)).unwrap();
+    assert_eq!(
+        row.and_then(|r| r.pending_out),
+        Some(asked.clone()),
+        "{case}"
+    );
+    s.ask(&mb(1), &mb(2), &asked, Some(&offer(2, false)))
+        .unwrap();
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(10)).unwrap(),
+        Some(offer(2, false)),
+        "{case}: the offer it carries"
+    );
+    s.set_offer(&fp(1), &fp(3), Some(&offer(3, true))).unwrap();
+    s.ask(&mb(1), &mb(3), &asked, None).unwrap();
+    assert_eq!(
+        s.offer(&fp(1), &fp(3), at(10)).unwrap(),
+        Some(offer(3, true)),
+        "{case}: an upgrade stays"
+    );
+}
+
+fn cleanup_counts_the_offers_lapsed_requests_take(s: &dyn RelationshipStore) {
+    let case = "cleanup_counts_the_offers_lapsed_requests_take";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let asked = PendingOut {
+        sent_at: at(1),
+        lapses_at: at(50),
+        delivered: true,
+        note: None,
+    };
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+        upgrade: false,
+    };
+    s.set_pending_out(&mb(1), &mb(2), Some(&asked)).unwrap();
+    s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
+    s.set_pending_out(&mb(3), &mb(4), Some(&asked)).unwrap();
+    assert_eq!(
+        s.cleanup(at(60), at(0), 100).unwrap(),
+        3,
+        "{case}: two requests and one offer"
+    );
 }

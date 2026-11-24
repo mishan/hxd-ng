@@ -778,10 +778,10 @@ pub trait RelationshipStore: Send + Sync + 'static {
         at: SystemTime,
     ) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError>;
 
-    /// Forget the friendship each `Reset` record last presented at or
-    /// before `before` kept, leaving its hash, but where the other party
-    /// still has an upgrade offer waiting for the presenter at `now`
-    /// (§4.3 step 4). How many went.
+    /// Clear the friendship of each `Reset` record last presented at or
+    /// before `before`, unless the other party has an upgrade offer
+    /// waiting for the presenter at `now` (§4.3 step 4); the hash stays
+    /// either way. How many were cleared.
     fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError>;
 
     /// The presentation `presenter` made naming `other`.
@@ -852,6 +852,17 @@ pub trait RelationshipStore: Send + Sync + 'static {
         &self,
         owner: &[u8; 32],
         other: &[u8; 32],
+        offer: Option<&StoredOffer>,
+    ) -> Result<(), StoreError>;
+
+    /// Record `owner`'s request to `other`, and the offer it carries if any,
+    /// in place of whatever offer an earlier request left, as one step; an
+    /// upgrade offer waiting stays where this request carries none.
+    fn ask(
+        &self,
+        owner: &Mailbox,
+        other: &Mailbox,
+        pending: &PendingOut,
         offer: Option<&StoredOffer>,
     ) -> Result<(), StoreError>;
 

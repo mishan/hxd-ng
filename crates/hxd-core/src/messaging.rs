@@ -457,6 +457,17 @@ impl RosterInner {
         }
     }
 
+    /// Tell `of`'s sessions that are not friendships sessions alone, as
+    /// they are told anything: what they show of an upgrade offer, which
+    /// they never see.
+    pub(crate) fn tell_plain(&mut self, of: &Mailbox, ev: Event) {
+        for uid in self.messengers(&Key::of(of)) {
+            if !self.users.get(&uid).is_some_and(is_friendships) {
+                self.send_to(uid, plain(ev.clone()));
+            }
+        }
+    }
+
     /// Tell `of`'s friendships sessions alone: an upgrade offer, which any
     /// other would show as a request from someone already a friend.
     pub(crate) fn tell_friendships(&mut self, of: &Mailbox, ev: Event) {
@@ -1163,9 +1174,15 @@ impl Core {
         // answer says nothing of `them`'s presentation. One waiting keeps
         // the edge so; one from a sender `them` declined is a request, held.
         if let Some(o) = &offer {
-            let waiting = self
-                .offer_between(store, &me.mailbox, &them, now)
-                .is_some_and(|o| o.upgrade);
+            // Read or refused: one missed would send the request route over
+            // a waiting upgrade.
+            let waiting = match (me.mailbox.fingerprint, them.fingerprint) {
+                (Some(x), Some(y)) => store
+                    .offer(&x, &y, now)
+                    .map_err(store_failed)?
+                    .is_some_and(|o| o.upgrade),
+                _ => false,
+            };
             let sender = Requester::Account(me.mailbox.clone());
             if !store.is_held(&them, &sender, now).map_err(store_failed)?
                 && self.reset_edge(store, &me.mailbox, &them, now, waiting)?
@@ -1205,21 +1222,14 @@ impl Core {
         }
         let delivered = !held && !full;
         let offer = offer.filter(|_| delivered);
-        if let (Some(offer), Some(a), Some(b)) = (&offer, me.mailbox.fingerprint, them.fingerprint)
-        {
-            store.set_offer(&a, &b, Some(offer)).map_err(store_failed)?;
-        }
+        let asked = PendingOut {
+            sent_at: now,
+            lapses_at: now + p.request_retention,
+            delivered,
+            note: note.clone(),
+        };
         store
-            .set_pending_out(
-                &me.mailbox,
-                &them,
-                Some(&PendingOut {
-                    sent_at: now,
-                    lapses_at: now + p.request_retention,
-                    delivered,
-                    note: note.clone(),
-                }),
-            )
+            .ask(&me.mailbox, &them, &asked, offer.as_ref())
             .map_err(store_failed)?;
         self.tell_entry(&me.mailbox, &them);
         if delivered {

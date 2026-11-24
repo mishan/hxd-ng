@@ -39,8 +39,8 @@ use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
 use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    Ended, EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore,
-    StoredOffer,
+    Ended, EndedEdge, Ending, HeldWithdrawal, PendingOut, Presentation, RelationId,
+    RelationshipStore, StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -389,20 +389,18 @@ impl<'a> Floors<'a> {
         out
     }
 
-    /// Whether `who`'s own half of the friendship `bytes` was signed by a
-    /// certificate below its floor.
-    fn own_half_below(&self, bytes: &[u8], who: &[u8; 32]) -> bool {
-        Friendship::check(bytes, STORED, &[], zero_floor).is_ok_and(|f| {
-            [
-                (&f.offer.from, &f.offer.cert),
-                (&f.acceptance.from, &f.acceptance.cert),
-            ]
-            .into_iter()
-            .any(|(from, cert)| {
-                Fingerprint::of(from).0 == *who
-                    && DeviceCert::parse(cert)
-                        .is_ok_and(|c| c.check_floor(self.floor(from)).is_err())
-            })
+    /// Whether `who`'s own half of `f`, signed by `who` or a key that
+    /// rotated to it along `rotations`, was signed by a certificate below
+    /// its signer's floor.
+    fn own_half_below(&self, f: &Friendship, who: &[u8; 32], rotations: &[Rotation]) -> bool {
+        [
+            (&f.offer.from, &f.offer.cert),
+            (&f.acceptance.from, &f.acceptance.cert),
+        ]
+        .into_iter()
+        .any(|(from, cert)| {
+            chain_end(Fingerprint::of(from), rotations).is_some_and(|k| k.0 == *who)
+                && DeviceCert::parse(cert).is_ok_and(|c| c.check_floor(self.floor(from)).is_err())
         })
     }
 
@@ -1253,40 +1251,43 @@ impl Core {
         else {
             return Ok(false);
         };
+        let Ok(f) = Friendship::check(&record, STORED, &[], zero_floor) else {
+            return Ok(false);
+        };
+        let rotations = self.rotations_for(store, &f.pair())?;
         let floors = Floors::new(self);
-        let below = floors.own_half_below(&record, &s);
+        let below = floors.own_half_below(&f, &s, &rotations);
         floors.failed().map_err(store_failed)?;
         Ok(below)
     }
 
-    /// `them`'s offer waiting for `me`, where the `Reset` just answered `me`
-    /// makes it an upgrade offer (§4.1): its request ended and the offer
-    /// taken as one in one step, and told to `me`'s friendships sessions as
-    /// one, at every presentation answered so, which reaches one made
+    /// `them`'s `offer` waiting for `me`, read before the `Reset` just
+    /// answered `me` was recorded, with the request it came with, `asked`
+    /// (§4.1): a request's offer is taken as an upgrade, its request ended
+    /// in the same step, and either is told to `me`'s friendships sessions
+    /// as one, at every presentation answered so, which reaches one made
     /// while `me` was away. An offer whose request lapsed is neither.
     fn reset_offer(
         &self,
         store: &Arc<dyn RelationshipStore>,
         me: &Mailbox,
         them: &Mailbox,
-        now: SystemTime,
+        offer: StoredOffer,
+        asked: Option<PendingOut>,
     ) -> Result<(), MessagingError> {
-        let Some(offer) = self.offer_between(store, them, me, now) else {
-            return Ok(());
-        };
-        if !self.reset_edge(store, them, me, now, false)? {
-            return Ok(());
-        }
-        let asked = store
-            .relationship(them, me, now)
-            .map_err(store_failed)?
-            .and_then(|r| r.pending_out);
         match &asked {
             Some(_) => store.take_as_upgrade(them, me).map_err(store_failed)?,
             None if offer.upgrade => {}
             None => return Ok(()),
         }
-        self.roster.lock().unwrap().tell_friendships(
+        let mut r = self.roster.lock().unwrap();
+        // Either party's sessions that never see an upgrade offer saw the
+        // request, which is gone; the friendships sessions keep the edge.
+        if asked.is_some() {
+            r.tell_plain(me, Event::FriendEntry(Box::new(FriendEntry::removed(them))));
+            r.tell_plain(them, Event::FriendEntry(Box::new(FriendEntry::removed(me))));
+        }
+        r.tell_friendships(
             me,
             Event::FriendRequest {
                 login: them.login.clone(),
@@ -2319,6 +2320,18 @@ impl Core {
                 return answer(Presented::AccountNotFound);
             }
             Judged::Reset => {
+                // The other party's offer waiting, and the request it came
+                // with, read before anything is written.
+                let waiting = store.offer(&theirs, &mine, wall).map_err(store_failed)?;
+                let asked = match &waiting {
+                    Some(_) => store
+                        .relationship(&them, me, wall)
+                        .map_err(store_failed)?
+                        .and_then(|r| r.pending_out),
+                    None => None,
+                };
+                let upgrade = waiting.filter(|_| floors.own_half_below(&f, &theirs, &rotations));
+                floors.failed().map_err(store_failed)?;
                 // What is stored of it is not held either, and goes now
                 // rather than at the next judging.
                 self.drop_pairs(
@@ -2326,9 +2339,13 @@ impl Core {
                     held.iter().filter(|p| p.hash == hash && p.evidence()),
                 )
                 .map_err(store_failed)?;
-                if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
+                // In place of a hash kept alone, or a record, but never of
+                // another friendship presented that is evidence.
+                if presented(&mine, &theirs).is_none_or(|p| p.hash == hash || !p.evidence()) {
                     record(None, Some(bytes.clone()))?;
-                    self.reset_offer(store, me, &them, wall)?;
+                    if let Some(offer) = upgrade {
+                        self.reset_offer(store, me, &them, offer, asked)?;
+                    }
                 }
                 return answer(Presented::Reset);
             }

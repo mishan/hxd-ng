@@ -729,6 +729,71 @@ async fn a_reset_keeps_what_was_taken_before_it_and_a_device_since_remakes_what_
 }
 
 #[tokio::test]
+async fn a_request_made_an_upgrade_by_reset_is_removed_for_sessions_without_bit_15() {
+    // Both parties' sessions without bit 15 are told the request is gone;
+    // those with it keep the edge for the upgrade.
+    let (mut alice, bob) = (alice(), bob());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let s1 = start(d1.path()).await;
+    let s2 = start(d2.path()).await;
+    let mut alice1 = classic_device(&s1, "alice", &alice, 0).await;
+    let mut bob1 = classic_device(&s1, "bob", &bob, 0).await;
+    let f = befriend_classic(&mut alice1, &mut bob1, &alice, &bob).await;
+    reset(&s2, &alice, now() - 1);
+    let renewed = enroll(&mut alice);
+    let mut alice2 = classic_device(&s2, "alice", &alice, renewed).await;
+    let mut bob2 = classic_device(&s2, "bob", &bob, 0).await;
+    let (mut plain_bob, _) = classic(&s2, "bob", CAP_MESSAGING).await;
+    ok(&mut plain_bob, ClientHdr::GetRoster, Vec::new()).await;
+    let (mut plain_alice, _) = classic(&s2, "alice", CAP_MESSAGING).await;
+    ok(&mut plain_alice, ClientHdr::GetRoster, Vec::new()).await;
+
+    // A request, since Bob has presented nothing here yet.
+    let o = offer(&alice, renewed, &bob, now());
+    ok(
+        &mut alice2,
+        ClientHdr::AddFriend,
+        im::add_friend_offering(b"bob", &o),
+    )
+    .await;
+    told(&mut plain_bob, ServerHdr::FriendRequest, "alice", |_| true).await;
+    told(&mut bob2, ServerHdr::FriendRequest, "alice", |e| {
+        e.offer == Some(o.as_slice())
+    })
+    .await;
+
+    present(&mut bob2, &[Presentation::Friendship(&f)]).await;
+    told(
+        &mut plain_bob,
+        ServerHdr::RosterEntry,
+        "alice",
+        state(RosterState::Removed),
+    )
+    .await;
+    told(&mut bob2, ServerHdr::FriendRequest, "alice", |e| {
+        e.offer == Some(o.as_slice())
+    })
+    .await;
+    told(
+        &mut plain_alice,
+        ServerHdr::RosterEntry,
+        "bob",
+        state(RosterState::Removed),
+    )
+    .await;
+    let removed = |c: &mut Client, login: &[u8]| {
+        c.rx.take_backlog().iter().any(|f| {
+            f.ty == ServerHdr::RosterEntry.as_u32()
+                && entry(f).login == login
+                && entry(f).state == Some(RosterState::Removed.wire())
+        })
+    };
+    assert!(!removed(&mut bob2, b"alice"), "the target's");
+    ok(&mut alice2, ClientHdr::FindUser, im::find_user(b"bob")).await;
+    assert!(!removed(&mut alice2, b"bob"), "the sender's");
+}
+
+#[tokio::test]
 async fn a_half_out_of_time_or_withdrawn_is_answered_by_its_code() {
     let (alice, bob, carol) = (alice(), bob(), carol());
     let d = tempfile::tempdir().unwrap();

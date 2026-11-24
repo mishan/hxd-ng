@@ -1619,6 +1619,39 @@ impl RelationshipStore for SqliteStore {
         Ok(())
     }
 
+    fn ask(
+        &self,
+        owner: &Mailbox,
+        other: &Mailbox,
+        pending: &PendingOut,
+        offer: Option<&StoredOffer>,
+    ) -> Result<(), StoreError> {
+        self.with_tx(|tx| {
+            let (id, mut rel) = match load_pair(tx, owner, other)? {
+                Some((id, rel)) => (Some(id), rel),
+                None => (None, Relationship::new(owner, other)),
+            };
+            rel.pending_out = Some(pending.clone());
+            write(tx, id, &mut rel)?;
+            let Some((x, y)) = owner.fingerprint.zip(other.fingerprint) else {
+                return Ok(());
+            };
+            let (x, y) = (fp_hex(&x), fp_hex(&y));
+            match offer {
+                Some(o) => sql(tx.execute(
+                    "INSERT OR REPLACE INTO friend_offer (owner, other, offer, lapses, upgrade)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![x, y, o.offer, unix(o.lapses_at), o.upgrade],
+                ))?,
+                None => sql(tx.execute(
+                    "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2 AND NOT upgrade",
+                    params![x, y],
+                ))?,
+            };
+            Ok(())
+        })
+    }
+
     fn take_as_upgrade(&self, owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError> {
         self.with_tx(|tx| {
             if let Some((id, mut rel)) = load_pair(tx, owner, other)? {
@@ -1826,7 +1859,7 @@ impl RelationshipStore for SqliteStore {
                     .filter(|_| now.as_ref().is_none_or(|r| r.pending_out.is_none()))
                     .and_then(|r| r.owner.fingerprint.zip(r.other.fingerprint));
                 if let Some((x, y)) = lapsed_ask {
-                    sql(tx.execute(
+                    n += sql(tx.execute(
                         "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2 AND NOT upgrade",
                         params![fp_hex(&x), fp_hex(&y)],
                     ))?;
