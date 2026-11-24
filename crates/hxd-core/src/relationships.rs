@@ -429,6 +429,11 @@ pub struct Presentation {
     /// toward the presenter's bound, for one refused before it could be
     /// recorded (§4.3, steps 2 and 3).
     pub friendship: Option<Vec<u8>>,
+    /// A `Reset` record (§4.3): the friendship a presentation answered
+    /// `Reset` kept, with `friendship` `None`, so that it is never
+    /// evidence and the upgrade offer that remakes it can be checked
+    /// against which half is below its floor.
+    pub reset: Option<Vec<u8>>,
     /// The SHA-256 of the device key whose session made it, or for one
     /// made by Friend Response, that signed the presenter's half: what a
     /// device's revocation drops (§6).
@@ -493,6 +498,9 @@ pub struct Ending {
     /// Where the friendship ends, `b` held from requests to `a` until
     /// then.
     pub hold: Option<SystemTime>,
+    /// `b` held from requests to `a` until then, whatever else ends: a
+    /// declined upgrade offer (§4.1).
+    pub declined: Option<SystemTime>,
 }
 
 /// A withdrawal this server holds (§4.3): what it ends, and the signed
@@ -524,6 +532,9 @@ pub struct StoredOffer {
     /// Its `expires`, when it lapses as everything here lapses: read as
     /// gone from then on.
     pub lapses_at: SystemTime,
+    /// Taken as an upgrade offer (§4.1), which no request carries: only
+    /// such an offer is answered without one.
+    pub upgrade: bool,
 }
 
 /// The other key of a rotation, and its record as it was published.
@@ -753,6 +764,26 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// party, which is returned.
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError>;
 
+    /// Record `rows` as [`RelationshipStore::present`] does and drop the
+    /// offers between `a` and `b` either way, and with `befriend` make the
+    /// two friends as [`RelationshipStore::befriend_dropping`] does under
+    /// the id it holds, as one step: a friendship made here by an
+    /// acceptance (§4.1). The rows replaced, in order, and the id.
+    fn present_befriending(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        rows: &[Presentation],
+        befriend: Option<Option<RelationId>>,
+        at: SystemTime,
+    ) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError>;
+
+    /// Forget the friendship each `Reset` record last presented at or
+    /// before `before` kept, leaving its hash, but where the other party
+    /// still has an upgrade offer waiting for the presenter at `now`
+    /// (§4.3 step 4). How many went.
+    fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError>;
+
     /// The presentation `presenter` made naming `other`.
     fn presentation(
         &self,
@@ -823,6 +854,11 @@ pub trait RelationshipStore: Send + Sync + 'static {
         other: &[u8; 32],
         offer: Option<&StoredOffer>,
     ) -> Result<(), StoreError>;
+
+    /// Take `owner`'s offer to `other` as an upgrade offer and end the
+    /// request it came with, as one step: a request whose friendship a
+    /// `Reset` answer left for remaking (§4.1).
+    fn take_as_upgrade(&self, owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError>;
 
     /// `owner`'s offer to `other`, as it reads at `now`.
     fn offer(
@@ -897,7 +933,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
     fn purge_count(&self, of: &Mailbox) -> Result<usize, StoreError>;
 
     /// Reclaim at most `batch` of each kind of row: what lapsed before
-    /// `lapsed_before`, and ledger entries from before `ledger_before`.
+    /// `lapsed_before`, a lapsed request's offer with it, and ledger
+    /// entries from before `ledger_before`.
     /// Changes no answer, since a lapsed part already reads as gone.
     /// Returns how many rows changed, so a caller can go on until none
     /// do.

@@ -47,6 +47,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_drop_ends_an_edge_only_where_it_had_evidence_both_ways(&*new_store());
     a_friendship_by_request_drops_the_presentations_named(&*new_store());
     ending_a_friendship_is_one_step(&*new_store());
+    a_declined_upgrade_drops_its_offer_and_holds_in_one_step(&*new_store());
+    a_friendship_an_acceptance_makes_is_one_step(&*new_store());
+    a_reset_record_lapses_unless_an_offer_waits_on_it(&*new_store());
+    a_lapsed_request_takes_its_offer_and_an_upgrade_is_taken_whole(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
@@ -59,6 +63,7 @@ fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation 
         pair: [presenter ^ other; 32],
         hash: [hash; 32],
         friendship: Some(vec![hash; 3]),
+        reset: None,
         device: [device; 32],
         edge: None,
         at: at(100 + u64::from(hash)),
@@ -89,9 +94,15 @@ fn a_presentation_is_one_per_party_and_is_dropped_by_its_device(s: &dyn Relation
     assert_eq!(s.present(&again).unwrap(), Some(first), "{case}: replaced");
     let theirs = Presentation {
         friendship: None,
+        reset: Some(vec![12; 3]),
         ..presentation(2, 1, 12, 7)
     };
     s.present(&theirs).unwrap();
+    assert_eq!(
+        s.presentation(&fp(2), &fp(1)).unwrap(),
+        Some(theirs),
+        "{case}: a `Reset` record read back whole"
+    );
     s.present(&presentation(1, 3, 13, 7)).unwrap();
     assert_eq!(
         s.presentation(&fp(1), &fp(2)).unwrap(),
@@ -196,6 +207,7 @@ fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
     let offer = StoredOffer {
         offer: vec![1, 2, 3],
         lapses_at: at(100),
+        upgrade: false,
     };
     s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
     assert_eq!(
@@ -216,6 +228,7 @@ fn an_offer_lapses_and_a_refriend_keeps_the_id(s: &dyn RelationshipStore) {
     let later = StoredOffer {
         offer: vec![4],
         lapses_at: at(300),
+        upgrade: false,
     };
     s.set_offer(&fp(1), &fp(3), Some(&later)).unwrap();
     s.set_offer(&fp(3), &fp(1), Some(&later)).unwrap();
@@ -273,6 +286,7 @@ fn rotation_moves_the_portable_part_and_purging_keeps_withdrawals(s: &dyn Relati
     let offer = StoredOffer {
         offer: vec![1],
         lapses_at: at(1000),
+        upgrade: false,
     };
     s.set_offer(&fp(1), &fp(2), Some(&offer)).unwrap();
     s.keep_withdrawal(&withdrawal(1, 9, 5, true, 1), 10)
@@ -608,6 +622,7 @@ fn ending_a_friendship_is_one_step(s: &dyn RelationshipStore) {
     let offer = StoredOffer {
         offer: vec![1],
         lapses_at: at(1000),
+        upgrade: false,
     };
     for (x, y) in [(1, 2), (2, 1), (1, 3)] {
         s.set_offer(&fp(x), &fp(y), Some(&offer)).unwrap();
@@ -630,6 +645,7 @@ fn ending_a_friendship_is_one_step(s: &dyn RelationshipStore) {
         block: Some(at(3)),
         friendship: true,
         hold: Some(at(500)),
+        declined: None,
     };
     let ended = s
         .end_friendship(
@@ -1774,4 +1790,191 @@ fn times_are_kept_to_the_second(s: &dyn RelationshipStore) {
         Some((at(1), at(10))),
         "{case}: and is read back as its second"
     );
+}
+
+fn a_declined_upgrade_drops_its_offer_and_holds_in_one_step(s: &dyn RelationshipStore) {
+    let case = "a_declined_upgrade_drops_its_offer_and_holds_in_one_step";
+    let (a, b) = (
+        Mailbox::identified("a", fp(1)),
+        Mailbox::identified("b", fp(2)),
+    );
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+        upgrade: false,
+    };
+    s.set_offer(&fp(2), &fp(1), Some(&offer)).unwrap();
+    let decline = Ending {
+        offers: vec![fp(2)],
+        declined: Some(at(500)),
+        ..Ending::default()
+    };
+    s.end_friendship(&a, &b, &decline).unwrap();
+    assert_eq!(s.offer(&fp(2), &fp(1), at(4)).unwrap(), None, "{case}");
+    let them = Requester::Account(b.clone());
+    assert!(s.is_held(&a, &them, at(10)).unwrap(), "{case}: held");
+    assert!(
+        !s.is_held(&a, &them, at(600)).unwrap(),
+        "{case}: until then"
+    );
+}
+
+fn a_friendship_an_acceptance_makes_is_one_step(s: &dyn RelationshipStore) {
+    let case = "a_friendship_an_acceptance_makes_is_one_step";
+    let (a, b) = (
+        Mailbox::identified("a", fp(1)),
+        Mailbox::identified("b", fp(2)),
+    );
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+        upgrade: false,
+    };
+    for (x, y) in [(1, 2), (2, 1), (1, 3)] {
+        s.set_offer(&fp(x), &fp(y), Some(&offer)).unwrap();
+    }
+    let kept = s.befriend(&a, &b, at(1)).unwrap();
+    s.unfriend(&a, &b).unwrap();
+    let record = Presentation {
+        friendship: None,
+        reset: Some(vec![9; 3]),
+        ..presentation(2, 1, 9, 7)
+    };
+    s.present(&record).unwrap();
+    let rows = [presentation(1, 2, 10, 7), presentation(2, 1, 10, 8)];
+    let (replaced, id) = s
+        .present_befriending(&a, &b, &rows, Some(Some(kept)), at(5))
+        .unwrap();
+    assert_eq!(replaced, [None, Some(record)], "{case}: what was replaced");
+    assert_eq!(id, Some(kept), "{case}: under the id kept");
+    let made = s.relationship(&a, &b, at(6)).unwrap();
+    assert_eq!(made.and_then(|r| r.friendship), Some(kept), "{case}");
+    assert_eq!(
+        s.presentation(&fp(1), &fp(2)).unwrap(),
+        Some(rows[0].clone()),
+        "{case}"
+    );
+    assert_eq!(
+        s.presentation(&fp(2), &fp(1)).unwrap(),
+        Some(rows[1].clone()),
+        "{case}"
+    );
+    assert_eq!(s.offer(&fp(1), &fp(2), at(4)).unwrap(), None, "{case}");
+    assert_eq!(s.offer(&fp(2), &fp(1), at(4)).unwrap(), None, "{case}");
+    assert!(
+        s.offer(&fp(1), &fp(3), at(4)).unwrap().is_some(),
+        "{case}: another pair's"
+    );
+
+    // Between friends already, the rows alone, and a fresh id where none
+    // was kept.
+    let (c, d) = (
+        Mailbox::identified("c", fp(5)),
+        Mailbox::identified("d", fp(6)),
+    );
+    let row = presentation(5, 6, 11, 7);
+    let (_, none) = s
+        .present_befriending(&c, &d, std::slice::from_ref(&row), None, at(5))
+        .unwrap();
+    assert_eq!(none, None, "{case}");
+    assert!(s.relationship(&c, &d, at(6)).unwrap().is_none(), "{case}");
+    assert_eq!(s.presentation(&fp(5), &fp(6)).unwrap(), Some(row), "{case}");
+    let (_, fresh) = s
+        .present_befriending(&c, &d, &[], Some(None), at(5))
+        .unwrap();
+    let made = s.relationship(&c, &d, at(6)).unwrap();
+    assert_eq!(made.and_then(|r| r.friendship), fresh, "{case}: made");
+    assert!(fresh.is_some(), "{case}");
+}
+
+fn a_reset_record_lapses_unless_an_offer_waits_on_it(s: &dyn RelationshipStore) {
+    let case = "a_reset_record_lapses_unless_an_offer_waits_on_it";
+    let record = |p: u8, o: u8, secs: u64| Presentation {
+        friendship: None,
+        reset: Some(vec![p; 3]),
+        at: at(secs),
+        ..presentation(p, o, p, 7)
+    };
+    s.present(&record(1, 2, 10)).unwrap();
+    s.present(&record(3, 4, 10)).unwrap();
+    s.present(&record(5, 6, 20)).unwrap();
+    s.present(&record(9, 10, 21)).unwrap();
+    s.present(&presentation(7, 8, 7, 7)).unwrap();
+    let waiting = |secs, upgrade| StoredOffer {
+        offer: vec![1],
+        lapses_at: at(secs),
+        upgrade,
+    };
+    s.set_offer(&fp(4), &fp(3), Some(&waiting(1000, true)))
+        .unwrap();
+    s.set_offer(&fp(2), &fp(1), Some(&waiting(1000, false)))
+        .unwrap();
+    s.set_offer(&fp(6), &fp(5), Some(&waiting(25, true)))
+        .unwrap();
+    assert_eq!(s.lapse_resets(at(20), at(30)).unwrap(), 2, "{case}");
+    let reset = |p, o| s.presentation(&fp(p), &fp(o)).unwrap().map(|p| p.reset);
+    assert_eq!(
+        reset(1, 2),
+        Some(None),
+        "{case}: a request's offer keeps none"
+    );
+    assert_eq!(reset(5, 6), Some(None), "{case}: at the time given");
+    assert_eq!(
+        reset(3, 4),
+        Some(Some(vec![3; 3])),
+        "{case}: an upgrade waits"
+    );
+    assert_eq!(reset(9, 10), Some(Some(vec![9; 3])), "{case}: later");
+    assert_eq!(
+        s.presentation(&fp(7), &fp(8)).unwrap(),
+        Some(presentation(7, 8, 7, 7)),
+        "{case}: evidence untouched"
+    );
+}
+
+fn a_lapsed_request_takes_its_offer_and_an_upgrade_is_taken_whole(s: &dyn RelationshipStore) {
+    let case = "a_lapsed_request_takes_its_offer_and_an_upgrade_is_taken_whole";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let asked = |lapses| PendingOut {
+        sent_at: at(1),
+        lapses_at: at(lapses),
+        delivered: true,
+        note: None,
+    };
+    let offer = |upgrade| StoredOffer {
+        offer: vec![1],
+        lapses_at: at(1000),
+        upgrade,
+    };
+    s.set_pending_out(&mb(1), &mb(2), Some(&asked(50))).unwrap();
+    s.set_offer(&fp(1), &fp(2), Some(&offer(false))).unwrap();
+    s.set_offer(&fp(1), &fp(3), Some(&offer(true))).unwrap();
+    s.set_pending_out(&mb(1), &mb(4), Some(&asked(500)))
+        .unwrap();
+    s.set_offer(&fp(1), &fp(4), Some(&offer(false))).unwrap();
+    s.take_as_upgrade(&mb(1), &mb(4)).unwrap();
+    assert!(
+        s.relationship(&mb(1), &mb(4), at(10))
+            .unwrap()
+            .is_none_or(|r| r.pending_out.is_none()),
+        "{case}: the request ended"
+    );
+    assert_eq!(
+        s.offer(&fp(1), &fp(4), at(10)).unwrap(),
+        Some(offer(true)),
+        "{case}: taken as an upgrade"
+    );
+    s.cleanup(at(60), at(0), 100).unwrap();
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(60)).unwrap(),
+        None,
+        "{case}: gone with its request"
+    );
+    for n in [3, 4] {
+        assert_eq!(
+            s.offer(&fp(1), &fp(n), at(60)).unwrap(),
+            Some(offer(true)),
+            "{case}: an upgrade, no request's"
+        );
+    }
 }

@@ -669,6 +669,8 @@ fn outcome_chunks(r: &PresentResult) -> Chunks {
         Presented::BadSignature => (ReasonCode::BadSignature, None),
         Presented::Withdrawn(w) => (ReasonCode::Withdrawn, w.as_ref()),
         Presented::Stale => (ReasonCode::Stale, None),
+        // `Reset` has no code on this wire yet (§7).
+        Presented::Reset => (ReasonCode::AccountNotFound, None),
     };
     let mut c = vec![
         (tag::FRIENDSHIP_HASH, r.hash.to_vec()),

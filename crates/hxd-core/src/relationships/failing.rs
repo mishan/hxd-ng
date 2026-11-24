@@ -230,6 +230,8 @@ through! {
     fn befriend_dropping(a: &Mailbox, b: &Mailbox, at: SystemTime, id: Option<RelationId>, drop: &[[u8; 32]]) -> Result<RelationId, StoreError>;
     fn made_at(id: RelationId) -> Result<Option<SystemTime>, StoreError>;
     fn present(p: &Presentation) -> Result<Option<Presentation>, StoreError>;
+    fn present_befriending(a: &Mailbox, b: &Mailbox, rows: &[Presentation], befriend: Option<Option<RelationId>>, at: SystemTime) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError>;
+    fn lapse_resets(before: SystemTime, now: SystemTime) -> Result<usize, StoreError>;
     fn presentation(presenter: &[u8; 32], other: &[u8; 32]) -> Result<Option<Presentation>, StoreError>;
     fn presentations(of: &[u8; 32]) -> Result<Vec<Presentation>, StoreError>;
     fn unpresent(presenter: &[u8; 32], other: &[u8; 32]) -> Result<Option<Presentation>, StoreError>;
@@ -241,6 +243,7 @@ through! {
     fn withdrawals_by(owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
     fn drop_withdrawal(owner: &[u8; 32], pair: &[u8; 32], party: &[u8; 32], withdrawal: &[u8]) -> Result<(), StoreError>;
     fn set_offer(owner: &[u8; 32], other: &[u8; 32], offer: Option<&StoredOffer>) -> Result<(), StoreError>;
+    fn take_as_upgrade(owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError>;
     fn offer(owner: &[u8; 32], other: &[u8; 32], now: SystemTime) -> Result<Option<StoredOffer>, StoreError>;
     fn offers_from(owner: &[u8; 32], now: SystemTime) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError>;
     fn keep_rotation(from: &[u8; 32], to: &[u8; 32], record: &[u8]) -> Result<(), StoreError>;

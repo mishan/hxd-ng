@@ -60,6 +60,10 @@ const MAX_CHAIN: usize = 16;
 /// not refuse it.
 const STORED: u64 = u64::MAX;
 
+/// How long a `Reset` record outlasts the last presentation answered
+/// `Reset` that kept it, while no upgrade offer waits on it (§4.3 step 4).
+const RESET_KEPT: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// Every floor taken as 0: for an object whose signatures must verify
 /// whatever the floors, which are tested after them (§4.3 step 1, §6),
 /// or one stored here and read only for what it says.
@@ -385,6 +389,23 @@ impl<'a> Floors<'a> {
         out
     }
 
+    /// Whether `who`'s own half of the friendship `bytes` was signed by a
+    /// certificate below its floor.
+    fn own_half_below(&self, bytes: &[u8], who: &[u8; 32]) -> bool {
+        Friendship::check(bytes, STORED, &[], zero_floor).is_ok_and(|f| {
+            [
+                (&f.offer.from, &f.offer.cert),
+                (&f.acceptance.from, &f.acceptance.cert),
+            ]
+            .into_iter()
+            .any(|(from, cert)| {
+                Fingerprint::of(from).0 == *who
+                    && DeviceCert::parse(cert)
+                        .is_ok_and(|c| c.check_floor(self.floor(from)).is_err())
+            })
+        })
+    }
+
     /// Whether `o` was signed by a certificate below its signer's floor.
     fn below(&self, o: &Offer) -> bool {
         DeviceCert::parse(&o.cert).is_ok_and(|c| c.check_floor(self.floor(&o.from)).is_err())
@@ -452,6 +473,9 @@ pub enum Presented {
     /// With the withdrawal that ends it, where it is not the server's own.
     Withdrawn(Option<Vec<u8>>),
     Stale,
+    /// A half below its signer's floor that this server did not hold
+    /// before the reset (§6).
+    Reset,
 }
 
 /// One object's answer, by the friendship hash, or a withdrawal's pair
@@ -609,6 +633,14 @@ impl Core {
     /// listed is passed over without reading its rows: a keep of them
     /// marks it due ([`Watched`]).
     pub(crate) fn reconcile_due(&self, listed: impl IntoIterator<Item = [u8; 32]>) {
+        if let Some(store) = &self.relationships {
+            // Under the hold an 802 judges a record under, so that none
+            // lapses between the judging and the offer it keeps waiting.
+            let _writing = self.friend_writes();
+            let now = self.clock.wall();
+            let lapsed = store.lapse_resets(now - RESET_KEPT, now);
+            logged("lapsing `Reset` records", lapsed.map(drop));
+        }
         let (Some(_), Some(cache)) = (&self.relationships, &self.record_cache) else {
             return;
         };
@@ -1161,6 +1193,7 @@ impl Core {
         Ok(StoredOffer {
             offer: bytes,
             lapses_at: unix_time(offer.expires),
+            upgrade: false,
         })
     }
 
@@ -1177,6 +1210,10 @@ impl Core {
         let (Some(a), Some(b)) = (me.fingerprint, them.fingerprint) else {
             return Err(MessagingError::AlreadyFriends);
         };
+        let offer = StoredOffer {
+            upgrade: true,
+            ..offer
+        };
         store
             .set_offer(&a, &b, Some(&offer))
             .map_err(store_failed)?;
@@ -1190,6 +1227,75 @@ impl Core {
             },
         );
         Ok(RosterState::Accepted)
+    }
+
+    /// Whether an offer from `sender` to `target` is an upgrade offer on an
+    /// edge a reset left inactive (§4.1): `target`'s own presentation for
+    /// the pair answered `Reset` here, which is its consent, and `sender`'s
+    /// half of the friendship it kept below its floor. `waiting`, for an
+    /// offer already taken as one, which keeps the record past its time.
+    pub(super) fn reset_edge(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        sender: &Mailbox,
+        target: &Mailbox,
+        now: SystemTime,
+        waiting: bool,
+    ) -> Result<bool, MessagingError> {
+        let (Some(s), Some(t)) = (sender.fingerprint, target.fingerprint) else {
+            return Ok(false);
+        };
+        let Some(record) = store
+            .presentation(&t, &s)
+            .map_err(store_failed)?
+            .filter(|p| waiting || p.at + RESET_KEPT > now)
+            .and_then(|p| p.reset)
+        else {
+            return Ok(false);
+        };
+        let floors = Floors::new(self);
+        let below = floors.own_half_below(&record, &s);
+        floors.failed().map_err(store_failed)?;
+        Ok(below)
+    }
+
+    /// `them`'s offer waiting for `me`, where the `Reset` just answered `me`
+    /// makes it an upgrade offer (§4.1): its request ended and the offer
+    /// taken as one in one step, and told to `me`'s friendships sessions as
+    /// one, at every presentation answered so, which reaches one made
+    /// while `me` was away. An offer whose request lapsed is neither.
+    fn reset_offer(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        me: &Mailbox,
+        them: &Mailbox,
+        now: SystemTime,
+    ) -> Result<(), MessagingError> {
+        let Some(offer) = self.offer_between(store, them, me, now) else {
+            return Ok(());
+        };
+        if !self.reset_edge(store, them, me, now, false)? {
+            return Ok(());
+        }
+        let asked = store
+            .relationship(them, me, now)
+            .map_err(store_failed)?
+            .and_then(|r| r.pending_out);
+        match &asked {
+            Some(_) => store.take_as_upgrade(them, me).map_err(store_failed)?,
+            None if offer.upgrade => {}
+            None => return Ok(()),
+        }
+        self.roster.lock().unwrap().tell_friendships(
+            me,
+            Event::FriendRequest {
+                login: them.login.clone(),
+                fingerprint: them.fingerprint,
+                note: asked.and_then(|p| p.note),
+                offer: Some(offer.offer),
+            },
+        );
+        Ok(())
     }
 
     /// An 805 that accepts with a friendship (§4.1): checked against the
@@ -1249,39 +1355,63 @@ impl Core {
         if judged != Judged::Stands {
             return Err(MessagingError::BadSignature);
         }
-        for ((presenter, other, dev), old) in rows.into_iter().zip(olds) {
-            let edge = old.as_ref().and_then(|p| p.edge);
-            let taken = old
-                .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
-                .map_or(at, |p| p.taken);
-            let replaced = store
-                .present(&Presentation {
-                    presenter,
-                    other,
-                    names: [presenter, other],
-                    pair: pair.hash(),
-                    hash: f.hash,
-                    friendship: Some(bytes.clone()),
-                    device: dev,
-                    edge,
-                    at,
-                    taken,
-                })
-                .map_err(store_failed)?;
-            self.replaced(store, replaced, Some(&bytes));
-        }
+        let kept = olds.iter().flatten().find_map(|p| p.edge);
+        let presented: Vec<Presentation> = rows
+            .into_iter()
+            .zip(olds)
+            .map(|((presenter, other, dev), old)| Presentation {
+                presenter,
+                other,
+                names: [presenter, other],
+                pair: pair.hash(),
+                hash: f.hash,
+                friendship: Some(bytes.clone()),
+                reset: None,
+                device: dev,
+                edge: old.as_ref().and_then(|p| p.edge),
+                at,
+                taken: old
+                    .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
+                    .map_or(at, |p| p.taken),
+            })
+            .collect();
         let friends = store
             .relationship(me, them, at)
             .map_err(store_failed)?
             .is_some_and(|r| r.friendship.is_some());
-        if friends {
-            self.drop_offers(store, me, them);
-            self.tell_entry(me, them);
-            self.tell_entry(them, me);
-            Ok(())
-        } else {
-            self.activate(store, me, them, &floors, at)
+        // Both rosters are asked before anything is written, so that a
+        // refusal leaves what was there, a `Reset` record included. One
+        // the sender has no room for is nothing the caller may answer now,
+        // not its own roster full. A request's sender always has room: its
+        // request is a row of its roster already.
+        let mut approvals = Vec::new();
+        if !friends {
+            let max = self.messaging_policy.max_roster;
+            for (x, y, full) in [
+                (me, them, MessagingError::RosterFull),
+                (them, me, MessagingError::NotFriends),
+            ] {
+                let row = store.relationship(x, y, at).map_err(store_failed)?;
+                if row.is_none() && store.roster_size(x, at).map_err(store_failed)? >= max {
+                    return Err(full);
+                }
+                approvals.extend(row.and_then(|r| r.approval));
+            }
         }
+        let (replaced, id) = store
+            .present_befriending(me, them, &presented, (!friends).then_some(kept), at)
+            .map_err(store_failed)?;
+        for old in replaced {
+            self.replaced(store, old, Some(&bytes));
+        }
+        match id {
+            Some(id) => self.befriended(me, them, id, &approvals),
+            None => {
+                self.tell_entry(me, them);
+                self.tell_entry(them, me);
+            }
+        }
+        Ok(())
     }
 
     /// The pairs two accounts' friendships name: their own fingerprints,
@@ -2127,7 +2257,7 @@ impl Core {
         }
         // The row as stored now, which a reset's drop may have taken
         // since `held` was read.
-        let record = |friendship: Option<Vec<u8>>| {
+        let record = |friendship: Option<Vec<u8>>, reset: Option<Vec<u8>>| {
             let old = store.presentation(&mine, &theirs).map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
@@ -2141,6 +2271,7 @@ impl Core {
                     pair: pair.hash(),
                     hash,
                     friendship: friendship.clone(),
+                    reset,
                     device: device.key,
                     edge,
                     at: wall,
@@ -2153,7 +2284,7 @@ impl Core {
         // identity draft has it, and changes nothing already held.
         let keep_hash = || match presented(&mine, &theirs) {
             Some(_) => Ok(()),
-            None => record(None),
+            None => record(None, None),
         };
         // Step 2: the other party.
         let them = match self.mailbox_of(&theirs) {
@@ -2177,8 +2308,8 @@ impl Core {
         }
         // Step 4: a half below its signer's floor, where this server did
         // not take the friendship, by either party, before that half was
-        // reset. Until `Reset` has a code, it is answered as the classic
-        // wire answers it meanwhile (§7), keeping the hash as step 2 does.
+        // reset. Unknown keeps the hash as step 2 does; `Reset` keeps the
+        // friendship as a record, for the upgrade offer that remakes it.
         let judged = floors.held(&hash, &bytes, &held, now);
         floors.failed().map_err(store_failed)?;
         match judged {
@@ -2196,9 +2327,10 @@ impl Core {
                 )
                 .map_err(store_failed)?;
                 if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
-                    record(None)?;
+                    record(None, Some(bytes.clone()))?;
+                    self.reset_offer(store, me, &them, wall)?;
                 }
-                return answer(Presented::AccountNotFound);
+                return answer(Presented::Reset);
             }
         }
         // Step 6, there being no hidden links for step 5. A local edge this
@@ -2217,7 +2349,7 @@ impl Core {
                     .map_err(store_failed)?;
             }
         }
-        record(Some(bytes.clone()))?;
+        record(Some(bytes.clone()), None)?;
         if let Some(p) = store
             .presentation(&theirs, &mine)
             .map_err(store_failed)?

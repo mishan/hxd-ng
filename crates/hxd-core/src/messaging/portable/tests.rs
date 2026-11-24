@@ -961,9 +961,393 @@ fn a_reset_holds_what_was_taken_before_it_and_refuses_what_was_not() {
             .core
             .friendships_present(uid, vec![], vec![f.clone()])
             .unwrap();
-        assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+        assert_eq!(refused[0].outcome, Presented::Reset);
     }
     assert!(told(&mut ra2).is_empty(), "never active");
+}
+
+/// Alice reset after making friends with Bob elsewhere, and enrolled a
+/// device since; `s`, under `policy`, never took their friendship, and
+/// has Carol's account too. Bob's first device, a session of his that
+/// never asked for portable friendships, and Alice's new device, each
+/// with its events.
+fn reset_elsewhere(
+    alice: &mut Person,
+    bob: &Person,
+    policy: MessagingPolicy,
+) -> (Server, Vec<u8>, usize, [(Uid, Events); 3]) {
+    let carol = fp(&person(5));
+    let accounts = [("alice", &fp(alice)), ("bob", &fp(bob)), ("carol", &carol)];
+    let (_, _, _, _, f) = made(&linked(&accounts), alice, bob);
+    let s = linked_with(policy, &accounts);
+    reset(&s, alice, 1, s.core.clock().unix() - 1);
+    let renewed = enroll(alice, 1);
+    let a = device(&s.core, "alice", alice, renewed);
+    let b = device(&s.core, "bob", bob, 0);
+    let plain = session(&s.core, "bob", bob, 1, false, u64::MAX);
+    s.core.friends_roster(plain.0).unwrap();
+    (s, f, renewed, [a, b, plain])
+}
+
+fn mailboxes(alice: &Person, bob: &Person) -> (Mailbox, Mailbox) {
+    (
+        Mailbox::identified("alice", fp(alice)),
+        Mailbox::identified("bob", fp(bob)),
+    )
+}
+
+#[test]
+fn an_upgrade_offer_on_a_friendship_answered_reset_is_its_friends_alone_and_a_decline_holds() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, mut ra), (b, mut rb), (_, mut rp)]) =
+        reset_elsewhere(&mut alice, &bob, policy());
+    let (_, refused) = s
+        .core
+        .friendships_present(b, vec![], vec![f.clone()])
+        .unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    let kept = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    assert_eq!(
+        (kept.friendship, kept.reset),
+        (None, Some(f.clone())),
+        "a record, never evidence"
+    );
+
+    // Answered as a request is, told to Bob's friendships sessions alone
+    // and asking nothing of the request bounds; declined, the offer goes
+    // and Alice is held, as from a request.
+    let o = offer(&alice, renewed, &bob, now() - 2);
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    assert_eq!(requests_offered(&mut rb), [Some(o)]);
+    assert!(requests_offered(&mut rp).is_empty(), "a plain session");
+    assert!(told(&mut ra).is_empty(), "no request of Alice's");
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let wall = s.core.clock().wall();
+    assert!(s.rel.relationship(&ma, &mb, wall).unwrap().is_none());
+    assert_eq!(
+        s.core.friend_respond(b, "alice", false),
+        Ok(RosterState::Removed)
+    );
+    assert!(s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap().is_none());
+    let o = offer(&alice, renewed, &bob, now() - 1);
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o)),
+        Ok(RosterState::PendingOut)
+    );
+    assert!(requests_offered(&mut rb).is_empty(), "held");
+    assert!(s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap().is_none());
+}
+
+#[test]
+fn an_offer_is_an_upgrade_only_from_the_half_below_its_floor_and_within_the_record() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let asking = |x: &Mailbox, y: &Mailbox| {
+        s.rel
+            .relationship(x, y, s.core.clock().wall())
+            .unwrap()
+            .is_some_and(|r| r.pending_out.is_some())
+    };
+    // Alice's presentation answered `Reset`: Bob's half is not below its
+    // floor, so his offer is a request.
+    let (_, refused) = s
+        .core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    s.core
+        .friend_ask(b, "alice", None, Some(offer(&bob, 0, &alice, now())))
+        .unwrap();
+    assert!(asking(&mb, &ma));
+    s.core.friend_remove(b, "alice").unwrap();
+
+    // Bob's, thirty days on: the record has gone by then.
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(30 * DAY + 1));
+    let o = offer(&alice, renewed, &bob, s.core.clock().unix());
+    s.core.friend_ask(a, "bob", None, Some(o)).unwrap();
+    assert!(asking(&ma, &mb));
+}
+
+#[test]
+fn an_offer_waiting_when_its_friendship_is_answered_reset_becomes_an_upgrade() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, mut rb), (_, mut rp)]) =
+        reset_elsewhere(&mut alice, &bob, policy());
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let o = offer(&alice, renewed, &bob, now());
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    drain(&mut rb);
+    drain(&mut rp);
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    assert_eq!(requests_offered(&mut rb), [Some(o.clone())], "told again");
+    assert!(requests_offered(&mut rp).is_empty());
+    let wall = s.core.clock().wall();
+    assert!(
+        s.rel
+            .relationship(&ma, &mb, wall)
+            .unwrap()
+            .is_none_or(|r| r.pending_out.is_none()),
+        "out of the request bounds"
+    );
+    let remade = accept(&o, &bob, 0, now());
+    assert_eq!(
+        s.core.friend_answer(b, "alice", true, Some(remade.clone())),
+        Ok(RosterState::Accepted)
+    );
+    assert!(friendship_of(&s, &alice, &bob).is_some());
+    let p = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    assert_eq!(
+        (p.friendship, p.reset),
+        (Some(remade), None),
+        "the record goes"
+    );
+}
+
+/// An offer of Alice's device `dev` to Bob that lapses `days` on.
+fn offer_for(from: &Person, dev: usize, to: &Person, time: u64, days: u64) -> Vec<u8> {
+    let (key, cert) = &from.devices[dev];
+    Offer {
+        from: from.id.public(),
+        to: Fingerprint(fp(to)),
+        time,
+        expires: time + days * DAY,
+        id: [time as u8 ^ 0x55; 16],
+        cert: cert.clone(),
+    }
+    .sign(key)
+    .unwrap()
+}
+
+#[test]
+fn a_reset_record_lapses_thirty_days_after_its_last_answer() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, _, [_, (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    let record = || {
+        s.rel
+            .presentation(&fp(&bob), &fp(&alice))
+            .unwrap()
+            .unwrap()
+            .reset
+    };
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(30 * DAY - 2));
+    s.core.reconcile_due(Vec::new());
+    assert!(record().is_some(), "kept into its thirtieth day");
+    s.core.clock().advance(std::time::Duration::from_secs(2));
+    s.core.reconcile_due(Vec::new());
+    assert_eq!(record(), None, "its bytes gone, its hash kept");
+}
+
+#[test]
+fn an_upgrade_waiting_keeps_its_record_and_an_offer_made_again_past_thirty_days() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (ma, mb) = mailboxes(&alice, &bob);
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(29 * DAY));
+    let first = offer_for(&alice, renewed, &bob, s.core.clock().unix(), 30);
+    s.core.friend_ask(a, "bob", None, Some(first)).unwrap();
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(2 * DAY));
+    s.core.reconcile_due(Vec::new());
+    let p = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    assert!(p.reset.is_some(), "kept while the upgrade waits");
+    let t = s.core.clock().unix();
+    let again = offer(&alice, renewed, &bob, t);
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(again.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    let wall = s.core.clock().wall();
+    assert!(
+        s.rel.relationship(&ma, &mb, wall).unwrap().is_none(),
+        "still an upgrade, no request"
+    );
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&again, &bob, 0, t))),
+        Ok(RosterState::Accepted)
+    );
+}
+
+#[test]
+fn an_offer_beside_a_request_is_no_upgrade() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [_, (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (ma, mb) = mailboxes(&alice, &bob);
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(31 * DAY));
+    // A request held, beside an offer waiting from before.
+    let (t, wall) = (s.core.clock().unix(), s.core.clock().wall());
+    let o = offer_for(&alice, renewed, &bob, t - 60, 30);
+    let stored = crate::relationships::StoredOffer {
+        offer: o.clone(),
+        lapses_at: wall + std::time::Duration::from_secs(DAY),
+        upgrade: false,
+    };
+    s.rel
+        .set_offer(&fp(&alice), &fp(&bob), Some(&stored))
+        .unwrap();
+    let held = crate::relationships::PendingOut {
+        sent_at: wall,
+        lapses_at: wall + std::time::Duration::from_secs(DAY),
+        delivered: false,
+        note: None,
+    };
+    s.rel.set_pending_out(&ma, &mb, Some(&held)).unwrap();
+    assert_eq!(
+        s.core.friend_respond(b, "alice", false),
+        Err(MessagingError::NotFriends)
+    );
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 0, t))),
+        Err(MessagingError::NotFriends)
+    );
+}
+
+#[test]
+fn an_offer_its_request_lapsed_behind_is_no_upgrade() {
+    let (mut alice, bob) = (person(1), person(2));
+    let brief = MessagingPolicy {
+        request_retention: std::time::Duration::from_secs(60),
+        ..policy()
+    };
+    let (s, f, renewed, [(a, _), (b, mut rb), _]) = reset_elsewhere(&mut alice, &bob, brief);
+    let o = offer(&alice, renewed, &bob, now());
+    s.core.friend_ask(a, "bob", None, Some(o.clone())).unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(120));
+    drain(&mut rb);
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    assert!(requests_offered(&mut rb).is_empty(), "told nothing");
+    assert_eq!(
+        s.core.friend_respond(b, "alice", false),
+        Err(MessagingError::NotFriends)
+    );
+    let t = s.core.clock().unix();
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 0, t))),
+        Err(MessagingError::NotFriends)
+    );
+    assert!(friendship_of(&s, &alice, &bob).is_none());
+}
+
+#[test]
+fn a_tick_waits_for_an_upgrade_offer_judged_on_its_record() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    let clock = |secs| s.core.clock().advance(std::time::Duration::from_secs(secs));
+    clock(29 * DAY);
+    let first = offer_for(&alice, renewed, &bob, s.core.clock().unix(), 30);
+    s.core.friend_ask(a, "bob", None, Some(first)).unwrap();
+    // The record past its days, kept by the first offer alone, which
+    // lapses while the second is judged on the record.
+    clock(30 * DAY - 60);
+    let again = offer(&alice, renewed, &bob, s.core.clock().unix());
+    let parked = s.fail.park.arm("presentation");
+    let asking = {
+        let (core, again) = (s.core.clone(), again.clone());
+        std::thread::spawn(move || core.friend_ask(a, "bob", None, Some(again)))
+    };
+    parked.arrived();
+    let ticking = {
+        let core = s.core.clone();
+        std::thread::spawn(move || {
+            core.clock().advance(std::time::Duration::from_secs(120));
+            core.reconcile_due(Vec::new());
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    parked.release();
+    assert_eq!(asking.join().unwrap(), Ok(RosterState::PendingOut));
+    ticking.join().unwrap();
+    let t = s.core.clock().unix();
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&again, &bob, 0, t))),
+        Ok(RosterState::Accepted),
+        "the record the offer was taken on kept for it"
+    );
+}
+
+#[test]
+fn a_remade_friendship_is_recorded_whole_or_not_at_all() {
+    for n in 1..=6 {
+        let (mut alice, bob) = (person(1), person(2));
+        let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+        s.core.friendships_present(b, vec![], vec![f]).unwrap();
+        let o = offer(&alice, renewed, &bob, now());
+        s.core.friend_ask(a, "bob", None, Some(o.clone())).unwrap();
+        s.fail.fail_nth_write(n);
+        let _ = s
+            .core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 0, now())));
+        let friends = friendship_of(&s, &alice, &bob).is_some();
+        let rows = [(&bob, &alice), (&alice, &bob)].map(|(x, y)| {
+            s.rel
+                .presentation(&fp(x), &fp(y))
+                .unwrap()
+                .is_some_and(|p| p.evidence())
+        });
+        let record = s
+            .rel
+            .presentation(&fp(&bob), &fp(&alice))
+            .unwrap()
+            .is_some_and(|p| p.reset.is_some());
+        assert_eq!(
+            (rows, record),
+            ([friends; 2], !friends),
+            "failing write {n}"
+        );
+    }
+}
+
+#[test]
+fn an_upgrade_the_senders_roster_has_no_room_for_is_refused_and_keeps_its_record() {
+    // Refused as nothing the acceptor may answer now, never as its own
+    // roster being full, which it is not.
+    let (mut alice, bob, carol) = (person(1), person(2), person(5));
+    let tight = MessagingPolicy {
+        max_roster: 1,
+        ..policy()
+    };
+    let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, tight);
+    let (c, _) = device(&s.core, "carol", &carol, 0);
+    s.core.friend_add(a, "carol", None).unwrap();
+    s.core.friend_respond(c, "alice", true).unwrap();
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    let o = offer(&alice, renewed, &bob, now());
+    s.core.friend_ask(a, "bob", None, Some(o.clone())).unwrap();
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 0, now()))),
+        Err(MessagingError::NotFriends)
+    );
+    let p = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
+    assert!(p.reset.is_some(), "the record kept");
 }
 
 #[test]
@@ -979,7 +1363,7 @@ fn a_floor_learned_late_drops_what_was_taken_after_the_reset() {
         "removed with no withdrawal"
     );
     let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
-    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+    assert_eq!(refused[0].outcome, Presented::Reset);
 }
 
 #[test]
@@ -1108,7 +1492,7 @@ fn a_floor_with_no_record_kept_drops_nothing_and_presenting_drops_what_is_not_he
     // finds it not held, and what is stored of it goes then.
     keep(&s, &alice, 1, taken - 30);
     let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
-    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+    assert_eq!(refused[0].outcome, Presented::Reset);
     assert_eq!(
         told(&mut rb),
         [("alice".into(), RosterState::Removed, vec![], None)]
@@ -1176,7 +1560,7 @@ fn a_presentation_refused_before_it_was_recorded_holds_nothing() {
     let renewed = enroll(&mut alice, 1);
     let (a2, _) = device(&s.core, "alice", &alice, renewed);
     let (_, refused) = s.core.friendships_present(a2, vec![], vec![f]).unwrap();
-    assert_eq!(refused[0].outcome, Presented::AccountNotFound);
+    assert_eq!(refused[0].outcome, Presented::Reset);
 }
 
 #[test]
@@ -1668,6 +2052,7 @@ fn a_dropped_presentation_ends_its_edge_where_a_party_takes_no_part() {
                 pair: Pair::new(Fingerprint(fp(p)), Fingerprint(fp(q))).hash(),
                 hash: hash(&f),
                 friendship: Some(f.clone()),
+                reset: None,
                 device: Fingerprint::of(&who.devices[0].0.public()).0,
                 edge: None,
                 at,
@@ -1947,7 +2332,7 @@ fn a_reset_leaves_no_id_for_a_friendship_made_after_it() {
     keep(&s, &alice, 1, reset_at);
     let (b1, _) = device(&s.core, "bob", &bob, 1);
     let (_, judged) = s.core.friendships_present(b1, vec![], vec![f]).unwrap();
-    assert_eq!(judged[0].outcome, Presented::AccountNotFound);
+    assert_eq!(judged[0].outcome, Presented::Reset);
     assert_eq!(
         edge(&s),
         None,
@@ -2392,6 +2777,7 @@ fn a_taking_is_carried_only_to_the_bytes_it_dated() {
                 pair: Pair::new(Fingerprint(p), Fingerprint(q)).hash(),
                 hash: hash(&f),
                 friendship: Some(b"not a friendship".to_vec()),
+                reset: None,
                 device: [0; 32],
                 edge: None,
                 at: super::unix_time(t),
@@ -2626,6 +3012,7 @@ fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
                 pair: pair_of(&successor, &bob),
                 hash: hash(&theirs),
                 friendship: whole.then_some(theirs),
+                reset: None,
                 device: Fingerprint::of(&successor.devices[0].0.public()).0,
                 edge: None,
                 at,
@@ -2929,6 +3316,7 @@ fn a_pass_dates_a_friendship_by_its_taking_under_every_key_of_the_chain() {
                 pair: pair_of(presenter, other),
                 hash: hash(bytes),
                 friendship: Some(bytes.clone()),
+                reset: None,
                 device: Fingerprint::of(&presenter.devices[0].0.public()).0,
                 edge: None,
                 at,
@@ -2973,6 +3361,7 @@ fn an_orphan_is_dated_by_its_taking_under_every_key_of_the_chain() {
                 pair: pair_of(&alice, &bob),
                 hash: hash(&f),
                 friendship: Some(f.clone()),
+                reset: None,
                 device: Fingerprint::of(&presenter.devices[0].0.public()).0,
                 edge: None,
                 at,
@@ -3024,6 +3413,7 @@ fn a_pass_whose_ends_meet_the_generations_forgotten_records_nothing() {
                     pair: pair_of(presenter, to),
                     hash: hash(&f),
                     friendship: Some(f.clone()),
+                    reset: None,
                     device: Fingerprint::of(&presenter.devices[0].0.public()).0,
                     edge: None,
                     at: taken,
@@ -3095,6 +3485,7 @@ fn stored(s: &Server, bytes: &[u8], names: [&Person; 2], rows: &[(&Person, &Pers
                 pair: pair_of(names[0], names[1]),
                 hash: hash(bytes),
                 friendship: Some(bytes.to_vec()),
+                reset: None,
                 device: Fingerprint::of(&presenter.devices[0].0.public()).0,
                 edge: None,
                 at,

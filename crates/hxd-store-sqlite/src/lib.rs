@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1116,6 +1116,15 @@ ALTER TABLE friend_presentation ADD COLUMN taken INTEGER NOT NULL DEFAULT 0;
 UPDATE friend_presentation SET taken = at;
 ";
 
+/// The friendship a presentation answered `Reset` kept, on a row whose
+/// `friendship` is NULL, so that it is never evidence; and whether an offer
+/// was taken as an upgrade offer, which no request carries.
+const SCHEMA_V41: &str = "
+ALTER TABLE friend_presentation ADD COLUMN reset BLOB;
+CREATE INDEX friend_presentation_reset ON friend_presentation (at) WHERE reset IS NOT NULL;
+ALTER TABLE friend_offer ADD COLUMN upgrade INTEGER NOT NULL DEFAULT 0;
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1883,6 +1892,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 40 {
         steps.push_str(SCHEMA_V40);
+    }
+    if version < 41 {
+        steps.push_str(SCHEMA_V41);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -4744,6 +4756,7 @@ mod tests {
             pair: [3; 32],
             hash: [4; 32],
             friendship: Some(vec![4]),
+            reset: None,
             device: [5; 32],
             edge: None,
             at,
@@ -5114,6 +5127,55 @@ mod tests {
                 .map(|d| (d.devid.as_str(), d.epoch))
                 .collect::<Vec<_>>(),
             [(devid.as_str(), 0)]
+        );
+    }
+
+    /// A presentation from before `Reset` records were kept is none, and
+    /// a migrated file keeps one; an offer from before is no upgrade.
+    #[test]
+    fn version_forty_migrates_into_presentations_that_keep_a_reset_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37, SCHEMA_V38, SCHEMA_V39, SCHEMA_V40,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair, \
+                 hash, friendship, device, at, taken) VALUES (?1, ?2, ?3, ?3, ?3, ?3, ?3, ?3, 1, 1)",
+                rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 32]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO friend_offer (owner, other, offer, lapses) VALUES (?1, ?2, ?3, 9)",
+                rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 3]],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 40).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let at = SystemTime::UNIX_EPOCH;
+        let o = store.offer(&[7; 32], &[8; 32], at).unwrap().unwrap();
+        assert!(!o.upgrade);
+        let p = store.presentation(&[7; 32], &[8; 32]).unwrap().unwrap();
+        assert_eq!(p.reset, None);
+        let record = hxd_core::relationships::Presentation {
+            friendship: None,
+            reset: Some(vec![1; 32]),
+            ..p
+        };
+        store.present(&record).unwrap();
+        assert_eq!(
+            store.presentation(&[7; 32], &[8; 32]).unwrap(),
+            Some(record)
         );
     }
 
