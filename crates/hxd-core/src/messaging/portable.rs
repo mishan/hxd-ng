@@ -662,6 +662,14 @@ impl Core {
             let _writing = self.friend_writes();
             let before = self.reconciled.lock().unwrap().of(&keys);
             let pair = [store.presentation(&a, &b)?, store.presentation(&b, &a)?];
+            // Moved or changed since: judged by a pass that reads it where
+            // it is now.
+            let read = |q: &[u8; 32], r: &[u8; 32]| {
+                held.iter().find(|p| (&p.presenter, &p.other) == (q, r))
+            };
+            if pair[0].as_ref() != read(&a, &b) || pair[1].as_ref() != read(&b, &a) {
+                whole = false;
+            }
             let floors = Floors::after(self, &known);
             let mut gone = Vec::new();
             for p in pair.iter().flatten() {

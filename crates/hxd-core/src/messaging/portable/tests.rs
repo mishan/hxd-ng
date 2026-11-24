@@ -3190,3 +3190,33 @@ fn a_copy_dropped_under_a_predecessor_judges_its_successors_again() {
     s.core.judge_floors([fp(&new)]);
     assert!(later().is_none());
 }
+
+#[test]
+fn a_pair_moved_while_a_pass_judged_it_is_judged_again() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&alice, 0, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&alice, &bob],
+        &[(&alice, &bob, t), (&bob, &alice, t)],
+    );
+    keep(&s, &alice, 1, t - 100);
+    let parked = s.core.reconciling.arm("read");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.core.keep_rotation_record(&rotation(&bob, &successor));
+    s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
+    parked.release();
+    pass.join().unwrap();
+    s.core.judge_floors([fp(&alice)]);
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&successor))
+        .unwrap()
+        .is_none());
+}
