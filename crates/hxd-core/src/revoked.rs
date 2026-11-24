@@ -374,7 +374,7 @@ impl Core {
         mut list: Published,
         kept: &[[u8; 32]],
     ) -> Vec<(Uid, String)> {
-        let (identities, devices, floors): (Vec<_>, Vec<_>, Vec<_>) = {
+        let (identities, devices, floors, newly): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             for id in kept {
                 if let Some(&installed) = refused.published.floors.get(id) {
@@ -399,8 +399,15 @@ impl Core {
                 .filter(|i| !refused.published.refuses_identity(i))
                 .copied()
                 .collect();
+            // Revoked now, frozen before or not: a freeze alone keeps the
+            // offers, a revocation takes them.
+            let newly = list
+                .identities
+                .difference(&refused.published.identities)
+                .copied()
+                .collect();
             refused.published = list.clone();
-            (ids, new, risen)
+            (ids, new, risen, newly)
         };
         let keys = devices
             .iter()
@@ -419,12 +426,7 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
-            let revoked: Vec<_> = identities
-                .iter()
-                .filter(|i| list.identities.contains(*i))
-                .copied()
-                .collect();
-            self.drop_revoked_offers(&revoked);
+            self.drop_revoked_offers(&newly);
         }
         self.reconcile_due(list.floors.keys().copied());
         ended

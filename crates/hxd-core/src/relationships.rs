@@ -797,8 +797,9 @@ pub trait RelationshipStore: Send + Sync + 'static {
 
     /// Clear the friendship of each `Reset` record last presented at or
     /// before `before`, unless the other party has an upgrade offer
-    /// waiting for the presenter at `now` (§4.3 step 4); the hash stays
-    /// either way. How many were cleared.
+    /// waiting for the presenter at `now`, or the pending out one shows it,
+    /// which lapses as a request would (§4.3 step 4); the hash stays either
+    /// way. How many were cleared.
     fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError>;
 
     /// The presentation `presenter` made naming `other`.

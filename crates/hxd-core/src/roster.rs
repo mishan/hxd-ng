@@ -2277,6 +2277,9 @@ pub struct Core {
     /// tests of what lands between.
     #[cfg(test)]
     pub(crate) reconciling: crate::relationships::failing::Park,
+    /// Revoked devices whose offers could not be read or dropped, owed to
+    /// a records tick once their backoff is over.
+    pub(crate) offer_sweeps: Mutex<Vec<crate::messaging::OwedSweep>>,
     /// No offer is taken as an upgrade offer on an edge a reset left
     /// inactive: the sequence harness's twin, which no `Reset` record
     /// ever shows to.

@@ -59,6 +59,9 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_record_leaving_takes_the_upgrade_it_qualified(&*new_store());
     an_upgrade_beside_a_friendship_ends_with_it(&*new_store());
     a_rotation_into_a_pair_keeps_each_direction_one_state(&*new_store());
+    a_row_left_with_nothing_is_reclaimed(&*new_store());
+    a_record_is_kept_while_its_upgrade_is_pending(&*new_store());
+    a_merged_pending_out_goes_with_its_record(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
@@ -2009,7 +2012,11 @@ fn a_requests_offer_lapses_and_goes_with_its_request(s: &dyn RelationshipStore) 
         "{case}: the request stays, plain"
     );
     s.cleanup(at(60), at(0), 100).unwrap();
-    assert_eq!(asked(s, 1, 2, 60), Some((true, None)), "{case}: reclaimed");
+    assert_eq!(
+        asked(s, 1, 2, 10),
+        Some((true, None)),
+        "{case}: reclaimed, read again before it lapsed"
+    );
     assert_eq!(
         s.cleanup(at(600), at(0), 100).unwrap(),
         1,
@@ -2250,4 +2257,82 @@ fn a_rotation_into_a_pair_keeps_each_direction_one_state(s: &dyn RelationshipSto
         "{case}: never both"
     );
     assert_eq!(asked(s, 6, 4, 10), Some((true, Some(req.offer))), "{case}");
+}
+
+fn a_row_left_with_nothing_is_reclaimed(s: &dyn RelationshipStore) {
+    let case = "a_row_left_with_nothing_is_reclaimed";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let record = |p: u8, o: u8| Presentation {
+        friendship: None,
+        reset: Some(vec![p; 3]),
+        ..presentation(p, o, p, 7)
+    };
+    // By a drop, by its record going, and by a rotation's settling.
+    asked_with(s, 1, 2, true);
+    s.drop_offers(&[(fp(1), fp(2))]).unwrap();
+    assert_eq!(s.purge_count(&mb(1)).unwrap(), 0, "{case}: dropped");
+    s.present(&record(4, 3)).unwrap();
+    asked_with(s, 3, 4, true);
+    s.unpresent(&fp(4), &fp(3)).unwrap();
+    assert_eq!(s.purge_count(&mb(3)).unwrap(), 0, "{case}: its record gone");
+    asked_with(s, 5, 6, true);
+    s.rotate(&fp(6), &fp(7)).unwrap();
+    assert_eq!(s.purge_count(&mb(5)).unwrap(), 0, "{case}: settled");
+}
+
+fn a_record_is_kept_while_its_upgrade_is_pending(s: &dyn RelationshipStore) {
+    let case = "a_record_is_kept_while_its_upgrade_is_pending";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    s.present(&Presentation {
+        friendship: None,
+        reset: Some(vec![2; 3]),
+        at: at(10),
+        ..presentation(2, 1, 2, 7)
+    })
+    .unwrap();
+    let shown = PendingOut {
+        upgrade: true,
+        ..pending(1, 1000, true)
+    };
+    let offer = StoredOffer {
+        offer: vec![1],
+        lapses_at: at(25),
+    };
+    s.ask(&mb(1), &mb(2), &shown, Some(&offer)).unwrap();
+    assert_eq!(
+        s.lapse_resets(at(20), at(30)).unwrap(),
+        0,
+        "{case}: its pending out keeps it, the offer lapsed"
+    );
+    assert_eq!(
+        s.lapse_resets(at(20), at(1000)).unwrap(),
+        1,
+        "{case}: until the pending out lapses"
+    );
+}
+
+fn a_merged_pending_out_goes_with_its_record(s: &dyn RelationshipStore) {
+    let case = "a_merged_pending_out_goes_with_its_record";
+    // 1's upgrade offer to 2, on 2's record; 1 rotates to 5, toward which
+    // 2 has presented already, so 2's record collides with its own row
+    // and the successor keeps that one: the upgrade's record is gone.
+    s.present(&Presentation {
+        friendship: None,
+        reset: Some(vec![2; 3]),
+        ..presentation(2, 1, 2, 7)
+    })
+    .unwrap();
+    asked_with(s, 1, 2, true);
+    s.present(&presentation(2, 5, 9, 7)).unwrap();
+    s.rotate(&fp(1), &fp(5)).unwrap();
+    assert_eq!(
+        asked(s, 5, 2, 10),
+        None,
+        "{case}: no record, no pending out"
+    );
+    assert_eq!(
+        s.offer(&fp(5), &fp(2), at(10)).unwrap(),
+        None,
+        "{case}: nor its offer"
+    );
 }

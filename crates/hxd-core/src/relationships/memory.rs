@@ -217,6 +217,12 @@ impl Inner {
                 p.offer = None;
             }
         }
+        self.rows.retain(|r| {
+            let rel = &r.rel;
+            let pair = rel.owner.fingerprint.as_ref() == Some(x)
+                && rel.other.fingerprint.as_ref() == Some(y);
+            !pair || !rel.is_empty()
+        });
     }
 
     /// Every pair, by fingerprint, an offer waits on that names `fp`.
@@ -618,36 +624,44 @@ impl Inner {
     /// pending out shows it and while the record it was taken on does, and
     /// never beside a request.
     fn settle_upgrades(&mut self, fp: &[u8; 32]) {
-        let pairs: Vec<_> = self
-            .offers
-            .iter()
-            .map(|(o, t, _)| (*o, *t))
-            .chain(self.rows.iter().filter_map(|r| {
-                r.rel.pending_out.as_ref().filter(|p| p.upgrade)?;
-                r.rel.owner.fingerprint.zip(r.rel.other.fingerprint)
-            }))
-            .filter(|(o, t)| o == fp || t == fp)
-            .collect();
-        for (x, y) in pairs {
-            let row = self
-                .rows
-                .iter()
-                .find(|r| r.rel.owner.fingerprint == Some(x) && r.rel.other.fingerprint == Some(y));
-            let friends = row.is_some_and(|r| r.rel.friendship.is_some());
-            let upgrade =
-                row.is_some_and(|r| r.rel.pending_out.as_ref().is_some_and(|p| p.upgrade));
-            let recorded = self
-                .presentations
-                .iter()
-                .any(|p| p.presenter == y && p.other == x && p.reset.is_some());
-            if friends || (upgrade && recorded) {
-                continue;
-            }
-            self.offers.retain(|(o, t, _)| (*o, *t) != (x, y));
-            if upgrade {
-                self.drop_offer(&x, &y);
+        let names = |rel: &Relationship| {
+            rel.owner.fingerprint.as_ref() == Some(fp) || rel.other.fingerprint.as_ref() == Some(fp)
+        };
+        // A pending out shown for an upgrade offer, without its record.
+        let presentations = &self.presentations;
+        for r in self.rows.iter_mut().filter(|r| names(&r.rel)) {
+            let shown = r.rel.pending_out.as_ref().is_some_and(|p| p.upgrade);
+            let recorded = r
+                .rel
+                .owner
+                .fingerprint
+                .zip(r.rel.other.fingerprint)
+                .is_some_and(|(x, y)| {
+                    presentations
+                        .iter()
+                        .any(|p| p.presenter == y && p.other == x && p.reset.is_some())
+                });
+            if shown && !recorded {
+                r.rel.pending_out = None;
             }
         }
+        // An upgrade offer with neither a friendship nor that pending out.
+        let standing: Vec<([u8; 32], [u8; 32])> = self
+            .rows
+            .iter()
+            .filter(|r| {
+                r.rel.friendship.is_some() || r.rel.pending_out.as_ref().is_some_and(|p| p.upgrade)
+            })
+            .filter_map(|r| r.rel.owner.fingerprint.zip(r.rel.other.fingerprint))
+            .collect();
+        self.offers
+            .retain(|(o, t, _)| (o != fp && t != fp) || standing.contains(&(*o, *t)));
+        self.reclaim();
+    }
+
+    /// Rows left holding nothing, gone.
+    fn reclaim(&mut self) {
+        self.rows.retain(|r| !r.rel.is_empty());
     }
 
     /// The upgrade offer `x` has waiting for `y` on an edge a reset left
@@ -666,6 +680,7 @@ impl Inner {
         for r in self.rows.iter_mut().filter(|r| shown(&r.rel)) {
             r.rel.pending_out = None;
         }
+        self.reclaim();
     }
 
     fn unpresent_pair(
@@ -1077,6 +1092,8 @@ impl RelationshipStore for MemoryRelationships {
 
     fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        // An upgrade offer waiting, or the pending out it shows its sender,
+        // which lapses as a request would.
         let shown = inner.rows.iter().filter_map(|r| {
             let rel = r.rel.clone().as_of(floor(now))?;
             rel.pending_out.filter(|p| p.upgrade)?;
@@ -1325,6 +1342,9 @@ impl RelationshipStore for MemoryRelationships {
     ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError> {
         let inner = self.inner.lock().unwrap();
         let asked = inner.rows.iter().filter_map(|r| {
+            if r.rel.owner.fingerprint.as_ref() != Some(owner) {
+                return None;
+            }
             let rel = r.rel.clone().as_of(floor(now))?;
             let o = rel.pending_out?.offer?;
             (rel.owner.fingerprint.as_ref() == Some(owner)).then_some((rel.other.fingerprint?, o))

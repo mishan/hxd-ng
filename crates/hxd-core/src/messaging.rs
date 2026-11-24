@@ -55,7 +55,7 @@ mod tests;
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
-pub(crate) use portable::{KeptFloors, Reconciled, Watched};
+pub(crate) use portable::{KeptFloors, OwedSweep, Reconciled, Watched};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// [`Core::friend_writes`] held: what a step that must share its caller's
@@ -1330,6 +1330,7 @@ impl Core {
                     if let (Some(a), Some(b)) = (them.fingerprint, me.mailbox.fingerprint) {
                         store.set_offer(&a, &b, None).map_err(store_failed)?;
                     }
+                    self.tell_entry(&me.mailbox, &them);
                     false
                 }
                 // On an edge a reset left inactive the offer goes with the
@@ -1346,6 +1347,7 @@ impl Core {
                         .end_friendship(&me.mailbox, &them, &end)
                         .map_err(store_failed)?;
                     self.tell_entry(&them, &me.mailbox);
+                    self.tell_entry(&me.mailbox, &them);
                     false
                 }
             };
@@ -1472,10 +1474,7 @@ impl Core {
                 .end_friendship(&them, &me.mailbox, &cancel)
                 .map_err(store_failed)?;
             self.tell_entry(&me.mailbox, &them);
-            if sent.upgrade {
-                let gone = Event::FriendEntry(Box::new(FriendEntry::removed(&me.mailbox)));
-                self.roster.lock().unwrap().tell_friendships(&them, gone);
-            } else if sent.delivered {
+            if sent.upgrade || sent.delivered {
                 self.tell_entry(&them, &me.mailbox);
             }
             return Ok(());

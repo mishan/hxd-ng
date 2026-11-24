@@ -216,6 +216,20 @@ enum Step {
     },
     /// Decline the other's request or upgrade offer.
     Decline,
+    /// Remove Friend (803) carrying the caller's own offer: cancel it.
+    Cancel,
+    /// A registrar's list revokes the device.
+    PublishDevice,
+    /// A registrar's list freezes the identity, refused but not revoked.
+    Freeze,
+    /// A registrar's list revokes the identity.
+    RevokeIdentity,
+    /// The identity rotates to its successor key, once; with `into`, the
+    /// other party has first presented a friendship it made with that
+    /// successor elsewhere, so the rotation lands on a pair it holds.
+    Rotate {
+        into: bool,
+    },
     /// The clock moved on by this much: past a request's or an offer's
     /// lapse, or a `Reset` record's.
     Clock {
@@ -236,40 +250,42 @@ enum Failure {
 impl Step {
     fn of(n: u32) -> (Step, usize, usize, Failure) {
         let (p, d, arg) = ((n >> 5) as usize & 1, (n >> 6) as usize & 1, n >> 7);
-        // Weighted toward the acts that make friends, so that sequences
-        // reach the endings often.
+        // Weighted toward the acts on pending state and the endings that
+        // make room for it: Ask 5/32, Answer 3/32, Remove, Unblock,
+        // Present, Decline, Cancel and Clock 2/32 each (each clock move
+        // 1/48), every other kind 1/32 (each way of rotating 1/64).
         let step = match n % 32 {
-            0..=4 => Step::Ask {
+            0..=3 | 30 => Step::Ask {
                 offer: arg & 1 == 1,
             },
-            5..=9 => Step::Answer {
+            4..=6 => Step::Answer {
                 friendship: arg & 1 == 1,
             },
-            10..=15 => Step::Present { k: arg as usize },
-            16 | 17 => Step::Remove {
+            7 | 31 => Step::Present { k: arg as usize },
+            8 | 9 => Step::Remove {
                 withdraw: arg & 1 == 1,
                 early: arg & 2 == 2,
             },
-            18 => Step::BlockWithdrawal,
-            19 => Step::Block,
-            20 | 21 => Step::Unblock,
-            22 | 23 => Step::PresentWithdrawal {
+            10 | 12 => Step::Unblock,
+            11 => Step::Revoke,
+            13 => Step::RemoveByKey,
+            14 => Step::PresentWithdrawal {
                 early: arg & 1 == 1,
             },
-            24 => Step::Link,
-            25 => Step::RemoveByKey,
-            26 => Step::Messaging,
-            27 => Step::Revoke,
-            28 | 30 => Step::Floor { how: arg % 3 },
-            29 => Step::Answer {
-                friendship: arg & 1 == 1,
+            15 | 21 => Step::Clock {
+                secs: [120, DAY, 31 * DAY][arg as usize % 3],
             },
-            _ => match arg % 4 {
-                0 => Step::Decline,
-                1 => Step::Clock { secs: 120 },
-                2 => Step::Clock { secs: DAY },
-                _ => Step::Clock { secs: 31 * DAY },
-            },
+            16 => Step::Block,
+            17 | 23 => Step::Decline,
+            18 => Step::Link,
+            19 => Step::Floor { how: arg % 3 },
+            20 => Step::Messaging,
+            22 => Step::BlockWithdrawal,
+            24 | 25 => Step::Cancel,
+            26 => Step::PublishDevice,
+            27 => Step::Freeze,
+            28 => Step::RevokeIdentity,
+            _ => Step::Rotate { into: arg & 1 == 1 },
         };
         // A quarter of the steps meet a failure somewhere in them.
         let failure = match n >> 27 {
@@ -300,6 +316,9 @@ struct Pairing {
 
 type Row = ([u8; 32], [u8; 32], u64);
 
+/// A key's resets, as `(epoch, time)`.
+type Resets = Vec<(u64, u64)>;
+
 fn row_of(p: &Presentation) -> Row {
     (p.presenter, p.hash, secs(p.taken))
 }
@@ -322,6 +341,18 @@ struct Run {
     /// and whether it shows a request from the other.
     plain: [(Uid, Events); 2],
     shows: [bool; 2],
+    /// Whether each party's friendships sessions show a request or an
+    /// upgrade offer from the other, and the entry each was last told.
+    views: [[(bool, Option<RosterState>); 2]; 2],
+    /// What the registrars' lists hold beside the floors.
+    listed: Published,
+    /// Each party's successor key, once it has rotated to it.
+    rotated: [bool; 2],
+    /// Each party's keys before its rotation, with the resets they kept.
+    former: [Vec<(Person, Resets)>; 2],
+    /// Sessions made this step, which read what is as they start rather
+    /// than being told it.
+    fresh: HashSet<Uid>,
     /// What an ask this step was answered.
     asked: Option<Result<RosterState, super::MessagingError>>,
     /// The last step as its actor saw it, for the twin to compare.
@@ -443,6 +474,11 @@ impl Run {
             sessions,
             plain,
             shows: [false, false],
+            views: Default::default(),
+            listed: Published::default(),
+            rotated: [false, false],
+            former: Default::default(),
+            fresh: HashSet::new(),
             asked: None,
             seen: None,
             ended: HashSet::new(),
@@ -541,11 +577,8 @@ impl Run {
             .iter()
             .map(|cert| {
                 let cert = DeviceCert::parse(cert).expect("a certificate");
-                let q = (0..2)
-                    .find(|&q| self.people[q].id.public() == cert.identity)
-                    .expect("one of the pair");
-                let kept = &self.resets[q];
-                let installed = self.floors.get(&self.people[q].fp()).copied();
+                let (who, kept) = self.signer(&cert.identity).expect("one of the pair");
+                let installed = self.floors.get(&who).copied();
                 let floor = kept.iter().map(|(e, _)| *e).chain(installed).max();
                 if floor.is_none_or(|floor| cert.epoch >= floor) {
                     return Some(true);
@@ -595,10 +628,14 @@ impl Run {
                 continue;
             };
             let o = Offer::check(&o.offer, u64::MAX, &[], |_| 0).expect("an offer kept");
-            let epoch = DeviceCert::parse(&o.cert).expect("a certificate").epoch;
-            let floor = self.floors.get(&me).copied().unwrap_or(0);
+            let cert = DeviceCert::parse(&o.cert).expect("a certificate");
+            // An offer kept through a rotation is its signer's, the key
+            // rotated away from.
+            let (signer, kept) = self.signer(&cert.identity).expect("one of the pair");
+            let floor = self.floors.get(&signer).copied().unwrap_or(0);
+            let kept = kept.iter().map(|(e, _)| *e).max().unwrap_or(0);
             assert!(
-                epoch >= floor.max(self.kept_floor(q)),
+                cert.epoch >= floor.max(kept),
                 "{what}: a pass left {login}'s offer below the floor"
             );
         }
@@ -632,7 +669,8 @@ impl Run {
     ) {
         for (q, sessions) in told.iter().enumerate() {
             for (d, told) in sessions.iter().enumerate() {
-                if self.ended.contains(&self.sessions[q][d].0) {
+                let uid = self.sessions[q][d].0;
+                if self.ended.contains(&uid) || self.fresh.contains(&uid) {
                     continue;
                 }
                 let removed = told.iter().filter(|s| **s == RosterState::Removed).count();
@@ -700,6 +738,10 @@ impl Run {
                 if now + secs < base + 80 * DAY {
                     core.clock.advance(Duration::from_secs(secs));
                 }
+                let wall = core.clock.wall();
+                let _ = self
+                    .store
+                    .cleanup(wall, wall - Duration::from_secs(DAY), 1000);
                 true
             }
             Step::Present { k } => {
@@ -751,12 +793,33 @@ impl Run {
             }
             Step::Revoke => {
                 self.revoked.insert(me.device(d));
-                core.set_revocations(Revocations {
+                let ended = core.set_revocations(Revocations {
                     devices: self.revoked.clone(),
                     ..Default::default()
                 });
+                self.ended.extend(ended.into_iter().map(|(uid, _)| uid));
                 true
             }
+            Step::Cancel => match self.offers[p].clone() {
+                Some(o) => core.friend_cancel_offer(uid, other, &o).is_ok(),
+                None => false,
+            },
+            Step::PublishDevice => {
+                self.listed.devices.insert((me.fp(), me.device(d)));
+                self.publish();
+                true
+            }
+            Step::Freeze => {
+                self.listed.unrevoked.insert(me.fp());
+                self.publish();
+                true
+            }
+            Step::RevokeIdentity => {
+                self.listed.identities.insert(me.fp());
+                self.publish();
+                true
+            }
+            Step::Rotate { into } => self.rotate(p, into),
             Step::Floor { how } => {
                 let fp = me.fp();
                 if how != 0 {
@@ -778,16 +841,121 @@ impl Run {
                 }
                 if how != 2 {
                     self.floors.insert(fp, 1);
-                    let ended = core.set_published_revocations(Published {
-                        floors: self.floors.clone(),
-                        covered: self.floors.keys().copied().collect(),
-                        ..Default::default()
-                    });
-                    self.ended.extend(ended.into_iter().map(|(uid, _)| uid));
+                    self.publish();
                 }
                 true
             }
         }
+    }
+
+    /// Install what the lists hold, the floors among it, and note the
+    /// sessions it ended.
+    fn publish(&mut self) {
+        let mut list = self.listed.clone();
+        list.floors = self.floors.clone();
+        list.covered = self
+            .floors
+            .keys()
+            .chain(&list.identities)
+            .chain(&list.unrevoked)
+            .chain(list.devices.iter().map(|(i, _)| i))
+            .copied()
+            .collect();
+        let ended = self.core.set_published_revocations(list);
+        self.ended.extend(ended.into_iter().map(|(uid, _)| uid));
+    }
+
+    /// `p` rotates to its successor key, its account linking it and its
+    /// sessions made again under it; with `into`, after the other party
+    /// presented a friendship it made with the successor elsewhere.
+    fn rotate(&mut self, p: usize, into: bool) -> bool {
+        if self.rotated[p] {
+            return false;
+        }
+        let now = self.core.clock.unix();
+        let next = Person::new(3 + p as u8, self.base);
+        if into {
+            let (q, them) = (1 - p, &self.people[1 - p]);
+            let o = next.offer(1, them, now - 30);
+            let f = them.accept(1, &o, now - 30);
+            let uid = self.sessions[q][1].0;
+            let _ = self.core.friendships_present(uid, vec![], vec![f]);
+        }
+        let me = &self.people[p];
+        let record = hl_identity::Rotation {
+            identity: me.id.public(),
+            successor: next.id.public(),
+            time: now,
+            next: None,
+        }
+        .sign(&me.id, &next.id)
+        .expect("a rotation");
+        let (from, to) = (me.fp(), next.fp());
+        self.dir.0.lock().unwrap()[p].0.fingerprint = Some(to);
+        self.core.keep_rotation_record(&record);
+        // One that fails, its record kept, is made again with nothing
+        // failing, as the successor's next login would, so that what
+        // follows has one key to judge by; what follows is that login.
+        let made = self.core.rotate_identity(&from, &to);
+        self.fail.fail_nth(0);
+        if made.is_err() {
+            self.core
+                .rotate_identity(&from, &to)
+                .expect("a rotation made again");
+        }
+        self.rotated[p] = true;
+        for (uid, _) in self.sessions[p].iter().chain([&self.plain[p]]) {
+            self.ended.insert(*uid);
+            self.core.end_session(*uid);
+        }
+        let old = std::mem::replace(&mut self.people[p], next);
+        let resets = std::mem::take(&mut self.resets[p]);
+        self.former[p].push((old, resets));
+        self.withdrawn.retain(|(q, _)| *q != p);
+        self.offers[p] = None;
+        let sessions = [0, 1].map(|d| attach(&self.core, LOGINS[p], &self.people[p], d, true));
+        let plain = attach(&self.core, LOGINS[p], &self.people[p], 0, false);
+        for (uid, _) in sessions.iter().chain([&plain]) {
+            self.core.friends_roster(*uid).expect("a roster");
+        }
+        self.fresh
+            .extend(sessions.iter().chain([&plain]).map(|(uid, _)| *uid));
+        self.sessions[p] = sessions;
+        self.plain[p] = plain;
+        self.resync(p);
+        true
+    }
+
+    /// What `q`'s sessions show taken from the store, for sessions made
+    /// now or a step nothing could be judged by.
+    fn resync(&mut self, q: usize) {
+        let (shown, upgrade, friends) = self.expected(q);
+        self.shows[q] = shown;
+        for d in 0..2 {
+            self.views[q][d] = (shown || upgrade, friends.then_some(RosterState::Accepted));
+        }
+    }
+
+    /// For `q`: whether a request from the other is held that it may see,
+    /// whether the other's upgrade offer waits for it off a friendship, and
+    /// whether they are friends.
+    fn expected(&self, q: usize) -> (bool, bool, bool) {
+        let now = self.core.clock.wall();
+        let (me, them) = (self.mailbox(q), self.mailbox(1 - q));
+        let shown = self
+            .store
+            .pending_in(&me, now)
+            .unwrap()
+            .iter()
+            .any(|r| r.owner.login == LOGINS[1 - q]);
+        let friends = self
+            .store
+            .relationship(&me, &them, now)
+            .unwrap()
+            .is_some_and(|r| r.friendship.is_some());
+        let (x, y) = (self.people[1 - q].fp(), self.people[q].fp());
+        let upgrade = !friends && self.store.offer(&x, &y, now).unwrap().is_some();
+        (shown, upgrade, friends)
     }
 
     /// What each session of each party was told of the other this step,
@@ -801,6 +969,7 @@ impl Run {
                         self.shows[q] = true;
                     }
                     Event::FriendEntry(e) if e.login == LOGINS[1 - q] => {
+                        assert!(e.offer.is_none(), "{} told an offer on an entry", LOGINS[q]);
                         self.shows[q] = e.state == RosterState::PendingIn;
                     }
                     _ => {}
@@ -811,10 +980,20 @@ impl Run {
         for (p, sessions) in self.sessions.iter_mut().enumerate() {
             for (d, (_, rx)) in sessions.iter_mut().enumerate() {
                 while let Ok(se) = rx.try_recv() {
-                    if let Event::FriendEntry(e) = se.event {
-                        if e.login == LOGINS[1 - p] {
+                    match se.event {
+                        Event::FriendEntry(e) if e.login == LOGINS[1 - p] => {
                             out[p][d].push(e.state);
+                            self.views[p][d] = (e.state == RosterState::PendingIn, Some(e.state));
                         }
+                        // An upgrade offer beside a friendship is shown on
+                        // the friend's entry, never as a request.
+                        Event::FriendRequest { login, .. }
+                            if login == LOGINS[1 - p]
+                                && self.views[p][d].1 != Some(RosterState::Accepted) =>
+                        {
+                            self.views[p][d].0 = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -822,9 +1001,10 @@ impl Run {
         out
     }
 
-    fn step(&mut self, n: u32) {
+    fn step(&mut self, n: u32, p: usize) {
+        self.fresh.clear();
         self.told();
-        let (step, p, d, failure) = Step::of(n);
+        let (step, _, d, failure) = Step::of(n);
         let before = self.pairing();
         let signed_before = self.signed();
         // Whether a removal or a block would name the other party: one
@@ -853,6 +1033,7 @@ impl Run {
             .any(|r| r.owner.login == LOGINS[1 - p]);
         let visible = (before.friendship.is_some(), mine, shown);
         let free = before.friendship.is_none() && !mine;
+        let predecessor = self.names_a_predecessor();
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
         self.core.clock.advance(Duration::from_secs(1));
@@ -922,8 +1103,15 @@ impl Run {
                 | Step::PresentWithdrawal { .. }
                 | Step::RemoveByKey
                 | Step::Present { .. }
-        ) || (matches!(step, Step::Link | Step::Revoke | Step::Floor { .. })
-            && before.evidence == [true, true]);
+        ) || (matches!(
+            step,
+            Step::Link
+                | Step::Revoke
+                | Step::Floor { .. }
+                | Step::PublishDevice
+                | Step::RevokeIdentity
+                | Step::Rotate { .. }
+        ) && before.evidence == [true, true]);
         assert!(
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
@@ -937,8 +1125,11 @@ impl Run {
             let granted = before.friendship.is_none()
                 || (before.evidence != [true, true] && after.evidence == [true, true]);
             let all = self.presentations();
+            // A rotation moves rows onto the successor's key: moved, not
+            // written.
+            let moving = matches!(step, Step::Rotate { .. });
             for pres in all.iter().filter(|p| p.evidence()) {
-                let written = !before.rows.contains(&row_of(pres));
+                let written = !moving && !before.rows.contains(&row_of(pres));
                 assert!(
                     !(granted || written) || self.held(pres, &all),
                     "{what}: active over {pres:?}, which is not held"
@@ -994,14 +1185,27 @@ impl Run {
         }
         // A decline of a request or an upgrade offer holds its sender, in
         // the one step that ends it, whatever failed after.
-        if matches!(step, Step::Decline) && before.asking[1 - p] {
-            self.holds[p] = after.held[p] && !before.held[p] || self.holds[p];
+        if matches!(step, Step::Decline) && ok && before.asking[1 - p] {
+            self.holds[p] = true;
         }
         // A hold lapses with time, and only with it.
         if let Step::Clock { .. } = step {
             for q in 0..2 {
                 self.holds[q] &= after.held[q];
             }
+        }
+        // A withdrawal by a successor's key names the successor's pair, and
+        // what it cuts of a friendship naming a predecessor's is not
+        // modeled here (a follow-up of its own): that hold alone is taken
+        // as the store has it.
+        let withdrawing = matches!(
+            step,
+            Step::Remove { withdraw: true, .. }
+                | Step::BlockWithdrawal
+                | Step::PresentWithdrawal { .. }
+        );
+        if withdrawing && predecessor {
+            self.holds[p] = after.held[p];
         }
         assert_eq!(
             after.held, self.holds,
@@ -1126,23 +1330,33 @@ impl Run {
     /// it where something did.
     fn shown(&mut self, what: &str, whole: bool, blocking: Option<usize>) {
         self.told();
-        let now = self.core.clock.wall();
         for q in 0..2 {
-            let other = LOGINS[1 - q];
-            let held = self
-                .store
-                .pending_in(&self.mailbox(q), now)
-                .unwrap()
-                .iter()
-                .any(|r| r.owner.login == other);
-            if whole && blocking != Some(q) && self.takes_part(q) && self.takes_part(1 - q) {
+            let (held, upgrade, _) = self.expected(q);
+            let judged =
+                whole && blocking != Some(q) && self.takes_part(q) && self.takes_part(1 - q);
+            if judged && !self.ended.contains(&self.plain[q].0) {
                 assert_eq!(
-                    self.shows[q], held,
-                    "{what}: {}'s plain session shows a request from {other}",
-                    LOGINS[q]
+                    self.shows[q],
+                    held,
+                    "{what}: {}'s plain session shows a request from {}",
+                    LOGINS[q],
+                    LOGINS[1 - q]
                 );
             }
-            self.shows[q] = held;
+            for d in 0..2 {
+                if judged && !self.ended.contains(&self.sessions[q][d].0) {
+                    assert_eq!(
+                        self.views[q][d].0,
+                        held || upgrade,
+                        "{what}: {}'s device {d} shows a request or an upgrade from {}",
+                        LOGINS[q],
+                        LOGINS[1 - q]
+                    );
+                }
+            }
+            if !judged {
+                self.resync(q);
+            }
         }
     }
 
@@ -1151,31 +1365,90 @@ impl Run {
         self.resets[q].iter().map(|(e, _)| *e).max().unwrap_or(0)
     }
 
+    /// The fingerprint and the resets of the key `identity` is among the
+    /// pair's, now or before a rotation.
+    fn signer(&self, identity: &hl_identity::PublicKey) -> Option<([u8; 32], &Resets)> {
+        (0..2).find_map(|q| {
+            if self.people[q].id.public() == *identity {
+                return Some((self.people[q].fp(), &self.resets[q]));
+            }
+            self.former[q]
+                .iter()
+                .find(|(p, _)| p.id.public() == *identity)
+                .map(|(p, r)| (p.fp(), r))
+        })
+    }
+
+    /// A cancel or a decline is drawn for a party with something to cancel
+    /// or decline, where either has.
+    fn actor(&self, n: u32) -> usize {
+        let (step, p, ..) = Step::of(n);
+        let wall = self.core.clock.wall();
+        let has = |q: usize| match step {
+            Step::Cancel => self.offers[q].is_some(),
+            Step::Decline => {
+                self.offers[1 - q].is_some()
+                    || self
+                        .store
+                        .pending_in(&self.mailbox(q), wall)
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.owner.login == LOGINS[1 - q])
+            }
+            _ => true,
+        };
+        if has(p) || !has(1 - p) {
+            p
+        } else {
+            1 - p
+        }
+    }
+
+    /// Whether a presentation of the pair names a key either party has
+    /// rotated away from.
+    fn names_a_predecessor(&self) -> bool {
+        let former: Vec<[u8; 32]> = self.former.iter().flatten().map(|(p, _)| p.fp()).collect();
+        self.presentations()
+            .iter()
+            .any(|p| p.names.iter().any(|n| former.contains(n)))
+    }
+
+    /// Every key of `q`'s, its current last.
+    fn keys(&self, q: usize) -> Vec<[u8; 32]> {
+        self.former[q]
+            .iter()
+            .map(|(p, _)| p.fp())
+            .chain([self.people[q].fp()])
+            .collect()
+    }
+
     /// A signed withdrawal by `q`, as `(q, its certificate's epoch, its
     /// cutoff, its bytes)`.
     fn signed_of(&self, q: usize, bytes: &[u8]) -> (usize, u64, u64, Vec<u8>) {
         let k = Withdrawal::parse(bytes, u64::MAX, |_| 0).expect("a withdrawal kept");
         let w = k.withdrawal();
-        assert_eq!(w.from, self.people[q].id.public(), "signed by its owner");
+        let own = self.keys(q).contains(&Fingerprint::of(&w.from).0);
+        assert!(own, "signed by its owner");
         let epoch = DeviceCert::parse(&w.cert).expect("a certificate").epoch;
         (q, epoch, w.before, bytes.to_vec())
     }
 
     /// The signed withdrawals held for the pair, each party's own.
     fn signed(&self) -> Vec<(usize, u64, u64, Vec<u8>)> {
-        let pair = Pair::new(
-            Fingerprint(self.people[0].fp()),
-            Fingerprint(self.people[1].fp()),
-        );
         let mut out = Vec::new();
-        for w in self.store.withdrawals(&pair.hash()).unwrap() {
+        let (xs, ys) = (self.keys(0), self.keys(1));
+        let pairs = xs.iter().flat_map(|x| {
+            ys.iter()
+                .map(move |y| Pair::new(Fingerprint(*x), Fingerprint(*y)))
+        });
+        for w in pairs.flat_map(|pair| self.store.withdrawals(&pair.hash()).unwrap()) {
             let Some(bytes) = w.withdrawal else {
                 continue;
             };
             let q = (0..2)
-                .find(|&q| self.people[q].fp() == w.owner)
+                .find(|&q| self.keys(q).contains(&w.owner))
                 .expect("one of the pair's");
-            assert_eq!(w.party, w.owner, "its signer's own cutoff");
+            assert!(self.keys(q).contains(&w.party), "its signer's own cutoff");
             // By the cutoff the row keeps, which is what it ends.
             let (q, epoch, _, bytes) = self.signed_of(q, &bytes);
             out.push((q, epoch, w.before, bytes));
@@ -1240,25 +1513,35 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize, friendships: bool) -
 /// an upgrade offer on a friendship answered `Reset` and accepted, a
 /// request with an offer taken as one, declined, then asked again, the
 /// record an upgrade offer was taken on dropped under it, a request taken
-/// as one then asked again with an offer, and an ask that would be one at
-/// the daily bound.
+/// as one then asked again with an offer, an ask that would be one at
+/// the daily bound, a rotation failing past its store and one failing in
+/// it, an upgrade offer kept through a rotation, then a floor, and a
+/// record replaced by the presentation that makes the friendship active
+/// again.
 pub const FOUND: &[&[u32]] = &[
-    &[1073741952, 1073741852, 1073741989],
-    &[1073741979, 1073741980, 1073742026],
-    &[1073741883, 1073742016, 1073742053],
-    &[3653138233, 1083754464, 736438803, 2139438085],
+    &[1073741952, 1073741843, 1073741988],
+    &[1073742219, 1073741971, 1073742023],
+    &[1073742123, 1073742016, 1073742052],
+    &[3653138221, 1083754464, 736438800, 2139438084],
     &[
-        3598185087, 4667, 535997, 1755425304, 1160182336, 1648425276, 1769223613,
+        3489662961, 4651, 535972, 1755425298, 1160182336, 1648425267, 1769223588,
     ],
-    &[1088533014, 3701201436, 2985964758],
-    &[2586569270, 334638460, 3275716080],
-    &[1073742495, 1073742108, 1073741866, 1073742016, 1073741989],
+    &[1088533518, 3701201427, 2985964750],
+    &[2586569774, 334638451, 3275716072],
+    &[1073745039, 1073742099, 1073741863, 1073742016, 1073741988],
     &[
-        1073742495, 1073742108, 1073742016, 1073741866, 1073741887, 1073741888,
+        1073745039, 1073742099, 1073742016, 1073741863, 1073742129, 1073741888,
     ],
-    &[1073742495, 1073742108, 1073741866, 1073742016, 1073741881],
-    &[1073742495, 1073742108, 1073742016, 1073741866, 1073742016],
-    &[1073741844, 1073742108, 1073741866, 1073742016],
+    &[1073745039, 1073742099, 1073741863, 1073742016, 1073741869],
+    &[1073745039, 1073742099, 1073742016, 1073741863, 1073742016],
+    &[1073741964, 1073742099, 1073741863, 1073742016],
+    &[1484404, 2287251147, 881412125],
+    &[2817259648, 3125557727, 1520565341, 1356973523],
+    &[
+        69354185, 3394129704, 169593288, 949713781, 1869947303, 1134085939, 3446946862, 2183693831,
+        4199419015,
+    ],
+    &[1369815304, 3160564558, 62, 142700573, 2788673504],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the
@@ -1275,10 +1558,14 @@ pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
         if start.evidence == [true, true] {
             r.portable.extend(start.friendship);
         }
+        r.resync(0);
+        r.resync(1);
     }
     for &n in steps {
-        run.step(n);
-        twin.step(n);
+        // Both runs act as the same party, whatever the twin holds.
+        let p = run.actor(n);
+        run.step(n, p);
+        twin.step(n, p);
         // What the other party holds never shows to an asker: where it saw
         // the same before, it is answered and told the same.
         if let (Some(a), Some(b)) = (&run.seen, &twin.seen) {

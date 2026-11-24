@@ -481,6 +481,23 @@ fn drop_pair(
     Ok(Ended { gone, ended })
 }
 
+/// Rows `clause` names left holding nothing, gone.
+fn reclaim(
+    tx: &Connection,
+    clause: &str,
+    binds: &[&dyn rusqlite::ToSql],
+) -> Result<(), StoreError> {
+    sql(tx.execute(
+        &format!(
+            "DELETE FROM relationship
+              WHERE ({clause}) AND blocked_at IS NULL AND friendship IS NULL
+                AND approval IS NULL AND pending_at IS NULL AND ignore_mode IS NULL"
+        ),
+        binds,
+    ))?;
+    Ok(())
+}
+
 /// [`RelationshipStore::drop_offers`] for the offers whose upgrade rows
 /// `upgrades` names and whose request rows `requests` does: an upgrade
 /// offer with the pending out it showed its owner, a request's offer
@@ -507,7 +524,7 @@ fn drop_offers_where(
         ),
         binds,
     ))?;
-    Ok(())
+    reclaim(tx, requests, binds)
 }
 
 /// The friendships the pair `x`, `y`'s `Reset` records kept, gone, their
@@ -791,7 +808,7 @@ fn settle_upgrades(tx: &Connection, fp: &str) -> Result<(), StoreError> {
                                AND (r.friendship IS NOT NULL OR r.pending_upgrade))",
         params![fp],
     ))?;
-    Ok(())
+    reclaim(tx, "owner_fp = ?1 OR other_fp = ?1", &[&fp])
 }
 
 /// The upgrade offer `x` has waiting for `y` on an edge a reset left
@@ -809,6 +826,7 @@ fn drop_upgrade(tx: &Connection, x: &str, y: &str) -> Result<(), StoreError> {
             "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
             params![x, y],
         ))?;
+        reclaim(tx, "owner_fp = ?1 AND other_fp = ?2", &[&x, &y])?;
     }
     Ok(())
 }

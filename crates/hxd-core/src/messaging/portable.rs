@@ -162,6 +162,42 @@ const GENERATIONS: usize = 1 << 16;
 /// there are.
 const UNRECORDED_PER_TICK: usize = 256;
 
+/// How long a revoked device's offers wait to be swept again after a
+/// sweep of them fails, doubling with each failure up to
+/// [`SWEEP_BACKOFF_MAX`], so a store that keeps failing costs a try and a
+/// log line that often rather than every tick.
+const SWEEP_BACKOFF: u64 = 60;
+const SWEEP_BACKOFF_MAX: u64 = 3600;
+
+/// A revoked device whose offers a sweep could not read or drop.
+pub(crate) struct OwedSweep {
+    identity: [u8; 32],
+    device: [u8; 32],
+    failures: u32,
+    due: u64,
+}
+
+impl OwedSweep {
+    fn new(identity: [u8; 32], device: [u8; 32]) -> Self {
+        OwedSweep {
+            identity,
+            device,
+            failures: 0,
+            due: 0,
+        }
+    }
+
+    fn failed(self, now: u64) -> Self {
+        let failures = self.failures + 1;
+        let wait = SWEEP_BACKOFF.saturating_mul(1 << (failures - 1).min(6));
+        OwedSweep {
+            failures,
+            due: now + wait.min(SWEEP_BACKOFF_MAX),
+            ..self
+        }
+    }
+}
+
 /// What [`Core::judge_floors`] reconciled: each identity whose stored
 /// friendships and offers were all judged at its epochs, with the
 /// generation of each key of its chain then, and a generation for each
@@ -652,6 +688,16 @@ impl Core {
     /// listed is passed over without reading its rows: a keep of them
     /// marks it due ([`Watched`]).
     pub(crate) fn reconcile_due(&self, listed: impl IntoIterator<Item = [u8; 32]>) {
+        let now = self.clock.unix();
+        if self
+            .offer_sweeps
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.due <= now)
+        {
+            self.drop_revoked_presentations(&[]);
+        }
         if let Some(store) = &self.relationships {
             // Under the hold an 802 judges a record under, so that none
             // lapses between the judging and the offer it keeps waiting.
@@ -1436,7 +1482,7 @@ impl Core {
             .present_befriending(me, them, &presented, (!friends).then_some(kept), at)
             .map_err(store_failed)?;
         for old in replaced {
-            self.replaced(store, old, Some(&bytes));
+            self.replaced(store, old, Some(&bytes), false);
         }
         match id {
             Some(id) => self.befriended(me, them, id, &approvals),
@@ -1575,7 +1621,18 @@ impl Core {
                     end.presentations.push(p);
                 }
             }
-            if let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? {
+            // An upgrade offer, or the offer a request carries.
+            let asked = store
+                .relationship(
+                    &Mailbox::identified("", p),
+                    &Mailbox::identified("", q),
+                    wall,
+                )
+                .map_err(store_failed)?
+                .and_then(|r| r.pending_out)
+                .and_then(|r| r.offer);
+            let waiting = store.offer(&p, &q, wall).map_err(store_failed)?.or(asked);
+            if let Some(o) = waiting {
                 if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| o.cut_by(&cut)) {
                     end.offers.push(p);
                 }
@@ -1724,17 +1781,37 @@ impl Core {
         if let Some(e) = &dropped.ended {
             self.edge_ended(e, None);
         }
+        for gone in &dropped.gone {
+            self.record_left(gone);
+        }
         Ok(dropped.gone)
     }
 
+    /// A `Reset` record left its row, and with it any upgrade offer it
+    /// qualified: both parties told their entries as they now stand.
+    fn record_left(&self, p: &Presentation) {
+        if p.reset.is_none() {
+            return;
+        }
+        if let (Some(a), Some(b)) = (self.mailbox_of(&p.presenter), self.mailbox_of(&p.other)) {
+            self.tell_entry(&a, &b);
+            self.tell_entry(&b, &a);
+        }
+    }
+
     /// A presentation `present` answered as replaced, where its evidence
-    /// was other than `now`'s: what it held is judged again.
+    /// was other than `now`'s: what it held is judged again. A record it
+    /// was is told, unless the caller tells both parties after.
     fn replaced(
         &self,
         store: &Arc<dyn RelationshipStore>,
         old: Option<Presentation>,
         now: Option<&[u8]>,
+        tell: bool,
     ) {
+        if let Some(old) = old.as_ref().filter(|_| tell) {
+            self.record_left(old);
+        }
         if let Some(old) = old.filter(|o| o.friendship.is_some() && o.friendship.as_deref() != now)
         {
             self.unjudge(store, [old.presenter, old.other]);
@@ -2055,8 +2132,7 @@ impl Core {
             .end_friendship(&them, &me.mailbox, &end)
             .map_err(store_failed)?;
         self.tell_entry(&me.mailbox, &them);
-        let gone = Event::FriendEntry(Box::new(FriendEntry::removed(&me.mailbox)));
-        self.roster.lock().unwrap().tell_friendships(&them, gone);
+        self.tell_entry(&them, &me.mailbox);
         Ok(())
     }
 
@@ -2340,7 +2416,7 @@ impl Core {
             let p = row(friendship, reset)?;
             store
                 .present(&p)
-                .map(|old| self.replaced(store, old, p.friendship.as_deref()))
+                .map(|old| self.replaced(store, old, p.friendship.as_deref(), true))
                 .map_err(store_failed)
         };
         // Step 2's refusal keeps the hash alone toward the bound, as the
@@ -2443,8 +2519,11 @@ impl Core {
                         self.edge_ended(e, None);
                     }
                 }
-                self.replaced(store, replaced, None);
-                if let (true, Some(offer)) = (recording, upgrade) {
+                self.replaced(store, replaced, None, true);
+                // What is told is what the step left waiting: a record it
+                // replaced may have taken the upgrade with it.
+                let waiting = store.offer(&theirs, &mine, wall).map_err(store_failed)?;
+                if let (true, Some(_), Some(offer)) = (recording, upgrade, waiting) {
                     self.reset_offer(me, &them, offer, pending.filter(|p| !p.upgrade));
                 }
                 return answer(Presented::Reset);
@@ -2466,7 +2545,10 @@ impl Core {
                     .map_err(store_failed)?;
             }
         }
-        record(Some(bytes.clone()), None)?;
+        let p = row(Some(bytes.clone()), None)?;
+        let old = store.present(&p).map_err(store_failed)?;
+        let left = old.clone().filter(|o| o.reset.is_some());
+        self.replaced(store, old, p.friendship.as_deref(), false);
         if let Some(p) = store
             .presentation(&theirs, &mine)
             .map_err(store_failed)?
@@ -2474,7 +2556,16 @@ impl Core {
         {
             self.judged_alone(store, &p).map_err(store_failed)?;
         }
-        match self.activate(store, me, &them, floors, wall) {
+        let activated = self.activate(store, me, &them, floors, wall);
+        // A record replaced is told where the edge was not made active,
+        // which tells both parties of itself.
+        if let Some(left) = left {
+            match store.relationship(me, &them, wall) {
+                Ok(Some(r)) if r.friendship.is_some() => {}
+                _ => self.record_left(&left),
+            }
+        }
+        match activated {
             Ok(()) => answer(Presented::Ok),
             Err(MessagingError::RosterFull) => answer(Presented::RosterFull),
             Err(e) => Err(e),
@@ -2663,25 +2754,45 @@ impl Core {
             return;
         };
         let _writing = self.friend_writes();
-        let wall = self.clock.wall();
+        let (wall, now) = (self.clock.wall(), self.clock.unix());
         let mut signed = Vec::new();
-        for (identity, device) in devices {
-            let Some(identity) = identity else {
-                continue;
+        let mut owed = self.offer_sweeps.lock().unwrap();
+        let (due, later): (Vec<_>, Vec<_>) = owed.drain(..).partition(|o| o.due <= now);
+        *owed = later;
+        let due = devices
+            .iter()
+            .filter_map(|(i, d)| i.map(|i| OwedSweep::new(i, *d)))
+            .chain(due);
+        // Those whose offers were read, owed again if the drop fails.
+        let mut read = Vec::new();
+        for sweep in due {
+            let offers = match store.offers_from(&sweep.identity, wall) {
+                Ok(offers) => offers,
+                Err(e) => {
+                    warn!("relationships: reading a revoked device's offers: {e}");
+                    owed.push(sweep.failed(now));
+                    continue;
+                }
             };
-            for (other, o) in store.offers_from(identity, wall).unwrap_or_default() {
+            for (other, o) in offers {
                 let by = Offer::check(&o.offer, STORED, &[], zero_floor)
                     .ok()
                     .and_then(|o| DeviceCert::parse(&o.cert).ok())
                     .map(|c| Fingerprint::of(&c.device).0);
-                if by == Some(*device) {
-                    signed.push((*identity, other));
+                if by == Some(sweep.device) {
+                    signed.push((sweep.identity, other));
                 }
             }
+            read.push(sweep);
         }
+        drop(owed);
         match store.drop_offers(&signed) {
             Ok(()) => self.offers_dropped(&signed),
-            Err(e) => warn!("relationships: dropping the offers a revoked device signed: {e}"),
+            Err(e) => {
+                warn!("relationships: dropping the offers a revoked device signed: {e}");
+                let mut owed = self.offer_sweeps.lock().unwrap();
+                owed.extend(read.into_iter().map(|o| o.failed(now)));
+            }
         }
         for (identity, device) in devices {
             let made = match store.presented_by(device) {

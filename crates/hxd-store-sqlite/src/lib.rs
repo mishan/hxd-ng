@@ -1127,6 +1127,8 @@ CREATE INDEX friend_presentation_reset ON friend_presentation (at) WHERE reset I
 ALTER TABLE relationship ADD COLUMN pending_offer BLOB;
 ALTER TABLE relationship ADD COLUMN pending_offer_lapses INTEGER;
 ALTER TABLE relationship ADD COLUMN pending_upgrade INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX relationship_pending_offer_lapses ON relationship (pending_offer_lapses)
+ WHERE pending_offer_lapses IS NOT NULL;
 UPDATE relationship
    SET (pending_offer, pending_offer_lapses) =
        (SELECT o.offer, o.lapses FROM friend_offer o

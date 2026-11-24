@@ -4209,3 +4209,191 @@ fn a_plain_session_asks_as_it_sees_beside_an_upgrade_it_cannot() {
     let (ma, mb) = mailboxes(&alice, &bob);
     assert!(requested(&s, &ma, &mb));
 }
+
+#[test]
+fn a_dismissed_upgrade_is_told_to_the_dismissers_sessions() {
+    for accept in [false, true] {
+        let (mut alice, bob) = (person(1), person(2));
+        let (s, f, renewed, [(a, _), (b, mut rb), _]) = reset_elsewhere(&mut alice, &bob, policy());
+        s.core.friendships_present(b, vec![], vec![f]).unwrap();
+        s.core
+            .friend_ask(a, "bob", None, Some(offer(&alice, renewed, &bob, now())))
+            .unwrap();
+        drain(&mut rb);
+        s.core.friend_respond(b, "alice", accept).unwrap();
+        assert_eq!(
+            told(&mut rb),
+            [("alice".into(), RosterState::Removed, vec![], None)],
+            "accept {accept}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_upgrade_tells_the_friend_what_still_stands() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, mut rb), (plain, _)]) =
+        reset_elsewhere(&mut alice, &bob, policy());
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    let o = offer(&alice, renewed, &bob, now());
+    s.core.friend_ask(a, "bob", None, Some(o.clone())).unwrap();
+    s.core.friend_add(plain, "alice", None).unwrap();
+    drain(&mut rb);
+    s.core.friend_cancel_offer(a, "bob", &o).unwrap();
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::PendingOut, vec![], None)],
+        "Bob's own request stands"
+    );
+}
+
+#[test]
+fn an_upgrade_its_record_was_replaced_under_is_not_told_again() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, mut rb), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, renewed, &bob, now())))
+        .unwrap();
+    // Another friendship the two made elsewhere before the reset.
+    let o2 = offer(&alice, 0, &bob, now() - 1800);
+    let f2 = accept(&o2, &bob, 0, now() - 1800);
+    drain(&mut rb);
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f2]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    assert!(
+        requests_offered(&mut rb).is_empty(),
+        "the upgrade went with its record"
+    );
+}
+
+/// What a records tick does with a sweep owed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Owed {
+    /// Its backoff is not over: not tried, whatever would fail.
+    Waits,
+    /// Tried, and failing again.
+    Fails,
+    /// Tried with nothing failing: the offer goes.
+    Sweeps,
+}
+
+/// A revocation sweep of alice's device whose `failing` call failed, then
+/// each tick after the clock moves so many seconds.
+fn sweep_owed(failing: &'static str, ticks: &[(u64, Owed)]) {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let offered = || {
+        let roster = s.core.friends_roster(b).unwrap();
+        roster
+            .iter()
+            .find(|e| e.login == "alice")
+            .unwrap()
+            .offer
+            .is_some()
+    };
+    assert!(offered());
+    s.fail.fail_next(failing);
+    drop(s.core.set_published_revocations(Published {
+        devices: [(fp(&alice), Fingerprint::of(&alice.devices[0].0.public()).0)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert_eq!(s.fail.failed(), Some(failing));
+    for &(secs, owed) in ticks {
+        s.core.clock.advance(std::time::Duration::from_secs(secs));
+        if owed != Owed::Sweeps {
+            s.fail.fail_next(failing);
+        }
+        s.core.reconcile_due(Vec::new());
+        s.fail.fail_nth(0);
+        let tried = s.fail.failed() == Some(failing);
+        assert_eq!(tried, owed == Owed::Fails, "{secs}s on: {owed:?}");
+        assert_eq!(offered(), owed != Owed::Sweeps, "{secs}s on: {owed:?}");
+    }
+}
+
+#[test]
+fn offers_a_revocation_could_not_read_are_swept_after_a_backoff() {
+    use Owed::*;
+    sweep_owed(
+        "offers_from",
+        &[(0, Waits), (61, Fails), (61, Waits), (60, Sweeps)],
+    );
+}
+
+#[test]
+fn offers_a_revocation_could_not_drop_are_dropped_after_a_backoff() {
+    sweep_owed("drop_offers", &[(0, Owed::Waits), (61, Owed::Sweeps)]);
+}
+
+#[test]
+fn a_frozen_identity_revoked_after_loses_its_offers() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let shown = |s: &Server| {
+        let roster = s.core.friends_roster(b).unwrap();
+        roster
+            .iter()
+            .find(|e| e.login == "alice")
+            .and_then(|e| e.offer.clone())
+    };
+    drop(s.core.set_published_revocations(Published {
+        unrevoked: [fp(&alice)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert!(shown(&s).is_some(), "frozen alone keeps it");
+    drop(s.core.set_published_revocations(Published {
+        identities: [fp(&alice)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert_eq!(shown(&s), None, "revoked takes it");
+}
+
+#[test]
+fn a_withdrawal_cutting_a_requests_offer_leaves_the_request_plain() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now() - 60)))
+        .unwrap();
+    let w = withdraw(&alice, 0, &bob, now());
+    s.core.friendships_present(a, vec![w], vec![]).unwrap();
+    let roster = s.core.friends_roster(b).unwrap();
+    let e = roster.iter().find(|e| e.login == "alice").unwrap();
+    assert_eq!((e.state, e.offer.clone()), (RosterState::PendingIn, None));
+}
+
+#[test]
+fn a_dismissed_upgrade_beside_a_friendship_is_told_to_the_dismissers_sessions() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _, b, mut rb, _) = made(&s, &alice, &bob);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    drain(&mut rb);
+    s.core.friend_respond(b, "alice", false).unwrap();
+    let entries: Vec<_> = drain(&mut rb)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FriendEntry(e) if e.login == "alice" => Some((e.state, e.offer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entries, [(RosterState::Accepted, None)], "the offer gone");
+}
