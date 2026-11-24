@@ -730,8 +730,9 @@ async fn a_reset_keeps_what_was_taken_before_it_and_a_device_since_remakes_what_
 
 #[tokio::test]
 async fn a_request_made_an_upgrade_by_reset_is_removed_for_sessions_without_bit_15() {
-    // Both parties' sessions without bit 15 are told the request is gone;
-    // those with it keep the edge for the upgrade.
+    // The target's sessions without bit 15 are told the request is gone,
+    // those with it keep the edge for the upgrade, and the sender's see
+    // their request as it was.
     let (mut alice, bob) = (alice(), bob());
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let s1 = start(d1.path()).await;
@@ -774,13 +775,16 @@ async fn a_request_made_an_upgrade_by_reset_is_removed_for_sessions_without_bit_
         e.offer == Some(o.as_slice())
     })
     .await;
-    told(
-        &mut plain_alice,
-        ServerHdr::RosterEntry,
-        "bob",
-        state(RosterState::Removed),
-    )
-    .await;
+    assert_eq!(
+        refused(
+            &mut plain_alice,
+            ClientHdr::AddFriend,
+            im::add_friend(b"bob", None)
+        )
+        .await,
+        Some(ReasonCode::RequestPending),
+        "the sender's request standing"
+    );
     let removed = |c: &mut Client, login: &[u8]| {
         c.rx.take_backlog().iter().any(|f| {
             f.ty == ServerHdr::RosterEntry.as_u32()
@@ -791,6 +795,10 @@ async fn a_request_made_an_upgrade_by_reset_is_removed_for_sessions_without_bit_
     assert!(!removed(&mut bob2, b"alice"), "the target's");
     ok(&mut alice2, ClientHdr::FindUser, im::find_user(b"bob")).await;
     assert!(!removed(&mut alice2, b"bob"), "the sender's");
+    assert!(
+        !removed(&mut plain_alice, b"bob"),
+        "the sender's without bit 15"
+    );
 }
 
 #[tokio::test]

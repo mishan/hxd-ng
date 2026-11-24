@@ -2277,6 +2277,11 @@ pub struct Core {
     /// tests of what lands between.
     #[cfg(test)]
     pub(crate) reconciling: crate::relationships::failing::Park,
+    /// No offer is taken as an upgrade offer on an edge a reset left
+    /// inactive: the sequence harness's twin, which no `Reset` record
+    /// ever shows to.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) upgrades_off: std::sync::atomic::AtomicBool,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

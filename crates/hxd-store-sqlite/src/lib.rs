@@ -1117,12 +1117,26 @@ UPDATE friend_presentation SET taken = at;
 ";
 
 /// The friendship a presentation answered `Reset` kept, on a row whose
-/// `friendship` is NULL, so that it is never evidence; and whether an offer
-/// was taken as an upgrade offer, which no request carries.
+/// `friendship` is NULL, so that it is never evidence; and a request's
+/// offer moved onto the request's own row, so that `friend_offer` holds
+/// upgrade offers alone. An offer is carried over where its request, live
+/// and delivered, or its friendship stands, and dropped otherwise.
 const SCHEMA_V41: &str = "
 ALTER TABLE friend_presentation ADD COLUMN reset BLOB;
 CREATE INDEX friend_presentation_reset ON friend_presentation (at) WHERE reset IS NOT NULL;
-ALTER TABLE friend_offer ADD COLUMN upgrade INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE relationship ADD COLUMN pending_offer BLOB;
+ALTER TABLE relationship ADD COLUMN pending_offer_lapses INTEGER;
+ALTER TABLE relationship ADD COLUMN pending_upgrade INTEGER NOT NULL DEFAULT 0;
+UPDATE relationship
+   SET (pending_offer, pending_offer_lapses) =
+       (SELECT o.offer, o.lapses FROM friend_offer o
+         WHERE o.owner = relationship.owner_fp AND o.other = relationship.other_fp)
+ WHERE friendship IS NULL AND pending_delivered
+   AND pending_lapses > CAST(strftime('%s', 'now') AS INTEGER);
+DELETE FROM friend_offer
+ WHERE NOT EXISTS (SELECT 1 FROM relationship r
+                    WHERE r.owner_fp = friend_offer.owner AND r.other_fp = friend_offer.other
+                      AND r.friendship IS NOT NULL);
 ";
 
 /// The bans this server asked linked servers for (`docs/server-link.md`
@@ -5130,8 +5144,128 @@ mod tests {
         );
     }
 
+    /// Each offer kept apart before moves onto its request where that is
+    /// live and delivered, stays an upgrade offer beside a friendship, and
+    /// goes otherwise, a crossing pair's each way on its own.
+    #[test]
+    fn version_forty_carries_offers_where_their_request_or_friendship_stands() {
+        use hxd_core::inbox::Mailbox;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let far: i64 = 4_000_000_000;
+        let hex = |n: u8| format!("{n:02x}").repeat(32);
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37, SCHEMA_V38, SCHEMA_V39, SCHEMA_V40,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            // (owner, other, keyed by fingerprint, friendship, request:
+            // (lapses, delivered)), each with an offer from owner to other.
+            type Seeded = (u8, u8, bool, Option<i64>, Option<(i64, bool)>);
+            let rows: [Seeded; 7] = [
+                (1, 2, true, None, Some((far, true))),
+                (3, 4, true, Some(1), None),
+                (5, 6, true, None, Some((far, false))),
+                (9, 10, true, None, Some((far, true))),
+                (10, 9, true, None, Some((far, true))),
+                (11, 12, false, None, Some((far, true))),
+                (13, 14, true, None, Some((5, true))),
+            ];
+            for (o, t, keyed, friendship, asked) in rows {
+                let fps = keyed.then(|| (hex(o), hex(t)));
+                conn.execute(
+                    "INSERT INTO relationship (owner, owner_fp, other, other_fp, friendship, \
+                     pending_at, pending_lapses, pending_delivered) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        format!("m{o}"),
+                        fps.as_ref().map(|f| f.0.clone()),
+                        format!("m{t}"),
+                        fps.as_ref().map(|f| f.1.clone()),
+                        friendship,
+                        asked.map(|_| 1),
+                        asked.map(|a| a.0),
+                        asked.map(|a| a.1),
+                    ],
+                )
+                .unwrap();
+            }
+            for (o, t) in [
+                (1, 2),
+                (3, 4),
+                (5, 6),
+                (7, 8),
+                (9, 10),
+                (10, 9),
+                (11, 12),
+                (13, 14),
+            ] {
+                conn.execute(
+                    "INSERT INTO friend_offer (owner, other, offer, lapses) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![hex(o), hex(t), [o, t], far],
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 40).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let now = SystemTime::now();
+        let mb = |n: u8| Mailbox::identified(format!("m{n}"), [n; 32]);
+        let carried = |o: u8, t: u8| {
+            store
+                .relationship(&mb(o), &mb(t), now)
+                .unwrap()
+                .and_then(|r| r.pending_out)
+                .and_then(|p| p.offer)
+                .map(|o| o.offer)
+        };
+        let upgrade = |o: u8, t: u8| {
+            store
+                .offer(&[o; 32], &[t; 32], now)
+                .unwrap()
+                .map(|o| o.offer)
+        };
+        assert_eq!(
+            (carried(1, 2), upgrade(1, 2)),
+            (Some(vec![1, 2]), None),
+            "a live request's"
+        );
+        assert_eq!(
+            (carried(3, 4), upgrade(3, 4)),
+            (None, Some(vec![3, 4])),
+            "a friendship's"
+        );
+        assert_eq!((carried(5, 6), upgrade(5, 6)), (None, None), "held");
+        assert_eq!(upgrade(7, 8), None, "no request");
+        assert_eq!(carried(9, 10), Some(vec![9, 10]), "a crossing, one way");
+        assert_eq!(carried(10, 9), Some(vec![10, 9]), "and the other");
+        assert!(
+            store.offers_from(&[11; 32], now).unwrap().is_empty(),
+            "keyed by login"
+        );
+        // Read raw: a lapsed request reads as gone whatever it holds.
+        let lapsed: Option<Vec<u8>> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pending_offer FROM relationship WHERE owner_fp = ?1",
+                rusqlite::params![hex(13)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lapsed, None, "a lapsed request's");
+    }
+
     /// A presentation from before `Reset` records were kept is none, and
-    /// a migrated file keeps one; an offer from before is no upgrade.
+    /// a migrated file keeps one.
     #[test]
     fn version_forty_migrates_into_presentations_that_keep_a_reset_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -5154,17 +5288,9 @@ mod tests {
                 rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 32]],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO friend_offer (owner, other, offer, lapses) VALUES (?1, ?2, ?3, 9)",
-                rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 3]],
-            )
-            .unwrap();
             conn.pragma_update(None, "user_version", 40).unwrap();
         }
         let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
-        let at = SystemTime::UNIX_EPOCH;
-        let o = store.offer(&[7; 32], &[8; 32], at).unwrap().unwrap();
-        assert!(!o.upgrade);
         let p = store.presentation(&[7; 32], &[8; 32]).unwrap().unwrap();
         assert_eq!(p.reset, None);
         let record = hxd_core::relationships::Presentation {

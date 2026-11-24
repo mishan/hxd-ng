@@ -2418,6 +2418,8 @@ fn a_rotation_tells_a_friend_with_no_row_naming_the_successor() {
                 lapses_at: now + Duration::from_secs(3600),
                 delivered: true,
                 note: None,
+                offer: None,
+                upgrade: false,
             }),
         )
         .unwrap();

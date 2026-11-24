@@ -720,7 +720,8 @@ Three layers, all `cargo test --workspace`:
   floor is learned and answered `AccountNotFound` after, then remade
   by an upgrade offer from a device enrolled since, told to bit-15
   sessions alone, and a request it made an upgrade told removed to
-  both parties' sessions without bit 15; 834 answering
+  the friend's sessions without bit 15 while its sender's stands; 834
+  answering
   a rotation's record in chain order;
   bit 15 confirmed only beside bits 6 and 13 where a device can be
   proved, and never bit 13; a session without bit 15 sent plain

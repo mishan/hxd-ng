@@ -7,9 +7,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Ended, EndedEdge, Ending, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount,
-    PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore,
-    RequestKind, Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry,
+    MessagingAccount, PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship,
+    RelationshipStore, RequestKind, Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
@@ -191,6 +191,9 @@ fn floor_row(r: &mut Relationship) {
     if let Some(p) = r.pending_out.as_mut() {
         p.sent_at = floor(p.sent_at);
         p.lapses_at = floor(p.lapses_at);
+        if let Some(o) = p.offer.as_mut() {
+            o.lapses_at = floor(o.lapses_at);
+        }
     }
     if let Some(i) = r.ignore.as_mut() {
         i.until = i.until.map(floor);
@@ -198,6 +201,48 @@ fn floor_row(r: &mut Relationship) {
 }
 
 impl Inner {
+    /// [`RelationshipStore::drop_offers`]'s one pair.
+    fn drop_offer(&mut self, x: &[u8; 32], y: &[u8; 32]) {
+        self.offers.retain(|(o, t, _)| (o, t) != (x, y));
+        for r in self.rows.iter_mut() {
+            let rel = &mut r.rel;
+            if rel.owner.fingerprint.as_ref() != Some(x)
+                || rel.other.fingerprint.as_ref() != Some(y)
+            {
+                continue;
+            }
+            if rel.pending_out.as_ref().is_some_and(|p| p.upgrade) {
+                rel.pending_out = None;
+            } else if let Some(p) = rel.pending_out.as_mut() {
+                p.offer = None;
+            }
+        }
+    }
+
+    /// Every pair, by fingerprint, an offer waits on that names `fp`.
+    fn offers_naming(&self, fp: &[u8; 32]) -> Vec<([u8; 32], [u8; 32])> {
+        let upgrades = self.offers.iter().map(|(o, t, _)| (*o, *t));
+        let asked = self.rows.iter().filter_map(|r| {
+            let p = r.rel.pending_out.as_ref()?;
+            p.offer.as_ref()?;
+            r.rel.owner.fingerprint.zip(r.rel.other.fingerprint)
+        });
+        upgrades
+            .chain(asked)
+            .filter(|(o, t)| o == fp || t == fp)
+            .collect()
+    }
+
+    /// The friendships a pair's `Reset` records kept, gone, their hashes
+    /// left.
+    fn forget_resets(&mut self, x: &[u8; 32], y: &[u8; 32]) {
+        for p in self.presentations.iter_mut() {
+            if (p.presenter, p.other) == (*x, *y) || (p.presenter, p.other) == (*y, *x) {
+                p.reset = None;
+            }
+        }
+    }
+
     fn find(&self, owner: &Mailbox, other: &Mailbox) -> Option<usize> {
         self.rows
             .iter()
@@ -558,8 +603,69 @@ impl Inner {
             .iter()
             .position(|k| k.presenter == p.presenter && k.other == p.other)
             .map(|i| self.presentations.remove(i));
+        if old
+            .as_ref()
+            .is_some_and(|o| o.reset.is_some() && o.reset != p.reset)
+        {
+            self.drop_upgrade(&p.other, &p.presenter);
+        }
         self.presentations.push(p);
         old
+    }
+
+    /// What a rotation merged onto `fp`, made one state a direction again:
+    /// an upgrade offer off a friendship stands only as its sender's
+    /// pending out shows it and while the record it was taken on does, and
+    /// never beside a request.
+    fn settle_upgrades(&mut self, fp: &[u8; 32]) {
+        let pairs: Vec<_> = self
+            .offers
+            .iter()
+            .map(|(o, t, _)| (*o, *t))
+            .chain(self.rows.iter().filter_map(|r| {
+                r.rel.pending_out.as_ref().filter(|p| p.upgrade)?;
+                r.rel.owner.fingerprint.zip(r.rel.other.fingerprint)
+            }))
+            .filter(|(o, t)| o == fp || t == fp)
+            .collect();
+        for (x, y) in pairs {
+            let row = self
+                .rows
+                .iter()
+                .find(|r| r.rel.owner.fingerprint == Some(x) && r.rel.other.fingerprint == Some(y));
+            let friends = row.is_some_and(|r| r.rel.friendship.is_some());
+            let upgrade =
+                row.is_some_and(|r| r.rel.pending_out.as_ref().is_some_and(|p| p.upgrade));
+            let recorded = self
+                .presentations
+                .iter()
+                .any(|p| p.presenter == y && p.other == x && p.reset.is_some());
+            if friends || (upgrade && recorded) {
+                continue;
+            }
+            self.offers.retain(|(o, t, _)| (*o, *t) != (x, y));
+            if upgrade {
+                self.drop_offer(&x, &y);
+            }
+        }
+    }
+
+    /// The upgrade offer `x` has waiting for `y` on an edge a reset left
+    /// inactive, gone with the record `y` kept for it, and the pending out
+    /// it showed `x` with it.
+    fn drop_upgrade(&mut self, x: &[u8; 32], y: &[u8; 32]) {
+        let shown = |rel: &Relationship| {
+            rel.owner.fingerprint.as_ref() == Some(x)
+                && rel.other.fingerprint.as_ref() == Some(y)
+                && rel.pending_out.as_ref().is_some_and(|p| p.upgrade)
+        };
+        if !self.rows.iter().any(|r| shown(&r.rel)) {
+            return;
+        }
+        self.offers.retain(|(o, t, _)| (o, t) != (x, y));
+        for r in self.rows.iter_mut().filter(|r| shown(&r.rel)) {
+            r.rel.pending_out = None;
+        }
     }
 
     fn unpresent_pair(
@@ -577,6 +683,9 @@ impl Inner {
             }
             !go
         });
+        for g in gone.iter().filter(|g| g.reset.is_some()) {
+            self.drop_upgrade(&g.other, &g.presenter);
+        }
         gone
     }
 
@@ -607,6 +716,11 @@ impl Inner {
             }
         }
         self.forget(ended);
+        // An upgrade offer stood beside the friendship, and goes with it.
+        if let Some((x, y)) = parties[0].fingerprint.zip(parties[1].fingerprint) {
+            self.offers
+                .retain(|(o, t, _)| (*o, *t) != (x, y) && (*o, *t) != (y, x));
+        }
         Some(EndedEdge { id, parties })
     }
 
@@ -635,9 +749,21 @@ impl Inner {
         let mut gone = Vec::new();
         if let Some((x, y)) = fps {
             gone = self.unpresent_pair(&x, &y, &end.presentations);
-            self.offers.retain(|(o, t, _)| {
-                !(end.offers.contains(o) && ((*o == x && *t == y) || (*o == y && *t == x)))
-            });
+            for (o, t) in [(x, y), (y, x)] {
+                if end.offers.contains(&o) || end.block.is_some() {
+                    self.drop_offer(&o, &t);
+                }
+            }
+            if end.block.is_some() {
+                self.forget_resets(&x, &y);
+            }
+        }
+        if end.pending && self.find(b, a).is_some() {
+            let offer = b.fingerprint.zip(a.fingerprint);
+            self.edit(b, a, |r| r.pending_out = None);
+            if let Some((x, y)) = offer {
+                self.drop_offer(&x, &y);
+            }
         }
         if let Some(at) = end.block {
             self.edit(a, b, |r| r.blocked_at = r.blocked_at.or(Some(at)));
@@ -749,7 +875,10 @@ impl RelationshipStore for MemoryRelationships {
             .filter(|r| is(&r.rel.other, owner))
             .filter_map(|r| Some((r.seq, r.rel.clone().as_of(floor(now))?)))
             .filter_map(|(seq, rel)| {
-                let p = rel.pending_out.as_ref().filter(|p| p.delivered)?;
+                let p = rel
+                    .pending_out
+                    .as_ref()
+                    .filter(|p| p.delivered && !p.upgrade)?;
                 Some((secs(p.sent_at), seq, rel))
             })
             .collect();
@@ -902,6 +1031,7 @@ impl RelationshipStore for MemoryRelationships {
         let mut inner = self.inner.lock().unwrap();
         if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
             inner.unpresent_pair(&x, &y, drop);
+            inner.forget_resets(&x, &y);
         }
         Ok(match id {
             Some(id) => {
@@ -947,11 +1077,17 @@ impl RelationshipStore for MemoryRelationships {
 
     fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        let shown = inner.rows.iter().filter_map(|r| {
+            let rel = r.rel.clone().as_of(floor(now))?;
+            rel.pending_out.filter(|p| p.upgrade)?;
+            rel.owner.fingerprint.zip(rel.other.fingerprint)
+        });
         let waiting: Vec<([u8; 32], [u8; 32])> = inner
             .offers
             .iter()
-            .filter(|(_, _, o)| o.upgrade && o.lapses_at > floor(now))
+            .filter(|(_, _, o)| o.lapses_at > floor(now))
             .map(|(o, t, _)| (*o, *t))
+            .chain(shown)
             .collect();
         let mut n = 0;
         for p in inner.presentations.iter_mut() {
@@ -991,12 +1127,12 @@ impl RelationshipStore for MemoryRelationships {
         presenter: &[u8; 32],
         other: &[u8; 32],
     ) -> Result<Option<Presentation>, StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        Ok(inner
-            .presentations
-            .iter()
-            .position(|p| p.presenter == *presenter && p.other == *other)
-            .map(|i| inner.presentations.remove(i)))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .unpresent_pair(presenter, other, &[*presenter])
+            .pop())
     }
 
     fn drop_presentations(
@@ -1091,15 +1227,13 @@ impl RelationshipStore for MemoryRelationships {
         owner: &Mailbox,
         other: &Mailbox,
         pending: &PendingOut,
-        offer: Option<&StoredOffer>,
+        upgrade: Option<&StoredOffer>,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         inner.edit(owner, other, |r| r.pending_out = Some(pending.clone()));
         if let Some((x, y)) = owner.fingerprint.zip(other.fingerprint) {
-            inner
-                .offers
-                .retain(|(o, t, kept)| (*o, *t) != (x, y) || (offer.is_none() && kept.upgrade));
-            if let Some(o) = offer {
+            inner.offers.retain(|(o, t, _)| (*o, *t) != (x, y));
+            if let Some(o) = upgrade {
                 let o = StoredOffer {
                     lapses_at: floor(o.lapses_at),
                     ..o.clone()
@@ -1110,19 +1244,64 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
-    fn take_as_upgrade(&self, owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError> {
+    fn answer_reset(
+        &self,
+        drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)],
+        record: Option<&Presentation>,
+        upgrade: Option<(&Mailbox, &Mailbox)>,
+    ) -> Result<(Vec<Ended>, Option<Presentation>), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.find(owner, other).is_some() {
-            inner.edit(owner, other, |r| r.pending_out = None);
-        }
-        if let Some((x, y)) = owner.fingerprint.zip(other.fingerprint) {
-            for (o, t, offer) in inner.offers.iter_mut() {
-                if (*o, *t) == (x, y) {
-                    offer.upgrade = true;
-                }
+        let ended = drops
+            .iter()
+            .map(|(a, b, presenters)| inner.drop_presentations(a, b, presenters))
+            .collect();
+        let replaced = record.and_then(|p| inner.present(p));
+        if let Some((owner, other)) = upgrade {
+            let fps = owner.fingerprint.zip(other.fingerprint);
+            let offer = inner.find(owner, other).and_then(|i| {
+                let p = inner.rows[i].rel.pending_out.as_mut()?;
+                let o = p.offer.take()?;
+                p.upgrade = true;
+                Some(StoredOffer {
+                    lapses_at: o.lapses_at.min(p.lapses_at),
+                    ..o
+                })
+            });
+            if let (Some(o), Some((x, y))) = (offer, fps) {
+                inner.offers.retain(|(a, b, _)| (*a, *b) != (x, y));
+                inner.offers.push((x, y, o));
             }
         }
+        Ok((ended, replaced))
+    }
+
+    fn drop_offers(&self, pairs: &[FpPair]) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        for (x, y) in pairs {
+            inner.drop_offer(x, y);
+        }
         Ok(())
+    }
+
+    fn drop_offers_naming(&self, fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut pairs = inner.offers_naming(fp);
+        pairs.extend(
+            inner
+                .rows
+                .iter()
+                .filter_map(|r| {
+                    r.rel.pending_out.as_ref().filter(|p| p.upgrade)?;
+                    r.rel.owner.fingerprint.zip(r.rel.other.fingerprint)
+                })
+                .filter(|(o, t)| o == fp || t == fp),
+        );
+        pairs.sort();
+        pairs.dedup();
+        for (x, y) in &pairs {
+            inner.drop_offer(x, y);
+        }
+        Ok(pairs)
     }
 
     fn offer(
@@ -1145,12 +1324,20 @@ impl RelationshipStore for MemoryRelationships {
         now: SystemTime,
     ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
+        let asked = inner.rows.iter().filter_map(|r| {
+            let rel = r.rel.clone().as_of(floor(now))?;
+            let o = rel.pending_out?.offer?;
+            (rel.owner.fingerprint.as_ref() == Some(owner)).then_some((rel.other.fingerprint?, o))
+        });
+        let mut out: Vec<_> = inner
             .offers
             .iter()
             .filter(|(a, _, o)| a == owner && o.lapses_at > floor(now))
             .map(|(_, b, o)| (*b, o.clone()))
-            .collect())
+            .chain(asked)
+            .collect();
+        out.sort_by_key(|(b, _)| *b);
+        Ok(out)
     }
 
     fn keep_rotation(
@@ -1414,8 +1601,14 @@ impl RelationshipStore for MemoryRelationships {
 
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        for (x, y) in inner.offers_naming(from) {
+            if y == *from {
+                inner.drop_offer(&x, &y);
+            }
+        }
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
+        inner.settle_upgrades(to);
         Ok(rekeyed)
     }
 
@@ -1480,25 +1673,14 @@ impl RelationshipStore for MemoryRelationships {
             .map(|(i, _)| i)
             .take(batch)
             .collect();
-        let mut asked = Vec::new();
         for &i in lapsing.iter().rev() {
-            let was = &inner.rows[i].rel;
-            let now = was.clone().as_of(lapsed_before);
-            if was.pending_out.is_some() && now.as_ref().is_none_or(|r| r.pending_out.is_none()) {
-                asked.extend(was.owner.fingerprint.zip(was.other.fingerprint));
-            }
-            match now {
+            match inner.rows[i].rel.clone().as_of(lapsed_before) {
                 Some(rel) => inner.rows[i].rel = rel,
                 None => {
                     inner.rows.remove(i);
                 }
             }
         }
-        let before = inner.offers.len();
-        inner
-            .offers
-            .retain(|(o, t, offer)| offer.upgrade || !asked.contains(&(*o, *t)));
-        n += before - inner.offers.len();
         n += lapsing.len();
         let mut old = 0;
         inner.ledger.retain(|e| {

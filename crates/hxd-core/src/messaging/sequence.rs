@@ -19,7 +19,21 @@
 //!   costs one that does;
 //! - with nothing failing, a pass over both parties leaves no evidence
 //!   that a reset shows is not held, and a second, with nothing of the
-//!   first remembered, changes and tells nothing.
+//!   first remembered, changes and tells nothing;
+//! - each direction's pending state is one the model allows: a request,
+//!   with the offer it carries, or an upgrade offer, never both; none
+//!   beside a friendship or a block; and an upgrade offer on an edge a
+//!   reset left inactive only while the record it was taken on stands;
+//! - a session that did not ask for portable friendships is never told an
+//!   offer, and, with nothing failing, shows a request from the other
+//!   party exactly while the store holds one it may see;
+//! - an ask with an offer that is answered, by a party with no friendship
+//!   and nothing pending, is answered and told to it alike whatever the
+//!   other party holds;
+//! - every ask, plain or with an offer, from whatever the asker can see,
+//!   is answered and told to the asker alike in a twin run where no
+//!   `Reset` record ever makes an upgrade offer: what the other party
+//!   holds never shows. The request ledger may differ, the answer may not.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -45,6 +59,7 @@ use crate::{
 };
 
 const LOGINS: [&str; 2] = ["alice", "bob"];
+const DAY: u64 = 24 * 3600;
 
 struct Person {
     id: IdentityKey,
@@ -199,6 +214,13 @@ enum Step {
     Floor {
         how: u32,
     },
+    /// Decline the other's request or upgrade offer.
+    Decline,
+    /// The clock moved on by this much: past a request's or an offer's
+    /// lapse, or a `Reset` record's.
+    Clock {
+        secs: u64,
+    },
 }
 
 /// What fails while a step runs.
@@ -242,7 +264,12 @@ impl Step {
             29 => Step::Answer {
                 friendship: arg & 1 == 1,
             },
-            _ => Step::Present { k: arg as usize },
+            _ => match arg % 4 {
+                0 => Step::Decline,
+                1 => Step::Clock { secs: 120 },
+                2 => Step::Clock { secs: DAY },
+                _ => Step::Clock { secs: 31 * DAY },
+            },
         };
         // A quarter of the steps meet a failure somewhere in them.
         let failure = match n >> 27 {
@@ -291,6 +318,14 @@ struct Run {
     people: [Person; 2],
     /// Each party's two device sessions.
     sessions: [[(Uid, Events); 2]; 2],
+    /// Each party's session that did not ask for portable friendships,
+    /// and whether it shows a request from the other.
+    plain: [(Uid, Events); 2],
+    shows: [bool; 2],
+    /// What an ask this step was answered.
+    asked: Option<Result<RosterState, super::MessagingError>>,
+    /// The last step as its actor saw it, for the twin to compare.
+    seen: Option<Seen>,
     /// The sessions a floor ended.
     ended: HashSet<Uid>,
     /// The floors installed, and each party's reset records kept, as
@@ -310,6 +345,23 @@ struct Run {
     carried: Option<(usize, Vec<u8>)>,
     /// The holds this run expects, alice's first.
     holds: [bool; 2],
+}
+
+/// An ask's answer, and what its actor's sessions were told.
+type Outcome = (
+    Option<Result<RosterState, super::MessagingError>>,
+    Vec<Vec<RosterState>>,
+);
+
+/// A step as its actor saw it: whether it was an ask, what the actor
+/// could see of the pair before it (a friendship, its own request, one
+/// from the other shown it), and, where nothing failed, the answer and
+/// what its sessions were told.
+#[derive(Debug, PartialEq)]
+struct Seen {
+    ask: bool,
+    visible: (bool, bool, bool),
+    outcome: Option<Outcome>,
 }
 
 fn mailbox(login: &str, p: &Person) -> Mailbox {
@@ -343,11 +395,20 @@ impl Run {
                 .with_messaging(MessagingPolicy {
                     enabled: true,
                     presence_debounce: Duration::ZERO,
+                    // Some runs, friends by presentations alone, at the
+                    // daily bound from the start.
+                    requests_per_day: if start % 6 == 0 { 0 } else { 20 },
                     ..MessagingPolicy::default()
                 })
                 .with_record_cache(records.clone()),
         );
-        let sessions = [0, 1].map(|p| [0, 1].map(|d| attach(&core, LOGINS[p], &people[p], d)));
+        let sessions =
+            [0, 1].map(|p| [0, 1].map(|d| attach(&core, LOGINS[p], &people[p], d, true)));
+        let plain = [0, 1].map(|p| {
+            let (uid, rx) = attach(&core, LOGINS[p], &people[p], 0, false);
+            core.friends_roster(uid).expect("a roster");
+            (uid, rx)
+        });
         // Two friendships made elsewhere a minute before the run.
         let friendships: Vec<Vec<u8>> = (0..2)
             .map(|d| {
@@ -380,6 +441,10 @@ impl Run {
             records,
             people,
             sessions,
+            plain,
+            shows: [false, false],
+            asked: None,
+            seen: None,
             ended: HashSet::new(),
             floors: HashMap::new(),
             resets: [Vec::new(), Vec::new()],
@@ -525,7 +590,8 @@ impl Run {
         let wall = self.core.clock.wall();
         for (q, login) in LOGINS.iter().enumerate() {
             let (me, them) = (self.people[q].fp(), self.people[1 - q].fp());
-            let Some(o) = self.store.offer(&me, &them, wall).unwrap() else {
+            let offers = self.store.offers_from(&me, wall).unwrap();
+            let Some((_, o)) = offers.into_iter().find(|(to, _)| *to == them) else {
                 continue;
             };
             let o = Offer::check(&o.offer, u64::MAX, &[], |_| 0).expect("an offer kept");
@@ -613,7 +679,9 @@ impl Run {
                 if asked.is_ok() {
                     self.offers[p] = o;
                 }
-                asked.is_ok()
+                let ok = asked.is_ok();
+                self.asked = Some(asked);
+                ok
             }
             Step::Answer { friendship } => {
                 let f = self.offers[1 - p]
@@ -624,6 +692,15 @@ impl Run {
                     self.friendships.push(f.clone());
                 }
                 core.friend_answer(uid, other, true, f).is_ok()
+            }
+            Step::Decline => core.friend_answer(uid, other, false, None).is_ok(),
+            // Inside the certificates' days, so that a device can still
+            // sign.
+            Step::Clock { secs } => {
+                if now + secs < base + 80 * DAY {
+                    core.clock.advance(Duration::from_secs(secs));
+                }
+                true
             }
             Step::Present { k } => {
                 let f = self.friendships[k % self.friendships.len()].clone();
@@ -716,6 +793,20 @@ impl Run {
     /// What each session of each party was told of the other this step,
     /// alice's first.
     fn told(&mut self) -> [[Vec<RosterState>; 2]; 2] {
+        for (q, (_, rx)) in self.plain.iter_mut().enumerate() {
+            while let Ok(se) = rx.try_recv() {
+                match se.event {
+                    Event::FriendRequest { login, offer, .. } if login == LOGINS[1 - q] => {
+                        assert!(offer.is_none(), "{} told an offer", LOGINS[q]);
+                        self.shows[q] = true;
+                    }
+                    Event::FriendEntry(e) if e.login == LOGINS[1 - q] => {
+                        self.shows[q] = e.state == RosterState::PendingIn;
+                    }
+                    _ => {}
+                }
+            }
+        }
         let mut out: [[Vec<RosterState>; 2]; 2] = Default::default();
         for (p, sessions) in self.sessions.iter_mut().enumerate() {
             for (d, (_, rx)) in sessions.iter_mut().enumerate() {
@@ -745,6 +836,23 @@ impl Run {
             Failure::Call(k) => self.fail.fail_nth(k),
             Failure::Write(k) => self.fail.fail_nth_write(k),
         }
+        // Whether the party has nothing to the other that its own sessions
+        // see: what an ask's answer may depend on.
+        let wall = self.core.clock.wall();
+        let mine = self
+            .store
+            .relationship(&me, &them, wall)
+            .unwrap()
+            .and_then(|r| r.pending_out)
+            .is_some();
+        let shown = self
+            .store
+            .pending_in(&me, wall)
+            .unwrap()
+            .iter()
+            .any(|r| r.owner.login == LOGINS[1 - p]);
+        let visible = (before.friendship.is_some(), mine, shown);
+        let free = before.friendship.is_none() && !mine;
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
         self.core.clock.advance(Duration::from_secs(1));
@@ -755,6 +863,32 @@ impl Run {
         let failed = self.fail.failed();
         let read_failed = failed.is_some_and(|m| READS.contains(&m));
         let what = format!("{step:?} by {} on device {d}, {failure:?}", LOGINS[p]);
+
+        // An ask with an offer, from a party with nothing to the other,
+        // answered and told alike whether or not it was taken as an
+        // upgrade offer; the request ledger and bounds aside, which differ
+        // by design.
+        let asked = self.asked.take();
+        self.seen = Some(Seen {
+            ask: matches!(step, Step::Ask { .. }),
+            visible,
+            outcome: failed.is_none().then(|| (asked, told[p].to_vec())),
+        });
+        if let (Step::Ask { offer: true }, Some(Ok(answer))) = (step, asked) {
+            if free && failed.is_none() {
+                assert_eq!(answer, RosterState::PendingOut, "{what}: answered");
+                for (q, told) in told[p].iter().enumerate() {
+                    if !self.ended.contains(&self.sessions[p][q].0) {
+                        assert_eq!(
+                            told,
+                            &[RosterState::PendingOut],
+                            "{what}: told {}",
+                            LOGINS[p]
+                        );
+                    }
+                }
+            }
+        }
 
         // An edge made active by presentations keeps its evidence both
         // ways while it is active; one a request made active again under
@@ -858,6 +992,17 @@ impl Run {
         if declined && ok {
             self.holds[p] = true;
         }
+        // A decline of a request or an upgrade offer holds its sender, in
+        // the one step that ends it, whatever failed after.
+        if matches!(step, Step::Decline) && before.asking[1 - p] {
+            self.holds[p] = after.held[p] && !before.held[p] || self.holds[p];
+        }
+        // A hold lapses with time, and only with it.
+        if let Step::Clock { .. } = step {
+            for q in 0..2 {
+                self.holds[q] &= after.held[q];
+            }
+        }
         assert_eq!(
             after.held, self.holds,
             "{what}: holds, {before:?} -> {after:?}"
@@ -906,6 +1051,99 @@ impl Run {
         }
         self.withdrawn = withdrawn;
         self.quiescent(&what);
+        self.legal(&what);
+        // A blocker's own client knows what its block ended, and a request
+        // lapses without a notice (instant-messaging 3): neither is told.
+        let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
+        let lapsing = matches!(step, Step::Clock { .. });
+        self.shown(&what, failed.is_none() && !lapsing, blocking);
+    }
+
+    /// Each direction's pending state one the model allows.
+    fn legal(&self, what: &str) {
+        let now = self.core.clock.wall();
+        let blocked = (0..2).any(|q| {
+            self.store
+                .is_blocked(&self.mailbox(q), &self.mailbox(1 - q))
+                .unwrap()
+        });
+        for (q, who) in LOGINS.iter().enumerate() {
+            let (me, them) = (self.mailbox(q), self.mailbox(1 - q));
+            let (x, y) = (self.people[q].fp(), self.people[1 - q].fp());
+            let row = self.store.relationship(&me, &them, now).unwrap();
+            let friends = row.as_ref().is_some_and(|r| r.friendship.is_some());
+            let pending = row.and_then(|r| r.pending_out);
+            let upgrade = self.store.offer(&x, &y, now).unwrap();
+            let record = |a, b| {
+                self.store
+                    .presentation(a, b)
+                    .unwrap()
+                    .and_then(|p: Presentation| p.reset)
+            };
+            if friends || blocked {
+                assert!(
+                    pending.is_none(),
+                    "{what}: {who}'s request beside a friendship or a block"
+                );
+            }
+            if blocked {
+                assert!(
+                    upgrade.is_none(),
+                    "{what}: {who}'s upgrade offer beside a block"
+                );
+            }
+            if blocked {
+                assert!(record(&y, &x).is_none(), "{what}: a record beside a block");
+            }
+            match &pending {
+                // Its offer may lapse before its pending out, which lapses
+                // as a request would; the record stays while either does.
+                Some(p) if p.upgrade => {
+                    assert!(
+                        p.offer.is_none(),
+                        "{what}: {who}'s upgrade with a request's offer"
+                    );
+                    assert!(
+                        record(&y, &x).is_some(),
+                        "{what}: {who}'s upgrade without the record it was taken on"
+                    );
+                }
+                Some(_) => assert!(
+                    upgrade.is_none(),
+                    "{what}: {who}'s request beside an upgrade"
+                ),
+                None => assert!(
+                    friends || upgrade.is_none(),
+                    "{what}: {who}'s upgrade offer with no pending out"
+                ),
+            }
+        }
+    }
+
+    /// Each session that did not ask for portable friendships shows a
+    /// request from the other party exactly while the store holds one it
+    /// may see: checked where nothing failed, and taken as the store has
+    /// it where something did.
+    fn shown(&mut self, what: &str, whole: bool, blocking: Option<usize>) {
+        self.told();
+        let now = self.core.clock.wall();
+        for q in 0..2 {
+            let other = LOGINS[1 - q];
+            let held = self
+                .store
+                .pending_in(&self.mailbox(q), now)
+                .unwrap()
+                .iter()
+                .any(|r| r.owner.login == other);
+            if whole && blocking != Some(q) && self.takes_part(q) && self.takes_part(1 - q) {
+                assert_eq!(
+                    self.shows[q], held,
+                    "{what}: {}'s plain session shows a request from {other}",
+                    LOGINS[q]
+                );
+            }
+            self.shows[q] = held;
+        }
     }
 
     /// The floor `q`'s kept records show.
@@ -946,7 +1184,7 @@ impl Run {
     }
 }
 
-fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
+fn attach(core: &Core, login: &str, who: &Person, d: usize, friendships: bool) -> (Uid, Events) {
     let cert = &who.devices[d].1;
     let (uid, mut rx) = core
         .attach(AttachInfo {
@@ -960,7 +1198,7 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
             can_detach: true,
             transport: crate::Transport {
                 messaging: true,
-                friendships: true,
+                friendships,
                 identity: Some(IdentityTag {
                     fingerprint: who.fp(),
                     device: who.device(d),
@@ -998,7 +1236,12 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize) -> (Uid, Events) {
 /// beside a presentation no record shows held, a friendship accepted
 /// where a dropped presentation kept the id, an upgrade offer a reset
 /// device signed, accepted, a withdrawal cutting earlier than one a
-/// reset device signed, and one below a floor installed alone.
+/// reset device signed, one below a floor installed alone, an ask taken as
+/// an upgrade offer on a friendship answered `Reset` and accepted, a
+/// request with an offer taken as one, declined, then asked again, the
+/// record an upgrade offer was taken on dropped under it, a request taken
+/// as one then asked again with an offer, and an ask that would be one at
+/// the daily bound.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741852, 1073741989],
     &[1073741979, 1073741980, 1073742026],
@@ -1009,19 +1252,45 @@ pub const FOUND: &[&[u32]] = &[
     ],
     &[1088533014, 3701201436, 2985964758],
     &[2586569270, 334638460, 3275716080],
+    &[1073742495, 1073742108, 1073741866, 1073742016, 1073741989],
+    &[
+        1073742495, 1073742108, 1073742016, 1073741866, 1073741887, 1073741888,
+    ],
+    &[1073742495, 1073742108, 1073741866, 1073742016, 1073741881],
+    &[1073742495, 1073742108, 1073742016, 1073741866, 1073742016],
+    &[1073741844, 1073742108, 1073741866, 1073742016],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the
 /// invariants above.
 pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
-    let mut run = Run::new(new_store(), steps.first().copied().unwrap_or(0));
-    let start = run.pairing();
-    assert!(start.friendship.is_some(), "friends from the start");
-    if start.evidence == [true, true] {
-        run.portable.extend(start.friendship);
+    let first = steps.first().copied().unwrap_or(0);
+    let (mut run, mut twin) = (Run::new(new_store(), first), Run::new(new_store(), first));
+    twin.core
+        .upgrades_off
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in [&mut run, &mut twin] {
+        let start = r.pairing();
+        assert!(start.friendship.is_some(), "friends from the start");
+        if start.evidence == [true, true] {
+            r.portable.extend(start.friendship);
+        }
     }
     for &n in steps {
         run.step(n);
+        twin.step(n);
+        // What the other party holds never shows to an asker: where it saw
+        // the same before, it is answered and told the same.
+        if let (Some(a), Some(b)) = (&run.seen, &twin.seen) {
+            if a.ask && a.visible == b.visible && a.outcome.is_some() && b.outcome.is_some() {
+                assert_eq!(
+                    a,
+                    b,
+                    "{:?}: an ask told what the other party holds",
+                    Step::of(n)
+                );
+            }
+        }
     }
 }
 
@@ -1032,6 +1301,7 @@ mod tests {
     use crate::relationships::MemoryRelationships;
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
         #[test]
         fn the_memory_store_keeps_every_step_whole(
             steps in proptest::collection::vec(any::<u32>(), 1..40)

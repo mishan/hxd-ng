@@ -842,7 +842,9 @@ impl Core {
                 return;
             }
         };
-        let asked = theirs.and_then(|t| t.pending_out).filter(|p| p.delivered);
+        let asked = theirs
+            .and_then(|t| t.pending_out)
+            .filter(|p| p.delivered && !p.upgrade);
         let text = self.shown_text(row.as_ref());
         let mut entry = {
             let r = self.roster.lock().unwrap();
@@ -1145,17 +1147,37 @@ impl Core {
             .map_err(store_failed)?;
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
             return match offer {
-                Some(offer) => self.upgrade_offer(store, &me.mailbox, &them, note, offer),
+                Some(offer) => {
+                    self.upgrade_offer(store, uid, &me.mailbox, &them, note, offer)?;
+                    Ok(RosterState::Accepted)
+                }
                 None => Err(MessagingError::AlreadyFriends),
             };
         }
-        if mine.as_ref().is_some_and(|m| m.pending_out.is_some()) {
+        // An upgrade offer waiting is a pending request to its sender, and
+        // answered as one, whatever it was taken as.
+        if mine.and_then(|m| m.pending_out).is_some() {
             return Err(MessagingError::RequestPending);
         }
-        let crossing = store
+        let theirs = store
             .relationship(&them, &me.mailbox, now)
             .map_err(store_failed)?
-            .is_some_and(|t| t.pending_out.is_some());
+            .and_then(|t| t.pending_out);
+        // One that meets an upgrade offer is answered by the 805 that
+        // accepts it, from a session shown the offer; a session never
+        // shown one asks as it sees, beside it.
+        let shown = self
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&uid)
+            .is_some_and(is_friendships);
+        let upgrading = theirs.as_ref().is_some_and(|t| t.upgrade);
+        if upgrading && shown {
+            return Err(MessagingError::RequestPending);
+        }
+        let crossing = theirs.is_some() && !upgrading;
         // Two offers make no friendship: one that meets a request is
         // answered as the extension answers a crossing, and the client
         // answers the earlier request with an 805 instead.
@@ -1169,28 +1191,6 @@ impl Core {
         if crossing && !me.understands {
             return Err(MessagingError::RequestPending);
         }
-        // One on an edge a reset left inactive asks nothing new of `them`,
-        // so it skips the request bounds, answered as a request so that the
-        // answer says nothing of `them`'s presentation. One waiting keeps
-        // the edge so; one from a sender `them` declined is a request, held.
-        if let Some(o) = &offer {
-            // Read or refused: one missed would send the request route over
-            // a waiting upgrade.
-            let waiting = match (me.mailbox.fingerprint, them.fingerprint) {
-                (Some(x), Some(y)) => store
-                    .offer(&x, &y, now)
-                    .map_err(store_failed)?
-                    .is_some_and(|o| o.upgrade),
-                _ => false,
-            };
-            let sender = Requester::Account(me.mailbox.clone());
-            if !store.is_held(&them, &sender, now).map_err(store_failed)?
-                && self.reset_edge(store, &me.mailbox, &them, now, waiting)?
-            {
-                self.upgrade_offer(store, &me.mailbox, &them, note, o.clone())?;
-                return Ok(RosterState::PendingOut);
-            }
-        }
         if store.roster_size(&me.mailbox, now).map_err(store_failed)? >= p.max_roster {
             return Err(MessagingError::RosterFull);
         }
@@ -1199,6 +1199,9 @@ impl Core {
             return Ok(RosterState::Accepted);
         }
 
+        // Held to the request bounds and counted in the ledger whether or
+        // not it is taken as an upgrade offer below, so that nothing the
+        // caller is answered, then or later, says what `them` holds.
         let addr = self.request_address(uid);
         let sender = Requester::Account(me.mailbox.clone());
         self.request_bounds(store, &sender, addr.as_deref(), &them, now)?;
@@ -1215,6 +1218,16 @@ impl Core {
             })
             .map_err(store_failed)?;
         let held = store.is_held(&them, &sender, now).map_err(store_failed)?;
+        // One on an edge a reset left inactive asks nothing new of `them`,
+        // who is not told it as a request; it is answered, and shown its
+        // sender, as a request is. One from a sender `them` declined is a
+        // request, held.
+        if let Some(o) = offer.as_ref().filter(|_| !held) {
+            if self.reset_edge(store, &me.mailbox, &them, now, false)? {
+                self.upgrade_offer(store, uid, &me.mailbox, &them, note, o.clone())?;
+                return Ok(RosterState::PendingOut);
+            }
+        }
         let full = !held
             && store.pending_in(&them, now).map_err(store_failed)?.len() >= p.max_friend_requests;
         if full {
@@ -1227,9 +1240,11 @@ impl Core {
             lapses_at: now + p.request_retention,
             delivered,
             note: note.clone(),
+            offer: offer.clone(),
+            upgrade: false,
         };
         store
-            .ask(&me.mailbox, &them, &asked, offer.as_ref())
+            .ask(&me.mailbox, &them, &asked, None)
             .map_err(store_failed)?;
         self.tell_entry(&me.mailbox, &them);
         if delivered {
@@ -1284,50 +1299,56 @@ impl Core {
             .relationship(&them, &me.mailbox, now)
             .map_err(store_failed)?
             .and_then(|t| t.pending_out);
-        let asked = pending.as_ref().is_some_and(|p| p.delivered);
+        // A request shown to the caller, or an upgrade offer it never is
+        // shown as one; each with the offer its own.
+        let asked = pending.as_ref().is_some_and(|p| p.delivered && !p.upgrade);
+        let upgraded = pending.as_ref().is_some_and(|p| p.upgrade);
         let friends = store
             .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?
             .is_some_and(|r| r.friendship.is_some());
-        let offered = self.offer_between(store, &them, &me.mailbox, now);
-        // Only an offer taken as an upgrade is answered without a request,
-        // and one beside a request, even a held one, is the request's.
-        let reset = pending.is_none()
-            && !friends
-            && offered.as_ref().is_some_and(|o| o.upgrade)
+        let upgrade = match (them.fingerprint, me.mailbox.fingerprint) {
+            (Some(a), Some(b)) if friends || upgraded => {
+                store.offer(&a, &b, now).map_err(store_failed)?
+            }
+            _ => None,
+        };
+        let reset = upgraded
+            && upgrade.is_some()
             && self.reset_edge(store, &them, &me.mailbox, now, true)?;
-        if !asked && !(friends && offered.is_some()) && !reset {
+        if !asked && !(friends && upgrade.is_some()) && !reset {
             return Err(MessagingError::NotFriends);
         }
         if !asked {
             let made = match (friendship.filter(|_| accept), device) {
                 (Some(bytes), Some(device)) => {
-                    let offered = offered.expect("checked above");
+                    let offered = upgrade.expect("checked above");
                     self.made_here(store, &me.mailbox, &device, &them, &offered, bytes)?;
                     true
                 }
-                // A decline holds the sender, as a request's does, in the
-                // step that drops its offer.
-                _ if reset && !accept => {
-                    let decline = Ending {
-                        offers: them.fingerprint.into_iter().collect(),
-                        declined: Some(now + self.messaging_policy.request_retention),
-                        ..Ending::default()
-                    };
-                    store
-                        .end_friendship(&me.mailbox, &them, &decline)
-                        .map_err(store_failed)?;
-                    false
-                }
-                _ => {
+                _ if friends => {
                     if let (Some(a), Some(b)) = (them.fingerprint, me.mailbox.fingerprint) {
                         store.set_offer(&a, &b, None).map_err(store_failed)?;
                     }
                     false
                 }
+                // On an edge a reset left inactive the offer goes with the
+                // pending out its sender is shown, and a decline holds the
+                // sender as a request's does, in the same step.
+                _ => {
+                    let end = Ending {
+                        offers: them.fingerprint.into_iter().collect(),
+                        pending: true,
+                        declined: (!accept).then(|| now + self.messaging_policy.request_retention),
+                        ..Ending::default()
+                    };
+                    store
+                        .end_friendship(&me.mailbox, &them, &end)
+                        .map_err(store_failed)?;
+                    self.tell_entry(&them, &me.mailbox);
+                    false
+                }
             };
-            // An upgrade offer on an edge a reset left inactive makes
-            // nothing unless it is taken.
             return Ok(if friends || made {
                 RosterState::Accepted
             } else {
@@ -1347,7 +1368,13 @@ impl Core {
         }
         match (friendship, device) {
             (Some(bytes), Some(device)) => {
-                let offered = offered.ok_or(MessagingError::BadSignature)?;
+                let offered = match pending.and_then(|p| p.offer) {
+                    Some(o) => o,
+                    None if portable::lapsed_offer(&bytes, now) => {
+                        return Err(MessagingError::Stale)
+                    }
+                    None => return Err(MessagingError::BadSignature),
+                };
                 self.made_here(store, &me.mailbox, &device, &them, &offered, bytes)?;
             }
             _ => {
@@ -1437,12 +1464,18 @@ impl Core {
             return taken.map(|_| ());
         }
         if let Some(sent) = mine.and_then(|m| m.pending_out) {
-            self.drop_offers(store, &me.mailbox, &them);
+            let cancel = Ending {
+                pending: true,
+                ..Ending::default()
+            };
             store
-                .set_pending_out(&me.mailbox, &them, None)
+                .end_friendship(&them, &me.mailbox, &cancel)
                 .map_err(store_failed)?;
             self.tell_entry(&me.mailbox, &them);
-            if sent.delivered {
+            if sent.upgrade {
+                let gone = Event::FriendEntry(Box::new(FriendEntry::removed(&me.mailbox)));
+                self.roster.lock().unwrap().tell_friendships(&them, gone);
+            } else if sent.delivered {
                 self.tell_entry(&them, &me.mailbox);
             }
             return Ok(());
@@ -1549,17 +1582,13 @@ impl Core {
         them: &Mailbox,
         now: SystemTime,
     ) -> Result<(), MessagingError> {
-        self.drop_offers(store, them, me);
-        store
-            .set_pending_out(them, me, None)
-            .map_err(store_failed)?;
-        store
-            .hold(
-                me,
-                &Requester::Account(them.clone()),
-                now + self.messaging_policy.request_retention,
-            )
-            .map_err(store_failed)?;
+        let end = Ending {
+            offers: them.fingerprint.into_iter().collect(),
+            pending: true,
+            declined: Some(now + self.messaging_policy.request_retention),
+            ..Ending::default()
+        };
+        store.end_friendship(me, them, &end).map_err(store_failed)?;
         self.tell_entry(me, them);
         self.tell_entry(them, me);
         Ok(())

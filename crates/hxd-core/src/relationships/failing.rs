@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use super::{
-    AccountUpdate, Ended, Ending, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount,
+    AccountUpdate, Ended, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount,
     PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore,
     RequestKind, Requester, RotationRecord, StoredOffer,
 };
@@ -243,8 +243,10 @@ through! {
     fn withdrawals_by(owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
     fn drop_withdrawal(owner: &[u8; 32], pair: &[u8; 32], party: &[u8; 32], withdrawal: &[u8]) -> Result<(), StoreError>;
     fn set_offer(owner: &[u8; 32], other: &[u8; 32], offer: Option<&StoredOffer>) -> Result<(), StoreError>;
-    fn take_as_upgrade(owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError>;
-    fn ask(owner: &Mailbox, other: &Mailbox, pending: &PendingOut, offer: Option<&StoredOffer>) -> Result<(), StoreError>;
+    fn ask(owner: &Mailbox, other: &Mailbox, pending: &PendingOut, upgrade: Option<&StoredOffer>) -> Result<(), StoreError>;
+    fn answer_reset(drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)], record: Option<&Presentation>, upgrade: Option<(&Mailbox, &Mailbox)>) -> Result<(Vec<Ended>, Option<Presentation>), StoreError>;
+    fn drop_offers(pairs: &[FpPair]) -> Result<(), StoreError>;
+    fn drop_offers_naming(fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError>;
     fn offer(owner: &[u8; 32], other: &[u8; 32], now: SystemTime) -> Result<Option<StoredOffer>, StoreError>;
     fn offers_from(owner: &[u8; 32], now: SystemTime) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError>;
     fn keep_rotation(from: &[u8; 32], to: &[u8; 32], record: &[u8]) -> Result<(), StoreError>;

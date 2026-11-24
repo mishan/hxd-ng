@@ -157,6 +157,13 @@ pub struct PendingOut {
     /// `DATA_REQUEST_NOTE`, kept for a delivery at the target's next
     /// login.
     pub note: Option<String>,
+    /// The offer the request carries (§4.1), read as gone from its own
+    /// lapse, the request staying plain.
+    pub offer: Option<StoredOffer>,
+    /// Taken as an upgrade offer on an edge a reset left inactive (§4.1),
+    /// whose offer waits among the upgrade offers: what the owner is
+    /// shown, and the other never is.
+    pub upgrade: bool,
 }
 
 /// What `owner` has decided about `other`.
@@ -199,6 +206,11 @@ impl Relationship {
             .is_some_and(|p| p.lapses_at <= now)
         {
             self.pending_out = None;
+        }
+        if let Some(p) = self.pending_out.as_mut() {
+            if p.offer.as_ref().is_some_and(|o| o.lapses_at <= now) {
+                p.offer = None;
+            }
         }
         if self
             .ignore
@@ -489,7 +501,8 @@ pub struct Ending {
     /// The parties whose offers to the other go.
     pub offers: Vec<[u8; 32]>,
     /// `a` blocks `b`, at this time unless it already had, and the
-    /// requests and approvals either way end with it.
+    /// requests, approvals and offers either way end with it, and the
+    /// friendship each kept for a `Reset`, leaving its hash.
     pub block: Option<SystemTime>,
     /// End the friendship, where there is one: its id goes with it, off
     /// whatever presentations of the pair are left, since what makes the
@@ -499,8 +512,11 @@ pub struct Ending {
     /// then.
     pub hold: Option<SystemTime>,
     /// `b` held from requests to `a` until then, whatever else ends: a
-    /// declined upgrade offer (§4.1).
+    /// declined request or upgrade offer (§4.1).
     pub declined: Option<SystemTime>,
+    /// `b`'s pending state toward `a` ends: its request, or the upgrade
+    /// offer it was taken as, with its offer.
+    pub pending: bool,
 }
 
 /// A withdrawal this server holds (§4.3): what it ends, and the signed
@@ -532,10 +548,10 @@ pub struct StoredOffer {
     /// Its `expires`, when it lapses as everything here lapses: read as
     /// gone from then on.
     pub lapses_at: SystemTime,
-    /// Taken as an upgrade offer (§4.1), which no request carries: only
-    /// such an offer is answered without one.
-    pub upgrade: bool,
 }
+
+/// A pair of fingerprints, owner first.
+pub type FpPair = ([u8; 32], [u8; 32]);
 
 /// The other key of a rotation, and its record as it was published.
 pub type RotationRecord = ([u8; 32], Vec<u8>);
@@ -746,6 +762,7 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// drop in the same step the presentations of the pair, found by the
     /// mailboxes' fingerprints, that `drop` made: what a friendship by
     /// request makes over what the two presented that is not held (§6).
+    /// A `Reset` record of the pair keeps its hash and nothing more.
     fn befriend_dropping(
         &self,
         a: &Mailbox,
@@ -847,7 +864,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
         withdrawal: &[u8],
     ) -> Result<(), StoreError>;
 
-    /// Set or clear `owner`'s offer to `other`.
+    /// Set or clear `owner`'s upgrade offer to `other`, on a friendship
+    /// standing.
     fn set_offer(
         &self,
         owner: &[u8; 32],
@@ -855,23 +873,43 @@ pub trait RelationshipStore: Send + Sync + 'static {
         offer: Option<&StoredOffer>,
     ) -> Result<(), StoreError>;
 
-    /// Record `owner`'s request to `other`, and the offer it carries if any,
-    /// in place of whatever offer an earlier request left, as one step; an
-    /// upgrade offer waiting stays where this request carries none.
+    /// Record `owner`'s pending state toward `other` as one step: a request
+    /// with the offer it carries, or, with `upgrade` and `pending.upgrade`,
+    /// an upgrade offer and the pending out it shows `owner`. Whatever
+    /// upgrade offer waited from `owner` to `other` goes, or is replaced.
     fn ask(
         &self,
         owner: &Mailbox,
         other: &Mailbox,
         pending: &PendingOut,
-        offer: Option<&StoredOffer>,
+        upgrade: Option<&StoredOffer>,
     ) -> Result<(), StoreError>;
 
-    /// Take `owner`'s offer to `other` as an upgrade offer and end the
-    /// request it came with, as one step: a request whose friendship a
-    /// `Reset` answer left for remaking (§4.1).
-    fn take_as_upgrade(&self, owner: &Mailbox, other: &Mailbox) -> Result<(), StoreError>;
+    /// A presentation answered `Reset` (§4.3 step 4), as one step: what
+    /// `drops` names dropped as [`RelationshipStore::drop_presentations`]
+    /// drops each pair's, `record` recorded where there is one, and with
+    /// `upgrade`, `upgrade.0`'s request to `upgrade.1` taken as an upgrade
+    /// offer, its offer moved among those and its pending out kept for
+    /// `upgrade.0` alone. What each drop ended, and the row `record`
+    /// replaced.
+    #[allow(clippy::type_complexity)]
+    fn answer_reset(
+        &self,
+        drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)],
+        record: Option<&Presentation>,
+        upgrade: Option<(&Mailbox, &Mailbox)>,
+    ) -> Result<(Vec<Ended>, Option<Presentation>), StoreError>;
 
-    /// `owner`'s offer to `other`, as it reads at `now`.
+    /// Drop each offer `owner` has waiting for `other`, by fingerprint, as
+    /// one step: a request's, the request staying plain, or an upgrade
+    /// offer, with the pending out it showed its owner.
+    fn drop_offers(&self, pairs: &[FpPair]) -> Result<(), StoreError>;
+
+    /// [`RelationshipStore::drop_offers`] for every offer from or to `fp`:
+    /// the pairs, by fingerprint, it dropped one for.
+    fn drop_offers_naming(&self, fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError>;
+
+    /// `owner`'s upgrade offer to `other`, as it reads at `now`.
     fn offer(
         &self,
         owner: &[u8; 32],
@@ -879,8 +917,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<Option<StoredOffer>, StoreError>;
 
-    /// Every offer `owner` holds, by the party it is to, as they read at
-    /// `now`.
+    /// Every offer `owner` has waiting, its requests' and its upgrade
+    /// offers, by the party it is to, as they read at `now`.
     fn offers_from(
         &self,
         owner: &[u8; 32],
@@ -928,6 +966,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// offers and the withdrawals it counts toward among it; a successor
     /// already holding one for the same other party keeps its own, and a
     /// pair that had evidence both ways and has it no more ends its edge.
+    /// An offer to `from`, which names it, goes, as
+    /// [`RelationshipStore::drop_offers`] drops one.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the

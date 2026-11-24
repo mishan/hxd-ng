@@ -147,23 +147,25 @@ as AGENTS.md's "Releasing" describes it.
 
 - Schema 41 keeps the friendship a presentation answered `Reset` was for
   (docs/proposals/portable-friends.md §4.3), so that it can be made
-  again, and marks an offer taken as an upgrade offer, so that one a
-  lapsed request left behind is never answered as one: ng's
-  `friendships_present` now answers it `reset`, while the classic wire
-  answers `AccountNotFound` until `Reset` has a code there. An offer
-  from the party whose half is below its floor, from a device enrolled
-  since, is then an upgrade offer, answered as a request is but outside
-  the request limits and told to the friend's friendships sessions
-  alone, and its acceptance makes them friends here; a decline holds its
-  sender as a request's does. So is an offer already waiting when the
-  friend's presentation is answered `Reset`. The record lasts 30 days
-  from the last presentation answered so, or while an upgrade offer
-  waits on it, and the records sweep then forgets the friendship it
-  kept. An upgrade offer's acceptance that the sender's roster has no
-  room for is refused `NotFriends` (`not_friends` on ng) and changes
-  nothing. The
-  main SQLite store migrates from schema 40 on first start; a build from
-  before refuses the migrated file.
+  again: ng's `friendships_present` now answers it `reset`, while the
+  classic wire answers `AccountNotFound` until `Reset` has a code there.
+  An offer from the party whose half is below its floor, from a device
+  enrolled since, is then an upgrade offer: answered, held to the
+  request limits and shown its sender as a request is, so that nothing
+  its sender is told says what the friend holds, told to the friend's
+  friendships sessions alone, and made friends by its acceptance; a
+  decline holds its sender as a request's does. A request
+  with an offer waiting when the friend's presentation is answered
+  `Reset` becomes one, and the friend's other sessions are told it is
+  gone. The record lasts 30 days from the last presentation answered so,
+  or while an upgrade offer waits on it, and the records sweep then
+  forgets the friendship it kept. A request's offer is now kept on the
+  request itself and lapses at its own `expires`, the request staying
+  plain; an acceptance built from one that lapsed is refused `Stale`.
+  The main SQLite store migrates from schema 40 on first start, carrying
+  each offer over where its request, live and delivered, or its
+  friendship stands and dropping it otherwise; a build from before
+  refuses the migrated file.
 
 - `[ng] max_detached_per_login` (default 2) is a new key: how many
   detached sessions one login may hold at one address. `[ng]

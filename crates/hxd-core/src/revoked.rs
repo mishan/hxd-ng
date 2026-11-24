@@ -337,6 +337,7 @@ impl Core {
         self.take_revoked(keys.chain(ids).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
+            self.drop_revoked_offers(&identities);
         }
         ended
     }
@@ -418,6 +419,12 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
+            let revoked: Vec<_> = identities
+                .iter()
+                .filter(|i| list.identities.contains(*i))
+                .copied()
+                .collect();
+            self.drop_revoked_offers(&revoked);
         }
         self.reconcile_due(list.floors.keys().copied());
         ended
