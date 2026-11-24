@@ -3338,3 +3338,31 @@ fn a_pass_of_no_floor_is_recorded() {
         "a record that does not verify, judged once"
     );
 }
+
+#[test]
+fn a_pass_of_no_floor_records_nothing_past_a_keep_and_a_clear() {
+    let mut s = linked(&[]);
+    let kept = |time| KeptEpoch {
+        epoch: 1,
+        time,
+        record: Vec::new(),
+    };
+    // Kept before a restart, so no generation is held for it.
+    let stored = Arc::new(MemoryRecordCache::default());
+    stored.keep_epoch(&[1; 32], &kept(2)).unwrap();
+    let core = Arc::get_mut(&mut s.core).unwrap();
+    core.record_cache = Some(Arc::new(super::Watched {
+        inner: stored,
+        reconciled: core.reconciled.clone(),
+    }));
+    let records = s.core.record_cache().unwrap();
+    let parked = s.core.reconciling.arm("no floor");
+    let core = s.core.clone();
+    let pass = std::thread::spawn(move || core.judge_floors([[1; 32]]));
+    parked.arrived();
+    records.keep_epoch(&[1; 32], &kept(1)).unwrap();
+    s.core.unjudge_all();
+    parked.release();
+    pass.join().unwrap();
+    assert!(!s.core.reconciled.lock().unwrap().at.contains_key(&[1; 32]));
+}

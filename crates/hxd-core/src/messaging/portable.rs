@@ -685,7 +685,10 @@ impl Core {
         any_floor: bool,
     ) -> Result<(), StoreError> {
         // Before the read, so a keep landing after it is not recorded over.
-        let alone = self.reconciled.lock().unwrap().of(&[fp]);
+        let (alone, cleared) = {
+            let r = self.reconciled.lock().unwrap();
+            (r.of(&[fp]), r.cleared)
+        };
         let (seen, rows) = self.epoch_key(&fp)?;
         // A pass of no floor recorded says nothing of the chain's rows.
         if !any_floor && self.reconciled.lock().unwrap().holds(&fp, &seen) {
@@ -695,8 +698,10 @@ impl Core {
         if epochs.floor == 0 && !any_floor {
             // Nothing of its own below a floor: judged again only once
             // its rows change, which bumps it.
+            #[cfg(test)]
+            self.reconciling.at("no floor");
             let mut r = self.reconciled.lock().unwrap();
-            if r.of(&[fp]) == alone {
+            if r.of(&[fp]) == alone && r.cleared == cleared {
                 r.at.insert(fp, (seen, alone));
             }
             return Ok(());
