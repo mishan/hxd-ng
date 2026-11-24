@@ -355,6 +355,15 @@ as AGENTS.md's "Releasing" describes it.
   longer leaves the friend shown online to the other, and a session of a
   key rotated away sends, asks and changes nothing once it is being
   ended, so nothing it does is left under the old key.
+- Judging stored portable friendships by the device epoch floors reads
+  the store under the friendship lock and checks signatures outside it,
+  so a sweep that installs a floor no longer holds back messaging logins
+  for the length of its checks. What it judged is judged again after any
+  change that can leave a friendship no longer held, so a presentation a
+  Remove Friend by fingerprint left held by nothing but itself, where
+  judging it failed, ends at the next sweep. An offer an identity made before
+  rotating, kept under its successor, is dropped once its device is
+  reset, as one under the identity's own key is.
 - A client that may use any name logging in, agreeing or changing its
   info with an empty name, or one a classic client reads as empty (a
   leading NUL, or nothing but control characters), and shown with none:

@@ -54,8 +54,8 @@ mod tests;
 
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
-pub(crate) use portable::{Epochs, KeptFloors};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
+pub(crate) use portable::{KeptFloors, Reconciled};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// [`Core::friend_writes`] held: what a step that must share its caller's
@@ -1465,6 +1465,9 @@ impl Core {
         let id = store
             .befriend_dropping(a, b, now, id, drop)
             .map_err(store_failed)?;
+        if !drop.is_empty() {
+            self.unjudge(store, [a.fingerprint, b.fingerprint].into_iter().flatten());
+        }
         self.drop_offers(store, a, b);
         self.roster.lock().unwrap().friends_changed(a, b, true);
         self.tell_entry(a, b);
@@ -1738,6 +1741,8 @@ impl Core {
             warn!("relationships: purging {}: {e}", of.login);
             return;
         }
+        // Each party to a presentation it made is judged again.
+        self.unjudge_all();
         let mut r = self.roster.lock().unwrap();
         for other in &audience {
             r.friends_changed(of, other, false);

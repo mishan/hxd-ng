@@ -1590,6 +1590,32 @@ impl RelationshipStore for SqliteStore {
             .optional())
     }
 
+    fn offers_from(
+        &self,
+        owner: &[u8; 32],
+        now: SystemTime,
+    ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT other, offer, lapses FROM friend_offer
+              WHERE owner = ?1 AND lapses > ?2 ORDER BY other",
+        ))?;
+        let found = sql(stmt.query_map(params![fp_hex(owner), unix(now)], |r| {
+            let other: String = r.get(0)?;
+            let offer = StoredOffer {
+                offer: r.get(1)?,
+                lapses_at: from_unix(r.get(2)?),
+            };
+            Ok((other, offer))
+        }))?;
+        found
+            .map(|r| {
+                let (other, offer) = r.map_err(StoreError::new)?;
+                Ok((fp_from_hex(&other)?, offer))
+            })
+            .collect()
+    }
+
     fn keep_rotation(
         &self,
         from: &[u8; 32],

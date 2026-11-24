@@ -832,6 +832,14 @@ pub trait RelationshipStore: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<Option<StoredOffer>, StoreError>;
 
+    /// Every offer `owner` holds, by the party it is to, as they read at
+    /// `now`.
+    fn offers_from(
+        &self,
+        owner: &[u8; 32],
+        now: SystemTime,
+    ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError>;
+
     /// Keep the record of `from`'s rotation to `to`, verified by the
     /// caller. The first kept for `from` stands, as the first rotation
     /// accepted does.

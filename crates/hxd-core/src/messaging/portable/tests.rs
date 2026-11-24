@@ -2706,3 +2706,517 @@ fn a_withdrawal_below_a_floor_installed_alone_is_kept_past_the_cap() {
     let held = |other: &Person| s.rel.withdrawals(&pair_of(&alice, other)).unwrap().len();
     assert_eq!([held(&carol), held(&dave), held(&erin)], [0, 1, 1]);
 }
+
+#[test]
+fn an_orphan_a_removal_by_fingerprint_left_goes_when_judged_again() {
+    let (mut alice, bob, carol) = (person(1), person(2), person(3));
+    let accounts = [
+        ("alice", &fp(&alice)),
+        ("bob", &fp(&bob)),
+        ("carol", &fp(&carol)),
+    ];
+    let s1 = linked(&accounts);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = linked_with(
+        MessagingPolicy {
+            max_roster: 1,
+            ..policy()
+        },
+        &accounts,
+    );
+    let t = s.core.clock().unix();
+    // Alice's roster is full, so the friendship stays inactive here.
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    s.core.inbox_block(a, "carol", true).unwrap();
+    s.core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&held));
+
+    // Bob's, held by Alice's taking alone, outlives the removal's
+    // judging of it.
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    s.fail.fail_next("presentation");
+    assert_eq!(s.core.friend_remove_by_key(a2, &fp(&bob), None), Ok(()));
+    assert_eq!(s.fail.failed(), Some("presentation"));
+    let bobs = || s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap();
+    assert!(bobs().is_some());
+    s.core.judge_floors([fp(&alice)]);
+    assert!(bobs().is_none());
+}
+
+#[test]
+fn an_offer_moved_to_a_successor_goes_with_its_predecessors_floor() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    assert_eq!(
+        s.core
+            .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now()))),
+        Ok(RosterState::PendingOut)
+    );
+    let (_, mut rb) = device(&s.core, "bob", &bob, 0);
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+    let record = Rotation {
+        identity: alice.id.public(),
+        successor: successor.id.public(),
+        time: now(),
+        next: None,
+    }
+    .sign(&alice.id, &successor.id)
+    .unwrap();
+    s.core.keep_rotation_record(&record);
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    let wall = std::time::SystemTime::now();
+    let moved = || s.rel.offer(&fp(&successor), &fp(&bob), wall).unwrap();
+    assert!(moved().is_some());
+    drain(&mut rb);
+
+    reset(&s, &alice, 1, now());
+    assert!(moved().is_none());
+    let entries: Vec<_> = drain(&mut rb)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FriendEntry(e) if e.login == "alice" => Some((e.state, e.offer)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entries, [(RosterState::PendingIn, None)]);
+}
+
+#[test]
+fn a_grant_judged_before_an_install_is_judged_by_the_pass_after_it() {
+    let (mut alice, bob) = (person(1), person(2));
+    let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
+    let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
+    let s = linked(&accounts);
+    let t = s.core.clock().unix();
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, renewed);
+    // Parked once it has judged the friendship at Alice's epochs before
+    // the reset, holding the lock, before it records.
+    let parked = s.fail.park.arm("presentation");
+    let core = s.core.clone();
+    let grant = std::thread::spawn(move || core.friendships_present(a, vec![], vec![f]));
+    parked.arrived();
+    keep(&s, &alice, 1, t - 60);
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let install = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    while s.core.published_floor(&fp(&alice)) != Some(1) {
+        std::thread::yield_now();
+    }
+    // Room for a pass that read without the lock to read before the grant
+    // records.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    parked.release();
+    let (_, granted) = grant.join().unwrap().unwrap();
+    assert!(ok_all(&granted), "{granted:?}");
+    install.join().unwrap();
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none_or(|p| !p.evidence()));
+}
+
+#[test]
+fn a_pass_records_its_own_ends_and_not_a_change_beside_them() {
+    for beside in [false, true] {
+        let (alice, bob, successor) = (person(1), person(2), person(4));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let reset_at = s.core.clock().unix() - 30;
+        made(&s, &alice, &bob);
+        keep(&s, &alice, 1, reset_at);
+        let parked = s.core.reconciling.arm("ended");
+        let core = s.core.clone();
+        let alice_fp = fp(&alice);
+        let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+        parked.arrived();
+        assert_eq!(friendship_of(&s, &alice, &bob), None, "ended by the pass");
+        if beside {
+            // A link in Alice's chain, which the pass did not read.
+            let record = Rotation {
+                identity: alice.id.public(),
+                successor: successor.id.public(),
+                time: now(),
+                next: None,
+            }
+            .sign(&alice.id, &successor.id)
+            .unwrap();
+            s.core.keep_rotation_record(&record);
+        }
+        parked.release();
+        pass.join().unwrap();
+        let recorded = s
+            .core
+            .reconciled
+            .lock()
+            .unwrap()
+            .at
+            .contains_key(&fp(&alice));
+        assert_eq!(recorded, !beside, "beside {beside}");
+    }
+}
+
+fn rotation(from: &Person, to: &Person) -> Vec<u8> {
+    Rotation {
+        identity: from.id.public(),
+        successor: to.id.public(),
+        time: now(),
+        next: None,
+    }
+    .sign(&from.id, &to.id)
+    .unwrap()
+}
+
+#[test]
+fn a_pass_records_nothing_after_a_change_under_a_key_it_rotated_to() {
+    for beside in [false, true] {
+        let (alice, bob, successor, next) = (person(1), person(2), person(4), person(5));
+        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        // Two predecessors of one successor: the store answers one of them
+        // first.
+        s.core.keep_rotation_record(&rotation(&alice, &successor));
+        s.core.keep_rotation_record(&rotation(&bob, &successor));
+        keep(&s, &bob, 1, now());
+        let parked = s.core.reconciling.arm("ended");
+        let core = s.core.clone();
+        let bob_fp = fp(&bob);
+        let pass = std::thread::spawn(move || core.raise_floor(bob_fp, 1));
+        parked.arrived();
+        if beside {
+            s.core.keep_rotation_record(&rotation(&successor, &next));
+        }
+        parked.release();
+        pass.join().unwrap();
+        let recorded = s.core.reconciled.lock().unwrap().at.contains_key(&fp(&bob));
+        assert_eq!(recorded, !beside, "beside {beside}");
+    }
+}
+
+#[test]
+fn a_pass_dates_a_friendship_by_its_taking_under_every_key_of_the_chain() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&alice, 0, &bob, t - 300), &bob, 0, t - 300);
+    let g = accept(&offer(&alice, 0, &bob, t - 250), &bob, 0, t - 250);
+    let row = |presenter: &Person, other: &Person, bytes: &Vec<u8>, taken: u64| {
+        let at = super::unix_time(taken);
+        s.rel
+            .present(&Presentation {
+                presenter: fp(presenter),
+                other: fp(other),
+                names: [fp(presenter), fp(other)],
+                pair: pair_of(presenter, other),
+                hash: hash(bytes),
+                friendship: Some(bytes.clone()),
+                device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+    };
+    // `f` taken under Alice's key before her reset, and again under her
+    // successor's after it; Bob's of the successor, `g`, only after.
+    row(&alice, &bob, &f, t - 200);
+    row(&successor, &bob, &f, t);
+    row(&bob, &successor, &g, t);
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    reset(&s, &alice, 1, t - 100);
+    assert!(s
+        .rel
+        .presentation(&fp(&bob), &fp(&successor))
+        .unwrap()
+        .is_none());
+    assert!(
+        s.rel
+            .presentation(&fp(&successor), &fp(&bob))
+            .unwrap()
+            .is_some(),
+        "held by its taking under Alice's key"
+    );
+}
+
+#[test]
+fn an_orphan_is_dated_by_its_taking_under_every_key_of_the_chain() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&successor)), ("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&alice, 0, &bob, t - 300), &bob, 0, t - 300);
+    let row = |presenter: &Person, other: &Person, names: [&Person; 2], taken: u64| {
+        let at = super::unix_time(taken);
+        s.rel
+            .present(&Presentation {
+                presenter: fp(presenter),
+                other: fp(other),
+                names: [fp(names[0]), fp(names[1])],
+                pair: pair_of(&alice, &bob),
+                hash: hash(&f),
+                friendship: Some(f.clone()),
+                device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+    };
+    // Taken under Alice's key before her reset, and under her successor's
+    // and by Bob after it.
+    row(&alice, &bob, [&alice, &bob], t - 200);
+    row(&successor, &bob, [&alice, &bob], t);
+    row(&bob, &successor, [&bob, &alice], t);
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    reset(&s, &alice, 1, t - 100);
+    let bobs = || s.rel.presentation(&fp(&bob), &fp(&successor)).unwrap();
+    assert!(bobs().is_some(), "held by the taking under Alice's key");
+
+    let (a, _) = device(&s.core, "alice", &successor, 0);
+    assert_eq!(s.core.friend_remove_by_key(a, &fp(&bob), None), Ok(()));
+    assert!(s
+        .rel
+        .presentation(&fp(&successor), &fp(&bob))
+        .unwrap()
+        .is_none());
+    assert!(
+        bobs().is_some(),
+        "still held by the taking under Alice's key"
+    );
+}
+
+#[test]
+fn a_pass_whose_ends_meet_the_generations_forgotten_records_nothing() {
+    let (alice, bob, carol) = (person(1), person(2), person(3));
+    let s = linked(&[
+        ("alice", &fp(&alice)),
+        ("bob", &fp(&bob)),
+        ("carol", &fp(&carol)),
+    ]);
+    let t = now();
+    for (other, at) in [(&bob, t - 300), (&carol, t - 250)] {
+        let f = accept(&offer(&alice, 0, other, at), other, 0, at);
+        for (presenter, to) in [(&alice, other), (other, &alice)] {
+            let taken = super::unix_time(t);
+            s.rel
+                .present(&Presentation {
+                    presenter: fp(presenter),
+                    other: fp(to),
+                    names: [fp(presenter), fp(to)],
+                    pair: pair_of(presenter, to),
+                    hash: hash(&f),
+                    friendship: Some(f.clone()),
+                    device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                    edge: None,
+                    at: taken,
+                    taken,
+                })
+                .unwrap();
+        }
+    }
+    // The first pair's end leaves the generations one short of their
+    // bound, and the second's passes it.
+    let filler = (0..super::GENERATIONS as u32 - 2).map(|i| {
+        let mut k = [0xee; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        k
+    });
+    s.core
+        .unjudge(s.core.relationships.as_ref().unwrap(), filler);
+    reset(&s, &alice, 1, t - 100);
+    for other in [&bob, &carol] {
+        assert!(s
+            .rel
+            .presentation(&fp(&alice), &fp(other))
+            .unwrap()
+            .is_none());
+    }
+    assert!(!s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+}
+
+#[test]
+fn a_pass_that_fails_keeps_one_under_way_from_recording() {
+    let alice = person(1);
+    let s = linked(&[("alice", &fp(&alice))]);
+    keep(&s, &alice, 1, now());
+    let parked = s.core.reconciling.arm("ended");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.fail.fail_next("presentations");
+    s.core.judge_floors([fp(&alice)]);
+    assert_eq!(s.fail.failed(), Some("presentations"));
+    parked.release();
+    pass.join().unwrap();
+    assert!(!s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+}
+
+/// Presentations of `bytes` by each `(presenter, other)`, named by
+/// `names` and taken at its time.
+fn stored(s: &Server, bytes: &[u8], names: [&Person; 2], rows: &[(&Person, &Person, u64)]) {
+    for (presenter, other, taken) in rows {
+        let at = super::unix_time(*taken);
+        s.rel
+            .present(&Presentation {
+                presenter: fp(presenter),
+                other: fp(other),
+                names: [fp(names[0]), fp(names[1])],
+                pair: pair_of(names[0], names[1]),
+                hash: hash(bytes),
+                friendship: Some(bytes.to_vec()),
+                device: Fingerprint::of(&presenter.devices[0].0.public()).0,
+                edge: None,
+                at,
+                taken: at,
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_reset_dated_after_a_pass_kept_the_friendship_unknown_ends_it() {
+    let (mut alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let renewed = enroll(&mut alice, 1);
+    let f = accept(&offer(&alice, renewed, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&alice, &bob],
+        &[(&alice, &bob, t), (&bob, &alice, t)],
+    );
+    // Bob's floor with no record of when he reset: Unknown to both passes.
+    install(&s, &bob, 1);
+    keep(&s, &alice, 1, t - 1000);
+    s.core.raise_floor(fp(&alice), 1);
+    let theirs = || s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap();
+    assert!(theirs().is_some());
+    assert!(s
+        .core
+        .reconciled
+        .lock()
+        .unwrap()
+        .at
+        .contains_key(&fp(&alice)));
+
+    // The record arrives as an admission fetches it.
+    keep(&s, &bob, 1, t - 100);
+    s.core.raise_floor(fp(&bob), 1);
+    assert!(theirs().is_none());
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn an_offer_moved_while_a_pass_judged_it_is_judged_again() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    assert_eq!(
+        s.core
+            .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now()))),
+        Ok(RosterState::PendingOut)
+    );
+    keep(&s, &alice, 1, now());
+    let parked = s.core.reconciling.arm("read");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.core.keep_rotation_record(&rotation(&bob, &successor));
+    s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
+    parked.release();
+    pass.join().unwrap();
+    s.core.judge_floors([fp(&alice)]);
+    let wall = std::time::SystemTime::now();
+    assert!(s
+        .rel
+        .offer(&fp(&alice), &fp(&successor), wall)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_copy_dropped_under_a_predecessor_judges_its_successors_again() {
+    let (old, new, bob) = (person(1), person(4), person(2));
+    let s = linked(&[("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&old, 0, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&old, &bob],
+        &[(&old, &bob, t - 200), (&new, &bob, t)],
+    );
+    s.core.keep_rotation_record(&rotation(&old, &new));
+    keep(&s, &old, 1, t - 100);
+    keep(&s, &new, 1, t - 1000);
+    s.core.judge_floors([fp(&new)]);
+    let later = || s.rel.presentation(&fp(&new), &fp(&bob)).unwrap();
+    assert!(later().is_some(), "dated by the copy under the old key");
+
+    let device = Fingerprint::of(&old.devices[0].0.public()).0;
+    s.core
+        .drop_revoked_presentations(&[(Some(fp(&old)), device)]);
+    s.core.judge_floors([fp(&new)]);
+    assert!(later().is_none());
+}
+
+#[test]
+fn a_pair_moved_while_a_pass_judged_it_is_judged_again() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let t = now();
+    let f = accept(&offer(&alice, 0, &bob, t - 300), &bob, 0, t - 300);
+    stored(
+        &s,
+        &f,
+        [&alice, &bob],
+        &[(&alice, &bob, t), (&bob, &alice, t)],
+    );
+    keep(&s, &alice, 1, t - 100);
+    let parked = s.core.reconciling.arm("read");
+    let core = s.core.clone();
+    let alice_fp = fp(&alice);
+    let pass = std::thread::spawn(move || core.raise_floor(alice_fp, 1));
+    parked.arrived();
+    s.core.keep_rotation_record(&rotation(&bob, &successor));
+    s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
+    parked.release();
+    pass.join().unwrap();
+    s.core.judge_floors([fp(&alice)]);
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&successor))
+        .unwrap()
+        .is_none());
+}
