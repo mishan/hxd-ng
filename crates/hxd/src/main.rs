@@ -1684,6 +1684,13 @@ async fn main() {
         }
         // The audit trail's evidence window and closed reports' retention.
         tokio::spawn(hxd::moderation::pruner(ctx.core.clone()));
+        // What was judged of friendships against the device epochs kept
+        // here is not kept across a restart; judged before anyone logs in,
+        // who would otherwise be shown what the pass then ends.
+        let reconciling = ctx.core.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || reconciling.reconcile_kept()).await {
+            tracing::error!("judging friendships at start failed: {e}");
+        }
         let link_status = config.link.as_ref().map(hxd::link::status_path);
         let status_writer = match (&hub, &link_status) {
             (Some(hub), Some(path)) => {

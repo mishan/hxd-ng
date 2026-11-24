@@ -1079,7 +1079,12 @@ they are reserved before PF3 needs them.
    owed to `hotline-ng.md` §4 and §10, and present's and fetch's
    `request_weight`. hx-ng keeps friendships and presents them.
    This is where the design is first used end to end, by a client we
-   control.
+   control. hxd-ng judges both parties' friendships as an edge
+   activates and the other party's as one is replaced or dropped; it
+   judges again every identity with a reset kept here when it
+   starts, at each records sweep the identities whose floors it
+   installs and those it has not judged as their epochs now stand, and
+   a rotation's predecessor once the rotation is applied.
 3. **PF3, the classic wire.** §7's fields, Get Device Challenge and
    Prove Device with linking, Present Friendships and Get Friendships,
    once their numbers are reserved, each rated as §4.3 has it, in

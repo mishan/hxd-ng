@@ -212,6 +212,19 @@ impl RecordCache for SqliteStore {
         }))?;
         rows.map(sql).collect()
     }
+
+    fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            sql(conn.prepare_cached("SELECT DISTINCT identity FROM identity_device_floor"))?;
+        let rows = sql(stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+        rows.map(|r| {
+            let id = sql(r)?;
+            id.try_into()
+                .map_err(|_| StoreError("a kept identity is not 32 bytes".into()))
+        })
+        .collect()
+    }
 }
 
 #[cfg(test)]

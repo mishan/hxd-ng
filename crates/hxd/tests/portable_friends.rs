@@ -38,6 +38,7 @@ struct Server {
     classic: SocketAddr,
     ng: SocketAddr,
     core: Arc<Core>,
+    stop: Vec<tokio::task::AbortHandle>,
 }
 
 /// An identity with two devices, each certified.
@@ -71,10 +72,15 @@ fn fp(p: &Person) -> Fingerprint {
     Fingerprint::of(&p.id.public())
 }
 
-/// A server whose `alice` and `bob` link these identities, with
-/// `erin` a password account beside them. With `anchors`, it keeps
-/// successor commitments, and so applies rotations; `messaging` is
-/// `[messaging] enabled`.
+/// Linked by `carol` on every server.
+fn carol() -> Person {
+    person(9)
+}
+
+/// A server whose `alice` and `bob` link these identities and `carol`
+/// [`carol`]'s, with `erin` a password account beside them. With
+/// `anchors`, it keeps successor commitments, and so applies rotations;
+/// `messaging` is `[messaging] enabled`.
 async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messaging: bool) -> Server {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
@@ -82,6 +88,7 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
     for (login, link) in [
         ("alice", Some(fp(alice))),
         ("bob", Some(fp(bob))),
+        ("carol", Some(fp(&carol()))),
         ("erin", None),
     ] {
         let link = link.map_or_else(String::new, |f| {
@@ -110,7 +117,12 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
                 ..MessagingPolicy::default()
             }),
     );
-    tokio::spawn(hxd::presence_flusher(core.clone()));
+    // As the binary starts it, finished before anyone logs in.
+    let reconciling = core.clone();
+    tokio::task::spawn_blocking(move || reconciling.reconcile_kept())
+        .await
+        .unwrap();
+    let flusher = tokio::spawn(hxd::presence_flusher(core.clone()));
     let auth: Arc<dyn hxd_core::AuthBackend> = auth;
     let legacy_ctx = ServerCtx {
         core: core.clone(),
@@ -154,9 +166,24 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
         banner: None,
         metrics: None,
     };
-    tokio::spawn(hxd_session::serve(l1, legacy_ctx));
-    tokio::spawn(hxd_ng_session::serve(l2, ng_ctx));
-    Server { classic, ng, core }
+    let stop = vec![
+        flusher.abort_handle(),
+        tokio::spawn(hxd_session::serve(l1, legacy_ctx)).abort_handle(),
+        tokio::spawn(hxd_ng_session::serve(l2, ng_ctx)).abort_handle(),
+    ];
+    Server {
+        classic,
+        ng,
+        core,
+        stop,
+    }
+}
+
+/// `s` stopped and started again on its database.
+async fn restart(s: Server, dir: &Path, alice: &Person, bob: &Person) -> Server {
+    s.stop.iter().for_each(tokio::task::AbortHandle::abort);
+    drop(s);
+    start(dir, alice, bob, false, true).await
 }
 
 /// One HTTP/1.1 request, closed after its answer: the JSON body.
@@ -806,4 +833,58 @@ async fn a_login_that_does_not_ask_is_answered_as_before() {
     assert_eq!(found["user"], json!({ "login": "bob", "name": "bob" }));
     let refused = ask(&mut quiet, "friend_remove", json!({})).await;
     assert_eq!(refused, Err("bad_request".to_string()));
+}
+
+#[tokio::test]
+async fn a_reset_kept_for_an_identity_away_is_judged_when_the_server_starts() {
+    let (alice, bob, carol) = (person(1), person(2), carol());
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), &alice, &bob, false, true).await;
+    let mut alice_c = device(&s, &alice, 0, "alice").await;
+    let mut bob_c = device(&s, &bob, 0, "bob").await;
+    let mut carol_c = device(&s, &carol, 0, "carol").await;
+    let held = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
+    present(&mut alice_c, &[], &[&held]).await;
+    present(&mut bob_c, &[], &[&held]).await;
+    event(&mut alice_c, "friend", |d| is_entry(d, "bob", "accepted")).await;
+    // Bob resets half a minute on; Carol's friendship is taken after it.
+    let reset_at = now() + 30;
+    s.core.clock().advance(Duration::from_secs(60));
+    let unheld = accept(&offer(&carol, 0, &bob, now() - 60), &bob, 0, now() - 60);
+    present(&mut carol_c, &[], &[&unheld]).await;
+    present(&mut bob_c, &[], &[&unheld]).await;
+    event(&mut carol_c, "friend", |d| is_entry(d, "bob", "accepted")).await;
+    drop(bob_c);
+
+    // Kept for him while he is away, as a sweep keeps a push identity's,
+    // and the server stopped before it installs a floor.
+    let record = DeviceEpoch {
+        identity: bob.id.public(),
+        epoch: 1,
+        time: reset_at,
+    }
+    .sign(&bob.id)
+    .unwrap();
+    let kept = KeptEpoch {
+        epoch: 1,
+        time: reset_at,
+        record,
+    };
+    let records = s.core.record_cache().unwrap();
+    records.keep_epoch(&fp(&bob).0, &kept).unwrap();
+    let listed = ok(&mut carol_c, "friends", json!({})).await;
+    assert_eq!(listed["friends"][0]["friendships"], json!([hash(&unheld)]));
+    drop((alice_c, carol_c, records));
+
+    let s = restart(s, dir.path(), &alice, &bob).await;
+    let mut alice_c = device(&s, &alice, 0, "alice").await;
+    let mut carol_c = device(&s, &carol, 0, "carol").await;
+    let listed = ok(&mut alice_c, "friends", json!({})).await;
+    assert_eq!(
+        listed["friends"][0]["friendships"],
+        json!([hash(&held)]),
+        "taken before the reset: {listed}"
+    );
+    let listed = ok(&mut carol_c, "friends", json!({})).await;
+    assert_eq!(listed["friends"], json!([]), "taken after it");
 }

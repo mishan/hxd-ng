@@ -512,13 +512,12 @@ impl Run {
         (self.pairing(), self.signed(), offers)
     }
 
-    /// With nothing failing, a pass over both parties, as the sweep makes
-    /// over the identities it covers: what it leaves, and what a pass
-    /// after a restart makes of that.
+    /// With nothing failing, a sweep's tick over the floors installed:
+    /// what it leaves, and what a tick after a restart makes of that.
     fn quiescent(&mut self, what: &str) {
-        let fps = [self.people[0].fp(), self.people[1].fp()];
+        let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
         let before = self.pairing();
-        self.core.judge_floors(fps);
+        self.core.reconcile_due(listed.iter().copied());
         let after = self.pairing();
         let told = self.told();
         let ended = before.friendship.is_some() && after.friendship != before.friendship;
@@ -547,7 +546,7 @@ impl Run {
         }
         let before = self.reconcilable();
         self.core.unjudge_all();
-        self.core.judge_floors(fps);
+        self.core.reconcile_due(listed);
         assert_eq!(self.reconcilable(), before, "{what}: a pass judged again");
         let told = self.told();
         assert!(

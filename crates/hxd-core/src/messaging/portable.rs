@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
-use crate::identity_records::KeptEpoch;
+use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
     Ended, EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore,
@@ -147,6 +147,12 @@ impl EpochKey {
 /// at once rather than the map growing with every key ever changed.
 const GENERATIONS: usize = 1 << 16;
 
+/// So many identities [`Core::reconcile_due`] judges a tick beside those
+/// the tick names: each that no pass recorded costs a pass, and one whose
+/// passes keep failing would otherwise cost one every tick however many
+/// there are.
+const UNRECORDED_PER_TICK: usize = 256;
+
 /// What [`Core::judge_floors`] reconciled: each identity whose stored
 /// friendships and offers were all judged at its epochs, with the
 /// generation of each key of its chain then, and a generation for each
@@ -160,6 +166,8 @@ pub(crate) struct Reconciled {
     generation: HashMap<[u8; 32], u64>,
     /// Bumped where every identity's is forgotten at once.
     cleared: u64,
+    /// Where [`Core::reconcile_due`]'s last tick stopped.
+    next: [u8; 32],
 }
 
 /// The keys of a chain, each with its generation.
@@ -174,10 +182,78 @@ impl Reconciled {
     /// Whether `fp` was recorded at `key`, nothing under its chain changed
     /// since.
     fn holds(&self, fp: &[u8; 32], key: &EpochKey) -> bool {
-        self.at.get(fp).is_some_and(|(at, gens)| {
-            let keys: Vec<[u8; 32]> = gens.iter().map(|(k, _)| *k).collect();
-            at == key && self.of(&keys) == *gens
+        self.at.get(fp).is_some_and(|(at, _)| at == key) && self.current(fp)
+    }
+
+    /// Whether `fp` was recorded, nothing under its chain changed since.
+    fn current(&self, fp: &[u8; 32]) -> bool {
+        self.at.get(fp).is_some_and(|(_, gens)| {
+            gens.iter()
+                .all(|(k, g)| self.generation.get(k).copied().unwrap_or(0) == *g)
         })
+    }
+
+    /// Every pass whose chain holds one of `keys` is due again.
+    fn bump(&mut self, keys: impl IntoIterator<Item = [u8; 32]>) {
+        for k in keys {
+            *self.generation.entry(k).or_default() += 1;
+        }
+        if self.generation.len() > GENERATIONS {
+            self.forget();
+        }
+    }
+
+    fn forget(&mut self) {
+        self.at.clear();
+        self.generation.clear();
+        self.cleared += 1;
+    }
+}
+
+/// The record cache as the core holds it: a device epoch kept bumps its
+/// identity, so a tick that passes over identities recorded and not named
+/// finds it due whichever caller kept it.
+pub(crate) struct Watched {
+    pub(crate) inner: Arc<dyn RecordCache>,
+    pub(crate) reconciled: Arc<std::sync::Mutex<Reconciled>>,
+}
+
+impl RecordCache for Watched {
+    fn put(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        self.inner.put(identity, list)
+    }
+    fn lists(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        self.inner.lists(identity)
+    }
+    fn hold_superseded(&self, identity: &[u8; 32], list: &CachedList) -> Result<(), StoreError> {
+        self.inner.hold_superseded(identity, list)
+    }
+    fn superseded(&self, identity: &[u8; 32]) -> Result<Vec<CachedList>, StoreError> {
+        self.inner.superseded(identity)
+    }
+    fn release_superseded(&self, identity: &[u8; 32]) -> Result<(), StoreError> {
+        self.inner.release_superseded(identity)
+    }
+    fn first_seen(&self, identity: &[u8; 32], now: u64) -> Result<u64, StoreError> {
+        self.inner.first_seen(identity, now)
+    }
+    // Bumped after the write, so a pass that read before it records
+    // nothing and one recorded before it is due.
+    fn keep_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let kept = self.inner.keep_epoch(identity, kept);
+        self.reconciled.lock().unwrap().bump([*identity]);
+        kept
+    }
+    fn replace_epoch(&self, identity: &[u8; 32], kept: &KeptEpoch) -> Result<(), StoreError> {
+        let kept = self.inner.replace_epoch(identity, kept);
+        self.reconciled.lock().unwrap().bump([*identity]);
+        kept
+    }
+    fn epochs(&self, identity: &[u8; 32]) -> Result<Vec<KeptEpoch>, StoreError> {
+        self.inner.epochs(identity)
+    }
+    fn identities_with_epochs(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+        self.inner.identities_with_epochs()
     }
 }
 
@@ -521,17 +597,76 @@ impl Core {
     /// earlier: an identity reconciled whole at the epochs it reads now is
     /// passed over. Store work, so called off the reactor.
     pub(crate) fn judge_floors(&self, identities: impl IntoIterator<Item = [u8; 32]>) {
+        for fp in identities {
+            self.reconcile_logged(fp, false);
+        }
+    }
+
+    /// A sweep's tick: [`Self::judge_floors`] for the identities `listed`,
+    /// whose floors it installs, and for those with epochs kept here that
+    /// no pass recorded as they stand, as after a restart or a pass
+    /// something else changed under, so many a tick. One recorded and not
+    /// listed is passed over without reading its rows: a keep of them
+    /// marks it due ([`Watched`]).
+    pub(crate) fn reconcile_due(&self, listed: impl IntoIterator<Item = [u8; 32]>) {
+        let (Some(_), Some(cache)) = (&self.relationships, &self.record_cache) else {
+            return;
+        };
+        let mut due: Vec<[u8; 32]> = listed.into_iter().collect();
+        match cache.identities_with_epochs() {
+            Ok(mut kept) => {
+                let named: std::collections::HashSet<[u8; 32]> = due.iter().copied().collect();
+                let next = {
+                    let r = self.reconciled.lock().unwrap();
+                    kept.retain(|fp| !named.contains(fp) && !r.current(fp));
+                    r.next
+                };
+                kept.sort_unstable();
+                // On from where the last tick stopped, so that none waits
+                // behind ones whose passes never record.
+                let from = kept.partition_point(|fp| *fp <= next);
+                kept.rotate_left(from);
+                kept.truncate(UNRECORDED_PER_TICK);
+                if let Some(last) = kept.last() {
+                    self.reconciled.lock().unwrap().next = *last;
+                }
+                due.extend(kept);
+            }
+            Err(e) => warn!("relationships: reading the identities with device epochs: {e}"),
+        }
+        self.judge_floors(due);
+    }
+
+    /// [`Self::judge_floors`] for every identity with epochs kept here, as
+    /// a start does, since what was recorded is not kept across one.
+    /// Store work, so called off the reactor.
+    pub fn reconcile_kept(&self) {
+        let (Some(_), Some(cache)) = (&self.relationships, &self.record_cache) else {
+            return;
+        };
+        match cache.identities_with_epochs() {
+            Ok(kept) => self.judge_floors(kept),
+            Err(e) => warn!("relationships: reading the identities with device epochs: {e}"),
+        }
+    }
+
+    /// [`Self::judge_floors`] for `fp` once it has rotated, whatever its
+    /// own floor: its chain now holds the rows moved to its successor,
+    /// whose halves the other parties' floors judge.
+    pub(crate) fn reconcile_predecessor(&self, fp: [u8; 32]) {
+        self.reconcile_logged(fp, true);
+    }
+
+    fn reconcile_logged(&self, fp: [u8; 32], any_floor: bool) {
         let Some(store) = self.relationships.as_ref() else {
             return;
         };
-        for fp in identities {
-            if let Err(e) = self.reconcile(store, fp) {
-                // A pass under way may have read before what this one
-                // could not judge.
-                let _writing = self.friend_writes();
-                self.unjudge(store, [fp]);
-                warn!("relationships: judging presentations by a device floor: {e}");
-            }
+        if let Err(e) = self.reconcile(store, fp, any_floor) {
+            // A pass under way may have read before what this one could
+            // not judge.
+            let _writing = self.friend_writes();
+            self.unjudge(store, [fp]);
+            warn!("relationships: judging presentations by a device floor: {e}");
         }
     }
 
@@ -547,14 +682,28 @@ impl Core {
         &self,
         store: &Arc<dyn RelationshipStore>,
         fp: [u8; 32],
+        any_floor: bool,
     ) -> Result<(), StoreError> {
+        // Before the read, so a keep landing after it is not recorded over.
+        let (alone, cleared) = {
+            let r = self.reconciled.lock().unwrap();
+            (r.of(&[fp]), r.cleared)
+        };
         let (seen, rows) = self.epoch_key(&fp)?;
-        if self.reconciled.lock().unwrap().holds(&fp, &seen) {
+        // A pass of no floor recorded says nothing of the chain's rows.
+        if !any_floor && self.reconciled.lock().unwrap().holds(&fp, &seen) {
             return Ok(());
         }
         let epochs = Epochs::of(&fp, seen.installed, &rows);
-        if epochs.floor == 0 {
-            self.reconciled.lock().unwrap().at.remove(&fp);
+        if epochs.floor == 0 && !any_floor {
+            // Nothing of its own below a floor: judged again only once
+            // its rows change, which bumps it.
+            #[cfg(test)]
+            self.reconciling.at("no floor");
+            let mut r = self.reconciled.lock().unwrap();
+            if r.of(&[fp]) == alone && r.cleared == cleared {
+                r.at.insert(fp, (seen, alone));
+            }
             return Ok(());
         }
         let wall = self.clock.wall();
@@ -713,16 +862,16 @@ impl Core {
             .all(|((g, s), own)| g.1 == s.1.wrapping_add(*own));
         if whole && now == key && reconciled.cleared == cleared && ours {
             reconciled.at.insert(fp, (key, gens));
+        } else if !reconciled.holds(&fp, &now) {
+            // Due again at the next tick, which passes over a recording.
+            reconciled.at.remove(&fp);
         }
         Ok(())
     }
 
     /// Forget every pass recorded, as a restart does.
     pub(crate) fn unjudge_all(&self) {
-        let mut reconciled = self.reconciled.lock().unwrap();
-        reconciled.at.clear();
-        reconciled.generation.clear();
-        reconciled.cleared += 1;
+        self.reconciled.lock().unwrap().forget();
     }
 
     /// Forget what was reconciled of the friendships under `fps`, and
@@ -748,14 +897,7 @@ impl Core {
                 }
             }
         }
-        let mut reconciled = self.reconciled.lock().unwrap();
-        for fp in keys {
-            *reconciled.generation.entry(fp).or_default() += 1;
-        }
-        if reconciled.generation.len() > GENERATIONS {
-            drop(reconciled);
-            self.unjudge_all();
-        }
+        self.reconciled.lock().unwrap().bump(keys);
     }
 
     /// The account linked to `fp` that takes part, if there is one.

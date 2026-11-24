@@ -134,7 +134,11 @@ as AGENTS.md's "Releasing" describes it.
   moves earlier, the presentations of friendships no longer held are
   dropped, and an edge they kept active is told `Removed` with no
   withdrawal, as are offers a device below the floor signed, leaving
-  their requests plain. What is held here is judged whatever the clock
+  their requests plain. The server judges this again for every identity
+  with a reset kept here when it starts, and at each records sweep for
+  any it has not judged as its epochs now stand, so a reset kept for
+  someone away, or just before a restart, does not wait for them to log
+  in. What is held here is judged whatever the clock
   says, so a clock set back neither drops a withdrawal nor keeps one from
   ending a friendship. Presentations from before read as taken when they were
   last presented, so a friendship presented again after a reset the
