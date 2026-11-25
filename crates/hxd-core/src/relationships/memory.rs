@@ -1867,7 +1867,12 @@ impl RelationshipStore for MemoryRelationships {
             || inner.accounts.iter().any(|a| bare(&a.owner)))
     }
 
-    fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
+    fn rotate_reporting(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        report: &Report,
+    ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         // What waits for the key that retires goes, an upgrade's pending
         // out with its offer.
@@ -1923,7 +1928,8 @@ impl RelationshipStore for MemoryRelationships {
                 inner.drop_upgrade(to, &other);
             }
         }
-        Ok(rekeyed)
+        let left = inner.left(&report.and_ended(&rekeyed.ended));
+        Ok((rekeyed, left))
     }
 
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError> {

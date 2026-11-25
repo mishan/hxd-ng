@@ -379,6 +379,16 @@ impl Report {
         }
     }
 
+    /// These pairs, then each of `ended`'s by its parties: what a
+    /// rotation reports.
+    pub fn and_ended(&self, ended: &[EndedEdge]) -> Report {
+        let parties = ended.iter().map(|e| e.parties.clone().into());
+        Report {
+            pairs: self.pairs.iter().cloned().chain(parties).collect(),
+            now: self.now,
+        }
+    }
+
     pub fn of(a: &Mailbox, b: &Mailbox, now: SystemTime) -> Report {
         Report {
             pairs: vec![(a.clone(), b.clone())],
@@ -1105,7 +1115,20 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// pair that had evidence both ways and has it no more ends its edge.
     /// An offer to `from`, which names it, goes, as
     /// [`RelationshipStore::drop_offers`] drops one.
-    fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
+    fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
+        self.rotate_reporting(from, to, &Report::none())
+            .map(|(rekeyed, _)| rekeyed)
+    }
+
+    /// [`RelationshipStore::rotate`], and what it left of `report`'s pairs
+    /// and then of each edge it ended, by the parties as their rows keep
+    /// them, in order, read inside the same step.
+    fn rotate_reporting(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        report: &Report,
+    ) -> Result<(Rekeyed, Vec<Left>), StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the
     /// friendships and approvals on them, the holds it placed or is held

@@ -7,7 +7,9 @@ use std::time::SystemTime;
 use crate::avatar::AvatarOwner;
 use crate::ban::{Ban, BanTarget};
 use crate::inbox::StoreError;
+use crate::messaging::Key;
 use crate::push::PushStore;
+use crate::relationships::Report;
 use crate::Core;
 
 impl Core {
@@ -78,7 +80,17 @@ impl Core {
             let wall = self.clock.wall();
             let mut audience = self.counterparts_of(store, from, wall)?;
             audience.extend(self.counterparts_of(store, to, wall)?);
-            let rekeyed = store.rotate(from, to)?;
+            let mut seen = std::collections::HashSet::new();
+            audience.retain(|(_, other)| seen.insert(Key::of(other)));
+            let report = Report {
+                pairs: audience
+                    .into_iter()
+                    .map(|(_, other)| (successor.clone(), other))
+                    .collect(),
+                now: wall,
+            };
+            let (rekeyed, left) = store.rotate_reporting(from, to, &report)?;
+            let (audience, ended_left) = left.split_at(report.pairs.len());
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
             self.unjudge(store, [*from, *to].into_iter().chain(merged));
             #[cfg(test)]
@@ -87,22 +99,20 @@ impl Core {
                 tracing::warn!("inbox: re-stamping a rotation's merged friendships: {e}");
             }
             self.rekey_friends(&writing, &old, &successor);
-            self.merge_dropped(&writing, store, &rekeyed);
+            self.merge_dropped(&writing, store, &rekeyed, ended_left);
             self.after_merge(&writing, &successor);
             let ended: Vec<_> = rekeyed
                 .ended
                 .iter()
                 .flat_map(|e| e.parties.iter().map(|m| m.fingerprint))
                 .collect();
-            for (_, other) in audience {
-                let none = |x: &crate::inbox::Mailbox, y: &crate::inbox::Mailbox| {
-                    store.relationship(x, y, wall).is_ok_and(|r| r.is_none())
-                };
-                // One the edge's ending told, or of a successor no account
-                // here names, is told nothing more.
-                let told = ended.contains(&other.fingerprint) || successor.login.is_empty();
-                if !told && none(&successor, &other) && none(&other, &successor) {
-                    self.tell_entry("a merge", &other, &successor);
+            // One the merge left nothing with the successor, told so from
+            // what it left: one the edge's ending told, or of a successor no
+            // account here names, is told nothing more.
+            for left in audience {
+                let told = ended.contains(&left.pair[1].fingerprint) || successor.login.is_empty();
+                if !told && left.rows == [None, None] {
+                    self.tell_left(left, [false, true]);
                 }
             }
         }

@@ -39,8 +39,8 @@ use super::{store_failed, takes_part, FriendEntry, Key, MessagingError, RosterSt
 use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal, Left, Part, PendingOut,
-    Presentation, RelationId, Relationship, RelationshipStore, Report, StoredOffer,
+    Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Left, Part, PendingOut, Presentation,
+    RelationId, Relationship, RelationshipStore, Report, StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -2031,16 +2031,6 @@ impl Core {
         Ok(())
     }
 
-    /// An edge's ending, told once it is committed: the roster, then both
-    /// parties' entries, by the mailboxes their rows keep, so a party the
-    /// directory no longer names is told too.
-    pub(super) fn edge_ended(&self, site: &'static str, e: &EndedEdge, withdraw: Option<&[u8]>) {
-        let [a, b] = &e.parties;
-        self.roster.lock().unwrap().friends_changed(a, b, false);
-        self.tell_entry_with(site, a, b, withdraw);
-        self.tell_entry_with(site, b, a, withdraw);
-    }
-
     /// What a rotation's merge dropped, told and judged as any drop is:
     /// each edge it ended, then the other party's presentation each
     /// dropped one leaves held by its own taking alone. Under the hold the
@@ -2050,9 +2040,12 @@ impl Core {
         _writing: &super::FriendWrites<'_>,
         store: &Arc<dyn RelationshipStore>,
         rekeyed: &crate::relationships::Rekeyed,
+        ended: &[Left],
     ) {
-        for e in &rekeyed.ended {
-            self.edge_ended("a rotation's merge", e, None);
+        // Each by the parties as their rows keep them, so a party the
+        // directory no longer names is told too.
+        for left in ended {
+            self.edge_ended_left(left, None);
         }
         for gone in &rekeyed.dropped {
             self.orphan_judged_or_owed(store, gone);
