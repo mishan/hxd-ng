@@ -28,8 +28,8 @@
 //!   fresh read of its roster would, offers and listed friendships
 //!   included; a session that did not ask for portable friendships is
 //!   never told an offer;
-//! - an act reads what it tells from what its step left, never from a
-//!   read after it, but where [`TELLS_BY_READING`] names;
+//! - an act tells from what its writes left, never from a read after
+//!   them;
 //! - a pass drops an offer only where what is installed forbids it, and
 //!   ticks with nothing failing leave none such, nor a revoked device's
 //!   presentation;
@@ -62,7 +62,7 @@ use super::{Key, Presented, RosterState};
 use crate::access::bit;
 use crate::identity_records::{KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, MemoryStore};
-use crate::relationships::failing::{Failing, READS};
+use crate::relationships::failing::Failing;
 use crate::relationships::{
     PendingOut, Presentation, RelationId, RelationshipStore, Report, Requester, StoredOffer,
 };
@@ -415,12 +415,6 @@ struct Run {
     /// The keys the last list published covered.
     covered: HashSet<[u8; 32]>,
 }
-
-/// Where tells are still read after the step that changed what they
-/// tell, so that a read failing there may cost one: a rotation's, the
-/// last to move onto telling from what the step left. Every other tell is
-/// made from that, and one read after its step fails the run.
-const TELLS_BY_READING: &[&str] = &["a merge", "a rotation's merge"];
 
 /// An ask's answer, and what its actor's sessions were told.
 type Outcome = (
@@ -1302,10 +1296,6 @@ impl Run {
         })
     }
 
-    fn told_by_reading(&self) -> Vec<&'static str> {
-        std::mem::take(&mut *self.core.told_by_reading.lock().unwrap())
-    }
-
     fn uid(&self, q: usize, slot: usize) -> Uid {
         if slot < 2 {
             self.sessions[q][slot].0
@@ -1451,22 +1441,13 @@ impl Run {
         let predecessor = self.names_a_predecessor();
         let owed = self.core.owed_sweeps();
         let upgrading = self.upgrading_now();
-        self.told_by_reading();
         let ok = self.act(step, p, d);
-        let by_reading = self.told_by_reading();
         self.fail.fail_nth(0);
         self.core.clock.advance(Duration::from_secs(1));
         let after = self.pairing();
         let told = self.told();
-        // A failed read can cost an ending its tell, never a tell its
-        // ending.
         let failed = self.fail.failed();
-        let read_failed = failed.is_some_and(|m| READS.contains(&m));
         let what = format!("{step:?} by {} on device {d}, {failure:?}", LOGINS[p]);
-        if let Some(site) = by_reading.iter().find(|s| !TELLS_BY_READING.contains(s)) {
-            panic!("{what}: told from a read after its step, at {site}");
-        }
-        let unmigrated = !by_reading.is_empty();
 
         // An ask with an offer, from a party with nothing to the other,
         // answered and told alike whether or not it was taken as an
@@ -1546,7 +1527,7 @@ impl Run {
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
         );
-        self.told_once(&what, &after, ended && !read_failed, &told);
+        self.told_once(&what, &after, ended, &told);
 
         // An active edge stands on held evidence wherever a step made it
         // active, made it portable or wrote evidence for it, and an
@@ -1688,14 +1669,11 @@ impl Run {
         // A blocker's own client knows what its block ended, and a request
         // lapses without a notice (instant-messaging 3): neither is told.
         let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
-        // An act on the list reads what it tells after its writes, so a
-        // read that fails there costs a tell; losing the messaging bit is
-        // read live.
-        // What a merge of a successor's own state tells is a rotation's,
-        // still read after its step, and the state was not one an act made.
+        // Losing the messaging bit is read live, and a crowded rotation
+        // merges state written by hand, which no act told.
         let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || self.crowded;
         self.upgrading = upgrading;
-        self.shown(&what, !(read_failed && unmigrated) && !lapsing, blocking);
+        self.shown(&what, !lapsing, blocking);
     }
 
     /// Each sweep owed before a step and gone after it ended on positive
@@ -2273,7 +2251,6 @@ pub fn run_failing_each_call(
                 let (step, _, d, _) = Step::of(n);
                 run.told();
                 run.requested = 0;
-                run.told_by_reading();
                 run.upgrading = run.upgrading_now();
                 let held = |run: &Run| format!("{}\n{}", dump(), run.core.friend_state());
                 let before = held(&run);
@@ -2292,7 +2269,6 @@ pub fn run_failing_each_call(
                     true => format!("{step:?} by {}, a write failing after part {k}", LOGINS[p]),
                 };
                 let what = format!("{what} after {writes:?}");
-                let by_reading = run.told_by_reading();
                 if !ok {
                     assert_eq!(held(&run), before, "{what}: an error left a change");
                     let told = run.told();
@@ -2304,13 +2280,11 @@ pub fn run_failing_each_call(
                     continue;
                 }
                 // One answered as done past the failure leaves a state the
-                // model allows, each session told what it changed, but where
-                // a tell still read after its step could cost one.
+                // model allows, each session told what it changed.
                 run.legal(&what);
                 let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
                 let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || run.crowded;
-                let listed = by_reading.iter().any(|s| TELLS_BY_READING.contains(s));
-                run.shown(&what, !listed && !lapsing, blocking);
+                run.shown(&what, !lapsing, blocking);
             }
         }
     }

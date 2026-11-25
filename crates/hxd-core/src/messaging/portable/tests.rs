@@ -2292,23 +2292,6 @@ fn a_block_that_fails_blocks_nothing() {
 }
 
 #[test]
-fn an_entry_whose_read_fails_is_not_told() {
-    for nth in [1, 2] {
-        let (alice, bob) = (person(1), person(2));
-        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
-        let (_, mut ra, _, _, _) = made(&s, &alice, &bob);
-        s.fail.fail_nth(nth);
-        s.core.tell_entry(
-            "a test",
-            &Mailbox::identified("alice", fp(&alice)),
-            &Mailbox::identified("bob", fp(&bob)),
-        );
-        assert_eq!(s.fail.failed(), Some("relationship"));
-        assert_eq!(told(&mut ra), [], "read {nth} failing");
-    }
-}
-
-#[test]
 fn a_withdrawal_retried_after_a_failure_ends_a_friendship_made_while_the_clock_ran_ahead() {
     for method in ["presentation", "write"] {
         let (alice, bob) = (person(1), person(2));
@@ -2382,7 +2365,7 @@ fn a_merge_is_told_from_what_its_settling_left_whatever_is_read_after() {
     s.rel
         .set_blocked(&ma, &mb, true, std::time::SystemTime::now())
         .unwrap();
-    s.fail.fail_reads_after_write();
+    s.fail.fail_reads_after("write");
     s.core.after_merge(&s.core.friend_writes(), &ma);
     s.fail.fail_nth(0);
     assert!(s.fail.failed().is_some(), "a read after the write failed");
@@ -3289,7 +3272,8 @@ fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
     // The successor already holds a presentation of Bob, so Alice's moved
     // one goes. As a hash alone it leaves the edge evidence one way; whole,
     // it leaves Bob's held by his own taking alone, after Alice's reset.
-    for whole in [false, true] {
+    // Its tell is made from what the rotation left, whatever is read after.
+    for (whole, unread) in [(false, false), (true, false), (false, true)] {
         let (alice, bob, successor) = (person(1), person(2), person(4));
         let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
         let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
@@ -3326,9 +3310,18 @@ fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
             .unwrap();
         drain(&mut rb);
 
+        if unread {
+            s.fail.fail_reads_after("rotate");
+        }
         s.core
             .rotate_identity(&fp(&alice), &fp(&successor))
             .unwrap();
+        s.fail.fail_nth(0);
+        assert_eq!(
+            s.fail.failed().is_some(),
+            unread,
+            "whole {whole}, unread {unread}"
+        );
         let rows = s
             .rel
             .relationship(
@@ -3337,11 +3330,15 @@ fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
                 std::time::SystemTime::now(),
             )
             .unwrap();
-        assert_eq!(rows.and_then(|r| r.friendship), None, "whole {whole}");
+        assert_eq!(
+            rows.and_then(|r| r.friendship),
+            None,
+            "whole {whole}, unread {unread}"
+        );
         assert_eq!(
             told(&mut rb),
             [("alice".into(), RosterState::Removed, vec![], None)],
-            "whole {whole}"
+            "whole {whole}, unread {unread}"
         );
         let kept: Vec<_> = s
             .rel
@@ -3351,6 +3348,48 @@ fn a_presentation_a_rotation_merges_away_is_dropped_as_any_drop_is() {
             .map(|p| p.edge)
             .collect();
         assert!(kept.contains(&Some(id)), "whole {whole}: {kept:?}");
+    }
+}
+
+#[test]
+fn a_party_a_rotation_leaves_nothing_with_is_told_so_whatever_is_read_after() {
+    // Alice's request is taken as an upgrade offer to Bob, on the edge his
+    // presentation answered `Reset` left inactive: the only row of the
+    // pair, which the rotation drops with the offer.
+    for unread in [false, true] {
+        let (mut alice, bob, successor) = (person(1), person(2), person(6));
+        let accounts = [
+            ("alice", &fp(&alice)),
+            ("bob", &fp(&bob)),
+            ("bob", &fp(&successor)),
+        ];
+        let (_, _, _, _, f) = made(&linked(&accounts), &alice, &bob);
+        let s = linked(&accounts);
+        reset(&s, &alice, 1, s.core.clock().unix() - 1);
+        let renewed = enroll(&mut alice, 1);
+        let (a, mut ra) = device(&s.core, "alice", &alice, renewed);
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+        assert_eq!(refused[0].outcome, Presented::Reset);
+        let o = offer(&alice, renewed, &bob, now() - 2);
+        assert_eq!(
+            s.core.friend_ask(a, "bob", None, Some(o)),
+            Ok(RosterState::PendingOut)
+        );
+        drain(&mut ra);
+        s.core.keep_rotation_record(&rotation(&bob, &successor));
+
+        if unread {
+            s.fail.fail_reads_after("rotate");
+        }
+        s.core.rotate_identity(&fp(&bob), &fp(&successor)).unwrap();
+        s.fail.fail_nth(0);
+        assert_eq!(s.fail.failed().is_some(), unread);
+        assert_eq!(
+            told(&mut ra),
+            [("bob".into(), RosterState::Removed, vec![], None)],
+            "unread {unread}"
+        );
     }
 }
 

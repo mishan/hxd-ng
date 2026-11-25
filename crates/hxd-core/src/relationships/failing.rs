@@ -58,9 +58,10 @@ enum Plan {
     /// The next `write` fails after this many of its parts, all or
     /// nothing.
     Part(usize),
-    /// Every read fails once a write has been called: whether one was.
+    /// Every read fails once a write whose name starts with this has been
+    /// called: whether one was.
     #[cfg(test)]
-    ReadsAfterWrite(bool),
+    ReadsAfter(&'static str, bool),
 }
 
 pub(crate) struct Failing {
@@ -163,11 +164,12 @@ impl Failing {
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::NthWrite(n) };
     }
 
-    /// Every read from the first write on fails, until the plan is set
-    /// again: what a tell made from a read after its step depends on.
+    /// Every read from the first write named `write`, or a longer name
+    /// starting with it, on fails, until the plan is set again: what a
+    /// tell made from a read after its step depends on.
     #[cfg(test)]
-    pub(crate) fn fail_reads_after_write(&self) {
-        *self.plan.lock().unwrap() = Plan::ReadsAfterWrite(false);
+    pub(crate) fn fail_reads_after(&self, write: &'static str) {
+        *self.plan.lock().unwrap() = Plan::ReadsAfter(write, false);
     }
 
     /// The next `write` fails after `k` of its parts, if it has as many.
@@ -214,9 +216,9 @@ impl Failing {
             Plan::NthWrite(_) => false,
             Plan::Part(_) => false,
             #[cfg(test)]
-            Plan::ReadsAfterWrite(written) => {
+            Plan::ReadsAfter(write, written) => {
                 let read = READS.contains(&method);
-                *written |= !read;
+                *written |= !read && method.starts_with(*write);
                 if read && *written {
                     *self.failed.lock().unwrap() = Some(method);
                     return Err(StoreError(format!("{method} failed")));
@@ -323,7 +325,7 @@ through! {
     fn update_account(of: &Mailbox, update: &AccountUpdate) -> Result<(), StoreError>;
     fn claim(login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
     fn claimable(login: &str) -> Result<bool, StoreError>;
-    fn rotate(from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
+    fn rotate_reporting(from: &[u8; 32], to: &[u8; 32], report: &Report) -> Result<(Rekeyed, Vec<Left>), StoreError>;
     fn purge(of: &Mailbox) -> Result<usize, StoreError>;
     fn purge_count(of: &Mailbox) -> Result<usize, StoreError>;
     fn cleanup(lapsed_before: SystemTime, ledger_before: SystemTime, batch: usize) -> Result<usize, StoreError>;

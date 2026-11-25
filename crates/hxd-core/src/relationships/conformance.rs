@@ -410,7 +410,12 @@ fn a_rotation_ends_an_edge_its_merge_leaves_without_evidence_both_ways(s: &dyn R
     .unwrap();
     s.present(&presentation(5, 3, 30, 9)).unwrap();
 
-    let rotated = s.rotate(&fp(1), &fp(5)).unwrap();
+    let (new, p3) = (
+        Mailbox::identified("new", fp(5)),
+        Mailbox::identified("p3", fp(3)),
+    );
+    let report = Report::of(&new, &p3, at(2));
+    let (rotated, left) = s.rotate_reporting(&fp(1), &fp(5), &report).unwrap();
     let dropped: Vec<_> = rotated
         .dropped
         .iter()
@@ -423,6 +428,32 @@ fn a_rotation_ends_an_edge_its_merge_leaves_without_evidence_both_ways(s: &dyn R
     );
     let ended: Vec<_> = rotated.ended.iter().map(|e| e.id).collect();
     assert_eq!(ended, [ids[0]], "{case}: only the pair left one way");
+    // What the rotation left of the pair asked of, then of the edge it
+    // ended, by the parties as their rows keep them.
+    assert_eq!(left.len(), 2, "{case}: reported");
+    assert_eq!(left[0].pair, [new.clone(), p3.clone()], "{case}");
+    assert_eq!(
+        left[0]
+            .rows
+            .each_ref()
+            .map(|r| r.as_ref().and_then(|r| r.friendship)),
+        [Some(ids[1]); 2],
+        "{case}: as it left them"
+    );
+    let [x, y] = &rotated.ended[0].parties;
+    assert_eq!(
+        left[1].pair,
+        [x.clone(), y.clone()],
+        "{case}: the ended edge"
+    );
+    assert_eq!(
+        left[1]
+            .presentations
+            .each_ref()
+            .map(|p| p.as_ref().and_then(|p| p.edge)),
+        [Some(ids[0]); 2],
+        "{case}: the ended edge's id on what is left"
+    );
     let friendship = |other: u8| {
         s.relationship(
             &Mailbox::identified("new", fp(5)),

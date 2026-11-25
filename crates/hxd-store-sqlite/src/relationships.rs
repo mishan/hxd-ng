@@ -1410,7 +1410,8 @@ impl SqliteStore {
         to: &str,
         from: &str,
         portable: bool,
-    ) -> Result<Rekeyed, StoreError> {
+        report: &Report,
+    ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         self.with_tx(|tx| {
             // What waits for the key that retires goes first; then each
             // upgrade the key that moves has waiting, with the record it
@@ -1510,7 +1511,8 @@ impl SqliteStore {
                     }
                 }
             }
-            Ok(rekeyed)
+            let left = left(tx, &report.and_ended(&rekeyed.ended))?;
+            Ok((rekeyed, left))
         })
     }
 }
@@ -2288,7 +2290,14 @@ impl RelationshipStore for SqliteStore {
     }
 
     fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rekey(claim_moves, &fp_hex(fingerprint), login, false)
+        self.rekey(
+            claim_moves,
+            &fp_hex(fingerprint),
+            login,
+            false,
+            &Report::none(),
+        )
+        .map(|(rekeyed, _)| rekeyed)
     }
 
     fn claimable(&self, login: &str) -> Result<bool, StoreError> {
@@ -2304,8 +2313,13 @@ impl RelationshipStore for SqliteStore {
         Ok(false)
     }
 
-    fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rekey(rotate_moves, &fp_hex(to), &fp_hex(from), true)
+    fn rotate_reporting(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        report: &Report,
+    ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
+        self.rekey(rotate_moves, &fp_hex(to), &fp_hex(from), true, report)
     }
 
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError> {

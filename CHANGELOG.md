@@ -358,7 +358,10 @@ as AGENTS.md's "Releasing" describes it.
   each party its entry as the write left it, rather than reading the
   store again after: a read failing there no longer leaves a session
   showing the entry as it was. Sweeps that name one pair under a renamed
-  account's old and new login tell it once.
+  account's old and new login tell it once. An identity's rotation now
+  does the same for the friendships its merge ends and for a party it
+  leaves nothing with, which a read failing after the merge told
+  nothing, and tells a party of both keys once.
 - Portable friendships are granted only over friendships held at the
   device epoch floors (docs/proposals/portable-friends.md §6): a
   friendship made by a plain Friend Response (805), or by an Add Friend

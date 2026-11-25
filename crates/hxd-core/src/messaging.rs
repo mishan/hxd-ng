@@ -818,60 +818,6 @@ impl Core {
         }
     }
 
-    /// `of`'s roster row about `other`, sent to `of`'s messenger
-    /// sessions: what it is now, or that it is gone.
-    pub(crate) fn tell_entry(&self, site: &'static str, of: &Mailbox, other: &Mailbox) {
-        self.tell_entry_with(site, of, other, None);
-    }
-
-    /// [`Self::tell_entry`], with the withdrawal that ended the row where
-    /// one did.
-    fn tell_entry_with(
-        &self,
-        site: &'static str,
-        of: &Mailbox,
-        other: &Mailbox,
-        withdraw: Option<&[u8]>,
-    ) {
-        let Ok(store) = self.friends_store() else {
-            return;
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        self.told_by_reading.lock().unwrap().push(site);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let _ = site;
-        let now = self.clock.wall();
-        // A row that cannot be read is not told as gone.
-        let (row, theirs) = match (
-            store.relationship(of, other, now),
-            store.relationship(other, of, now),
-        ) {
-            (Ok(row), Ok(theirs)) => (row, theirs),
-            (Err(e), _) | (_, Err(e)) => {
-                warn!("relationships: reading {}'s entry: {e}", of.login);
-                return;
-            }
-        };
-        let asked = theirs
-            .and_then(|t| t.pending_out)
-            .filter(|p| p.delivered && !p.upgrade);
-        let text = self.shown_text(row.as_ref());
-        let mut entry = {
-            let r = self.roster.lock().unwrap();
-            row.and_then(|row| r.entry_of(&row, asked.as_ref(), text))
-                .or_else(|| asked.map(|p| FriendEntry::asking(other, p.note)))
-                .unwrap_or_else(|| FriendEntry::removed(other))
-        };
-        self.portable_fields(store, of, &mut entry, now);
-        if entry.state == RosterState::Removed {
-            entry.withdraw = withdraw.map(<[u8]>::to_vec);
-        }
-        self.roster
-            .lock()
-            .unwrap()
-            .tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
-    }
-
     /// `parts` written as one step of the store, with what it left of each
     /// pair of `pairs`, read inside that step, for its tells.
     fn write_left(
@@ -894,7 +840,7 @@ impl Core {
     /// What a step left told to the parties `to` names, `left.pair`'s
     /// first first: each its entry for the other, made from what the step
     /// left and never from a read after it.
-    fn tell_left(&self, left: &Left, to: [bool; 2]) {
+    pub(crate) fn tell_left(&self, left: &Left, to: [bool; 2]) {
         self.tell_left_with(left, to, None);
     }
 
