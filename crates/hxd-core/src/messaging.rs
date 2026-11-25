@@ -37,8 +37,8 @@ use tracing::warn;
 use crate::access::bit;
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    AccountUpdate, Ending, LedgerEntry, PendingOut, Profile, RelationId, Relationship,
-    RelationshipStore, RequestKind, Requester,
+    AccountUpdate, Charge, Did, Ending, LedgerEntry, Left, Part, PendingOut, Profile, RelationId,
+    Relationship, RelationshipStore, Report, RequestKind, Requester,
 };
 use crate::roster::{Announced, Event, RosterInner, SessionStatus, Uid, UserSession};
 use crate::Core;
@@ -55,7 +55,7 @@ mod tests;
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
-pub(crate) use portable::{KeptFloors, OwedSweep, Reconciled, Watched};
+pub(crate) use portable::{KeptFloors, OwedSweep, Reconciled, Sweep, Watched};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// [`Core::friend_writes`] held: what a step that must share its caller's
@@ -820,16 +820,26 @@ impl Core {
 
     /// `of`'s roster row about `other`, sent to `of`'s messenger
     /// sessions: what it is now, or that it is gone.
-    fn tell_entry(&self, of: &Mailbox, other: &Mailbox) {
-        self.tell_entry_with(of, other, None);
+    fn tell_entry(&self, site: &'static str, of: &Mailbox, other: &Mailbox) {
+        self.tell_entry_with(site, of, other, None);
     }
 
     /// [`Self::tell_entry`], with the withdrawal that ended the row where
     /// one did.
-    fn tell_entry_with(&self, of: &Mailbox, other: &Mailbox, withdraw: Option<&[u8]>) {
+    fn tell_entry_with(
+        &self,
+        site: &'static str,
+        of: &Mailbox,
+        other: &Mailbox,
+        withdraw: Option<&[u8]>,
+    ) {
         let Ok(store) = self.friends_store() else {
             return;
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.told_by_reading.lock().unwrap().push(site);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = site;
         let now = self.clock.wall();
         // A row that cannot be read is not told as gone.
         let (row, theirs) = match (
@@ -860,6 +870,62 @@ impl Core {
             .lock()
             .unwrap()
             .tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
+    }
+
+    /// `parts` written as one step of the store, with what it left of each
+    /// pair of `pairs`, read inside that step, for its tells.
+    fn write_left(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        parts: &[Part],
+        pairs: &[(&Mailbox, &Mailbox)],
+        now: SystemTime,
+    ) -> Result<(Vec<Did>, Vec<Left>), StoreError> {
+        let report = Report {
+            pairs: pairs
+                .iter()
+                .map(|(a, b)| ((*a).clone(), (*b).clone()))
+                .collect(),
+            now,
+        };
+        store.write(parts, &report)
+    }
+
+    /// What a step left told to the parties `to` names, `left.pair`'s
+    /// first first: each its entry for the other, made from what the step
+    /// left and never from a read after it.
+    fn tell_left(&self, left: &Left, to: [bool; 2]) {
+        self.tell_left_with(left, to, None);
+    }
+
+    /// [`Self::tell_left`], with the withdrawal that ended the row where
+    /// one did.
+    fn tell_left_with(&self, left: &Left, to: [bool; 2], withdraw: Option<&[u8]>) {
+        for (i, _) in to.iter().enumerate().filter(|(_, t)| **t) {
+            let (of, other) = (&left.pair[i], &left.pair[1 - i]);
+            let (row, theirs) = (left.rows[i].clone(), left.rows[1 - i].as_ref());
+            let asked = theirs
+                .and_then(|t| t.pending_out.clone())
+                .filter(|p| p.delivered && !p.upgrade);
+            let text = row
+                .as_ref()
+                .filter(|r| r.friendship.is_some())
+                .and_then(|_| left.shown[1 - i].clone());
+            let mut entry = {
+                let r = self.roster.lock().unwrap();
+                row.and_then(|row| r.entry_of(&row, asked.as_ref(), text))
+                    .or_else(|| asked.map(|p| FriendEntry::asking(other, p.note)))
+                    .unwrap_or_else(|| FriendEntry::removed(other))
+            };
+            portable::fields_left(left, i, &mut entry);
+            if entry.state == RosterState::Removed {
+                entry.withdraw = withdraw.map(<[u8]>::to_vec);
+            }
+            self.roster
+                .lock()
+                .unwrap()
+                .tell_mailbox(of, Event::FriendEntry(Box::new(entry)));
+        }
     }
 
     /// The stored text a friend was last shown with, for its roster row.
@@ -1139,6 +1205,9 @@ impl Core {
             }
             _ => None,
         };
+        // No offer to a revoked identity is kept, as its revocation's
+        // sweep keeps none.
+        let offer = offer.filter(|_| !them.fingerprint.is_some_and(|f| self.identity_revoked(&f)));
         if store.is_blocked(&me.mailbox, &them).map_err(store_failed)? {
             return Err(MessagingError::Blocked);
         }
@@ -1148,7 +1217,7 @@ impl Core {
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
             return match offer {
                 Some(offer) => {
-                    self.upgrade_offer(store, uid, &me.mailbox, &them, note, offer)?;
+                    self.upgrade_offer(store, uid, &me.mailbox, &them, note, offer, None)?;
                     Ok(RosterState::Accepted)
                 }
                 None => Err(MessagingError::AlreadyFriends),
@@ -1205,33 +1274,34 @@ impl Core {
         let addr = self.request_address(uid);
         let sender = Requester::Account(me.mailbox.clone());
         self.request_bounds(store, &sender, addr.as_deref(), &them, now)?;
-        let bytes = note.as_ref().map_or(0, |n| n.len() as u64);
-        store
-            .record_request(&LedgerEntry {
-                kind: RequestKind::Friend,
-                sender: Some(me.mailbox.clone()),
-                address: addr,
-                recipient: them.clone(),
-                guid: None,
-                bytes,
-                at: now,
-            })
-            .map_err(store_failed)?;
         let held = store.is_held(&them, &sender, now).map_err(store_failed)?;
         // One on an edge a reset left inactive asks nothing new of `them`,
         // who is not told it as a request; it is answered, and shown its
         // sender, as a request is. One from a sender `them` declined is a
         // request, held.
-        if let Some(o) = offer.as_ref().filter(|_| !held) {
-            if self.reset_edge(store, &me.mailbox, &them, now, false)? {
-                self.upgrade_offer(store, uid, &me.mailbox, &them, note, o.clone())?;
-                return Ok(RosterState::PendingOut);
-            }
-        }
+        let upgrade = match offer.as_ref().filter(|_| !held) {
+            Some(_) => self.reset_edge(store, &me.mailbox, &them, now, false)?,
+            None => false,
+        };
         let full = !held
+            && !upgrade
             && store.pending_in(&them, now).map_err(store_failed)?.len() >= p.max_friend_requests;
-        if full {
-            store.request_dropped(&them).map_err(store_failed)?;
+        let charge = Charge {
+            entry: LedgerEntry {
+                kind: RequestKind::Friend,
+                sender: Some(me.mailbox.clone()),
+                address: addr,
+                recipient: them.clone(),
+                guid: None,
+                bytes: note.as_ref().map_or(0, |n| n.len() as u64),
+                at: now,
+            },
+            dropped: full,
+        };
+        if let Some(o) = offer.as_ref().filter(|_| upgrade) {
+            let o = o.clone();
+            self.upgrade_offer(store, uid, &me.mailbox, &them, note, o, Some(&charge))?;
+            return Ok(RosterState::PendingOut);
         }
         let delivered = !held && !full;
         let offer = offer.filter(|_| delivered);
@@ -1243,10 +1313,17 @@ impl Core {
             offer: offer.clone(),
             upgrade: false,
         };
-        store
-            .ask(&me.mailbox, &them, &asked, None)
+        let left = store
+            .ask(
+                &me.mailbox,
+                &them,
+                &asked,
+                None,
+                Some(&charge),
+                &Report::of(&me.mailbox, &them, now),
+            )
             .map_err(store_failed)?;
-        self.tell_entry(&me.mailbox, &them);
+        self.tell_left(&left[0], [true, false]);
         if delivered {
             let mut r = self.roster.lock().unwrap();
             r.tell_mailbox(
@@ -1316,6 +1393,15 @@ impl Core {
         let reset = upgraded
             && upgrade.is_some()
             && self.reset_edge(store, &them, &me.mailbox, now, true)?;
+        // A signed acceptance of an upgrade whose offer lapsed while its
+        // pending out stands is answered as one of a lapsed request's is.
+        if upgraded && upgrade.is_none() && accept {
+            if let Some(bytes) = friendship.as_ref() {
+                if portable::lapsed_offer(bytes, now) {
+                    return Err(MessagingError::Stale);
+                }
+            }
+        }
         if !asked && !(friends && upgrade.is_some()) && !reset {
             return Err(MessagingError::NotFriends);
         }
@@ -1327,10 +1413,14 @@ impl Core {
                     true
                 }
                 _ if friends => {
-                    if let (Some(a), Some(b)) = (them.fingerprint, me.mailbox.fingerprint) {
-                        store.set_offer(&a, &b, None).map_err(store_failed)?;
-                    }
-                    self.tell_entry(&me.mailbox, &them);
+                    let parts: Vec<Part> = match (them.fingerprint, me.mailbox.fingerprint) {
+                        (Some(a), Some(b)) => vec![Part::SetOffer(a, b, None)],
+                        _ => Vec::new(),
+                    };
+                    let (_, left) = self
+                        .write_left(store, &parts, &[(&me.mailbox, &them)], now)
+                        .map_err(store_failed)?;
+                    self.tell_left(&left[0], [true, false]);
                     false
                 }
                 // On an edge a reset left inactive the offer goes with the
@@ -1343,11 +1433,11 @@ impl Core {
                         declined: (!accept).then(|| now + self.messaging_policy.request_retention),
                         ..Ending::default()
                     };
-                    store
-                        .end_friendship(&me.mailbox, &them, &end)
+                    let end = Part::EndFriendship(me.mailbox.clone(), them.clone(), end);
+                    let (_, left) = self
+                        .write_left(store, &[end], &[(&me.mailbox, &them)], now)
                         .map_err(store_failed)?;
-                    self.tell_entry(&them, &me.mailbox);
-                    self.tell_entry(&me.mailbox, &them);
+                    self.tell_left(&left[0], [true, true]);
                     false
                 }
             };
@@ -1423,45 +1513,32 @@ impl Core {
             .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?;
         if mine.as_ref().is_some_and(|m| m.friendship.is_some()) {
-            let taken = match (withdraw, device) {
-                (Some(bytes), Some(Ok(device))) => self
-                    .take_withdrawal(store, &me.mailbox, &device, &them, bytes, false)
-                    .map(Some),
-                (_, Some(Err(e))) => Err(e),
-                _ => Ok(None),
-            };
-            // A store's failure is not a refusal: nothing ends, so a retry
-            // finds the friendship still there to withdraw.
-            if matches!(taken, Err(MessagingError::ServerError)) {
-                return Err(MessagingError::ServerError);
-            }
-            // Answered from what the withdrawal committed: one that ended
-            // the friendship is the whole removal, and one that leaves each
-            // party's presentation standing keeps it, told to both again
-            // (§4.3). Otherwise it ends here alone.
-            match &taken {
-                Ok(Some((_, portable::Applied::Ended))) => return Ok(()),
-                Ok(Some((_, portable::Applied::Standing([x, y])))) => {
-                    self.tell_entry(x, y);
-                    self.tell_entry(y, x);
-                    return Ok(());
-                }
-                _ => {}
-            }
+            // What it ends here alone, read first: written with a
+            // withdrawal that does not end the friendship, in its step.
             let mut end = self
                 .end_here(store, &me.mailbox, &them, &[])
                 .map_err(store_failed)?;
             end.friendship = true;
             end.hold = Some(now + p.request_retention);
-            let ended = self
+            let taken = match (withdraw, device) {
+                (Some(bytes), Some(Ok(device))) => self
+                    .take_withdrawal(store, &me.mailbox, &device, &them, bytes, Some(end.clone()))
+                    .map(Some),
+                (_, Some(Err(e))) => Err(e),
+                _ => Ok(None),
+            };
+            // A refused withdrawal ends the friendship here alone; a
+            // store's failure, nothing, so a retry finds it still there.
+            match taken {
+                Err(MessagingError::ServerError) => return Err(MessagingError::ServerError),
+                Ok(Some(_)) => return Ok(()),
+                _ => {}
+            }
+            let (ended, left) = self
                 .end_friendship(store, &me.mailbox, &them, &end)
                 .map_err(store_failed)?;
-            if let Some(e) = ended.ended {
-                let withdraw = taken
-                    .as_ref()
-                    .ok()
-                    .and_then(|t| t.as_ref().map(|(w, _)| w.clone()));
-                self.edge_ended(&e, withdraw.as_deref());
+            if ended.ended.is_some() {
+                self.edge_ended_left(&left, None);
             }
             return taken.map(|_| ());
         }
@@ -1470,13 +1547,11 @@ impl Core {
                 pending: true,
                 ..Ending::default()
             };
-            store
-                .end_friendship(&them, &me.mailbox, &cancel)
+            let cancel = Part::EndFriendship(them.clone(), me.mailbox.clone(), cancel);
+            let (_, left) = self
+                .write_left(store, &[cancel], &[(&me.mailbox, &them)], now)
                 .map_err(store_failed)?;
-            self.tell_entry(&me.mailbox, &them);
-            if sent.upgrade || sent.delivered {
-                self.tell_entry(&them, &me.mailbox);
-            }
+            self.tell_left(&left[0], [true, sent.upgrade || sent.delivered]);
             return Ok(());
         }
         let asked = store
@@ -1511,7 +1586,7 @@ impl Core {
         store
             .set_alias(&me.mailbox, &them, alias)
             .map_err(store_failed)?;
-        self.tell_entry(&me.mailbox, &them);
+        self.tell_entry("an alias", &me.mailbox, &them);
         Ok(())
     }
 
@@ -1552,23 +1627,34 @@ impl Core {
                 approvals.push(id);
             }
         }
-        let id = store
-            .befriend_dropping(a, b, now, id, drop)
+        let parts = portable::befriend_parts(a, b, now, id, drop);
+        let (did, left) = self
+            .write_left(store, &parts, &[(a, b)], now)
             .map_err(store_failed)?;
+        let Some(Did::Friends(id)) = did.first().cloned() else {
+            unreachable!("a befriending answers its id");
+        };
         if !drop.is_empty() {
             self.unjudge(store, [a.fingerprint, b.fingerprint].into_iter().flatten());
         }
-        self.drop_offers(store, a, b);
-        self.befriended(a, b, id, &approvals);
+        self.befriended(&left[0], id, &approvals);
         Ok(id)
+    }
+
+    /// An edge a step ended, told to both from what the step left, with
+    /// the withdrawal that ended it where one did.
+    fn edge_ended_left(&self, left: &Left, withdraw: Option<&[u8]>) {
+        let [a, b] = &left.pair;
+        self.roster.lock().unwrap().friends_changed(a, b, false);
+        self.tell_left_with(left, [true, true], withdraw);
     }
 
     /// What follows `a` and `b` being made friends under `id`, in place of
     /// the `approvals` it ended: presence, their entries, and what waited.
-    fn befriended(&self, a: &Mailbox, b: &Mailbox, id: RelationId, approvals: &[RelationId]) {
+    fn befriended(&self, left: &Left, id: RelationId, approvals: &[RelationId]) {
+        let [a, b] = &left.pair;
         self.roster.lock().unwrap().friends_changed(a, b, true);
-        self.tell_entry(a, b);
-        self.tell_entry(b, a);
+        self.tell_left(left, [true, true]);
         self.friendship_releases(a, b, id, approvals);
     }
 
@@ -1587,9 +1673,11 @@ impl Core {
             declined: Some(now + self.messaging_policy.request_retention),
             ..Ending::default()
         };
-        store.end_friendship(me, them, &end).map_err(store_failed)?;
-        self.tell_entry(me, them);
-        self.tell_entry(them, me);
+        let end = Part::EndFriendship(me.clone(), them.clone(), end);
+        let (_, left) = self
+            .write_left(store, &[end], &[(me, them)], now)
+            .map_err(store_failed)?;
+        self.tell_left(&left[0], [true, true]);
         Ok(())
     }
 
@@ -1683,17 +1771,17 @@ impl Core {
             // one is never in 800 or 801 (§4.6).
             end.block = Some(at);
             end.friendship = true;
-            let unfriended = self.end_friendship(store, blocker, blocked, &end)?.ended;
+            let unfriended = self.end_friendship(store, blocker, blocked, &end)?.0.ended;
             if let Some(e) = &unfriended {
                 let [a, b] = &e.parties;
                 self.roster.lock().unwrap().friends_changed(a, b, false);
             }
             if unfriended.is_some() || shown {
-                self.tell_entry(blocked, blocker);
+                self.tell_entry("a block", blocked, blocker);
             }
             self.block_deletes_requests(blocker, blocked);
         }
-        self.tell_entry(blocker, blocked);
+        self.tell_entry("a block", blocker, blocked);
         Ok(())
     }
 
@@ -1764,7 +1852,7 @@ impl Core {
                 fix(ending
                     .and_then(|end| self.end_friendship(store, x, y, &end))
                     .map(|ended| {
-                        if let Some(e) = ended.ended {
+                        if let Some(e) = ended.0.ended {
                             let [a, b] = &e.parties;
                             self.roster.lock().unwrap().friends_changed(a, b, false);
                         }
@@ -1782,11 +1870,11 @@ impl Core {
             }
         }
         for (me, other) in told {
-            self.tell_entry(&me, &other);
+            self.tell_entry("a merge", &me, &other);
             // With no row of the friend's to give the login a rotation's
             // successor is known by, there is no entry to name.
             if !me.login.is_empty() {
-                self.tell_entry(&other, &me);
+                self.tell_entry("a merge", &other, &me);
             }
         }
     }

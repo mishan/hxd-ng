@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 use crate::ending::EndedBy;
+use crate::messaging::Sweep;
 use crate::push::Unrevoked;
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
@@ -327,6 +328,9 @@ impl Core {
         };
         let keys = devices.iter().map(|(_, d)| Unrevoked::LocalDevice(*d));
         let ids = identities.iter().map(|i| Unrevoked::LocalIdentity(*i));
+        // The identity each device signed offers for, read while its
+        // sessions are still there to show it.
+        let signers = self.signers_of(devices.iter().map(|(_, d)| *d));
         // Sessions first: the lists already hide the rows, and the
         // deletes may wait on registrations.
         let ended = match list.is_empty() {
@@ -337,9 +341,25 @@ impl Core {
         self.take_revoked(keys.chain(ids).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
-            self.drop_revoked_offers(&identities);
+            let devices = signers.into_iter().map(|(identity, device)| Sweep::Device {
+                identity,
+                device,
+                operator: true,
+            });
+            let identities = identities.iter().map(|i| Sweep::Identity {
+                identity: *i,
+                operator: true,
+            });
+            self.sweep_offers(devices.chain(identities).collect());
         }
         ended
+    }
+
+    /// Whether `identity` is revoked, by the operator or a registrar: no
+    /// offer from or to it is kept.
+    pub(crate) fn identity_revoked(&self, identity: &[u8; 32]) -> bool {
+        let r = self.revoked.read().unwrap();
+        r.local.identities.contains(identity) || r.published.identities.contains(identity)
     }
 
     /// The identity keys of every session on the roster, live or
@@ -426,7 +446,18 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
-            self.drop_revoked_offers(&newly);
+            let devices = devices.iter().filter_map(|(i, d)| {
+                i.map(|identity| Sweep::Device {
+                    identity,
+                    device: *d,
+                    operator: false,
+                })
+            });
+            let identities = newly.iter().map(|i| Sweep::Identity {
+                identity: *i,
+                operator: false,
+            });
+            self.sweep_offers(devices.chain(identities).collect());
         }
         self.reconcile_due(list.floors.keys().copied());
         ended

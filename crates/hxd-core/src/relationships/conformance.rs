@@ -8,9 +8,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Birthdate, Ending, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry,
-    MessagingAccount, PendingOut, Presentation, Profile, Recorded, RelationshipStore, RequestKind,
-    Requester, StoredOffer,
+    AccountUpdate, Birthdate, Charge, Ending, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry,
+    MessagingAccount, PendingOut, Presentation, Profile, Recorded, RelationshipStore, Report,
+    RequestKind, Requester, StoredOffer,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent};
 
@@ -62,6 +62,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_row_left_with_nothing_is_reclaimed(&*new_store());
     a_record_is_kept_while_its_upgrade_is_pending(&*new_store());
     a_merged_pending_out_goes_with_its_record(&*new_store());
+    an_upgrade_goes_where_a_rotation_keeps_another_record(&*new_store());
+    an_ask_counts_its_request_in_the_same_step(&*new_store());
+    #[cfg(any(test, feature = "test-support"))]
+    a_write_is_whole_or_not_at_all_and_reports_what_it_left(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
 }
@@ -1914,8 +1918,15 @@ fn asked_with(s: &dyn RelationshipStore, from: u8, to: u8, upgrade: bool) -> Sto
         upgrade,
         ..pending(1, 1000, true)
     };
-    s.ask(&mb(from), &mb(to), &shown, upgrade.then_some(&offer))
-        .unwrap();
+    s.ask(
+        &mb(from),
+        &mb(to),
+        &shown,
+        upgrade.then_some(&offer),
+        None,
+        &Report::none(),
+    )
+    .unwrap();
     offer
 }
 
@@ -1983,6 +1994,90 @@ fn a_reset_record_lapses_unless_an_offer_waits_on_it(s: &dyn RelationshipStore) 
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn a_write_is_whole_or_not_at_all_and_reports_what_it_left(s: &dyn RelationshipStore) {
+    use super::{Did, Part};
+    let case = "a_write_is_whole_or_not_at_all_and_reports_what_it_left";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let offer = StoredOffer {
+        offer: vec![1, 2],
+        lapses_at: at(1000),
+    };
+    let parts = |fail: bool| {
+        let mut parts = vec![
+            Part::Present(presentation(2, 1, 2, 7)),
+            Part::SetOffer(fp(1), fp(2), Some(offer.clone())),
+        ];
+        if fail {
+            parts.push(Part::Fail);
+        }
+        parts
+    };
+    s.update_account(
+        &mb(2),
+        &AccountUpdate {
+            shown_text: Some(Some("away".into())),
+            ..AccountUpdate::default()
+        },
+    )
+    .unwrap();
+    let report = Report::of(&mb(1), &mb(2), at(10));
+    assert!(s.write(&parts(true), &report).is_err(), "{case}: failed");
+    assert_eq!(
+        s.presentation(&fp(2), &fp(1)).unwrap(),
+        None,
+        "{case}: nothing"
+    );
+    assert_eq!(
+        s.offer(&fp(1), &fp(2), at(10)).unwrap(),
+        None,
+        "{case}: nothing"
+    );
+    let (did, left) = s.write(&parts(false), &report).unwrap();
+    assert_eq!(did, [Did::Replaced(None), Did::Nothing], "{case}: answered");
+    let left = &left[0];
+    assert_eq!(left.pair, [mb(1), mb(2)], "{case}");
+    assert_eq!(
+        left.presentations,
+        [None, Some(presentation(2, 1, 2, 7))],
+        "{case}"
+    );
+    assert_eq!(left.offers, [Some(offer.clone()), None], "{case}");
+    assert_eq!(left.shown, [None, Some("away".into())], "{case}");
+    assert_eq!(left.rows, [None, None], "{case}: no rows");
+}
+
+fn an_ask_counts_its_request_in_the_same_step(s: &dyn RelationshipStore) {
+    let case = "an_ask_counts_its_request_in_the_same_step";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let charge = Charge {
+        entry: entry(RequestKind::Friend, Some(&mb(1)), &mb(2), 1),
+        dropped: true,
+    };
+    let shown = PendingOut {
+        delivered: false,
+        ..pending(1, 500, true)
+    };
+    let report = Report::of(&mb(1), &mb(2), at(10));
+    let left = s
+        .ask(&mb(1), &mb(2), &shown, None, Some(&charge), &report)
+        .unwrap();
+    assert_eq!(left.len(), 1, "{case}: the pair asked of");
+    assert_eq!(left[0].pair, [mb(1), mb(2)], "{case}");
+    let sent = left[0].rows[0].as_ref().and_then(|r| r.pending_out.clone());
+    assert_eq!(
+        sent.map(|p| p.delivered),
+        Some(false),
+        "{case}: as it left it"
+    );
+    assert_eq!(left[0].rows[1], None, "{case}: no row the other way");
+    let from = Requester::Account(mb(1));
+    let counted = s.requests_to(&from, &mb(2), RequestKind::Friend, at(0));
+    assert_eq!(counted.unwrap(), 1, "{case}: in the ledger");
+    assert_eq!(s.requests_listed(&mb(2)).unwrap(), 1, "{case}: dropped");
+    assert!(asked(s, 1, 2, 10).is_some(), "{case}: asked");
+}
+
 fn a_requests_offer_lapses_and_goes_with_its_request(s: &dyn RelationshipStore) {
     let case = "a_requests_offer_lapses_and_goes_with_its_request";
     let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
@@ -1994,7 +2089,8 @@ fn a_requests_offer_lapses_and_goes_with_its_request(s: &dyn RelationshipStore) 
         offer: Some(offer.clone()),
         ..pending(1, 500, true)
     };
-    s.ask(&mb(1), &mb(2), &shown, None).unwrap();
+    s.ask(&mb(1), &mb(2), &shown, None, None, &Report::none())
+        .unwrap();
     assert_eq!(asked(s, 1, 2, 10), Some((true, Some(vec![1]))), "{case}");
     assert_eq!(
         s.offers_from(&fp(1), at(10)).unwrap(),
@@ -2298,7 +2394,8 @@ fn a_record_is_kept_while_its_upgrade_is_pending(s: &dyn RelationshipStore) {
         offer: vec![1],
         lapses_at: at(25),
     };
-    s.ask(&mb(1), &mb(2), &shown, Some(&offer)).unwrap();
+    s.ask(&mb(1), &mb(2), &shown, Some(&offer), None, &Report::none())
+        .unwrap();
     assert_eq!(
         s.lapse_resets(at(20), at(30)).unwrap(),
         0,
@@ -2309,6 +2406,30 @@ fn a_record_is_kept_while_its_upgrade_is_pending(s: &dyn RelationshipStore) {
         1,
         "{case}: until the pending out lapses"
     );
+}
+
+fn an_upgrade_goes_where_a_rotation_keeps_another_record(s: &dyn RelationshipStore) {
+    let case = "an_upgrade_goes_where_a_rotation_keeps_another_record";
+    // 1's upgrade offer to 2, on 2's record; 1 rotates to 5, where 2 kept
+    // a record of another friendship: that one stays, and the upgrade
+    // taken on the first goes with it. 3's to 4, on a record that moves
+    // whole with 3's rotation to 6, stays.
+    let record = |p: u8, o: u8, bytes: u8| Presentation {
+        friendship: None,
+        reset: Some(vec![bytes; 3]),
+        ..presentation(p, o, bytes, 7)
+    };
+    s.present(&record(2, 1, 2)).unwrap();
+    asked_with(s, 1, 2, true);
+    s.present(&record(2, 5, 9)).unwrap();
+    s.rotate(&fp(1), &fp(5)).unwrap();
+    assert_eq!(asked(s, 5, 2, 10), None, "{case}: another record");
+    assert_eq!(s.offer(&fp(5), &fp(2), at(10)).unwrap(), None, "{case}");
+    s.present(&record(4, 3, 4)).unwrap();
+    asked_with(s, 3, 4, true);
+    s.rotate(&fp(3), &fp(6)).unwrap();
+    assert!(asked(s, 6, 4, 10).is_some(), "{case}: its own record");
+    assert!(s.offer(&fp(6), &fp(4), at(10)).unwrap().is_some(), "{case}");
 }
 
 fn a_merged_pending_out_goes_with_its_record(s: &dyn RelationshipStore) {

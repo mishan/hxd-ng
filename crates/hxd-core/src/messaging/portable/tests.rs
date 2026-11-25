@@ -1349,7 +1349,7 @@ fn a_remade_friendship_is_recorded_whole_or_not_at_all() {
     let wall = s.core.clock().wall();
     let row = |x: &Person, y: &Person| s.rel.presentation(&fp(x), &fp(y)).unwrap();
 
-    s.fail.fail_next("present_befriending");
+    s.fail.fail_next("write");
     assert_eq!(
         s.core.friend_answer(b, "alice", true, Some(remade.clone())),
         Err(MessagingError::ServerError)
@@ -2095,12 +2095,12 @@ fn a_presentation_replaced_takes_the_other_partys_only_it_held() {
     let (a2, _) = device(&s.core, "alice", &alice, renewed);
     let o = offer(&alice, renewed, &bob, now() - 30);
     let f2 = accept(&o, &bob, 0, now() - 30);
-    s.fail.fail_next("drop_presentations");
+    s.fail.fail_next("write");
     assert_eq!(
         s.core.friendships_present(a2, vec![], vec![f2.clone()]),
         Err(MessagingError::ServerError)
     );
-    assert_eq!(s.fail.failed(), Some("drop_presentations"));
+    assert_eq!(s.fail.failed(), Some("write"));
     let (_, replaced) = s.core.friendships_present(a2, vec![], vec![f2]).unwrap();
     assert!(ok_all(&replaced), "{replaced:?}");
     assert!(
@@ -2243,7 +2243,7 @@ fn a_dropped_presentation_ends_its_edge_where_a_party_takes_no_part() {
 
 #[test]
 fn a_removal_that_fails_leaves_the_friendship_whole() {
-    for method in ["presentation", "withdrawals", "end_friendship"] {
+    for method in ["presentation", "withdrawals", "write"] {
         let (alice, bob) = (person(1), person(2));
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
@@ -2268,7 +2268,7 @@ fn a_removal_that_fails_leaves_the_friendship_whole() {
 
 #[test]
 fn a_block_that_fails_blocks_nothing() {
-    for method in ["presentation", "end_friendship"] {
+    for method in ["presentation", "write"] {
         let (alice, bob) = (person(1), person(2));
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let (a, _, _, _, _) = made(&s, &alice, &bob);
@@ -2299,6 +2299,7 @@ fn an_entry_whose_read_fails_is_not_told() {
         let (_, mut ra, _, _, _) = made(&s, &alice, &bob);
         s.fail.fail_nth(nth);
         s.core.tell_entry(
+            "a test",
             &Mailbox::identified("alice", fp(&alice)),
             &Mailbox::identified("bob", fp(&bob)),
         );
@@ -2309,7 +2310,7 @@ fn an_entry_whose_read_fails_is_not_told() {
 
 #[test]
 fn a_withdrawal_retried_after_a_failure_ends_a_friendship_made_while_the_clock_ran_ahead() {
-    for method in ["presentation", "end_friendship"] {
+    for method in ["presentation", "write"] {
         let (alice, bob) = (person(1), person(2));
         let mut s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         s.core.clock().advance(std::time::Duration::from_secs(3600));
@@ -2355,7 +2356,7 @@ fn a_merge_whose_ending_fails_changes_and_tells_nothing() {
         let e = r.presences.by.get(&Key::of(&ma));
         e.is_some_and(|e| e.friends.contains(&Key::of(&mb)))
     };
-    s.fail.fail_next("end_friendship");
+    s.fail.fail_next("write");
     s.core.after_merge(&s.core.friend_writes(), &ma);
     assert!(s.fail.failed().is_some());
     assert!(friendship_of(&s, &alice, &bob).is_some());
@@ -2449,6 +2450,63 @@ fn a_reset_of_both_presentations_ends_the_pair_in_one_step() {
             "one drop, presenting {on_presenting}"
         );
     }
+}
+
+/// A directory whose account for one key loses the messaging bit when
+/// told to.
+struct Unmessaging(Directory, [u8; 32], Arc<AtomicBool>);
+
+impl Unmessaging {
+    fn access(&self, who: &Mailbox, bits: crate::AccessBits) -> crate::AccessBits {
+        match who.fingerprint == Some(self.1) && self.2.load(Ordering::Relaxed) {
+            true => crate::AccessBits::empty(),
+            false => bits,
+        }
+    }
+}
+
+impl crate::AccountDirectory for Unmessaging {
+    fn inbox_account(&self, login: &str) -> Option<Mailbox> {
+        self.0.inbox_account(login)
+    }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<crate::AccessBits> {
+        self.0.mailbox_access(who).map(|b| self.access(who, b))
+    }
+
+    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, crate::AccessBits)> {
+        let (m, b) = self.0.account_by_key(fp)?;
+        let b = self.access(&m, b);
+        Some((m, b))
+    }
+}
+
+#[test]
+fn a_withdrawal_that_ends_an_edge_tells_it_where_the_other_party_takes_no_part() {
+    let (alice, bob) = (person(1), person(2));
+    let lost = Arc::new(AtomicBool::new(false));
+    let dir = Directory(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ]);
+    let s = server_of(
+        Unmessaging(dir, fp(&alice), lost.clone()),
+        policy(),
+        crate::InboxPolicy::default(),
+        None,
+    );
+    let (_, _, b, mut rb, _) = made(&s, &alice, &bob);
+    lost.store(true, Ordering::Relaxed);
+    let w = withdraw(&bob, 0, &alice, now());
+    let (taken, _) = s.core.friendships_present(b, vec![w], vec![]).unwrap();
+    assert!(ok_all(&taken));
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    assert!(
+        told(&mut rb)
+            .iter()
+            .any(|(login, state, ..)| login == "alice" && *state == RosterState::Removed),
+        "the edge it ended told to the party that takes part"
+    );
 }
 
 #[test]
@@ -4329,7 +4387,94 @@ fn offers_a_revocation_could_not_read_are_swept_after_a_backoff() {
 
 #[test]
 fn offers_a_revocation_could_not_drop_are_dropped_after_a_backoff() {
-    sweep_owed("drop_offers", &[(0, Owed::Waits), (61, Owed::Sweeps)]);
+    sweep_owed("write", &[(0, Owed::Waits), (61, Owed::Sweeps)]);
+}
+
+#[test]
+fn offers_an_identity_revocation_could_not_drop_are_dropped_after_a_backoff() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let offered = || {
+        let roster = s.core.friends_roster(b).unwrap();
+        roster
+            .iter()
+            .find(|e| e.login == "alice")
+            .unwrap()
+            .offer
+            .is_some()
+    };
+    s.fail.fail_next("write");
+    drop(s.core.set_published_revocations(Published {
+        identities: [fp(&alice)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert_eq!(s.fail.failed(), Some("write"));
+    assert!(offered(), "kept, and owed");
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.reconcile_due(Vec::new());
+    assert!(!offered(), "dropped once its backoff is over");
+}
+
+#[test]
+fn an_owed_sweep_whose_revocation_lifted_drops_nothing() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let device_fp = Fingerprint::of(&alice.devices[0].0.public()).0;
+    s.fail.fail_next("write");
+    drop(s.core.set_published_revocations(Published {
+        devices: [(fp(&alice), device_fp)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert_eq!(s.fail.failed(), Some("write"));
+    // Lifted, and the device asks again: what the sweep owed is moot.
+    drop(s.core.set_published_revocations(Published {
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    s.core.friend_remove(a, "bob").unwrap();
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.reconcile_due(Vec::new());
+    let roster = s.core.friends_roster(b).unwrap();
+    let e = roster.iter().find(|e| e.login == "alice").unwrap();
+    assert!(e.offer.is_some(), "an offer signed after the lift kept");
+}
+
+#[test]
+fn a_signed_acceptance_of_an_upgrade_whose_offer_lapsed_is_stale() {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, _), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    let o = offer(&alice, renewed, &bob, now() - 2);
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o.clone())),
+        Ok(RosterState::PendingOut)
+    );
+    s.core
+        .clock()
+        .advance(std::time::Duration::from_secs(2 * DAY));
+    assert_eq!(
+        s.core
+            .friend_answer(b, "alice", true, Some(accept(&o, &bob, 0, now()))),
+        Err(MessagingError::Stale),
+        "its offer lapsed while its pending out stands"
+    );
 }
 
 #[test]

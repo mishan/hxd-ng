@@ -4730,6 +4730,51 @@ mod tests {
         hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    /// Every row of every table, for a test to tell whether an act
+    /// changed any of it.
+    fn dump(store: &SqliteStore) -> String {
+        let conn = store.conn.lock().unwrap();
+        let mut tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tables.retain(|t| !t.starts_with("sqlite_"));
+        let mut out = String::new();
+        for t in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {t}")).unwrap();
+            let n = stmt.column_count();
+            let mut rows: Vec<String> = stmt
+                .query_map([], |r| {
+                    (0..n)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .map(|row| format!("{t} {:?}\n", row.unwrap()))
+                .collect();
+            rows.sort();
+            out.extend(rows);
+        }
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20))]
+        #[test]
+        fn is_left_as_it_was_by_a_friendship_step_that_fails(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..9)
+        ) {
+            hxd_core::messaging::sequence::run_failing_each_call(&|| {
+                let store = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+                let dumped = store.clone();
+                (store as _, Box::new(move || dump(&dumped)) as hxd_core::messaging::sequence::Dump)
+            }, &steps);
+        }
+    }
+
     #[test]
     fn keeps_the_friendship_sequences_found_before() {
         for steps in hxd_core::messaging::sequence::FOUND {

@@ -7,9 +7,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use super::{
-    AccountUpdate, Ended, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry, MessagingAccount,
-    PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore,
-    RequestKind, Requester, RotationRecord, StoredOffer,
+    AccountUpdate, Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry, Left,
+    MessagingAccount, Part, PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship,
+    RelationshipStore, Report, RequestKind, Requester, RotationRecord, StoredOffer,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
@@ -53,12 +53,17 @@ enum Plan {
     Next(&'static str, usize),
     /// This many writes from now, the last fails.
     NthWrite(usize),
+    /// The next `write` fails after this many of its parts, all or
+    /// nothing.
+    Part(usize),
 }
 
 pub(crate) struct Failing {
     inner: Arc<dyn RelationshipStore>,
     plan: Mutex<Plan>,
     failed: Mutex<Option<&'static str>>,
+    /// The methods called since the plan was last set, in order.
+    calls: Mutex<Vec<&'static str>>,
     /// Held once its call is made, at the method's name.
     pub(crate) park: Park,
 }
@@ -124,6 +129,7 @@ impl Failing {
             inner,
             plan: Mutex::new(Plan::Off),
             failed: Mutex::new(None),
+            calls: Mutex::new(Vec::new()),
             park: Park::default(),
         }
     }
@@ -131,6 +137,7 @@ impl Failing {
     /// The `n`-th call from now fails, whichever method it is; 1 is the
     /// next.
     pub(crate) fn fail_nth(&self, n: usize) {
+        self.calls.lock().unwrap().clear();
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::Nth(n) };
     }
 
@@ -151,12 +158,29 @@ impl Failing {
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::NthWrite(n) };
     }
 
+    /// The next `write` fails after `k` of its parts, if it has as many.
+    pub(crate) fn fail_write_part(&self, k: usize) {
+        self.calls.lock().unwrap().clear();
+        *self.plan.lock().unwrap() = Plan::Part(k);
+    }
+
+    /// The writes called since the plan was last set, in order.
+    pub(crate) fn writes(&self) -> Vec<&'static str> {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|m| !READS.contains(m))
+            .copied()
+            .collect()
+    }
+
     /// The method whose call failed since this was last asked.
     pub(crate) fn failed(&self) -> Option<&'static str> {
         self.failed.lock().unwrap().take()
     }
 
     fn call(&self, method: &'static str) -> Result<(), StoreError> {
+        self.calls.lock().unwrap().push(method);
         let mut plan = self.plan.lock().unwrap();
         let fails = match &mut *plan {
             Plan::Off => false,
@@ -176,6 +200,7 @@ impl Failing {
                 *n == 0
             }
             Plan::NthWrite(_) => false,
+            Plan::Part(_) => false,
         };
         if fails {
             *plan = Plan::Off;
@@ -189,6 +214,24 @@ impl Failing {
 macro_rules! through {
     ($(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
         impl RelationshipStore for Failing {
+            fn write(&self, parts: &[Part], report: &Report) -> Result<(Vec<Did>, Vec<Left>), StoreError> {
+                self.call("write")?;
+                let mut plan = self.plan.lock().unwrap();
+                let parts = match *plan {
+                    Plan::Part(k) if k <= parts.len() => {
+                        *plan = Plan::Off;
+                        *self.failed.lock().unwrap() = Some("write");
+                        let mut failing = parts.to_vec();
+                        failing.insert(k, Part::Fail);
+                        failing
+                    }
+                    _ => parts.to_vec(),
+                };
+                drop(plan);
+                let out = self.inner.write(&parts, report);
+                self.park.at("write");
+                out
+            }
             $(fn $name(&self, $($arg: $ty),*) -> $ret {
                 self.call(stringify!($name))?;
                 let out = self.inner.$name($($arg),*);
@@ -243,7 +286,7 @@ through! {
     fn withdrawals_by(owner: &[u8; 32]) -> Result<Vec<HeldWithdrawal>, StoreError>;
     fn drop_withdrawal(owner: &[u8; 32], pair: &[u8; 32], party: &[u8; 32], withdrawal: &[u8]) -> Result<(), StoreError>;
     fn set_offer(owner: &[u8; 32], other: &[u8; 32], offer: Option<&StoredOffer>) -> Result<(), StoreError>;
-    fn ask(owner: &Mailbox, other: &Mailbox, pending: &PendingOut, upgrade: Option<&StoredOffer>) -> Result<(), StoreError>;
+    fn ask(owner: &Mailbox, other: &Mailbox, pending: &PendingOut, upgrade: Option<&StoredOffer>, charge: Option<&Charge>, report: &Report) -> Result<Vec<Left>, StoreError>;
     fn answer_reset(drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)], record: Option<&Presentation>, upgrade: Option<(&Mailbox, &Mailbox)>) -> Result<(Vec<Ended>, Option<Presentation>), StoreError>;
     fn drop_offers(pairs: &[FpPair]) -> Result<(), StoreError>;
     fn drop_offers_naming(fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError>;

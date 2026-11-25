@@ -2285,6 +2285,11 @@ pub struct Core {
     /// ever shows to.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) upgrades_off: std::sync::atomic::AtomicBool,
+    /// Entries told from a read after the step that changed them, which
+    /// the sequence harness holds to the acts not yet telling from what
+    /// their step left.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) told_by_reading: Mutex<Vec<&'static str>>,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

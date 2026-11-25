@@ -361,6 +361,115 @@ pub enum Recorded {
     Retry(Box<LedgerEntry>),
 }
 
+/// The pairs a step reports what it left of, read at `now` inside the
+/// step, so that what their parties are told comes from what the step
+/// left and never from a read after it.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub pairs: Vec<(Mailbox, Mailbox)>,
+    pub now: SystemTime,
+}
+
+impl Report {
+    /// No pair: for a caller that tells nothing from the step.
+    pub fn none() -> Report {
+        Report {
+            pairs: Vec::new(),
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    pub fn of(a: &Mailbox, b: &Mailbox, now: SystemTime) -> Report {
+        Report {
+            pairs: vec![(a.clone(), b.clone())],
+            now,
+        }
+    }
+}
+
+/// What a step left of a pair, each field the pair's first party's
+/// first: each party's row toward the other, its presentation for the
+/// other, its upgrade offer to the other, and the text its account was
+/// last shown with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Left {
+    pub pair: [Mailbox; 2],
+    pub rows: [Option<Relationship>; 2],
+    pub presentations: [Option<Presentation>; 2],
+    pub offers: [Option<StoredOffer>; 2],
+    pub shown: [Option<String>; 2],
+}
+
+/// The presentations of a pair to drop, as
+/// [`RelationshipStore::drop_presentations`] takes them.
+pub type PairDrop = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
+
+/// One of the store's own writes, as a part of [`RelationshipStore::write`]:
+/// each does what the method it is named for does.
+#[derive(Debug, Clone)]
+pub enum Part {
+    DropPresentations([u8; 32], [u8; 32], Vec<[u8; 32]>),
+    EndFriendship(Mailbox, Mailbox, Ending),
+    Present(Presentation),
+    PresentBefriending {
+        a: Mailbox,
+        b: Mailbox,
+        rows: Vec<Presentation>,
+        befriend: Option<Option<RelationId>>,
+        at: SystemTime,
+    },
+    AnswerReset {
+        drops: Vec<PairDrop>,
+        record: Option<Presentation>,
+        upgrade: Option<(Mailbox, Mailbox)>,
+    },
+    SetOffer([u8; 32], [u8; 32], Option<StoredOffer>),
+    DropOffers(Vec<FpPair>),
+    DropOffersNaming([u8; 32]),
+    BefriendDropping {
+        a: Mailbox,
+        b: Mailbox,
+        at: SystemTime,
+        id: Option<RelationId>,
+        drop: Vec<[u8; 32]>,
+    },
+    KeepWithdrawal(HeldWithdrawal, usize),
+    DropWithdrawal([u8; 32], [u8; 32], [u8; 32], Vec<u8>),
+    /// Fails the write where it stands, for a test of all or nothing.
+    #[cfg(any(test, feature = "test-support"))]
+    Fail,
+}
+
+impl Part {
+    /// Whether this part fails its write: never outside a test.
+    pub fn fails(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        return matches!(self, Part::Fail);
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
+    }
+}
+
+/// What a [`Part`] answered, as its method answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Did {
+    Nothing,
+    Ended(Ended),
+    Replaced(Option<Presentation>),
+    Befriended(Vec<Option<Presentation>>, Option<RelationId>),
+    Reset(Vec<Ended>, Option<Presentation>),
+    Named(Vec<FpPair>),
+    Friends(RelationId),
+}
+
+/// A request counted as [`RelationshipStore::ask`] records it: its ledger
+/// entry, and whether its target's full requests dropped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Charge {
+    pub entry: LedgerEntry,
+    pub dropped: bool,
+}
+
 /// A date of birth whose parts are each optional: 0 is "not given".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Birthdate {
@@ -878,13 +987,23 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// with the offer it carries, or, with `upgrade` and `pending.upgrade`,
     /// an upgrade offer and the pending out it shows `owner`. Whatever
     /// upgrade offer waited from `owner` to `other` goes, or is replaced.
+    /// With `charge`, the request is counted in the ledger in the same
+    /// step, and one `other`'s full requests dropped counted for it.
     fn ask(
         &self,
         owner: &Mailbox,
         other: &Mailbox,
         pending: &PendingOut,
         upgrade: Option<&StoredOffer>,
-    ) -> Result<(), StoreError>;
+        charge: Option<&Charge>,
+        report: &Report,
+    ) -> Result<Vec<Left>, StoreError>;
+
+    /// `parts`, in order, as one step, and what `report` asks of as that
+    /// step left it, read inside it: what each part answered, and the
+    /// pairs. The way an act that reads everything first writes once and
+    /// tells from what it wrote.
+    fn write(&self, parts: &[Part], report: &Report) -> Result<(Vec<Did>, Vec<Left>), StoreError>;
 
     /// A presentation answered `Reset` (§4.3 step 4), as one step: what
     /// `drops` names dropped as [`RelationshipStore::drop_presentations`]
