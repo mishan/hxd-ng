@@ -335,6 +335,10 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Fixed
 
+- Metrics: the frames a server link receives are counted in
+  `hxd_frames_total` by their transaction type (`type="900"` to
+  `"915"`) rather than as `type="other"`.
+
 - Portable friendships end in one store write: a removal, a withdrawal
   or a dropped presentation that fails part way changes nothing, Remove
   Friend answers a server error rather than OK over half of one, and a

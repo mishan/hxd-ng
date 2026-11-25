@@ -685,6 +685,7 @@ fn type_label(ty: u32) -> Kind<'static> {
         || friends::handles(ty)
         || emoji::handles(ty)
         || reactions::handles(ty)
+        || crate::peer::TYPES.contains(&ty)
         || ty == media::trans::UPLOAD_MEDIA
         || ty == media::trans::DOWNLOAD_MEDIA
         || matches!(ty, gif_icons::GET_LIST | gif_icons::GET | gif_icons::SET);
