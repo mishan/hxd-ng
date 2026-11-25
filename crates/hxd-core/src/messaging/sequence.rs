@@ -417,21 +417,10 @@ struct Run {
 }
 
 /// Where tells are still read after the step that changed what they
-/// tell, so that a read failing there may cost one: what the follow-up to
-/// #474 moves onto telling from what the step left. Every other tell is
+/// tell, so that a read failing there may cost one: a rotation's, the
+/// last to move onto telling from what the step left. Every other tell is
 /// made from that, and one read after its step fails the run.
-const TELLS_BY_READING: &[&str] = &[
-    "an unblock",
-    "an alias",
-    "a merge",
-    "a rotation's merge",
-    "a floor's pass",
-    "an offer below a floor",
-    "an orphan judged",
-    "a removal by key",
-    "a revoked device's presentation",
-    "an unlinked identity's presentation",
-];
+const TELLS_BY_READING: &[&str] = &["a merge", "a rotation's merge"];
 
 /// An ask's answer, and what its actor's sessions were told.
 type Outcome = (
@@ -2204,6 +2193,21 @@ pub const FOUND: &[&[u32]] = &[
     ],
 ];
 
+/// Sequences each reaching an act that tells from what its step left, in
+/// order: an unblock, an alias, a floor's pass, an offer below a floor, a
+/// removal by key, a revoked device's presentation and an unlinked
+/// identity's. For [`run_failing_each_call`], so that a read failing after
+/// each act's write is drawn whatever proptest draws.
+pub const FOUND_TELLING: &[&[u32]] = &[
+    &[4190456556, 4269538169],
+    &[4275179230],
+    &[4168862311, 4199760947],
+    &[4184385920, 4181072083],
+    &[4282268916, 4210818445],
+    &[4228555290, 4200952286],
+    &[4163459622, 4184817938],
+];
+
 /// Run `steps` against a store from `new_store`, each step held to the
 /// invariants above.
 pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
@@ -2305,7 +2309,8 @@ pub fn run_failing_each_call(
                 run.legal(&what);
                 let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
                 let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || run.crowded;
-                run.shown(&what, by_reading.is_empty() && !lapsing, blocking);
+                let listed = by_reading.iter().any(|s| TELLS_BY_READING.contains(s));
+                run.shown(&what, !listed && !lapsing, blocking);
             }
         }
     }
@@ -2341,6 +2346,20 @@ mod tests {
                 let dumped = store.clone();
                 (store as _, Box::new(move || dumped.dump()) as super::Dump)
             }, &steps);
+        }
+    }
+
+    #[test]
+    fn the_memory_store_tells_what_each_act_left_whatever_fails_in_it() {
+        for steps in super::FOUND_TELLING {
+            super::run_failing_each_call(
+                &|| {
+                    let store = std::sync::Arc::new(MemoryRelationships::new());
+                    let dumped = store.clone();
+                    (store as _, Box::new(move || dumped.dump()) as super::Dump)
+                },
+                steps,
+            );
         }
     }
 

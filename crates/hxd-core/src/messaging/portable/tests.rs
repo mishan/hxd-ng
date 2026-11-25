@@ -1764,7 +1764,7 @@ fn an_unlink_takes_the_presentation_only_it_held() {
 
 #[test]
 fn a_reset_whose_cleanup_fails_ends_the_friendship_when_judged_again() {
-    for write in ["presentations", "drop_presentations"] {
+    for write in ["presentations", "write"] {
         let (alice, bob) = (person(1), person(2));
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let reset_at = s.core.clock().unix() - 30;
@@ -2369,6 +2369,78 @@ fn a_merge_whose_ending_fails_changes_and_tells_nothing() {
     assert!(!befriended(&s));
 }
 
+#[test]
+fn a_merge_is_told_from_what_its_settling_left_whatever_is_read_after() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (_, mut ra, _, mut rb, _) = made(&s, &alice, &bob);
+    let (ma, mb) = (
+        Mailbox::identified("alice", fp(&alice)),
+        Mailbox::identified("bob", fp(&bob)),
+    );
+    // A fold left a block beside the friendship.
+    s.rel
+        .set_blocked(&ma, &mb, true, std::time::SystemTime::now())
+        .unwrap();
+    s.fail.fail_reads_after_write();
+    s.core.after_merge(&s.core.friend_writes(), &ma);
+    s.fail.fail_nth(0);
+    assert!(s.fail.failed().is_some(), "a read after the write failed");
+    assert_eq!(friendship_of(&s, &alice, &bob), None);
+    assert_eq!(
+        told(&mut ra),
+        [("bob".into(), RosterState::Blocked, vec![], None)]
+    );
+    assert_eq!(
+        told(&mut rb),
+        [("alice".into(), RosterState::Removed, vec![], None)]
+    );
+}
+
+#[test]
+fn a_pair_two_sweeps_name_by_two_spellings_is_told_once() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (_, mut rb) = device(&s.core, "bob", &bob, 0);
+    let o = offer(&alice, 0, &bob, now());
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o)),
+        Ok(RosterState::PendingOut)
+    );
+    drain(&mut rb);
+    // The directory renamed Alice under the rows that name her.
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alicia", fp(&alice));
+    let device = Fingerprint::of(&alice.devices[0].0.public()).0;
+    s.core.sweep_offers(vec![
+        super::Sweep::Device {
+            identity: Some(fp(&alice)),
+            device,
+            operator: false,
+        },
+        super::Sweep::Identity {
+            identity: fp(&alice),
+            operator: false,
+        },
+    ]);
+    let told: Vec<_> = drain(&mut rb)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FriendEntry(e) => Some((e.login, e.state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [("alice".into(), RosterState::PendingIn)],
+        "once, as the rows name her"
+    );
+}
+
 /// Accounts whose bits a test changes as it goes.
 #[derive(Clone)]
 struct Switch(Arc<std::sync::Mutex<Vec<(Mailbox, crate::AccessBits)>>>);
@@ -2426,7 +2498,7 @@ fn a_reset_of_both_presentations_ends_the_pair_in_one_step() {
         let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let reset_at = s.core.clock().unix() - 30;
         let (_, _, _, _, f) = made(&s, &alice, &bob);
-        s.fail.fail_nth_of("drop_presentations", 2);
+        s.fail.fail_nth_of("write", 2);
         if on_presenting {
             keep(&s, &alice, 1, reset_at);
             let (b1, _) = device(&s.core, "bob", &bob, 1);
@@ -2447,7 +2519,7 @@ fn a_reset_of_both_presentations_ends_the_pair_in_one_step() {
         assert_eq!(
             s.fail.failed(),
             None,
-            "one drop, presenting {on_presenting}"
+            "one write, presenting {on_presenting}"
         );
     }
 }

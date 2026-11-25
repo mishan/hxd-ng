@@ -435,6 +435,9 @@ pub enum Part {
     },
     KeepWithdrawal(HeldWithdrawal, usize),
     DropWithdrawal([u8; 32], [u8; 32], [u8; 32], Vec<u8>),
+    SetAlias(Mailbox, Mailbox, Option<String>),
+    SetBlocked(Mailbox, Mailbox, bool, SystemTime),
+    SetPendingOut(Mailbox, Mailbox, Option<PendingOut>),
     /// Fails the write where it stands, for a test of all or nothing.
     #[cfg(any(test, feature = "test-support"))]
     Fail,

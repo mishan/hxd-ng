@@ -58,6 +58,9 @@ enum Plan {
     /// The next `write` fails after this many of its parts, all or
     /// nothing.
     Part(usize),
+    /// Every read fails once a write has been called: whether one was.
+    #[cfg(test)]
+    ReadsAfterWrite(bool),
 }
 
 pub(crate) struct Failing {
@@ -160,6 +163,13 @@ impl Failing {
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::NthWrite(n) };
     }
 
+    /// Every read from the first write on fails, until the plan is set
+    /// again: what a tell made from a read after its step depends on.
+    #[cfg(test)]
+    pub(crate) fn fail_reads_after_write(&self) {
+        *self.plan.lock().unwrap() = Plan::ReadsAfterWrite(false);
+    }
+
     /// The next `write` fails after `k` of its parts, if it has as many.
     pub(crate) fn fail_write_part(&self, k: usize) {
         self.calls.lock().unwrap().clear();
@@ -203,6 +213,16 @@ impl Failing {
             }
             Plan::NthWrite(_) => false,
             Plan::Part(_) => false,
+            #[cfg(test)]
+            Plan::ReadsAfterWrite(written) => {
+                let read = READS.contains(&method);
+                *written |= !read;
+                if read && *written {
+                    *self.failed.lock().unwrap() = Some(method);
+                    return Err(StoreError(format!("{method} failed")));
+                }
+                false
+            }
         };
         if fails {
             *plan = Plan::Off;

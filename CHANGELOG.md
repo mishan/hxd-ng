@@ -352,6 +352,13 @@ as AGENTS.md's "Releasing" describes it.
   id of one the reset ended, so messages queued before the reset stay
   held. A roster entry the server cannot read is no longer told as
   removed.
+- Setting a friend's alias, unblocking, settling what an identity link
+  folded together, and the drops a device epoch floor, a revoked device,
+  an unlinked identity or a Remove Friend by fingerprint make now tell
+  each party its entry as the write left it, rather than reading the
+  store again after: a read failing there no longer leaves a session
+  showing the entry as it was. Sweeps that name one pair under a renamed
+  account's old and new login tell it once.
 - Portable friendships are granted only over friendships held at the
   device epoch floors (docs/proposals/portable-friends.md §6): a
   friendship made by a plain Friend Response (805), or by an Add Friend
