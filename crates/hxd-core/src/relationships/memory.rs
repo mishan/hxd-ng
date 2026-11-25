@@ -7,10 +7,10 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal, Ignore,
-    LedgerEntry, Left, MessagingAccount, PairDrop, Part, PendingOut, Presentation, Recorded,
-    Rekeyed, RelationId, Relationship, RelationshipStore, Report, RequestKind, Requester,
-    RotationRecord, StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Cause, Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal, Ignore,
+    LedgerEntry, Left, MessagingAccount, Owed, OwedId, PairDrop, Part, PendingOut, Presentation,
+    Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, Report, RequestKind, Requester,
+    RotationRecord, StoredOffer, Work, MAX_LANGUAGES,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
@@ -135,6 +135,9 @@ struct Inner {
     offers: Vec<([u8; 32], [u8; 32], StoredOffer)>,
     /// `(from, to, record)`.
     rotations: Vec<([u8; 32], [u8; 32], Vec<u8>)>,
+    /// In id order.
+    owed: Vec<Owed>,
+    last_owed: OwedId,
 }
 
 #[derive(Default)]
@@ -154,7 +157,7 @@ impl MemoryRelationships {
         let i = self.inner.lock().unwrap();
         let made: std::collections::BTreeMap<_, _> = i.made.iter().collect();
         format!(
-            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
             i.next_seq,
             i.next_relation,
             i.rows,
@@ -165,7 +168,9 @@ impl MemoryRelationships {
             i.presentations,
             i.withdrawals,
             i.offers,
-            i.rotations
+            i.rotations,
+            i.owed,
+            i.last_owed
         )
     }
 
@@ -331,6 +336,45 @@ impl Inner {
         }
     }
 
+    fn owe(&mut self, work: &Work, cause: &Cause) -> OwedId {
+        if let Some(o) = (self.owed.iter()).find(|o| o.work == *work && o.cause == *cause) {
+            return o.id;
+        }
+        self.last_owed += 1;
+        self.owed.push(Owed {
+            id: self.last_owed,
+            work: work.clone(),
+            cause: cause.clone(),
+        });
+        self.last_owed
+    }
+
+    /// A rotation's re-stamp of owed work, in id order: a piece that
+    /// becomes one already owed is folded into it.
+    fn restamp_owed(&mut self, from: &[u8; 32], to: &[u8; 32]) -> Vec<(OwedId, OwedId)> {
+        let mut merged = Vec::new();
+        let mut i = 0;
+        while i < self.owed.len() {
+            let o = &self.owed[i];
+            let work = restamped(&o.work, from, to);
+            if work == o.work {
+                i += 1;
+                continue;
+            }
+            match (self.owed.iter()).find(|k| k.work == work && k.cause == o.cause) {
+                Some(kept) => {
+                    merged.push((o.id, kept.id));
+                    self.owed.remove(i);
+                }
+                None => {
+                    self.owed[i].work = work;
+                    i += 1;
+                }
+            }
+        }
+        merged
+    }
+
     /// One part of a write, as its method does it.
     fn part(&mut self, part: &Part) -> Did {
         match part {
@@ -396,6 +440,11 @@ impl Inner {
             }
             Part::SetPendingOut(owner, other, pending) => {
                 self.edit(owner, other, |r| r.pending_out = pending.clone());
+                Did::Nothing
+            }
+            Part::Owe(work, cause) => Did::Owed(self.owe(work, cause)),
+            Part::Settle(id) => {
+                self.owed.retain(|o| o.id != *id);
                 Did::Nothing
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -1630,6 +1679,21 @@ impl RelationshipStore for MemoryRelationships {
             .map(|(_, t, r)| (*t, r.clone())))
     }
 
+    fn owe(&self, owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(owed.iter().map(|(w, c)| inner.owe(w, c)).collect())
+    }
+
+    fn owed(&self) -> Result<Vec<Owed>, StoreError> {
+        Ok(self.inner.lock().unwrap().owed.clone())
+    }
+
+    fn settle(&self, ids: &[OwedId]) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.owed.retain(|o| !ids.contains(&o.id));
+        Ok(())
+    }
+
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -1917,6 +1981,7 @@ impl RelationshipStore for MemoryRelationships {
             .collect();
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
+        rekeyed.owed_merged = inner.restamp_owed(from, to);
         inner.settle_upgrades(to);
         for (other, record) in moving {
             let kept = inner
@@ -2015,6 +2080,24 @@ impl RelationshipStore for MemoryRelationships {
             !go
         });
         Ok(n + old + offers)
+    }
+}
+
+fn restamped(work: &Work, from: &[u8; 32], to: &[u8; 32]) -> Work {
+    let m = |k: &[u8; 32]| if k == from { *to } else { *k };
+    match work {
+        Work::DropOffersBy { under, device } => Work::DropOffersBy {
+            under: under.as_ref().map(m),
+            device: *device,
+        },
+        Work::DropPresentedBy { under, device } => Work::DropPresentedBy {
+            under: under.as_ref().map(m),
+            device: *device,
+        },
+        Work::DropOffersNaming(k) => Work::DropOffersNaming(m(k)),
+        Work::DropPresentationsOf(k) => Work::DropPresentationsOf(m(k)),
+        Work::Judge(a, b) => Work::Judge(m(a), m(b)),
+        Work::Settle(k) => Work::Settle(m(k)),
     }
 }
 

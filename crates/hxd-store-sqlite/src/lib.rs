@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1141,6 +1141,26 @@ DELETE FROM friend_offer
                       AND r.friendship IS NOT NULL);
 ";
 
+/// Friendship work an act left undone, kept until it is done or what
+/// owed it is lifted. Keys are hex as everywhere here, and `''` where
+/// there is none rather than NULL, which the unique key would count as
+/// distinct, so that owing one piece of work twice keeps one row.
+const SCHEMA_V42: &str = "
+CREATE TABLE friend_owed (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind    INTEGER NOT NULL,
+  key     TEXT    NOT NULL,
+  other   TEXT    NOT NULL,
+  device  TEXT    NOT NULL,
+  cause   INTEGER NOT NULL,
+  cause_a TEXT    NOT NULL,
+  cause_b TEXT    NOT NULL,
+  UNIQUE (kind, key, other, device, cause, cause_a, cause_b)
+);
+CREATE INDEX friend_owed_key ON friend_owed (key);
+CREATE INDEX friend_owed_other ON friend_owed (other);
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1911,6 +1931,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 41 {
         steps.push_str(SCHEMA_V41);
+    }
+    if version < 42 {
+        steps.push_str(SCHEMA_V42);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -5368,6 +5391,64 @@ mod tests {
         assert_eq!(
             store.presentation(&[7; 32], &[8; 32]).unwrap(),
             Some(record)
+        );
+    }
+
+    /// A file from before owed work was kept owes none, keeps what it
+    /// held, and keeps what is owed from then on across a reopen.
+    #[test]
+    fn version_forty_one_migrates_into_a_store_that_keeps_owed_work() {
+        use hxd_core::relationships::{Cause, Work};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for step in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+                SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+                SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
+                SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28,
+                SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35,
+                SCHEMA_V36, SCHEMA_V37, SCHEMA_V38, SCHEMA_V39, SCHEMA_V40, SCHEMA_V41,
+            ] {
+                conn.execute_batch(step).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair, \
+                 hash, friendship, device, at, taken) VALUES (?1, ?2, ?3, ?3, ?3, ?3, ?3, ?3, 1, 1)",
+                rusqlite::params!["07".repeat(32), "08".repeat(32), [1u8; 32]],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 41).unwrap();
+        }
+        let owing = [
+            (Work::Judge([7; 32], [8; 32]), Cause::Always),
+            (
+                Work::DropOffersBy {
+                    under: None,
+                    device: [9; 32],
+                },
+                Cause::OperatorDevice([9; 32]),
+            ),
+        ];
+        let ids = {
+            let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+            assert!(store.presentation(&[7; 32], &[8; 32]).unwrap().is_some());
+            assert_eq!(store.owed().unwrap(), []);
+            store.owe(&owing).unwrap()
+        };
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        let owed: Vec<_> = (store.owed().unwrap().into_iter())
+            .map(|o| (o.id, (o.work, o.cause)))
+            .collect();
+        assert_eq!(
+            owed,
+            ids.iter().copied().zip(owing.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.owe(&owing).unwrap(),
+            ids,
+            "the same rows, by the unique key"
         );
     }
 

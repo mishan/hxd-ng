@@ -10,10 +10,10 @@ use std::time::SystemTime;
 
 use hxd_core::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 use hxd_core::relationships::{
-    AccountUpdate, Birthdate, Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal,
-    Ignore, IgnoreMode, LedgerEntry, Left, MessagingAccount, Part, PendingOut, Presentation,
-    Profile, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, Report, RequestKind,
-    Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Birthdate, Cause, Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal,
+    Ignore, IgnoreMode, LedgerEntry, Left, MessagingAccount, Owed, OwedId, Part, PendingOut,
+    Presentation, Profile, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, Report,
+    RequestKind, Requester, RotationRecord, StoredOffer, Work, MAX_LANGUAGES,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -1027,6 +1027,161 @@ fn befriend_dropping(
     }
 }
 
+const OWED_COLUMNS: &str = "id, kind, key, other, device, cause, cause_a, cause_b";
+
+/// A piece of work's columns, the id's aside: `(kind, key, other, device)`
+/// and `(cause, cause_a, cause_b)`, a key that is absent `''`. The kind
+/// and cause numbers are on disk: never reused, and one added comes with
+/// a schema version, since a row this build cannot read fails the whole
+/// record's read.
+type OwedRow = ((i64, String, String, String), (i64, String, String));
+
+fn owed_columns(work: &Work, cause: &Cause) -> OwedRow {
+    let hex = fp_hex;
+    let maybe = |k: &Option<[u8; 32]>| k.as_ref().map(fp_hex).unwrap_or_default();
+    let none = String::new;
+    let work = match work {
+        Work::DropOffersBy { under, device } => (1, maybe(under), none(), hex(device)),
+        Work::DropOffersNaming(k) => (2, hex(k), none(), none()),
+        Work::DropPresentedBy { under, device } => (3, maybe(under), none(), hex(device)),
+        Work::DropPresentationsOf(k) => (4, hex(k), none(), none()),
+        Work::Judge(a, b) => (5, hex(a), hex(b), none()),
+        Work::Settle(k) => (6, hex(k), none(), none()),
+    };
+    let cause = match cause {
+        Cause::OperatorDevice(d) => (1, hex(d), none()),
+        Cause::OperatorIdentity(i) => (2, hex(i), none()),
+        Cause::PublishedDevice { identity, device } => (3, hex(identity), hex(device)),
+        Cause::PublishedIdentity(i) => (4, hex(i), none()),
+        Cause::Unlinked => (5, none(), none()),
+        Cause::Always => (6, none(), none()),
+    };
+    (work, cause)
+}
+
+fn owed_from_columns(
+    id: i64,
+    ((kind, key, other, device), (cause, a, b)): OwedRow,
+) -> Result<Owed, StoreError> {
+    let maybe = |k: &str| (!k.is_empty()).then(|| fp_from_hex(k)).transpose();
+    let work = match kind {
+        1 => Work::DropOffersBy {
+            under: maybe(&key)?,
+            device: fp_from_hex(&device)?,
+        },
+        2 => Work::DropOffersNaming(fp_from_hex(&key)?),
+        3 => Work::DropPresentedBy {
+            under: maybe(&key)?,
+            device: fp_from_hex(&device)?,
+        },
+        4 => Work::DropPresentationsOf(fp_from_hex(&key)?),
+        5 => Work::Judge(fp_from_hex(&key)?, fp_from_hex(&other)?),
+        6 => Work::Settle(fp_from_hex(&key)?),
+        n => return Err(StoreError(format!("owed work of unknown kind {n}"))),
+    };
+    let cause = match cause {
+        1 => Cause::OperatorDevice(fp_from_hex(&a)?),
+        2 => Cause::OperatorIdentity(fp_from_hex(&a)?),
+        3 => Cause::PublishedDevice {
+            identity: fp_from_hex(&a)?,
+            device: fp_from_hex(&b)?,
+        },
+        4 => Cause::PublishedIdentity(fp_from_hex(&a)?),
+        5 => Cause::Unlinked,
+        6 => Cause::Always,
+        n => return Err(StoreError(format!("owed work of unknown cause {n}"))),
+    };
+    Ok(Owed {
+        id: id as OwedId,
+        work,
+        cause,
+    })
+}
+
+/// A row of [`OWED_COLUMNS`], as its columns.
+fn owed_raw(r: &Row<'_>) -> rusqlite::Result<(i64, OwedRow)> {
+    let work = (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+    Ok((r.get(0)?, (work, (r.get(5)?, r.get(6)?, r.get(7)?))))
+}
+
+fn owed_row(r: &Row<'_>) -> rusqlite::Result<Result<Owed, StoreError>> {
+    let (id, row) = owed_raw(r)?;
+    Ok(owed_from_columns(id, row))
+}
+
+/// The id of the row holding exactly these columns.
+fn owed_id(
+    tx: &Connection,
+    ((kind, key, other, device), (cause, a, b)): &OwedRow,
+) -> Result<Option<i64>, StoreError> {
+    sql(tx
+        .query_row(
+            "SELECT id FROM friend_owed
+              WHERE kind = ?1 AND key = ?2 AND other = ?3 AND device = ?4
+                AND cause = ?5 AND cause_a = ?6 AND cause_b = ?7",
+            params![kind, key, other, device, cause, a, b],
+            |r| r.get(0),
+        )
+        .optional())
+}
+
+fn owe(tx: &Connection, work: &Work, cause: &Cause) -> Result<OwedId, StoreError> {
+    let row = owed_columns(work, cause);
+    if let Some(id) = owed_id(tx, &row)? {
+        return Ok(id as OwedId);
+    }
+    let ((kind, key, other, device), (cause, a, b)) = row;
+    sql(tx.execute(
+        "INSERT INTO friend_owed (kind, key, other, device, cause, cause_a, cause_b)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![kind, key, other, device, cause, a, b],
+    ))?;
+    Ok(tx.last_insert_rowid() as OwedId)
+}
+
+fn settle(tx: &Connection, id: OwedId) -> Result<(), StoreError> {
+    sql(tx.execute("DELETE FROM friend_owed WHERE id = ?1", params![id as i64]))?;
+    Ok(())
+}
+
+/// A rotation's re-stamp of owed work's keys, in id order, never its
+/// device's or its cause's: a piece that becomes one already owed is
+/// folded into it.
+fn restamp_owed(
+    tx: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(OwedId, OwedId)>, StoreError> {
+    let moving: Vec<(i64, OwedRow)> = {
+        let mut stmt = sql(tx.prepare(&format!(
+            "SELECT {OWED_COLUMNS} FROM friend_owed WHERE key = ?1 OR other = ?1 ORDER BY id"
+        )))?;
+        let rows = sql(stmt.query_map(params![from], owed_raw))?;
+        sql(rows.collect())?
+    };
+    let mut merged = Vec::new();
+    for (id, mut row) in moving {
+        for k in [&mut row.0 .1, &mut row.0 .2] {
+            if k == from {
+                *k = to.to_string();
+            }
+        }
+        match owed_id(tx, &row)? {
+            Some(kept) if kept != id => {
+                settle(tx, id as OwedId)?;
+                merged.push((id as OwedId, kept as OwedId));
+            }
+            _ => {
+                sql(tx.execute(
+                    "UPDATE friend_owed SET key = ?2, other = ?3 WHERE id = ?1",
+                    params![id, row.0 .1, row.0 .2],
+                ))?;
+            }
+        }
+    }
+    Ok(merged)
+}
+
 /// One part of a write, as its method does it.
 fn part(tx: &Connection, part: &Part) -> Result<Did, StoreError> {
     #[allow(unreachable_patterns)]
@@ -1089,6 +1244,11 @@ fn part(tx: &Connection, part: &Part) -> Result<Did, StoreError> {
         }
         Part::SetPendingOut(owner, other, pending) => {
             edit_in(tx, owner, other, |r| r.pending_out = pending.clone())?;
+            Did::Nothing
+        }
+        Part::Owe(work, cause) => Did::Owed(owe(tx, work, cause)?),
+        Part::Settle(id) => {
+            settle(tx, *id)?;
             Did::Nothing
         }
         _ if part.fails() => return Err(StoreError("a part of the write failed".into())),
@@ -1494,6 +1654,7 @@ impl SqliteStore {
             };
             if portable {
                 rotate_portable(tx, from, to, &mut rekeyed)?;
+                rekeyed.owed_merged = restamp_owed(tx, from, to)?;
                 settle_upgrades(tx, to)?;
                 for (other, record) in moving {
                     let owner = to.to_string();
@@ -2272,6 +2433,25 @@ impl RelationshipStore for SqliteStore {
         found
             .map(|(to, record)| Ok((fp_from_hex(&to)?, record)))
             .transpose()
+    }
+
+    fn owe(&self, owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError> {
+        self.with_tx(|tx| owed.iter().map(|(w, c)| owe(tx, w, c)).collect())
+    }
+
+    fn owed(&self) -> Result<Vec<Owed>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare(&format!(
+            "SELECT {OWED_COLUMNS} FROM friend_owed ORDER BY id"
+        )))?;
+        let rows = sql(stmt.query_map([], owed_row))?;
+        sql(rows.collect::<Result<Vec<_>, _>>())?
+            .into_iter()
+            .collect()
+    }
+
+    fn settle(&self, ids: &[OwedId]) -> Result<(), StoreError> {
+        self.with_tx(|tx| ids.iter().try_for_each(|id| settle(tx, *id)))
     }
 
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
