@@ -380,6 +380,24 @@ impl Inner {
                 self.drop_withdrawal(owner, pair, party, w);
                 Did::Nothing
             }
+            Part::SetAlias(owner, other, alias) => {
+                self.edit(owner, other, |r| r.alias = alias.clone());
+                Did::Nothing
+            }
+            Part::SetBlocked(owner, other, blocked, at) => {
+                self.edit(owner, other, |r| {
+                    r.blocked_at = if *blocked {
+                        r.blocked_at.or(Some(*at))
+                    } else {
+                        None
+                    }
+                });
+                Did::Nothing
+            }
+            Part::SetPendingOut(owner, other, pending) => {
+                self.edit(owner, other, |r| r.pending_out = pending.clone());
+                Did::Nothing
+            }
             #[cfg(any(test, feature = "test-support"))]
             Part::Fail => unreachable!("failed before it is applied"),
         }
@@ -1169,9 +1187,9 @@ impl RelationshipStore for MemoryRelationships {
         other: &Mailbox,
         alias: Option<&str>,
     ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.edit(owner, other, |r| r.alias = alias.map(str::to_owned));
-        Ok(())
+        let alias = alias.map(str::to_owned);
+        let part = Part::SetAlias(owner.clone(), other.clone(), alias);
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn set_blocked(
@@ -1181,15 +1199,8 @@ impl RelationshipStore for MemoryRelationships {
         blocked: bool,
         at: SystemTime,
     ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.edit(owner, other, |r| {
-            r.blocked_at = if blocked {
-                r.blocked_at.or(Some(at))
-            } else {
-                None
-            }
-        });
-        Ok(())
+        let part = Part::SetBlocked(owner.clone(), other.clone(), blocked, at);
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
@@ -1217,9 +1228,8 @@ impl RelationshipStore for MemoryRelationships {
         other: &Mailbox,
         pending: Option<&PendingOut>,
     ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.edit(owner, other, |r| r.pending_out = pending.cloned());
-        Ok(())
+        let part = Part::SetPendingOut(owner.clone(), other.clone(), pending.cloned());
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn set_ignore(

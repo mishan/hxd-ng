@@ -1596,17 +1596,21 @@ impl Core {
         let them = self.other(&me, login)?;
         let store = self.friends_store()?;
         let _writing = self.friend_act(uid)?;
-        let friends = store
-            .relationship(&me.mailbox, &them, self.clock.wall())
+        let now = self.clock.wall();
+        let Some(row) = store
+            .relationship(&me.mailbox, &them, now)
             .map_err(store_failed)?
-            .is_some_and(|r| r.friendship.is_some() && r.blocked_at.is_none());
-        if !friends {
+            .filter(|r| r.friendship.is_some() && r.blocked_at.is_none())
+        else {
             return Err(MessagingError::NotFriends);
-        }
-        store
-            .set_alias(&me.mailbox, &them, alias)
+        };
+        // By the row's mailbox, whose fingerprint finds what the entry
+        // shows of the friendship.
+        let alias = Part::SetAlias(me.mailbox.clone(), them, alias.map(str::to_owned));
+        let (_, left) = self
+            .write_left(store, &[alias], &[(&me.mailbox, &row.other)], now)
             .map_err(store_failed)?;
-        self.tell_entry("an alias", &me.mailbox, &them);
+        self.tell_left(&left[0], [true, false]);
         Ok(())
     }
 
@@ -1776,7 +1780,9 @@ impl Core {
             return store.set_blocked(blocker, blocked, now_blocked, at);
         }
         if !now_blocked {
-            store.set_blocked(blocker, blocked, false, at)?;
+            let unblock = Part::SetBlocked(blocker.clone(), blocked.clone(), false, at);
+            let (_, left) = self.write_left(store, &[unblock], &[(blocker, blocked)], at)?;
+            self.tell_left(&left[0], [true, false]);
         } else {
             // Whether the blocked had a row to see go: only then is it
             // told, so a block on a stranger tells it nothing. Read before
@@ -1804,9 +1810,7 @@ impl Core {
             let unsaid = ended.ended.is_none() && !shown && !upgraded;
             self.tell_left(&left, [true, !unsaid]);
             self.block_deletes_requests(blocker, blocked);
-            return Ok(());
         }
-        self.tell_entry("an unblock", blocker, blocked);
         Ok(())
     }
 
@@ -1827,7 +1831,7 @@ impl Core {
                 return;
             }
         };
-        let mut told = Vec::new();
+        let mut told: Vec<(Left, [bool; 2])> = Vec::new();
         for mine in rows {
             let other = mine.other.clone();
             let theirs = match store.relationship(&other, me, now) {
@@ -1851,10 +1855,17 @@ impl Core {
             };
             let blocked = mine.blocked_at.is_some()
                 || theirs.as_ref().is_some_and(|t| t.blocked_at.is_some());
-            let mut changed = false;
-            let mut fix = |r: Result<(), StoreError>| match r {
-                Ok(()) => changed = true,
-                Err(e) => warn!("relationships: settling a merge: {e}"),
+            // Both told, the friend only where `me` has a login: with no
+            // row of the friend's to give the login a rotation's successor
+            // is known by, there is no entry to name.
+            let to = |left: &Left| {
+                let mine = Key::of(&left.pair[0]) == Key::of(me);
+                let named = !me.login.is_empty();
+                if mine {
+                    [true, named]
+                } else {
+                    [named, true]
+                }
             };
             // A block ends what a block made now ends (`block_changed`),
             // written as the block it already is.
@@ -1874,33 +1885,39 @@ impl Core {
                     friendship: true,
                     ..here
                 });
-                fix(ending
-                    .and_then(|end| self.end_friendship(store, x, y, &end))
-                    .map(|ended| {
-                        if let Some(e) = ended.0.ended {
+                match ending.and_then(|end| self.end_friendship(store, x, y, &end)) {
+                    Ok((ended, left)) => {
+                        if let Some(e) = ended.ended {
                             let [a, b] = &e.parties;
                             self.roster.lock().unwrap().friends_changed(a, b, false);
                         }
-                    }));
+                        let to = to(&left);
+                        told.push((left, to));
+                    }
+                    Err(e) => warn!("relationships: settling a merge: {e}"),
+                }
             }
             let friends = mine.friendship.is_some() && !blocked;
+            let mut clear = Vec::new();
             if friends && mine.pending_out.is_some() {
-                fix(store.set_pending_out(me, &other, None));
+                clear.push(Part::SetPendingOut(me.clone(), other.clone(), None));
             }
             if friends && theirs.as_ref().is_some_and(|t| t.pending_out.is_some()) {
-                fix(store.set_pending_out(&other, me, None));
+                clear.push(Part::SetPendingOut(other.clone(), me.clone(), None));
             }
-            if changed {
-                told.push((me.clone(), other));
+            if !clear.is_empty() {
+                match self.write_left(store, &clear, &[(me, &other)], now) {
+                    Ok((_, mut left)) => {
+                        let left = left.remove(0);
+                        let to = to(&left);
+                        told.push((left, to));
+                    }
+                    Err(e) => warn!("relationships: settling a merge: {e}"),
+                }
             }
         }
-        for (me, other) in told {
-            self.tell_entry("a merge", &me, &other);
-            // With no row of the friend's to give the login a rotation's
-            // successor is known by, there is no entry to name.
-            if !me.login.is_empty() {
-                self.tell_entry("a merge", &other, &me);
-            }
+        for (left, to) in told {
+            self.tell_left(&left, to);
         }
     }
 

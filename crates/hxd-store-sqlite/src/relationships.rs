@@ -1073,9 +1073,44 @@ fn part(tx: &Connection, part: &Part) -> Result<Did, StoreError> {
             drop_withdrawal(tx, owner, pair, party, w)?;
             Did::Nothing
         }
+        Part::SetAlias(owner, other, alias) => {
+            edit_in(tx, owner, other, |r| r.alias = alias.clone())?;
+            Did::Nothing
+        }
+        Part::SetBlocked(owner, other, blocked, at) => {
+            edit_in(tx, owner, other, |r| {
+                r.blocked_at = if *blocked {
+                    r.blocked_at.or(Some(*at))
+                } else {
+                    None
+                }
+            })?;
+            Did::Nothing
+        }
+        Part::SetPendingOut(owner, other, pending) => {
+            edit_in(tx, owner, other, |r| r.pending_out = pending.clone())?;
+            Did::Nothing
+        }
         _ if part.fails() => return Err(StoreError("a part of the write failed".into())),
         _ => unreachable!("every part is one of the above"),
     })
+}
+
+/// `owner`'s row about `other`, made where there is none, changed by `f`
+/// and written in `tx`.
+fn edit_in<T>(
+    tx: &Connection,
+    owner: &Mailbox,
+    other: &Mailbox,
+    f: impl FnOnce(&mut Relationship) -> T,
+) -> Result<T, StoreError> {
+    let (id, mut rel) = match load_pair(tx, owner, other)? {
+        Some((id, rel)) => (Some(id), rel),
+        None => (None, Relationship::new(owner, other)),
+    };
+    let out = f(&mut rel);
+    write(tx, id, &mut rel)?;
+    Ok(out)
 }
 
 /// What `report` asks of, as it stands in `conn`.
@@ -1346,15 +1381,7 @@ impl SqliteStore {
         other: &Mailbox,
         f: impl FnOnce(&mut Relationship) -> T,
     ) -> Result<T, StoreError> {
-        self.with_tx(|tx| {
-            let (id, mut rel) = match load_pair(tx, owner, other)? {
-                Some((id, rel)) => (Some(id), rel),
-                None => (None, Relationship::new(owner, other)),
-            };
-            let out = f(&mut rel);
-            write(tx, id, &mut rel)?;
-            Ok(out)
-        })
+        self.with_tx(|tx| edit_in(tx, owner, other, f))
     }
 
     fn account_edit<T>(
@@ -1569,7 +1596,9 @@ impl RelationshipStore for SqliteStore {
         other: &Mailbox,
         alias: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.edit(owner, other, |r| r.alias = alias.map(str::to_owned))
+        let alias = alias.map(str::to_owned);
+        let part = Part::SetAlias(owner.clone(), other.clone(), alias);
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn set_blocked(
@@ -1579,13 +1608,8 @@ impl RelationshipStore for SqliteStore {
         blocked: bool,
         at: SystemTime,
     ) -> Result<(), StoreError> {
-        self.edit(owner, other, |r| {
-            r.blocked_at = if blocked {
-                r.blocked_at.or(Some(at))
-            } else {
-                None
-            }
-        })
+        let part = Part::SetBlocked(owner.clone(), other.clone(), blocked, at);
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn is_blocked(&self, owner: &Mailbox, other: &Mailbox) -> Result<bool, StoreError> {
@@ -1622,7 +1646,8 @@ impl RelationshipStore for SqliteStore {
         other: &Mailbox,
         pending: Option<&PendingOut>,
     ) -> Result<(), StoreError> {
-        self.edit(owner, other, |r| r.pending_out = pending.cloned())
+        let part = Part::SetPendingOut(owner.clone(), other.clone(), pending.cloned());
+        self.write(&[part], &Report::none()).map(drop)
     }
 
     fn set_ignore(

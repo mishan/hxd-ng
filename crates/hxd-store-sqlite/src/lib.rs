@@ -4778,6 +4778,23 @@ mod tests {
     }
 
     #[test]
+    fn tells_what_each_friendship_act_left_whatever_fails_in_it() {
+        for steps in hxd_core::messaging::sequence::FOUND_TELLING {
+            hxd_core::messaging::sequence::run_failing_each_call(
+                &|| {
+                    let store = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+                    let dumped = store.clone();
+                    (
+                        store as _,
+                        Box::new(move || dump(&dumped)) as hxd_core::messaging::sequence::Dump,
+                    )
+                },
+                steps,
+            );
+        }
+    }
+
+    #[test]
     fn keeps_the_friendship_sequences_found_before() {
         for steps in hxd_core::messaging::sequence::FOUND {
             hxd_core::messaging::sequence::run(

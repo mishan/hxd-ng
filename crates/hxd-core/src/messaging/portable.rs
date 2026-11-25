@@ -22,7 +22,7 @@
 //! a block either way.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,7 +35,7 @@ use hl_identity::{
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
-use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
+use super::{store_failed, takes_part, FriendEntry, Key, MessagingError, RosterState};
 use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
@@ -993,10 +993,12 @@ impl Core {
             let below = floors.below(&o);
             floors.failed()?;
             if below {
-                store.drop_offers(&[(owner, other)])?;
-                if let (Some(me), Some(them)) = (self.mailbox_of(&owner), self.mailbox_of(&other)) {
-                    self.tell_entry("an offer below a floor", &them, &me);
-                    self.tell_entry("an offer below a floor", &me, &them);
+                let pair = self.mailbox_of(&other).zip(self.mailbox_of(&owner));
+                let asked: Vec<_> = pair.iter().map(|(x, y)| (x, y)).collect();
+                let drop = Part::DropOffers(vec![(owner, other)]);
+                let (_, left) = self.write_left(store, &[drop], &asked, wall)?;
+                if let Some(left) = left.first() {
+                    self.tell_left(left, [true, true]);
                 }
             }
         }
@@ -1611,7 +1613,7 @@ impl Core {
             unreachable!("a presenting befriending answers what it replaced");
         };
         for old in replaced {
-            self.replaced(store, old, Some(&bytes), false);
+            self.replaced(store, old, Some(&bytes));
         }
         match id {
             Some(id) => self.befriended(&left[0], id, &approvals),
@@ -1954,53 +1956,52 @@ impl Core {
     /// released when it is active again (§6).
     fn drop_presented(
         &self,
-        site: &'static str,
         store: &Arc<dyn RelationshipStore>,
         a: &[u8; 32],
         b: &[u8; 32],
         presenters: &[[u8; 32]],
     ) -> Result<Vec<Presentation>, StoreError> {
-        let dropped = store.drop_presentations(a, b, presenters)?;
+        let wall = self.clock.wall();
+        // Told by the mailboxes the pair's rows keep, read before the drop.
+        let pair = self.pair_mailboxes(store, a, b, wall)?;
+        let asked: Vec<_> = pair.iter().map(|(x, y)| (x, y)).collect();
+        let part = Part::DropPresentations(*a, *b, presenters.to_vec());
+        let (mut did, left) = self.write_left(store, &[part], &asked, wall)?;
+        let Some(Did::Ended(dropped)) = did.pop() else {
+            unreachable!("a drop answers what it ended");
+        };
         if !dropped.gone.is_empty() {
             self.unjudge(store, [*a, *b]);
         }
-        // An edge ended is told once, whatever record left with it.
-        match &dropped.ended {
-            Some(e) => self.edge_ended(site, e, None),
-            None => {
-                for gone in &dropped.gone {
-                    self.record_left(site, gone);
-                }
+        // An edge ended is told once, whatever record left with it; a
+        // `Reset` record that left takes any upgrade offer it qualified.
+        if let Some(left) = left.first() {
+            if dropped.ended.is_some() {
+                self.edge_ended_left(left, None);
+            } else if dropped.gone.iter().any(|p| p.reset.is_some()) {
+                self.record_left(left);
             }
         }
         Ok(dropped.gone)
     }
 
-    /// A `Reset` record left its row, and with it any upgrade offer it
-    /// qualified: both parties told their entries as they now stand.
-    fn record_left(&self, site: &'static str, p: &Presentation) {
-        if p.reset.is_none() {
-            return;
-        }
-        if let (Some(a), Some(b)) = (self.mailbox_of(&p.presenter), self.mailbox_of(&p.other)) {
-            self.tell_entry(site, &a, &b);
-            self.tell_entry(site, &b, &a);
+    /// A `Reset` record left `left`'s pair: both parties told their
+    /// entries as the drop left them, where the directory names both.
+    fn record_left(&self, left: &Left) {
+        let named = |m: &Mailbox| m.fingerprint.and_then(|fp| self.mailbox_of(&fp));
+        if left.pair.iter().all(|m| named(m).is_some()) {
+            self.tell_left(left, [true, true]);
         }
     }
 
     /// A presentation `present` answered as replaced, where its evidence
-    /// was other than `now`'s: what it held is judged again. A record it
-    /// was is told, unless the caller tells both parties after.
+    /// was other than `now`'s: what it held is judged again.
     fn replaced(
         &self,
         store: &Arc<dyn RelationshipStore>,
         old: Option<Presentation>,
         now: Option<&[u8]>,
-        tell: bool,
     ) {
-        if let Some(old) = old.as_ref().filter(|_| tell) {
-            self.record_left("a hash kept", old);
-        }
         if let Some(old) = old.filter(|o| o.friendship.is_some() && o.friendship.as_deref() != now)
         {
             self.unjudge(store, [old.presenter, old.other]);
@@ -2025,7 +2026,7 @@ impl Core {
             }
         }
         for (a, b, presenters) in pairs {
-            self.drop_presented("a floor's pass", store, &a, &b, &presenters)?;
+            self.drop_presented(store, &a, &b, &presenters)?;
         }
         Ok(())
     }
@@ -2119,8 +2120,7 @@ impl Core {
         p: &Presentation,
     ) -> Result<(), StoreError> {
         if self.judged_reset(store, p, &[])? {
-            let site = "an orphan judged";
-            self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
         }
         Ok(())
     }
@@ -2295,16 +2295,24 @@ impl Core {
                     .map_err(store_failed)?;
                 end.friendship = true;
                 end.hold = Some(wall + self.messaging_policy.request_retention);
-                let (ended, _) = self
+                let (ended, left) = self
                     .end_friendship(store, &me.mailbox, &them, &end)
                     .map_err(store_failed)?;
+                // By the rows' mailboxes: `them` names the friend by its
+                // key alone.
                 if let Some(e) = ended.ended {
-                    self.edge_ended("a removal by key", &e, None);
+                    self.edge_ended_left(
+                        &Left {
+                            pair: e.parties,
+                            ..left
+                        },
+                        None,
+                    );
                 }
                 return Ok(());
             }
             let gone = self
-                .drop_presented("a removal by key", store, &mine, fingerprint, &[mine])
+                .drop_presented(store, &mine, fingerprint, &[mine])
                 .map_err(store_failed)?;
             for gone in &gone {
                 self.orphan_judged_or_owed(store, gone);
@@ -2655,7 +2663,9 @@ impl Core {
             let p = row(friendship, reset)?;
             store
                 .present(&p)
-                .map(|old| self.replaced(store, old, p.friendship.as_deref(), true))
+                // Under the hold, `keep_hash` records only where `held`
+                // had nothing: there is no record replaced to tell.
+                .map(|old| self.replaced(store, old, p.friendship.as_deref()))
                 .map_err(store_failed)
         };
         // Step 2's refusal keeps the hash alone toward the bound, as the
@@ -2786,7 +2796,7 @@ impl Core {
                 }
                 let left = &left[0];
                 let record_left = replaced.as_ref().is_some_and(|o| o.reset.is_some());
-                self.replaced(store, replaced, None, false);
+                self.replaced(store, replaced, None);
                 if record_left && !said {
                     self.tell_left(left, [true, true]);
                 }
@@ -2859,7 +2869,7 @@ impl Core {
                 }
                 Did::Replaced(old) => {
                     owed |= old.as_ref().is_some_and(|o| o.reset.is_some());
-                    self.replaced(store, old.clone(), p.friendship.as_deref(), false);
+                    self.replaced(store, old.clone(), p.friendship.as_deref());
                 }
                 Did::Friends(id) => {
                     if let Activation::Befriend(_, approvals) = &plan {
@@ -3090,8 +3100,7 @@ impl Core {
             .into_iter()
             .filter(|p| identity.is_none_or(|i| p.presenter == i))
         {
-            let site = "a revoked device's presentation";
-            let gone = self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            let gone = self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
             for gone in &gone {
                 self.orphan_judged_or_owed(store, gone);
             }
@@ -3172,20 +3181,27 @@ impl Core {
                 }
             }
         }
-        // One tell a pair, whichever sweeps named it: an unlink's
-        // recipients kept, each party told where any sweep would tell it.
+        // One tell a pair, whichever sweeps named it, by the keys a row
+        // is matched by: an unlink's recipients kept, each party told
+        // where any sweep would tell it.
         let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
+        let mut at: HashMap<(Key, Key), usize> = HashMap::new();
         for (a, b, to) in pairs {
-            let key = |m: &Mailbox| (m.login.clone(), m.fingerprint);
-            match coalesced.iter_mut().find(|(x, y, _)| {
-                (key(x), key(y)) == (key(&a), key(&b)) || (key(x), key(y)) == (key(&b), key(&a))
-            }) {
-                Some((x, _, seen)) => {
-                    let same = key(x) == key(&a);
-                    let to = if same { to } else { [to[1], to[0]] };
+            match at.get(&(Key::of(&a), Key::of(&b))) {
+                Some(&i) => {
+                    let (x, _, seen) = &mut coalesced[i];
+                    let to = if Key::of(x) == Key::of(&a) {
+                        to
+                    } else {
+                        [to[1], to[0]]
+                    };
                     *seen = [seen[0] || to[0], seen[1] || to[1]];
                 }
-                None => coalesced.push((a, b, to)),
+                None => {
+                    at.insert((Key::of(&a), Key::of(&b)), coalesced.len());
+                    at.insert((Key::of(&b), Key::of(&a)), coalesced.len());
+                    coalesced.push((a, b, to));
+                }
             }
         }
         let pairs = coalesced;
@@ -3194,7 +3210,7 @@ impl Core {
             match self.write_left(store, &parts, &asked, wall) {
                 Ok((did, left)) => {
                     // Told where an offer went, and nowhere else.
-                    let mut gone: Vec<FpPair> = Vec::new();
+                    let mut gone: HashSet<FpPair> = HashSet::new();
                     for (part, did) in parts.iter().zip(did) {
                         match (part, did) {
                             (Part::DropOffers(signed), _) => gone.extend(signed),
@@ -3404,10 +3420,12 @@ impl Core {
                         continue;
                     }
                     signed.push((identity, other));
-                    if let (Some(a), Some(b)) =
-                        (self.mailbox_of(&identity), self.mailbox_of(&other))
-                    {
-                        named.push((a, b, [true, true]));
+                    // Named as the pair's rows keep them, as the other
+                    // sweeps name theirs.
+                    if self.mailbox_of(&identity).is_some() && self.mailbox_of(&other).is_some() {
+                        if let Some((a, b)) = self.pair_mailboxes(store, &identity, &other, wall)? {
+                            named.push((a, b, [true, true]));
+                        }
                     }
                 }
                 (Part::DropOffers(signed), named)
@@ -3452,9 +3470,8 @@ impl Core {
                     .map(|r| (r.other, r.owner)),
             )
             .collect();
-        let key = |(_, b): &(Mailbox, Mailbox)| (b.login.clone(), b.fingerprint);
-        out.sort_by_key(key);
-        out.dedup_by_key(|p| key(p));
+        let mut seen = HashSet::new();
+        out.retain(|(_, b)| seen.insert(Key::of(b)));
         Ok(out)
     }
 
@@ -3495,8 +3512,7 @@ impl Core {
     ) -> Result<(), StoreError> {
         let made = store.presentations(fingerprint)?;
         for p in made.iter().filter(|p| p.presenter == *fingerprint) {
-            let site = "an unlinked identity's presentation";
-            let gone = self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            let gone = self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
             for gone in &gone {
                 self.orphan_judged_or_owed(store, gone);
             }
