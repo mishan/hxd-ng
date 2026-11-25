@@ -2277,6 +2277,19 @@ pub struct Core {
     /// tests of what lands between.
     #[cfg(test)]
     pub(crate) reconciling: crate::relationships::failing::Park,
+    /// Revoked devices whose offers could not be read or dropped, owed to
+    /// a records tick once their backoff is over.
+    pub(crate) offer_sweeps: Mutex<Vec<crate::messaging::OwedSweep>>,
+    /// No offer is taken as an upgrade offer on an edge a reset left
+    /// inactive: the sequence harness's twin, which no `Reset` record
+    /// ever shows to.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) upgrades_off: std::sync::atomic::AtomicBool,
+    /// Entries told from a read after the step that changed them, which
+    /// the sequence harness holds to the acts not yet telling from what
+    /// their step left.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) told_by_reading: Mutex<Vec<&'static str>>,
     /// Where acts on a ghost go (`crate::server_link`), once a link hub
     /// has started.
     pub(crate) peer_router: std::sync::OnceLock<Arc<dyn crate::server_link::PeerRouter>>,

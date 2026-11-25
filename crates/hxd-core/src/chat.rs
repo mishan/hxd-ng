@@ -3758,7 +3758,10 @@ impl Core {
         self.forget_waiting_reactions(of);
         self.news_subs_purge(of);
         self.devices_purge(of);
-        self.purge_relationships(of);
+        // One that cannot be done now is owed until it is.
+        if !self.purge_or_owe(of) {
+            tracing::warn!(login = %of.login, "relationships: a deleted account's purge is owed");
+        }
         let Some(store) = self.inbox.as_ref() else {
             return 0;
         };

@@ -7,7 +7,8 @@
 //! GtkHx builds and reads them. A friendship made with an ng client or
 //! another classic one is in place on the next server once both present
 //! it, a withdrawal on one ends it on the other, a device reset keeps
-//! only what was taken before it, a rotation's records are fetched, and a
+//! only what was taken before it and a device since remakes the rest, a
+//! rotation's records are fetched, and a
 //! session that did not negotiate bit 15, and a period client beside it
 //! all, see nothing new.
 
@@ -394,6 +395,16 @@ fn outcomes(f: &Frame) -> Vec<Outcome> {
         .collect()
 }
 
+/// A device of `who` enrolled since its reset to epoch 1: its index.
+fn enroll(who: &mut Person) -> usize {
+    let dev = DeviceKey::from_seed(&Sha256::digest(fp(who).0).into());
+    let mut c =
+        DeviceCert::for_device(&who.id, &dev, now() - 3600, cert::RECOMMENDED_LIFETIME).unwrap();
+    c.epoch = 1;
+    who.devices.push((dev, c.sign(&who.id)));
+    who.devices.len() - 1
+}
+
 /// `who` reset its devices to epoch 1 at `time`, as `s` keeps the record
 /// and installs the floor the lists publish.
 fn reset(s: &Server, who: &Person, time: u64) {
@@ -623,8 +634,8 @@ async fn a_withdrawal_on_one_server_ends_a_classic_friendship_on_the_other() {
 }
 
 #[tokio::test]
-async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
-    let (alice, bob) = (alice(), bob());
+async fn a_reset_keeps_what_was_taken_before_it_and_a_device_since_remakes_what_was_not() {
+    let (mut alice, bob) = (alice(), bob());
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let s1 = start(d1.path()).await;
     let s2 = start(d2.path()).await;
@@ -658,7 +669,54 @@ async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
     let refused = present(&mut bob2, &[Presentation::Friendship(&f)]).await;
     assert_eq!(
         outcomes(&refused),
-        vec![(hash(&f), Some(ReasonCode::AccountNotFound), None)]
+        vec![(hash(&f), Some(ReasonCode::AccountNotFound), None)],
+        "`Reset` has no code yet"
+    );
+
+    // Remade from a device enrolled since, as an upgrade offer answered as
+    // a request is, and told to bit-15 sessions alone.
+    let (mut plain_bob, _) = classic(&s2, "bob", CAP_MESSAGING).await;
+    ok(&mut plain_bob, ClientHdr::GetRoster, Vec::new()).await;
+    let renewed = enroll(&mut alice);
+    let mut alice3 = classic_device(&s2, "alice", &alice, renewed).await;
+    let o = offer(&alice, renewed, &bob, now());
+    let asked = ok(
+        &mut alice3,
+        ClientHdr::AddFriend,
+        im::add_friend_offering(b"bob", &o),
+    )
+    .await;
+    assert_eq!(
+        asked.uint(tag::ROSTER_STATE),
+        Some(RosterState::PendingOut.wire().into())
+    );
+    told(&mut bob2, ServerHdr::FriendRequest, "alice", |e| {
+        e.offer == Some(o.as_slice())
+    })
+    .await;
+    let remade = accept(&o, &bob, 1, now());
+    ok(
+        &mut bob2,
+        ClientHdr::FriendResponse,
+        im::friend_response_with(b"alice", &remade),
+    )
+    .await;
+    let done = told(
+        &mut alice3,
+        ServerHdr::RosterEntry,
+        "bob",
+        state(RosterState::Accepted),
+    )
+    .await;
+    assert_eq!(hashes(&entry(&done)), vec![hash(&remade)]);
+    ok(&mut plain_bob, ClientHdr::FindUser, im::find_user(b"alice")).await;
+    assert!(
+        !plain_bob
+            .rx
+            .take_backlog()
+            .iter()
+            .any(|f| f.ty == ServerHdr::FriendRequest.as_u32()),
+        "no request told to a session without bit 15"
     );
 
     reset(&s1, &alice, reset_at);
@@ -667,6 +725,79 @@ async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
         outcomes(&kept),
         vec![(hash(&f), Some(ReasonCode::Ok), None)],
         "held"
+    );
+}
+
+#[tokio::test]
+async fn a_request_made_an_upgrade_by_reset_is_removed_for_sessions_without_bit_15() {
+    // The target's sessions without bit 15 are told the request is gone,
+    // those with it keep the edge for the upgrade, and the sender's see
+    // their request as it was.
+    let (mut alice, bob) = (alice(), bob());
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let s1 = start(d1.path()).await;
+    let s2 = start(d2.path()).await;
+    let mut alice1 = classic_device(&s1, "alice", &alice, 0).await;
+    let mut bob1 = classic_device(&s1, "bob", &bob, 0).await;
+    let f = befriend_classic(&mut alice1, &mut bob1, &alice, &bob).await;
+    reset(&s2, &alice, now() - 1);
+    let renewed = enroll(&mut alice);
+    let mut alice2 = classic_device(&s2, "alice", &alice, renewed).await;
+    let mut bob2 = classic_device(&s2, "bob", &bob, 0).await;
+    let (mut plain_bob, _) = classic(&s2, "bob", CAP_MESSAGING).await;
+    ok(&mut plain_bob, ClientHdr::GetRoster, Vec::new()).await;
+    let (mut plain_alice, _) = classic(&s2, "alice", CAP_MESSAGING).await;
+    ok(&mut plain_alice, ClientHdr::GetRoster, Vec::new()).await;
+
+    // A request, since Bob has presented nothing here yet.
+    let o = offer(&alice, renewed, &bob, now());
+    ok(
+        &mut alice2,
+        ClientHdr::AddFriend,
+        im::add_friend_offering(b"bob", &o),
+    )
+    .await;
+    told(&mut plain_bob, ServerHdr::FriendRequest, "alice", |_| true).await;
+    told(&mut bob2, ServerHdr::FriendRequest, "alice", |e| {
+        e.offer == Some(o.as_slice())
+    })
+    .await;
+
+    present(&mut bob2, &[Presentation::Friendship(&f)]).await;
+    told(
+        &mut plain_bob,
+        ServerHdr::RosterEntry,
+        "alice",
+        state(RosterState::Removed),
+    )
+    .await;
+    told(&mut bob2, ServerHdr::FriendRequest, "alice", |e| {
+        e.offer == Some(o.as_slice())
+    })
+    .await;
+    assert_eq!(
+        refused(
+            &mut plain_alice,
+            ClientHdr::AddFriend,
+            im::add_friend(b"bob", None)
+        )
+        .await,
+        Some(ReasonCode::RequestPending),
+        "the sender's request standing"
+    );
+    let removed = |c: &mut Client, login: &[u8]| {
+        c.rx.take_backlog().iter().any(|f| {
+            f.ty == ServerHdr::RosterEntry.as_u32()
+                && entry(f).login == login
+                && entry(f).state == Some(RosterState::Removed.wire())
+        })
+    };
+    assert!(!removed(&mut bob2, b"alice"), "the target's");
+    ok(&mut alice2, ClientHdr::FindUser, im::find_user(b"bob")).await;
+    assert!(!removed(&mut alice2, b"bob"), "the sender's");
+    assert!(
+        !removed(&mut plain_alice, b"bob"),
+        "the sender's without bit 15"
     );
 }
 

@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 use crate::ending::EndedBy;
+use crate::messaging::Sweep;
 use crate::push::Unrevoked;
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
@@ -337,8 +338,27 @@ impl Core {
         self.take_revoked(keys.chain(ids).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
+            // The operator names a device alone: its offers are found by
+            // what signed them, under whichever identity.
+            let devices = devices.iter().map(|(_, device)| Sweep::Device {
+                identity: None,
+                device: *device,
+                operator: true,
+            });
+            let identities = identities.iter().map(|i| Sweep::Identity {
+                identity: *i,
+                operator: true,
+            });
+            self.sweep_offers(devices.chain(identities).collect());
         }
         ended
+    }
+
+    /// Whether `identity` is revoked, by the operator or a registrar: no
+    /// offer from or to it is kept.
+    pub(crate) fn identity_revoked(&self, identity: &[u8; 32]) -> bool {
+        let r = self.revoked.read().unwrap();
+        r.local.identities.contains(identity) || r.published.identities.contains(identity)
     }
 
     /// The identity keys of every session on the roster, live or
@@ -373,7 +393,7 @@ impl Core {
         mut list: Published,
         kept: &[[u8; 32]],
     ) -> Vec<(Uid, String)> {
-        let (identities, devices, floors): (Vec<_>, Vec<_>, Vec<_>) = {
+        let (identities, devices, floors, newly): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             for id in kept {
                 if let Some(&installed) = refused.published.floors.get(id) {
@@ -398,8 +418,15 @@ impl Core {
                 .filter(|i| !refused.published.refuses_identity(i))
                 .copied()
                 .collect();
+            // Revoked now, frozen before or not: a freeze alone keeps the
+            // offers, a revocation takes them.
+            let newly = list
+                .identities
+                .difference(&refused.published.identities)
+                .copied()
+                .collect();
             refused.published = list.clone();
-            (ids, new, risen)
+            (ids, new, risen, newly)
         };
         let keys = devices
             .iter()
@@ -418,6 +445,18 @@ impl Core {
         self.take_revoked(keys.chain(ids).chain(floors).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
+            let devices = devices.iter().filter_map(|(i, d)| {
+                i.map(|identity| Sweep::Device {
+                    identity: Some(identity),
+                    device: *d,
+                    operator: false,
+                })
+            });
+            let identities = newly.iter().map(|i| Sweep::Identity {
+                identity: *i,
+                operator: false,
+            });
+            self.sweep_offers(devices.chain(identities).collect());
         }
         self.reconcile_due(list.floors.keys().copied());
         ended

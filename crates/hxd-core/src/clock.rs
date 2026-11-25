@@ -8,6 +8,8 @@
 //! time.
 //! Timers (tokio's sleeps and timeouts) stay on real time: the offset
 //! moves what the server decides, not when it wakes.
+//! A test may stand a clock still ([`Clock::frozen`]), so that two cores
+//! it compares decide at the same times.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,25 +19,37 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct Clock {
     /// Milliseconds added to real time.
     offset: Arc<AtomicU64>,
+    /// Where a test's clock stands still, but for what it advances: so two
+    /// cores a test compares read the same times whatever ran between.
+    frozen: Option<(Instant, SystemTime)>,
 }
 
 impl Clock {
+    /// A clock that stands at `at` until advanced.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn frozen(at: SystemTime) -> Clock {
+        Clock {
+            offset: Arc::default(),
+            frozen: Some((Instant::now(), at)),
+        }
+    }
+
     fn offset(&self) -> Duration {
         Duration::from_millis(self.offset.load(Ordering::Relaxed))
     }
 
     pub fn now(&self) -> Instant {
-        Instant::now() + self.offset()
+        self.frozen.map_or_else(Instant::now, |(at, _)| at) + self.offset()
     }
 
     /// The wall time, for what is stored and lapses.
     pub fn wall(&self) -> SystemTime {
-        SystemTime::now() + self.offset()
+        self.frozen.map_or_else(SystemTime::now, |(_, at)| at) + self.offset()
     }
 
     /// Unix seconds.
     pub fn unix(&self) -> u64 {
-        (SystemTime::now() + self.offset())
+        self.wall()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)

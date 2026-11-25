@@ -5,7 +5,7 @@
 //! friendship made on one server is in place on the next with no new
 //! request, a withdrawal on one ends it on the other, a revoked device's
 //! presentations go with it, a device reset keeps only what was taken
-//! before it, a rotation is followed, and a client that never asks, and a
+//! before it and a device since remakes the rest, a rotation is followed, and a client that never asks, and a
 //! period client beside it all, see nothing new.
 
 use std::net::SocketAddr;
@@ -416,6 +416,16 @@ async fn befriend(
     f
 }
 
+/// A device of `who` enrolled since its reset to epoch 1: its index.
+fn enroll(who: &mut Person) -> usize {
+    let dev = DeviceKey::from_seed(&Sha256::digest(fp(who).0).into());
+    let mut c =
+        DeviceCert::for_device(&who.id, &dev, now() - 3600, cert::RECOMMENDED_LIFETIME).unwrap();
+    c.epoch = 1;
+    who.devices.push((dev, c.sign(&who.id)));
+    who.devices.len() - 1
+}
+
 /// `who` reset its devices to epoch 1 at `time`, as `s` keeps the record
 /// and installs the floor the lists publish.
 fn reset(s: &Server, who: &Person, time: u64) {
@@ -601,8 +611,8 @@ async fn a_revoked_device_takes_its_presentations_with_it() {
 }
 
 #[tokio::test]
-async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
-    let (alice, bob) = (person(1), person(2));
+async fn a_reset_keeps_what_was_taken_before_it_and_a_device_since_remakes_what_was_not() {
+    let (mut alice, bob) = (person(1), person(2));
     let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let s1 = start(d1.path(), &alice, &bob, false, true).await;
     let s2 = start(d2.path(), &alice, &bob, false, true).await;
@@ -622,7 +632,45 @@ async fn a_reset_keeps_what_was_taken_before_it_and_drops_what_was_not() {
     let gone = event(&mut bob2, "friend", |d| is_entry(d, "alice", "removed")).await;
     assert!(gone["friend"].get("withdraw").is_none(), "{gone}");
     let refused = present(&mut bob2, &[], &[&f]).await;
-    assert_eq!(refused["friendships"][0]["result"], "no_such_user");
+    assert_eq!(refused["friendships"][0]["result"], "reset");
+
+    // Remade from a device enrolled since, as an upgrade offer answered as
+    // a request is, and told to friendships sessions alone.
+    let (mut plain_bob, _) = password(&s2, "bob").await;
+    let renewed = enroll(&mut alice);
+    let mut alice3 = device(&s2, &alice, renewed, "alice").await;
+    let o = offer(&alice, renewed, &bob, now());
+    let asked = ok(
+        &mut alice3,
+        "friend_add",
+        json!({ "login": "bob", "offer": b64(&o) }),
+    )
+    .await;
+    assert_eq!(asked["state"], "pending_out");
+    let req = event(&mut bob2, "friend_request", |d| d["login"] == "alice").await;
+    assert_eq!(req["offer"], b64(&o));
+    let remade = accept(&o, &bob, 1, now());
+    let done = ok(
+        &mut bob2,
+        "friend_respond",
+        json!({ "login": "alice", "accept": true, "friendship": b64(&remade) }),
+    )
+    .await;
+    assert_eq!(done["state"], "accepted");
+    let entry = event(&mut alice3, "friend", |d| is_entry(d, "bob", "accepted")).await;
+    assert_eq!(entry["friend"]["friendships"], json!([hash(&remade)]));
+    event(&mut plain_bob, "friend", |d| {
+        is_entry(d, "alice", "accepted")
+    })
+    .await;
+    assert!(
+        !plain_bob
+            .rx
+            .take_backlog()
+            .iter()
+            .any(|e| e.ev == "friend_request"),
+        "no request told to a session that never asked"
+    );
 
     reset(&s1, &alice, reset_at);
     let kept = present(&mut bob1, &[], &[&f]).await;

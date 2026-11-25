@@ -315,16 +315,16 @@ makes a local edge, as the extension describes.
   Whether it qualifies is decided when the 802 arrives, and once more if
   it is still pending when the target's presentation is later answered
   `Reset`: an offer the sender made first, as a party answered `Reset`
-  before its friend presented does (§6), then becomes an upgrade offer,
-  leaving the friend-request bounds and ledger, and is delivered again
-  to the target's friendships sessions as one. Otherwise it stays as
-  decided. It is checked first as any 802 with an offer is, so that it
-  tests no hidden link, and it is answered the same whether it
+  before its friend presented does (§6), then becomes an upgrade offer
+  and is delivered again to the target's friendships sessions as one,
+  while its sender still sees its request pending. Otherwise it stays
+  as decided. It is checked first as any 802 with an offer is, so that
+  it tests no hidden link, and it is answered the same whether it
   qualifies: as a friend request is, on this wire, and `pending_out` on
-  the ng wire (`hotline-ng.md` §7.5), so the answer says nothing of the
-  target's presentation; only that a qualifying one skips the
-  friend-request ledger and bounds could tell, a small leak to a party
-  that already holds the friendship. The target's client asks its user
+  the ng wire (`hotline-ng.md` §7.5). Unlike an upgrade offer on an
+  existing edge, it is held to the friend-request bounds and counted
+  in the ledger as a request is, so that no answer, then or later,
+  differs by whether the target holds a `Reset` record. The target's client asks its user
   before accepting, since the offer comes from a device the old
   friendship did not name. Its acceptance makes the edge portable,
   presented by both and active. It is then an active edge as any other,

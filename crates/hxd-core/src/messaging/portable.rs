@@ -39,8 +39,8 @@ use super::{store_failed, takes_part, FriendEntry, MessagingError, RosterState};
 use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    Ended, EndedEdge, Ending, HeldWithdrawal, Presentation, RelationId, RelationshipStore,
-    StoredOffer,
+    Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal, Left, Part, PendingOut,
+    Presentation, RelationId, Relationship, RelationshipStore, Report, StoredOffer,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -59,6 +59,15 @@ const MAX_CHAIN: usize = 16;
 /// against the clock when it was taken, and a clock set back since must
 /// not refuse it.
 const STORED: u64 = u64::MAX;
+
+/// What one object of a presentation weighs against the classic wire's
+/// friendship pacing (`Core::friendships_spend`), as the frontends weigh
+/// it.
+const PRESENTING: u32 = 4;
+
+/// How long a `Reset` record outlasts the last presentation answered
+/// `Reset` that kept it, while no upgrade offer waits on it (§4.3 step 4).
+const RESET_KEPT: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// Every floor taken as 0: for an object whose signatures must verify
 /// whatever the floors, which are tested after them (§4.3 step 1, §6),
@@ -152,6 +161,65 @@ const GENERATIONS: usize = 1 << 16;
 /// passes keep failing would otherwise cost one every tick however many
 /// there are.
 const UNRECORDED_PER_TICK: usize = 256;
+
+/// How long a revoked device's offers wait to be swept again after a
+/// sweep of them fails, doubling with each failure up to
+/// [`SWEEP_BACKOFF_MAX`], so a store that keeps failing costs a try and a
+/// log line that often rather than every tick.
+const SWEEP_BACKOFF: u64 = 60;
+const SWEEP_BACKOFF_MAX: u64 = 3600;
+
+/// Offers owed a drop: a revoked device's, by the operator or by a
+/// registrar, under the identity it signed for; a revoked identity's,
+/// from or to it; or an unlinked one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// A deleted account's relationships, purged under the mailbox it
+    /// held, so that whoever is given the login next inherits none.
+    Purge(Mailbox),
+    /// The offers a device signed: under the identity a registrar names
+    /// it for, or, the operator's naming none, under whichever.
+    Device {
+        identity: Option<[u8; 32]>,
+        device: [u8; 32],
+        operator: bool,
+    },
+    Identity {
+        identity: [u8; 32],
+        operator: bool,
+    },
+    Unlinked([u8; 32]),
+    /// The presentations an unlinked identity made.
+    Unpresented([u8; 32]),
+    /// What two keys hold of each other judged again, after a drop that
+    /// left one held by its own taking alone could not be judged.
+    Judge([u8; 32], [u8; 32]),
+    /// A revoked device's presentations, the operator's by device alone.
+    Presented {
+        identity: Option<[u8; 32]>,
+        device: [u8; 32],
+    },
+}
+
+/// A sweep that could not read or drop what it owes, until its
+/// backoff is over or what owed it is lifted.
+pub(crate) struct OwedSweep {
+    sweep: Sweep,
+    failures: u32,
+    due: u64,
+}
+
+impl OwedSweep {
+    pub(super) fn failed(sweep: Sweep, failures: u32, now: u64) -> Self {
+        let failures = failures + 1;
+        let wait = SWEEP_BACKOFF.saturating_mul(1 << (failures - 1).min(6));
+        OwedSweep {
+            sweep,
+            failures,
+            due: now + wait.min(SWEEP_BACKOFF_MAX),
+        }
+    }
+}
 
 /// What [`Core::judge_floors`] reconciled: each identity whose stored
 /// friendships and offers were all judged at its epochs, with the
@@ -385,6 +453,21 @@ impl<'a> Floors<'a> {
         out
     }
 
+    /// Whether `who`'s own half of `f`, signed by `who` or a key that
+    /// rotated to it along `rotations`, was signed by a certificate below
+    /// its signer's floor.
+    fn own_half_below(&self, f: &Friendship, who: &[u8; 32], rotations: &[Rotation]) -> bool {
+        [
+            (&f.offer.from, &f.offer.cert),
+            (&f.acceptance.from, &f.acceptance.cert),
+        ]
+        .into_iter()
+        .any(|(from, cert)| {
+            chain_end(Fingerprint::of(from), rotations).is_some_and(|k| k.0 == *who)
+                && DeviceCert::parse(cert).is_ok_and(|c| c.check_floor(self.floor(from)).is_err())
+        })
+    }
+
     /// Whether `o` was signed by a certificate below its signer's floor.
     fn below(&self, o: &Offer) -> bool {
         DeviceCert::parse(&o.cert).is_ok_and(|c| c.check_floor(self.floor(&o.from)).is_err())
@@ -452,6 +535,9 @@ pub enum Presented {
     /// With the withdrawal that ends it, where it is not the server's own.
     Withdrawn(Option<Vec<u8>>),
     Stale,
+    /// A half below its signer's floor that this server did not hold
+    /// before the reset (§6).
+    Reset,
 }
 
 /// One object's answer, by the friendship hash, or a withdrawal's pair
@@ -481,9 +567,8 @@ type Going = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
 pub(super) enum Applied {
     /// Ended, and told.
     Ended,
-    /// Active, each party's presentation standing, under the mailboxes
-    /// its rows keep.
-    Standing([Mailbox; 2]),
+    /// Active, each party's presentation standing, told to both again.
+    Standing,
     /// Neither: there was none, or it is this server's alone and made
     /// after the cutoff.
     Untouched,
@@ -513,8 +598,91 @@ fn own(device: &Device, me: &Mailbox, from: &[u8; 32], cert: &[u8]) -> Result<()
     Ok(())
 }
 
+/// [`Core::portable_fields`] for `left.pair[i]`'s entry, from what the
+/// step left.
+pub(super) fn fields_left(left: &Left, i: usize, e: &mut FriendEntry) {
+    if left.pair[i].fingerprint.is_none() || e.fingerprint.is_none() {
+        return;
+    }
+    let (mine, theirs) = (&left.presentations[i], &left.presentations[1 - i]);
+    if e.state == RosterState::Accepted && whole(mine) && whole(theirs) {
+        let mut hashes: Vec<[u8; 32]> = [mine, theirs]
+            .into_iter()
+            .flatten()
+            .map(|p| p.hash)
+            .collect();
+        hashes.dedup();
+        e.friendships = hashes;
+    }
+    e.offer = match e.state {
+        RosterState::Accepted => left.offers[1 - i].clone(),
+        RosterState::PendingIn => left.rows[1 - i]
+            .as_ref()
+            .and_then(|r| r.pending_out.clone())
+            .filter(|p| !p.upgrade)
+            .and_then(|p| p.offer),
+        _ => None,
+    }
+    .map(|o| o.offer);
+}
+
+/// The drops that make room for the withdrawals a write keeps, and each
+/// owner's withdrawals judged whole by them, to record once it commits.
+struct Room {
+    parts: Vec<Part>,
+    judged: Vec<([u8; 32], KeptFloors)>,
+}
+
+/// What presenting does to the edge, as [`Core::activation`] reads it.
+enum Activation {
+    None,
+    Already,
+    RosterFull,
+    Befriend(Option<RelationId>, Vec<RelationId>),
+}
+
+/// The parts that make `a` and `b` friends, under `id` where there is
+/// one, dropping the pair's presentations `drop` names and the offers
+/// between them: the first acceptance answers them all.
+pub(super) fn befriend_parts(
+    a: &Mailbox,
+    b: &Mailbox,
+    at: SystemTime,
+    id: Option<RelationId>,
+    drop: &[[u8; 32]],
+) -> Vec<Part> {
+    let mut parts = vec![Part::BefriendDropping {
+        a: a.clone(),
+        b: b.clone(),
+        at,
+        id,
+        drop: drop.to_vec(),
+    }];
+    if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
+        parts.push(Part::SetOffer(x, y, None));
+        parts.push(Part::SetOffer(y, x, None));
+    }
+    parts
+}
+
 fn whole(p: &Option<Presentation>) -> bool {
     p.as_ref().is_some_and(Presentation::evidence)
+}
+
+impl Core {
+    /// [`Core`]'s `upgrades_off`, false outside the sequence harness.
+    fn upgrades_off(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        return self.upgrades_off.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
+    }
+}
+
+/// Whether the friendship `bytes` was built from an offer that has lapsed
+/// by `now` (§4.1), which its acceptance is answered `Stale` for.
+pub(super) fn lapsed_offer(bytes: &[u8], now: SystemTime) -> bool {
+    Friendship::check(bytes, STORED, &[], zero_floor).is_ok_and(|f| f.offer.expires <= secs(now))
 }
 
 fn logged(what: &str, r: Result<(), StoreError>) {
@@ -609,6 +777,24 @@ impl Core {
     /// listed is passed over without reading its rows: a keep of them
     /// marks it due ([`Watched`]).
     pub(crate) fn reconcile_due(&self, listed: impl IntoIterator<Item = [u8; 32]>) {
+        let now = self.clock.unix();
+        if self
+            .offer_sweeps
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.due <= now)
+        {
+            self.sweep_offers(Vec::new());
+        }
+        if let Some(store) = &self.relationships {
+            // Under the hold an 802 judges a record under, so that none
+            // lapses between the judging and the offer it keeps waiting.
+            let _writing = self.friend_writes();
+            let now = self.clock.wall();
+            let lapsed = store.lapse_resets(now - RESET_KEPT, now);
+            logged("lapsing `Reset` records", lapsed.map(drop));
+        }
         let (Some(_), Some(cache)) = (&self.relationships, &self.record_cache) else {
             return;
         };
@@ -786,10 +972,18 @@ impl Core {
         // Offers first, so the entry each tells is the one before an end.
         for (owner, other, stored, o) in dropping {
             let _writing = self.friend_writes();
-            if store
-                .offer(&owner, &other, wall)?
-                .is_none_or(|now| now.offer != stored.offer)
-            {
+            // The pair's own offer, read alone: an upgrade, or the one its
+            // request carries.
+            let asked = store
+                .relationship(
+                    &Mailbox::identified("", owner),
+                    &Mailbox::identified("", other),
+                    wall,
+                )?
+                .and_then(|r| r.pending_out)
+                .and_then(|p| p.offer);
+            let now = store.offer(&owner, &other, wall)?.or(asked);
+            if now.is_none_or(|now| now.offer != stored.offer) {
                 // Moved or replaced since: judged by a pass that reads it
                 // where it is now.
                 whole = false;
@@ -799,9 +993,10 @@ impl Core {
             let below = floors.below(&o);
             floors.failed()?;
             if below {
-                store.set_offer(&owner, &other, None)?;
+                store.drop_offers(&[(owner, other)])?;
                 if let (Some(me), Some(them)) = (self.mailbox_of(&owner), self.mailbox_of(&other)) {
-                    self.tell_entry(&them, &me);
+                    self.tell_entry("an offer below a floor", &them, &me);
+                    self.tell_entry("an offer below a floor", &me, &them);
                 }
             }
         }
@@ -953,7 +1148,9 @@ impl Core {
         store: &Arc<dyn RelationshipStore>,
         floors: &Floors,
         keeping: &[HeldWithdrawal],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Room, StoreError> {
+        let mut parts = Vec::new();
+        let mut judged = Vec::new();
         let same = |a: &HeldWithdrawal, b: &HeldWithdrawal| {
             (a.owner, a.pair, a.party, a.withdrawal.is_none())
                 == (b.owner, b.pair, b.party, b.withdrawal.is_none())
@@ -970,38 +1167,44 @@ impl Core {
             // A withdrawal is kept only at or above its signer's floor, its
             // owner's own key, so none falls below the kept floors an
             // owner's were last judged whole at until one of them rises.
-            let judged = self.withdrawals_judged.lock().unwrap().get(&owner).cloned();
-            let whole = judged.is_some_and(|j| j.iter().all(|(fp, kept)| floors.kept(fp) == *kept));
+            let last = self.withdrawals_judged.lock().unwrap().get(&owner).cloned();
+            let whole = last.is_some_and(|j| j.iter().all(|(fp, kept)| floors.kept(fp) == *kept));
             if held.len() + new > self.messaging_policy.max_roster && !whole {
                 #[cfg(test)]
                 self.withdrawal_scans
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut signers = self.drop_dead(store, floors, &held)?;
+                let (mut signers, dead) = self.dead(floors, &held);
+                parts.extend(dead);
                 signers.push((owner, floors.kept(&owner)));
                 floors.failed()?;
-                self.withdrawals_judged
-                    .lock()
-                    .unwrap()
-                    .insert(owner, signers);
+                judged.push((owner, signers));
             } else {
                 let shadowed = |h: &&HeldWithdrawal| {
                     keeping.iter().any(|k| k.withdrawal.is_some() && same(h, k))
                 };
-                self.drop_dead(store, floors, held.iter().filter(shadowed))?;
+                parts.extend(self.dead(floors, held.iter().filter(shadowed)).1);
             }
         }
-        floors.failed()
+        floors.failed()?;
+        Ok(Room { parts, judged })
     }
 
-    /// Drop those of `held` signed below their signer's kept floor,
-    /// answering each signer's kept floor as read.
-    fn drop_dead<'w>(
+    /// What a write `make_room` made room for judged, once that write
+    /// committed: a cache that recorded a scan the write never kept would
+    /// pass over the rows it left.
+    fn room_made(&self, judged: Vec<([u8; 32], KeptFloors)>) {
+        self.withdrawals_judged.lock().unwrap().extend(judged);
+    }
+
+    /// The drops of those of `held` signed below their signer's kept
+    /// floor, with each signer's kept floor as read.
+    fn dead<'w>(
         &self,
-        store: &Arc<dyn RelationshipStore>,
         floors: &Floors,
         held: impl IntoIterator<Item = &'w HeldWithdrawal>,
-    ) -> Result<KeptFloors, StoreError> {
+    ) -> (KeptFloors, Vec<Part>) {
         let mut signers = KeptFloors::new();
+        let mut parts = Vec::new();
         for w in held {
             let Some(bytes) = w.withdrawal.as_deref() else {
                 continue;
@@ -1014,10 +1217,15 @@ impl Core {
                 signers.push((signer, kept));
             }
             if cert.check_floor(kept).is_err() {
-                store.drop_withdrawal(&w.owner, &w.pair, &w.party, bytes)?;
+                parts.push(Part::DropWithdrawal(
+                    w.owner,
+                    w.pair,
+                    w.party,
+                    bytes.to_vec(),
+                ));
             }
         }
-        Ok(signers)
+        (signers, parts)
     }
 
     /// Drop every withdrawal counted toward `owners` that will never
@@ -1031,7 +1239,8 @@ impl Core {
         let floors = Floors::new(self);
         for owner in owners {
             self.withdrawals_judged.lock().unwrap().remove(owner);
-            self.drop_dead(store, &floors, &store.withdrawals_by(owner)?)?;
+            let (_, dead) = self.dead(&floors, &store.withdrawals_by(owner)?);
+            store.write(&dead, &Report::none())?;
         }
         floors.failed()
     }
@@ -1044,11 +1253,17 @@ impl Core {
         a: &Mailbox,
         b: &Mailbox,
         end: &Ending,
-    ) -> Result<Ended, StoreError> {
-        self.make_room(store, &Floors::new(self), &end.withdrawals)?;
-        let ended = store.end_friendship(a, b, end)?;
+    ) -> Result<(Ended, Left), StoreError> {
+        let Room { mut parts, judged } =
+            self.make_room(store, &Floors::new(self), &end.withdrawals)?;
+        parts.push(Part::EndFriendship(a.clone(), b.clone(), end.clone()));
+        let (mut did, left) = self.write_left(store, &parts, &[(a, b)], self.clock.wall())?;
+        self.room_made(judged);
+        let Some(Did::Ended(ended)) = did.pop() else {
+            unreachable!("an ending answers what it ended");
+        };
         self.unjudge(store, [a.fingerprint, b.fingerprint].into_iter().flatten());
-        Ok(ended)
+        Ok((ended, left.into_iter().next().expect("the pair asked of")))
     }
 
     /// What the withdrawals held for `pair` that stand at the current
@@ -1061,6 +1276,7 @@ impl Core {
         pair: &Pair,
         rotations: &[Rotation],
         floors: &Floors,
+        tidy: &mut Vec<Part>,
     ) -> Result<Vec<HeldCutoff>, MessagingError> {
         let mut out = Vec::new();
         for w in store.withdrawals(&pair.hash()).map_err(store_failed)? {
@@ -1072,9 +1288,12 @@ impl Core {
                     .is_some_and(|k| k.check_pair(pair, rotations).is_ok());
                 if !passes {
                     if let Some(bytes) = &w.withdrawal {
-                        store
-                            .drop_withdrawal(&w.owner, &w.pair, &w.party, bytes)
-                            .map_err(store_failed)?;
+                        tidy.push(Part::DropWithdrawal(
+                            w.owner,
+                            w.pair,
+                            w.party,
+                            bytes.clone(),
+                        ));
                     }
                     continue;
                 }
@@ -1082,9 +1301,10 @@ impl Core {
                     checked: true,
                     ..w.clone()
                 };
-                store
-                    .keep_withdrawal(&checked, self.messaging_policy.max_roster)
-                    .map_err(store_failed)?;
+                tidy.push(Part::KeepWithdrawal(
+                    checked,
+                    self.messaging_policy.max_roster,
+                ));
             }
             // One a device now below its floor signed ends nothing.
             if !floors.stands(w.withdrawal.as_deref()) {
@@ -1099,34 +1319,6 @@ impl Core {
         }
         Ok(out)
     }
-
-    /// The offer `from` has waiting for `to`, as it reads now.
-    pub(super) fn offer_between(
-        &self,
-        store: &Arc<dyn RelationshipStore>,
-        from: &Mailbox,
-        to: &Mailbox,
-        now: SystemTime,
-    ) -> Option<StoredOffer> {
-        let (a, b) = (from.fingerprint?, to.fingerprint?);
-        store.offer(&a, &b, now).unwrap_or_else(|e| {
-            warn!("relationships: reading an offer: {e}");
-            None
-        })
-    }
-
-    /// Drop the offers either of two accounts has waiting for the other.
-    pub(super) fn drop_offers(&self, store: &Arc<dyn RelationshipStore>, a: &Mailbox, b: &Mailbox) {
-        let (Some(x), Some(y)) = (a.fingerprint, b.fingerprint) else {
-            return;
-        };
-        for (p, q) in [(x, y), (y, x)] {
-            if let Err(e) = store.set_offer(&p, &q, None) {
-                warn!("relationships: dropping an offer: {e}");
-            }
-        }
-    }
-
     /// An 802's offer, checked as §4.1 has it: the caller's own act, in
     /// time, to the fingerprint `them` links, and ended by no withdrawal
     /// held here.
@@ -1137,6 +1329,7 @@ impl Core {
         device: &Device,
         them: &Mailbox,
         bytes: Vec<u8>,
+        tidy: &mut Vec<Part>,
     ) -> Result<StoredOffer, MessagingError> {
         let now = self.clock.unix();
         let floors = Floors::new(self);
@@ -1153,7 +1346,7 @@ impl Core {
         }
         let pair = offer.pair();
         let rotations = self.rotations_for(store, &pair)?;
-        let cuts = self.cutoffs(store, &pair, &rotations, &floors)?;
+        let cuts = self.cutoffs(store, &pair, &rotations, &floors, tidy)?;
         floors.failed().map_err(store_failed)?;
         if cuts.iter().any(|(c, _)| offer.cut_by(c)) {
             return Err(MessagingError::Withdrawn);
@@ -1164,22 +1357,68 @@ impl Core {
         })
     }
 
-    /// An upgrade offer on a friendship already standing (§4.1): kept,
-    /// and told to the friend's friendships sessions alone.
+    /// An upgrade offer (§4.1), told to `them`'s friendships sessions
+    /// alone: on a friendship standing, kept beside it; on an edge a reset
+    /// left inactive, kept with a pending out its sender is shown as of a
+    /// request, which `them` never is. One that takes the place of another
+    /// waiting is paced as presenting is, so that offers made again tell
+    /// `them` no faster than presentations would.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn upgrade_offer(
         &self,
         store: &Arc<dyn RelationshipStore>,
+        uid: Uid,
         me: &Mailbox,
         them: &Mailbox,
         note: Option<String>,
         offer: StoredOffer,
-    ) -> Result<RosterState, MessagingError> {
+        charge: Option<&Charge>,
+    ) -> Result<(), MessagingError> {
         let (Some(a), Some(b)) = (me.fingerprint, them.fingerprint) else {
             return Err(MessagingError::AlreadyFriends);
         };
-        store
-            .set_offer(&a, &b, Some(&offer))
-            .map_err(store_failed)?;
+        let now = self.clock.wall();
+        if store.offer(&a, &b, now).map_err(store_failed)?.is_some()
+            && self.friendships_spend(uid, PRESENTING).is_err()
+        {
+            return Err(MessagingError::RateLimited);
+        }
+        let friends = store
+            .relationship(me, them, now)
+            .map_err(store_failed)?
+            .is_some_and(|r| r.friendship.is_some());
+        if friends {
+            store
+                .set_offer(&a, &b, Some(&offer))
+                .map_err(store_failed)?;
+        } else {
+            // It lapses for its sender as a request would, and its offer
+            // never after it.
+            let lapses_at = now + self.messaging_policy.request_retention;
+            let shown = PendingOut {
+                sent_at: now,
+                lapses_at,
+                delivered: true,
+                note: note.clone(),
+                offer: None,
+                upgrade: true,
+            };
+            let kept = StoredOffer {
+                lapses_at: offer.lapses_at.min(lapses_at),
+                ..offer.clone()
+            };
+            let left = store
+                .ask(
+                    me,
+                    them,
+                    &shown,
+                    Some(&kept),
+                    charge,
+                    &Report::of(me, them, now),
+                )
+                .map_err(store_failed)?;
+            self.tell_left(&left[0], [true, false]);
+        }
         self.roster.lock().unwrap().tell_friendships(
             them,
             Event::FriendRequest {
@@ -1189,7 +1428,73 @@ impl Core {
                 offer: Some(offer.offer),
             },
         );
-        Ok(RosterState::Accepted)
+        Ok(())
+    }
+
+    /// Whether an offer from `sender` to `target` is an upgrade offer on an
+    /// edge a reset left inactive (§4.1): `target`'s own presentation for
+    /// the pair answered `Reset` here, which is its consent, and `sender`'s
+    /// half of the friendship it kept below its floor. `waiting`, for an
+    /// offer already taken as one, which keeps the record past its time.
+    pub(super) fn reset_edge(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        sender: &Mailbox,
+        target: &Mailbox,
+        now: SystemTime,
+        waiting: bool,
+    ) -> Result<bool, MessagingError> {
+        let (Some(s), Some(t)) = (sender.fingerprint, target.fingerprint) else {
+            return Ok(false);
+        };
+        if self.upgrades_off() {
+            return Ok(false);
+        }
+        let Some(record) = store
+            .presentation(&t, &s)
+            .map_err(store_failed)?
+            .filter(|p| waiting || p.at + RESET_KEPT > now)
+            .and_then(|p| p.reset)
+        else {
+            return Ok(false);
+        };
+        let Ok(f) = Friendship::check(&record, STORED, &[], zero_floor) else {
+            return Ok(false);
+        };
+        let rotations = self.rotations_for(store, &f.pair())?;
+        let floors = Floors::new(self);
+        let below = floors.own_half_below(&f, &s, &rotations);
+        floors.failed().map_err(store_failed)?;
+        Ok(below)
+    }
+
+    /// What a `Reset` answered `me` tells of `them`'s `offer` waiting
+    /// (§4.1), told to `me`'s friendships sessions as an upgrade offer at
+    /// every presentation answered so, which reaches one made while `me`
+    /// was away. Where it came with `asked`, a request taken as an upgrade
+    /// just now, `me`'s other sessions saw the request, which is gone for
+    /// them; `them`'s sessions are told nothing, their request standing as
+    /// far as they can tell.
+    fn reset_offer(
+        &self,
+        me: &Mailbox,
+        them: &Mailbox,
+        offer: StoredOffer,
+        asked: Option<PendingOut>,
+    ) {
+        let mut r = self.roster.lock().unwrap();
+        if asked.is_some() {
+            r.tell_plain(me, Event::FriendEntry(Box::new(FriendEntry::removed(them))));
+        }
+        r.tell_friendships(
+            me,
+            Event::FriendRequest {
+                login: them.login.clone(),
+                fingerprint: them.fingerprint,
+                note: asked.and_then(|p| p.note),
+                offer: Some(offer.offer),
+            },
+        );
     }
 
     /// An 805 that accepts with a friendship (§4.1): checked against the
@@ -1221,7 +1526,8 @@ impl Core {
         fresh(f.acceptance.time, now)?;
         let pair = f.pair();
         let rotations = self.rotations_for(store, &pair)?;
-        let cuts = self.cutoffs(store, &pair, &rotations, &floors)?;
+        let mut tidy = Vec::new();
+        let cuts = self.cutoffs(store, &pair, &rotations, &floors, &mut tidy)?;
         floors.failed().map_err(store_failed)?;
         if cuts.iter().any(|(c, _)| f.cut_by(c)) {
             return Err(MessagingError::Withdrawn);
@@ -1249,39 +1555,69 @@ impl Core {
         if judged != Judged::Stands {
             return Err(MessagingError::BadSignature);
         }
-        for ((presenter, other, dev), old) in rows.into_iter().zip(olds) {
-            let edge = old.as_ref().and_then(|p| p.edge);
-            let taken = old
-                .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
-                .map_or(at, |p| p.taken);
-            let replaced = store
-                .present(&Presentation {
-                    presenter,
-                    other,
-                    names: [presenter, other],
-                    pair: pair.hash(),
-                    hash: f.hash,
-                    friendship: Some(bytes.clone()),
-                    device: dev,
-                    edge,
-                    at,
-                    taken,
-                })
-                .map_err(store_failed)?;
-            self.replaced(store, replaced, Some(&bytes));
-        }
+        let kept = olds.iter().flatten().find_map(|p| p.edge);
+        let presented: Vec<Presentation> = rows
+            .into_iter()
+            .zip(olds)
+            .map(|((presenter, other, dev), old)| Presentation {
+                presenter,
+                other,
+                names: [presenter, other],
+                pair: pair.hash(),
+                hash: f.hash,
+                friendship: Some(bytes.clone()),
+                reset: None,
+                device: dev,
+                edge: old.as_ref().and_then(|p| p.edge),
+                at,
+                taken: old
+                    .filter(|p| p.friendship.as_deref() == Some(&bytes[..]))
+                    .map_or(at, |p| p.taken),
+            })
+            .collect();
         let friends = store
             .relationship(me, them, at)
             .map_err(store_failed)?
             .is_some_and(|r| r.friendship.is_some());
-        if friends {
-            self.drop_offers(store, me, them);
-            self.tell_entry(me, them);
-            self.tell_entry(them, me);
-            Ok(())
-        } else {
-            self.activate(store, me, them, &floors, at)
+        // The caller's roster is asked before anything is written, so that
+        // a refusal leaves what was there, a `Reset` record included. The
+        // sender's always has room: its request, or the pending out its
+        // upgrade offer shows it, is a row of it already.
+        let mut approvals = Vec::new();
+        if !friends {
+            let max = self.messaging_policy.max_roster;
+            for (x, y) in [(me, them), (them, me)] {
+                let row = store.relationship(x, y, at).map_err(store_failed)?;
+                if x == me
+                    && row.is_none()
+                    && store.roster_size(x, at).map_err(store_failed)? >= max
+                {
+                    return Err(MessagingError::RosterFull);
+                }
+                approvals.extend(row.and_then(|r| r.approval));
+            }
         }
+        let part = Part::PresentBefriending {
+            a: me.clone(),
+            b: them.clone(),
+            rows: presented,
+            befriend: (!friends).then_some(kept),
+            at,
+        };
+        let (did, left) = self
+            .write_left(store, &[tidy, vec![part]].concat(), &[(me, them)], at)
+            .map_err(store_failed)?;
+        let Some(Did::Befriended(replaced, id)) = did.into_iter().last() else {
+            unreachable!("a presenting befriending answers what it replaced");
+        };
+        for old in replaced {
+            self.replaced(store, old, Some(&bytes), false);
+        }
+        match id {
+            Some(id) => self.befriended(&left[0], id, &approvals),
+            None => self.tell_left(&left[0], [true, true]),
+        }
+        Ok(())
     }
 
     /// The pairs two accounts' friendships name: their own fingerprints,
@@ -1309,7 +1645,9 @@ impl Core {
     /// (§4.3): checked whole against the pair it names, kept, and applied.
     /// Answers its bytes, for the `Removed` it is told with, and what it
     /// left of the friendship. With `block`, `me` blocks `them` in the
-    /// same step, as Block User (806) carrying it does.
+    /// same step, as Block User (806) carrying it does; with `removal`,
+    /// what a removal ends here alone is written in the same step where
+    /// the withdrawal does not end the friendship.
     pub(super) fn take_withdrawal(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -1317,8 +1655,9 @@ impl Core {
         device: &Device,
         them: &Mailbox,
         bytes: Vec<u8>,
-        block: bool,
+        removal: Option<Ending>,
     ) -> Result<(Vec<u8>, Applied), MessagingError> {
+        let block = removal.is_none();
         let now = self.clock.unix();
         let floors = Floors::new(self);
         let parsed = Withdrawal::parse(&bytes, now, |k| floors.floor(k));
@@ -1352,7 +1691,7 @@ impl Core {
             (theirs, mine)
         };
         let blocking = block.then_some((me, them));
-        let applied = self.apply_cutoff(store, &floors, keep, party, other, blocking)?;
+        let applied = self.apply_cutoff(store, &floors, keep, party, other, blocking, removal)?;
         Ok((bytes, applied))
     }
 
@@ -1378,6 +1717,7 @@ impl Core {
     /// withdrawal kept, the presentations and offers it ends dropped, and
     /// the edge following what is left (§4.3). A friendship of this
     /// server alone ends where it was made before the cutoff (§2).
+    #[allow(clippy::too_many_arguments)]
     fn apply_cutoff(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -1386,6 +1726,7 @@ impl Core {
         party: [u8; 32],
         other: [u8; 32],
         block: Option<(&Mailbox, &Mailbox)>,
+        removal: Option<Ending>,
     ) -> Result<Applied, MessagingError> {
         let cut = Cutoff {
             pair: keep.pair,
@@ -1411,7 +1752,18 @@ impl Core {
                     end.presentations.push(p);
                 }
             }
-            if let Some(o) = store.offer(&p, &q, wall).map_err(store_failed)? {
+            // An upgrade offer, or the offer a request carries.
+            let asked = store
+                .relationship(
+                    &Mailbox::identified("", p),
+                    &Mailbox::identified("", q),
+                    wall,
+                )
+                .map_err(store_failed)?
+                .and_then(|r| r.pending_out)
+                .and_then(|r| r.offer);
+            let waiting = store.offer(&p, &q, wall).map_err(store_failed)?.or(asked);
+            if let Some(o) = waiting {
                 if Offer::check(&o.offer, STORED, &[], zero_floor).is_ok_and(|o| o.cut_by(&cut)) {
                     end.offers.push(p);
                 }
@@ -1435,6 +1787,24 @@ impl Core {
         }
         let withdraw = keep.withdrawal.clone();
         end.withdrawals.push(keep);
+        let standing = had == 2 && row.as_ref().is_some_and(|r| r.friendship.is_some());
+        // A removal the withdrawal leaves undone ends the friendship here
+        // alone, in the same step.
+        if let Some(here) = removal.filter(|_| !end.friendship && !standing) {
+            for p in here.presentations {
+                if !end.presentations.contains(&p) {
+                    end.presentations.push(p);
+                }
+            }
+            for o in here.offers {
+                if !end.offers.contains(&o) {
+                    end.offers.push(o);
+                }
+            }
+            end.withdrawals.extend(here.withdrawals);
+            end.friendship = here.friendship;
+            end.hold = here.hold;
+        }
         // A block takes what a removal here takes besides, and is written
         // with it: what the withdrawal ends never stands without it.
         let mut shown = false;
@@ -1460,22 +1830,60 @@ impl Core {
                 .map_err(store_failed)?
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
+            // An upgrade the blocked had waiting goes too, told as a
+            // decline is.
+            shown |= store
+                .relationship(blocked, blocker, wall)
+                .map_err(store_failed)?
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.upgrade);
         }
         let (a, b) = block.unwrap_or((&x, &y));
-        self.make_room(store, floors, &end.withdrawals)
+        let Room { mut parts, judged } = self
+            .make_room(store, floors, &end.withdrawals)
             .map_err(store_failed)?;
-        let ended = store.end_friendship(a, b, &end).map_err(store_failed)?;
+        let changes = standing || !end.presentations.is_empty() || !end.offers.is_empty();
+        parts.push(Part::EndFriendship(a.clone(), b.clone(), end));
+        // Told under the accounts' own mailboxes, read before the write.
+        let told = match block {
+            Some((blocker, blocked)) => Some((blocker.clone(), blocked.clone())),
+            None => self
+                .pair_mailboxes(store, &party, &other, wall)
+                .map_err(store_failed)?,
+        };
+        let pairs: Vec<(&Mailbox, &Mailbox)> = told.iter().map(|(a, b)| (a, b)).collect();
+        let (mut did, left) = self
+            .write_left(store, &parts, &pairs, wall)
+            .map_err(store_failed)?;
+        self.room_made(judged);
+        let Some(Did::Ended(ended)) = did.pop() else {
+            unreachable!("an ending answers what it ended");
+        };
         self.unjudge(store, [party, other]);
+        let left = left.first();
         if let Some(e) = ended.ended {
-            self.edge_ended(&e, withdraw.as_deref());
+            let [a, b] = &e.parties;
+            self.roster.lock().unwrap().friends_changed(a, b, false);
+            if let Some(left) = left {
+                self.tell_left_with(left, [true, true], withdraw.as_deref());
+            }
             return Ok(Applied::Ended);
         }
-        if shown {
-            self.tell_entry(b, a);
+        // An edge that stays active is told to both again (§4.3), as is
+        // what it cut of what waits; a block's own client knows what its
+        // block ended.
+        if let Some(left) = left {
+            match block {
+                Some(_) if shown => self.tell_left(left, [false, true]),
+                Some(_) => {}
+                None if changes => self.tell_left(left, [true, true]),
+                None => {}
+            }
         }
-        Ok(match row.filter(|r| r.friendship.is_some()) {
-            Some(r) if had == 2 => Applied::Standing([r.owner, r.other]),
-            _ => Applied::Untouched,
+        Ok(if standing {
+            Applied::Standing
+        } else {
+            Applied::Untouched
         })
     }
 
@@ -1524,15 +1932,13 @@ impl Core {
             // standing at the floors, already cuts as far; kept beside any
             // other.
             let floors = Floors::new(self);
-            let signed = store.withdrawals(&pres.pair).is_ok_and(|held| {
-                held.iter().any(|w| {
-                    w.owner == mine
-                        && w.party == named
-                        && w.checked
-                        && w.withdrawal.is_some()
-                        && w.before >= before
-                        && floors.stands(w.withdrawal.as_deref())
-                })
+            let signed = store.withdrawals(&pres.pair)?.iter().any(|w| {
+                w.owner == mine
+                    && w.party == named
+                    && w.checked
+                    && w.withdrawal.is_some()
+                    && w.before >= before
+                    && floors.stands(w.withdrawal.as_deref())
             });
             if signed && floors.failed().is_ok() {
                 continue;
@@ -1548,6 +1954,7 @@ impl Core {
     /// released when it is active again (§6).
     fn drop_presented(
         &self,
+        site: &'static str,
         store: &Arc<dyn RelationshipStore>,
         a: &[u8; 32],
         b: &[u8; 32],
@@ -1557,20 +1964,43 @@ impl Core {
         if !dropped.gone.is_empty() {
             self.unjudge(store, [*a, *b]);
         }
-        if let Some(e) = &dropped.ended {
-            self.edge_ended(e, None);
+        // An edge ended is told once, whatever record left with it.
+        match &dropped.ended {
+            Some(e) => self.edge_ended(site, e, None),
+            None => {
+                for gone in &dropped.gone {
+                    self.record_left(site, gone);
+                }
+            }
         }
         Ok(dropped.gone)
     }
 
+    /// A `Reset` record left its row, and with it any upgrade offer it
+    /// qualified: both parties told their entries as they now stand.
+    fn record_left(&self, site: &'static str, p: &Presentation) {
+        if p.reset.is_none() {
+            return;
+        }
+        if let (Some(a), Some(b)) = (self.mailbox_of(&p.presenter), self.mailbox_of(&p.other)) {
+            self.tell_entry(site, &a, &b);
+            self.tell_entry(site, &b, &a);
+        }
+    }
+
     /// A presentation `present` answered as replaced, where its evidence
-    /// was other than `now`'s: what it held is judged again.
+    /// was other than `now`'s: what it held is judged again. A record it
+    /// was is told, unless the caller tells both parties after.
     fn replaced(
         &self,
         store: &Arc<dyn RelationshipStore>,
         old: Option<Presentation>,
         now: Option<&[u8]>,
+        tell: bool,
     ) {
+        if let Some(old) = old.as_ref().filter(|_| tell) {
+            self.record_left("a hash kept", old);
+        }
         if let Some(old) = old.filter(|o| o.friendship.is_some() && o.friendship.as_deref() != now)
         {
             self.unjudge(store, [old.presenter, old.other]);
@@ -1595,7 +2025,7 @@ impl Core {
             }
         }
         for (a, b, presenters) in pairs {
-            self.drop_presented(store, &a, &b, &presenters)?;
+            self.drop_presented("a floor's pass", store, &a, &b, &presenters)?;
         }
         Ok(())
     }
@@ -1603,11 +2033,11 @@ impl Core {
     /// An edge's ending, told once it is committed: the roster, then both
     /// parties' entries, by the mailboxes their rows keep, so a party the
     /// directory no longer names is told too.
-    pub(super) fn edge_ended(&self, e: &EndedEdge, withdraw: Option<&[u8]>) {
+    pub(super) fn edge_ended(&self, site: &'static str, e: &EndedEdge, withdraw: Option<&[u8]>) {
         let [a, b] = &e.parties;
         self.roster.lock().unwrap().friends_changed(a, b, false);
-        self.tell_entry_with(a, b, withdraw);
-        self.tell_entry_with(b, a, withdraw);
+        self.tell_entry_with(site, a, b, withdraw);
+        self.tell_entry_with(site, b, a, withdraw);
     }
 
     /// What a rotation's merge dropped, told and judged as any drop is:
@@ -1621,10 +2051,10 @@ impl Core {
         rekeyed: &crate::relationships::Rekeyed,
     ) {
         for e in &rekeyed.ended {
-            self.edge_ended(e, None);
+            self.edge_ended("a rotation's merge", e, None);
         }
         for gone in &rekeyed.dropped {
-            logged("judging an orphan", self.orphan_judged(store, gone));
+            self.orphan_judged_or_owed(store, gone);
         }
     }
 
@@ -1688,21 +2118,54 @@ impl Core {
         store: &Arc<dyn RelationshipStore>,
         p: &Presentation,
     ) -> Result<(), StoreError> {
+        if self.judged_reset(store, p, &[])? {
+            let site = "an orphan judged";
+            self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+        }
+        Ok(())
+    }
+
+    /// The mailboxes of the accounts holding `a` and `b`, `a`'s first: as
+    /// the pair's rows keep them, whether or not the directory still names
+    /// each key, or as the directory names them where there is no row.
+    fn pair_mailboxes(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &[u8; 32],
+        b: &[u8; 32],
+        wall: SystemTime,
+    ) -> Result<Option<(Mailbox, Mailbox)>, StoreError> {
+        let (x, y) = (Mailbox::identified("", *a), Mailbox::identified("", *b));
+        if let Some(r) = store.relationship(&x, &y, wall)? {
+            return Ok(Some((r.owner, r.other)));
+        }
+        if let Some(r) = store.relationship(&y, &x, wall)? {
+            return Ok(Some((r.other, r.owner)));
+        }
+        Ok(self.mailbox_of(a).zip(self.mailbox_of(b)))
+    }
+
+    /// Whether `p`, held by its own taking alone, no longer is, once the
+    /// rows `replacing` names are replaced by others. Reads alone.
+    fn judged_reset(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        p: &Presentation,
+        replacing: &[([u8; 32], [u8; 32])],
+    ) -> Result<bool, StoreError> {
         let Some(bytes) = p.friendship.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
         let f = Friendship::check(bytes, STORED, &[], zero_floor);
-        let copies = match &f {
+        let mut copies = match &f {
             Ok(f) => self.copies(store, f, bytes)?,
             Err(_) => Vec::new(),
         };
+        copies.retain(|c| !replacing.contains(&(c.presenter, c.other)));
         let floors = Floors::new(self);
         let judged = floors.judged(&p.hash, bytes, f.as_ref(), &copies, STORED);
         floors.failed()?;
-        if judged == Judged::Reset {
-            self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
-        }
-        Ok(())
+        Ok(judged == Judged::Reset)
     }
 
     /// Judge what `a` and `b` have presented of each other, for a
@@ -1766,13 +2229,17 @@ impl Core {
                 e.friendships = hashes;
             }
         }
-        if matches!(e.state, RosterState::Accepted | RosterState::PendingIn) {
-            e.offer = store
-                .offer(&theirs, &mine, now)
-                .ok()
-                .flatten()
-                .map(|o| o.offer);
+        // An upgrade offer beside a friendship, or the offer a request
+        // shown as pending in carries: each from where it is kept.
+        e.offer = match e.state {
+            RosterState::Accepted => store.offer(&theirs, &mine, now).ok().flatten(),
+            RosterState::PendingIn => self.mailbox_of(&theirs).and_then(|them| {
+                let row = store.relationship(&them, of, now).ok().flatten()?;
+                row.pending_out.filter(|p| !p.upgrade)?.offer
+            }),
+            _ => None,
         }
+        .map(|o| o.offer);
     }
 
     // --- Requests ------------------------------------------------------
@@ -1828,19 +2295,19 @@ impl Core {
                     .map_err(store_failed)?;
                 end.friendship = true;
                 end.hold = Some(wall + self.messaging_policy.request_retention);
-                let ended = self
+                let (ended, _) = self
                     .end_friendship(store, &me.mailbox, &them, &end)
                     .map_err(store_failed)?;
                 if let Some(e) = ended.ended {
-                    self.edge_ended(&e, None);
+                    self.edge_ended("a removal by key", &e, None);
                 }
                 return Ok(());
             }
             let gone = self
-                .drop_presented(store, &mine, fingerprint, &[mine])
+                .drop_presented("a removal by key", store, &mine, fingerprint, &[mine])
                 .map_err(store_failed)?;
             for gone in &gone {
-                logged("judging an orphan", self.orphan_judged(store, gone));
+                self.orphan_judged_or_owed(store, gone);
             }
         }
         Ok(())
@@ -1859,16 +2326,41 @@ impl Core {
         let store = self.friends_store()?;
         let _writing = self.friend_act(uid)?;
         let now = self.clock.wall();
-        match self.offer_between(store, &me.mailbox, &them, now) {
-            Some(o) if o.offer == offer => {
-                let (a, b) = (me.mailbox.fingerprint, them.fingerprint);
-                let (Some(a), Some(b)) = (a, b) else {
-                    return Err(MessagingError::NotFriends);
-                };
-                store.set_offer(&a, &b, None).map_err(store_failed)
-            }
-            _ => Err(MessagingError::NotFriends),
+        let (Some(a), Some(b)) = (me.mailbox.fingerprint, them.fingerprint) else {
+            return Err(MessagingError::NotFriends);
+        };
+        if store
+            .offer(&a, &b, now)
+            .map_err(store_failed)?
+            .is_none_or(|o| o.offer != offer)
+        {
+            return Err(MessagingError::NotFriends);
         }
+        // On an edge a reset left inactive, with the pending out it shows.
+        let shown = store
+            .relationship(&me.mailbox, &them, now)
+            .map_err(store_failed)?
+            .and_then(|r| r.pending_out)
+            .is_some_and(|p| p.upgrade);
+        // Beside a friendship the friend's entry loses the offer, and is
+        // told so.
+        let part = match shown {
+            false => Part::SetOffer(a, b, None),
+            true => Part::EndFriendship(
+                them.clone(),
+                me.mailbox.clone(),
+                Ending {
+                    offers: vec![a],
+                    pending: true,
+                    ..Ending::default()
+                },
+            ),
+        };
+        let (_, left) = self
+            .write_left(store, &[part], &[(&me.mailbox, &them)], now)
+            .map_err(store_failed)?;
+        self.tell_left(&left[0], [shown, true]);
+        Ok(())
     }
 
     /// The withdrawal a Block User (806) carries, taken with the block
@@ -1919,7 +2411,7 @@ impl Core {
         {
             return Ok(());
         }
-        self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw, true)
+        self.take_withdrawal(store, &me.mailbox, &device, &them, withdraw, None)
             .map(|_| ())
     }
 
@@ -1964,7 +2456,22 @@ impl Core {
             .collect::<Result<_, _>>()?;
         let presented = friendships
             .into_iter()
-            .map(|b| self.present_friendship(store, &me.mailbox, mine, &device, &floors, b))
+            .map(|b| {
+                let mut tidy = Vec::new();
+                let presented = self.present_friendship(
+                    store,
+                    &me.mailbox,
+                    mine,
+                    &device,
+                    &floors,
+                    b,
+                    &mut tidy,
+                );
+                if presented.is_ok() {
+                    self.tidy(store, tidy);
+                }
+                presented
+            })
             .collect::<Result<_, _>>()?;
         Ok((taken, presented))
     }
@@ -2026,11 +2533,12 @@ impl Core {
                 checked: false,
                 at: self.clock.wall(),
             };
-            self.make_room(store, floors, std::slice::from_ref(&cut))
+            let Room { mut parts, judged } = self
+                .make_room(store, floors, std::slice::from_ref(&cut))
                 .map_err(store_failed)?;
-            store
-                .keep_withdrawal(&cut, self.messaging_policy.max_roster)
-                .map_err(store_failed)?;
+            parts.push(Part::KeepWithdrawal(cut, self.messaging_policy.max_roster));
+            store.write(&parts, &Report::none()).map_err(store_failed)?;
+            self.room_made(judged);
             return refused(w.pair, Presented::Ok);
         };
         let pair = Pair::new(Fingerprint(names[0]), Fingerprint(names[1]));
@@ -2045,13 +2553,7 @@ impl Core {
         } else {
             (other, presenter)
         };
-        // An edge that stays active is told to both again (§4.3).
-        if let Applied::Standing([x, y]) =
-            self.apply_cutoff(store, floors, keep, party, other, None)?
-        {
-            self.tell_entry(&x, &y);
-            self.tell_entry(&y, &x);
-        }
+        self.apply_cutoff(store, floors, keep, party, other, None, None)?;
         refused(w.pair, Presented::Ok)
     }
 
@@ -2072,6 +2574,7 @@ impl Core {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn present_friendship(
         &self,
         store: &Arc<dyn RelationshipStore>,
@@ -2080,6 +2583,7 @@ impl Core {
         device: &Device,
         floors: &Floors,
         bytes: Vec<u8>,
+        tidy: &mut Vec<Part>,
     ) -> Result<PresentResult, MessagingError> {
         let now = self.clock.unix();
         let wall = self.clock.wall();
@@ -2127,33 +2631,38 @@ impl Core {
         }
         // The row as stored now, which a reset's drop may have taken
         // since `held` was read.
-        let record = |friendship: Option<Vec<u8>>| {
+        let row = |friendship: Option<Vec<u8>>, reset: Option<Vec<u8>>| {
             let old = store.presentation(&mine, &theirs).map_err(store_failed)?;
             let edge = old.as_ref().and_then(|p| p.edge);
             let taken = old
                 .filter(|p| friendship.is_some() && p.friendship == friendship)
                 .map_or(wall, |p| p.taken);
+            Ok::<_, MessagingError>(Presentation {
+                presenter: mine,
+                other: theirs,
+                names: [my_name.0, their_name.0],
+                pair: pair.hash(),
+                hash,
+                friendship,
+                reset,
+                device: device.key,
+                edge,
+                at: wall,
+                taken,
+            })
+        };
+        let record = |friendship: Option<Vec<u8>>, reset: Option<Vec<u8>>| {
+            let p = row(friendship, reset)?;
             store
-                .present(&Presentation {
-                    presenter: mine,
-                    other: theirs,
-                    names: [my_name.0, their_name.0],
-                    pair: pair.hash(),
-                    hash,
-                    friendship: friendship.clone(),
-                    device: device.key,
-                    edge,
-                    at: wall,
-                    taken,
-                })
-                .map(|old| self.replaced(store, old, friendship.as_deref()))
+                .present(&p)
+                .map(|old| self.replaced(store, old, p.friendship.as_deref(), true))
                 .map_err(store_failed)
         };
         // Step 2's refusal keeps the hash alone toward the bound, as the
         // identity draft has it, and changes nothing already held.
         let keep_hash = || match presented(&mine, &theirs) {
             Some(_) => Ok(()),
-            None => record(None),
+            None => record(None, None),
         };
         // Step 2: the other party.
         let them = match self.mailbox_of(&theirs) {
@@ -2170,15 +2679,15 @@ impl Core {
         };
         // Step 3: withdrawals, those a device below its floor signed
         // ending nothing.
-        let cuts = self.cutoffs(store, &pair, &rotations, floors)?;
+        let cuts = self.cutoffs(store, &pair, &rotations, floors, tidy)?;
         floors.failed().map_err(store_failed)?;
         if let Some((_, w)) = cuts.into_iter().find(|(c, _)| f.cut_by(c)) {
             return answer(Presented::Withdrawn(w));
         }
         // Step 4: a half below its signer's floor, where this server did
         // not take the friendship, by either party, before that half was
-        // reset. Until `Reset` has a code, it is answered as the classic
-        // wire answers it meanwhile (§7), keeping the hash as step 2 does.
+        // reset. Unknown keeps the hash as step 2 does; `Reset` keeps the
+        // friendship as a record, for the upgrade offer that remakes it.
         let judged = floors.held(&hash, &bytes, &held, now);
         floors.failed().map_err(store_failed)?;
         match judged {
@@ -2188,17 +2697,105 @@ impl Core {
                 return answer(Presented::AccountNotFound);
             }
             Judged::Reset => {
+                // The other party's pending state toward the presenter, read
+                // before anything is written.
+                let pending = store
+                    .relationship(&them, me, wall)
+                    .map_err(store_failed)?
+                    .and_then(|r| r.pending_out);
+                let below = !self.upgrades_off() && floors.own_half_below(&f, &theirs, &rotations);
+                floors.failed().map_err(store_failed)?;
+                let upgrade = match &pending {
+                    Some(p) if p.upgrade && below => {
+                        store.offer(&theirs, &mine, wall).map_err(store_failed)?
+                    }
+                    Some(p) if below => p.offer.clone(),
+                    _ => None,
+                };
                 // What is stored of it is not held either, and goes now
-                // rather than at the next judging.
-                self.drop_pairs(
-                    store,
-                    held.iter().filter(|p| p.hash == hash && p.evidence()),
-                )
-                .map_err(store_failed)?;
-                if presented(&mine, &theirs).is_none_or(|p| p.hash == hash) {
-                    record(None)?;
+                // rather than at the next judging; the record takes the
+                // place of a hash kept alone, or a record, but never of
+                // another friendship presented that is evidence; and the
+                // request it remakes is taken as an upgrade: one step.
+                let mut drops: Vec<Going> = Vec::new();
+                for p in held.iter().filter(|p| p.hash == hash && p.evidence()) {
+                    let pair = drops.iter_mut().find(|(a, b, _)| {
+                        (*a, *b) == (p.presenter, p.other) || (*a, *b) == (p.other, p.presenter)
+                    });
+                    match pair {
+                        Some((_, _, presenters)) => presenters.push(p.presenter),
+                        None => drops.push((p.presenter, p.other, vec![p.presenter])),
+                    }
                 }
-                return answer(Presented::AccountNotFound);
+                let recording =
+                    presented(&mine, &theirs).is_none_or(|p| p.hash == hash || !p.evidence());
+                let dropping_mine = drops.iter().any(|(a, b, ps)| {
+                    (*a, *b) == (mine, theirs) && ps.contains(&mine)
+                        || (*a, *b) == (theirs, mine) && ps.contains(&mine)
+                });
+                let record = recording
+                    .then(|| row(None, Some(bytes.clone())))
+                    .transpose()?
+                    .map(|p| Presentation {
+                        edge: p.edge.filter(|_| !dropping_mine),
+                        ..p
+                    });
+                let converting = recording && pending.as_ref().is_some_and(|p| !p.upgrade);
+                let part = Part::AnswerReset {
+                    drops: drops.clone(),
+                    record,
+                    upgrade: converting
+                        .then(|| (them.clone(), me.clone()))
+                        .filter(|_| upgrade.is_some()),
+                };
+                // Each pair a drop names is told from what the step left
+                // of it, under the mailboxes its rows keep, so a party the
+                // directory no longer names is told too.
+                let mut named: Vec<(Mailbox, Mailbox)> = Vec::new();
+                for (a, b, _) in &drops {
+                    named.extend(
+                        self.pair_mailboxes(store, a, b, wall)
+                            .map_err(store_failed)?,
+                    );
+                }
+                let mut pairs = vec![(me, &them)];
+                pairs.extend(named.iter().map(|(a, b)| (a, b)));
+                let (did, left) = self
+                    .write_left(store, &[part], &pairs, wall)
+                    .map_err(store_failed)?;
+                let Some(Did::Reset(ended, replaced)) = did.into_iter().next() else {
+                    unreachable!("a reset answers what it dropped and replaced");
+                };
+                let mut said = false;
+                for ((a, b, _), dropped) in drops.iter().zip(&ended) {
+                    if !dropped.gone.is_empty() {
+                        self.unjudge(store, [*a, *b]);
+                    }
+                    let Some(e) = &dropped.ended else {
+                        continue;
+                    };
+                    let pair = left.iter().find(|l| {
+                        let fps = [l.pair[0].fingerprint, l.pair[1].fingerprint];
+                        let ends = [e.parties[0].fingerprint, e.parties[1].fingerprint];
+                        fps == ends || fps == [ends[1], ends[0]]
+                    });
+                    if let Some(l) = pair {
+                        said |= l.pair[0] == *me || l.pair[1] == *me;
+                        self.edge_ended_left(l, None);
+                    }
+                }
+                let left = &left[0];
+                let record_left = replaced.as_ref().is_some_and(|o| o.reset.is_some());
+                self.replaced(store, replaced, None, false);
+                if record_left && !said {
+                    self.tell_left(left, [true, true]);
+                }
+                // What is told is what the step left waiting: a record it
+                // replaced may have taken the upgrade with it.
+                if let (true, Some(_), Some(offer)) = (recording, upgrade, left.offers[1].clone()) {
+                    self.reset_offer(me, &them, offer, pending.filter(|p| !p.upgrade));
+                }
+                return answer(Presented::Reset);
             }
         }
         // Step 6, there being no hidden links for step 5. A local edge this
@@ -2208,63 +2805,110 @@ impl Core {
         let both = [(mine, theirs), (theirs, mine)]
             .iter()
             .all(|(p, q)| presented(p, q).is_some_and(|x| x.evidence()));
-        if friends.contains(&theirs) && !both {
-            let (gone, _) = self
-                .unheld_between(store, me, &them)
-                .map_err(store_failed)?;
-            if !gone.is_empty() {
-                self.drop_presented(store, &mine, &theirs, &gone)
-                    .map_err(store_failed)?;
+        // Everything read first, then written as one step: what is not
+        // held of a local edge, this presentation, the other party's of
+        // other bytes where its own taking no longer holds it, and the
+        // friendship where both now stand.
+        let gone = match friends.contains(&theirs) && !both {
+            true => {
+                self.unheld_between(store, me, &them)
+                    .map_err(store_failed)?
+                    .0
+            }
+            false => Vec::new(),
+        };
+        let p = row(Some(bytes.clone()), None)?;
+        let other = presented(&theirs, &mine).filter(|t| !gone.contains(&t.presenter));
+        let reset_theirs = match other
+            .as_ref()
+            .filter(|t| t.friendship.as_ref() != Some(&bytes))
+        {
+            Some(t) => self
+                .judged_reset(store, t, &[(mine, theirs)])
+                .map_err(store_failed)?,
+            None => false,
+        };
+        let other = other.filter(|_| !reset_theirs);
+        let plan = self.activation(store, me, &them, floors, &Some(p.clone()), &other, wall)?;
+        let mut parts = Vec::new();
+        if !gone.is_empty() {
+            parts.push(Part::DropPresentations(mine, theirs, gone));
+        }
+        parts.push(Part::Present(p.clone()));
+        if reset_theirs {
+            parts.push(Part::DropPresentations(theirs, mine, vec![theirs]));
+        }
+        if let Activation::Befriend(edge, _) = &plan {
+            parts.extend(befriend_parts(me, &them, wall, *edge, &[]));
+        }
+        let (did, left) = self
+            .write_left(store, &parts, &[(me, &them)], wall)
+            .map_err(store_failed)?;
+        let left = &left[0];
+        let (mut owed, mut said) = (false, false);
+        for d in &did {
+            match d {
+                Did::Ended(dropped) => {
+                    if !dropped.gone.is_empty() {
+                        self.unjudge(store, [mine, theirs]);
+                    }
+                    if dropped.ended.is_some() && !said {
+                        self.edge_ended_left(left, None);
+                        said = true;
+                    }
+                }
+                Did::Replaced(old) => {
+                    owed |= old.as_ref().is_some_and(|o| o.reset.is_some());
+                    self.replaced(store, old.clone(), p.friendship.as_deref(), false);
+                }
+                Did::Friends(id) => {
+                    if let Activation::Befriend(_, approvals) = &plan {
+                        self.unjudge(store, [mine, theirs]);
+                        self.befriended(left, *id, approvals);
+                        return answer(Presented::Ok);
+                    }
+                }
+                _ => {}
             }
         }
-        record(Some(bytes.clone()))?;
-        if let Some(p) = store
-            .presentation(&theirs, &mine)
-            .map_err(store_failed)?
-            .filter(|p| p.friendship.as_ref() != Some(&bytes))
-        {
-            self.judged_alone(store, &p).map_err(store_failed)?;
+        // An edge active already is told to both again; so is a record
+        // this replaced, and the upgrade it took with it.
+        if (owed || matches!(plan, Activation::Already)) && !said {
+            self.tell_left(left, [true, true]);
         }
-        match self.activate(store, me, &them, floors, wall) {
-            Ok(()) => answer(Presented::Ok),
-            Err(MessagingError::RosterFull) => answer(Presented::RosterFull),
-            Err(e) => Err(e),
+        match plan {
+            Activation::RosterFull => answer(Presented::RosterFull),
+            _ => answer(Presented::Ok),
         }
     }
 
-    /// Make the edge between `me` and `them` active where each has
-    /// presented a friendship for it (§4.3), under the id it had where a
-    /// dropped presentation kept one; or tell both its entry again where
-    /// it is active already. `RosterFull` where `me`'s roster has no room
-    /// for it; where `them`'s has none it stays inactive, unanswered. A
-    /// presentation stored here counts only where its friendship stands at
-    /// the floors, as it must where presented now (§6).
-    fn activate(
+    /// Whether the edge between `me` and `them` is made active, where
+    /// each has presented a friendship for it (§4.3), with `mine` and
+    /// `theirs` as they will stand: under the id a dropped presentation
+    /// kept, with the approvals it ends. `RosterFull` where `me`'s roster
+    /// has no room for it; where `them`'s has none it stays inactive,
+    /// unanswered. A presentation stored here counts only where its
+    /// friendship stands at the floors, as it must where presented now
+    /// (§6). Reads alone.
+    #[allow(clippy::too_many_arguments)]
+    fn activation(
         &self,
         store: &Arc<dyn RelationshipStore>,
         me: &Mailbox,
         them: &Mailbox,
         floors: &Floors,
+        mine: &Option<Presentation>,
+        theirs: &Option<Presentation>,
         now: SystemTime,
-    ) -> Result<(), MessagingError> {
-        let (Some(a), Some(b)) = (me.fingerprint, them.fingerprint) else {
-            return Ok(());
-        };
-        let pa = store.presentation(&a, &b).map_err(store_failed)?;
-        let pb = store.presentation(&b, &a).map_err(store_failed)?;
-        if !(whole(&pa) && whole(&pb)) {
-            return Ok(());
+    ) -> Result<Activation, MessagingError> {
+        if me.fingerprint.zip(them.fingerprint).is_none() || !(whole(mine) && whole(theirs)) {
+            return Ok(Activation::None);
         }
-        let friends = store
-            .relationship(me, them, now)
-            .map_err(store_failed)?
-            .is_some_and(|r| r.friendship.is_some());
-        if friends {
-            self.tell_entry(me, them);
-            self.tell_entry(them, me);
-            return Ok(());
+        let row = store.relationship(me, them, now).map_err(store_failed)?;
+        if row.as_ref().is_some_and(|r| r.friendship.is_some()) {
+            return Ok(Activation::Already);
         }
-        let rows: Vec<Presentation> = pa.iter().chain(&pb).cloned().collect();
+        let rows: Vec<Presentation> = mine.iter().chain(theirs).cloned().collect();
         let stands = rows.iter().all(|p| {
             p.friendship
                 .as_deref()
@@ -2272,25 +2916,28 @@ impl Core {
         });
         floors.failed().map_err(store_failed)?;
         if !stands {
-            return Ok(());
+            return Ok(Activation::None);
         }
         let max = self.messaging_policy.max_roster;
-        let room = |x: &Mailbox, y: &Mailbox| -> Result<bool, MessagingError> {
-            Ok(store
-                .relationship(x, y, now)
-                .map_err(store_failed)?
-                .is_some()
-                || store.roster_size(x, now).map_err(store_failed)? < max)
+        let back = store.relationship(them, me, now).map_err(store_failed)?;
+        let room = |row: &Option<Relationship>, x: &Mailbox| -> Result<bool, MessagingError> {
+            Ok(row.is_some() || store.roster_size(x, now).map_err(store_failed)? < max)
         };
-        if !room(me, them)? {
-            return Err(MessagingError::RosterFull);
+        if !room(&row, me)? {
+            return Ok(Activation::RosterFull);
         }
-        if !room(them, me)? {
-            return Ok(());
+        if !room(&back, them)? {
+            return Ok(Activation::None);
         }
-        let edge = pa.and_then(|p| p.edge).or(pb.and_then(|p| p.edge));
-        self.befriend_as(store, me, them, now, edge, &[])?;
-        Ok(())
+        let approvals = [&row, &back]
+            .into_iter()
+            .filter_map(|r| r.as_ref().and_then(|r| r.approval))
+            .collect();
+        let edge = mine
+            .as_ref()
+            .and_then(|p| p.edge)
+            .or(theirs.as_ref().and_then(|p| p.edge));
+        Ok(Activation::Befriend(edge, approvals))
     }
 
     /// Get Friendships (§4.2), open to the sessions Present Friendships
@@ -2414,28 +3061,401 @@ impl Core {
             return;
         };
         let _writing = self.friend_writes();
+        let now = self.clock.unix();
         for (identity, device) in devices {
-            let made = match store.presented_by(device) {
-                Ok(made) => made,
-                Err(e) => {
-                    warn!("relationships: reading a revoked device's presentations: {e}");
-                    continue;
-                }
-            };
-            for p in made
+            if let Err(e) = self.drop_device_presentations(store, *identity, device) {
+                warn!("relationships: dropping a revoked device's presentations: {e}");
+                let sweep = Sweep::Presented {
+                    identity: *identity,
+                    device: *device,
+                };
+                self.offer_sweeps
+                    .lock()
+                    .unwrap()
+                    .push(OwedSweep::failed(sweep, 0, now));
+            }
+        }
+    }
+
+    /// What `device` presented, for `identity` where one is named,
+    /// dropped, each pair as one step.
+    fn drop_device_presentations(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        identity: Option<[u8; 32]>,
+        device: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let made = store.presented_by(device)?;
+        for p in made
+            .into_iter()
+            .filter(|p| identity.is_none_or(|i| p.presenter == i))
+        {
+            let site = "a revoked device's presentation";
+            let gone = self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            for gone in &gone {
+                self.orphan_judged_or_owed(store, gone);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop what `sweeps` owe and what owed sweeps whose backoff is over
+    /// owe, as one step, every pair it changes told to its parties from
+    /// what the step left: one that cannot be read or written owed again,
+    /// and one whose revocation was lifted, or whose identity was linked
+    /// again, moot.
+    pub(crate) fn sweep_offers(&self, sweeps: Vec<Sweep>) {
+        let Some(store) = self.relationships.as_ref() else {
+            return;
+        };
+        let _writing = self.friend_writes();
+        let (wall, now) = (self.clock.wall(), self.clock.unix());
+        // Fresh ones stand by what owes them; those owed again are
+        // checked against it first.
+        let due: Vec<(Sweep, u32, bool)> = {
+            let mut owed = self.offer_sweeps.lock().unwrap();
+            let (due, later): (Vec<_>, Vec<_>) = owed.drain(..).partition(|o| o.due <= now);
+            *owed = later;
+            sweeps
                 .into_iter()
-                .filter(|p| identity.is_none_or(|i| p.presenter == i))
-            {
-                match self.drop_presented(store, &p.presenter, &p.other, &[p.presenter]) {
-                    Ok(gone) => {
-                        for gone in &gone {
-                            logged("judging an orphan", self.orphan_judged(store, gone));
-                        }
-                    }
-                    Err(e) => warn!("relationships: dropping a revoked device's presentation: {e}"),
+                .map(|s| (s, 0, true))
+                .chain(
+                    due.into_iter()
+                        .map(|o| (o.sweep.clone(), o.failures, false)),
+                )
+                .collect()
+        };
+        let mut parts = Vec::new();
+        let mut pairs: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
+        let mut read = Vec::new();
+        let mut owe = Vec::new();
+        for (sweep, failures, fresh) in due {
+            if !fresh && !self.still_owed(&sweep) {
+                continue;
+            }
+            if let Sweep::Purge(of) = &sweep {
+                if !self.purge_relationships_held(&_writing, of) {
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
+                continue;
+            }
+            if let Sweep::Presented { identity, device } = sweep {
+                if let Err(e) = self.drop_device_presentations(store, identity, &device) {
+                    warn!("relationships: dropping a revoked device's presentations: {e}");
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
+                continue;
+            }
+            if let Sweep::Unpresented(fp) = sweep {
+                if let Err(e) = self.drop_unlinked_presentations(store, &fp) {
+                    warn!("relationships: dropping an unlinked account's presentations: {e}");
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
+                continue;
+            }
+            if let Sweep::Judge(a, b) = sweep {
+                if let Err(e) = self.judge_pair(store, &a, &b) {
+                    warn!("relationships: judging what a drop left: {e}");
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
+                continue;
+            }
+            match self.owed_by(store, &sweep, wall) {
+                Ok((part, named)) => {
+                    parts.push(part);
+                    pairs.extend(named);
+                    read.push((sweep, failures));
+                }
+                Err(e) => {
+                    warn!("relationships: reading what a revocation or an unlink owes: {e}");
+                    owe.push(OwedSweep::failed(sweep, failures, now));
                 }
             }
         }
+        // One tell a pair, whichever sweeps named it: an unlink's
+        // recipients kept, each party told where any sweep would tell it.
+        let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
+        for (a, b, to) in pairs {
+            let key = |m: &Mailbox| (m.login.clone(), m.fingerprint);
+            match coalesced.iter_mut().find(|(x, y, _)| {
+                (key(x), key(y)) == (key(&a), key(&b)) || (key(x), key(y)) == (key(&b), key(&a))
+            }) {
+                Some((x, _, seen)) => {
+                    let same = key(x) == key(&a);
+                    let to = if same { to } else { [to[1], to[0]] };
+                    *seen = [seen[0] || to[0], seen[1] || to[1]];
+                }
+                None => coalesced.push((a, b, to)),
+            }
+        }
+        let pairs = coalesced;
+        if !parts.is_empty() {
+            let asked: Vec<(&Mailbox, &Mailbox)> = pairs.iter().map(|(a, b, _)| (a, b)).collect();
+            match self.write_left(store, &parts, &asked, wall) {
+                Ok((did, left)) => {
+                    // Told where an offer went, and nowhere else.
+                    let mut gone: Vec<FpPair> = Vec::new();
+                    for (part, did) in parts.iter().zip(did) {
+                        match (part, did) {
+                            (Part::DropOffers(signed), _) => gone.extend(signed),
+                            (_, Did::Named(named)) => gone.extend(named),
+                            _ => {}
+                        }
+                    }
+                    for ((a, b, to), left) in pairs.iter().zip(&left) {
+                        let dropped = a
+                            .fingerprint
+                            .zip(b.fingerprint)
+                            .is_some_and(|(x, y)| gone.contains(&(x, y)) || gone.contains(&(y, x)));
+                        if dropped {
+                            self.tell_left(left, *to);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("relationships: dropping what a revocation or an unlink owes: {e}");
+                    owe.extend(read.into_iter().map(|(s, f)| OwedSweep::failed(s, f, now)));
+                }
+            }
+        }
+        self.offer_sweeps.lock().unwrap().extend(owe);
+    }
+
+    /// What judging the withdrawals tidied, written once the act it was
+    /// judged for is done: a withdrawal found checked or dropped is found
+    /// so again by the next that judges it, so one that cannot be written
+    /// costs nothing but the work.
+    pub(super) fn tidy(&self, store: &Arc<dyn RelationshipStore>, tidy: Vec<Part>) {
+        if tidy.is_empty() {
+            return;
+        }
+        if let Err(e) = store.write(&tidy, &Report::none()) {
+            warn!("relationships: tidying the withdrawals judged: {e}");
+        }
+    }
+
+    /// What `a` and `b` hold of each other, each presentation held by its
+    /// own taking alone judged from the store as it stands.
+    fn judge_pair(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        a: &[u8; 32],
+        b: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        for (p, q) in [(a, b), (b, a)] {
+            if let Some(held) = store.presentation(p, q)? {
+                self.judged_alone(store, &held)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `gone`'s orphan judged, or owed to a later tick where it cannot be.
+    fn orphan_judged_or_owed(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
+        if let Err(e) = self.orphan_judged(store, gone) {
+            warn!("relationships: judging an orphan: {e}");
+            let sweep = Sweep::Judge(gone.presenter, gone.other);
+            let now = self.clock.unix();
+            let owed = OwedSweep::failed(sweep, 0, now);
+            self.offer_sweeps.lock().unwrap().push(owed);
+        }
+    }
+
+    /// The sweeps owed, for the sequence harness to hold each to ending
+    /// only once done or lifted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn owed_sweeps(&self) -> Vec<Sweep> {
+        let owed = self.offer_sweeps.lock().unwrap();
+        owed.iter().map(|o| o.sweep.clone()).collect()
+    }
+
+    /// What the core keeps of friendships beside the store, as text: the
+    /// sweeps owed, the withdrawals judged, the revocations installed and
+    /// what the passes recorded, for a test to tell whether an act changed
+    /// any of it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn friend_state(&self) -> String {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut sweeps: Vec<String> = self
+            .offer_sweeps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| format!("{:?} {} {}", o.sweep, o.failures, o.due))
+            .collect();
+        sweeps.sort();
+        let judged: BTreeMap<_, _> = self
+            .withdrawals_judged
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let revoked = {
+            let r = self.revoked.read().unwrap();
+            let set = |s: &std::collections::HashSet<[u8; 32]>| {
+                s.iter().copied().collect::<BTreeSet<_>>()
+            };
+            let devices: BTreeSet<_> = r.published.devices.iter().copied().collect();
+            let floors: BTreeMap<_, _> = r.published.floors.iter().map(|(k, v)| (*k, *v)).collect();
+            format!(
+                "{:?} {:?} {:?} {devices:?} {:?} {floors:?} {:?}",
+                set(&r.local.identities),
+                set(&r.local.devices),
+                set(&r.published.identities),
+                set(&r.published.unrevoked),
+                set(&r.rotated),
+            )
+        };
+        let reconciled = {
+            let r = self.reconciled.lock().unwrap();
+            let at: BTreeMap<_, _> = r.at.iter().map(|(k, v)| (*k, format!("{v:?}"))).collect();
+            let generation: BTreeMap<_, _> = r.generation.iter().map(|(k, v)| (*k, *v)).collect();
+            format!("{at:?} {generation:?} {} {:?}", r.cleared, r.next)
+        };
+        format!("{sweeps:?} {judged:?} {revoked} {reconciled}")
+    }
+
+    /// Whether what owed `sweep` still stands.
+    fn still_owed(&self, sweep: &Sweep) -> bool {
+        match sweep {
+            // Linked again is the evidence, whatever the account may do.
+            Sweep::Unlinked(fp) | Sweep::Unpresented(fp) => {
+                let dir = self.directory.as_ref();
+                return dir.is_none_or(|d| d.account_by_key(fp).is_none());
+            }
+            Sweep::Judge(..) | Sweep::Purge(_) => return true,
+            _ => {}
+        }
+        // A registrar's lift is one only where the lists read cover the
+        // identity: a key missing from a list that covers nothing of it
+        // says nothing.
+        let r = self.revoked.read().unwrap();
+        let published =
+            |identity: &[u8; 32], listed: bool| listed || !r.published.covered.contains(identity);
+        match *sweep {
+            Sweep::Presented {
+                identity: None,
+                device,
+            }
+            | Sweep::Device {
+                device,
+                operator: true,
+                ..
+            } => r.local.devices.contains(&device),
+            Sweep::Presented {
+                identity: Some(identity),
+                device,
+            }
+            | Sweep::Device {
+                identity: Some(identity),
+                device,
+                ..
+            } => published(&identity, r.published.devices.contains(&(identity, device))),
+            Sweep::Device { identity: None, .. } => true,
+            Sweep::Identity {
+                identity,
+                operator: true,
+            } => r.local.identities.contains(&identity),
+            Sweep::Identity { identity, .. } => {
+                published(&identity, r.published.identities.contains(&identity))
+            }
+            Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) | Sweep::Purge(_) => {
+                unreachable!("answered above")
+            }
+        }
+    }
+
+    /// What `sweep` drops, read first, and each pair it names with which
+    /// of its parties to tell, the revoked or unlinked one first.
+    #[allow(clippy::type_complexity)]
+    fn owed_by(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        sweep: &Sweep,
+        wall: SystemTime,
+    ) -> Result<(Part, Vec<(Mailbox, Mailbox, [bool; 2])>), StoreError> {
+        Ok(match *sweep {
+            Sweep::Device {
+                identity, device, ..
+            } => {
+                let mut signed = Vec::new();
+                let mut named = Vec::new();
+                // Under the named key and each it rotated to, which an
+                // outgoing offer moves with; the operator's, under any.
+                let identities = match identity {
+                    Some(i) => {
+                        let next = self.chain_from(store, i)?;
+                        let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
+                        std::iter::once(i).chain(next).collect()
+                    }
+                    None => store.offerers(wall)?,
+                };
+                let mut offers = Vec::new();
+                for i in identities {
+                    offers.extend(store.offers_from(&i, wall)?.into_iter().map(|o| (i, o)));
+                }
+                for (identity, (other, o)) in offers {
+                    let by = Offer::check(&o.offer, STORED, &[], zero_floor)
+                        .ok()
+                        .and_then(|o| DeviceCert::parse(&o.cert).ok())
+                        .map(|c| Fingerprint::of(&c.device).0);
+                    if by != Some(device) {
+                        continue;
+                    }
+                    signed.push((identity, other));
+                    if let (Some(a), Some(b)) =
+                        (self.mailbox_of(&identity), self.mailbox_of(&other))
+                    {
+                        named.push((a, b, [true, true]));
+                    }
+                }
+                (Part::DropOffers(signed), named)
+            }
+            Sweep::Identity { identity, .. } => {
+                let named = self.counterparts_of(store, &identity, wall)?;
+                let named = named.into_iter().map(|(me, o)| (me, o, [true, true]));
+                (Part::DropOffersNaming(identity), named.collect())
+            }
+            Sweep::Unlinked(fp) => {
+                let to = [self.mailbox_of(&fp).is_some(), true];
+                let named = self.counterparts_of(store, &fp, wall)?;
+                let named = named.into_iter().map(|(me, o)| (me, o, to));
+                (Part::DropOffersNaming(fp), named.collect())
+            }
+            Sweep::Presented { .. }
+            | Sweep::Unpresented(_)
+            | Sweep::Judge(..)
+            | Sweep::Purge(_) => unreachable!("not offers"),
+        })
+    }
+
+    /// Each pair `fp` has a row about, or that has a request or an upgrade
+    /// waiting for it, `fp`'s mailbox as its rows keep it first: every
+    /// party a change to what stands between them affects.
+    pub(crate) fn counterparts_of(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fp: &[u8; 32],
+        wall: SystemTime,
+    ) -> Result<Vec<(Mailbox, Mailbox)>, StoreError> {
+        let m = Mailbox::identified("", *fp);
+        let mut out: Vec<(Mailbox, Mailbox)> = store
+            .relationships(&m, wall)?
+            .into_iter()
+            .map(|r| (r.owner, r.other))
+            .chain(
+                store
+                    .pending_in(&m, wall)?
+                    .into_iter()
+                    .chain(store.upgrades_to(&m, wall)?)
+                    .map(|r| (r.other, r.owner)),
+            )
+            .collect();
+        let key = |(_, b): &(Mailbox, Mailbox)| (b.login.clone(), b.fingerprint);
+        out.sort_by_key(key);
+        out.dedup_by_key(|p| key(p));
+        Ok(out)
     }
 
     /// An account gave up its link to `fingerprint`: what it presented
@@ -2458,17 +3478,29 @@ impl Core {
                 s.info.transport.friendships = false;
             }
         }
+        self.sweep_offers(vec![Sweep::Unlinked(*fingerprint)]);
         let _writing = self.friend_writes();
-        let made = store.presentations(fingerprint).unwrap_or_default();
+        if let Err(e) = self.drop_unlinked_presentations(store, fingerprint) {
+            warn!("relationships: dropping an unlinked account's presentations: {e}");
+            let owed = OwedSweep::failed(Sweep::Unpresented(*fingerprint), 0, self.clock.unix());
+            self.offer_sweeps.lock().unwrap().push(owed);
+        }
+    }
+
+    /// What `fingerprint` presented, dropped, each pair as one step.
+    fn drop_unlinked_presentations(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let made = store.presentations(fingerprint)?;
         for p in made.iter().filter(|p| p.presenter == *fingerprint) {
-            match self.drop_presented(store, &p.presenter, &p.other, &[p.presenter]) {
-                Ok(gone) => {
-                    for gone in &gone {
-                        logged("judging an orphan", self.orphan_judged(store, gone));
-                    }
-                }
-                Err(e) => warn!("relationships: dropping an unlinked account's presentation: {e}"),
+            let site = "an unlinked identity's presentation";
+            let gone = self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            for gone in &gone {
+                self.orphan_judged_or_owed(store, gone);
             }
         }
+        Ok(())
     }
 }

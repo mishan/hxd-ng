@@ -72,6 +72,12 @@ impl Core {
         }
         if let Some(store) = self.relationships.as_ref() {
             self.drop_dead_withdrawals(&[*from, *to])?;
+            // Every party either key had anything with, upgrades waiting
+            // for either included: one the merge leaves nothing with the
+            // successor is told so, no row being left to tell it by.
+            let wall = self.clock.wall();
+            let mut audience = self.counterparts_of(store, from, wall)?;
+            audience.extend(self.counterparts_of(store, to, wall)?);
             let rekeyed = store.rotate(from, to)?;
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
             self.unjudge(store, [*from, *to].into_iter().chain(merged));
@@ -83,6 +89,22 @@ impl Core {
             self.rekey_friends(&writing, &old, &successor);
             self.merge_dropped(&writing, store, &rekeyed);
             self.after_merge(&writing, &successor);
+            let ended: Vec<_> = rekeyed
+                .ended
+                .iter()
+                .flat_map(|e| e.parties.iter().map(|m| m.fingerprint))
+                .collect();
+            for (_, other) in audience {
+                let none = |x: &crate::inbox::Mailbox, y: &crate::inbox::Mailbox| {
+                    store.relationship(x, y, wall).is_ok_and(|r| r.is_none())
+                };
+                // One the edge's ending told, or of a successor no account
+                // here names, is told nothing more.
+                let told = ended.contains(&other.fingerprint) || successor.login.is_empty();
+                if !told && none(&successor, &other) && none(&other, &successor) {
+                    self.tell_entry("a merge", &other, &successor);
+                }
+            }
         }
         drop(writing);
         if judging {

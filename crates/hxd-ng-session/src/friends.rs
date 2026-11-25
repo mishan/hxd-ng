@@ -316,6 +316,7 @@ fn results_json(results: &[PresentResult]) -> Vec<Value> {
                 Presented::BadSignature => ("bad_signature", None),
                 Presented::Withdrawn(w) => ("withdrawn", w.as_ref()),
                 Presented::Stale => ("stale", None),
+                Presented::Reset => ("reset", None),
             };
             let mut v = json!({ "hash": b64url(&r.hash), "result": result });
             if let Some(w) = withdraw {

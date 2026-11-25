@@ -10,10 +10,10 @@ use std::time::SystemTime;
 
 use hxd_core::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 use hxd_core::relationships::{
-    AccountUpdate, Birthdate, Ended, EndedEdge, Ending, HeldWithdrawal, Ignore, IgnoreMode,
-    LedgerEntry, MessagingAccount, PendingOut, Presentation, Profile, Recorded, Rekeyed,
-    RelationId, Relationship, RelationshipStore, RequestKind, Requester, RotationRecord,
-    StoredOffer, MAX_LANGUAGES,
+    AccountUpdate, Birthdate, Charge, Did, Ended, EndedEdge, Ending, FpPair, HeldWithdrawal,
+    Ignore, IgnoreMode, LedgerEntry, Left, MessagingAccount, Part, PendingOut, Presentation,
+    Profile, Recorded, Rekeyed, RelationId, Relationship, RelationshipStore, Report, RequestKind,
+    Requester, RotationRecord, StoredOffer, MAX_LANGUAGES,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
@@ -29,7 +29,8 @@ const APPROVAL: i64 = 2;
 
 const COLUMNS: &str = "id, owner, owner_fp, other, other_fp, alias, blocked_at, friendship, \
                        approval, pending_at, pending_lapses, pending_delivered, pending_note, \
-                       ignore_mode, ignore_until";
+                       ignore_mode, ignore_until, pending_offer, pending_offer_lapses, \
+                       pending_upgrade";
 
 fn id_of(n: i64) -> Result<RelationId, StoreError> {
     RelationId::try_from(n).map_err(|_| StoreError(format!("relation id {n} is not an id")))
@@ -45,6 +46,8 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<(i64, Relationship), StoreError>>
     let pending: (Option<i64>, Option<i64>, Option<bool>, Option<String>) =
         (r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?);
     let (mode, until): (Option<i64>, Option<i64>) = (r.get(13)?, r.get(14)?);
+    let offer: (Option<Vec<u8>>, Option<i64>) = (r.get(15)?, r.get(16)?);
+    let upgrade: bool = r.get(17)?;
     Ok((|| {
         Ok((
             id,
@@ -62,6 +65,14 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Result<(i64, Relationship), StoreError>>
                         lapses_at: from_unix(lapses),
                         delivered,
                         note,
+                        offer: match offer {
+                            (Some(offer), Some(lapses)) => Some(StoredOffer {
+                                offer,
+                                lapses_at: from_unix(lapses),
+                            }),
+                            _ => None,
+                        },
+                        upgrade,
                     }),
                     _ => return Err(StoreError::new("a pending request is half stored")),
                 },
@@ -133,6 +144,9 @@ fn write(conn: &Connection, id: Option<i64>, rel: &mut Relationship) -> Result<(
         p.and_then(|p| p.note.as_ref()),
         rel.ignore.as_ref().map(|i| i.mode.as_i64()),
         rel.ignore.as_ref().and_then(|i| i.until).map(unix),
+        p.and_then(|p| p.offer.as_ref()).map(|o| &o.offer),
+        p.and_then(|p| p.offer.as_ref()).map(|o| unix(o.lapses_at)),
+        p.is_some_and(|p| p.upgrade),
         id,
     ];
     sql(match id {
@@ -140,16 +154,19 @@ fn write(conn: &Connection, id: Option<i64>, rel: &mut Relationship) -> Result<(
             "UPDATE relationship SET owner = ?1, owner_fp = ?2, other = ?3, other_fp = ?4,
                     alias = ?5, blocked_at = ?6, friendship = ?7, approval = ?8,
                     pending_at = ?9, pending_lapses = ?10, pending_delivered = ?11,
-                    pending_note = ?12, ignore_mode = ?13, ignore_until = ?14
-              WHERE id = ?15",
+                    pending_note = ?12, ignore_mode = ?13, ignore_until = ?14,
+                    pending_offer = ?15, pending_offer_lapses = ?16, pending_upgrade = ?17
+              WHERE id = ?18",
             values,
         ),
         None => conn.execute(
             "INSERT INTO relationship (owner, owner_fp, other, other_fp, alias, blocked_at,
                     friendship, approval, pending_at, pending_lapses, pending_delivered,
-                    pending_note, ignore_mode, ignore_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            &values[..14],
+                    pending_note, ignore_mode, ignore_until, pending_offer,
+                    pending_offer_lapses, pending_upgrade)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17)",
+            &values[..17],
         ),
     })?;
     Ok(())
@@ -370,7 +387,7 @@ const REKEYED: [(&str, &str); 7] = [
 ];
 
 const PRESENTATION_COLUMNS: &str =
-    "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at, taken";
+    "presenter, other, name_mine, name_other, pair, hash, friendship, device, edge, at, taken, reset";
 
 fn bytes32(v: Vec<u8>) -> Result<[u8; 32], StoreError> {
     <[u8; 32]>::try_from(v).map_err(|_| StoreError::new("a stored key is not 32 bytes"))
@@ -385,6 +402,7 @@ fn presentation_row(r: &Row<'_>) -> rusqlite::Result<Result<Presentation, StoreE
     let edge: Option<i64> = r.get(8)?;
     let at: i64 = r.get(9)?;
     let taken: i64 = r.get(10)?;
+    let reset: Option<Vec<u8>> = r.get(11)?;
     Ok((|| {
         Ok(Presentation {
             presenter: fp_from_hex(&presenter)?,
@@ -393,12 +411,131 @@ fn presentation_row(r: &Row<'_>) -> rusqlite::Result<Result<Presentation, StoreE
             pair: bytes32(pair)?,
             hash: bytes32(hash)?,
             friendship,
+            reset,
             device: bytes32(device)?,
             edge: edge.map(id_of).transpose()?,
             at: from_unix(at),
             taken: from_unix(taken),
         })
     })())
+}
+
+/// [`RelationshipStore::present`] within `tx`.
+fn present(tx: &Connection, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
+    let (presenter, other) = (fp_hex(&p.presenter), fp_hex(&p.other));
+    let old =
+        presentations_where(tx, "presenter = ?1 AND other = ?2", &[&presenter, &other])?.pop();
+    if old
+        .as_ref()
+        .is_some_and(|o| o.reset.is_some() && o.reset != p.reset)
+    {
+        drop_upgrade(tx, &other, &presenter)?;
+    }
+    sql(tx.execute(
+        "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
+        params![presenter, other],
+    ))?;
+    sql(tx.execute(
+        "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair,
+                    hash, friendship, device, edge, at, taken, reset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            presenter,
+            other,
+            p.names[0].as_slice(),
+            p.names[1].as_slice(),
+            p.pair.as_slice(),
+            p.hash.as_slice(),
+            p.friendship,
+            p.device.as_slice(),
+            p.edge.map(|n| n as i64),
+            unix(p.at),
+            unix(p.taken),
+            p.reset,
+        ],
+    ))?;
+    Ok(old)
+}
+
+/// [`RelationshipStore::drop_presentations`] within `tx`.
+fn drop_pair(
+    tx: &Connection,
+    a: &[u8; 32],
+    b: &[u8; 32],
+    presenters: &[[u8; 32]],
+) -> Result<Ended, StoreError> {
+    let (x, y) = (fp_hex(a), fp_hex(b));
+    let had = evidence_both_ways(tx, &x, &y)?;
+    let gone = unpresent_pair(tx, &x, &y, presenters)?;
+    let mut ended = None;
+    if had && !evidence_both_ways(tx, &x, &y)? {
+        ended = end_edge(
+            tx,
+            &Mailbox::identified("", *a),
+            &Mailbox::identified("", *b),
+        )?;
+        if let Some(e) = &ended {
+            set_edge(tx, &x, &y, Some(e.id))?;
+        }
+    }
+    Ok(Ended { gone, ended })
+}
+
+/// Rows `clause` names left holding nothing, gone.
+fn reclaim(
+    tx: &Connection,
+    clause: &str,
+    binds: &[&dyn rusqlite::ToSql],
+) -> Result<(), StoreError> {
+    sql(tx.execute(
+        &format!(
+            "DELETE FROM relationship
+              WHERE ({clause}) AND blocked_at IS NULL AND friendship IS NULL
+                AND approval IS NULL AND pending_at IS NULL AND ignore_mode IS NULL"
+        ),
+        binds,
+    ))?;
+    Ok(())
+}
+
+/// [`RelationshipStore::drop_offers`] for the offers whose upgrade rows
+/// `upgrades` names and whose request rows `requests` does: an upgrade
+/// offer with the pending out it showed its owner, a request's offer
+/// alone.
+fn drop_offers_where(
+    tx: &Connection,
+    upgrades: &str,
+    requests: &str,
+    binds: &[&dyn rusqlite::ToSql],
+) -> Result<(), StoreError> {
+    sql(tx.execute(&format!("DELETE FROM friend_offer WHERE {upgrades}"), binds))?;
+    sql(tx.execute(
+        &format!(
+            "UPDATE relationship SET pending_at = NULL, pending_lapses = NULL,
+                    pending_delivered = NULL, pending_note = NULL, pending_upgrade = 0
+              WHERE ({requests}) AND pending_upgrade"
+        ),
+        binds,
+    ))?;
+    sql(tx.execute(
+        &format!(
+            "UPDATE relationship SET pending_offer = NULL, pending_offer_lapses = NULL
+              WHERE {requests}"
+        ),
+        binds,
+    ))?;
+    reclaim(tx, requests, binds)
+}
+
+/// The friendships the pair `x`, `y`'s `Reset` records kept, gone, their
+/// hashes left.
+fn forget_resets(tx: &Connection, x: &str, y: &str) -> Result<(), StoreError> {
+    sql(tx.execute(
+        "UPDATE friend_presentation SET reset = NULL
+          WHERE (presenter = ?1 AND other = ?2) OR (presenter = ?2 AND other = ?1)",
+        params![x, y],
+    ))?;
+    Ok(())
 }
 
 fn presentations_where(
@@ -633,13 +770,466 @@ fn unpresent_pair(
             continue;
         };
         let clause = "presenter = ?1 AND other = ?2";
-        gone.extend(presentations_where(tx, clause, &[&presenter, &other])?);
+        let was = presentations_where(tx, clause, &[&presenter, &other])?;
         sql(tx.execute(
             "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
             params![presenter, other],
         ))?;
+        if was.iter().any(|p| p.reset.is_some()) {
+            drop_upgrade(tx, other, &presenter)?;
+        }
+        gone.extend(was);
     }
     Ok(gone)
+}
+
+fn end_friendship(
+    tx: &Connection,
+    a: &Mailbox,
+    b: &Mailbox,
+    end: &Ending,
+) -> Result<Ended, StoreError> {
+    assert!(
+        end.withdrawals.is_empty() || end.cap > 0,
+        "a cap to keep under"
+    );
+    let fps = a
+        .fingerprint
+        .zip(b.fingerprint)
+        .map(|(x, y)| (fp_hex(&x), fp_hex(&y)));
+
+    for w in &end.withdrawals {
+        keep_withdrawal(tx, w, end.cap)?;
+    }
+    let mut gone = Vec::new();
+    if let Some((x, y)) = &fps {
+        gone = unpresent_pair(tx, x, y, &end.presentations)?;
+        for (o, t) in [(x, y), (y, x)] {
+            let named = end.offers.iter().any(|f| fp_hex(f) == *o);
+            if named || end.block.is_some() {
+                drop_offers_where(
+                    tx,
+                    "owner = ?1 AND other = ?2",
+                    "owner_fp = ?1 AND other_fp = ?2",
+                    &[o, t],
+                )?;
+            }
+        }
+        if end.block.is_some() {
+            forget_resets(tx, x, y)?;
+        }
+    }
+    if end.pending {
+        if let Some((rid, mut rel)) = load_pair(tx, b, a)? {
+            rel.pending_out = None;
+            write(tx, Some(rid), &mut rel)?;
+        }
+        if let Some((x, y)) = &fps {
+            sql(tx.execute(
+                "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
+                params![y, x],
+            ))?;
+        }
+    }
+    if let Some(at) = end.block {
+        let (rid, mut rel) = match load_pair(tx, a, b)? {
+            Some((rid, rel)) => (Some(rid), rel),
+            None => (None, Relationship::new(a, b)),
+        };
+        rel.blocked_at = rel.blocked_at.or(Some(at));
+        write(tx, rid, &mut rel)?;
+        let mut lost = Vec::new();
+        for (x, y) in [(a, b), (b, a)] {
+            if let Some((rid, mut rel)) = load_pair(tx, x, y)? {
+                rel.pending_out = None;
+                lost.extend(rel.approval.take());
+                write(tx, Some(rid), &mut rel)?;
+            }
+        }
+        forget(tx, lost)?;
+    }
+    let ended = if end.friendship {
+        end_edge(tx, a, b)?
+    } else {
+        None
+    };
+    if let Some(e) = &ended {
+        if let Some((x, y)) = &fps {
+            set_edge(tx, x, y, None)?;
+        }
+        if let Some(until) = end.hold {
+            let held = Requester::Account(e.parties[1].clone());
+            hold(tx, &e.parties[0], &held, until)?;
+        }
+    }
+    if let Some(until) = end.declined {
+        hold(tx, a, &Requester::Account(b.clone()), until)?;
+    }
+    Ok(Ended { gone, ended })
+}
+
+fn set_offer(
+    conn: &Connection,
+    owner: &[u8; 32],
+    other: &[u8; 32],
+    offer: Option<&StoredOffer>,
+) -> Result<(), StoreError> {
+    let (owner, other) = (fp_hex(owner), fp_hex(other));
+    sql(match offer {
+        Some(o) => conn.execute(
+            "INSERT OR REPLACE INTO friend_offer (owner, other, offer, lapses)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![owner, other, o.offer, unix(o.lapses_at)],
+        ),
+        None => conn.execute(
+            "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
+            params![owner, other],
+        ),
+    })?;
+    Ok(())
+}
+
+fn drop_offers(tx: &Connection, pairs: &[FpPair]) -> Result<(), StoreError> {
+    for (x, y) in pairs {
+        drop_offers_where(
+            tx,
+            "owner = ?1 AND other = ?2",
+            "owner_fp = ?1 AND other_fp = ?2",
+            &[&fp_hex(x), &fp_hex(y)],
+        )?;
+    }
+    Ok(())
+}
+
+fn drop_offers_naming(tx: &Connection, fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError> {
+    let f = fp_hex(fp);
+    let mut stmt = sql(tx.prepare(
+        "SELECT owner, other FROM friend_offer WHERE owner = ?1 OR other = ?1
+             UNION SELECT owner_fp, other_fp FROM relationship
+              WHERE (owner_fp = ?1 OR other_fp = ?1)
+                AND (pending_offer IS NOT NULL OR pending_upgrade)",
+    ))?;
+    let found: Vec<(String, String)> =
+        sql(sql(stmt.query_map(params![f], |r| Ok((r.get(0)?, r.get(1)?))))?.collect())?;
+    drop(stmt);
+    drop_offers_where(
+        tx,
+        "owner = ?1 OR other = ?1",
+        "owner_fp = ?1 OR other_fp = ?1",
+        &[&f],
+    )?;
+    found
+        .iter()
+        .map(|(o, t)| Ok((fp_from_hex(o)?, fp_from_hex(t)?)))
+        .collect()
+}
+
+fn drop_withdrawal(
+    conn: &Connection,
+    owner: &[u8; 32],
+    pair: &[u8; 32],
+    party: &[u8; 32],
+    withdrawal: &[u8],
+) -> Result<(), StoreError> {
+    sql(conn.execute(
+        "DELETE FROM friend_withdrawal
+          WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND withdrawal = ?4",
+        params![fp_hex(owner), pair.as_slice(), party.as_slice(), withdrawal],
+    ))?;
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn answer_reset(
+    tx: &Connection,
+    drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)],
+    record: Option<&Presentation>,
+    upgrade: Option<(&Mailbox, &Mailbox)>,
+) -> Result<(Vec<Ended>, Option<Presentation>), StoreError> {
+    let mut ended = Vec::new();
+    for (a, b, presenters) in drops {
+        ended.push(drop_pair(tx, a, b, presenters)?);
+    }
+    let replaced = match record {
+        Some(p) => present(tx, p)?,
+        None => None,
+    };
+    let Some((owner, other)) = upgrade else {
+        return Ok((ended, replaced));
+    };
+    let (Some((id, mut rel)), Some((x, y))) = (
+        load_pair(tx, owner, other)?,
+        owner.fingerprint.zip(other.fingerprint),
+    ) else {
+        return Ok((ended, replaced));
+    };
+    let Some(p) = rel.pending_out.as_mut() else {
+        return Ok((ended, replaced));
+    };
+    let Some(o) = p.offer.take() else {
+        return Ok((ended, replaced));
+    };
+    p.upgrade = true;
+    let lapses = o.lapses_at.min(p.lapses_at);
+    write(tx, Some(id), &mut rel)?;
+    sql(tx.execute(
+        "INSERT OR REPLACE INTO friend_offer (owner, other, offer, lapses)
+             VALUES (?1, ?2, ?3, ?4)",
+        params![fp_hex(&x), fp_hex(&y), o.offer, unix(lapses)],
+    ))?;
+    Ok((ended, replaced))
+}
+
+#[allow(clippy::type_complexity)]
+fn present_befriending(
+    tx: &Connection,
+    a: &Mailbox,
+    b: &Mailbox,
+    rows: &[Presentation],
+    friends: Option<Option<RelationId>>,
+    at: SystemTime,
+) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError> {
+    let replaced = rows
+        .iter()
+        .map(|p| present(tx, p))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
+        sql(tx.execute(
+            "DELETE FROM friend_offer
+                  WHERE (owner = ?1 AND other = ?2) OR (owner = ?2 AND other = ?1)",
+            params![fp_hex(&x), fp_hex(&y)],
+        ))?;
+    }
+    let id = match friends {
+        Some(Some(id)) => Some(refriend(tx, a, b, id, at).map(|()| id)?),
+        Some(None) => Some(befriend(tx, a, b, at)?),
+        None => None,
+    };
+    Ok((replaced, id))
+}
+
+fn befriend_dropping(
+    tx: &Connection,
+    a: &Mailbox,
+    b: &Mailbox,
+    at: SystemTime,
+    id: Option<RelationId>,
+    drop: &[[u8; 32]],
+) -> Result<RelationId, StoreError> {
+    if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
+        let (x, y) = (fp_hex(&x), fp_hex(&y));
+        unpresent_pair(tx, &x, &y, drop)?;
+        forget_resets(tx, &x, &y)?;
+    }
+    match id {
+        Some(id) => refriend(tx, a, b, id, at).map(|()| id),
+        None => befriend(tx, a, b, at),
+    }
+}
+
+/// One part of a write, as its method does it.
+fn part(tx: &Connection, part: &Part) -> Result<Did, StoreError> {
+    #[allow(unreachable_patterns)]
+    Ok(match part {
+        Part::DropPresentations(a, b, presenters) => Did::Ended(drop_pair(tx, a, b, presenters)?),
+        Part::EndFriendship(a, b, end) => Did::Ended(end_friendship(tx, a, b, end)?),
+        Part::Present(p) => Did::Replaced(present(tx, p)?),
+        Part::PresentBefriending {
+            a,
+            b,
+            rows,
+            befriend,
+            at,
+        } => {
+            let (replaced, id) = present_befriending(tx, a, b, rows, *befriend, *at)?;
+            Did::Befriended(replaced, id)
+        }
+        Part::AnswerReset {
+            drops,
+            record,
+            upgrade,
+        } => {
+            let upgrade = upgrade.as_ref().map(|(o, t)| (o, t));
+            let (ended, replaced) = answer_reset(tx, drops, record.as_ref(), upgrade)?;
+            Did::Reset(ended, replaced)
+        }
+        Part::SetOffer(owner, other, offer) => {
+            set_offer(tx, owner, other, offer.as_ref())?;
+            Did::Nothing
+        }
+        Part::DropOffers(pairs) => {
+            drop_offers(tx, pairs)?;
+            Did::Nothing
+        }
+        Part::DropOffersNaming(fp) => Did::Named(drop_offers_naming(tx, fp)?),
+        Part::BefriendDropping { a, b, at, id, drop } => {
+            Did::Friends(befriend_dropping(tx, a, b, *at, *id, drop)?)
+        }
+        Part::KeepWithdrawal(w, cap) => {
+            keep_withdrawal(tx, w, *cap)?;
+            Did::Nothing
+        }
+        Part::DropWithdrawal(owner, pair, party, w) => {
+            drop_withdrawal(tx, owner, pair, party, w)?;
+            Did::Nothing
+        }
+        _ if part.fails() => return Err(StoreError("a part of the write failed".into())),
+        _ => unreachable!("every part is one of the above"),
+    })
+}
+
+/// What `report` asks of, as it stands in `conn`.
+fn left(conn: &Connection, report: &Report) -> Result<Vec<Left>, StoreError> {
+    let now = report.now;
+    let mut out = Vec::new();
+    for (a, b) in &report.pairs {
+        let row = |x: &Mailbox, y: &Mailbox| -> Result<_, StoreError> {
+            Ok(load_pair(conn, x, y)?.and_then(|(_, r)| r.as_of(now)))
+        };
+        let presentation = |x: &[u8; 32], y: &[u8; 32]| -> Result<_, StoreError> {
+            Ok(presentations_where(
+                conn,
+                "presenter = ?1 AND other = ?2",
+                &[&fp_hex(x), &fp_hex(y)],
+            )?
+            .pop())
+        };
+        let offer = |x: &[u8; 32], y: &[u8; 32]| -> Result<Option<StoredOffer>, StoreError> {
+            sql(conn
+                .query_row(
+                    "SELECT offer, lapses FROM friend_offer
+                      WHERE owner = ?1 AND other = ?2 AND lapses > ?3",
+                    params![fp_hex(x), fp_hex(y), unix(now)],
+                    |r| {
+                        Ok(StoredOffer {
+                            offer: r.get(0)?,
+                            lapses_at: from_unix(r.get(1)?),
+                        })
+                    },
+                )
+                .optional())
+        };
+        let shown = |m: &Mailbox| -> Result<_, StoreError> {
+            Ok(load_account(conn, m)?.and_then(|(_, a, _)| a.shown_text))
+        };
+        let (presentations, offers) = match a.fingerprint.zip(b.fingerprint) {
+            Some((x, y)) => (
+                [presentation(&x, &y)?, presentation(&y, &x)?],
+                [offer(&x, &y)?, offer(&y, &x)?],
+            ),
+            None => Default::default(),
+        };
+        out.push(Left {
+            pair: [a.clone(), b.clone()],
+            rows: [row(a, b)?, row(b, a)?],
+            presentations,
+            offers,
+            shown: [shown(a)?, shown(b)?],
+        });
+    }
+    Ok(out)
+}
+
+/// Each upgrade `from` has waiting, as the other party, with the bytes of
+/// the record it was taken on, where `to` has nothing pending for that
+/// party.
+fn moving_upgrades(
+    tx: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+    let mut stmt = sql(tx.prepare(
+        "SELECT r.other_fp, p.reset FROM relationship r
+           JOIN friend_presentation p ON p.presenter = r.other_fp AND p.other = r.owner_fp
+          WHERE r.pending_upgrade AND p.reset IS NOT NULL AND r.owner_fp = ?1
+            AND NOT EXISTS (SELECT 1 FROM relationship s
+                             WHERE s.owner_fp = ?2 AND s.other_fp = r.other_fp
+                               AND s.pending_at IS NOT NULL)",
+    ))?;
+    let found = sql(stmt.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?))))?;
+    sql(found.collect())
+}
+
+/// A ledger entry, inserted.
+fn insert_ledger(tx: &Connection, entry: &LedgerEntry) -> Result<(), StoreError> {
+    sql(tx.execute(
+        "INSERT INTO request_ledger
+           (kind, sender, sender_fp, address, recipient, recipient_fp, guid, bytes, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            entry.kind.as_i64(),
+            entry.sender.as_ref().map(|s| &s.login),
+            entry
+                .sender
+                .as_ref()
+                .and_then(|s| s.fingerprint.as_ref())
+                .map(fp_hex),
+            entry.address,
+            entry.recipient.login,
+            entry.recipient.fingerprint.as_ref().map(fp_hex),
+            entry.guid.as_ref().map(|g| g.as_str()),
+            entry.bytes as i64,
+            unix(entry.at),
+        ],
+    ))?;
+    Ok(())
+}
+
+/// What a rotation merged onto `fp`, made one state a direction again: an
+/// upgrade offer off a friendship stands only as its sender's pending out
+/// shows it and while the record it was taken on does, and never beside a
+/// request.
+fn settle_upgrades(tx: &Connection, fp: &str) -> Result<(), StoreError> {
+    let recorded = "EXISTS (SELECT 1 FROM friend_presentation p
+                     WHERE p.presenter = r.other_fp AND p.other = r.owner_fp
+                       AND p.reset IS NOT NULL)";
+    sql(tx.execute(
+        &format!(
+            "UPDATE relationship AS r SET pending_at = NULL, pending_lapses = NULL,
+                    pending_delivered = NULL, pending_note = NULL, pending_upgrade = 0
+              WHERE (r.owner_fp = ?1 OR r.other_fp = ?1) AND r.pending_upgrade
+                AND NOT {recorded}"
+        ),
+        params![fp],
+    ))?;
+    // Nor any pending out beside the friendship a merge left.
+    sql(tx.execute(
+        "UPDATE relationship SET pending_at = NULL, pending_lapses = NULL,
+                pending_delivered = NULL, pending_note = NULL, pending_upgrade = 0,
+                pending_offer = NULL, pending_offer_lapses = NULL
+          WHERE (owner_fp = ?1 OR other_fp = ?1) AND friendship IS NOT NULL
+            AND pending_at IS NOT NULL",
+        params![fp],
+    ))?;
+    sql(tx.execute(
+        "DELETE FROM friend_offer AS f
+          WHERE (f.owner = ?1 OR f.other = ?1)
+            AND NOT EXISTS (SELECT 1 FROM relationship r
+                             WHERE r.owner_fp = f.owner AND r.other_fp = f.other
+                               AND (r.friendship IS NOT NULL OR r.pending_upgrade))",
+        params![fp],
+    ))?;
+    reclaim(tx, "owner_fp = ?1 OR other_fp = ?1", &[&fp])
+}
+
+/// The upgrade offer `x` has waiting for `y` on an edge a reset left
+/// inactive, gone with the record `y` kept for it, and the pending out it
+/// showed `x` with it.
+fn drop_upgrade(tx: &Connection, x: &str, y: &str) -> Result<(), StoreError> {
+    let shown = sql(tx.execute(
+        "UPDATE relationship SET pending_at = NULL, pending_lapses = NULL,
+                pending_delivered = NULL, pending_note = NULL, pending_upgrade = 0
+          WHERE owner_fp = ?1 AND other_fp = ?2 AND pending_upgrade",
+        params![x, y],
+    ))?;
+    if shown > 0 {
+        sql(tx.execute(
+            "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
+            params![x, y],
+        ))?;
+        reclaim(tx, "owner_fp = ?1 AND other_fp = ?2", &[&x, &y])?;
+    }
+    Ok(())
 }
 
 fn befriend(
@@ -727,6 +1317,14 @@ fn end_edge(tx: &Connection, a: &Mailbox, b: &Mailbox) -> Result<Option<EndedEdg
         write(tx, Some(rid), &mut rel)?;
     }
     forget(tx, ended)?;
+    // An upgrade offer stood beside the friendship, and goes with it.
+    if let Some((x, y)) = parties[0].fingerprint.zip(parties[1].fingerprint) {
+        sql(tx.execute(
+            "DELETE FROM friend_offer
+              WHERE (owner = ?1 AND other = ?2) OR (owner = ?2 AND other = ?1)",
+            params![fp_hex(&x), fp_hex(&y)],
+        ))?;
+    }
     Ok(Some(EndedEdge { id, parties }))
 }
 
@@ -787,6 +1385,17 @@ impl SqliteStore {
         portable: bool,
     ) -> Result<Rekeyed, StoreError> {
         self.with_tx(|tx| {
+            // What waits for the key that retires goes first; then each
+            // upgrade the key that moves has waiting, with the record it
+            // was taken on, where the successor has nothing pending for
+            // the same party to keep in its place.
+            if portable {
+                drop_offers_where(tx, "other = ?1", "other_fp = ?1", &[&from])?;
+            }
+            let moving = match portable {
+                true => moving_upgrades(tx, from, to)?,
+                false => Vec::new(),
+            };
             let after = |r: &str, col: &str| {
                 format!(
                     "CASE WHEN {} THEN ?1 ELSE IFNULL({r}.{col}_fp, {r}.{col}) END",
@@ -857,6 +1466,22 @@ impl SqliteStore {
             };
             if portable {
                 rotate_portable(tx, from, to, &mut rekeyed)?;
+                settle_upgrades(tx, to)?;
+                for (other, record) in moving {
+                    let owner = to.to_string();
+                    let kept: Option<Vec<u8>> = sql(tx
+                        .query_row(
+                            "SELECT reset FROM friend_presentation
+                              WHERE presenter = ?1 AND other = ?2",
+                            params![other, owner],
+                            |r| r.get(0),
+                        )
+                        .optional())?
+                    .flatten();
+                    if kept.as_ref() != Some(&record) {
+                        drop_upgrade(tx, &owner, &other)?;
+                    }
+                }
             }
             Ok(rekeyed)
         })
@@ -890,6 +1515,23 @@ impl RelationshipStore for SqliteStore {
             .collect())
     }
 
+    fn upgrades_to(
+        &self,
+        owner: &Mailbox,
+        now: SystemTime,
+    ) -> Result<Vec<Relationship>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let text = format!(
+            "SELECT {COLUMNS} FROM relationship
+              WHERE {} AND pending_upgrade AND pending_lapses > ?2 ORDER BY id",
+            mailbox_sql(owner, "other", 1)
+        );
+        Ok(rows(&conn, &text, &[&bind(owner), &unix(now)])?
+            .into_iter()
+            .filter_map(|(_, r)| r.as_of(now))
+            .collect())
+    }
+
     fn pending_in(
         &self,
         owner: &Mailbox,
@@ -898,7 +1540,7 @@ impl RelationshipStore for SqliteStore {
         let conn = self.conn.lock().unwrap();
         let text = format!(
             "SELECT {COLUMNS} FROM relationship
-              WHERE {} AND pending_delivered AND pending_lapses > ?2
+              WHERE {} AND pending_delivered AND NOT pending_upgrade AND pending_lapses > ?2
               ORDER BY pending_at, id",
             mailbox_sql(owner, "other", 1)
         );
@@ -1096,26 +1738,7 @@ impl RelationshipStore for SqliteStore {
                     return Ok(Recorded::Retry(Box::new(e?)));
                 }
             }
-            sql(tx.execute(
-                "INSERT INTO request_ledger
-                   (kind, sender, sender_fp, address, recipient, recipient_fp, guid, bytes, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    entry.kind.as_i64(),
-                    entry.sender.as_ref().map(|s| &s.login),
-                    entry
-                        .sender
-                        .as_ref()
-                        .and_then(|s| s.fingerprint.as_ref())
-                        .map(fp_hex),
-                    entry.address,
-                    entry.recipient.login,
-                    entry.recipient.fingerprint.as_ref().map(fp_hex),
-                    entry.guid.as_ref().map(|g| g.as_str()),
-                    entry.bytes as i64,
-                    unix(entry.at),
-                ],
-            ))?;
+            insert_ledger(tx, entry)?;
             Ok(Recorded::New)
         })
     }
@@ -1315,15 +1938,7 @@ impl RelationshipStore for SqliteStore {
         id: Option<RelationId>,
         drop: &[[u8; 32]],
     ) -> Result<RelationId, StoreError> {
-        self.with_tx(|tx| {
-            if let Some((x, y)) = a.fingerprint.zip(b.fingerprint) {
-                unpresent_pair(tx, &fp_hex(&x), &fp_hex(&y), drop)?;
-            }
-            match id {
-                Some(id) => refriend(tx, a, b, id, at).map(|()| id),
-                None => befriend(tx, a, b, at),
-            }
-        })
+        self.with_tx(|tx| befriend_dropping(tx, a, b, at, id, drop))
     }
 
     fn made_at(&self, id: RelationId) -> Result<Option<SystemTime>, StoreError> {
@@ -1339,35 +1954,36 @@ impl RelationshipStore for SqliteStore {
     }
 
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError> {
-        let (presenter, other) = (fp_hex(&p.presenter), fp_hex(&p.other));
-        self.with_tx(|tx| {
-            let old =
-                presentations_where(tx, "presenter = ?1 AND other = ?2", &[&presenter, &other])?
-                    .pop();
-            sql(tx.execute(
-                "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
-                params![presenter, other],
-            ))?;
-            sql(tx.execute(
-                "INSERT INTO friend_presentation (presenter, other, name_mine, name_other, pair,
-                        hash, friendship, device, edge, at, taken)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    presenter,
-                    other,
-                    p.names[0].as_slice(),
-                    p.names[1].as_slice(),
-                    p.pair.as_slice(),
-                    p.hash.as_slice(),
-                    p.friendship,
-                    p.device.as_slice(),
-                    p.edge.map(|n| n as i64),
-                    unix(p.at),
-                    unix(p.taken),
-                ],
-            ))?;
-            Ok(old)
-        })
+        self.with_tx(|tx| present(tx, p))
+    }
+
+    fn present_befriending(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        rows: &[Presentation],
+        friends: Option<Option<RelationId>>,
+        at: SystemTime,
+    ) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError> {
+        self.with_tx(|tx| present_befriending(tx, a, b, rows, friends, at))
+    }
+
+    fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let n = sql(conn.execute(
+            "UPDATE friend_presentation SET reset = NULL
+              WHERE reset IS NOT NULL AND at <= ?1
+                AND NOT EXISTS (SELECT 1 FROM friend_offer o
+                                 WHERE o.owner = friend_presentation.other
+                                   AND o.other = friend_presentation.presenter
+                                   AND o.lapses > ?2)
+                AND NOT EXISTS (SELECT 1 FROM relationship r
+                                 WHERE r.owner_fp = friend_presentation.other
+                                   AND r.other_fp = friend_presentation.presenter
+                                   AND r.pending_upgrade AND r.pending_lapses > ?2)",
+            params![unix(before), unix(now)],
+        ))?;
+        Ok(n)
     }
 
     fn presentation(
@@ -1394,17 +2010,8 @@ impl RelationshipStore for SqliteStore {
         presenter: &[u8; 32],
         other: &[u8; 32],
     ) -> Result<Option<Presentation>, StoreError> {
-        let (presenter, other) = (fp_hex(presenter), fp_hex(other));
-        self.with_tx(|tx| {
-            let old =
-                presentations_where(tx, "presenter = ?1 AND other = ?2", &[&presenter, &other])?
-                    .pop();
-            sql(tx.execute(
-                "DELETE FROM friend_presentation WHERE presenter = ?1 AND other = ?2",
-                params![presenter, other],
-            ))?;
-            Ok(old)
-        })
+        let (a, b) = (fp_hex(presenter), fp_hex(other));
+        self.with_tx(|tx| Ok(unpresent_pair(tx, &a, &b, &[*presenter])?.pop()))
     }
 
     fn drop_presentations(
@@ -1413,88 +2020,11 @@ impl RelationshipStore for SqliteStore {
         b: &[u8; 32],
         presenters: &[[u8; 32]],
     ) -> Result<Ended, StoreError> {
-        let (x, y) = (fp_hex(a), fp_hex(b));
-        self.with_tx(|tx| {
-            let had = evidence_both_ways(tx, &x, &y)?;
-            let gone = unpresent_pair(tx, &x, &y, presenters)?;
-            let mut ended = None;
-            if had && !evidence_both_ways(tx, &x, &y)? {
-                ended = end_edge(
-                    tx,
-                    &Mailbox::identified("", *a),
-                    &Mailbox::identified("", *b),
-                )?;
-                if let Some(e) = &ended {
-                    set_edge(tx, &x, &y, Some(e.id))?;
-                }
-            }
-            Ok(Ended { gone, ended })
-        })
+        self.with_tx(|tx| drop_pair(tx, a, b, presenters))
     }
 
     fn end_friendship(&self, a: &Mailbox, b: &Mailbox, end: &Ending) -> Result<Ended, StoreError> {
-        assert!(
-            end.withdrawals.is_empty() || end.cap > 0,
-            "a cap to keep under"
-        );
-        let fps = a
-            .fingerprint
-            .zip(b.fingerprint)
-            .map(|(x, y)| (fp_hex(&x), fp_hex(&y)));
-        self.with_tx(|tx| {
-            for w in &end.withdrawals {
-                keep_withdrawal(tx, w, end.cap)?;
-            }
-            let mut gone = Vec::new();
-            if let Some((x, y)) = &fps {
-                gone = unpresent_pair(tx, x, y, &end.presentations)?;
-                for owner in end.offers.iter().map(fp_hex) {
-                    let other = if owner == *x {
-                        y
-                    } else if owner == *y {
-                        x
-                    } else {
-                        continue;
-                    };
-                    sql(tx.execute(
-                        "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
-                        params![owner, other],
-                    ))?;
-                }
-            }
-            if let Some(at) = end.block {
-                let (rid, mut rel) = match load_pair(tx, a, b)? {
-                    Some((rid, rel)) => (Some(rid), rel),
-                    None => (None, Relationship::new(a, b)),
-                };
-                rel.blocked_at = rel.blocked_at.or(Some(at));
-                write(tx, rid, &mut rel)?;
-                let mut lost = Vec::new();
-                for (x, y) in [(a, b), (b, a)] {
-                    if let Some((rid, mut rel)) = load_pair(tx, x, y)? {
-                        rel.pending_out = None;
-                        lost.extend(rel.approval.take());
-                        write(tx, Some(rid), &mut rel)?;
-                    }
-                }
-                forget(tx, lost)?;
-            }
-            let ended = if end.friendship {
-                end_edge(tx, a, b)?
-            } else {
-                None
-            };
-            if let Some(e) = &ended {
-                if let Some((x, y)) = &fps {
-                    set_edge(tx, x, y, None)?;
-                }
-                if let Some(until) = end.hold {
-                    let held = Requester::Account(e.parties[1].clone());
-                    hold(tx, &e.parties[0], &held, until)?;
-                }
-            }
-            Ok(Ended { gone, ended })
-        })
+        self.with_tx(|tx| end_friendship(tx, a, b, end))
     }
 
     fn presented_by(&self, device: &[u8; 32]) -> Result<Vec<Presentation>, StoreError> {
@@ -1537,13 +2067,7 @@ impl RelationshipStore for SqliteStore {
         party: &[u8; 32],
         withdrawal: &[u8],
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        sql(conn.execute(
-            "DELETE FROM friend_withdrawal
-              WHERE owner = ?1 AND pair = ?2 AND party = ?3 AND withdrawal = ?4",
-            params![fp_hex(owner), pair.as_slice(), party.as_slice(), withdrawal],
-        ))?;
-        Ok(())
+        drop_withdrawal(&self.conn.lock().unwrap(), owner, pair, party, withdrawal)
     }
 
     fn set_offer(
@@ -1552,20 +2076,78 @@ impl RelationshipStore for SqliteStore {
         other: &[u8; 32],
         offer: Option<&StoredOffer>,
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let (owner, other) = (fp_hex(owner), fp_hex(other));
-        sql(match offer {
-            Some(o) => conn.execute(
-                "INSERT OR REPLACE INTO friend_offer (owner, other, offer, lapses)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![owner, other, o.offer, unix(o.lapses_at)],
-            ),
-            None => conn.execute(
+        set_offer(&self.conn.lock().unwrap(), owner, other, offer)
+    }
+
+    fn ask(
+        &self,
+        owner: &Mailbox,
+        other: &Mailbox,
+        pending: &PendingOut,
+        upgrade: Option<&StoredOffer>,
+        charge: Option<&Charge>,
+        report: &Report,
+    ) -> Result<Vec<Left>, StoreError> {
+        self.with_tx(|tx| {
+            if let Some(c) = charge {
+                insert_ledger(tx, &c.entry)?;
+                if c.dropped {
+                    let (id, a, dropped) = match load_account(tx, other)? {
+                        Some((id, a, d)) => (Some(id), a, d),
+                        None => (None, MessagingAccount::default(), 0),
+                    };
+                    write_account(tx, other, id, &a, dropped + 1)?;
+                }
+            }
+            let (id, mut rel) = match load_pair(tx, owner, other)? {
+                Some((id, rel)) => (Some(id), rel),
+                None => (None, Relationship::new(owner, other)),
+            };
+            rel.pending_out = Some(pending.clone());
+            write(tx, id, &mut rel)?;
+            let Some((x, y)) = owner.fingerprint.zip(other.fingerprint) else {
+                return left(tx, report);
+            };
+            let (x, y) = (fp_hex(&x), fp_hex(&y));
+            sql(tx.execute(
                 "DELETE FROM friend_offer WHERE owner = ?1 AND other = ?2",
-                params![owner, other],
-            ),
-        })?;
-        Ok(())
+                params![x, y],
+            ))?;
+            if let Some(o) = upgrade {
+                sql(tx.execute(
+                    "INSERT INTO friend_offer (owner, other, offer, lapses) VALUES (?1, ?2, ?3, ?4)",
+                    params![x, y, o.offer, unix(o.lapses_at)],
+                ))?;
+            }
+            left(tx, report)
+        })
+    }
+
+    fn answer_reset(
+        &self,
+        drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)],
+        record: Option<&Presentation>,
+        upgrade: Option<(&Mailbox, &Mailbox)>,
+    ) -> Result<(Vec<Ended>, Option<Presentation>), StoreError> {
+        self.with_tx(|tx| answer_reset(tx, drops, record, upgrade))
+    }
+
+    fn write(&self, parts: &[Part], report: &Report) -> Result<(Vec<Did>, Vec<Left>), StoreError> {
+        self.with_tx(|tx| {
+            let did = parts
+                .iter()
+                .map(|p| part(tx, p))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((did, left(tx, report)?))
+        })
+    }
+
+    fn drop_offers(&self, pairs: &[FpPair]) -> Result<(), StoreError> {
+        self.with_tx(|tx| drop_offers(tx, pairs))
+    }
+
+    fn drop_offers_naming(&self, fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError> {
+        self.with_tx(|tx| drop_offers_naming(tx, fp))
     }
 
     fn offer(
@@ -1590,6 +2172,22 @@ impl RelationshipStore for SqliteStore {
             .optional())
     }
 
+    fn offerers(&self, now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT owner FROM friend_offer WHERE lapses > ?1
+             UNION
+             SELECT owner_fp FROM relationship
+              WHERE owner_fp IS NOT NULL AND pending_offer IS NOT NULL
+                AND pending_offer_lapses > ?1 AND pending_lapses > ?1
+             ORDER BY 1",
+        ))?;
+        let found = sql(stmt.query_map(params![unix(now)], |r| r.get::<_, String>(0)))?;
+        found
+            .map(|r| fp_from_hex(&r.map_err(StoreError::new)?))
+            .collect()
+    }
+
     fn offers_from(
         &self,
         owner: &[u8; 32],
@@ -1597,8 +2195,12 @@ impl RelationshipStore for SqliteStore {
     ) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = sql(conn.prepare_cached(
-            "SELECT other, offer, lapses FROM friend_offer
-              WHERE owner = ?1 AND lapses > ?2 ORDER BY other",
+            "SELECT other, offer, lapses FROM friend_offer WHERE owner = ?1 AND lapses > ?2
+             UNION ALL
+             SELECT other_fp, pending_offer, pending_offer_lapses FROM relationship
+              WHERE owner_fp = ?1 AND pending_offer IS NOT NULL AND pending_offer_lapses > ?2
+                AND pending_lapses > ?2
+             ORDER BY 1",
         ))?;
         let found = sql(stmt.query_map(params![fp_hex(owner), unix(now)], |r| {
             let other: String = r.get(0)?;
@@ -1743,6 +2345,7 @@ impl RelationshipStore for SqliteStore {
             let ids: Vec<i64> = {
                 let mut stmt = sql(tx.prepare(
                     "SELECT id FROM relationship WHERE pending_lapses <= ?1
+                     UNION SELECT id FROM relationship WHERE pending_offer_lapses <= ?1
                      UNION SELECT id FROM relationship WHERE ignore_until <= ?1
                      ORDER BY id LIMIT ?2",
                 ))?;

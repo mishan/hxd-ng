@@ -157,6 +157,13 @@ pub struct PendingOut {
     /// `DATA_REQUEST_NOTE`, kept for a delivery at the target's next
     /// login.
     pub note: Option<String>,
+    /// The offer the request carries (§4.1), read as gone from its own
+    /// lapse, the request staying plain.
+    pub offer: Option<StoredOffer>,
+    /// Taken as an upgrade offer on an edge a reset left inactive (§4.1),
+    /// whose offer waits among the upgrade offers: what the owner is
+    /// shown, and the other never is.
+    pub upgrade: bool,
 }
 
 /// What `owner` has decided about `other`.
@@ -199,6 +206,11 @@ impl Relationship {
             .is_some_and(|p| p.lapses_at <= now)
         {
             self.pending_out = None;
+        }
+        if let Some(p) = self.pending_out.as_mut() {
+            if p.offer.as_ref().is_some_and(|o| o.lapses_at <= now) {
+                p.offer = None;
+            }
         }
         if self
             .ignore
@@ -349,6 +361,115 @@ pub enum Recorded {
     Retry(Box<LedgerEntry>),
 }
 
+/// The pairs a step reports what it left of, read at `now` inside the
+/// step, so that what their parties are told comes from what the step
+/// left and never from a read after it.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub pairs: Vec<(Mailbox, Mailbox)>,
+    pub now: SystemTime,
+}
+
+impl Report {
+    /// No pair: for a caller that tells nothing from the step.
+    pub fn none() -> Report {
+        Report {
+            pairs: Vec::new(),
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    pub fn of(a: &Mailbox, b: &Mailbox, now: SystemTime) -> Report {
+        Report {
+            pairs: vec![(a.clone(), b.clone())],
+            now,
+        }
+    }
+}
+
+/// What a step left of a pair, each field the pair's first party's
+/// first: each party's row toward the other, its presentation for the
+/// other, its upgrade offer to the other, and the text its account was
+/// last shown with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Left {
+    pub pair: [Mailbox; 2],
+    pub rows: [Option<Relationship>; 2],
+    pub presentations: [Option<Presentation>; 2],
+    pub offers: [Option<StoredOffer>; 2],
+    pub shown: [Option<String>; 2],
+}
+
+/// The presentations of a pair to drop, as
+/// [`RelationshipStore::drop_presentations`] takes them.
+pub type PairDrop = ([u8; 32], [u8; 32], Vec<[u8; 32]>);
+
+/// One of the store's own writes, as a part of [`RelationshipStore::write`]:
+/// each does what the method it is named for does.
+#[derive(Debug, Clone)]
+pub enum Part {
+    DropPresentations([u8; 32], [u8; 32], Vec<[u8; 32]>),
+    EndFriendship(Mailbox, Mailbox, Ending),
+    Present(Presentation),
+    PresentBefriending {
+        a: Mailbox,
+        b: Mailbox,
+        rows: Vec<Presentation>,
+        befriend: Option<Option<RelationId>>,
+        at: SystemTime,
+    },
+    AnswerReset {
+        drops: Vec<PairDrop>,
+        record: Option<Presentation>,
+        upgrade: Option<(Mailbox, Mailbox)>,
+    },
+    SetOffer([u8; 32], [u8; 32], Option<StoredOffer>),
+    DropOffers(Vec<FpPair>),
+    DropOffersNaming([u8; 32]),
+    BefriendDropping {
+        a: Mailbox,
+        b: Mailbox,
+        at: SystemTime,
+        id: Option<RelationId>,
+        drop: Vec<[u8; 32]>,
+    },
+    KeepWithdrawal(HeldWithdrawal, usize),
+    DropWithdrawal([u8; 32], [u8; 32], [u8; 32], Vec<u8>),
+    /// Fails the write where it stands, for a test of all or nothing.
+    #[cfg(any(test, feature = "test-support"))]
+    Fail,
+}
+
+impl Part {
+    /// Whether this part fails its write: never outside a test.
+    pub fn fails(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        return matches!(self, Part::Fail);
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
+    }
+}
+
+/// What a [`Part`] answered, as its method answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Did {
+    Nothing,
+    Ended(Ended),
+    Replaced(Option<Presentation>),
+    Befriended(Vec<Option<Presentation>>, Option<RelationId>),
+    Reset(Vec<Ended>, Option<Presentation>),
+    Named(Vec<FpPair>),
+    Friends(RelationId),
+}
+
+/// A request counted as [`RelationshipStore::ask`] records it: its ledger
+/// entry, and whether its target's full requests dropped it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Charge {
+    pub entry: LedgerEntry,
+    pub dropped: bool,
+}
+
 /// A date of birth whose parts are each optional: 0 is "not given".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Birthdate {
@@ -429,6 +550,11 @@ pub struct Presentation {
     /// toward the presenter's bound, for one refused before it could be
     /// recorded (§4.3, steps 2 and 3).
     pub friendship: Option<Vec<u8>>,
+    /// A `Reset` record (§4.3): the friendship a presentation answered
+    /// `Reset` kept, with `friendship` `None`, so that it is never
+    /// evidence and the upgrade offer that remakes it can be checked
+    /// against which half is below its floor.
+    pub reset: Option<Vec<u8>>,
     /// The SHA-256 of the device key whose session made it, or for one
     /// made by Friend Response, that signed the presenter's half: what a
     /// device's revocation drops (§6).
@@ -484,7 +610,8 @@ pub struct Ending {
     /// The parties whose offers to the other go.
     pub offers: Vec<[u8; 32]>,
     /// `a` blocks `b`, at this time unless it already had, and the
-    /// requests and approvals either way end with it.
+    /// requests, approvals and offers either way end with it, and the
+    /// friendship each kept for a `Reset`, leaving its hash.
     pub block: Option<SystemTime>,
     /// End the friendship, where there is one: its id goes with it, off
     /// whatever presentations of the pair are left, since what makes the
@@ -493,6 +620,12 @@ pub struct Ending {
     /// Where the friendship ends, `b` held from requests to `a` until
     /// then.
     pub hold: Option<SystemTime>,
+    /// `b` held from requests to `a` until then, whatever else ends: a
+    /// declined request or upgrade offer (§4.1).
+    pub declined: Option<SystemTime>,
+    /// `b`'s pending state toward `a` ends: its request, or the upgrade
+    /// offer it was taken as, with its offer.
+    pub pending: bool,
 }
 
 /// A withdrawal this server holds (§4.3): what it ends, and the signed
@@ -526,6 +659,9 @@ pub struct StoredOffer {
     pub lapses_at: SystemTime,
 }
 
+/// A pair of fingerprints, owner first.
+pub type FpPair = ([u8; 32], [u8; 32]);
+
 /// The other key of a rotation, and its record as it was published.
 pub type RotationRecord = ([u8; 32], Vec<u8>);
 
@@ -544,6 +680,15 @@ pub trait RelationshipStore: Send + Sync + 'static {
 
     /// Every row `owner` has, oldest first.
     fn relationships(
+        &self,
+        owner: &Mailbox,
+        now: SystemTime,
+    ) -> Result<Vec<Relationship>, StoreError>;
+
+    /// Others' rows whose pending out is an upgrade offer to `owner`,
+    /// which no listing of requests shows it: for telling their owners
+    /// what a change to `owner` takes from them.
+    fn upgrades_to(
         &self,
         owner: &Mailbox,
         now: SystemTime,
@@ -735,6 +880,7 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// drop in the same step the presentations of the pair, found by the
     /// mailboxes' fingerprints, that `drop` made: what a friendship by
     /// request makes over what the two presented that is not held (§6).
+    /// A `Reset` record of the pair keeps its hash and nothing more.
     fn befriend_dropping(
         &self,
         a: &Mailbox,
@@ -752,6 +898,27 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// Record a presentation, replacing the presenter's for that other
     /// party, which is returned.
     fn present(&self, p: &Presentation) -> Result<Option<Presentation>, StoreError>;
+
+    /// Record `rows` as [`RelationshipStore::present`] does and drop the
+    /// offers between `a` and `b` either way, and with `befriend` make the
+    /// two friends as [`RelationshipStore::befriend_dropping`] does under
+    /// the id it holds, as one step: a friendship made here by an
+    /// acceptance (§4.1). The rows replaced, in order, and the id.
+    fn present_befriending(
+        &self,
+        a: &Mailbox,
+        b: &Mailbox,
+        rows: &[Presentation],
+        befriend: Option<Option<RelationId>>,
+        at: SystemTime,
+    ) -> Result<(Vec<Option<Presentation>>, Option<RelationId>), StoreError>;
+
+    /// Clear the friendship of each `Reset` record last presented at or
+    /// before `before`, unless the other party has an upgrade offer
+    /// waiting for the presenter at `now`, or the pending out one shows it,
+    /// which lapses as a request would (§4.3 step 4); the hash stays either
+    /// way. How many were cleared.
+    fn lapse_resets(&self, before: SystemTime, now: SystemTime) -> Result<usize, StoreError>;
 
     /// The presentation `presenter` made naming `other`.
     fn presentation(
@@ -816,7 +983,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
         withdrawal: &[u8],
     ) -> Result<(), StoreError>;
 
-    /// Set or clear `owner`'s offer to `other`.
+    /// Set or clear `owner`'s upgrade offer to `other`, on a friendship
+    /// standing.
     fn set_offer(
         &self,
         owner: &[u8; 32],
@@ -824,7 +992,53 @@ pub trait RelationshipStore: Send + Sync + 'static {
         offer: Option<&StoredOffer>,
     ) -> Result<(), StoreError>;
 
-    /// `owner`'s offer to `other`, as it reads at `now`.
+    /// Record `owner`'s pending state toward `other` as one step: a request
+    /// with the offer it carries, or, with `upgrade` and `pending.upgrade`,
+    /// an upgrade offer and the pending out it shows `owner`. Whatever
+    /// upgrade offer waited from `owner` to `other` goes, or is replaced.
+    /// With `charge`, the request is counted in the ledger in the same
+    /// step, and one `other`'s full requests dropped counted for it.
+    fn ask(
+        &self,
+        owner: &Mailbox,
+        other: &Mailbox,
+        pending: &PendingOut,
+        upgrade: Option<&StoredOffer>,
+        charge: Option<&Charge>,
+        report: &Report,
+    ) -> Result<Vec<Left>, StoreError>;
+
+    /// `parts`, in order, as one step, and what `report` asks of as that
+    /// step left it, read inside it: what each part answered, and the
+    /// pairs. The way an act that reads everything first writes once and
+    /// tells from what it wrote.
+    fn write(&self, parts: &[Part], report: &Report) -> Result<(Vec<Did>, Vec<Left>), StoreError>;
+
+    /// A presentation answered `Reset` (§4.3 step 4), as one step: what
+    /// `drops` names dropped as [`RelationshipStore::drop_presentations`]
+    /// drops each pair's, `record` recorded where there is one, and with
+    /// `upgrade`, `upgrade.0`'s request to `upgrade.1` taken as an upgrade
+    /// offer, its offer moved among those and its pending out kept for
+    /// `upgrade.0` alone. What each drop ended, and the row `record`
+    /// replaced.
+    #[allow(clippy::type_complexity)]
+    fn answer_reset(
+        &self,
+        drops: &[([u8; 32], [u8; 32], Vec<[u8; 32]>)],
+        record: Option<&Presentation>,
+        upgrade: Option<(&Mailbox, &Mailbox)>,
+    ) -> Result<(Vec<Ended>, Option<Presentation>), StoreError>;
+
+    /// Drop each offer `owner` has waiting for `other`, by fingerprint, as
+    /// one step: a request's, the request staying plain, or an upgrade
+    /// offer, with the pending out it showed its owner.
+    fn drop_offers(&self, pairs: &[FpPair]) -> Result<(), StoreError>;
+
+    /// [`RelationshipStore::drop_offers`] for every offer from or to `fp`:
+    /// the pairs, by fingerprint, it dropped one for.
+    fn drop_offers_naming(&self, fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError>;
+
+    /// `owner`'s upgrade offer to `other`, as it reads at `now`.
     fn offer(
         &self,
         owner: &[u8; 32],
@@ -832,8 +1046,13 @@ pub trait RelationshipStore: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<Option<StoredOffer>, StoreError>;
 
-    /// Every offer `owner` holds, by the party it is to, as they read at
-    /// `now`.
+    /// The keys with any offer waiting, as they read at `now`: for a sweep
+    /// that knows the device that signed what it drops but not the
+    /// identity.
+    fn offerers(&self, now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError>;
+
+    /// Every offer `owner` has waiting, its requests' and its upgrade
+    /// offers, by the party it is to, as they read at `now`.
     fn offers_from(
         &self,
         owner: &[u8; 32],
@@ -881,6 +1100,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// offers and the withdrawals it counts toward among it; a successor
     /// already holding one for the same other party keeps its own, and a
     /// pair that had evidence both ways and has it no more ends its edge.
+    /// An offer to `from`, which names it, goes, as
+    /// [`RelationshipStore::drop_offers`] drops one.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the
@@ -897,7 +1118,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
     fn purge_count(&self, of: &Mailbox) -> Result<usize, StoreError>;
 
     /// Reclaim at most `batch` of each kind of row: what lapsed before
-    /// `lapsed_before`, and ledger entries from before `ledger_before`.
+    /// `lapsed_before`, a lapsed request's offer with it, and ledger
+    /// entries from before `ledger_before`.
     /// Changes no answer, since a lapsed part already reads as gone.
     /// Returns how many rows changed, so a caller can go on until none
     /// do.
