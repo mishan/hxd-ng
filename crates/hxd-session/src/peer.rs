@@ -23,6 +23,11 @@ use crate::session::{enqueue, reader_task, writer_task, Backlog, Outbound, Tx, W
 pub const EXPORTER_LABEL: &[u8] = b"EXPERIMENTAL-hotline-link-key-proof";
 pub const EXPORTER_LEN: usize = 32;
 
+/// The link wire's transaction types (`hxd-link`'s `wire::tx`): a
+/// link's frames are read by the session's reader, and labeled by type
+/// in the metrics.
+pub(crate) const TYPES: std::ops::RangeInclusive<u32> = 900..=915;
+
 /// The login fields of a key-mode link (the extension's "The Key Proof").
 pub mod field {
     pub const SERVER_KEY: u16 = 0x0640;
