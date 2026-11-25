@@ -173,9 +173,9 @@ const SWEEP_BACKOFF_MAX: u64 = 3600;
 /// minute apart: a backlog drains at that rate.
 const CLEANUP_BATCH: usize = 1000;
 
-/// How long ago a row must have lapsed for [`Core::owed_tick`] to
-/// reclaim it, so that an act reading at a time it took a moment before
-/// still finds what had not lapsed then.
+/// How long before what it could reclaim [`Core::owed_tick`] stops, a
+/// lapsed row or a ledger entry no limit counts, so that an act reading
+/// at a time it took a moment before still finds what it should.
 const CLEANUP_MARGIN: Duration = Duration::from_secs(3600);
 
 /// Offers owed a drop: a revoked device's, by the operator or by a
@@ -845,9 +845,11 @@ impl Core {
         }
     }
 
-    /// The earliest request ledger entry a limit counts: a day's rates
-    /// and `request_retention`'s allowance read it back, so reclaiming one
-    /// any later would give its sender a send back early. A retry by guid
+    /// The earliest request ledger entry a limit counts, less
+    /// [`CLEANUP_MARGIN`] for an act whose clock read is that old: a day's
+    /// rates and `request_retention`'s allowance read it back, so
+    /// reclaiming one any later would give its sender a send back early.
+    /// A retry by guid
     /// is answered from the ledger only this far back; older, it is a new
     /// request.
     pub(crate) fn ledger_read_from(&self, now: SystemTime) -> SystemTime {
@@ -855,7 +857,8 @@ impl Core {
             .messaging_policy
             .request_retention
             .max(Duration::from_secs(24 * 3600));
-        now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH)
+        now.checked_sub(window + CLEANUP_MARGIN)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
     /// [`Self::judge_floors`] for every identity with epochs kept here, as

@@ -4836,3 +4836,31 @@ fn a_tick_keeps_the_ledger_a_senders_allowance_is_counted_over() {
     s.core.owed_tick();
     assert_eq!(ledger(), 0, "reclaimed once no limit counts it");
 }
+
+#[test]
+fn a_tick_keeps_the_ledger_an_act_that_read_its_clock_a_moment_before_counts() {
+    use crate::MsgOutcome;
+    let p = MessagingPolicy {
+        request_messages: 1,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (_b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+    assert_eq!(send(&s.core, g, "bob", "one"), Ok(MsgOutcome::Requested));
+    s.core
+        .clock
+        .advance(p.request_retention - Duration::from_secs(1));
+    // A request reads its clock here, then waits for the hold while a
+    // tick a moment later takes it first.
+    let read = s.core.clock.wall();
+    let counted = || {
+        let since = read - p.request_retention;
+        let sent = s.rel.request_addresses(&Mailbox::login("bob"), since, None);
+        sent.unwrap().len()
+    };
+    assert_eq!(counted(), 1);
+    s.core.clock.advance(Duration::from_secs(2));
+    s.core.owed_tick();
+    assert_eq!(counted(), 1, "still there for the request to count");
+}
