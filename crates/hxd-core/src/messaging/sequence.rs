@@ -63,7 +63,9 @@ use crate::access::bit;
 use crate::identity_records::{KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, MemoryStore};
 use crate::relationships::failing::{Failing, READS};
-use crate::relationships::{Presentation, RelationId, RelationshipStore, Requester};
+use crate::relationships::{
+    PendingOut, Presentation, RelationId, RelationshipStore, Report, Requester, StoredOffer,
+};
 use crate::roster::{AttachInfo, Event, InboxPolicy, Uid};
 use crate::{
     AccessBits, AccountDirectory, Core, Events, IdentityTag, MessagingPolicy, Published,
@@ -234,17 +236,24 @@ enum Step {
     Decline,
     /// Remove Friend (803) carrying the caller's own offer: cancel it.
     Cancel,
-    /// A registrar's list revokes the device.
-    PublishDevice,
+    /// A registrar's list revokes the device; with `unread`, the lists are
+    /// published again with this party's left unread, covering nothing of
+    /// it.
+    PublishDevice {
+        unread: bool,
+    },
     /// A registrar's list freezes the identity, refused but not revoked.
     Freeze,
     /// A registrar's list revokes the identity.
     RevokeIdentity,
     /// The identity rotates to its successor key, once; with `into`, the
     /// other party has first presented a friendship it made with that
-    /// successor elsewhere, so the rotation lands on a pair it holds.
+    /// successor elsewhere, so the rotation lands on a pair it holds; with
+    /// `crowded`, the successor brings state of its own toward the other
+    /// party, and the other party has upgrades to both keys.
     Rotate {
         into: bool,
+        crowded: bool,
     },
     /// The clock moved on by this much: past a request's or an offer's
     /// lapse, or a `Reset` record's.
@@ -269,7 +278,7 @@ impl Step {
         // Weighted toward the acts on pending state and the endings that
         // make room for it: Ask 4/32, Answer 3/32, Remove, Unblock,
         // Present, Decline, Cancel and Clock 2/32 each (each clock move
-        // 1/48), every other kind 1/32 (each way of rotating 1/64).
+        // 1/48), every other kind 1/32 (each way of rotating 1/128).
         let step = match n % 32 {
             0..=3 => Step::Ask {
                 offer: arg & 1 == 1,
@@ -298,11 +307,16 @@ impl Step {
             20 => Step::Messaging,
             22 => Step::BlockWithdrawal,
             24 | 25 => Step::Cancel,
-            26 => Step::PublishDevice,
+            26 => Step::PublishDevice {
+                unread: arg & 1 == 1,
+            },
             27 => Step::Freeze,
             28 => Step::RevokeIdentity,
             30 => Step::Alias { set: arg & 1 == 1 },
-            _ => Step::Rotate { into: arg & 1 == 1 },
+            _ => Step::Rotate {
+                into: arg & 1 == 1,
+                crowded: arg & 2 == 2,
+            },
         };
         // A quarter of the steps meet a failure somewhere in them.
         let failure = match n >> 27 {
@@ -391,6 +405,15 @@ struct Run {
     carried: Option<(usize, Vec<u8>)>,
     /// The holds this run expects, alice's first.
     holds: [bool; 2],
+    /// The requests told since this was last cleared.
+    requested: usize,
+    /// Whether a rotation has brought state written to the store by hand,
+    /// as a successor's account here would have left it.
+    crowded: bool,
+    /// Whether each party's pending out was an upgrade before the step.
+    upgrading: [bool; 2],
+    /// The keys the last list published covered.
+    covered: HashSet<[u8; 32]>,
 }
 
 /// Where tells are still read after the step that changed what they
@@ -545,6 +568,10 @@ impl Run {
             withdrawn: Vec::new(),
             carried: None,
             holds: [false, false],
+            requested: 0,
+            crowded: false,
+            upgrading: [false, false],
+            covered: HashSet::new(),
         }
     }
 
@@ -744,13 +771,17 @@ impl Run {
         told: &[[Vec<RosterState>; 3]; 2],
     ) {
         for (q, sessions) in told.iter().enumerate() {
-            for (d, told) in sessions[..2].iter().enumerate() {
-                let uid = self.sessions[q][d].0;
+            for (slot, told) in sessions.iter().enumerate() {
+                let uid = self.uid(q, slot);
                 if self.ended.contains(&uid) || self.fresh.contains(&uid) {
                     continue;
                 }
                 let removed = told.iter().filter(|s| **s == RosterState::Removed).count();
-                assert!(removed <= 1, "{what}: {} told twice: {told:?}", LOGINS[q]);
+                assert!(
+                    removed <= 1,
+                    "{what}: {} told twice in session {slot}: {told:?}",
+                    LOGINS[q]
+                );
                 if removed > 0 {
                     assert_eq!(
                         after.friendship, None,
@@ -894,7 +925,11 @@ impl Run {
                 Some(o) => core.friend_cancel_offer(uid, other, &o).is_ok(),
                 None => false,
             },
-            Step::PublishDevice => {
+            Step::PublishDevice { unread: true } => {
+                self.publish_unread(Some(p));
+                true
+            }
+            Step::PublishDevice { unread: false } => {
                 let listed = (me.fp(), me.device(d));
                 let lifted = self.listed.devices.remove(&listed);
                 if !lifted {
@@ -916,7 +951,7 @@ impl Run {
                 self.publish();
                 true
             }
-            Step::Rotate { into } => self.rotate(p, into),
+            Step::Rotate { into, crowded } => self.rotate(p, into, crowded),
             Step::Floor { how } => {
                 let fp = me.fp();
                 if how != 0 {
@@ -948,16 +983,25 @@ impl Run {
     /// Install what the lists hold, the floors among it, and note the
     /// sessions it ended.
     fn publish(&mut self) {
+        self.publish_unread(None);
+    }
+
+    /// [`Self::publish`], every key of both parties covered, but `unread`'s
+    /// where its lists could not be read.
+    fn publish_unread(&mut self, unread: Option<usize>) {
         let mut list = self.listed.clone();
         list.floors = self.floors.clone();
-        list.covered = self
-            .floors
-            .keys()
-            .chain(&list.identities)
-            .chain(&list.unrevoked)
-            .chain(list.devices.iter().map(|(i, _)| i))
-            .copied()
+        let keys: Vec<[u8; 32]> = (0..2)
+            .filter(|q| Some(*q) != unread)
+            .flat_map(|q| {
+                let former = self.former[q].iter().map(|(p, _)| p.fp());
+                former.chain([self.people[q].fp()]).collect::<Vec<_>>()
+            })
             .collect();
+        // An unread party's entries are carried from before, as a sweep
+        // carries what it found; its keys are covered by nothing read now.
+        list.covered = keys.into_iter().collect();
+        self.covered = list.covered.clone();
         let ended = self.core.set_published_revocations(list);
         self.ended.extend(ended.into_iter().map(|(uid, _)| uid));
     }
@@ -965,7 +1009,7 @@ impl Run {
     /// `p` rotates to its successor key, its account linking it and its
     /// sessions made again under it; with `into`, after the other party
     /// presented a friendship it made with the successor elsewhere.
-    fn rotate(&mut self, p: usize, into: bool) -> bool {
+    fn rotate(&mut self, p: usize, into: bool, crowded: bool) -> bool {
         if self.rotated[p] {
             return false;
         }
@@ -988,6 +1032,11 @@ impl Run {
         .sign(&me.id, &next.id)
         .expect("a rotation");
         let (from, to) = (me.fp(), next.fp());
+        if crowded {
+            self.crowd(p, &next);
+            self.crowded = true;
+        }
+        let before = self.upgrades_of(p, &[from, to]);
         self.dir.0.lock().unwrap()[p].0.fingerprint = Some(to);
         self.core.keep_rotation_record(&record);
         // One that fails, its record kept, is made again with nothing
@@ -1000,6 +1049,7 @@ impl Run {
                 .rotate_identity(&from, &to)
                 .expect("a rotation made again");
         }
+        self.settled(p, from, to, &before);
         self.rotated[p] = true;
         let old = std::mem::replace(&mut self.people[p], next);
         let resets = std::mem::take(&mut self.resets[p]);
@@ -1008,6 +1058,208 @@ impl Run {
         self.offers[p] = None;
         self.sign_in_again(p);
         true
+    }
+
+    /// The successor `next` of `p` brought state of its own toward the
+    /// other party, as an account it was linked to here left it: its
+    /// upgrade to the other party on a record the other holds for it,
+    /// the other's upgrade to it on a record it holds, and the other's
+    /// upgrade to the key it retires, where nothing else stands between
+    /// them. Written to the store as that account left it, and read by
+    /// the parties' sessions afresh.
+    fn crowd(&mut self, p: usize, next: &Person) {
+        let (me, them) = (&self.people[p], &self.people[1 - p]);
+        let (now, wall) = (self.core.clock.unix(), self.core.clock.wall());
+        // Beside no friendship and no block, where such state could stand.
+        let (mine, other) = (self.mailbox(p), self.mailbox(1 - p));
+        let standing = |x: &Mailbox, y: &Mailbox| {
+            self.store
+                .relationship(x, y, wall)
+                .unwrap()
+                .is_some_and(|r| r.friendship.is_some() || r.blocked_at.is_some())
+        };
+        if standing(&mine, &other) || standing(&other, &mine) {
+            return;
+        }
+        let record = |by: &Person, of: &Person, bytes: Vec<u8>| Presentation {
+            presenter: by.fp(),
+            other: of.fp(),
+            names: [by.fp(), of.fp()],
+            pair: Pair::new(Fingerprint(by.fp()), Fingerprint(of.fp())).hash(),
+            hash: Sha256::digest(&bytes).into(),
+            friendship: None,
+            reset: Some(bytes),
+            device: by.device(1),
+            edge: None,
+            at: wall,
+            taken: wall,
+        };
+        let friendship = |a: &Person, b: &Person, t: u64| b.accept(1, &a.offer(1, b, t), t);
+        let shown = PendingOut {
+            sent_at: wall,
+            lapses_at: wall + Duration::from_secs(30 * DAY),
+            delivered: true,
+            note: None,
+            offer: None,
+            upgrade: true,
+        };
+        let stored = |offer: Vec<u8>| StoredOffer {
+            offer,
+            lapses_at: wall + Duration::from_secs(DAY),
+        };
+        let (succ, other, mine) = (
+            Mailbox::identified(LOGINS[p], next.fp()),
+            self.mailbox(1 - p),
+            self.mailbox(p),
+        );
+        let store = &self.store;
+        let none = Report::none();
+        // By no device what is installed refuses.
+        let refused = |by: &Person| {
+            let d = by.device(1);
+            self.revoked.contains(&d) || self.listed.devices.contains(&(by.fp(), d))
+        };
+        if refused(them) || refused(next) || refused(me) {
+            return;
+        }
+        store
+            .present(&record(them, next, friendship(next, them, now - 40)))
+            .unwrap();
+        store
+            .present(&record(next, them, friendship(them, next, now - 41)))
+            .unwrap();
+        // None that what is installed would have swept away.
+        let ask = |a: &Mailbox, b: &Mailbox, o: Vec<u8>| {
+            if self.forbidden(&o) {
+                return;
+            }
+            store
+                .ask(a, b, &shown, Some(&stored(o)), None, &none)
+                .unwrap();
+        };
+        // Where the key that retires has something pending for the other
+        // party, the successor has an upgrade of its own to it; otherwise
+        // the other has upgrades to both keys, the one to the key that
+        // retires where that key holds nothing toward it but the record it
+        // is taken on. Never two upgrades crossing, which nothing makes.
+        let pending = |x: &Mailbox, y: &Mailbox| {
+            store
+                .relationship(x, y, wall)
+                .unwrap()
+                .is_some_and(|r| r.pending_out.is_some())
+        };
+        if pending(&mine, &other) {
+            ask(&succ, &other, next.offer(1, them, now));
+        } else {
+            ask(&other, &succ, them.offer(1, next, now));
+            let free = store.relationship(&other, &mine, wall).unwrap().is_none()
+                && store.relationship(&mine, &other, wall).unwrap().is_none()
+                && store.presentation(&me.fp(), &them.fp()).unwrap().is_none();
+            if free {
+                store
+                    .present(&record(me, them, friendship(them, me, now - 42)))
+                    .unwrap();
+                ask(&other, &mine, them.offer(1, me, now));
+            }
+        }
+        self.resync(0);
+        self.resync(1);
+    }
+
+    /// Each upgrade waiting between `p`'s keys `keys` and the other party,
+    /// either way, as `(owner, other, offer)`, with the records each was
+    /// taken on: those its pending out shows, with their offers.
+    #[allow(clippy::type_complexity)]
+    fn upgrades_of(
+        &self,
+        p: usize,
+        keys: &[[u8; 32]],
+    ) -> (
+        Vec<([u8; 32], [u8; 32], Vec<u8>)>,
+        HashMap<([u8; 32], [u8; 32]), Vec<u8>>,
+    ) {
+        let wall = self.core.clock.wall();
+        let b = self.people[1 - p].fp();
+        let mut upgrades = Vec::new();
+        let mut records = HashMap::new();
+        for k in keys {
+            for (x, y) in [(*k, b), (b, *k)] {
+                let (mx, my) = (Mailbox::identified("", x), Mailbox::identified("", y));
+                let shown = self
+                    .store
+                    .relationship(&mx, &my, wall)
+                    .unwrap()
+                    .and_then(|r| r.pending_out)
+                    .is_some_and(|p| p.upgrade);
+                if let Some(o) = self.store.offer(&x, &y, wall).unwrap().filter(|_| shown) {
+                    upgrades.push((x, y, o.offer));
+                }
+                if let Some(reset) = self
+                    .store
+                    .presentation(&y, &x)
+                    .unwrap()
+                    .and_then(|p| p.reset)
+                {
+                    records.insert((y, x), reset);
+                }
+            }
+        }
+        upgrades.sort();
+        (upgrades, records)
+    }
+
+    /// What a rotation of `p` from `from` to `to` left of the upgrades
+    /// between its keys and the other party, held to what should stand:
+    /// the successor's own toward the other where it had one, else the
+    /// retired key's, moved, while the record it was taken on is the one
+    /// that survives; the other's to the successor, as it was; and none to
+    /// or from the retired key.
+    #[allow(clippy::type_complexity)]
+    fn settled(
+        &self,
+        p: usize,
+        from: [u8; 32],
+        to: [u8; 32],
+        before: &(
+            Vec<([u8; 32], [u8; 32], Vec<u8>)>,
+            HashMap<([u8; 32], [u8; 32]), Vec<u8>>,
+        ),
+    ) {
+        let (pre, records) = before;
+        let b = self.people[1 - p].fp();
+        let had = |x: [u8; 32], y: [u8; 32]| {
+            pre.iter()
+                .find(|(o, t, _)| (*o, *t) == (x, y))
+                .map(|(_, _, offer)| offer.clone())
+        };
+        let (after, kept) = self.upgrades_of(p, &[from, to]);
+        let mut expected = Vec::new();
+        // None stands as a pending out beside the friendship the merge
+        // left.
+        let wall = self.core.clock.wall();
+        let (mine, theirs) = (Mailbox::identified("", to), Mailbox::identified("", b));
+        let friends = self
+            .store
+            .relationship(&mine, &theirs, wall)
+            .unwrap()
+            .is_some_and(|r| r.friendship.is_some());
+        let outgoing = had(to, b).filter(|_| !friends).or_else(|| {
+            let moved = had(from, b).filter(|_| !friends)?;
+            let qualified = records.get(&(b, from))?;
+            (kept.get(&(b, to)) == Some(qualified)).then_some(moved)
+        });
+        if let Some(o) = outgoing {
+            expected.push((to, b, o));
+        }
+        if let Some(o) = had(b, to).filter(|_| !friends) {
+            expected.push((b, to, o));
+        }
+        expected.sort();
+        assert_eq!(
+            after, expected,
+            "{}'s rotation settled the upgrades to and from its keys",
+            LOGINS[p]
+        );
     }
 
     /// `p`'s sessions ended and made again, each reading its roster.
@@ -1124,6 +1376,7 @@ impl Run {
                             *view = View::of(&e);
                         }
                         Event::FriendRequest { login, offer, .. } if login == LOGINS[1 - p] => {
+                            self.requested += 1;
                             if slot == 2 {
                                 assert!(offer.is_none(), "{} told an offer", LOGINS[p]);
                             }
@@ -1183,9 +1436,20 @@ impl Run {
             .relationship(&them, &me, wall)
             .unwrap()
             .and_then(|r| r.pending_out)
-            .filter(|p| p.delivered);
+            .filter(|p| p.delivered && !p.upgrade);
         let free = before.friendship.is_none() && !mine;
         let predecessor = self.names_a_predecessor();
+        let owed = self.core.owed_sweeps();
+        // Whether each party's pending out is an upgrade, which a block
+        // that takes it tells.
+        let upgrading = [0, 1].map(|q| {
+            let (x, y) = (self.mailbox(q), self.mailbox(1 - q));
+            self.store
+                .relationship(&x, &y, wall)
+                .unwrap()
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.upgrade)
+        });
         self.told_by_reading();
         let ok = self.act(step, p, d);
         let by_reading = self.told_by_reading();
@@ -1273,7 +1537,7 @@ impl Run {
             Step::Link
                 | Step::Revoke
                 | Step::Floor { .. }
-                | Step::PublishDevice
+                | Step::PublishDevice { .. }
                 | Step::RevokeIdentity
                 | Step::Rotate { .. }
         ) && before.evidence == [true, true]);
@@ -1418,6 +1682,7 @@ impl Run {
         }
         self.withdrawn = withdrawn;
         self.quiescent(&what);
+        self.ended_owed(&what, &owed);
         self.legal(&what);
         // A blocker's own client knows what its block ended, and a request
         // lapses without a notice (instant-messaging 3): neither is told.
@@ -1425,8 +1690,80 @@ impl Run {
         // An act on the list reads what it tells after its writes, so a
         // read that fails there costs a tell; losing the messaging bit is
         // read live.
-        let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging);
+        // What a merge of a successor's own state tells is a rotation's,
+        // still read after its step, and the state was not one an act made.
+        let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || self.crowded;
+        self.upgrading = upgrading;
         self.shown(&what, !(read_failed && unmigrated) && !lapsing, blocking);
+    }
+
+    /// Each sweep owed before a step and gone after it ended on positive
+    /// evidence: its work done, or what owed it lifted by a list that
+    /// covers it.
+    fn ended_owed(&self, what: &str, before: &[crate::messaging::Sweep]) {
+        use crate::messaging::Sweep;
+        let now = self.core.owed_sweeps();
+        let offers: Vec<(DeviceCert, [u8; 32])> = self
+            .stored_offers()
+            .iter()
+            .map(|o| {
+                let o = Offer::check(o, u64::MAX, &[], |_| 0).expect("an offer kept");
+                (DeviceCert::parse(&o.cert).expect("a certificate"), o.to.0)
+            })
+            .collect();
+        let names = |fp: &[u8; 32]| {
+            offers
+                .iter()
+                .any(|(c, to)| Fingerprint::of(&c.identity).0 == *fp || to == fp)
+        };
+        for sweep in before.iter().filter(|s| !now.contains(s)) {
+            let done = match *sweep {
+                Sweep::Device {
+                    identity, device, ..
+                } => !offers.iter().any(|(c, _)| {
+                    identity.is_none_or(|i| Fingerprint::of(&c.identity).0 == i)
+                        && Fingerprint::of(&c.device).0 == device
+                }),
+                Sweep::Identity { identity, .. } => !names(&identity),
+                Sweep::Unlinked(fp) => !names(&fp),
+                Sweep::Presented { device, .. } => {
+                    !self.presentations().iter().any(|p| p.device == device)
+                }
+                Sweep::Judge(..) => true,
+            };
+            let lifted = match *sweep {
+                Sweep::Device {
+                    device,
+                    operator: true,
+                    ..
+                }
+                | Sweep::Presented {
+                    identity: None,
+                    device,
+                } => !self.revoked.contains(&device),
+                Sweep::Device {
+                    identity: Some(identity),
+                    device,
+                    ..
+                }
+                | Sweep::Presented {
+                    identity: Some(identity),
+                    device,
+                } => {
+                    self.covered.contains(&identity)
+                        && !self.listed.devices.contains(&(identity, device))
+                }
+                Sweep::Device { identity: None, .. } => false,
+                Sweep::Identity { identity, .. } => {
+                    self.covered.contains(&identity) && !self.listed.identities.contains(&identity)
+                }
+                Sweep::Unlinked(_) | Sweep::Judge(..) => true,
+            };
+            assert!(
+                done || lifted,
+                "{what}: {sweep:?} ended undone and not lifted"
+            );
+        }
     }
 
     /// Every offer the store holds between the pair, on a request or as
@@ -1489,15 +1826,31 @@ impl Run {
             self.core.reconcile_due(listed.iter().copied());
         }
         for o in self.stored_offers() {
+            let detail = Offer::check(&o, u64::MAX, &[], |_| 0).map(|o| {
+                let c = DeviceCert::parse(&o.cert).expect("a certificate");
+                (Fingerprint::of(&c.identity).0[0], o.to.0[0], c.epoch)
+            });
             assert!(
                 !self.forbidden(&o),
-                "converged on an offer that is forbidden"
+                "converged on an offer that is forbidden: {detail:?}, {:?}",
+                [self.people[0].fp()[0], self.people[1].fp()[0]]
             );
         }
         for p in self.presentations() {
             let revoked = self.revoked.contains(&p.device)
                 || self.listed.devices.contains(&(p.presenter, p.device));
-            assert!(!revoked, "converged on a revoked device's presentation");
+            assert!(
+                !revoked,
+                "converged on a revoked device's presentation: {:?} by {:?}, owing {:?}",
+                (
+                    p.presenter[0],
+                    p.other[0],
+                    p.friendship.is_some(),
+                    p.reset.is_some()
+                ),
+                (p.device[0], self.revoked.contains(&p.device)),
+                self.core.owed_sweeps()
+            );
         }
     }
 
@@ -1576,6 +1929,7 @@ impl Run {
                 // A block drops the blocked party's request unsaid, as a
                 // missing account's would be.
                 let unsaid = blocking == Some(1 - q)
+                    && !self.upgrading[q]
                     && self.views[q][slot].state == Some(RosterState::PendingOut)
                     && derived.state.is_none();
                 // What is shown of a party that takes no part is read live,
@@ -1774,7 +2128,9 @@ fn try_attach(
 /// replaced by the presentation that makes the friendship active again,
 /// an upgrade beside a friendship canceled, an unlink, the offer a
 /// device the operator revoked signed, one to an identity whose
-/// revocation's sweep was owed, and one asked of a revoked identity.
+/// revocation's sweep was owed, one asked of a revoked identity, and a
+/// rotation whose successor's own upgrade wins the merge, and an unlink's
+/// sweep owed for an account that lost messaging and was linked again.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -1803,9 +2159,13 @@ pub const FOUND: &[&[u32]] = &[
     &[2728864225, 3673178098, 783180557, 773610635],
     &[877930787, 259041713, 422970530, 2957443115],
     &[
-        1162221802, 137516829, 362072657, 498996160, 115384252, 3433446927,
+        1162221802, 137516573, 362072657, 498996160, 115384252, 3433446927,
     ],
     &[199610076, 2956155360],
+    &[35977725],
+    &[
+        299946571, 4253775924, 118200754, 1634629088, 36862, 2276450037,
+    ],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the
@@ -1823,6 +2183,11 @@ pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
         let p = run.actor(n);
         run.step(n, p);
         twin.step(n, p);
+        // The state a crowded rotation wrote by hand ends the run: what
+        // follows would judge acts on state no act made.
+        if run.crowded {
+            break;
+        }
         // What the other party holds never shows to an asker: where it saw
         // the same before, it is answered and told the same.
         if let (Some(a), Some(b)) = (&run.seen, &twin.seen) {
@@ -1863,6 +2228,7 @@ pub fn run_failing_each_call(
                 let p = run.actor(n);
                 let (step, _, d, _) = Step::of(n);
                 run.told();
+                run.requested = 0;
                 run.told_by_reading();
                 let held = |run: &Run| format!("{}\n{}", dump(), run.core.friend_state());
                 let before = held(&run);
@@ -1886,8 +2252,9 @@ pub fn run_failing_each_call(
                     assert_eq!(held(&run), before, "{what}: an error left a change");
                     let told = run.told();
                     assert!(
-                        told.iter().flatten().all(Vec::is_empty),
-                        "{what}: an error told {told:?}"
+                        told.iter().flatten().all(Vec::is_empty) && run.requested == 0,
+                        "{what}: an error told {told:?}, and {} requests",
+                        run.requested
                     );
                     continue;
                 }
@@ -1896,7 +2263,7 @@ pub fn run_failing_each_call(
                 // a tell still read after its step could cost one.
                 run.legal(&what);
                 let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
-                let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging);
+                let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || run.crowded;
                 run.shown(&what, by_reading.is_empty() && !lapsing, blocking);
             }
         }

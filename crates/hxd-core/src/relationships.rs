@@ -685,6 +685,15 @@ pub trait RelationshipStore: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<Vec<Relationship>, StoreError>;
 
+    /// Others' rows whose pending out is an upgrade offer to `owner`,
+    /// which no listing of requests shows it: for telling their owners
+    /// what a change to `owner` takes from them.
+    fn upgrades_to(
+        &self,
+        owner: &Mailbox,
+        now: SystemTime,
+    ) -> Result<Vec<Relationship>, StoreError>;
+
     /// The friend requests waiting for `owner`: others' rows whose
     /// pending out names it and was delivered, oldest request first. The
     /// extension's `PendingIn`.
@@ -1036,6 +1045,11 @@ pub trait RelationshipStore: Send + Sync + 'static {
         other: &[u8; 32],
         now: SystemTime,
     ) -> Result<Option<StoredOffer>, StoreError>;
+
+    /// The keys with any offer waiting, as they read at `now`: for a sweep
+    /// that knows the device that signed what it drops but not the
+    /// identity.
+    fn offerers(&self, now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError>;
 
     /// Every offer `owner` has waiting, its requests' and its upgrade
     /// offers, by the party it is to, as they read at `now`.

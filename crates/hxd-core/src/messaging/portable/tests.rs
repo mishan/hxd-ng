@@ -3309,6 +3309,40 @@ fn an_owner_past_its_cap_is_judged_whole_again_only_once_a_floor_rises() {
 }
 
 #[test]
+fn a_scan_past_the_cap_is_recorded_only_once_its_write_commits() {
+    let mut alice = person(1);
+    let others: Vec<Person> = (3..8).map(person).collect();
+    let cap = MessagingPolicy {
+        max_roster: 2,
+        ..policy()
+    };
+    let s = linked_with(cap, &[("alice", &fp(&alice))]);
+    let renewed = enroll(&mut alice, 1);
+    let (a, _) = device(&s.core, "alice", &alice, renewed);
+    let present = |other: &Person| {
+        let w = withdraw(&alice, renewed, other, now());
+        s.core.friendships_present(a, vec![w], vec![])
+    };
+    for other in &others[..2] {
+        assert!(ok_all(&present(other).unwrap().0));
+    }
+    let judged = || {
+        s.core
+            .withdrawals_judged
+            .lock()
+            .unwrap()
+            .contains_key(&fp(&alice))
+    };
+    assert!(!judged(), "under the cap, no scan");
+    s.fail.fail_next("write");
+    assert!(present(&others[2]).is_err());
+    assert_eq!(s.fail.failed(), Some("write"));
+    assert!(!judged(), "a scan whose write failed is not recorded");
+    assert!(ok_all(&present(&others[2]).unwrap().0));
+    assert!(judged(), "and is once its write commits");
+}
+
+#[test]
 fn a_withdrawal_below_a_floor_installed_alone_is_kept_past_the_cap() {
     // That floor can fall, and a withdrawal dropped cannot come back.
     let (mut alice, carol, dave, erin) = (person(1), person(3), person(4), person(5));
@@ -4455,6 +4489,103 @@ fn an_owed_sweep_whose_revocation_lifted_drops_nothing() {
     assert!(e.offer.is_some(), "an offer signed after the lift kept");
 }
 
+/// Alice's upgrade waiting for Bob, on the record Bob holds: what each
+/// test below takes from Bob's side.
+fn upgrade_waiting() -> (Person, Person, Server, Events) {
+    let (mut alice, bob) = (person(1), person(2));
+    let (s, f, renewed, [(a, mut ra), (b, _), _]) = reset_elsewhere(&mut alice, &bob, policy());
+    let (_, refused) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert_eq!(refused[0].outcome, Presented::Reset);
+    let o = offer(&alice, renewed, &bob, now() - 2);
+    assert_eq!(
+        s.core.friend_ask(a, "bob", None, Some(o)),
+        Ok(RosterState::PendingOut)
+    );
+    drain(&mut ra);
+    (alice, bob, s, ra)
+}
+
+#[test]
+fn every_party_an_upgrade_waits_from_is_told_when_it_goes() {
+    let removed = |ra: &mut Events| {
+        told(ra)
+            .iter()
+            .any(|(login, state, ..)| login == "bob" && *state == RosterState::Removed)
+    };
+    // Bob's identity revoked.
+    let (_, bob, s, mut ra) = upgrade_waiting();
+    drop(s.core.set_published_revocations(Published {
+        identities: [fp(&bob)].into(),
+        covered: [fp(&bob)].into(),
+        ..Default::default()
+    }));
+    assert!(removed(&mut ra), "a revocation");
+    // Bob blocking Alice, which says nothing of the block.
+    let (_, _, s, mut ra) = upgrade_waiting();
+    let (b, _) = device(&s.core, "bob", &person(2), 0);
+    s.core.inbox_block(b, "alice", true).unwrap();
+    assert!(removed(&mut ra), "a block");
+    // Bob's account purged.
+    let (_, bob, s, mut ra) = upgrade_waiting();
+    s.core
+        .purge_relationships(&Mailbox::identified("bob", fp(&bob)));
+    assert!(removed(&mut ra), "a purge");
+}
+
+#[test]
+fn an_owed_sweep_ends_only_on_a_list_that_covers_its_identity() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let offered = || {
+        let roster = s.core.friends_roster(b).unwrap();
+        roster
+            .iter()
+            .find(|e| e.login == "alice")
+            .unwrap()
+            .offer
+            .is_some()
+    };
+    s.fail.fail_next("write");
+    drop(s.core.set_published_revocations(Published {
+        identities: [fp(&alice)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert!(offered(), "owed");
+    // Lists that could not read Alice's say nothing of her.
+    drop(s.core.set_published_revocations(Published {
+        covered: [fp(&bob)].into(),
+        ..Default::default()
+    }));
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.reconcile_due(Vec::new());
+    assert!(!offered(), "still owed, and dropped");
+}
+
+#[test]
+fn an_operator_revoked_devices_offers_go_with_no_session_or_presentation_to_name_it() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    s.core.end_session(a);
+    drop(s.core.set_revocations(Revocations {
+        devices: [Fingerprint::of(&alice.devices[0].0.public()).0].into(),
+        ..Default::default()
+    }));
+    let roster = s.core.friends_roster(b).unwrap();
+    let e = roster.iter().find(|e| e.login == "alice").unwrap();
+    assert_eq!(e.offer, None, "found by what signed it");
+}
+
 #[test]
 fn a_signed_acceptance_of_an_upgrade_whose_offer_lapsed_is_stale() {
     let (mut alice, bob) = (person(1), person(2));
@@ -4465,6 +4596,19 @@ fn a_signed_acceptance_of_an_upgrade_whose_offer_lapsed_is_stale() {
     assert_eq!(
         s.core.friend_ask(a, "bob", None, Some(o.clone())),
         Ok(RosterState::PendingOut)
+    );
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let wall = s.core.clock().wall();
+    let shown = s.rel.relationship(&ma, &mb, wall).unwrap();
+    assert!(
+        shown.and_then(|r| r.pending_out).is_some_and(|p| p.upgrade),
+        "taken as an upgrade"
+    );
+    let kept = s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap();
+    assert_eq!(
+        kept.map(|k| k.offer),
+        Some(o.clone()),
+        "its offer kept apart"
     );
     s.core
         .clock()

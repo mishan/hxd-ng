@@ -820,7 +820,7 @@ impl Core {
 
     /// `of`'s roster row about `other`, sent to `of`'s messenger
     /// sessions: what it is now, or that it is gone.
-    fn tell_entry(&self, site: &'static str, of: &Mailbox, other: &Mailbox) {
+    pub(crate) fn tell_entry(&self, site: &'static str, of: &Mailbox, other: &Mailbox) {
         self.tell_entry_with(site, of, other, None);
     }
 
@@ -1183,6 +1183,26 @@ impl Core {
         // cleanup takes, so what it admits is recorded before that cleanup
         // runs, and dropped by it, or refused after.
         let _writing = self.friend_writes();
+        let mut tidy = Vec::new();
+        let asked = self.friend_ask_tidying(uid, login, note, offer, &mut tidy);
+        if asked.is_ok() {
+            if let Ok(store) = self.friends_store() {
+                self.tidy(store, tidy);
+            }
+        }
+        asked
+    }
+
+    /// [`Self::friend_ask`], what judging an offer's withdrawals tidied
+    /// left in `tidy` for once it is done.
+    fn friend_ask_tidying(
+        &self,
+        uid: Uid,
+        login: &str,
+        note: Option<String>,
+        offer: Option<Vec<u8>>,
+        tidy: &mut Vec<Part>,
+    ) -> Result<RosterState, MessagingError> {
         let (me, device) = match offer {
             Some(_) => self.device_act(uid).map(|(me, d)| (me, Some(d)))?,
             None => (self.messenger(uid)?, None),
@@ -1201,7 +1221,7 @@ impl Core {
         }
         let offer = match (offer, device.as_ref()) {
             (Some(bytes), Some(device)) => {
-                Some(self.check_offer(store, &me.mailbox, device, &them, bytes)?)
+                Some(self.check_offer(store, &me.mailbox, device, &them, bytes, tidy)?)
             }
             _ => None,
         };
@@ -1766,6 +1786,14 @@ impl Core {
                 .flatten()
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
+            // An upgrade the blocked had waiting goes with the block, and
+            // is told as a decline is, which says nothing of the block.
+            let upgraded = store
+                .relationship(blocked, blocker, self.clock.wall())
+                .ok()
+                .flatten()
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.upgrade);
             let mut end = self.end_here(store, blocker, blocked, &[])?;
             // Its requests and approvals end with it, an approval silently:
             // one is never in 800 or 801 (§4.6).
@@ -1776,7 +1804,7 @@ impl Core {
                 let [a, b] = &e.parties;
                 self.roster.lock().unwrap().friends_changed(a, b, false);
             }
-            if unfriended.is_some() || shown {
+            if unfriended.is_some() || shown || upgraded {
                 self.tell_entry("a block", blocked, blocker);
             }
             self.block_deletes_requests(blocker, blocked);
@@ -1915,6 +1943,7 @@ impl Core {
                 .pending_in(of, now)
                 .unwrap_or_default()
                 .into_iter()
+                .chain(store.upgrades_to(of, now).unwrap_or_default())
                 .map(|r| r.owner),
         );
         if let Err(e) = store.purge(of) {

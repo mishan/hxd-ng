@@ -18,6 +18,7 @@ pub(crate) const READS: &[&str] = &[
     "relationship",
     "relationships",
     "pending_in",
+    "upgrades_to",
     "roster_size",
     "is_blocked",
     "blocked",
@@ -37,6 +38,7 @@ pub(crate) const READS: &[&str] = &[
     "withdrawals_by",
     "offer",
     "offers_from",
+    "offerers",
     "rotation_from",
     "rotation_to",
     "account",
@@ -246,6 +248,7 @@ through! {
     fn relationship(owner: &Mailbox, other: &Mailbox, now: SystemTime) -> Result<Option<Relationship>, StoreError>;
     fn relationships(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn pending_in(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
+    fn upgrades_to(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn roster_size(owner: &Mailbox, now: SystemTime) -> Result<usize, StoreError>;
     fn set_alias(owner: &Mailbox, other: &Mailbox, alias: Option<&str>) -> Result<(), StoreError>;
     fn set_blocked(owner: &Mailbox, other: &Mailbox, blocked: bool, at: SystemTime) -> Result<(), StoreError>;
@@ -292,6 +295,7 @@ through! {
     fn drop_offers_naming(fp: &[u8; 32]) -> Result<Vec<FpPair>, StoreError>;
     fn offer(owner: &[u8; 32], other: &[u8; 32], now: SystemTime) -> Result<Option<StoredOffer>, StoreError>;
     fn offers_from(owner: &[u8; 32], now: SystemTime) -> Result<Vec<([u8; 32], StoredOffer)>, StoreError>;
+    fn offerers(now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError>;
     fn keep_rotation(from: &[u8; 32], to: &[u8; 32], record: &[u8]) -> Result<(), StoreError>;
     fn rotation_from(from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
     fn rotation_to(to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;

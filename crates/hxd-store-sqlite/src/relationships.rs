@@ -1130,16 +1130,23 @@ fn left(conn: &Connection, report: &Report) -> Result<Vec<Left>, StoreError> {
     Ok(out)
 }
 
-/// Each upgrade's pending out from or to `fp`, as `(owner, other)`, with
-/// the bytes of the record it was taken on.
-fn qualified(tx: &Connection, fp: &str) -> Result<Vec<(String, String, Vec<u8>)>, StoreError> {
+/// Each upgrade `from` has waiting, as the other party, with the bytes of
+/// the record it was taken on, where `to` has nothing pending for that
+/// party.
+fn moving_upgrades(
+    tx: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
     let mut stmt = sql(tx.prepare(
-        "SELECT r.owner_fp, r.other_fp, p.reset FROM relationship r
+        "SELECT r.other_fp, p.reset FROM relationship r
            JOIN friend_presentation p ON p.presenter = r.other_fp AND p.other = r.owner_fp
-          WHERE r.pending_upgrade AND p.reset IS NOT NULL
-            AND (r.owner_fp = ?1 OR r.other_fp = ?1)",
+          WHERE r.pending_upgrade AND p.reset IS NOT NULL AND r.owner_fp = ?1
+            AND NOT EXISTS (SELECT 1 FROM relationship s
+                             WHERE s.owner_fp = ?2 AND s.other_fp = r.other_fp
+                               AND s.pending_at IS NOT NULL)",
     ))?;
-    let found = sql(stmt.query_map(params![fp], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
+    let found = sql(stmt.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?))))?;
     sql(found.collect())
 }
 
@@ -1183,6 +1190,15 @@ fn settle_upgrades(tx: &Connection, fp: &str) -> Result<(), StoreError> {
               WHERE (r.owner_fp = ?1 OR r.other_fp = ?1) AND r.pending_upgrade
                 AND NOT {recorded}"
         ),
+        params![fp],
+    ))?;
+    // Nor any pending out beside the friendship a merge left.
+    sql(tx.execute(
+        "UPDATE relationship SET pending_at = NULL, pending_lapses = NULL,
+                pending_delivered = NULL, pending_note = NULL, pending_upgrade = 0,
+                pending_offer = NULL, pending_offer_lapses = NULL
+          WHERE (owner_fp = ?1 OR other_fp = ?1) AND friendship IS NOT NULL
+            AND pending_at IS NOT NULL",
         params![fp],
     ))?;
     sql(tx.execute(
@@ -1369,15 +1385,17 @@ impl SqliteStore {
         portable: bool,
     ) -> Result<Rekeyed, StoreError> {
         self.with_tx(|tx| {
-            // Each upgrade naming the key that moves, with the record it
-            // was taken on: one whose record the move displaces goes.
-            let qualified = match portable {
-                true => qualified(tx, from)?,
-                false => Vec::new(),
-            };
+            // What waits for the key that retires goes first; then each
+            // upgrade the key that moves has waiting, with the record it
+            // was taken on, where the successor has nothing pending for
+            // the same party to keep in its place.
             if portable {
                 drop_offers_where(tx, "other = ?1", "other_fp = ?1", &[&from])?;
             }
+            let moving = match portable {
+                true => moving_upgrades(tx, from, to)?,
+                false => Vec::new(),
+            };
             let after = |r: &str, col: &str| {
                 format!(
                     "CASE WHEN {} THEN ?1 ELSE IFNULL({r}.{col}_fp, {r}.{col}) END",
@@ -1449,9 +1467,8 @@ impl SqliteStore {
             if portable {
                 rotate_portable(tx, from, to, &mut rekeyed)?;
                 settle_upgrades(tx, to)?;
-                for (owner, other, record) in qualified {
-                    let at = |fp: String| if fp == from { to.to_string() } else { fp };
-                    let (owner, other) = (at(owner), at(other));
+                for (other, record) in moving {
+                    let owner = to.to_string();
                     let kept: Option<Vec<u8>> = sql(tx
                         .query_row(
                             "SELECT reset FROM friend_presentation
@@ -1493,6 +1510,23 @@ impl RelationshipStore for SqliteStore {
             mailbox_sql(owner, "owner", 1)
         );
         Ok(rows(&conn, &text, &[&bind(owner)])?
+            .into_iter()
+            .filter_map(|(_, r)| r.as_of(now))
+            .collect())
+    }
+
+    fn upgrades_to(
+        &self,
+        owner: &Mailbox,
+        now: SystemTime,
+    ) -> Result<Vec<Relationship>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let text = format!(
+            "SELECT {COLUMNS} FROM relationship
+              WHERE {} AND pending_upgrade AND pending_lapses > ?2 ORDER BY id",
+            mailbox_sql(owner, "other", 1)
+        );
+        Ok(rows(&conn, &text, &[&bind(owner), &unix(now)])?
             .into_iter()
             .filter_map(|(_, r)| r.as_of(now))
             .collect())
@@ -2136,6 +2170,22 @@ impl RelationshipStore for SqliteStore {
                 },
             )
             .optional())
+    }
+
+    fn offerers(&self, now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sql(conn.prepare_cached(
+            "SELECT owner FROM friend_offer WHERE lapses > ?1
+             UNION
+             SELECT owner_fp FROM relationship
+              WHERE owner_fp IS NOT NULL AND pending_offer IS NOT NULL
+                AND pending_offer_lapses > ?1 AND pending_lapses > ?1
+             ORDER BY 1",
+        ))?;
+        let found = sql(stmt.query_map(params![unix(now)], |r| r.get::<_, String>(0)))?;
+        found
+            .map(|r| fp_from_hex(&r.map_err(StoreError::new)?))
+            .collect()
     }
 
     fn offers_from(

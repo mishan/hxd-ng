@@ -883,7 +883,8 @@ impl Inner {
                         .iter()
                         .any(|p| p.presenter == y && p.other == x && p.reset.is_some())
                 });
-            if shown && !recorded {
+            // Nor any pending out beside the friendship a merge left.
+            if shown && !recorded || r.rel.friendship.is_some() {
                 r.rel.pending_out = None;
             }
         }
@@ -1117,6 +1118,21 @@ impl RelationshipStore for MemoryRelationships {
             .iter()
             .filter(|r| is(&r.rel.owner, owner))
             .filter_map(|r| r.rel.clone().as_of(floor(now)))
+            .collect())
+    }
+
+    fn upgrades_to(
+        &self,
+        owner: &Mailbox,
+        now: SystemTime,
+    ) -> Result<Vec<Relationship>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .rows
+            .iter()
+            .filter(|r| is(&r.rel.other, owner))
+            .filter_map(|r| r.rel.clone().as_of(floor(now)))
+            .filter(|r| r.pending_out.as_ref().is_some_and(|p| p.upgrade))
             .collect())
     }
 
@@ -1538,6 +1554,25 @@ impl RelationshipStore for MemoryRelationships {
             .map(|(_, _, o)| o.clone()))
     }
 
+    fn offerers(&self, now: SystemTime) -> Result<Vec<[u8; 32]>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let asked = inner.rows.iter().filter_map(|r| {
+            let rel = r.rel.clone().as_of(floor(now))?;
+            rel.pending_out?.offer?;
+            rel.owner.fingerprint
+        });
+        let mut out: Vec<[u8; 32]> = inner
+            .offers
+            .iter()
+            .filter(|(_, _, o)| o.lapses_at > floor(now))
+            .map(|(a, _, _)| *a)
+            .chain(asked)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
     fn offers_from(
         &self,
         owner: &[u8; 32],
@@ -1824,40 +1859,58 @@ impl RelationshipStore for MemoryRelationships {
 
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        for (x, y) in inner.offers_naming(from) {
-            if y == *from {
-                inner.drop_offer(&x, &y);
-            }
+        // What waits for the key that retires goes, an upgrade's pending
+        // out with its offer.
+        let incoming: Vec<[u8; 32]> = inner
+            .offers_naming(from)
+            .into_iter()
+            .filter(|(_, y)| y == from)
+            .map(|(x, _)| x)
+            .chain(inner.rows.iter().filter_map(|r| {
+                r.rel.pending_out.as_ref().filter(|p| p.upgrade)?;
+                (r.rel.other.fingerprint.as_ref() == Some(from)).then_some(r.rel.owner.fingerprint?)
+            }))
+            .collect();
+        for x in incoming {
+            inner.drop_upgrade(&x, from);
+            inner.drop_offer(&x, from);
         }
-        // Each upgrade naming the key that moves, with the record it was
-        // taken on: one whose record the move displaces goes.
-        let qualified: Vec<([u8; 32], [u8; 32], Vec<u8>)> = inner
+        // Each upgrade the key that moves has waiting, with the record it
+        // was taken on, where the successor has nothing pending for the
+        // same party to keep in its place: once moved, it stands only on
+        // that record.
+        let moving: Vec<([u8; 32], Vec<u8>)> = inner
             .rows
             .iter()
             .filter(|r| r.rel.pending_out.as_ref().is_some_and(|p| p.upgrade))
-            .filter_map(|r| r.rel.owner.fingerprint.zip(r.rel.other.fingerprint))
-            .filter(|(o, t)| o == from || t == from)
-            .filter_map(|(o, t)| {
+            .filter(|r| r.rel.owner.fingerprint.as_ref() == Some(from))
+            .filter_map(|r| r.rel.other.fingerprint)
+            .filter(|t| {
+                let theirs = Mailbox::identified("", *t);
+                let succ = Mailbox::identified("", *to);
+                inner
+                    .find(&succ, &theirs)
+                    .is_none_or(|i| inner.rows[i].rel.pending_out.is_none())
+            })
+            .filter_map(|t| {
                 let p = inner
                     .presentations
                     .iter()
-                    .find(|p| p.presenter == t && p.other == o)?;
-                Some((o, t, p.reset.clone()?))
+                    .find(|p| p.presenter == t && p.other == *from)?;
+                Some((t, p.reset.clone()?))
             })
             .collect();
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
         inner.settle_upgrades(to);
-        for (owner, other, record) in qualified {
-            let at = |fp: [u8; 32]| if fp == *from { *to } else { fp };
-            let (owner, other) = (at(owner), at(other));
+        for (other, record) in moving {
             let kept = inner
                 .presentations
                 .iter()
-                .find(|p| p.presenter == other && p.other == owner)
+                .find(|p| p.presenter == other && p.other == *to)
                 .and_then(|p| p.reset.clone());
             if kept.as_ref() != Some(&record) {
-                inner.drop_upgrade(&owner, &other);
+                inner.drop_upgrade(to, &other);
             }
         }
         Ok(rekeyed)

@@ -4741,7 +4741,9 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        tables.retain(|t| !t.starts_with("sqlite_"));
+        // What the schema keeps of its own, the ids it handed out among
+        // it, is part of what a rollback must put back.
+        tables.retain(|t| !t.starts_with("sqlite_") || t == "sqlite_sequence");
         let mut out = String::new();
         for t in tables {
             let mut stmt = conn.prepare(&format!("SELECT * FROM {t}")).unwrap();

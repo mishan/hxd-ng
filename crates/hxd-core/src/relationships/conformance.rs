@@ -63,6 +63,7 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_record_is_kept_while_its_upgrade_is_pending(&*new_store());
     a_merged_pending_out_goes_with_its_record(&*new_store());
     an_upgrade_goes_where_a_rotation_keeps_another_record(&*new_store());
+    a_rotation_keeps_the_upgrades_the_successor_and_the_other_party_hold(&*new_store());
     an_ask_counts_its_request_in_the_same_step(&*new_store());
     #[cfg(any(test, feature = "test-support"))]
     a_write_is_whole_or_not_at_all_and_reports_what_it_left(&*new_store());
@@ -2405,6 +2406,60 @@ fn a_record_is_kept_while_its_upgrade_is_pending(s: &dyn RelationshipStore) {
         s.lapse_resets(at(20), at(1000)).unwrap(),
         1,
         "{case}: until the pending out lapses"
+    );
+}
+
+fn a_rotation_keeps_the_upgrades_the_successor_and_the_other_party_hold(s: &dyn RelationshipStore) {
+    let case = "a_rotation_keeps_the_upgrades_the_successor_and_the_other_party_hold";
+    let mb = |n: u8| Mailbox::identified(format!("m{n}"), fp(n));
+    let record = |p: u8, o: u8, bytes: u8| Presentation {
+        friendship: None,
+        reset: Some(vec![bytes; 3]),
+        ..presentation(p, o, bytes, 7)
+    };
+    let shown = |from: u8, to: u8| {
+        s.relationship(&mb(from), &mb(to), at(10))
+            .unwrap()
+            .and_then(|r| r.pending_out)
+            .is_some_and(|p| p.upgrade)
+    };
+    let offered = |from: u8, to: u8| {
+        s.offer(&fp(from), &fp(to), at(10))
+            .unwrap()
+            .map(|o| o.offer)
+    };
+    // 1 and its successor 5 each have an upgrade to 2, on records 2 holds
+    // for each: the successor's own stays, offer and all.
+    s.present(&record(2, 1, 2)).unwrap();
+    s.present(&record(2, 5, 9)).unwrap();
+    asked_with(s, 1, 2, true);
+    asked_with(s, 5, 2, true);
+    // 3 has upgrades to both 1 and 5, on records each holds for it: the
+    // one to the successor stays, the one to the key retired goes.
+    s.present(&record(1, 3, 4)).unwrap();
+    s.present(&record(5, 3, 6)).unwrap();
+    asked_with(s, 3, 1, true);
+    asked_with(s, 3, 5, true);
+    // 4 has an upgrade to 1 alone: it goes, its pending out with it; and
+    // 6's pending out to 1, its offer already gone, goes too.
+    s.present(&record(1, 4, 8)).unwrap();
+    asked_with(s, 4, 1, true);
+    s.present(&record(1, 6, 3)).unwrap();
+    asked_with(s, 6, 1, true);
+    s.set_offer(&fp(6), &fp(1), None).unwrap();
+    s.rotate(&fp(1), &fp(5)).unwrap();
+    assert!(shown(5, 2), "{case}: the successor's own");
+    assert_eq!(offered(5, 2), Some(vec![5, 2]), "{case}: its own offer");
+    assert!(shown(3, 5), "{case}: the other's to the successor");
+    assert_eq!(offered(3, 5), Some(vec![3, 5]), "{case}: its own offer");
+    assert!(
+        !shown(4, 5),
+        "{case}: one to the key retired, pending out and all"
+    );
+    assert_eq!(offered(4, 5), None, "{case}: nor its offer");
+    assert!(
+        !shown(6, 5),
+        "{case}: a pending out whose offer went before"
     );
 }
 

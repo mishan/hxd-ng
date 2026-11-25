@@ -328,9 +328,6 @@ impl Core {
         };
         let keys = devices.iter().map(|(_, d)| Unrevoked::LocalDevice(*d));
         let ids = identities.iter().map(|i| Unrevoked::LocalIdentity(*i));
-        // The identity each device signed offers for, read while its
-        // sessions are still there to show it.
-        let signers = self.signers_of(devices.iter().map(|(_, d)| *d));
         // Sessions first: the lists already hide the rows, and the
         // deletes may wait on registrations.
         let ended = match list.is_empty() {
@@ -341,9 +338,11 @@ impl Core {
         self.take_revoked(keys.chain(ids).collect());
         if !list.is_empty() {
             self.drop_revoked_presentations(&devices);
-            let devices = signers.into_iter().map(|(identity, device)| Sweep::Device {
-                identity,
-                device,
+            // The operator names a device alone: its offers are found by
+            // what signed them, under whichever identity.
+            let devices = devices.iter().map(|(_, device)| Sweep::Device {
+                identity: None,
+                device: *device,
                 operator: true,
             });
             let identities = identities.iter().map(|i| Sweep::Identity {
@@ -448,7 +447,7 @@ impl Core {
             self.drop_revoked_presentations(&devices);
             let devices = devices.iter().filter_map(|(i, d)| {
                 i.map(|identity| Sweep::Device {
-                    identity,
+                    identity: Some(identity),
                     device: *d,
                     operator: false,
                 })
