@@ -335,6 +335,24 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Fixed
 
+- Friendship work a failed store call left owed (dropping an unlinked
+  identity's or a revoked device's offers and presentations, a deleted
+  account's relationships) is retried once a minute on every server,
+  and a `Reset` record's bytes lapse there too, 30 days after the last
+  presentation answered `Reset`. Until now only a server with trusted
+  registrars did either: one without kept the owed rows until a restart
+  forgot the work, and every `Reset` record's bytes for good.
+
+- The relationship store's rows that have lapsed (unanswered requests
+  and their offers, upgrade offers, holds, ignores) are reclaimed once
+  a minute, and request ledger entries once older than the longest
+  window a limit counts them over (`request_retention`, or a day if
+  that is shorter). No server reclaimed them before. The lapsed rows
+  already read as gone; a request retried under its guid once its
+  ledger entry is gone is taken as a new request, and raising
+  `[messaging] request_retention_days` does not bring back entries
+  already reclaimed.
+
 - Metrics: the frames a server link receives are counted in
   `hxd_frames_total` by their transaction type (`type="900"` to
   `"915"`) rather than as `type="other"`.

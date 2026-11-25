@@ -77,11 +77,8 @@ fn carol() -> Person {
     person(9)
 }
 
-/// A server whose `alice` and `bob` link these identities and `carol`
-/// [`carol`]'s, with `erin` a password account beside them. With
-/// `anchors`, it keeps successor commitments, and so applies rotations;
-/// `messaging` is `[messaging] enabled`.
-async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messaging: bool) -> Server {
+/// [`start`]'s accounts, in the directory it returns.
+fn accounts(dir: &Path, alice: &Person, bob: &Person) -> std::path::PathBuf {
     let accounts = dir.join("accounts");
     hxd_auth_file::FileAuth::bootstrap(&accounts).unwrap();
     let member = "read_chat = true\nsend_chat = true\nsend_msgs = true\nmessaging = true\n";
@@ -100,6 +97,15 @@ async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messagin
         )
         .unwrap();
     }
+    accounts
+}
+
+/// A server whose `alice` and `bob` link these identities and `carol`
+/// [`carol`]'s, with `erin` a password account beside them. With
+/// `anchors`, it keeps successor commitments, and so applies rotations;
+/// `messaging` is `[messaging] enabled`.
+async fn start(dir: &Path, alice: &Person, bob: &Person, anchors: bool, messaging: bool) -> Server {
+    let accounts = accounts(dir, alice, bob);
     let store = Arc::new(SqliteStore::open(dir.join("hx.db"), Synchronous::Normal).unwrap());
     let auth = Arc::new(hxd_auth_file::FileAuth::new(accounts));
     let core = Arc::new(
@@ -184,6 +190,47 @@ async fn restart(s: Server, dir: &Path, alice: &Person, bob: &Person) -> Server 
     s.stop.iter().for_each(tokio::task::AbortHandle::abort);
     drop(s);
     start(dir, alice, bob, false, true).await
+}
+
+/// [`start`]'s accounts on a server built the binary's way from a config
+/// with an identity and messaging but no registrars, with the binary's
+/// owed-work task, run every `every`.
+async fn configured(dir: &Path, alice: &Person, bob: &Person, every: Duration) -> Server {
+    accounts(dir, alice, bob);
+    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (classic, ng) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
+    let d = dir.display();
+    let path = dir.join("hxd-ng.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[paths]\naccounts = \"{d}/accounts\"\n[ng]\nbind = \"{ng}\"\n\
+             [inbox]\ndb = \"{d}/hx.db\"\n[messaging]\nenabled = true\n\
+             [identity]\nkey = \"{d}/identity.key\"\nnext_key = \"{d}/identity.next\"\n\
+             handovers = \"{d}/identity.handovers\"\nhosts = [\"{ng}\"]\n"
+        ),
+    )
+    .unwrap();
+    let config = hxd::Config::load(&path).unwrap();
+    hxd::check_config(&config).unwrap();
+    let ctx = hxd::build_ctx(&config, None, None, None, None).unwrap();
+    let ng_ctx = hxd::build_ng_ctx(&config, &ctx, None, None, None)
+        .unwrap()
+        .unwrap();
+    let core = ctx.core.clone();
+    let stop = vec![
+        tokio::spawn(hxd::presence_flusher(core.clone())).abort_handle(),
+        tokio::spawn(hxd::owed_ticker(core.clone(), every)).abort_handle(),
+        tokio::spawn(hxd_session::serve(l1, ctx)).abort_handle(),
+        tokio::spawn(hxd_ng_session::serve(l2, ng_ctx)).abort_handle(),
+    ];
+    Server {
+        classic,
+        ng,
+        core,
+        stop,
+    }
 }
 
 /// One HTTP/1.1 request, closed after its answer: the JSON body.
@@ -935,4 +982,48 @@ async fn a_reset_kept_for_an_identity_away_is_judged_when_the_server_starts() {
     );
     let listed = ok(&mut carol_c, "friends", json!({})).await;
     assert_eq!(listed["friends"], json!([]), "taken after it");
+}
+
+#[tokio::test]
+async fn an_offer_an_unlink_could_not_drop_is_dropped_once_its_backoff_is_over() {
+    let (alice, bob) = (person(1), person(2));
+    let d = tempfile::tempdir().unwrap();
+    let s = configured(d.path(), &alice, &bob, Duration::from_millis(20)).await;
+    let mut alice0 = device(&s, &alice, 0, "alice").await;
+    let o = offer(&alice, 0, &bob, now() - 60);
+    let asked = ok(
+        &mut alice0,
+        "friend_add",
+        json!({ "login": "bob", "offer": b64(&o) }),
+    )
+    .await;
+    assert_eq!(asked["state"], "pending_out");
+    let db = rusqlite::Connection::open(d.path().join("hx.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let offers = || {
+        let q = "SELECT count(*) FROM relationship WHERE pending_offer IS NOT NULL";
+        db.query_row(q, [], |r| r.get::<_, i64>(0)).unwrap()
+    };
+    assert_eq!(offers(), 1);
+    db.execute_batch(
+        "CREATE TRIGGER held BEFORE UPDATE OF pending_offer ON relationship
+          WHEN NEW.pending_offer IS NULL BEGIN SELECT RAISE(ABORT, 'held'); END",
+    )
+    .unwrap();
+    let t = token(&s, &alice, 1, &card(&alice, "alice"), json!({}))
+        .await
+        .unwrap();
+    let unlinked = http_as(s.ng, "/identity/unlink", b"", Some(&t)).await;
+    assert_eq!(unlinked["unlinked"], "alice", "{unlinked}");
+    db.execute_batch("DROP TRIGGER held").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(offers(), 1, "owed, and not tried before its backoff");
+    s.core.clock().advance(Duration::from_secs(61));
+    timeout(Duration::from_secs(10), async {
+        while offers() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the owed drop, done by the binary's tick");
 }

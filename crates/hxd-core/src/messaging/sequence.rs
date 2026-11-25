@@ -697,6 +697,7 @@ impl Run {
         let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
         let before = self.pairing();
         let offered = self.stored_offers();
+        self.core.owed_tick();
         self.core.reconcile_due(listed.iter().copied());
         let after = self.pairing();
         // A pass drops an offer only for what forbids it, or with the
@@ -840,9 +841,7 @@ impl Run {
                     core.clock.advance(Duration::from_secs(secs));
                 }
                 let wall = core.clock.wall();
-                let _ = self
-                    .store
-                    .cleanup(wall, wall - Duration::from_secs(DAY), 1000);
+                let _ = self.store.cleanup(wall, core.ledger_read_from(wall), 1000);
                 true
             }
             Step::Present { k } => {
@@ -1818,6 +1817,7 @@ impl Run {
         self.fail.fail_nth(0);
         for _ in 0..8 {
             self.core.clock.advance(Duration::from_secs(3700));
+            self.core.owed_tick();
             self.core.reconcile_due(listed.iter().copied());
         }
         for o in self.stored_offers() {

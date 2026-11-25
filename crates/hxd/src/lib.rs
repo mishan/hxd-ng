@@ -4619,6 +4619,18 @@ pub async fn presence_flusher(core: Arc<Core>) {
     }
 }
 
+/// Tries again, every `every`, the friendship work a failed store call
+/// left owed (`hxd_core::Core::owed_tick`).
+pub async fn owed_ticker(core: Arc<Core>, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let core = core.clone();
+        let _ = crate::spawn_blocking("prune", move || core.owed_tick()).await;
+    }
+}
+
 /// Sends each room's reactions once its batch is due
 /// (`hxd_core::Core::reactions_flush`), measured on the core's clock, off
 /// the runtime's workers since a batch takes a room's serial and reads the
