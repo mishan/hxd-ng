@@ -57,7 +57,8 @@ something narrower in `allow` than this host.
 Every name here is written in one place, `hxd_core::instrument`, and
 every label value is either fixed in the code or bounded by it. A
 transaction type from the wire becomes a label only when the server
-knows it (the number of a legacy transaction the session answers, or
+knows it (the number of a legacy transaction the session answers or
+a server link sends, or
 an ng request name the dispatcher handles, or its family); anything a
 client invents is `other`. Tests read each dispatcher's arms from its
 source and fail if one has no label. A label value is a series the recorder keeps for the life of

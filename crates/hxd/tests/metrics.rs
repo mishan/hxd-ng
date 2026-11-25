@@ -59,7 +59,13 @@ async fn start_with(dir: &Path, ng: &str, metrics: &str) -> Server {
     server
 }
 
+/// A scrape writes its server's census into the one recorder, then
+/// renders it, so two servers scraped at once could each show the
+/// other's: one request at a time in this process.
+static SCRAPES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn get(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> (u16, String) {
+    let _one = SCRAPES.lock().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n");
     for (k, v) in extra {
@@ -408,6 +414,11 @@ async fn a_scrape_accounts_for_a_link_its_ghosts_and_its_end() {
     })
     .await;
     assert_eq!(value(&text, "hxd_link_establish_seconds_count"), Some(2.0));
+    // A link's frames are counted by its transaction types, as a user's are.
+    assert!(
+        !has(&text, "hxd_frames_total", &["type=\"other\""]),
+        "{text}"
+    );
     assert_eq!(value(&scrape(&a).await, "hxd_ghosts"), Some(0.0));
 
     let config = std::fs::read_to_string(&a_config).unwrap();
