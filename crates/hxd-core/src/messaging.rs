@@ -1920,14 +1920,24 @@ impl Core {
 
     /// Purge `of`'s relationships, telling everyone it had a friendship
     /// or a request with that its row is gone.
-    pub(crate) fn purge_relationships(&self, of: &Mailbox) {
+    /// Whether it was done: one that could not be is owed to a records
+    /// tick until it is.
+    pub(crate) fn purge_relationships(&self, of: &Mailbox) -> bool {
+        self.purge_relationships_held(&self.friend_writes(), of)
+    }
+
+    /// [`Self::purge_relationships`], under the hold the caller took.
+    pub(crate) fn purge_relationships_held(
+        &self,
+        _writing: &FriendWrites<'_>,
+        of: &Mailbox,
+    ) -> bool {
         let Some(store) = self.relationships.as_ref() else {
-            return;
+            return true;
         };
         let now = self.clock.wall();
-        let _writing = self.friend_writes();
         // Read before anything is written: a purge whose audience cannot
-        // be read waits for a later one rather than leaving it untold.
+        // be read is owed, and made again whole.
         let read = || -> Result<Vec<Mailbox>, StoreError> {
             let mut audience: Vec<Mailbox> = store
                 .relationships(of, now)?
@@ -1948,12 +1958,12 @@ impl Core {
                     "relationships: reading whom {}'s purge tells: {e}",
                     of.login
                 );
-                return;
+                return false;
             }
         };
         if let Err(e) = store.purge(of) {
             warn!("relationships: purging {}: {e}", of.login);
-            return;
+            return false;
         }
         // Each party to a presentation it made is judged again.
         self.unjudge_all();
@@ -1965,6 +1975,18 @@ impl Core {
                 Event::FriendEntry(Box::new(FriendEntry::removed(of))),
             );
         }
+        true
+    }
+
+    /// [`Self::purge_relationships`], owed to a later tick where it cannot
+    /// be done now: whether it was.
+    pub(crate) fn purge_or_owe(&self, of: &Mailbox) -> bool {
+        if self.purge_relationships(of) {
+            return true;
+        }
+        let owed = portable::OwedSweep::failed(Sweep::Purge(of.clone()), 0, self.clock.unix());
+        self.offer_sweeps.lock().unwrap().push(owed);
+        false
     }
 
     // --- Discovery -----------------------------------------------------

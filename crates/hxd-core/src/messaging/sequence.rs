@@ -1299,6 +1299,20 @@ impl Run {
 
     /// Where entries were told from a read after their step, since last
     /// asked.
+    /// Whether each party's pending out is an upgrade, which a block that
+    /// takes it tells: read before a step acts.
+    fn upgrading_now(&self) -> [bool; 2] {
+        let wall = self.core.clock.wall();
+        [0, 1].map(|q| {
+            let (x, y) = (self.mailbox(q), self.mailbox(1 - q));
+            self.store
+                .relationship(&x, &y, wall)
+                .unwrap()
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.upgrade)
+        })
+    }
+
     fn told_by_reading(&self) -> Vec<&'static str> {
         std::mem::take(&mut *self.core.told_by_reading.lock().unwrap())
     }
@@ -1447,16 +1461,7 @@ impl Run {
         let free = before.friendship.is_none() && !mine;
         let predecessor = self.names_a_predecessor();
         let owed = self.core.owed_sweeps();
-        // Whether each party's pending out is an upgrade, which a block
-        // that takes it tells.
-        let upgrading = [0, 1].map(|q| {
-            let (x, y) = (self.mailbox(q), self.mailbox(1 - q));
-            self.store
-                .relationship(&x, &y, wall)
-                .unwrap()
-                .and_then(|r| r.pending_out)
-                .is_some_and(|p| p.upgrade)
-        });
+        let upgrading = self.upgrading_now();
         self.told_by_reading();
         let ok = self.act(step, p, d);
         let by_reading = self.told_by_reading();
@@ -1724,22 +1729,36 @@ impl Run {
                 .any(|(c, to)| Fingerprint::of(&c.identity).0 == *fp || to == fp)
         };
         for sweep in before.iter().filter(|s| !now.contains(s)) {
-            let done = match *sweep {
+            let done = match sweep {
                 Sweep::Device {
                     identity, device, ..
                 } => !offers.iter().any(|(c, _)| {
                     identity.is_none_or(|i| Fingerprint::of(&c.identity).0 == i)
-                        && Fingerprint::of(&c.device).0 == device
+                        && Fingerprint::of(&c.device).0 == *device
                 }),
-                Sweep::Identity { identity, .. } => !names(&identity),
-                Sweep::Unlinked(fp) => !names(&fp),
+                Sweep::Identity { identity, .. } => !names(identity),
+                Sweep::Unlinked(fp) => !names(fp),
                 Sweep::Presented { device, .. } => {
-                    !self.presentations().iter().any(|p| p.device == device)
+                    !self.presentations().iter().any(|p| p.device == *device)
                 }
-                Sweep::Unpresented(fp) => !self.presentations().iter().any(|p| p.presenter == fp),
-                Sweep::Judge(..) => true,
+                Sweep::Unpresented(fp) => !self.presentations().iter().any(|p| p.presenter == *fp),
+                // What it judged stands, or is gone.
+                Sweep::Judge(a, b) => {
+                    let all = self.presentations();
+                    all.iter()
+                        .filter(|p| {
+                            [(p.presenter, p.other), (p.other, p.presenter)].contains(&(*a, *b))
+                        })
+                        .filter(|p| p.evidence())
+                        .all(|p| self.judged(p, &all) != Some(false))
+                }
+                Sweep::Purge(of) => {
+                    let wall = self.core.clock.wall();
+                    self.store.relationships(of, wall).unwrap().is_empty()
+                        && self.store.pending_in(of, wall).unwrap().is_empty()
+                }
             };
-            let lifted = match *sweep {
+            let lifted = match sweep.clone() {
                 Sweep::Device {
                     device,
                     operator: true,
@@ -1765,7 +1784,8 @@ impl Run {
                 Sweep::Identity { identity, .. } => {
                     self.covered.contains(&identity) && !self.listed.identities.contains(&identity)
                 }
-                Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) => true,
+                Sweep::Unlinked(_) | Sweep::Unpresented(_) => true,
+                Sweep::Judge(..) | Sweep::Purge(_) => false,
             };
             assert!(
                 done || lifted,
@@ -2250,6 +2270,7 @@ pub fn run_failing_each_call(
                 run.told();
                 run.requested = 0;
                 run.told_by_reading();
+                run.upgrading = run.upgrading_now();
                 let held = |run: &Run| format!("{}\n{}", dump(), run.core.friend_state());
                 let before = held(&run);
                 match inside {

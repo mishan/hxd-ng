@@ -4545,6 +4545,16 @@ fn a_block_whose_reads_fail_writes_nothing_and_one_that_takes_an_upgrade_tells_i
             let row = s.rel.relationship(&ma, &mb, wall).unwrap();
             row.and_then(|r| r.pending_out).is_some_and(|p| p.upgrade)
         };
+        // Both rows and the offer apart, as they stood.
+        let held = || {
+            let wall = s.core.clock().wall();
+            (
+                s.rel.relationship(&ma, &mb, wall).unwrap(),
+                s.rel.relationship(&mb, &ma, wall).unwrap(),
+                s.rel.offer(&fp(&alice), &fp(&bob), wall).unwrap(),
+            )
+        };
+        let before = held();
         s.fail.fail_nth(k);
         let blocked = s.core.inbox_block(b, "alice", true);
         s.fail.fail_nth(0);
@@ -4554,12 +4564,107 @@ fn a_block_whose_reads_fail_writes_nothing_and_one_that_takes_an_upgrade_tells_i
             .any(|(login, state, ..)| login == "bob" && *state == RosterState::Removed);
         match blocked {
             Ok(()) => assert!(!waiting() && told, "call {k}: taken, and told"),
-            Err(_) => assert!(waiting() && !told, "call {k} ({failed:?}): nothing written"),
+            Err(_) => {
+                assert!(!told, "call {k} ({failed:?}): nothing told");
+                assert_eq!(held(), before, "call {k} ({failed:?}): nothing written");
+            }
         }
         if failed.is_none() {
             break;
         }
     }
+}
+
+#[test]
+fn a_deleted_accounts_purge_that_cannot_be_done_is_owed_until_it_is() {
+    let (alice, bob, s, _) = upgrade_waiting();
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let rows = || {
+        s.rel
+            .relationships(&ma, s.core.clock().wall())
+            .unwrap()
+            .len()
+    };
+    assert!(rows() > 0);
+    s.fail.fail_next("relationships");
+    s.core.inbox_purge(&ma);
+    assert_eq!(s.fail.failed(), Some("relationships"));
+    assert!(rows() > 0, "nothing purged yet");
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.reconcile_due(Vec::new());
+    assert_eq!(rows(), 0, "purged once owed");
+    let _ = mb;
+}
+
+#[test]
+fn a_registrar_device_sweep_follows_the_offers_its_identity_rotated() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    let record = Rotation {
+        identity: alice.id.public(),
+        successor: successor.id.public(),
+        time: now(),
+        next: None,
+    }
+    .sign(&alice.id, &successor.id)
+    .unwrap();
+    s.core.keep_rotation_record(&record);
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    let carried = || {
+        let ms = Mailbox::identified("alice", fp(&successor));
+        let mb = Mailbox::identified("bob", fp(&bob));
+        let row = s.rel.relationship(&ms, &mb, s.core.clock().wall()).unwrap();
+        row.and_then(|r| r.pending_out).and_then(|p| p.offer)
+    };
+    assert!(carried().is_some(), "moved with the rotation");
+    drop(s.core.set_published_revocations(Published {
+        devices: [(fp(&alice), Fingerprint::of(&alice.devices[0].0.public()).0)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert_eq!(carried(), None, "found under the successor");
+}
+
+#[test]
+fn sweeps_that_overlap_in_one_install_tell_each_pair_once() {
+    let (alice, bob, s, mut ra) = upgrade_waiting();
+    let stored = s.rel.offer(&fp(&alice), &fp(&bob), s.core.clock().wall());
+    let stored = stored.unwrap().expect("the upgrade's offer");
+    let cert = Offer::check(&stored.offer, u64::MAX, &[], |_| 0)
+        .unwrap()
+        .cert;
+    let renewed = Fingerprint::of(&DeviceCert::parse(&cert).unwrap().device).0;
+    drop(s.core.set_published_revocations(Published {
+        identities: [fp(&alice)].into(),
+        devices: [(fp(&alice), renewed)].into(),
+        covered: [fp(&alice), fp(&bob)].into(),
+        ..Default::default()
+    }));
+    let entries = told(&mut ra)
+        .iter()
+        .filter(|(login, ..)| login == "bob")
+        .count();
+    assert_eq!(entries, 1, "one tell for one pair");
+}
+
+#[test]
+fn a_signed_block_that_takes_an_upgrade_tells_its_sender() {
+    let (alice, bob, s, mut ra) = upgrade_waiting();
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    let w = withdraw(&bob, 0, &alice, now());
+    s.core.block_withdrawing(b, "alice", w).unwrap();
+    assert!(
+        told(&mut ra)
+            .iter()
+            .any(|(login, state, ..)| login == "bob" && *state == RosterState::Removed),
+        "told as a decline is"
+    );
 }
 
 #[test]
@@ -4603,9 +4708,16 @@ fn an_operator_revoked_devices_offers_go_with_no_session_or_presentation_to_name
     let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
     let (a, _) = device(&s.core, "alice", &alice, 0);
     let (b, _) = device(&s.core, "bob", &bob, 0);
-    s.core
-        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
-        .unwrap();
+    let o = offer(&alice, 0, &bob, now());
+    s.core.friend_ask(a, "bob", None, Some(o.clone())).unwrap();
+    let (ma, mb) = mailboxes(&alice, &bob);
+    let row = s.rel.relationship(&ma, &mb, s.core.clock().wall()).unwrap();
+    let carried = row.and_then(|r| r.pending_out).and_then(|p| p.offer);
+    assert_eq!(
+        carried.map(|o| o.offer),
+        Some(o),
+        "the request carries the offer signed"
+    );
     s.core.end_session(a);
     drop(s.core.set_revocations(Revocations {
         devices: [Fingerprint::of(&alice.devices[0].0.public()).0].into(),

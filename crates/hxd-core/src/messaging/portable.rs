@@ -172,8 +172,11 @@ const SWEEP_BACKOFF_MAX: u64 = 3600;
 /// Offers owed a drop: a revoked device's, by the operator or by a
 /// registrar, under the identity it signed for; a revoked identity's,
 /// from or to it; or an unlinked one's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Sweep {
+    /// A deleted account's relationships, purged under the mailbox it
+    /// held, so that whoever is given the login next inherits none.
+    Purge(Mailbox),
     /// The offers a device signed: under the identity a registrar names
     /// it for, or, the operator's naming none, under whichever.
     Device {
@@ -207,7 +210,7 @@ pub(crate) struct OwedSweep {
 }
 
 impl OwedSweep {
-    fn failed(sweep: Sweep, failures: u32, now: u64) -> Self {
+    pub(super) fn failed(sweep: Sweep, failures: u32, now: u64) -> Self {
         let failures = failures + 1;
         let wait = SWEEP_BACKOFF.saturating_mul(1 << (failures - 1).min(6));
         OwedSweep {
@@ -1827,6 +1830,13 @@ impl Core {
                 .map_err(store_failed)?
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
+            // An upgrade the blocked had waiting goes too, told as a
+            // decline is.
+            shown |= store
+                .relationship(blocked, blocker, wall)
+                .map_err(store_failed)?
+                .and_then(|r| r.pending_out)
+                .is_some_and(|p| p.upgrade);
         }
         let (a, b) = block.unwrap_or((&x, &y));
         let Room { mut parts, judged } = self
@@ -3109,7 +3119,10 @@ impl Core {
             sweeps
                 .into_iter()
                 .map(|s| (s, 0, true))
-                .chain(due.into_iter().map(|o| (o.sweep, o.failures, false)))
+                .chain(
+                    due.into_iter()
+                        .map(|o| (o.sweep.clone(), o.failures, false)),
+                )
                 .collect()
         };
         let mut parts = Vec::new();
@@ -3118,6 +3131,12 @@ impl Core {
         let mut owe = Vec::new();
         for (sweep, failures, fresh) in due {
             if !fresh && !self.still_owed(&sweep) {
+                continue;
+            }
+            if let Sweep::Purge(of) = &sweep {
+                if !self.purge_relationships_held(&_writing, of) {
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
                 continue;
             }
             if let Sweep::Presented { identity, device } = sweep {
@@ -3153,6 +3172,23 @@ impl Core {
                 }
             }
         }
+        // One tell a pair, whichever sweeps named it: an unlink's
+        // recipients kept, each party told where any sweep would tell it.
+        let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
+        for (a, b, to) in pairs {
+            let key = |m: &Mailbox| (m.login.clone(), m.fingerprint);
+            match coalesced.iter_mut().find(|(x, y, _)| {
+                (key(x), key(y)) == (key(&a), key(&b)) || (key(x), key(y)) == (key(&b), key(&a))
+            }) {
+                Some((x, _, seen)) => {
+                    let same = key(x) == key(&a);
+                    let to = if same { to } else { [to[1], to[0]] };
+                    *seen = [seen[0] || to[0], seen[1] || to[1]];
+                }
+                None => coalesced.push((a, b, to)),
+            }
+        }
+        let pairs = coalesced;
         if !parts.is_empty() {
             let asked: Vec<(&Mailbox, &Mailbox)> = pairs.iter().map(|(a, b, _)| (a, b)).collect();
             match self.write_left(store, &parts, &asked, wall) {
@@ -3230,7 +3266,7 @@ impl Core {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn owed_sweeps(&self) -> Vec<Sweep> {
         let owed = self.offer_sweeps.lock().unwrap();
-        owed.iter().map(|o| o.sweep).collect()
+        owed.iter().map(|o| o.sweep.clone()).collect()
     }
 
     /// What the core keeps of friendships beside the store, as text: the
@@ -3288,7 +3324,7 @@ impl Core {
                 let dir = self.directory.as_ref();
                 return dir.is_none_or(|d| d.account_by_key(fp).is_none());
             }
-            Sweep::Judge(..) => return true,
+            Sweep::Judge(..) | Sweep::Purge(_) => return true,
             _ => {}
         }
         // A registrar's lift is one only where the lists read cover the
@@ -3324,7 +3360,7 @@ impl Core {
             Sweep::Identity { identity, .. } => {
                 published(&identity, r.published.identities.contains(&identity))
             }
-            Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) => {
+            Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) | Sweep::Purge(_) => {
                 unreachable!("answered above")
             }
         }
@@ -3345,8 +3381,14 @@ impl Core {
             } => {
                 let mut signed = Vec::new();
                 let mut named = Vec::new();
+                // Under the named key and each it rotated to, which an
+                // outgoing offer moves with; the operator's, under any.
                 let identities = match identity {
-                    Some(i) => vec![i],
+                    Some(i) => {
+                        let next = self.chain_from(store, i)?;
+                        let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
+                        std::iter::once(i).chain(next).collect()
+                    }
                     None => store.offerers(wall)?,
                 };
                 let mut offers = Vec::new();
@@ -3381,9 +3423,10 @@ impl Core {
                 let named = named.into_iter().map(|(me, o)| (me, o, to));
                 (Part::DropOffersNaming(fp), named.collect())
             }
-            Sweep::Presented { .. } | Sweep::Unpresented(_) | Sweep::Judge(..) => {
-                unreachable!("not offers")
-            }
+            Sweep::Presented { .. }
+            | Sweep::Unpresented(_)
+            | Sweep::Judge(..)
+            | Sweep::Purge(_) => unreachable!("not offers"),
         })
     }
 
