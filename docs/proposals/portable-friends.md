@@ -447,10 +447,15 @@ For each friendship the server checks, in this order:
    hash, so that the upgrade offer that remakes it (§4.1) can be checked
    against which half is below the floor. The record is counted toward
    the bound of step 1, shown to nobody, and does not make the
-   friendship held. It goes when that upgrade offer's acceptance
-   activates the edge, when the presenter presents another friendship
-   for the pair, or 30 days after the last presentation of it that kept
-   the record, answered `Reset` or `AccountNotFound` in its place, for a
+   friendship held. A half below its floor whose reset `time` no record
+   here shows is `AccountNotFound` instead, keeping only the hash as
+   step 2 does and no `Reset` record, since nothing shows whether the
+   friendship is held; the client presents it again at a later login,
+   by when the records may have come. The record goes when that upgrade
+   offer's acceptance activates the edge, when the presenter presents
+   another friendship for the pair, when the two make a local
+   friendship or either blocks the other, or 30 days after the last
+   presentation of it that kept the record, answered `Reset` or `AccountNotFound` in its place, for a
    hidden party here or on the classic wire (§7), which a client
    presenting the friendship again at each login keeps restarting; while
    a qualifying upgrade offer for it is pending, it is kept until the
