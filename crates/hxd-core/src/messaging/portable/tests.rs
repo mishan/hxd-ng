@@ -4533,6 +4533,36 @@ fn every_party_an_upgrade_waits_from_is_told_when_it_goes() {
 }
 
 #[test]
+fn a_block_whose_reads_fail_writes_nothing_and_one_that_takes_an_upgrade_tells_it() {
+    // Each call the block makes failing in turn, then none: whatever it
+    // takes of Alice's upgrade, she is told; whatever fails, nothing goes.
+    for k in 1.. {
+        let (alice, bob, s, mut ra) = upgrade_waiting();
+        let (b, _) = device(&s.core, "bob", &bob, 0);
+        let (ma, mb) = mailboxes(&alice, &bob);
+        let waiting = || {
+            let wall = s.core.clock().wall();
+            let row = s.rel.relationship(&ma, &mb, wall).unwrap();
+            row.and_then(|r| r.pending_out).is_some_and(|p| p.upgrade)
+        };
+        s.fail.fail_nth(k);
+        let blocked = s.core.inbox_block(b, "alice", true);
+        s.fail.fail_nth(0);
+        let failed = s.fail.failed();
+        let told = told(&mut ra)
+            .iter()
+            .any(|(login, state, ..)| login == "bob" && *state == RosterState::Removed);
+        match blocked {
+            Ok(()) => assert!(!waiting() && told, "call {k}: taken, and told"),
+            Err(_) => assert!(waiting() && !told, "call {k} ({failed:?}): nothing written"),
+        }
+        if failed.is_none() {
+            break;
+        }
+    }
+}
+
+#[test]
 fn an_owed_sweep_ends_only_on_a_list_that_covers_its_identity() {
     let (alice, bob) = (person(1), person(2));
     let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);

@@ -49,7 +49,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use hl_identity::friendship::Pair;
 use hl_identity::{
@@ -421,7 +421,7 @@ struct Run {
 /// #474 moves onto telling from what the step left. Every other tell is
 /// made from that, and one read after its step fails the run.
 const TELLS_BY_READING: &[&str] = &[
-    "a block",
+    "an unblock",
     "an alias",
     "a merge",
     "a rotation's merge",
@@ -472,17 +472,21 @@ impl View {
     }
 }
 
+/// Unix seconds, real time: where a run's clock starts.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs()
+}
+
 fn mailbox(login: &str, p: &Person) -> Mailbox {
     Mailbox::identified(login, p.fp())
 }
 
 impl Run {
-    fn new(store: Arc<dyn RelationshipStore>, start: u32) -> Self {
+    fn new(store: Arc<dyn RelationshipStore>, start: u32, base: u64) -> Self {
         let fail = Arc::new(Failing::new(store.clone()));
-        let base = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after 1970")
-            .as_secs();
         let people = [Person::new(1, base), Person::new(2, base)];
         let records = Arc::new(MemoryRecordCache::default());
         let dir = Arc::new(Directory(Mutex::new(
@@ -492,24 +496,27 @@ impl Run {
                 .map(|(l, p)| (mailbox(l, p), messaging_bits()))
                 .collect(),
         )));
-        let core = Arc::new(
-            Core::new()
-                .with_inbox(
-                    Arc::new(MemoryStore::new()),
-                    dir.clone(),
-                    InboxPolicy::default(),
-                )
-                .with_relationships(fail.clone())
-                .with_messaging(MessagingPolicy {
-                    enabled: true,
-                    presence_debounce: Duration::ZERO,
-                    // Some runs, friends by presentations alone, at the
-                    // daily bound from the start.
-                    requests_per_day: if start % 6 == 0 { 0 } else { 20 },
-                    ..MessagingPolicy::default()
-                })
-                .with_record_cache(records.clone()),
-        );
+        let mut core = Core::new()
+            .with_inbox(
+                Arc::new(MemoryStore::new()),
+                dir.clone(),
+                InboxPolicy::default(),
+            )
+            .with_relationships(fail.clone())
+            .with_messaging(MessagingPolicy {
+                enabled: true,
+                presence_debounce: Duration::ZERO,
+                // Some runs, friends by presentations alone, at the
+                // daily bound from the start.
+                requests_per_day: if start % 6 == 0 { 0 } else { 20 },
+                ..MessagingPolicy::default()
+            })
+            .with_record_cache(records.clone());
+        // Standing still but for what the run advances, as its twin's
+        // does from the same time: a lapse at a second's edge lands
+        // alike in both.
+        core.clock = crate::clock::Clock::frozen(UNIX_EPOCH + Duration::from_secs(base));
+        let core = Arc::new(core);
         let sessions =
             [0, 1].map(|p| [0, 1].map(|d| attach(&core, LOGINS[p], &people[p], d, true)));
         let plain = [0, 1].map(|p| {
@@ -1729,6 +1736,7 @@ impl Run {
                 Sweep::Presented { device, .. } => {
                     !self.presentations().iter().any(|p| p.device == device)
                 }
+                Sweep::Unpresented(fp) => !self.presentations().iter().any(|p| p.presenter == fp),
                 Sweep::Judge(..) => true,
             };
             let lifted = match *sweep {
@@ -1757,7 +1765,7 @@ impl Run {
                 Sweep::Identity { identity, .. } => {
                     self.covered.contains(&identity) && !self.listed.identities.contains(&identity)
                 }
-                Sweep::Unlinked(_) | Sweep::Judge(..) => true,
+                Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) => true,
             };
             assert!(
                 done || lifted,
@@ -2130,7 +2138,8 @@ fn try_attach(
 /// device the operator revoked signed, one to an identity whose
 /// revocation's sweep was owed, one asked of a revoked identity, and a
 /// rotation whose successor's own upgrade wins the merge, and an unlink's
-/// sweep owed for an account that lost messaging and was linked again.
+/// sweep owed for an account that lost messaging and was linked again,
+/// and an ask its twin answered across a second's edge the run did not.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2166,13 +2175,24 @@ pub const FOUND: &[&[u32]] = &[
     &[
         299946571, 4253775924, 118200754, 1634629088, 36862, 2276450037,
     ],
+    &[
+        968273619, 3005749070, 3110229216, 2592843849, 3169815897, 2983732227, 4079285387,
+        1781202850, 2551120605, 160697240, 1692976527, 992581572, 2048177643, 2784003648,
+        785053516, 3582407074, 1096161089, 3001502511, 3351752313, 1353097061, 3296373531,
+        857864333, 642791484, 3113031500, 3247857250, 1760733790, 1121327242, 716363323,
+        1144741207, 3717504557, 1248828497, 1455716137,
+    ],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the
 /// invariants above.
 pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
     let first = steps.first().copied().unwrap_or(0);
-    let (mut run, mut twin) = (Run::new(new_store(), first), Run::new(new_store(), first));
+    let base = now();
+    let (mut run, mut twin) = (
+        Run::new(new_store(), first, base),
+        Run::new(new_store(), first, base),
+    );
     twin.core
         .upgrades_off
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2219,7 +2239,7 @@ pub fn run_failing_each_call(
         for (inside, from) in [(false, 1), (true, 0)] {
             for k in from.. {
                 let (store, dump) = new_store();
-                let mut run = Run::new(store, first);
+                let mut run = Run::new(store, first, now());
                 run.start();
                 for &m in &steps[..i] {
                     let p = run.actor(m);

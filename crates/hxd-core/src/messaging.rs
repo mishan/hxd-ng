@@ -1779,19 +1779,16 @@ impl Core {
             store.set_blocked(blocker, blocked, false, at)?;
         } else {
             // Whether the blocked had a row to see go: only then is it
-            // told, so a block on a stranger tells it nothing.
+            // told, so a block on a stranger tells it nothing. Read before
+            // anything is written, so that a read that fails writes nothing.
             let shown = store
-                .relationship(blocker, blocked, self.clock.wall())
-                .ok()
-                .flatten()
+                .relationship(blocker, blocked, at)?
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.delivered);
             // An upgrade the blocked had waiting goes with the block, and
             // is told as a decline is, which says nothing of the block.
             let upgraded = store
-                .relationship(blocked, blocker, self.clock.wall())
-                .ok()
-                .flatten()
+                .relationship(blocked, blocker, at)?
                 .and_then(|r| r.pending_out)
                 .is_some_and(|p| p.upgrade);
             let mut end = self.end_here(store, blocker, blocked, &[])?;
@@ -1799,17 +1796,17 @@ impl Core {
             // one is never in 800 or 801 (§4.6).
             end.block = Some(at);
             end.friendship = true;
-            let unfriended = self.end_friendship(store, blocker, blocked, &end)?.0.ended;
-            if let Some(e) = &unfriended {
+            let (ended, left) = self.end_friendship(store, blocker, blocked, &end)?;
+            if let Some(e) = &ended.ended {
                 let [a, b] = &e.parties;
                 self.roster.lock().unwrap().friends_changed(a, b, false);
             }
-            if unfriended.is_some() || shown || upgraded {
-                self.tell_entry("a block", blocked, blocker);
-            }
+            let unsaid = ended.ended.is_none() && !shown && !upgraded;
+            self.tell_left(&left, [true, !unsaid]);
             self.block_deletes_requests(blocker, blocked);
+            return Ok(());
         }
-        self.tell_entry("a block", blocker, blocked);
+        self.tell_entry("an unblock", blocker, blocked);
         Ok(())
     }
 
@@ -1929,23 +1926,31 @@ impl Core {
         };
         let now = self.clock.wall();
         let _writing = self.friend_writes();
-        let mut audience: Vec<Mailbox> = store
-            .relationships(of, now)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| {
-                r.friendship.is_some() || r.pending_out.as_ref().is_some_and(|p| p.delivered)
-            })
-            .map(|r| r.other)
-            .collect();
-        audience.extend(
-            store
-                .pending_in(of, now)
-                .unwrap_or_default()
+        // Read before anything is written: a purge whose audience cannot
+        // be read waits for a later one rather than leaving it untold.
+        let read = || -> Result<Vec<Mailbox>, StoreError> {
+            let mut audience: Vec<Mailbox> = store
+                .relationships(of, now)?
                 .into_iter()
-                .chain(store.upgrades_to(of, now).unwrap_or_default())
-                .map(|r| r.owner),
-        );
+                .filter(|r| {
+                    r.friendship.is_some() || r.pending_out.as_ref().is_some_and(|p| p.delivered)
+                })
+                .map(|r| r.other)
+                .collect();
+            let waiting = store.pending_in(of, now)?.into_iter();
+            audience.extend(waiting.chain(store.upgrades_to(of, now)?).map(|r| r.owner));
+            Ok(audience)
+        };
+        let audience = match read() {
+            Ok(audience) => audience,
+            Err(e) => {
+                warn!(
+                    "relationships: reading whom {}'s purge tells: {e}",
+                    of.login
+                );
+                return;
+            }
+        };
         if let Err(e) = store.purge(of) {
             warn!("relationships: purging {}: {e}", of.login);
             return;

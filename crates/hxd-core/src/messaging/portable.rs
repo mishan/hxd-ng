@@ -186,6 +186,8 @@ pub(crate) enum Sweep {
         operator: bool,
     },
     Unlinked([u8; 32]),
+    /// The presentations an unlinked identity made.
+    Unpresented([u8; 32]),
     /// What two keys hold of each other judged again, after a drop that
     /// left one held by its own taking alone could not be judged.
     Judge([u8; 32], [u8; 32]),
@@ -1920,15 +1922,13 @@ impl Core {
             // standing at the floors, already cuts as far; kept beside any
             // other.
             let floors = Floors::new(self);
-            let signed = store.withdrawals(&pres.pair).is_ok_and(|held| {
-                held.iter().any(|w| {
-                    w.owner == mine
-                        && w.party == named
-                        && w.checked
-                        && w.withdrawal.is_some()
-                        && w.before >= before
-                        && floors.stands(w.withdrawal.as_deref())
-                })
+            let signed = store.withdrawals(&pres.pair)?.iter().any(|w| {
+                w.owner == mine
+                    && w.party == named
+                    && w.checked
+                    && w.withdrawal.is_some()
+                    && w.before >= before
+                    && floors.stands(w.withdrawal.as_deref())
             });
             if signed && floors.failed().is_ok() {
                 continue;
@@ -3127,6 +3127,13 @@ impl Core {
                 }
                 continue;
             }
+            if let Sweep::Unpresented(fp) = sweep {
+                if let Err(e) = self.drop_unlinked_presentations(store, &fp) {
+                    warn!("relationships: dropping an unlinked account's presentations: {e}");
+                    owe.push(OwedSweep::failed(sweep, failures, now));
+                }
+                continue;
+            }
             if let Sweep::Judge(a, b) = sweep {
                 if let Err(e) = self.judge_pair(store, &a, &b) {
                     warn!("relationships: judging what a drop left: {e}");
@@ -3277,7 +3284,7 @@ impl Core {
     fn still_owed(&self, sweep: &Sweep) -> bool {
         match sweep {
             // Linked again is the evidence, whatever the account may do.
-            Sweep::Unlinked(fp) => {
+            Sweep::Unlinked(fp) | Sweep::Unpresented(fp) => {
                 let dir = self.directory.as_ref();
                 return dir.is_none_or(|d| d.account_by_key(fp).is_none());
             }
@@ -3317,7 +3324,9 @@ impl Core {
             Sweep::Identity { identity, .. } => {
                 published(&identity, r.published.identities.contains(&identity))
             }
-            Sweep::Unlinked(_) | Sweep::Judge(..) => unreachable!("answered above"),
+            Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) => {
+                unreachable!("answered above")
+            }
         }
     }
 
@@ -3372,7 +3381,9 @@ impl Core {
                 let named = named.into_iter().map(|(me, o)| (me, o, to));
                 (Part::DropOffersNaming(fp), named.collect())
             }
-            Sweep::Presented { .. } | Sweep::Judge(..) => unreachable!("not offers"),
+            Sweep::Presented { .. } | Sweep::Unpresented(_) | Sweep::Judge(..) => {
+                unreachable!("not offers")
+            }
         })
     }
 
@@ -3426,17 +3437,27 @@ impl Core {
         }
         self.sweep_offers(vec![Sweep::Unlinked(*fingerprint)]);
         let _writing = self.friend_writes();
-        let made = store.presentations(fingerprint).unwrap_or_default();
+        if let Err(e) = self.drop_unlinked_presentations(store, fingerprint) {
+            warn!("relationships: dropping an unlinked account's presentations: {e}");
+            let owed = OwedSweep::failed(Sweep::Unpresented(*fingerprint), 0, self.clock.unix());
+            self.offer_sweeps.lock().unwrap().push(owed);
+        }
+    }
+
+    /// What `fingerprint` presented, dropped, each pair as one step.
+    fn drop_unlinked_presentations(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        let made = store.presentations(fingerprint)?;
         for p in made.iter().filter(|p| p.presenter == *fingerprint) {
             let site = "an unlinked identity's presentation";
-            match self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter]) {
-                Ok(gone) => {
-                    for gone in &gone {
-                        self.orphan_judged_or_owed(store, gone);
-                    }
-                }
-                Err(e) => warn!("relationships: dropping an unlinked account's presentation: {e}"),
+            let gone = self.drop_presented(site, store, &p.presenter, &p.other, &[p.presenter])?;
+            for gone in &gone {
+                self.orphan_judged_or_owed(store, gone);
             }
         }
+        Ok(())
     }
 }
