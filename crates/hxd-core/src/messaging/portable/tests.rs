@@ -4743,6 +4743,29 @@ fn a_registrar_device_sweep_follows_the_offers_its_identity_rotated() {
 }
 
 #[test]
+fn a_registrar_device_revocation_follows_the_presentations_its_identity_rotated() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    made(&s, &alice, &bob);
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    let revoked = Fingerprint::of(&alice.devices[0].0.public()).0;
+    let presented = || s.rel.presented_by(&revoked).unwrap();
+    assert!(
+        presented().iter().any(|p| p.presenter == fp(&successor)),
+        "moved with the rotation"
+    );
+    drop(s.core.set_published_revocations(Published {
+        devices: [(fp(&alice), revoked)].into(),
+        covered: [fp(&alice)].into(),
+        ..Default::default()
+    }));
+    assert!(presented().is_empty(), "found under the successor");
+}
+
+#[test]
 fn sweeps_that_overlap_in_one_install_tell_each_pair_once() {
     let (alice, bob, s, mut ra) = upgrade_waiting();
     let stored = s.rel.offer(&fp(&alice), &fp(&bob), s.core.clock().wall());

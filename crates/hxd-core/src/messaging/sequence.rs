@@ -2126,7 +2126,8 @@ fn try_attach(
 /// revocation's sweep was owed, one asked of a revoked identity, and a
 /// rotation whose successor's own upgrade wins the merge, and an unlink's
 /// sweep owed for an account that lost messaging and was linked again,
-/// and an ask its twin answered across a second's edge the run did not.
+/// an ask its twin answered across a second's edge the run did not, and
+/// a revoked device's presentations owed through a rotation.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2169,6 +2170,7 @@ pub const FOUND: &[&[u32]] = &[
         857864333, 642791484, 3113031500, 3247857250, 1760733790, 1121327242, 716363323,
         1144741207, 3717504557, 1248828497, 1455716137,
     ],
+    &[1702465536, 609691418, 2400948381, 958047247],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
