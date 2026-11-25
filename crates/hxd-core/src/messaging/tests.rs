@@ -4782,3 +4782,85 @@ fn a_drain_replays_a_rekey_then_a_deletion_in_order() {
     });
     assert!(im_reactions(&drain(&mut rb)).is_empty());
 }
+
+#[test]
+fn a_tick_reclaims_a_lapsed_request() {
+    let s = server(&["alice", "bob"]);
+    let (a, _ra) = messenger(&s.core, "alice");
+    let (_b, _rb) = messenger(&s.core, "bob");
+    s.core.friend_add(a, "bob", None).unwrap();
+    let asked = s.core.clock.wall();
+    let pending = || {
+        let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));
+        let row = s.rel.relationship(&alice, &bob, asked).unwrap();
+        row.is_some_and(|r| r.pending_out.is_some())
+    };
+    assert!(pending());
+    s.core
+        .clock
+        .advance(policy().request_retention + Duration::from_secs(1));
+    s.core.owed_tick();
+    assert!(pending(), "not reclaimed within an hour of its lapse");
+    s.core.clock.advance(Duration::from_secs(3600));
+    s.core.owed_tick();
+    assert!(!pending(), "reclaimed: gone even as of when it was asked");
+}
+
+#[test]
+fn a_tick_keeps_the_ledger_a_senders_allowance_is_counted_over() {
+    use crate::{ChatError, MsgOutcome};
+    let p = MessagingPolicy {
+        request_messages: 1,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (_b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+    assert_eq!(send(&s.core, g, "bob", "one"), Ok(MsgOutcome::Requested));
+    assert_eq!(send(&s.core, g, "bob", "two"), Err(ChatError::RequestFull));
+    s.core.clock.advance(Duration::from_secs(2 * 24 * 3600));
+    s.core.owed_tick();
+    assert_eq!(
+        send(&s.core, g, "bob", "three"),
+        Err(ChatError::RequestFull),
+        "still counted inside `request_retention`"
+    );
+    let ledger = || {
+        let all = s
+            .rel
+            .request_addresses(&Mailbox::login("bob"), std::time::UNIX_EPOCH, None);
+        all.unwrap().len()
+    };
+    assert_eq!(ledger(), 1);
+    s.core.clock.advance(p.request_retention);
+    s.core.owed_tick();
+    assert_eq!(ledger(), 0, "reclaimed once no limit counts it");
+}
+
+#[test]
+fn a_tick_keeps_the_ledger_an_act_that_read_its_clock_a_moment_before_counts() {
+    use crate::MsgOutcome;
+    let p = MessagingPolicy {
+        request_messages: 1,
+        ..policy()
+    };
+    let s = server_with(p, &[("bob", messaging_bits())]);
+    let (_b, _rb) = taker(&s.core, "bob");
+    let (g, _rg) = guest_at(&s.core, "10.0.1.1");
+    assert_eq!(send(&s.core, g, "bob", "one"), Ok(MsgOutcome::Requested));
+    s.core
+        .clock
+        .advance(p.request_retention - Duration::from_secs(1));
+    // A request reads its clock here, then waits for the hold while a
+    // tick a moment later takes it first.
+    let read = s.core.clock.wall();
+    let counted = || {
+        let since = read - p.request_retention;
+        let sent = s.rel.request_addresses(&Mailbox::login("bob"), since, None);
+        sent.unwrap().len()
+    };
+    assert_eq!(counted(), 1);
+    s.core.clock.advance(Duration::from_secs(2));
+    s.core.owed_tick();
+    assert_eq!(counted(), 1, "still there for the request to count");
+}

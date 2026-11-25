@@ -1190,10 +1190,10 @@ fn a_reset_record_lapses_thirty_days_after_its_last_answer() {
     s.core
         .clock()
         .advance(std::time::Duration::from_secs(30 * DAY - 2));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     assert!(record().is_some(), "kept into its thirtieth day");
     s.core.clock().advance(std::time::Duration::from_secs(2));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     assert_eq!(record(), None, "its bytes gone, its hash kept");
 }
 
@@ -1213,7 +1213,7 @@ fn an_upgrade_waiting_keeps_its_record_and_an_offer_made_again_past_thirty_days(
     s.core
         .clock()
         .advance(std::time::Duration::from_secs(2 * DAY));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     let p = s.rel.presentation(&fp(&bob), &fp(&alice)).unwrap().unwrap();
     assert!(p.reset.is_some(), "kept while the upgrade waits");
     // Asked again, answered as a request asked again is; the one waiting
@@ -1320,7 +1320,7 @@ fn a_tick_waits_for_an_upgrade_offer_judged_on_its_record() {
         let core = s.core.clone();
         std::thread::spawn(move || {
             core.clock().advance(std::time::Duration::from_secs(120));
-            core.reconcile_due(Vec::new());
+            core.owed_tick();
         })
     };
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -4513,7 +4513,7 @@ fn sweep_owed(failing: &'static str, ticks: &[(u64, Owed)]) {
         if owed != Owed::Sweeps {
             s.fail.fail_next(failing);
         }
-        s.core.reconcile_due(Vec::new());
+        s.core.owed_tick();
         s.fail.fail_nth(0);
         let tried = s.fail.failed() == Some(failing);
         assert_eq!(tried, owed == Owed::Fails, "{secs}s on: {owed:?}");
@@ -4562,7 +4562,7 @@ fn offers_an_identity_revocation_could_not_drop_are_dropped_after_a_backoff() {
     assert_eq!(s.fail.failed(), Some("write"));
     assert!(offered(), "kept, and owed");
     s.core.clock().advance(std::time::Duration::from_secs(61));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     assert!(!offered(), "dropped once its backoff is over");
 }
 
@@ -4594,7 +4594,7 @@ fn an_owed_sweep_whose_revocation_lifted_drops_nothing() {
         .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
         .unwrap();
     s.core.clock().advance(std::time::Duration::from_secs(61));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     let roster = s.core.friends_roster(b).unwrap();
     let e = roster.iter().find(|e| e.login == "alice").unwrap();
     assert!(e.offer.is_some(), "an offer signed after the lift kept");
@@ -4702,7 +4702,7 @@ fn a_deleted_accounts_purge_that_cannot_be_done_is_owed_until_it_is() {
     assert_eq!(s.fail.failed(), Some("relationships"));
     assert!(rows() > 0, "nothing purged yet");
     s.core.clock().advance(std::time::Duration::from_secs(61));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     assert_eq!(rows(), 0, "purged once owed");
     let _ = mb;
 }
@@ -4832,7 +4832,7 @@ fn an_owed_sweep_ends_only_on_a_list_that_covers_its_identity() {
         ..Default::default()
     }));
     s.core.clock().advance(std::time::Duration::from_secs(61));
-    s.core.reconcile_due(Vec::new());
+    s.core.owed_tick();
     assert!(!offered(), "still owed, and dropped");
 }
 

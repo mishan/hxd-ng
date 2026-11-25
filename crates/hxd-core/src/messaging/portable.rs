@@ -169,6 +169,15 @@ const UNRECORDED_PER_TICK: usize = 256;
 const SWEEP_BACKOFF: u64 = 60;
 const SWEEP_BACKOFF_MAX: u64 = 3600;
 
+/// So many rows of each kind [`Core::owed_tick`] reclaims a tick, a
+/// minute apart: a backlog drains at that rate.
+const CLEANUP_BATCH: usize = 1000;
+
+/// How long before what it could reclaim [`Core::owed_tick`] stops, a
+/// lapsed row or a ledger entry no limit counts, so that an act reading
+/// at a time it took a moment before still finds what it should.
+const CLEANUP_MARGIN: Duration = Duration::from_secs(3600);
+
 /// Offers owed a drop: a revoked device's, by the operator or by a
 /// registrar, under the identity it signed for; a revoked identity's,
 /// from or to it; or an unlinked one's.
@@ -777,24 +786,6 @@ impl Core {
     /// listed is passed over without reading its rows: a keep of them
     /// marks it due ([`Watched`]).
     pub(crate) fn reconcile_due(&self, listed: impl IntoIterator<Item = [u8; 32]>) {
-        let now = self.clock.unix();
-        if self
-            .offer_sweeps
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|o| o.due <= now)
-        {
-            self.sweep_offers(Vec::new());
-        }
-        if let Some(store) = &self.relationships {
-            // Under the hold an 802 judges a record under, so that none
-            // lapses between the judging and the offer it keeps waiting.
-            let _writing = self.friend_writes();
-            let now = self.clock.wall();
-            let lapsed = store.lapse_resets(now - RESET_KEPT, now);
-            logged("lapsing `Reset` records", lapsed.map(drop));
-        }
         let (Some(_), Some(cache)) = (&self.relationships, &self.record_cache) else {
             return;
         };
@@ -821,6 +812,53 @@ impl Core {
             Err(e) => warn!("relationships: reading the identities with device epochs: {e}"),
         }
         self.judge_floors(due);
+    }
+
+    /// The owed sweeps whose backoff is over, tried again, the `Reset`
+    /// records past [`RESET_KEPT`] lapsed and the rows that lapsed
+    /// reclaimed: the periodic retry of what a failed store call left
+    /// owed, and the housekeeping beside it. Store work, so called off the
+    /// reactor.
+    pub fn owed_tick(&self) {
+        let now = self.clock.unix();
+        if self
+            .offer_sweeps
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.due <= now)
+        {
+            self.sweep_offers(Vec::new());
+        }
+        if let Some(store) = &self.relationships {
+            // Under the hold an 802 judges a record under, so that none
+            // lapses between the judging and the offer it keeps waiting.
+            let _writing = self.friend_writes();
+            let now = self.clock.wall();
+            let lapsed = store.lapse_resets(now - RESET_KEPT, now);
+            logged("lapsing `Reset` records", lapsed.map(drop));
+            // Under it too, since an act reads a row and writes it back
+            // in calls of their own.
+            let (lapsed, ledger) = (now - CLEANUP_MARGIN, self.ledger_read_from(now));
+            let reclaimed = store.cleanup(lapsed, ledger, CLEANUP_BATCH);
+            logged("reclaiming lapsed relationship rows", reclaimed.map(drop));
+        }
+    }
+
+    /// The earliest request ledger entry a limit counts, less
+    /// [`CLEANUP_MARGIN`] for an act whose clock read is that old: a day's
+    /// rates and `request_retention`'s allowance read it back, so
+    /// reclaiming one any later would give its sender a send back early.
+    /// A retry by guid
+    /// is answered from the ledger only this far back; older, it is a new
+    /// request.
+    pub(crate) fn ledger_read_from(&self, now: SystemTime) -> SystemTime {
+        let window = self
+            .messaging_policy
+            .request_retention
+            .max(Duration::from_secs(24 * 3600));
+        now.checked_sub(window + CLEANUP_MARGIN)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
     /// [`Self::judge_floors`] for every identity with epochs kept here, as

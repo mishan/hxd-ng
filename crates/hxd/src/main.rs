@@ -1691,6 +1691,12 @@ async fn main() {
         if let Err(e) = tokio::task::spawn_blocking(move || reconciling.reconcile_kept()).await {
             tracing::error!("judging friendships at start failed: {e}");
         }
+        // Not beside the records sweeper: a server without registrars owes
+        // work too.
+        tokio::spawn(hxd::owed_ticker(
+            ctx.core.clone(),
+            std::time::Duration::from_secs(60),
+        ));
         let link_status = config.link.as_ref().map(hxd::link::status_path);
         let status_writer = match (&hub, &link_status) {
             (Some(hub), Some(path)) => {
