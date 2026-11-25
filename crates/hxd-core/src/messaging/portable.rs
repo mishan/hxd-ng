@@ -3080,18 +3080,27 @@ impl Core {
         }
     }
 
-    /// What `device` presented, for `identity` where one is named,
-    /// dropped, each pair as one step.
+    /// What `device` presented, for `identity` or a key it rotated to
+    /// where one is named, dropped, each pair as one step.
     fn drop_device_presentations(
         &self,
         store: &Arc<dyn RelationshipStore>,
         identity: Option<[u8; 32]>,
         device: &[u8; 32],
     ) -> Result<(), StoreError> {
+        // A rotation re-stamps a presentation's presenter.
+        let keys = match identity {
+            Some(i) => {
+                let next = self.chain_from(store, i)?;
+                let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
+                Some(std::iter::once(i).chain(next).collect::<Vec<_>>())
+            }
+            None => None,
+        };
         let made = store.presented_by(device)?;
         for p in made
             .into_iter()
-            .filter(|p| identity.is_none_or(|i| p.presenter == i))
+            .filter(|p| keys.as_ref().is_none_or(|k| k.contains(&p.presenter)))
         {
             let gone = self.drop_presented(store, &p.presenter, &p.other, &[p.presenter])?;
             for gone in &gone {
