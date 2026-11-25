@@ -416,6 +416,14 @@ async fn a_scrape_accounts_for_a_link_its_ghosts_and_its_end() {
     assert_eq!(value(&text, "hxd_link_establish_seconds_count"), Some(2.0));
     // A link's frames are counted by its transaction types, as a user's are.
     assert!(
+        has(
+            &text,
+            "hxd_frames_total",
+            &["wire=\"legacy\"", "dir=\"in\"", "type=\"900\""]
+        ),
+        "{text}"
+    );
+    assert!(
         !has(&text, "hxd_frames_total", &["type=\"other\""]),
         "{text}"
     );
