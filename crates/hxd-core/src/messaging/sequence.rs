@@ -2589,7 +2589,9 @@ fn try_attach(
 /// once it does not, a restart with a device the operator revoked, and
 /// one doing the drop its revocation owed, and a tick doing an unlink's,
 /// and a freeze doing a revocation's drop kept unwritten, and a floor's
-/// judging, and a restart after a revocation owing its drop was lifted.
+/// judging, and a restart after a revocation owing its drop was lifted,
+/// and a floor and a rotation while the store fails, and an offer a
+/// rotation moved under an identity revoked while it fails.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2654,6 +2656,10 @@ pub const FOUND: &[&[u32]] = &[
     &[3863809839, 1926845451, 1494381365, 3876424443],
     &[1948674675, 3865136571],
     &[608174091, 1073741835, 1073742226],
+    &[1912602624, 3199040019, 3438240477, 2415919262],
+    &[
+        1793414368, 3343849085, 1912602624, 3282849468, 3097260335, 3758105620,
+    ],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
