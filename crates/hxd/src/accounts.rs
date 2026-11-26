@@ -264,10 +264,14 @@ pub fn set_bot(
         password: password.read()?,
         ..Default::default()
     };
-    let account = backend(config)?
+    backend(config)?
         .write_account(&edit, &exists)
         .map_err(|e| refused(login, e))?;
-    Ok(describe(&account))
+    Ok(if on {
+        format!("{login} is a bot; a running server ends its sessions when it reloads")
+    } else {
+        format!("{login} is no longer a bot")
+    })
 }
 
 /// What an edit of an account that must already exist checks.

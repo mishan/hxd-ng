@@ -827,9 +827,10 @@ async fn the_command_line_keeps_accounts_and_a_reload_reaches_their_sessions() {
     assert!(relay.contains("password: none\n  bot: yes"), "{relay}");
     assert!(hxd::accounts::passwd(&config, "relay", &password).is_err());
     assert!(hxd::accounts::set_bot(&config, "frank", true, &none).is_err());
-    let unbotted = hxd::accounts::set_bot(&config, "relay", false, &password).unwrap();
+    hxd::accounts::set_bot(&config, "relay", false, &password).unwrap();
+    let unbotted = hxd::accounts::show(&config, "relay").unwrap();
     assert!(
-        unbotted.contains("password: set") && !unbotted.contains("bot"),
+        unbotted.contains("password: set") && !unbotted.contains("bot:"),
         "{unbotted}"
     );
 
