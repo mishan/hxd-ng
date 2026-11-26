@@ -225,14 +225,17 @@ since a rotation is seen at whichever of several points comes first and
 a server may stop between two stores: the account link first, then
 what the core keeps (`Core::rotate_identity`), and only when all of it
 has landed is the rotation's line written again ending in `moved`. Until
-then it is retried at each start and at every admission of the
-successor, which is refused, as a server error, until they have. Once
+then it is retried at each start and at every admission of the key
+it lands on, which is refused, as a server error, until they have: the
+key reached by following the successor's rotations on, whether or not
+their moves have landed, a held one aside. The moves go to that key
+too, and retries nearest it go first. Once
 the account link has moved, every session still keyed by the
 predecessor ends, a password login to the account included, so nothing
-is written under the old key afterwards. A successor already linked to
-another account keeps that link, and the predecessor's account is left
-linked to the refused key for the operator, since one key cannot hold
-two accounts.
+is written under the old key afterwards. A key it lands on already
+linked to another account keeps that link, and the predecessor's
+account is left linked to the refused key for the operator, since one
+key cannot hold two accounts.
 
 What stays as it was is the record: chat history, the moderation
 trail and its reports, and who an image already sent may be shown to

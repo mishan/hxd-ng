@@ -191,6 +191,33 @@ fn a_rotated_identity_s_avatar_is_its_successor_s() {
 }
 
 #[test]
+fn a_rotation_reads_where_it_lands_and_moves_the_link_under_its_hold() {
+    let core = core();
+    let held = || core.rotations.try_lock().is_err();
+    let (mut landed, mut linked) = (None, None);
+    core.rotate_identity_linking(
+        &[4; 32],
+        &[5; 32],
+        false,
+        |to| {
+            landed = Some(held());
+            [to[0] + 1; 32]
+        },
+        |dest| {
+            linked = Some((held(), *dest));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(landed, Some(true), "where it lands, under the hold");
+    assert_eq!(
+        linked,
+        Some((true, [6; 32])),
+        "the link, there, under the hold"
+    );
+}
+
+#[test]
 fn a_rotation_overtaken_after_its_hold_moves_the_avatar_where_the_rest_went() {
     let core =
         core().with_relationships(Arc::new(crate::relationships::MemoryRelationships::new()));

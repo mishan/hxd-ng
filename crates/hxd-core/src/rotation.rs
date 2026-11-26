@@ -22,7 +22,7 @@ impl Core {
     /// For a caller with no account link to move: see
     /// [`Self::rotate_identity_linking`].
     pub fn rotate_identity(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<(), StoreError> {
-        self.rotate_identity_linking(from, to, false, |_| Ok(()))
+        self.rotate_identity_linking(from, to, false, |to| *to, |_| Ok(()))
     }
 
     /// [`Self::rotate_identity`], moving the account link first, with
@@ -34,12 +34,15 @@ impl Core {
     /// nothing is written there while the rest moves. `at_start` for a
     /// caller on the reactor as the server starts, leaving the
     /// predecessor's friendships to the pass a start makes over them
-    /// ([`Self::reconcile_kept`]).
+    /// ([`Self::reconcile_kept`]). `lands` says, under the hold, where a
+    /// rotation into `to` lands by the caller's record of rotations, for
+    /// the store's moves to resolve further.
     pub fn rotate_identity_linking(
         &self,
         from: &[u8; 32],
         to: &[u8; 32],
         at_start: bool,
+        lands: impl FnOnce(&[u8; 32]) -> [u8; 32],
         link: impl FnOnce(&[u8; 32]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         // A rotation to itself moves nothing.
@@ -55,6 +58,7 @@ impl Core {
         // for one key whichever stands; and no act finds the store moved
         // and the roster not.
         let writing = self.friend_writes();
+        let to = &lands(to);
         let dest = match self.relationships.as_ref() {
             Some(store) => destination(from, to, store.moved(to)?).unwrap_or(*to),
             None => *to,
