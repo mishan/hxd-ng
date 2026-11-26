@@ -439,6 +439,10 @@ struct Run {
     revoked: HashSet<[u8; 32]>,
     /// Ids that were active with evidence both ways.
     portable: HashSet<RelationId>,
+    /// The keys unlinked this step.
+    unlinking: Vec<[u8; 32]>,
+    /// What the pairs a rotation this step moved onto held before it.
+    at_successor: Vec<Presentation>,
     /// The withdrawals answered as taken, with their signer, while one
     /// that stands holds as far.
     withdrawn: Vec<(usize, Vec<u8>)>,
@@ -645,6 +649,8 @@ impl Run {
             refused_over: false,
             covered: HashSet::new(),
             ever_owed: Vec::new(),
+            unlinking: Vec::new(),
+            at_successor: Vec::new(),
             unread: HashSet::new(),
         }
     }
@@ -1196,6 +1202,11 @@ impl Run {
         if linked[0] {
             self.dir.0.lock().unwrap()[p].0.fingerprint = Some(to);
         }
+        let other = self.people[1 - p].fp();
+        for (x, y) in [(to, other), (other, to)] {
+            self.at_successor
+                .extend(self.store.presentation(&x, &y).unwrap());
+        }
         self.core.keep_rotation_record(&record);
         // One that fails, its record kept, is made again with nothing
         // failing, as the successor's next login would, so that what
@@ -1468,12 +1479,15 @@ impl Run {
 
     /// `p`'s account gives up its link to `fp`, as the identity layer
     /// unlinks: refused where its drops cannot be owed.
-    fn unlink(&self, p: usize, fp: &[u8; 32]) -> bool {
+    fn unlink(&mut self, p: usize, fp: &[u8; 32]) -> bool {
         let unlinked = self.core.friendships_unlinking(fp, |owe| {
             owe()?;
             self.dir.0.lock().unwrap()[p].0.fingerprint = None;
             Ok::<_, crate::inbox::StoreError>(())
         });
+        if unlinked.is_ok() {
+            self.unlinking.push(*fp);
+        }
         unlinked.is_ok()
     }
 
@@ -1706,7 +1720,9 @@ impl Run {
         let free = before.friendship.is_none() && !mine;
         let predecessor = self.names_a_predecessor();
         let owed = self.store.owed().unwrap();
-        let unwritten = self.core.owed_unwritten();
+        let presented = self.presentations();
+        self.unlinking.clear();
+        self.at_successor.clear();
         let upgrading = self.upgrading_now();
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
@@ -1779,30 +1795,22 @@ impl Run {
         // An ending is told to each session of both once, a removal only
         // once committed, and only what removes or withdraws, or a
         // presentation, which judges the other party's (§6), ends an edge
-        // that was not its presentations' alone. One that was may also end
-        // by what drops presentations, including owed work a later step
-        // does.
+        // that was not its presentations' alone. Any step may end one that
+        // was, once the evidence it stood on no longer stands, and no other
+        // step while it does.
         let ended = before.friendship.is_some() && after.friendship != before.friendship;
-        let ends = matches!(
-            step,
-            Step::Remove { .. }
-                | Step::BlockWithdrawal
-                | Step::Block
-                | Step::PresentWithdrawal { .. }
-                | Step::RemoveByKey
-                | Step::Present { .. }
-        ) || ((matches!(
-            step,
-            Step::Link
-                | Step::Unlink
-                | Step::Restart
-                | Step::Revoke
-                | Step::Floor { .. }
-                | Step::PublishDevice { .. }
-                | Step::RevokeIdentity
-                | Step::Rotate { .. }
-        ) || self.did_owed_drops(&owed, &unwritten))
-            && before.evidence == [true, true]);
+        let lost = before.evidence == [true, true]
+            && presented.iter().any(|x| !self.stands(x, &presented));
+        let ends = lost
+            || matches!(
+                step,
+                Step::Remove { .. }
+                    | Step::BlockWithdrawal
+                    | Step::Block
+                    | Step::PresentWithdrawal { .. }
+                    | Step::RemoveByKey
+                    | Step::Present { .. }
+            );
         assert!(
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
@@ -1973,29 +1981,27 @@ impl Run {
         self.shown(&what, !lapsing, blocking, folds);
     }
 
-    /// Whether a step did work owed before it, in the store or kept
-    /// unwritten, that drops presentations: gone and done, not merely
-    /// written to the store or lifted. Any step that sweeps may end what
-    /// that work's own step would have.
-    fn did_owed_drops(&self, owed: &[Owed], unwritten: &[(Work, Cause)]) -> bool {
-        let drops = |w: &Work| {
-            matches!(
-                w,
-                Work::DropPresentedBy { .. } | Work::DropPresentationsOf(_) | Work::Judge(..)
-            )
-        };
-        let (owed_now, unwritten_now) = (self.store.owed().unwrap(), self.core.owed_unwritten());
-        let stored = (owed.iter().filter(|o| drops(&o.work)))
-            .any(|o| !owed_now.iter().any(|n| n.id == o.id) && self.done(&o.work));
-        // One flushed is a row new this step, under its cause.
-        let flushed = |c: &Cause| {
-            (owed_now.iter())
-                .any(|n| n.cause == *c && drops(&n.work) && !owed.iter().any(|o| o.id == n.id))
-        };
-        let kept = (unwritten.iter().filter(|(w, _)| drops(w))).any(|(w, c)| {
-            !unwritten_now.iter().any(|(n, m)| n == w && m == c) && !flushed(c) && self.done(w)
-        });
-        stored || kept
+    /// Whether a presentation taken before a step still stands as
+    /// evidence after it, by the run's own account: its presenting device
+    /// revoked by neither the operator nor a registrar's list, installed or
+    /// held over a restart; its identity not unlinked, now or in the step;
+    /// its friendship not shown below the floors; and not displaced by
+    /// another that the pair a rotation this step moved it onto held,
+    /// which the rotation keeps. A registrar's revocation of the identity
+    /// drops offers alone, so it leaves the presentation standing.
+    fn stands(&self, p: &Presentation, all: &[Presentation]) -> bool {
+        let chain = self.chain(&p.presenter);
+        let listed = self.unpublished.as_ref().map_or(&self.listed, |(l, _)| l);
+        let current = |k: &[u8; 32]| *self.chain(k).last().expect("a key");
+        let (by, to) = (current(&p.presenter), current(&p.other));
+        let displaced = (self.at_successor.iter())
+            .any(|x| (x.presenter, x.other) == (by, to) && x.hash != p.hash);
+        !displaced
+            && !self.revoked.contains(&p.device)
+            && !(listed.devices.iter()).any(|(i, d)| *d == p.device && chain.contains(i))
+            && self.chain_linked(&p.presenter)
+            && !self.unlinking.iter().any(|k| chain.contains(k))
+            && self.judged(p, all) != Some(false)
     }
 
     /// Each piece of work owed before a step, matched by its id, and gone
@@ -2582,7 +2588,8 @@ fn try_attach(
 /// a request lapsing while the store fails, and one a block drops, read
 /// once it does not, a restart with a device the operator revoked, and
 /// one doing the drop its revocation owed, and a tick doing an unlink's,
-/// and a freeze doing a revocation's drop kept unwritten.
+/// and a freeze doing a revocation's drop kept unwritten, and a floor's
+/// judging, and a restart after a revocation owing its drop was lifted.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2645,6 +2652,8 @@ pub const FOUND: &[&[u32]] = &[
     &[287656251, 122038571, 3969193906],
     &[15777745, 2791398592, 610125010],
     &[3863809839, 1926845451, 1494381365, 3876424443],
+    &[1948674675, 3865136571],
+    &[608174091, 1073741835, 1073742226],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
