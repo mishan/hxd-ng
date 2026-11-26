@@ -8,9 +8,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    AccountUpdate, Birthdate, Charge, Ending, HeldWithdrawal, Ignore, IgnoreMode, LedgerEntry,
-    MessagingAccount, PendingOut, Presentation, Profile, Recorded, RelationshipStore, Report,
-    RequestKind, Requester, StoredOffer,
+    AccountUpdate, Birthdate, Cause, Charge, Ending, HeldWithdrawal, Ignore, IgnoreMode,
+    LedgerEntry, MessagingAccount, PendingOut, Presentation, Profile, Recorded, RelationshipStore,
+    Report, RequestKind, Requester, StoredOffer, Work,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent};
 
@@ -69,6 +69,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     a_write_is_whole_or_not_at_all_and_reports_what_it_left(&*new_store());
     an_older_cutoff_kept_by_an_ending_still_holds_the_owner_to_its_cap(&*new_store());
     a_block_ends_the_requests_and_approvals_either_way(&*new_store());
+    owed_work_is_one_piece_per_owe_until_settled(&*new_store());
+    #[cfg(any(test, feature = "test-support"))]
+    owed_work_is_written_and_settled_whole_with_its_write(&*new_store());
+    a_rotation_moves_owed_work_and_folds_what_it_duplicates(&*new_store());
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -2541,5 +2545,278 @@ fn a_merged_pending_out_goes_with_its_record(s: &dyn RelationshipStore) {
         s.offer(&fp(5), &fp(2), at(10)).unwrap(),
         None,
         "{case}: nor its offer"
+    );
+}
+
+/// One of every kind of work, each under a cause of its own.
+fn every_owed() -> Vec<(Work, Cause)> {
+    vec![
+        (
+            Work::DropOffersBy {
+                under: Some(fp(1)),
+                device: fp(7),
+            },
+            Cause::PublishedDevice {
+                identity: fp(1),
+                device: fp(7),
+            },
+        ),
+        (
+            Work::DropOffersBy {
+                under: None,
+                device: fp(7),
+            },
+            Cause::OperatorDevice(fp(7)),
+        ),
+        (
+            Work::DropOffersNaming(fp(1)),
+            Cause::OperatorIdentity(fp(1)),
+        ),
+        (
+            Work::DropOffersNaming(fp(1)),
+            Cause::PublishedIdentity(fp(1)),
+        ),
+        (
+            Work::DropPresentedBy {
+                under: Some(fp(1)),
+                device: fp(7),
+            },
+            Cause::PublishedDevice {
+                identity: fp(1),
+                device: fp(7),
+            },
+        ),
+        (
+            Work::DropPresentedBy {
+                under: None,
+                device: fp(7),
+            },
+            Cause::OperatorDevice(fp(7)),
+        ),
+        (Work::DropPresentationsOf(fp(1)), Cause::Unlinked),
+        (Work::Judge(fp(1), fp(2)), Cause::Always),
+        (Work::Judge(fp(2), fp(1)), Cause::Always),
+        (Work::Settle(fp(1)), Cause::Always),
+    ]
+}
+
+fn owed_work_is_one_piece_per_owe_until_settled(s: &dyn RelationshipStore) {
+    let case = "owed_work_is_one_piece_per_owe_until_settled";
+    let every = every_owed();
+    let ids = s.owe(&every).unwrap();
+    let mut distinct = ids.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), every.len(), "{case}: one id each: {ids:?}");
+    let read = |s: &dyn RelationshipStore| {
+        s.owed()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.id, (o.work, o.cause)))
+            .collect::<Vec<_>>()
+    };
+    let want: Vec<_> = ids.iter().copied().zip(every.iter().cloned()).collect();
+    assert_eq!(read(s), want, "{case}: read back whole, oldest first");
+    let again = [every[2].clone(), every[0].clone(), every[2].clone()];
+    assert_eq!(
+        s.owe(&again).unwrap(),
+        [ids[2], ids[0], ids[2]],
+        "{case}: owed again is the same piece"
+    );
+    assert_eq!(read(s), want, "{case}: and no more of it");
+    s.settle(&[ids[0], ids[3], ids[0], 1 << 40]).unwrap();
+    let left: Vec<_> = (want.iter().enumerate())
+        .filter(|(i, _)| ![0, 3].contains(i))
+        .map(|(_, w)| w.clone())
+        .collect();
+    assert_eq!(read(s), left, "{case}: settled, the rest untouched");
+    s.settle(&ids).unwrap();
+    let anew = s.owe(&every[..1]).unwrap()[0];
+    assert!(!ids.contains(&anew), "{case}: an id is never reused");
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn owed_work_is_written_and_settled_whole_with_its_write(s: &dyn RelationshipStore) {
+    use super::{Did, Part};
+    let case = "owed_work_is_written_and_settled_whole_with_its_write";
+    let every = every_owed();
+    let kept = s.owe(&every[..1]).unwrap()[0];
+    let owe = |i: usize| Part::Owe(every[i].0.clone(), every[i].1.clone());
+    let failing = [
+        Part::Present(presentation(2, 1, 2, 7)),
+        owe(1),
+        Part::Settle(kept),
+        owe(2),
+        Part::Fail,
+    ];
+    assert!(
+        s.write(&failing, &Report::none()).is_err(),
+        "{case}: failed"
+    );
+    let owed = s.owed().unwrap();
+    assert_eq!(
+        owed.iter().map(|o| o.id).collect::<Vec<_>>(),
+        [kept],
+        "{case}: nothing owed or settled: {owed:?}"
+    );
+    assert_eq!(s.presentation(&fp(2), &fp(1)).unwrap(), None, "{case}");
+    let (did, _) = s
+        .write(&[owe(1), Part::Settle(kept), owe(1)], &Report::none())
+        .unwrap();
+    let Did::Owed(id) = did[0] else {
+        panic!("{case}: answered {did:?}")
+    };
+    assert_eq!(
+        did,
+        [Did::Owed(id), Did::Nothing, Did::Owed(id)],
+        "{case}: answered"
+    );
+    let owed = s.owed().unwrap();
+    assert_eq!(
+        owed.iter()
+            .map(|o| (o.id, o.work.clone()))
+            .collect::<Vec<_>>(),
+        [(id, every[1].0.clone())],
+        "{case}: owed and settled"
+    );
+}
+
+fn a_rotation_moves_owed_work_and_folds_what_it_duplicates(s: &dyn RelationshipStore) {
+    let case = "a_rotation_moves_owed_work_and_folds_what_it_duplicates";
+    let owing = [
+        (Work::Judge(fp(1), fp(3)), Cause::Always),
+        (Work::Judge(fp(3), fp(1)), Cause::Always),
+        (
+            Work::DropOffersNaming(fp(1)),
+            Cause::OperatorIdentity(fp(1)),
+        ),
+        (
+            Work::DropPresentedBy {
+                under: Some(fp(1)),
+                device: fp(1),
+            },
+            Cause::PublishedDevice {
+                identity: fp(1),
+                device: fp(1),
+            },
+        ),
+        (Work::Settle(fp(1)), Cause::Always),
+        (Work::Settle(fp(2)), Cause::Always),
+        (Work::DropPresentationsOf(fp(3)), Cause::Unlinked),
+        (Work::DropPresentationsOf(fp(1)), Cause::Unlinked),
+        (Work::DropPresentationsOf(fp(2)), Cause::Unlinked),
+        (Work::Judge(fp(4), fp(3)), Cause::Always),
+        (
+            Work::DropOffersNaming(fp(2)),
+            Cause::PublishedIdentity(fp(2)),
+        ),
+        (Work::Judge(fp(1), fp(2)), Cause::Always),
+        (Work::Judge(fp(2), fp(1)), Cause::Always),
+        (
+            Work::DropOffersBy {
+                under: Some(fp(1)),
+                device: fp(1),
+            },
+            Cause::Always,
+        ),
+        (
+            Work::DropOffersBy {
+                under: None,
+                device: fp(1),
+            },
+            Cause::Always,
+        ),
+    ];
+    let ids = s.owe(&owing).unwrap();
+    let rekeyed = s.rotate(&fp(1), &fp(2)).unwrap();
+    assert_eq!(
+        rekeyed.owed_merged,
+        [(ids[4], ids[5]), (ids[7], ids[8]), (ids[12], ids[11])],
+        "{case}: folded into what the successor owed"
+    );
+    let read = || {
+        s.owed()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.id, o.work, o.cause))
+            .collect::<Vec<_>>()
+    };
+    let at = |i: usize, work: Work| (ids[i], work, owing[i].1.clone());
+    assert_eq!(
+        read(),
+        [
+            at(0, Work::Judge(fp(2), fp(3))),
+            at(1, Work::Judge(fp(3), fp(2))),
+            at(2, Work::DropOffersNaming(fp(2))),
+            at(
+                3,
+                Work::DropPresentedBy {
+                    under: Some(fp(2)),
+                    device: fp(1),
+                }
+            ),
+            at(5, Work::Settle(fp(2))),
+            at(6, Work::DropPresentationsOf(fp(3))),
+            at(8, Work::DropPresentationsOf(fp(2))),
+            at(9, Work::Judge(fp(4), fp(3))),
+            at(10, Work::DropOffersNaming(fp(2))),
+            at(11, Work::Judge(fp(2), fp(2))),
+            at(
+                13,
+                Work::DropOffersBy {
+                    under: Some(fp(2)),
+                    device: fp(1),
+                }
+            ),
+            at(
+                14,
+                Work::DropOffersBy {
+                    under: None,
+                    device: fp(1),
+                }
+            ),
+        ],
+        "{case}: keys moved, devices and causes as they were"
+    );
+    let rekeyed = s.rotate(&fp(2), &fp(4)).unwrap();
+    assert_eq!(
+        rekeyed.owed_merged,
+        [(ids[0], ids[9])],
+        "{case}: a second hop folds too"
+    );
+    assert_eq!(
+        read(),
+        [
+            at(1, Work::Judge(fp(3), fp(4))),
+            at(2, Work::DropOffersNaming(fp(4))),
+            at(
+                3,
+                Work::DropPresentedBy {
+                    under: Some(fp(4)),
+                    device: fp(1),
+                }
+            ),
+            at(5, Work::Settle(fp(4))),
+            at(6, Work::DropPresentationsOf(fp(3))),
+            at(8, Work::DropPresentationsOf(fp(4))),
+            at(9, Work::Judge(fp(4), fp(3))),
+            at(10, Work::DropOffersNaming(fp(4))),
+            at(11, Work::Judge(fp(4), fp(4))),
+            at(
+                13,
+                Work::DropOffersBy {
+                    under: Some(fp(4)),
+                    device: fp(1),
+                }
+            ),
+            at(
+                14,
+                Work::DropOffersBy {
+                    under: None,
+                    device: fp(1),
+                }
+            ),
+        ],
+        "{case}: two hops"
     );
 }

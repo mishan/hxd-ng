@@ -7,9 +7,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use super::{
-    AccountUpdate, Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry, Left,
-    MessagingAccount, Part, PendingOut, Presentation, Recorded, Rekeyed, RelationId, Relationship,
-    RelationshipStore, Report, RequestKind, Requester, RotationRecord, StoredOffer,
+    AccountUpdate, Cause, Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Ignore, LedgerEntry,
+    Left, MessagingAccount, Owed, OwedId, Part, PendingOut, Presentation, Recorded, Rekeyed,
+    RelationId, Relationship, RelationshipStore, Report, RequestKind, Requester, RotationRecord,
+    StoredOffer, Work,
 };
 use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 
@@ -41,6 +42,7 @@ pub(crate) const READS: &[&str] = &[
     "offerers",
     "rotation_from",
     "rotation_to",
+    "owed",
     "account",
     "claimable",
     "purge_count",
@@ -321,6 +323,9 @@ through! {
     fn keep_rotation(from: &[u8; 32], to: &[u8; 32], record: &[u8]) -> Result<(), StoreError>;
     fn rotation_from(from: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
     fn rotation_to(to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
+    fn owe(owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError>;
+    fn owed() -> Result<Vec<Owed>, StoreError>;
+    fn settle(ids: &[OwedId]) -> Result<(), StoreError>;
     fn account(of: &Mailbox) -> Result<MessagingAccount, StoreError>;
     fn update_account(of: &Mailbox, update: &AccountUpdate) -> Result<(), StoreError>;
     fn claim(login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;

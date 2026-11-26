@@ -292,6 +292,9 @@ pub struct Rekeyed {
     /// The edges those drops ended, by the drop rule
     /// [`RelationshipStore::drop_presentations`] keeps.
     pub ended: Vec<EndedEdge>,
+    /// A rotation's: `(lost, kept)`, owed work re-stamped into the same
+    /// work already owed, which stands in its place.
+    pub owed_merged: Vec<(OwedId, OwedId)>,
 }
 
 /// Who sent a request, as its bounds and holds count it: an account by
@@ -448,6 +451,8 @@ pub enum Part {
     SetAlias(Mailbox, Mailbox, Option<String>),
     SetBlocked(Mailbox, Mailbox, bool, SystemTime),
     SetPendingOut(Mailbox, Mailbox, Option<PendingOut>),
+    Owe(Work, Cause),
+    Settle(OwedId),
     /// Fails the write where it stands, for a test of all or nothing.
     #[cfg(any(test, feature = "test-support"))]
     Fail,
@@ -473,6 +478,7 @@ pub enum Did {
     Reset(Vec<Ended>, Option<Presentation>),
     Named(Vec<FpPair>),
     Friends(RelationId),
+    Owed(OwedId),
 }
 
 /// A request counted as [`RelationshipStore::ask`] records it: its ledger
@@ -677,6 +683,62 @@ pub type FpPair = ([u8; 32], [u8; 32]);
 
 /// The other key of a rotation, and its record as it was published.
 pub type RotationRecord = ([u8; 32], Vec<u8>);
+
+/// A piece of owed friendship work's id: never reused, so work settled
+/// and owed again is a new piece.
+pub type OwedId = u64;
+
+/// The rows a piece of owed friendship work acts on. A rotation re-stamps
+/// every identity key here, never a device, in the step that moves the
+/// rows ([`RelationshipStore::rotate`]), so the work is found where they
+/// went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Work {
+    /// The offers a device signed: under an identity, or under any.
+    DropOffersBy {
+        under: Option<[u8; 32]>,
+        device: [u8; 32],
+    },
+    /// Every offer from or to a key.
+    DropOffersNaming([u8; 32]),
+    /// The presentations a device signed: its presenter under an
+    /// identity, or any.
+    DropPresentedBy {
+        under: Option<[u8; 32]>,
+        device: [u8; 32],
+    },
+    /// Every presentation a key made.
+    DropPresentationsOf([u8; 32]),
+    /// What two keys hold of each other, judged again.
+    Judge([u8; 32], [u8; 32]),
+    /// A key's pairs settled as a merge would have left them.
+    Settle([u8; 32]),
+}
+
+/// What keeps a piece of work owed. Never re-stamped: a revocation names
+/// the key it revoked, not where that key's rows went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cause {
+    OperatorDevice([u8; 32]),
+    OperatorIdentity([u8; 32]),
+    PublishedDevice {
+        identity: [u8; 32],
+        device: [u8; 32],
+    },
+    PublishedIdentity([u8; 32]),
+    /// No account links the work's own key.
+    Unlinked,
+    /// Owed until done.
+    Always,
+}
+
+/// A piece of work owed, as [`RelationshipStore::owed`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owed {
+    pub id: OwedId,
+    pub work: Work,
+    pub cause: Cause,
+}
 
 /// The relationship store, behind a trait as the inbox is, so the
 /// in-memory store can carry the domain's tests and SQLite's the server.
@@ -1088,6 +1150,18 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// The rotation to `to`, as its predecessor and its record.
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError>;
 
+    // --- Owed work ---------------------------------------------------------
+
+    /// Record each piece of work, as one step, answering its id in order:
+    /// work already owed for the same cause is kept, and its id answered.
+    fn owe(&self, owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError>;
+
+    /// Every piece of work owed, oldest first.
+    fn owed(&self) -> Result<Vec<Owed>, StoreError>;
+
+    /// Done or moot: gone. An id already gone is not an error.
+    fn settle(&self, ids: &[OwedId]) -> Result<(), StoreError>;
+
     // --- The account -------------------------------------------------------
 
     /// What `of` keeps about itself; the defaults where it has kept
@@ -1114,7 +1188,9 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// already holding one for the same other party keeps its own, and a
     /// pair that had evidence both ways and has it no more ends its edge.
     /// An offer to `from`, which names it, goes, as
-    /// [`RelationshipStore::drop_offers`] drops one.
+    /// [`RelationshipStore::drop_offers`] drops one. Owed work moves with
+    /// the rows, its causes left as they were: one piece that becomes the
+    /// same as another already owed is folded into it.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         self.rotate_reporting(from, to, &Report::none())
             .map(|(rekeyed, _)| rekeyed)
