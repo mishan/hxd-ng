@@ -684,6 +684,7 @@ impl RosterInner {
             remote: Some(g.remote.clone()),
             roles: Vec::new(),
             role_color: None,
+            bot: false,
             pronouns: None,
         }
     }

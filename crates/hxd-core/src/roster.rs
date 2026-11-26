@@ -395,6 +395,8 @@ pub struct UserInfo {
     /// The pronouns it shows (`crate::pronouns`), which only the ng wire
     /// shows on a row.
     pub pronouns: Option<String>,
+    /// Its account is a bot's (`AccountConfig::bot`).
+    pub bot: bool,
 }
 
 /// The fuller view one session may request of another (the user-info op).
@@ -2168,6 +2170,9 @@ pub struct Core {
     pub(crate) inbox_policy: InboxPolicy,
     /// What `[messaging]` says (`crate::messaging`).
     pub(crate) messaging_policy: crate::messaging::MessagingPolicy,
+    /// What the classic wire appends to a bot's nick
+    /// (`[server] bot_suffix`); empty for nothing.
+    pub(crate) bot_suffix: String,
     pub(crate) request_keyer: crate::relationships::RequestKeyer,
     /// Held across a relationship store write and the roster's copy of
     /// what it changed, and across loading a mailbox's friends, so the
@@ -2459,6 +2464,15 @@ pub(crate) struct InboxFlush;
 pub(crate) struct PmReactions;
 
 impl Core {
+    pub fn with_bot_suffix(mut self, suffix: String) -> Self {
+        self.bot_suffix = suffix;
+        self
+    }
+
+    pub fn bot_suffix(&self) -> &str {
+        &self.bot_suffix
+    }
+
     pub fn new() -> Self {
         let core = Self::default();
         // One clock: a test that moves the core's moves what the roster
@@ -2853,6 +2867,7 @@ impl Core {
                     roles,
                     role_color,
                     pronouns,
+                    bot: info.account.as_deref().is_some_and(crate::Account::is_bot),
                 },
                 access: info.access,
                 login: info.login,
@@ -3557,30 +3572,38 @@ pub(crate) fn test_attach_on(
 ) -> (Uid, Events) {
     let (uid, rx) = core
         .attach(AttachInfo {
-            account: None,
-            nick: nick.to_string(),
-            icon: 1,
-            admin: false,
-            access,
-            login: nick.to_string(),
-            addr: None,
-            can_detach: false,
             transport,
-            has_inbox: false,
-            attach_news: false,
-            set_avatar: false,
-            moderate: false,
-            can_spam: false,
-            manage_rooms: false,
-            set_subject: false,
-            is_person: false,
-            reads_on_delivery: false,
-            identity: None,
-            system: false,
+            ..test_attach_info(nick, access)
         })
         .unwrap();
     core.announce(uid);
     (uid, rx)
+}
+
+#[cfg(test)]
+pub(crate) fn test_attach_info(nick: &str, access: AccessBits) -> AttachInfo {
+    AttachInfo {
+        account: None,
+        nick: nick.to_string(),
+        icon: 1,
+        admin: false,
+        access,
+        login: nick.to_string(),
+        addr: None,
+        can_detach: false,
+        transport: Transport::default(),
+        has_inbox: false,
+        attach_news: false,
+        set_avatar: false,
+        moderate: false,
+        can_spam: false,
+        manage_rooms: false,
+        set_subject: false,
+        is_person: false,
+        reads_on_delivery: false,
+        identity: None,
+        system: false,
+    }
 }
 
 #[cfg(test)]

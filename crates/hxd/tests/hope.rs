@@ -539,3 +539,29 @@ async fn a_chacha20_poly1305_download_and_upload_are_sealed() {
         data
     );
 }
+
+#[tokio::test]
+async fn no_password_reaches_a_bot_by_a_plain_login_hope_or_ng() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), "").await;
+    // One with no password, which "" would open but for its being a
+    // bot, and one with a password written in by hand.
+    for (login, text) in [("open", ""), ("relay", "password = \"pw\"\n")] {
+        let path = dir.path().join(format!("accounts/{login}.toml"));
+        std::fs::write(path, format!("bot = true\n{text}")).unwrap();
+    }
+    for (account, password) in [("open", ""), ("relay", ""), ("relay", "pw")] {
+        let login = Login::account("r", account, password);
+        let mut c = Client::connect(s.legacy).await.unwrap();
+        let plain = c.login(&login).await;
+        assert!(matches!(plain, Err(Error::Refused { .. })), "{password:?}");
+        // Refused as a wrong password is.
+        let hoped = hope(s.legacy, &offer(&[Cipher::Blowfish], &[]), &login).await;
+        assert!(hoped.is_err(), "{password:?}");
+        let ng = ng::Client::account(s.ng, account, password, "r").await;
+        match ng {
+            Err(Error::Refused { code, .. }) => assert_eq!(code, "login_failed"),
+            other => panic!("{password:?}: {:?}", other.map(|_| ())),
+        }
+    }
+}

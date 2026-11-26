@@ -46,6 +46,9 @@ fn account_json(a: &Account) -> Value {
     v["login"] = json!(a.login);
     v["name"] = json!(a.name);
     v["password"] = json!(a.has_password);
+    if a.is_bot() {
+        v["bot"] = json!(true);
+    }
     if let Some(fp) = &a.identity.fingerprint {
         v["identity"] = json!(hl_identity::Fingerprint(*fp).to_string());
     }
@@ -105,6 +108,7 @@ fn admin_err(e: AdminError) -> (&'static str, String) {
         AdminError::RoleInUse => "role_in_use",
         AdminError::Exists => "already_exists",
         AdminError::InvalidLogin => "invalid_login",
+        AdminError::BadBot(_) => "bad_request",
         AdminError::Unsupported => "not_available",
         AdminError::Backend(e) => {
             tracing::warn!("account administration failed: {e}");

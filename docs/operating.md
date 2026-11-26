@@ -863,6 +863,8 @@ classic = true          # false: ng clients only, nothing of the classic
                         # wire listened for (Ports and the network)
 coalesce = false        # true: a person's sessions are one user (Persons)
 pronouns = true         # false: no pronouns shown or set (system-account.md §3)
+bot_suffix = ""         # appended to a bot account's nick on the classic wire
+                        # alone, at most 12 bytes: " [bot]", say
 name = "hxd-ng"
 version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10

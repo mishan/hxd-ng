@@ -11,7 +11,7 @@
 use hxd_auth_file::{edit_listed, FileAuth, EVERYONE};
 use hxd_core::access::{self, AccessBits};
 use hxd_core::account::FIELD_MAX_CHARS;
-use hxd_core::{Account, AccountAdmin, AccountEdit, AdminError};
+use hxd_core::{Account, AccountAdmin, AccountEdit, AdminError, RoleChange};
 
 use crate::Config;
 
@@ -129,6 +129,9 @@ fn describe(a: &Account) -> String {
         a.name,
         if a.has_password { "set" } else { "none" }
     );
+    if a.is_bot() {
+        out += "  bot: yes\n";
+    }
     if let Some(fp) = &a.identity.fingerprint {
         out += &format!("  identity: {}\n", hl_identity::Fingerprint(*fp));
     }
@@ -151,7 +154,7 @@ pub fn list(config: &Config) -> Result<String, String> {
         .iter()
         .map(|a| {
             format!(
-                "{:<20} {:<24} {}{}",
+                "{:<20} {:<24} {}{}{}",
                 a.login,
                 a.name,
                 if a.has_password {
@@ -163,7 +166,8 @@ pub fn list(config: &Config) -> Result<String, String> {
                     ", identity"
                 } else {
                     ""
-                }
+                },
+                if a.is_bot() { ", bot" } else { "" }
             )
         })
         .collect::<Vec<_>>()
@@ -188,7 +192,7 @@ pub fn show(config: &Config, login: &str) -> Result<String, String> {
 
 /// `hxd account add <login>`: access from `--access`, else the roles
 /// and `[access]` keys of the account `--like` names, else what
-/// `everyone` gives.
+/// `everyone` gives. A bot is given the role `bots` where there is one.
 pub fn add(
     config: &Config,
     login: &str,
@@ -196,22 +200,30 @@ pub fn add(
     like: Option<&str>,
     access: Option<&str>,
     password: &Password,
+    bot: bool,
 ) -> Result<String, String> {
     let auth = backend(config)?;
     let template = like
         .map(|like| auth.document(like).map_err(|e| refused(like, e)))
         .transpose()?;
-    // With no list, a new account follows `everyone` rather than
-    // withholding what it grants.
+    let roles: Vec<String> = if bot && auth.roles().get(BOTS).is_some() {
+        vec![BOTS.into()]
+    } else {
+        Vec::new()
+    };
+    // With no list, a new account follows its roles rather than
+    // withholding what they grant.
     let access = access
         .map(parse_access)
         .transpose()?
-        .unwrap_or_else(|| auth.roles().granted(&[]));
+        .unwrap_or_else(|| auth.roles().granted(&roles));
     let edit = AccountEdit {
         login: login.to_owned(),
         name,
         password: password.read()?,
         access: Some(access),
+        bot: bot.then_some(true),
+        roles: roles.into_iter().map(RoleChange::Add).collect(),
         ..Default::default()
     };
     let mut account = auth
@@ -233,6 +245,33 @@ pub fn add(
             .map_err(|e| refused(login, e))?;
     }
     Ok(describe(&account))
+}
+
+/// The role `hxd account add --bot` gives, if the roles file has it.
+const BOTS: &str = "bots";
+
+/// `hxd account bot <login> on|off`. Off, the account is given the
+/// password `password` reads, since without one it would open to "".
+pub fn set_bot(
+    config: &Config,
+    login: &str,
+    on: bool,
+    password: &Password,
+) -> Result<String, String> {
+    let edit = AccountEdit {
+        login: login.to_owned(),
+        bot: Some(on),
+        password: password.read()?,
+        ..Default::default()
+    };
+    backend(config)?
+        .write_account(&edit, &exists)
+        .map_err(|e| refused(login, e))?;
+    Ok(if on {
+        format!("{login} is a bot; a running server ends its sessions when it reloads")
+    } else {
+        format!("{login} is no longer a bot")
+    })
 }
 
 /// What an edit of an account that must already exist checks.
@@ -272,10 +311,9 @@ pub fn set_access(config: &Config, login: &str, changes: &[String]) -> Result<St
             Ok((key, b, on))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let had = auth
-        .read_account(login)
-        .map_err(|e| refused(login, e))?
-        .access;
+    let account = auth.read_account(login).map_err(|e| refused(login, e))?;
+    // What derives away, as a bot's messaging does, is still granted.
+    let had = AccessBits::from_raw(account.access.raw() | account.config.access.raw());
     let account = auth
         .edit_account(login, |doc| {
             let table = doc["access"]

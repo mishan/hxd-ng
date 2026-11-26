@@ -815,12 +815,24 @@ async fn the_command_line_keeps_accounts_and_a_reload_reaches_their_sessions() {
         Some("guest"),
         None,
         &password,
+        false,
     )
     .unwrap();
     assert!(added.contains("password: set"), "{added}");
     assert!(hxd::accounts::list(&config).unwrap().contains("frank"));
-    assert!(hxd::accounts::add(&config, "frank", None, None, None, &password).is_err());
-    assert!(hxd::accounts::add(&config, "@mods", None, None, None, &password).is_err());
+    assert!(hxd::accounts::add(&config, "frank", None, None, None, &password, false).is_err());
+    assert!(hxd::accounts::add(&config, "@mods", None, None, None, &password, false).is_err());
+    let none = hxd::accounts::Password::None;
+    let relay = hxd::accounts::add(&config, "relay", None, None, None, &none, true).unwrap();
+    assert!(relay.contains("password: none\n  bot: yes"), "{relay}");
+    assert!(hxd::accounts::passwd(&config, "relay", &password).is_err());
+    assert!(hxd::accounts::set_bot(&config, "frank", true, &none).is_err());
+    hxd::accounts::set_bot(&config, "relay", false, &password).unwrap();
+    let unbotted = hxd::accounts::show(&config, "relay").unwrap();
+    assert!(
+        unbotted.contains("password: set") && !unbotted.contains("bot:"),
+        "{unbotted}"
+    );
 
     std::fs::write(&secret, "second").unwrap();
     hxd::accounts::passwd(&config, "frank", &password).unwrap();
@@ -985,8 +997,12 @@ async fn a_role_grants_its_holders_and_an_edit_reaches_them_on_reload() {
     std::fs::write(td.path().join("roles.toml"), "").unwrap();
     hxd::roles::add(&config, "staff", None, None, None, Some("get_user_info")).unwrap();
     let password = hxd::accounts::Password::None;
-    let added = hxd::accounts::add(&config, "sam", None, Some("rita"), None, &password).unwrap();
+    let added =
+        hxd::accounts::add(&config, "sam", None, Some("rita"), None, &password, false).unwrap();
     assert!(added.contains("roles: staff"), "{added}");
+    hxd::roles::add(&config, "bots", None, None, None, None).unwrap();
+    let bot = hxd::accounts::add(&config, "relay2", None, None, None, &password, true).unwrap();
+    assert!(bot.contains("roles: bots"), "{bot}");
 
     // Not while a room's gate names it; then taken out of the accounts
     // listing it, and with it what it granted.
@@ -1673,4 +1689,54 @@ async fn past_bulk_rows_an_ng_client_syncs_and_a_classic_one_hears_each_row() {
             .unwrap();
         assert_eq!(row["admin"], json!(true), "{row}");
     }
+}
+
+#[tokio::test]
+async fn neither_editor_gives_a_bot_a_password() {
+    let server = start().await;
+    write(
+        server.accounts.path(),
+        "relay",
+        "bot = true\n[access]\nread_chat = true\n",
+    );
+    let chatter = access(&[bit::READ_CHAT]);
+    let mut admin = classic(&server, "admin", "pw").await;
+    assert_eq!(
+        refused(
+            admin
+                .call(ACCOUNT_MODIFY, &user("relay", Some("pw"), "Relay", chatter))
+                .await
+        ),
+        "A bot account has no password."
+    );
+    // A save that keeps what it has, which is none, is not refused.
+    admin
+        .call(ACCOUNT_MODIFY, &user("relay", None, "Relay", chatter))
+        .await
+        .unwrap();
+
+    let (mut ng_admin, _) = ng::Client::account(server.ng, "admin", "pw", "root")
+        .await
+        .unwrap();
+    let update = json!({ "login": "relay", "password": "pw" });
+    match ng_admin.request("account_update", update).await {
+        Err(Error::Refused { code, text }) => assert_eq!(
+            (code.as_str(), text.as_str()),
+            ("bad_request", "A bot account has no password.")
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let read = ng_admin
+        .request("account_get", json!({ "login": "relay" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        (&read["account"]["bot"], &read["account"]["password"]),
+        (&json!(true), &json!(false))
+    );
+    let file = std::fs::read_to_string(server.file("relay")).unwrap();
+    assert!(
+        file.starts_with("bot = true\n") && !file.contains("password"),
+        "{file}"
+    );
 }

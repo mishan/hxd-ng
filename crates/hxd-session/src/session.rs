@@ -999,40 +999,49 @@ pub(crate) fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
     enc.encode_capped(nick, 31)
 }
 
-/// The name a user is shown under: its own, or for a ghost of a server
-/// whose operator tags them, its own then `@tag`. The name is cut to leave
-/// the tag room, never the tag, which is what says where the user is from.
-fn shown_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
-    let tag = u.remote.as_ref().filter(|r| r.tagged);
-    shown_name(enc, &u.nick, tag.map(|r| r.home_tag.as_str()))
+/// What a user's name is shown with: for a ghost of a server whose
+/// operator tags them, `@tag`, and for a bot, `[server] bot_suffix`.
+fn name_suffix(u: &UserInfo, bot_suffix: &str) -> Option<String> {
+    match u.remote.as_ref().filter(|r| r.tagged) {
+        Some(r) => Some(format!("@{}", r.home_tag)),
+        None => (u.bot && !bot_suffix.is_empty()).then(|| bot_suffix.to_owned()),
+    }
+}
+
+/// The name a user is shown under: its own, then its [`name_suffix`].
+/// The name is cut to leave the suffix room, never the suffix, which is
+/// what says where the user is from or that it is a bot.
+fn shown_nick(enc: TextEncoding, u: &UserInfo, bot_suffix: &str) -> Vec<u8> {
+    suffixed(enc, &u.nick, name_suffix(u, bot_suffix).as_deref())
 }
 
 /// [`shown_nick`] of a name and the tag it is shown with, if any: what a
 /// history entry names a line's sender by, live or paged back, so the two
-/// agree with each other and with the user list.
+/// agree with each other.
 fn shown_name(enc: TextEncoding, nick: &str, tag: Option<&str>) -> Vec<u8> {
-    match tag {
-        Some(tag) => {
-            let tag = enc.encode_capped(&format!("@{tag}"), 31);
-            let mut name = enc.encode_capped(nick, 31 - tag.len());
-            name.extend(tag);
+    suffixed(enc, nick, tag.map(|tag| format!("@{tag}")).as_deref())
+}
+
+fn suffixed(enc: TextEncoding, nick: &str, suffix: Option<&str>) -> Vec<u8> {
+    match suffix {
+        Some(suffix) => {
+            let suffix = enc.encode_capped(suffix, 31);
+            let mut name = enc.encode_capped(nick, 31 - suffix.len());
+            name.extend(suffix);
             name
         }
         None => wire_nick(enc, nick),
     }
 }
 
-/// A name as public chat's 13-column name field shows it: a tagged
-/// ghost's cut short so the field never cuts its `@tag`.
-fn chat_nick(enc: TextEncoding, u: &UserInfo) -> Vec<u8> {
-    match u.remote.as_ref().filter(|r| r.tagged) {
-        Some(r) => {
-            let tag = enc.encode_capped(&format!("@{}", r.home_tag), 31);
-            let keep = 13usize.saturating_sub(r.home_tag.chars().count() + 1);
+/// A name as public chat's 13-column name field shows it: cut short so
+/// the field never cuts its [`name_suffix`].
+fn chat_nick(enc: TextEncoding, u: &UserInfo, bot_suffix: &str) -> Vec<u8> {
+    match name_suffix(u, bot_suffix) {
+        Some(suffix) => {
+            let keep = 13usize.saturating_sub(suffix.chars().count());
             let name: String = u.nick.chars().take(keep).collect();
-            let mut name = enc.encode_capped(&name, 31 - tag.len());
-            name.extend(tag);
-            name
+            suffixed(enc, &name, Some(&suffix))
         }
         None => wire_nick(enc, &u.nick),
     }
@@ -1099,15 +1108,15 @@ fn nick_color(u: &UserInfo) -> [u8; 4] {
 /// name's length and never reads past it.
 fn userlist_payload(
     u: &UserInfo,
-    mark_cleartext: bool,
+    ctx: &ServerCtx,
     enc: TextEncoding,
     nick_colors: bool,
 ) -> Vec<u8> {
-    let nick = shown_nick(enc, u);
+    let nick = shown_nick(enc, u, ctx.core.bot_suffix());
     let mut v = Vec::with_capacity(12 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
-    v.extend_from_slice(&wire_color(u, mark_cleartext).to_be_bytes());
+    v.extend_from_slice(&wire_color(u, ctx.cfg.mark_cleartext).to_be_bytes());
     v.extend_from_slice(&(nick.len() as u16).to_be_bytes());
     v.extend_from_slice(&nick);
     if nick_colors {
@@ -1118,7 +1127,7 @@ fn userlist_payload(
 
 fn user_change_chunks(
     u: &UserInfo,
-    mark_cleartext: bool,
+    ctx: &ServerCtx,
     enc: TextEncoding,
     nick_colors: bool,
 ) -> Vec<(u16, Vec<u8>)> {
@@ -1127,9 +1136,9 @@ fn user_change_chunks(
         (tag::ICON, u.icon.to_be_bytes().to_vec()),
         (
             tag::COLOUR,
-            wire_color(u, mark_cleartext).to_be_bytes().to_vec(),
+            wire_color(u, ctx.cfg.mark_cleartext).to_be_bytes().to_vec(),
         ),
-        (tag::NAME, shown_nick(enc, u)),
+        (tag::NAME, shown_nick(enc, u, ctx.core.bot_suffix())),
     ];
     if nick_colors {
         chunks.push((tag::COLOR, nick_color(u).to_vec()));
@@ -2884,7 +2893,7 @@ fn push_self_info(tx: &Tx, ctx: &ServerCtx, sess: &Session) {
                     (tag::ACCESS, sess.account.access.to_wire().to_vec()),
                     (
                         tag::USER_LIST,
-                        userlist_payload(&me, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+                        userlist_payload(&me, ctx, sess.enc, sess.nick_colors),
                     ),
                 ]
                 .into_iter()
@@ -3091,14 +3100,14 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             push(
                 tx,
                 hdr::USER_CHANGE,
-                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+                user_change_chunks(&u, ctx, sess.enc, sess.nick_colors),
             );
         }
         Event::Joined(u) => {
             push(
                 tx,
                 hdr::USER_CHANGE,
-                user_change_chunks(&u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+                user_change_chunks(&u, ctx, sess.enc, sess.nick_colors),
             );
             // A user list row cannot carry a picture, and a GIF-icon client
             // fetches one only on Icon Change: someone who joins already
@@ -3145,9 +3154,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             // 13-column name alignment stays correct for its renderer.
             // An emote has no name column to fit.
             let nick = if style == 1 {
-                shown_nick(sess.enc, &from)
+                shown_nick(sess.enc, &from, ctx.core.bot_suffix())
             } else {
-                chat_nick(sess.enc, &from)
+                chat_nick(sess.enc, &from, ctx.core.bot_suffix())
             };
             let line = format_chat(sess.enc, &nick, &sess.enc.encode(&text), style);
             let mut chunks = vec![(tag::BODY, line)];
@@ -3205,7 +3214,8 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                             0
                         },
                     icon: from.icon,
-                    nick: &shown_nick(sess.enc, &from),
+                    // As it is logged, so as a 700 entry names it.
+                    nick: &shown_nick(sess.enc, &from, ""),
                     text,
                     subfields: &subfields,
                 };
@@ -3946,7 +3956,7 @@ fn room_join(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session, room: u32) {
         .map(|u| {
             (
                 tag::USER_LIST,
-                userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+                userlist_payload(u, ctx, sess.enc, sess.nick_colors),
             )
         })
         .collect();
@@ -3978,7 +3988,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 .map(|u| {
                     (
                         tag::USER_LIST,
-                        userlist_payload(u, ctx.cfg.mark_cleartext, sess.enc, sess.nick_colors),
+                        userlist_payload(u, ctx, sess.enc, sess.nick_colors),
                     )
                 })
                 .collect();
@@ -4062,7 +4072,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         push(
                             tx,
                             hdr::USER_CHANGE,
-                            user_change_chunks(u, ctx.cfg.mark_cleartext, sess.enc, true),
+                            user_change_chunks(u, ctx, sess.enc, true),
                         );
                     }
                 }
@@ -5290,12 +5300,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                         .map(|u| {
                             (
                                 tag::USER_LIST,
-                                userlist_payload(
-                                    u,
-                                    ctx.cfg.mark_cleartext,
-                                    sess.enc,
-                                    sess.nick_colors,
-                                ),
+                                userlist_payload(u, ctx, sess.enc, sess.nick_colors),
                             )
                         })
                         .collect();
@@ -6540,8 +6545,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tagged_ghosts_name_keeps_its_tag_in_chat_on_either_encoding() {
-        let ghost = |nick: &str| UserInfo {
+    fn a_suffixed_name_keeps_its_suffix_in_chat_on_either_encoding() {
+        let user = |nick: &str, ghost: bool| UserInfo {
             uid: 9,
             transport: Default::default(),
             nick: nick.into(),
@@ -6551,7 +6556,7 @@ mod tests {
             status: SessionStatus::Active,
             avatar: None,
             color: None,
-            remote: Some(hxd_core::server_link::RemoteRef {
+            remote: ghost.then(|| hxd_core::server_link::RemoteRef {
                 home_tag: "bb".into(),
                 home_name: "B".into(),
                 tagged: true,
@@ -6564,12 +6569,25 @@ mod tests {
             roles: Vec::new(),
             role_color: None,
             pronouns: None,
+            bot: !ghost,
         };
         let long = "\u{3042}".repeat(12);
-        for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {
-            assert!(chat_nick(enc, &ghost(&long)).ends_with(b"@bb"), "{enc:?}");
-            assert_eq!(chat_nick(enc, &ghost("roberta-long")), b"roberta-lo@bb");
+        for (ghost, suffix, cut) in [
+            (true, "@bb", &b"roberta-lo@bb"[..]),
+            (false, " [bot]", b"roberta [bot]"),
+        ] {
+            for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {
+                let chat = |nick| chat_nick(enc, &user(nick, ghost), " [bot]");
+                assert!(chat(&long).ends_with(suffix.as_bytes()), "{enc:?}");
+                assert_eq!(chat("roberta-long"), cut);
+                let listed = shown_nick(enc, &user(&"r".repeat(31), ghost), " [bot]");
+                assert_eq!(listed.len(), 31);
+                assert!(listed.ends_with(suffix.as_bytes()));
+            }
         }
+        let bot = user("roberta", false);
+        assert_eq!(shown_nick(TextEncoding::Utf8, &bot, ""), b"roberta");
+        assert_eq!(chat_nick(TextEncoding::Utf8, &bot, ""), b"roberta");
     }
 
     #[test]

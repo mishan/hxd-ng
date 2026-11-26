@@ -6028,3 +6028,52 @@ async fn a_chain_that_does_not_end_at_the_server_key_is_refused() {
     let err = build_from(&path).err().expect("refused");
     assert!(err.contains("not to the server key"), "{err}");
 }
+
+#[tokio::test]
+async fn no_password_or_identity_reaches_a_bot_through_the_tunnel_or_the_identity_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_legacy, ng, _ctx) = start_server(dir.path()).await;
+    let p = person(31, "Stranger");
+    let q = person(32, "Linked");
+    // One with no password, which "" would open but for its being a bot,
+    // one with a password written in by hand, and one linked by hand to
+    // `q`: what no editor would write.
+    for (login, text) in [
+        ("open", String::new()),
+        ("relay", "password = \"pw\"\n".into()),
+        (
+            "linked",
+            format!("[identity]\nfingerprint = \"{}\"\n", q.id.fingerprint()),
+        ),
+    ] {
+        let path = dir.path().join(format!("accounts/{login}.toml"));
+        std::fs::write(path, format!("bot = true\n{text}")).unwrap();
+    }
+    for (login, password) in [("open", ""), ("relay", ""), ("relay", "pw")] {
+        let tunnelled = tunnel_login(ng, &p, login.as_bytes(), password.as_bytes()).await;
+        assert!(tunnelled.is_err(), "{login} {password:?}");
+        let r = try_authenticate(ng, &p, json!({ "login": login, "password": password })).await;
+        assert_eq!(r.status, 401, "{login} {password:?}: {:?}", r.json());
+        let token = authenticate(ng, &p).await["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let r = http(
+            ng,
+            "POST",
+            "/identity/link",
+            &[("Authorization", &format!("Bearer {token}"))],
+            json!({ "login": login, "password": password })
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+        assert!(r.status >= 400, "{login} {password:?}: {:?}", r.json());
+    }
+    let r = try_authenticate(ng, &q, json!({})).await;
+    assert_eq!(r.status, 403, "{:?}", r.json());
+    for login in ["open", "relay"] {
+        let file = std::fs::read_to_string(dir.path().join(format!("accounts/{login}.toml")));
+        assert!(!file.unwrap().contains("fingerprint"), "{login}");
+    }
+}
