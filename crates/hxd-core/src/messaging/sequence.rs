@@ -859,9 +859,12 @@ impl Run {
                 self.carried = w.clone().map(|w| (p, w));
                 let friends = self.pairing().friendship.is_some();
                 let removed = core.friend_unfriend(uid, other, w);
+                // Only once the friendship ended here: a refusal before
+                // that changed nothing.
                 self.refused_over = withdraw
                     && friends
-                    && removed.is_err_and(|e| e != super::MessagingError::ServerError);
+                    && removed.is_err_and(|e| e != super::MessagingError::ServerError)
+                    && self.pairing().friendship.is_none();
                 removed.is_ok()
             }
             Step::BlockWithdrawal => {
