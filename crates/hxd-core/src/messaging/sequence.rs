@@ -2269,7 +2269,8 @@ fn try_attach(
 /// revoked device's presentations owed through a rotation, a link made
 /// again that was refused, and a crowded rotation after a revocation's
 /// drop, an offer a rotation moved under an identity a registrar then
-/// revoked, its drop owed, and a revoked identity drawn to rotate.
+/// revoked, its drop owed, and a revoked identity drawn to rotate, one
+/// whose offers' drop a write failure left owed.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2319,6 +2320,7 @@ pub const FOUND: &[&[u32]] = &[
     &[
         212844157, 622128604, 792503153, 4265061469, 1058415471, 1378804416,
     ],
+    &[3088234, 2679763584, 59294812, 2164156381],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
