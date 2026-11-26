@@ -422,7 +422,7 @@ impl Receiver {
         .await
         .map_err(|_| Error::Timeout)??;
         let word = |at: usize| u32::from_be_bytes(raw[at..at + 4].try_into().expect("four bytes"));
-        if word(0) == TASK && word(4) == trans && word(8) != 0 {
+        if word(0) == TASK && word(4) == trans && word(8) & 1 != 0 {
             self.buf.extend_from_slice(&raw);
         } else {
             let mut hope = hope;

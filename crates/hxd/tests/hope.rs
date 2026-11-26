@@ -555,9 +555,8 @@ async fn no_password_reaches_a_bot_by_a_plain_login_hope_or_ng() {
         let mut c = Client::connect(s.legacy).await.unwrap();
         let plain = c.login(&login).await;
         assert!(matches!(plain, Err(Error::Refused { .. })), "{password:?}");
-        // Refused as a wrong password is.
         let hoped = hope(s.legacy, &offer(&[Cipher::Blowfish], &[]), &login).await;
-        assert!(hoped.is_err(), "{password:?}");
+        assert_eq!(refused(hoped), "Login failed.", "{account} {password:?}");
         let ng = ng::Client::account(s.ng, account, password, "r").await;
         match ng {
             Err(Error::Refused { code, .. }) => assert_eq!(code, "login_failed"),
