@@ -2300,6 +2300,10 @@ pub struct ServerSection {
     /// taken, though a user may still clear what is kept.
     #[serde(default = "default_true")]
     pub pronouns: bool,
+    /// Appended to a bot's nick on the classic wire, which has no other
+    /// way to say it is one. Empty: nothing.
+    #[serde(default)]
+    pub bot_suffix: String,
     /// Advertised server name.
     #[serde(default = "default_name")]
     pub name: String,
@@ -2772,6 +2776,10 @@ fn wider_than_one(wide: &str, n: usize, one: &str, per: usize) -> Result<(), Str
     Ok(())
 }
 
+/// In UTF-8 bytes, which is at least as many as the suffix takes on
+/// either encoding of the classic wire, out of a nick's 31.
+const BOT_SUFFIX_MAX: usize = 12;
+
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
@@ -2779,6 +2787,7 @@ impl Default for ServerSection {
             classic: true,
             coalesce: default_coalesce(),
             pronouns: true,
+            bot_suffix: String::new(),
             name: default_name(),
             version: default_version(),
             login_timeout: default_login_timeout(),
@@ -3620,6 +3629,13 @@ fn build_identity(
 /// startup rather than wondering why identity does nothing, or why
 /// messages never arrive.
 pub fn check_config(config: &Config) -> Result<(), String> {
+    let suffix = &config.server.bot_suffix;
+    if suffix.len() > BOT_SUFFIX_MAX || suffix.chars().any(char::is_control) {
+        return Err(format!(
+            "[server] bot_suffix is at most {BOT_SUFFIX_MAX} bytes, none of them control \
+             characters, so a bot's nick keeps room for its name"
+        ));
+    }
     if !config.server.classic {
         let refused = [
             (
@@ -4848,7 +4864,8 @@ pub fn build_ctx(
     let core = core
         .with_bulk_rows(config.roles.bulk_rows)
         .with_coalesce(config.server.coalesce)
-        .with_pronouns(config.server.pronouns);
+        .with_pronouns(config.server.pronouns)
+        .with_bot_suffix(config.server.bot_suffix.clone());
     let core = match &config.ng {
         Some(ng) => core.with_detached_per_login(ng.max_detached_per_login),
         None => core,
@@ -6733,6 +6750,22 @@ sync = "full"
         assert_eq!(result.unwrap(), 0);
         assert!(!dir.path().join("messages.db-shm").exists());
         assert!(!dir.path().join("messages.db-wal").exists());
+    }
+
+    #[test]
+    fn a_bot_suffix_leaves_a_nick_room_for_its_name() {
+        for (suffix, ok) in [
+            (" [bot]", true),
+            ("[123456789]", true),
+            ("[1234567890]", true),
+            ("[12345678901]", false),
+            ("\u{1f916}\u{1f916}\u{1f916}\u{1f916}", false),
+            (" bot\\t", true),
+            (" bot\t", false),
+        ] {
+            let cfg = parse(&format!("[server]\nbot_suffix = {suffix:?}\n")).unwrap();
+            assert_eq!(check_config(&cfg).is_ok(), ok, "{suffix:?}");
+        }
     }
 
     /// Parse a config the way [`Config::load`] would, without a file.

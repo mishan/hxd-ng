@@ -510,3 +510,22 @@ async fn a_banned_address_gets_no_handshake_on_either_tls_port() {
         );
     }
 }
+
+#[tokio::test]
+async fn no_password_reaches_a_bot_over_tls() {
+    use hxd_testclient::legacy::{Client, Login};
+    let server = start(Duration::from_secs(5)).await;
+    for (login, text) in [("open", ""), ("relay", "password = \"pw\"\n")] {
+        let path = server._temp.path().join(format!("accounts/{login}.toml"));
+        std::fs::write(path, format!("bot = true\n{text}")).unwrap();
+    }
+    for (account, password) in [("open", ""), ("relay", ""), ("relay", "pw")] {
+        let mut c = Client::over(Box::new(tls_stream(&server, server.tls).await))
+            .await
+            .unwrap();
+        match c.login(&Login::account("r", account, password)).await {
+            Err(hxd_testclient::Error::Refused { .. }) => {}
+            other => panic!("{password:?}: {:?}", other.map(|_| ())),
+        }
+    }
+}

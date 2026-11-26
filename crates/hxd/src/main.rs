@@ -335,6 +335,12 @@ enum Command {
         like: Option<String>,
         access: Option<String>,
         password: hxd::accounts::Password,
+        bot: bool,
+    },
+    AccountBot {
+        login: String,
+        on: bool,
+        password: hxd::accounts::Password,
     },
     AccountPasswd {
         login: String,
@@ -413,8 +419,10 @@ hxd [--config …] ban lift <id>\n  \
 hxd [--config …] account list\n  \
 hxd [--config …] account show <login>\n  \
 hxd [--config …] account add <login> [--name N] [--access KEY,… | --like LOGIN]\n    \
-(--password-stdin | --password-file F | --no-password)\n  \
+(--password-stdin | --password-file F | --no-password | --bot)\n  \
 hxd [--config …] account passwd <login> (--password-stdin | --password-file F)\n  \
+hxd [--config …] account bot <login> on\n  \
+hxd [--config …] account bot <login> off (--password-stdin | --password-file F | --no-password)\n  \
 hxd [--config …] account access <login> KEY=on|off…\n  \
 hxd [--config …] account rm <login>\n  \
 hxd [--config …] account roles <login> [+ROLE|-ROLE…]\n  \
@@ -553,6 +561,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     let mut position = None;
     let mut password = hxd::accounts::Password::None;
     let mut no_password = false;
+    let mut bot = false;
     let mut replace = false;
     let mut next = None;
     let mut from = None;
@@ -658,6 +667,7 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
                 ));
             }
             "--no-password" => no_password = true,
+            "--bot" => bot = true,
             "--no-block" => no_block = true,
             "--replace" => replace = true,
             "--from" => from = Some(PathBuf::from(args.next().ok_or("--from needs a path")?)),
@@ -777,9 +787,13 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
         return Err("--fingerprint and --dry-run belong to `inbox purge` and `purge`".to_string());
     }
     let adding = matches!(words[..], ["account", "add", _]);
+    let unbotting = matches!(words[..], ["account", "bot", _, "off"]);
     let adding_role = matches!(words[..], ["role", "add", _]);
-    if (name.is_some() || like.is_some() || no_password) && !adding {
-        return Err("--name, --like and --no-password belong to `account add`".into());
+    if (name.is_some() || like.is_some() || bot) && !adding {
+        return Err("--name, --like and --bot belong to `account add`".into());
+    }
+    if no_password && !adding && !unbotting {
+        return Err("--no-password belongs to `account add` and `account bot off`".into());
     }
     if access.is_some() && !adding && !adding_role {
         return Err("--access belongs to `account add` and `role add`".into());
@@ -789,10 +803,12 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
     }
     if !matches!(password, hxd::accounts::Password::None)
         && !adding
+        && !unbotting
         && !matches!(words[..], ["account", "passwd", _])
     {
         return Err(
-            "--password-stdin and --password-file belong to `account add` and `account passwd`"
+            "--password-stdin and --password-file belong to `account add`, \
+                    `account bot off` and `account passwd`"
                 .into(),
         );
     }
@@ -965,16 +981,40 @@ fn parse_args() -> Result<(PathBuf, Command), String> {
             if like.is_some() && access.is_some() {
                 return Err("`account add` takes --access or --like, not both".into());
             }
-            if matches!(password, hxd::accounts::Password::None) != no_password {
-                return Err("`account add` needs --password-stdin, --password-file or \
-                     --no-password, and only one"
+            let given = !matches!(password, hxd::accounts::Password::None);
+            if [given, no_password, bot].iter().filter(|b| **b).count() != 1 {
+                return Err("`account add` needs --password-stdin, --password-file, \
+                     --no-password or --bot, and only one"
                     .into());
+            }
+            if bot && like.is_some() {
+                return Err("`account add --bot` takes its roles from `bots`, not --like".into());
             }
             Command::AccountAdd {
                 login: login.to_string(),
                 name,
                 like,
                 access,
+                password,
+                bot,
+            }
+        }
+        ["account", "bot", login, "on"] => Command::AccountBot {
+            login: login.to_string(),
+            on: true,
+            password,
+        },
+        ["account", "bot", login, "off"] => {
+            if matches!(password, hxd::accounts::Password::None) != no_password {
+                return Err(
+                    "`account bot off` needs --password-stdin, --password-file or \
+                     --no-password, and only one: a bot has no password"
+                        .into(),
+                );
+            }
+            Command::AccountBot {
+                login: login.to_string(),
+                on: false,
                 password,
             }
         }
@@ -1265,6 +1305,7 @@ async fn main() {
                 like,
                 access,
                 password,
+                bot,
             } => {
                 println!(
                     "{}",
@@ -1275,8 +1316,17 @@ async fn main() {
                         like.as_deref(),
                         access.as_deref(),
                         password,
+                        *bot,
                     )?
                 );
+                return Ok(());
+            }
+            Command::AccountBot {
+                login,
+                on,
+                password,
+            } => {
+                println!("{}", hxd::accounts::set_bot(&config, login, *on, password)?);
                 return Ok(());
             }
             Command::AccountPasswd { login, password } => {

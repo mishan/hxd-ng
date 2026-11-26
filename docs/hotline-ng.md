@@ -1152,7 +1152,8 @@ counts in §3's sequence.
               "width": 128, "height": 96 },
   "color": 16744448,               // absent unless the user set a nick color
   "pronouns": "she/her",           // absent unless the user states some
-  "system": true                   // only on the server's own account
+  "system": true,                  // only on the server's own account
+  "bot": true                      // only on a bot account's sessions
 }
 ```
 
@@ -1169,6 +1170,7 @@ counts in §3's sequence.
 | `color` | For a user of a linked server, its home server's color. Otherwise present only when the user set a nick color for this session: `0x00RRGGBB` as a number (fogWraith's Colored Nicknames). Classic clients that send nick colors see it too. It is the user's choice of how their name looks, so a client MAY ignore it, for contrast or accessibility. This wire does not set one yet. |
 | `pronouns` | Present only when the user states some, on any server that shows them (*hxd-ng:* `[server] pronouns`), with no capability or declaration: the user's own claim, set with `pronouns` (§7.3) and never set or inferred by the server. Clients MUST show it exactly as sent, apart from the nick and in a style of its own, and isolated from the text around it for bidirectional layout (an HTML `<bdi>`, or FSI ... PDI); a client MAY decline to show it. On a person's row it is the person's (§7.6); device entries carry none. Absent for a user of a linked server. A change to it alone is a `user_changed` to this wire alone: a classic client sees pronouns only in Get User Info's text. |
 | `devices` | With `persons`, on a person's row alone, to a session that may see its devices: §7.6. `self` also carries `device`, this session's own device id. |
+| `bot` | Present, and `true`, only on a session of a bot account: a program, not a person at a client. Set by the operator alone. A bot takes no part in instant messaging (§7.5), so no friend or message request reaches one. Absent for a user of a linked server. |
 | `system` | Present, and `true`, on exactly one user, the server's reserved account (system-account.md §2), when the server runs one; absent on every other user. Clients MUST read an absent `system` as `false`. That user is always on the roster, has `admin` set, cannot be kicked or banned, and is the sender and addressee of server mail and commands (system-account.md §3). |
 
 ### 7.5 Instant messaging

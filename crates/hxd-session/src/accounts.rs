@@ -110,6 +110,7 @@ pub(crate) fn transaction(
             .and_then(|a| a.get(..8))
             .map(|a| AccessBits::from_wire(a.try_into().expect("eight bytes"))),
         editor_tier: Some(tier),
+        bot: None,
         shown,
         overrides: None,
         roles: Vec::new(),

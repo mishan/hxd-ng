@@ -169,7 +169,11 @@ impl Account {
     /// turning off an account's mail should not make its articles
     /// nobody's, nor turning it on for `guest` make them everybody's.
     pub fn is_person(&self) -> bool {
-        self.has_password || self.identity.fingerprint.is_some()
+        !self.is_bot() && (self.has_password || self.identity.fingerprint.is_some())
+    }
+
+    pub fn is_bot(&self) -> bool {
+        self.config.bot
     }
 }
 
@@ -233,6 +237,10 @@ pub struct AccountConfig {
     /// Not an `Extras` key: nothing derives it, and a mask or restriction
     /// that seemed to deny it would deny nothing.
     pub personal: bool,
+    /// Is the account a program rather than a person at a client
+    /// (`bot = true`)? No password logs in to it, and it takes no part
+    /// in instant messaging, so a message to it is never a request.
+    pub bot: bool,
 }
 
 /// What a session is denied whatever its account says: probation's and
@@ -262,6 +270,9 @@ impl AccountConfig {
         }
         if denied(bit::READ_CHAT) || denied(bit::CHAT_HISTORY) {
             access = access.without(bit::CHAT_HISTORY);
+        }
+        if self.bot {
+            access = access.without(bit::MESSAGING);
         }
         let kick = access.has(bit::DISCONNECT_USERS);
         let unkick = denied(bit::DISCONNECT_USERS);
@@ -539,6 +550,8 @@ pub struct AccountEdit {
     pub name: Option<String>,
     /// `Some("")` clears the password.
     pub password: Option<String>,
+    /// Makes the account a bot, or a bot an account again.
+    pub bot: Option<bool>,
     pub access: Option<AccessBits>,
     /// The highest bit of `access` the editor it came from can show (the
     /// tiers of fogWraith's Extended Privilege extension); `None` for one
@@ -632,6 +645,9 @@ pub enum AdminError {
     /// Not a login this backend can store, or one reserved for the
     /// server or for roles.
     InvalidLogin,
+    /// A write that would leave a bot account with a way in a bot has
+    /// none of, and why.
+    BadBot(&'static str),
     /// This server has no account administration.
     Unsupported,
     /// The backend itself failed. For the log, not the client.
@@ -653,6 +669,7 @@ impl std::fmt::Display for AdminError {
             AdminError::InvalidLogin => {
                 "A login is up to 31 letters, digits and _ - . @, not starting with a dot or @."
             }
+            AdminError::BadBot(why) => why,
             AdminError::Unsupported => "This server does not administer accounts.",
             AdminError::Backend(e) => return write!(f, "account store: {e}"),
         })

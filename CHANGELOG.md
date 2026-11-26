@@ -339,6 +339,24 @@ as AGENTS.md's "Releasing" describes it.
   again, until an upgraded one fetches the registrar's records again
   (docs/identity-registrar.md §7.4).
 
+- Bot accounts: `bot = true` in an account file, made with `hxd account
+  add <login> --bot` (which gives the role `bots` when the roles file
+  has one) or `hxd account bot <login> on|off`. No password logs in to
+  a bot account on any wire, the empty one included, and none can be
+  given one: `hxd account`, the 1.5 user editor and the ng `accounts`
+  requests refuse it, and a password written into one by hand is
+  ignored and named at startup. Nor does a linked identity log in to
+  one, and none can be linked to one, or the guest account made one. A
+  session already logged in as an account that becomes a bot ends as
+  soon as the server reads the change. `hxd account bot <login> off`
+  takes a password as `add` does, or `--no-password`. A bot takes no part in instant
+  messaging, so no friend or message request ever reaches it. The ng
+  wire shows `bot: true` on its `user` and account objects. New key:
+  `[server] bot_suffix` (default empty), up to 12 bytes appended to a
+  bot's nick in the classic wire's user list and public chat. Nothing
+  logs in as a bot yet. A build from before this release refuses an
+  account file with `bot`.
+
 ### Fixed
 
 - Friendship work a failed store call left owed (dropping an unlinked

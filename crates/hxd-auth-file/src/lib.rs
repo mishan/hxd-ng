@@ -8,6 +8,7 @@
 //! name = "Alice"
 //! password = "secret"     # omit or leave empty for password-less accounts
 //! roles = ["moderators"]  # what they grant comes first (`roles.rs`)
+//! bot = false             # a program's account, which no password logs in to
 //!
 //! [access]
 //! use_any_name = true
@@ -73,6 +74,9 @@ struct AccountFile {
     name: Option<String>,
     /// Plaintext-equivalent secret; omit/empty = password-less.
     password: Option<String>,
+    /// A bot's account, which no password logs in to.
+    #[serde(default)]
+    bot: bool,
     /// The roles whose grants come before this file's own keys.
     #[serde(default)]
     roles: Vec<String>,
@@ -186,8 +190,8 @@ impl AccountFile {
     /// Everything but the password check: shared by `authenticate` and
     /// `lookup`.
     fn into_account(self, login: String, roles: &Roles) -> Account {
-        let stored = self.password.as_deref().unwrap_or("");
-        let has_password = !stored.is_empty();
+        // A bot's password is never checked, so it is none.
+        let has_password = !self.password.as_deref().unwrap_or("").is_empty() && !self.bot;
         let fingerprint = self
             .identity
             .fingerprint
@@ -205,7 +209,8 @@ impl AccountFile {
             // is a state worth making unrepresentable rather than
             // warning about. The flag is the account's own only where
             // a password is left to fall back on.
-            identity_login: !has_password || self.identity.login.unwrap_or(true),
+            // A bot is reached by neither.
+            identity_login: !self.bot && (!has_password || self.identity.login.unwrap_or(true)),
             allow_self_link: self.identity.allow_self_link.unwrap_or(true),
             reserve_name: self.identity.reserve_name.unwrap_or(false),
         };
@@ -284,7 +289,23 @@ impl AccountFile {
                 .map(|r| r.name.clone())
                 .collect(),
             personal: self.extra.personal == Some(true),
+            bot: self.bot,
         }
+    }
+
+    /// What a bot's file holds that no bot may, if anything: a way in
+    /// other than its tokens, or the login everyone shares.
+    fn bot_refusal(&self, login: &str) -> Option<&'static str> {
+        if !self.bot {
+            return None;
+        }
+        if !self.password.as_deref().unwrap_or("").is_empty() {
+            return Some("A bot account has no password.");
+        }
+        if self.identity.fingerprint.is_some() {
+            return Some("A bot account has no linked identity.");
+        }
+        (login == "guest").then_some("The guest account cannot be a bot.")
     }
 
     /// Does this file say `personal` where it cannot apply: on the guest,
@@ -559,6 +580,14 @@ impl FileAuth {
                         tracing::warn!("{complaint}");
                         found.push(complaint);
                     }
+                    if let Some(why) = f.bot_refusal(&login) {
+                        let complaint = format!(
+                            "{login}.toml: {why} No password or identity logs in to it; \
+                             take out what it should not have"
+                        );
+                        tracing::warn!("{complaint}");
+                        found.push(complaint);
+                    }
                     if f.personal_ignored(&login) {
                         let complaint = format!(
                             "{login}.toml: extra.personal is ignored on the guest account and on \
@@ -704,7 +733,10 @@ impl AuthBackend for FileAuth {
         // not reachable by password, and "" is not an exemption. Note the
         // check is on the *stored text*, not on whether it parses: a
         // fingerprint we can't read is a broken link, not an open door.
-        if stored.is_empty() && file.identity.fingerprint.is_some() {
+        // No password reaches a bot's either, not even one its file was
+        // given by hand: it has none to check, and would take "" from
+        // anyone.
+        if stored.is_empty() && file.identity.fingerprint.is_some() || file.bot {
             return Err(AuthError::BadProof);
         }
         match proof {
@@ -920,10 +952,10 @@ impl AccountAdmin for FileAuth {
         let failed =
             |e: &dyn std::fmt::Display| AdminError::Backend(format!("{}: {e}", path.display()));
         let roles = self.roles();
-        let read = |text: &str| -> Result<Account, AdminError> {
-            let file: AccountFile = toml::from_str(text).map_err(|e| failed(&e))?;
-            Ok(file.into_account(login.clone(), &roles))
+        let parse = |text: &str| -> Result<AccountFile, AdminError> {
+            toml::from_str(text).map_err(|e| failed(&e))
         };
+        let read = |text: &str| Ok(parse(text)?.into_account(login.clone(), &roles));
         let old = match std::fs::read_to_string(&path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -942,6 +974,13 @@ impl AccountAdmin for FileAuth {
                 doc.remove("password");
             }
             Some(password) => doc["password"] = toml_edit::value(password),
+            None => {}
+        }
+        match edit.bot {
+            Some(true) => doc["bot"] = toml_edit::value(true),
+            Some(false) => {
+                doc.remove("bot");
+            }
             None => {}
         }
         let mut listed = existing.as_ref().map_or_else(Vec::new, |a| a.roles.clone());
@@ -989,6 +1028,15 @@ impl AccountAdmin for FileAuth {
             }
             (access, ..) => access,
         };
+        // A bot's sessions are derived without it, so what was shown
+        // says nothing of the bit its file keeps for when it is not one.
+        let access = access.map(|a| match &existing {
+            Some(now) if now.is_bot() && now.config.access.has(bit::MESSAGING) => {
+                a.with(bit::MESSAGING)
+            }
+            Some(now) if now.is_bot() => a.without(bit::MESSAGING),
+            _ => a,
+        });
         if let Some((grant, deny)) = edit.overrides {
             let table = doc["access"].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
             let table = table
@@ -1005,8 +1053,13 @@ impl AccountAdmin for FileAuth {
         let text = doc.to_string();
         // Also what makes sure no file is left behind that the next login
         // cannot read.
-        let after = read(&text)?;
+        let file = parse(&text)?;
+        let refusal = file.bot_refusal(&login);
+        let after = file.into_account(login.clone(), &roles);
         check(existing.as_ref(), &after)?;
+        if let Some(why) = refusal {
+            return Err(AdminError::BadBot(why));
+        }
         if old.is_none() {
             write_new(&path, &text).map_err(|e| match e.kind() {
                 std::io::ErrorKind::AlreadyExists => AdminError::Exists,
@@ -3252,5 +3305,126 @@ mod tests {
             file.contains("send_chat = true") && !file.contains("read_news"),
             "{file}"
         );
+    }
+
+    #[test]
+    fn no_password_reaches_a_bot() {
+        let (td, auth) = backend();
+        for (login, text) in [("kiosk", ""), ("handed", "password = \"pw\"\n")] {
+            write(td.path(), &format!("{login}.toml"), text);
+            let open = |pw: &[u8]| auth.authenticate(login, Proof::Plain(pw)).is_ok();
+            assert!(
+                open(b"") || open(b"pw"),
+                "{login} logs in before it is a bot"
+            );
+            write(
+                td.path(),
+                &format!("{login}.toml"),
+                &format!("bot = true\n{text}"),
+            );
+            let keyed: &dyn Fn(&str) -> bool = &|_| true;
+            for proof in [Proof::Plain(b""), Proof::Plain(b"pw"), Proof::Keyed(keyed)] {
+                assert_eq!(
+                    auth.authenticate(login, proof).unwrap_err(),
+                    AuthError::BadProof,
+                    "{login}"
+                );
+            }
+            let account = auth.lookup(login).unwrap();
+            assert!(account.is_bot() && !account.has_password && !account.is_person());
+        }
+        assert!(auth
+            .audit()
+            .iter()
+            .any(|c| c.starts_with("handed.toml: A bot account has no password.")));
+    }
+
+    #[test]
+    fn a_bot_is_given_no_password() {
+        let (td, auth) = backend();
+        write(td.path(), "alice.toml", "password = \"pw\"\n");
+        write(
+            td.path(),
+            "carol.toml",
+            &format!(
+                "[identity]\nfingerprint = \"{}\"\n",
+                hl_identity::Fingerprint([4; 32])
+            ),
+        );
+        let edit = |login: &str, bot, password: Option<&str>| AccountEdit {
+            login: login.into(),
+            bot,
+            password: password.map(Into::into),
+            ..Default::default()
+        };
+        let save = |e: AccountEdit| auth.write_account(&e, &|_, _| Ok(()));
+        assert!(save(edit("relay", Some(true), None)).unwrap().is_bot());
+        let before = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
+        for refused in [
+            edit("relay", None, Some("pw")),
+            edit("alice", Some(true), None),
+            edit("alice", Some(true), Some("other")),
+            edit("carol", Some(true), None),
+            edit("guest", Some(true), None),
+        ] {
+            assert!(
+                matches!(save(refused.clone()), Err(AdminError::BadBot(_))),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("alice.toml")).unwrap(),
+            before
+        );
+        assert!(!save(edit("relay", None, None)).unwrap().has_password);
+        let alice = save(edit("alice", Some(true), Some(""))).unwrap();
+        assert!(alice.is_bot() && !alice.has_password);
+        let alice = save(edit("alice", Some(false), Some("pw"))).unwrap();
+        assert!(!alice.is_bot() && alice.has_password);
+    }
+
+    #[test]
+    fn a_bot_takes_no_part_in_messaging() {
+        let (td, auth) = backend();
+        let file = "[access]\nmessaging = true\n";
+        write(td.path(), "relay.toml", file);
+        assert!(auth.lookup("relay").unwrap().access.has(bit::MESSAGING));
+        write(td.path(), "relay.toml", &format!("bot = true\n{file}"));
+        let relay = auth.lookup("relay").unwrap();
+        assert!(!relay.access.has(bit::MESSAGING));
+        // An editor saving what it was shown leaves the file's bit alone.
+        let shown = AccountEdit {
+            login: "relay".into(),
+            access: Some(relay.access),
+            shown: Some(relay.access),
+            ..Default::default()
+        };
+        auth.write_account(&shown, &|_, _| Ok(())).unwrap();
+        write(
+            td.path(),
+            "relay.toml",
+            &std::fs::read_to_string(td.path().join("relay.toml"))
+                .unwrap()
+                .replace("bot = true\n", ""),
+        );
+        assert!(auth.lookup("relay").unwrap().access.has(bit::MESSAGING));
+    }
+
+    #[test]
+    fn no_identity_logs_in_to_a_bot() {
+        let (td, auth) = backend();
+        let fp = [5u8; 32];
+        let text = format!(
+            "[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "relay.toml", &text);
+        assert!(auth.lookup("relay").unwrap().identity.identity_login);
+        write(td.path(), "relay.toml", &format!("bot = true\n{text}"));
+        assert!(!auth.lookup("relay").unwrap().identity.identity_login);
+        assert!(auth
+            .audit()
+            .iter()
+            .any(|c| c.starts_with("relay.toml: A bot account has no linked identity.")));
     }
 }

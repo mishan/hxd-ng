@@ -179,6 +179,7 @@ data of `account_changed`.
 { "login": "eve", "name": "Eve", "password": true,
   "access": ["read_chat", "send_chat"], "raw_bits": [41],
   "identity": "6htgz65…",    // absent unless the account links one
+  "bot": true,               // absent unless the account is a bot's (§6)
   "roles": [], "grant": ["read_chat", "send_chat"],
   "deny": ["read_chat_history"], "raw_grant": [41], "raw_deny": [] }
 ```
@@ -199,7 +200,7 @@ the server.
 | `already_exists` | `account_create` of a login that has one. |
 | `no_such_role` | `roles` naming `everyone`, or a role there is none of that the account does not already list. |
 | `invalid_login` | Not a login: up to 31 letters, digits and `_ - . @`, not starting with `.` or `@`, which is reserved for roles (`roles.md` §6.4). A write to the server's own login, or to an existing account whose login begins with `@`, answers it too. `account_get` and `account_delete` answer `no_such_account` for the server's own login, and act on an existing `@` account as on any other, so it can be cleared away. |
-| `bad_request` | Malformed, an access name that names no bit, a raw bit past 63, a name or password past 31 characters, `access` sent with the overrides, or a bit both granted and denied. |
+| `bad_request` | Malformed, an access name that names no bit, a raw bit past 63, a name or password past 31 characters, `access` sent with the overrides, a bit both granted and denied, or a password for a bot. |
 | `not_available` | The server does not administer accounts, whatever the session may do. |
 
 ### 5.4 The event
@@ -225,8 +226,10 @@ have been lost in the gap it recovers from.
 hxd account list
 hxd account show <login>
 hxd account add <login> [--name N] [--access KEY,… | --like LOGIN] \
-    (--password-stdin | --password-file F | --no-password)
+    (--password-stdin | --password-file F | --no-password | --bot)
 hxd account passwd <login> (--password-stdin | --password-file F)
+hxd account bot <login> on
+hxd account bot <login> off (--password-stdin | --password-file F | --no-password)
 hxd account access <login> KEY=on|off…
 hxd account roles <login> [+ROLE|-ROLE…]
 hxd account rm <login>
@@ -246,7 +249,13 @@ goes on the command line, where `ps` shows it to everyone on the host.
 (the guest account is the usual template), or what `everyone` gives;
 `--like` copies that account's roles and `[access]` keys. An account
 with no password and no linked identity is an open door, so
-`--no-password` has to be said. `access` sets the file's own keys, which win over its roles either way,
+`--no-password` has to be said. `--bot` makes the account a bot's
+(`bot = true` in its file): no password or linked identity logs in to
+it, so no editor gives it either, `bot on` refuses an account that
+has one or is the guest, `bot off` asks where its password comes from
+as `add` does, and `add` gives it the role `bots` when the roles file
+has one. A session already logged in as an account made a bot ends as
+soon as the server reads the change. `access` sets the file's own keys, which win over its roles either way,
 writing `off` only where something else grants the bit, and leaves
 history as the file has it — following `read_chat`, or set apart from
 it — unless the same command names `read_chat_history`. `roles` adds or

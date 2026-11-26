@@ -769,6 +769,9 @@ fn write_user<M: serde::ser::SerializeMap>(m: &mut M, u: &UserInfo) -> Result<()
     if u.system {
         m.serialize_entry("system", &true)?;
     }
+    if u.bot {
+        m.serialize_entry("bot", &true)?;
+    }
     // Present only when there is one, like `identity`: a change that
     // clears it is a `user_changed` without the key (`docs/avatars.md`).
     if let Some(avatar) = &u.avatar {
@@ -1489,6 +1492,7 @@ mod tests {
             // The ng wire works it out from `roles`, never sends it.
             role_color: full.then_some(0x0000_80ff),
             pronouns: full.then(|| "she/her".into()),
+            bot: full,
         }
     }
 
@@ -1504,6 +1508,7 @@ mod tests {
             });
             if full {
                 want["system"] = json!(true);
+                want["bot"] = json!(true);
                 want["avatar"] = crate::avatar::avatar_json(u.avatar.as_ref().unwrap());
                 want["color"] = json!(0x00ff_8000);
                 want["roles"] = json!(["staff"]);

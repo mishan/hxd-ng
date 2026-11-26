@@ -697,6 +697,12 @@ pub(crate) fn give_account(
     account: &Account,
     roles: Option<&[RoleView]>,
 ) -> Option<Row> {
+    // A session that is not a bot's came in by what never reaches one,
+    // so whatever way its account has become one, it goes.
+    if account.is_bot() && !r.users.get(&uid)?.info.bot {
+        let _ = crate::chat::kick_in(r, uid);
+        return None;
+    }
     let lobby = r.last_ids.get(&0).copied().unwrap_or(0);
     let row = r.row_uid(uid);
     let pronouns_off = r.pronouns_off;
@@ -760,7 +766,9 @@ pub(crate) fn give_account(
     let role_color = roles.map_or(s.info.role_color, |roles| role_color(roles, &account.roles));
     // A color a classic client draws, so not a change of roles alone.
     let recolored = std::mem::take(&mut s.recolored) || s.info.role_color != role_color;
-    let mut shown = s.info.admin != admin || s.info.role_color != role_color;
+    let mut shown =
+        s.info.admin != admin || s.info.role_color != role_color || s.info.bot != account.is_bot();
+    s.info.bot = account.is_bot();
     let pronouns = crate::pronouns::shown(account, &s.mask).filter(|_| !pronouns_off);
     // What only the ng wire shows on a row.
     let ng_changed = s.info.roles != account.roles || s.info.pronouns != pronouns;
@@ -881,6 +889,57 @@ mod tests {
         let core = Core::new().with_admin(accounts.clone());
         let (uid, _) = test_attach(&core, "root", root);
         (core, accounts, uid)
+    }
+
+    #[test]
+    fn a_bot_shows_on_its_row_from_login_and_through_a_reload() {
+        let (core, accounts, _) = server();
+        let watching = account("watcher", AccessBits::empty());
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("watcher".into(), watching);
+        let (_, mut watcher) = test_attach(&core, "watcher", AccessBits::empty());
+        let mut relay = account("relay", AccessBits::empty());
+        relay.config.bot = true;
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("relay".into(), relay.clone());
+        let (uid, _) = core
+            .attach(crate::roster::AttachInfo {
+                account: Some(Box::new(relay)),
+                ..crate::roster::test_attach_info("relay", AccessBits::empty())
+            })
+            .unwrap();
+        core.announce(uid);
+        let bot = |core: &Core| core.roster.lock().unwrap().users[&uid].info.bot;
+        assert!(bot(&core));
+        let told = |rx: &mut crate::Events| {
+            crate::roster::drain(rx).into_iter().find_map(|e| match e {
+                Event::Changed(u) if u.uid == uid => Some(u.bot),
+                _ => None,
+            })
+        };
+        crate::roster::drain(&mut watcher);
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("relay".into(), account("relay", AccessBits::empty()));
+        core.reload_accounts();
+        assert!(!bot(&core));
+        assert_eq!(told(&mut watcher), Some(false));
+
+        // A session up before its account became a bot's came in by
+        // what no longer reaches it.
+        let mut relay = account("relay", AccessBits::empty());
+        relay.config.bot = true;
+        accounts.0.lock().unwrap().insert("relay".into(), relay);
+        core.reload_accounts();
+        assert!(core.roster.lock().unwrap().users[&uid].kicked);
     }
 
     #[test]
