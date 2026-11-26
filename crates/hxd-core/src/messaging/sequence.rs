@@ -226,6 +226,20 @@ enum Step {
     },
     /// Unlink the identity and link it again.
     Link,
+    /// Unlink the identity, and leave it unlinked: the party's sessions
+    /// sign in again by password. Until it links again the run draws no
+    /// step of either party but those that change what is installed, a
+    /// rotation, a restart, the clock, the messaging bit, the link made
+    /// again and a plain request by the other party.
+    Unlink,
+    /// Link the identity again, claiming what its login kept.
+    Relink,
+    /// The server stopped and started again on its stores, in the binary's
+    /// order: the operator's list installed, the friendships judged at the
+    /// device epochs kept, then the owed-work tick, with no registrar's
+    /// list read yet; that waits for the next step that publishes one, or
+    /// for the end of the run.
+    Restart,
     RemoveByKey,
     /// The messaging bit lost, or given back.
     Messaging,
@@ -251,7 +265,7 @@ enum Step {
     Freeze,
     /// A registrar's list revokes the identity.
     RevokeIdentity,
-    /// The identity rotates to its successor key, once; with `into`, the
+    /// The identity rotates to its successor key, at most twice; with `into`, the
     /// other party has first presented a friendship it made with that
     /// successor elsewhere, so the rotation lands on a pair it holds; with
     /// `crowded`, the successor brings state of its own toward the other
@@ -275,6 +289,13 @@ enum Failure {
     Call(usize),
     /// The `k`-th write.
     Write(usize),
+    /// The `k`-th store call and every one after it, in this step and in
+    /// each after it until one clears it, counted afresh in each: the rest
+    /// of each such step, past what the run itself must read, fails as a
+    /// store that has gone away does.
+    From(usize),
+    /// Whatever failed from an earlier step, cleared.
+    Clear,
 }
 
 impl Step {
@@ -289,7 +310,8 @@ impl Step {
         // Weighted toward the acts on pending state and the endings that
         // make room for it: Ask 4/32, Answer 3/32, Remove, Unblock,
         // Present, Decline, Cancel and Clock 2/32 each (each clock move
-        // 1/48), every other kind 1/32 (each way of rotating 1/128).
+        // 1/48), every other kind 1/32 (each way of rotating, and Link,
+        // Unlink, Relink and Restart, 1/128).
         let step = match n % 32 {
             0..=3 => Step::Ask {
                 offer: arg & 1 == 1,
@@ -313,7 +335,7 @@ impl Step {
             },
             16 => Step::Block,
             17 | 23 => Step::Decline,
-            18 => Step::Link,
+            18 => [Step::Link, Step::Unlink, Step::Relink, Step::Restart][arg as usize % 4],
             19 => Step::Floor { how: arg % 3 },
             20 => Step::Messaging,
             22 => Step::BlockWithdrawal,
@@ -329,10 +351,13 @@ impl Step {
                 crowded: arg & 2 == 2,
             },
         };
-        // A quarter of the steps meet a failure somewhere in them.
+        // A quarter of the steps meet a failure somewhere in them; one in
+        // 32 fails from a call on until one of three in 32 clears it.
         let failure = match n >> 27 {
             f @ 0..=3 => Failure::Write(1 + f as usize),
             4..=7 => Failure::Call(1 + (n >> 22) as usize % 24),
+            14 => Failure::From(1 + (n >> 22) as usize % 24),
+            18 | 28 | 29 => Failure::Clear,
             _ => Failure::None,
         };
         (step, p, d, failure)
@@ -376,6 +401,13 @@ struct Run {
     fail: Arc<Failing>,
     dir: Arc<Directory>,
     records: Arc<MemoryRecordCache>,
+    inbox: Arc<MemoryStore>,
+    policy: MessagingPolicy,
+    /// Where a [`Failure::From`] fails from in each step, until cleared.
+    failing_from: Option<usize>,
+    /// What the registrars' lists hold, and the floors, while a restart
+    /// has left none of it installed.
+    unpublished: Option<(Published, HashMap<[u8; 32], u64>)>,
     people: [Person; 2],
     /// Each party's two device sessions.
     sessions: [[(Uid, Events); 2]; 2],
@@ -386,8 +418,6 @@ struct Run {
     views: [[View; 3]; 2],
     /// What the registrars' lists hold beside the floors.
     listed: Published,
-    /// Each party's successor key, once it has rotated to it.
-    rotated: [bool; 2],
     /// Each party's keys before its rotation, with the resets they kept.
     former: [Vec<(Person, Resets)>; 2],
     /// Sessions made this step, which read what is as they start rather
@@ -431,6 +461,9 @@ struct Run {
     covered: HashSet<[u8; 32]>,
     /// Every piece of work owed in the run, as last read.
     ever_owed: Vec<Owed>,
+    /// Sessions, as `(party, slot)`, that the run could not read afresh
+    /// since it last judged them.
+    unread: HashSet<(usize, usize)>,
 }
 
 /// An ask's answer, and what its actor's sessions were told.
@@ -502,6 +535,26 @@ fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
     }
 }
 
+/// A core on the run's stores, its clock standing still at `at` but for
+/// what the run advances, as its twin's does from the same time: a lapse
+/// at a second's edge lands alike in both.
+fn core_on(
+    inbox: &Arc<MemoryStore>,
+    dir: &Arc<Directory>,
+    fail: &Arc<Failing>,
+    records: &Arc<MemoryRecordCache>,
+    policy: MessagingPolicy,
+    at: std::time::SystemTime,
+) -> Core {
+    let mut core = Core::new()
+        .with_inbox(inbox.clone(), dir.clone(), InboxPolicy::default())
+        .with_relationships(fail.clone())
+        .with_messaging(policy)
+        .with_record_cache(records.clone());
+    core.clock = crate::clock::Clock::frozen(at);
+    core
+}
+
 impl Run {
     fn new(store: Arc<dyn RelationshipStore>, start: u32, base: u64) -> Self {
         let fail = Arc::new(Failing::new(store.clone()));
@@ -514,27 +567,17 @@ impl Run {
                 .map(|(l, p)| (mailbox(l, p), messaging_bits()))
                 .collect(),
         )));
-        let mut core = Core::new()
-            .with_inbox(
-                Arc::new(MemoryStore::new()),
-                dir.clone(),
-                InboxPolicy::default(),
-            )
-            .with_relationships(fail.clone())
-            .with_messaging(MessagingPolicy {
-                enabled: true,
-                presence_debounce: Duration::ZERO,
-                // Some runs, friends by presentations alone, at the
-                // daily bound from the start.
-                requests_per_day: if start % 6 == 0 { 0 } else { 20 },
-                ..MessagingPolicy::default()
-            })
-            .with_record_cache(records.clone());
-        // Standing still but for what the run advances, as its twin's
-        // does from the same time: a lapse at a second's edge lands
-        // alike in both.
-        core.clock = crate::clock::Clock::frozen(UNIX_EPOCH + Duration::from_secs(base));
-        let core = Arc::new(core);
+        let inbox = Arc::new(MemoryStore::new());
+        let policy = MessagingPolicy {
+            enabled: true,
+            presence_debounce: Duration::ZERO,
+            // Some runs, friends by presentations alone, at the
+            // daily bound from the start.
+            requests_per_day: if start % 6 == 0 { 0 } else { 20 },
+            ..MessagingPolicy::default()
+        };
+        let at = UNIX_EPOCH + Duration::from_secs(base);
+        let core = Arc::new(core_on(&inbox, &dir, &fail, &records, policy, at));
         let sessions =
             [0, 1].map(|p| [0, 1].map(|d| attach(&core, LOGINS[p], &people[p], d, true)));
         let plain = [0, 1].map(|p| {
@@ -572,12 +615,15 @@ impl Run {
             fail,
             dir,
             records,
+            inbox,
+            policy,
+            failing_from: None,
+            unpublished: None,
             people,
             sessions,
             plain,
             views: Default::default(),
             listed: Published::default(),
-            rotated: [false, false],
             former: Default::default(),
             fresh: HashSet::new(),
             asked: None,
@@ -599,11 +645,19 @@ impl Run {
             refused_over: false,
             covered: HashSet::new(),
             ever_owed: Vec::new(),
+            unread: HashSet::new(),
         }
     }
 
+    /// `p`'s mailbox under its identity, where its rows stay while its
+    /// account links nothing.
     fn mailbox(&self, p: usize) -> Mailbox {
         mailbox(LOGINS[p], &self.people[p])
+    }
+
+    /// Whether `p`'s account links its identity.
+    fn linked(&self, p: usize) -> bool {
+        self.dir.0.lock().unwrap()[p].0.fingerprint.is_some()
     }
 
     /// What the run starts from, as its sessions see it.
@@ -732,6 +786,18 @@ impl Run {
     /// what it leaves, and what a tick after a restart makes of that.
     fn quiescent(&mut self, what: &str) {
         let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
+        // A tick of a store still failing writes nothing to hold it to,
+        // but tells nothing it did not do.
+        if self.failing_from.is_some() {
+            let before = self.pairing();
+            self.core.owed_tick();
+            self.core.reconcile_due(listed);
+            let after = self.pairing();
+            let told = self.told();
+            let ended = before.friendship.is_some() && after.friendship != before.friendship;
+            self.told_once(&format!("{what}, then a pass"), &after, ended, &told);
+            return;
+        }
         let before = self.pairing();
         let offered = self.stored_offers();
         self.core.owed_tick();
@@ -840,6 +906,36 @@ impl Run {
     }
 
     fn act(&mut self, step: Step, p: usize, d: usize) -> bool {
+        let unlinked = !self.linked(0) || !self.linked(1);
+        // A plain request to an account by its login alone, which a link
+        // made again claims.
+        let asking = matches!(step, Step::Ask { offer: false }) && self.linked(p);
+        let allowed = asking
+            || matches!(
+                step,
+                Step::Relink
+                    | Step::Restart
+                    | Step::Rotate { .. }
+                    | Step::Clock { .. }
+                    | Step::Messaging
+                    | Step::Revoke
+                    | Step::PublishDevice { .. }
+                    | Step::Freeze
+                    | Step::RevokeIdentity
+                    | Step::Floor { .. }
+            );
+        if unlinked && !allowed {
+            return false;
+        }
+        if matches!(
+            step,
+            Step::PublishDevice { .. }
+                | Step::Freeze
+                | Step::RevokeIdentity
+                | Step::Floor { how: 0 | 1 }
+        ) {
+            self.republished();
+        }
         let core = self.core.clone();
         let (uid, other) = (self.sessions[p][d].0, LOGINS[1 - p]);
         let (me, them) = (&self.people[p], &self.people[1 - p]);
@@ -928,6 +1024,26 @@ impl Run {
                 }
                 self.relink(p, &fp);
                 self.sign_in_again(p);
+                true
+            }
+            Step::Unlink => {
+                let fp = me.fp();
+                if !self.unlink(p, &fp) {
+                    return false;
+                }
+                self.sign_in_again(p);
+                true
+            }
+            Step::Relink => {
+                let fp = me.fp();
+                if self.linked(p) || !self.relink(p, &fp) {
+                    return false;
+                }
+                self.sign_in_again(p);
+                true
+            }
+            Step::Restart => {
+                self.restart();
                 true
             }
             Step::RemoveByKey => core.friend_remove_by_key(uid, &them.fp(), None).is_ok(),
@@ -1046,12 +1162,13 @@ impl Run {
     /// sessions made again under it; with `into`, after the other party
     /// presented a friendship it made with the successor elsewhere.
     fn rotate(&mut self, p: usize, into: bool, crowded: bool) -> bool {
+        let n = self.former[p].len();
         // A registrar publishes no rotation of an identity it revoked.
-        if self.rotated[p] || self.identity_revoked(&self.people[p].fp()) {
+        if n == 2 || self.identity_revoked(&self.people[p].fp()) {
             return false;
         }
         let now = self.core.clock.unix();
-        let next = Person::new(3 + p as u8, self.base);
+        let next = Person::new(3 + p as u8 + 2 * n as u8, self.base);
         if into {
             let (q, them) = (1 - p, &self.people[1 - p]);
             let o = next.offer(1, them, now - 30);
@@ -1069,12 +1186,16 @@ impl Run {
         .sign(&me.id, &next.id)
         .expect("a rotation");
         let (from, to) = (me.fp(), next.fp());
-        if crowded {
+        let linked = [self.linked(p), self.linked(1 - p)];
+        if crowded && linked == [true, true] {
             self.crowd(p, &next);
             self.crowded = true;
         }
         let before = self.upgrades_of(p, &[from, to]);
-        self.dir.0.lock().unwrap()[p].0.fingerprint = Some(to);
+        // As the account link moves, where there is one.
+        if linked[0] {
+            self.dir.0.lock().unwrap()[p].0.fingerprint = Some(to);
+        }
         self.core.keep_rotation_record(&record);
         // One that fails, its record kept, is made again with nothing
         // failing, as the successor's next login would, so that what
@@ -1095,7 +1216,6 @@ impl Run {
             assert!(self.core.after_merge(&writing, &successor), "settled");
         }
         self.settled(p, from, to, &before);
-        self.rotated[p] = true;
         let old = std::mem::replace(&mut self.people[p], next);
         let resets = std::mem::take(&mut self.resets[p]);
         self.former[p].push((old, resets));
@@ -1315,15 +1435,26 @@ impl Run {
             self.ended.insert(*uid);
             self.core.end_session(*uid);
         }
-        // A device still refused stays signed out.
+        self.sign_in(p);
+    }
+
+    /// `p`'s sessions made, each reading its roster: its devices', or,
+    /// where its account links nothing, sessions by password.
+    fn sign_in(&mut self, p: usize) {
+        self.fail.fail_nth(0);
+        // A device still refused stays signed out, its slot holding uid 0,
+        // which no core hands out, so it reads as ended whatever core runs.
         let who = &self.people[p];
+        self.ended.insert(0);
         for d in 0..2 {
-            if let Some(s) = try_attach(&self.core, LOGINS[p], who, d, true) {
-                self.sessions[p][d] = s;
+            match try_attach(&self.core, LOGINS[p], who, d, true) {
+                Some(s) => self.sessions[p][d] = s,
+                None => self.sessions[p][d].0 = 0,
             }
         }
-        if let Some(s) = try_attach(&self.core, LOGINS[p], who, 0, false) {
-            self.plain[p] = s;
+        match try_attach(&self.core, LOGINS[p], who, 0, false) {
+            Some(s) => self.plain[p] = s,
+            None => self.plain[p].0 = 0,
         }
         for slot in 0..3 {
             let uid = self.uid(p, slot);
@@ -1357,6 +1488,54 @@ impl Run {
         self.core.inbox_claim(LOGINS[p], fp);
     }
 
+    /// The server started again on the run's stores, in the binary's
+    /// order, its sessions made anew; what a registrar's lists published
+    /// not read yet, and so taken by the run as installed no more.
+    fn restart(&mut self) {
+        let at = self.core.clock.wall();
+        let off = self
+            .core
+            .upgrades_off
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let core = core_on(
+            &self.inbox,
+            &self.dir,
+            &self.fail,
+            &self.records,
+            self.policy,
+            at,
+        );
+        core.upgrades_off
+            .store(off, std::sync::atomic::Ordering::Relaxed);
+        // The operator's list; then the rotations under way, none here,
+        // since the run finishes each at once; then the friendships judged
+        // at the epochs kept; then the ticks.
+        drop(core.set_revocations(Revocations {
+            devices: self.revoked.clone(),
+            ..Default::default()
+        }));
+        core.reconcile_kept();
+        core.owed_tick();
+        self.core = Arc::new(core);
+        if self.unpublished.is_none() {
+            let listed = std::mem::take(&mut self.listed);
+            self.unpublished = Some((listed, std::mem::take(&mut self.floors)));
+        }
+        self.covered.clear();
+        self.ended.clear();
+        self.sign_in(0);
+        self.sign_in(1);
+    }
+
+    /// What the registrars' lists hold taken as the run's again, as the
+    /// first read after a restart reinstalls it.
+    fn republished(&mut self) {
+        if let Some((listed, floors)) = self.unpublished.take() {
+            self.listed = listed;
+            self.floors = floors;
+        }
+    }
+
     /// Where entries were told from a read after their step, since last
     /// asked.
     /// Whether each party's pending out is an upgrade, which a block that
@@ -1387,6 +1566,7 @@ impl Run {
         for slot in 0..3 {
             if let Some(v) = self.derived(q, slot) {
                 self.views[q][slot] = v;
+                self.unread.remove(&(q, slot));
             }
         }
     }
@@ -1485,10 +1665,19 @@ impl Run {
         // that blocked it, or takes no part, is answered as no account.
         let (me, them) = (self.mailbox(p), self.mailbox(1 - p));
         let named = self.takes_part(1 - p) && !self.store.is_blocked(&them, &me).unwrap();
+        // What failed after the last step's act, as a store still failing
+        // fails the checks that follow it, is not this step's.
+        self.fail.fail_nth(0);
+        self.fail.failed();
         match failure {
             Failure::None => {}
             Failure::Call(k) => self.fail.fail_nth(k),
             Failure::Write(k) => self.fail.fail_nth_write(k),
+            Failure::From(k) => self.failing_from = Some(k),
+            Failure::Clear => self.failing_from = None,
+        }
+        if let Some(k) = self.failing_from {
+            self.fail.fail_from(k);
         }
         // Whether the party has nothing to the other that its own sessions
         // see: what an ask's answer may depend on.
@@ -1520,10 +1709,18 @@ impl Run {
         let upgrading = self.upgrading_now();
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
+        // Still failing for what the run asks of the core after the act.
+        if self.failing_from.is_some() {
+            self.fail.fail_from(1);
+        }
         self.core.clock.advance(Duration::from_secs(1));
         let after = self.pairing();
         let told = self.told();
         let failed = self.fail.failed();
+        let failure = match self.failing_from {
+            Some(k) => Failure::From(k),
+            _ => failure,
+        };
         let what = format!("{step:?} by {} on device {d}, {failure:?}", LOGINS[p]);
 
         // An ask with an offer, from a party with nothing to the other,
@@ -1594,6 +1791,8 @@ impl Run {
         ) || (matches!(
             step,
             Step::Link
+                | Step::Unlink
+                | Step::Restart
                 | Step::Revoke
                 | Step::Floor { .. }
                 | Step::PublishDevice { .. }
@@ -1604,6 +1803,17 @@ impl Run {
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
         );
+        // An unlink takes what the unlinked identity presented, and only it.
+        if matches!(step, Step::Unlink) {
+            let keys = self.keys(p);
+            let gone = before.rows.iter().filter(|r| !after.rows.contains(r));
+            for (presenter, ..) in gone {
+                assert!(
+                    keys.contains(presenter),
+                    "{what}: took the other's evidence"
+                );
+            }
+        }
         self.told_once(&what, &after, ended, &told);
 
         // An active edge stands on held evidence wherever a step made it
@@ -1748,7 +1958,12 @@ impl Run {
         let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
         // Losing the messaging bit is read live, and a crowded rotation
         // merges state written by hand, which no act told.
-        let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || self.crowded;
+        // While an account links nothing, the other's roster may name it
+        // twice, by the rows its identity keeps and by those its login does.
+        let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging)
+            || self.crowded
+            || !self.linked(0)
+            || !self.linked(1);
         let folds = step.folds();
         self.upgrading = upgrading;
         self.shown(&what, !lapsing, blocking, folds);
@@ -1885,8 +2100,8 @@ impl Run {
 
     /// Whether what is installed now forbids an offer: its device revoked
     /// by the operator or a registrar, a key of the chain of the identity
-    /// it is from or to revoked, or its certificate below its signer's
-    /// floor.
+    /// it is from or to revoked or linked by no account, or its
+    /// certificate below its signer's floor.
     fn forbidden(&self, offer: &[u8]) -> bool {
         let o = Offer::check(offer, u64::MAX, &[], |_| 0).expect("an offer kept");
         let cert = DeviceCert::parse(&o.cert).expect("a certificate");
@@ -1903,13 +2118,21 @@ impl Run {
             || self.identity_revoked(&identity)
             || self.identity_revoked(&o.to.0)
             || cert.epoch < floor
+            || !self.chain_linked(&identity)
+            || !self.chain_linked(&o.to.0)
     }
 
     /// With nothing failing, ticks until the store is quiet, owed sweeps'
     /// backoffs past: then it holds no offer and no presentation that
     /// what is installed forbids.
     fn converged(&mut self) {
+        self.failing_from = None;
         self.fail.fail_nth(0);
+        // The registrars' lists read again, as a records sweep would.
+        if self.unpublished.is_some() {
+            self.republished();
+            self.publish();
+        }
         let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
         for _ in 0..8 {
             self.core.clock.advance(Duration::from_secs(3700));
@@ -1940,7 +2163,7 @@ impl Run {
                 [self.people[0].fp()[0], self.people[1].fp()[0]]
             );
         }
-        for p in self.presentations() {
+        for p in self.all_presentations() {
             let revoked = self.revoked.contains(&p.device)
                 || self.listed.devices.contains(&(p.presenter, p.device));
             assert!(
@@ -1955,6 +2178,18 @@ impl Run {
                 (p.device[0], self.revoked.contains(&p.device)),
                 self.core.owed_unwritten()
             );
+        }
+        // Whatever was owed: nothing an identity no account links presented
+        // stays (its offers are forbidden, above).
+        for q in (0..2).filter(|q| !self.linked(*q)) {
+            let keys = self.keys(q);
+            for p in self.all_presentations() {
+                assert!(
+                    !keys.contains(&p.presenter),
+                    "converged on a presentation by {}, whose account links nothing",
+                    LOGINS[q]
+                );
+            }
         }
         if let Some(illegal) = self.illegal() {
             panic!("converged: {illegal}");
@@ -2033,6 +2268,17 @@ impl Run {
             if (friends || blocked) && pending.is_some() {
                 return Some(format!("{who}'s request beside a friendship or a block"));
             }
+            // A request the other party made of the account by its login
+            // alone while it linked nothing.
+            if !self.linked(1 - q) {
+                let login = Mailbox::login(LOGINS[1 - q]);
+                let row = self.store.relationship(&me, &login, now).unwrap();
+                if row.is_some_and(|r| {
+                    (r.friendship.is_some() || r.blocked_at.is_some()) && r.pending_out.is_some()
+                }) {
+                    return Some(format!("{who}'s request by login beside a friendship"));
+                }
+            }
             if blocked && upgrade.is_some() {
                 return Some(format!("{who}'s upgrade offer beside a block"));
             }
@@ -2070,9 +2316,14 @@ impl Run {
         for q in 0..2 {
             let judged = whole && blocking != Some(q) && self.takes_part(q);
             for slot in 0..3 {
+                // What may change untold (a lapse, a block's drop of a
+                // request, a blocker's own entry) in a step whose reads
+                // failed is read once they can be, and judged after that.
                 let Some(derived) = self.derived(q, slot) else {
+                    self.unread.insert((q, slot));
                     continue;
                 };
+                let read_since = !self.unread.remove(&(q, slot));
                 // A block drops the blocked party's request unsaid, as a
                 // missing account's would be, and so does the settling of
                 // a fold that left one standing.
@@ -2098,7 +2349,7 @@ impl Run {
                         },
                     ),
                 };
-                if judged && !unsaid {
+                if judged && !unsaid && read_since {
                     assert_eq!(
                         shows,
                         read,
@@ -2213,6 +2464,9 @@ fn attach(core: &Core, login: &str, who: &Person, d: usize, friendships: bool) -
     try_attach(core, login, who, d, friendships).expect("a session")
 }
 
+/// A session of `who`'s device `d`, asking for portable friendships where
+/// `friendships` says so: the device proved only where the account links
+/// the identity, a session by password where it does not.
 fn try_attach(
     core: &Core,
     login: &str,
@@ -2220,6 +2474,11 @@ fn try_attach(
     d: usize,
     friendships: bool,
 ) -> Option<(Uid, Events)> {
+    let linked = core
+        .directory
+        .as_ref()
+        .and_then(|dir| dir.account_by_key(&who.fp()))
+        .is_some();
     let cert = &who.devices[d].1;
     let (uid, mut rx) = core.attach(AttachInfo {
         account: None,
@@ -2232,8 +2491,8 @@ fn try_attach(
         can_detach: true,
         transport: crate::Transport {
             messaging: true,
-            friendships,
-            identity: Some(IdentityTag {
+            friendships: friendships && linked,
+            identity: linked.then(|| IdentityTag {
                 fingerprint: who.fp(),
                 device: who.device(d),
                 handle: None,
@@ -2256,7 +2515,7 @@ fn try_attach(
         set_subject: false,
         is_person: true,
         reads_on_delivery: false,
-        identity: Some(who.fp()),
+        identity: linked.then(|| who.fp()),
         system: false,
     })?;
     core.announce(uid);
@@ -2284,10 +2543,16 @@ fn try_attach(
 /// sweep owed for an account that lost messaging and was linked again,
 /// an ask its twin answered across a second's edge the run did not, a
 /// revoked device's presentations owed through a rotation, a link made
-/// again that was refused, and a crowded rotation after a revocation's
-/// drop, an offer a rotation moved under an identity a registrar then
-/// revoked, its drop owed, and a revoked identity drawn to rotate, one
-/// whose offers' drop a write failure left owed.
+/// again that was refused, a crowded rotation after a revocation's drop,
+/// an offer a rotation moved under an identity a registrar then revoked,
+/// its drop owed, a revoked identity drawn to rotate, one whose offers'
+/// drop a write failure left owed,
+/// an unlink's drop of presentations owed across a restart, and through a
+/// rotation, a claim's settling of a request beside a friendship that
+/// could not be written, an unlink ending an edge its presentations were evidence for,
+/// a request lapsing while the store fails, and one a block drops, read
+/// once it does not, a restart with a device the operator revoked, and
+/// one doing the drop its revocation owed, and a tick doing an unlink's.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2313,7 +2578,7 @@ pub const FOUND: &[&[u32]] = &[
     ],
     &[1369815304, 3160564558, 32, 142700573, 2788673504],
     &[1268098574, 1865338562, 2686804959, 2851487448],
-    &[2728864225, 3673178098, 783180557, 773610635],
+    &[2728864225, 3673177714, 783180557, 773610635],
     &[877930787, 259041713, 422970530, 2957443115],
     &[
         1162221802, 137516573, 362072657, 498996160, 115384252, 3433446927,
@@ -2321,7 +2586,7 @@ pub const FOUND: &[&[u32]] = &[
     &[199610076, 2956155360],
     &[35977725],
     &[
-        299946571, 4253775924, 118200754, 1634629088, 36862, 2276450037,
+        299946571, 4253775924, 118200370, 1634629088, 36862, 2276450037,
     ],
     &[
         968273619, 3005749070, 3110229216, 2592843849, 3169815897, 2983732227, 4079285387,
@@ -2331,13 +2596,24 @@ pub const FOUND: &[&[u32]] = &[
         1144741207, 3717504557, 1248828497, 1455716137,
     ],
     &[1702465536, 609691418, 2400948381, 958047247],
-    &[2980784683, 839393586, 136405568],
+    &[2980784683, 839393330, 136405568],
     &[1784966391, 69004476, 3951691538, 3192174383, 1465714621],
     &[1122325728, 1196365437, 61623996, 1083994415, 1073751060],
     &[
         212844157, 622128604, 792503153, 4265061469, 1058415471, 1378804416,
     ],
     &[3088234, 2679763584, 59294812, 2164156381],
+    &[1073741839, 134217874, 1073742226],
+    &[1073741839, 134217874, 1073741853, 1073741967],
+    &[1073741839, 1073741970, 1073741856, 134218002],
+    &[34133493, 4164061426],
+    &[
+        1187788168, 1669222220, 2688408827, 4273528256, 1997139577, 1313364021, 3787951305,
+    ],
+    &[2880806443, 2084961170],
+    &[3402283533, 1598910336, 1881993130, 2685432368, 3758100126],
+    &[287656251, 122038571, 3969193906],
+    &[15777745, 2791398592, 610125010],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
@@ -2354,7 +2630,7 @@ pub const FOUND_TELLING: &[&[u32]] = &[
     &[4184385920, 4181072083],
     &[4282268916, 4210818445],
     &[4228555290, 4200952286],
-    &[4163459622, 4184817938],
+    &[4163459622, 4184817682],
     &[3553310280, 1266791837, 1805439339, 0],
     &[5078164, 4015546323, 300212360],
 ];
@@ -2427,6 +2703,13 @@ pub fn run_failing_each_call(
                 }
                 let p = run.actor(n);
                 let (step, _, d, _) = Step::of(n);
+                // This step's one failure alone, whatever the steps before
+                // it left failing.
+                run.failing_from = None;
+                run.fail.fail_nth(0);
+                run.fail.failed();
+                run.resync(0);
+                run.resync(1);
                 run.told();
                 run.requested = 0;
                 run.upgrading = run.upgrading_now();
