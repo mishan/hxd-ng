@@ -201,16 +201,14 @@ async fn hope_checks_the_password_as_the_client_typed_it() {
     let mut ivan = Login::account("i", "ivan", CYRILLIC);
     ivan.caps = Some(1 << 1);
     hope(s.legacy, &o, &ivan).await.unwrap();
-    assert!(hope(s.legacy, &o, &Login::account("i", "ivan", "??????1"))
-        .await
-        .is_err());
-    // A wrong password, and a login no account has: the transport never
-    // starts, and the refusal is not one the client can read through it.
+    // A wrong password, and a login no account has: neither agrees a
+    // transport, so each is refused in the clear.
     for login in [
+        Login::account("i", "ivan", "??????1"),
         Login::account("a", "alice", "wrong"),
         Login::account("n", "nobody", "s3cret"),
     ] {
-        assert!(hope(s.legacy, &o, &login).await.is_err());
+        assert_eq!(refused(hope(s.legacy, &o, &login).await), "Login failed.");
     }
 }
 
@@ -224,9 +222,8 @@ async fn wrong_hope_passwords_count_as_any_others_do() {
     .await;
     let o = offer(&[Cipher::Blowfish], &[]);
     for _ in 0..2 {
-        assert!(hope(s.legacy, &o, &Login::account("a", "alice", "wrong"))
-            .await
-            .is_err());
+        let wrong = hope(s.legacy, &o, &Login::account("a", "alice", "wrong")).await;
+        assert_eq!(refused(wrong), "Login failed.");
     }
     // The address is out of guesses at alice, on the plain login as on HOPE.
     match Client::login_at(s.legacy, &Login::account("a", "alice", "s3cret")).await {
@@ -311,10 +308,14 @@ async fn a_guest_account_with_a_password_is_throttled_by_hope_as_any_other() {
     };
     hope(s.legacy, &o, &guest("gpw")).await.unwrap();
     for _ in 0..2 {
-        assert!(hope(s.legacy, &o, &guest("wrong")).await.is_err());
+        assert_eq!(
+            refused(hope(s.legacy, &o, &guest("wrong")).await),
+            "Login failed."
+        );
     }
     // Locked out: the right password is refused too.
-    assert!(hope(s.legacy, &o, &guest("gpw")).await.is_err());
+    let locked = refused(hope(s.legacy, &o, &guest("gpw")).await);
+    assert!(locked.starts_with("Too many failed logins."), "{locked}");
 }
 
 #[tokio::test]

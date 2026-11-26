@@ -402,6 +402,37 @@ impl Receiver {
         }
     }
 
+    /// The reply to HOPE's step 2, whose bytes are the next to arrive. A
+    /// refusal comes in the clear, since a wrong password agrees no keys
+    /// (docs/hope.md §2); anything else comes through `hope`, which is
+    /// this receiver's from then on.
+    async fn step2_reply(&mut self, trans: u32, hope: hxhope::Receiver) -> Result<Frame> {
+        let mut raw = Vec::new();
+        timeout(self.timeout, async {
+            while raw.len() < 20 {
+                let mut chunk = [0u8; 16 * 1024];
+                let n = self.rd.read(&mut chunk).await?;
+                if n == 0 {
+                    return Err(Error::Closed);
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
+        let word = |at: usize| u32::from_be_bytes(raw[at..at + 4].try_into().expect("four bytes"));
+        if word(0) == TASK && word(4) == trans && word(8) != 0 {
+            self.buf.extend_from_slice(&raw);
+        } else {
+            let mut hope = hope;
+            hope.decode(&raw, &mut self.buf)
+                .map_err(|e| Error::Protocol(e.to_string()))?;
+            self.hope = Some(hope);
+        }
+        self.read().await
+    }
+
     /// The first frame matching `pred`, backlog first; everything else
     /// stays in the backlog in order. The timeout is for the whole wait,
     /// so steady unrelated traffic cannot stretch it.
@@ -575,8 +606,8 @@ impl Client {
             hxhope::client::step2(offer, &answer.buf, &who, trans, random).map_err(refused)?;
         self.tx.send_raw(&est.step2).await?;
         let (send, recv) = est.transport.split();
-        (self.tx.hope, self.rx.hope) = (Some(send), Some(recv));
-        let reply = self.rx.reply(trans).await?;
+        self.tx.hope = Some(send);
+        let reply = self.rx.step2_reply(trans, recv).await?;
         if reply.is_error() {
             return Err(Error::Refused {
                 code: String::new(),
