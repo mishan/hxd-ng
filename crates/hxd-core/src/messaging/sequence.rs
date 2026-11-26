@@ -1041,7 +1041,8 @@ impl Run {
     /// sessions made again under it; with `into`, after the other party
     /// presented a friendship it made with the successor elsewhere.
     fn rotate(&mut self, p: usize, into: bool, crowded: bool) -> bool {
-        if self.rotated[p] {
+        // A registrar publishes no rotation of an identity it revoked.
+        if self.rotated[p] || self.identity_revoked(&self.people[p].fp()) {
             return false;
         }
         let now = self.core.clock.unix();
@@ -1866,9 +1867,16 @@ impl Run {
         out
     }
 
+    /// Whether a registrar's list revokes a key of `fp`'s chain, which
+    /// covers what a rotation has keyed under it since.
+    fn identity_revoked(&self, fp: &[u8; 32]) -> bool {
+        (self.chain(fp).iter()).any(|k| self.listed.identities.contains(k))
+    }
+
     /// Whether what is installed now forbids an offer: its device revoked
-    /// by the operator or a registrar, the identity it is from or to
-    /// revoked, or its certificate below its signer's floor.
+    /// by the operator or a registrar, a key of the chain of the identity
+    /// it is from or to revoked, or its certificate below its signer's
+    /// floor.
     fn forbidden(&self, offer: &[u8]) -> bool {
         let o = Offer::check(offer, u64::MAX, &[], |_| 0).expect("an offer kept");
         let cert = DeviceCert::parse(&o.cert).expect("a certificate");
@@ -1882,8 +1890,8 @@ impl Run {
         });
         self.revoked.contains(&device)
             || self.listed.devices.contains(&(identity, device))
-            || self.listed.identities.contains(&identity)
-            || self.listed.identities.contains(&o.to.0)
+            || self.identity_revoked(&identity)
+            || self.identity_revoked(&o.to.0)
             || cert.epoch < floor
     }
 
@@ -2260,7 +2268,8 @@ fn try_attach(
 /// an ask its twin answered across a second's edge the run did not, a
 /// revoked device's presentations owed through a rotation, a link made
 /// again that was refused, and a crowded rotation after a revocation's
-/// drop.
+/// drop, an offer a rotation moved under an identity a registrar then
+/// revoked, its drop owed, and a revoked identity drawn to rotate.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2306,6 +2315,10 @@ pub const FOUND: &[&[u32]] = &[
     &[1702465536, 609691418, 2400948381, 958047247],
     &[2980784683, 839393586, 136405568],
     &[1784966391, 69004476, 3951691538, 3192174383, 1465714621],
+    &[1122325728, 1196365437, 61623996, 1083994415, 1073751060],
+    &[
+        212844157, 622128604, 792503153, 4265061469, 1058415471, 1378804416,
+    ],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
