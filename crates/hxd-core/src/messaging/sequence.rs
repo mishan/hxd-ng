@@ -1706,6 +1706,7 @@ impl Run {
         let free = before.friendship.is_none() && !mine;
         let predecessor = self.names_a_predecessor();
         let owed = self.store.owed().unwrap();
+        let unwritten = self.core.owed_unwritten();
         let upgrading = self.upgrading_now();
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
@@ -1778,7 +1779,9 @@ impl Run {
         // An ending is told to each session of both once, a removal only
         // once committed, and only what removes or withdraws, or a
         // presentation, which judges the other party's (§6), ends an edge
-        // that was not its presentations' alone.
+        // that was not its presentations' alone. One that was may also end
+        // by what drops presentations, including owed work a later step
+        // does.
         let ended = before.friendship.is_some() && after.friendship != before.friendship;
         let ends = matches!(
             step,
@@ -1788,7 +1791,7 @@ impl Run {
                 | Step::PresentWithdrawal { .. }
                 | Step::RemoveByKey
                 | Step::Present { .. }
-        ) || (matches!(
+        ) || ((matches!(
             step,
             Step::Link
                 | Step::Unlink
@@ -1798,7 +1801,8 @@ impl Run {
                 | Step::PublishDevice { .. }
                 | Step::RevokeIdentity
                 | Step::Rotate { .. }
-        ) && before.evidence == [true, true]);
+        ) || self.did_owed_drops(&owed, &unwritten))
+            && before.evidence == [true, true]);
         assert!(
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
@@ -1967,6 +1971,31 @@ impl Run {
         let folds = step.folds();
         self.upgrading = upgrading;
         self.shown(&what, !lapsing, blocking, folds);
+    }
+
+    /// Whether a step did work owed before it, in the store or kept
+    /// unwritten, that drops presentations: gone and done, not merely
+    /// written to the store or lifted. Any step that sweeps may end what
+    /// that work's own step would have.
+    fn did_owed_drops(&self, owed: &[Owed], unwritten: &[(Work, Cause)]) -> bool {
+        let drops = |w: &Work| {
+            matches!(
+                w,
+                Work::DropPresentedBy { .. } | Work::DropPresentationsOf(_) | Work::Judge(..)
+            )
+        };
+        let (owed_now, unwritten_now) = (self.store.owed().unwrap(), self.core.owed_unwritten());
+        let stored = (owed.iter().filter(|o| drops(&o.work)))
+            .any(|o| !owed_now.iter().any(|n| n.id == o.id) && self.done(&o.work));
+        // One flushed is a row new this step, under its cause.
+        let flushed = |c: &Cause| {
+            (owed_now.iter())
+                .any(|n| n.cause == *c && drops(&n.work) && !owed.iter().any(|o| o.id == n.id))
+        };
+        let kept = (unwritten.iter().filter(|(w, _)| drops(w))).any(|(w, c)| {
+            !unwritten_now.iter().any(|(n, m)| n == w && m == c) && !flushed(c) && self.done(w)
+        });
+        stored || kept
     }
 
     /// Each piece of work owed before a step, matched by its id, and gone
@@ -2552,7 +2581,8 @@ fn try_attach(
 /// could not be written, an unlink ending an edge its presentations were evidence for,
 /// a request lapsing while the store fails, and one a block drops, read
 /// once it does not, a restart with a device the operator revoked, and
-/// one doing the drop its revocation owed, and a tick doing an unlink's.
+/// one doing the drop its revocation owed, and a tick doing an unlink's,
+/// and a freeze doing a revocation's drop kept unwritten.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2614,6 +2644,7 @@ pub const FOUND: &[&[u32]] = &[
     &[3402283533, 1598910336, 1881993130, 2685432368, 3758100126],
     &[287656251, 122038571, 3969193906],
     &[15777745, 2791398592, 610125010],
+    &[3863809839, 1926845451, 1494381365, 3876424443],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
