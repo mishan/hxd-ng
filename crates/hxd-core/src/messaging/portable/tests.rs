@@ -18,7 +18,7 @@ use super::super::tests::{messaging_bits, policy, server_of, Directory, Server};
 use super::super::*;
 use crate::identity_records::{CachedList, KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
-use crate::relationships::{Presentation, RelationId};
+use crate::relationships::{Cause, Presentation, RelationId, Work};
 use crate::roster::{drain, AttachInfo};
 use crate::{Events, IdentityTag, InboxPolicy, Published, Revocations};
 
@@ -2400,15 +2400,20 @@ fn a_pair_two_sweeps_name_by_two_spellings_is_told_once() {
     accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alicia", fp(&alice));
     let device = Fingerprint::of(&alice.devices[0].0.public()).0;
     s.core.sweep_offers(vec![
-        super::Sweep::Device {
-            identity: Some(fp(&alice)),
-            device,
-            operator: false,
-        },
-        super::Sweep::Identity {
-            identity: fp(&alice),
-            operator: false,
-        },
+        (
+            Work::DropOffersBy {
+                under: Some(fp(&alice)),
+                device,
+            },
+            Cause::PublishedDevice {
+                identity: fp(&alice),
+                device,
+            },
+        ),
+        (
+            Work::DropOffersNaming(fp(&alice)),
+            Cause::PublishedIdentity(fp(&alice)),
+        ),
     ]);
     let told: Vec<_> = drain(&mut rb)
         .into_iter()
@@ -3977,8 +3982,13 @@ fn a_copy_dropped_under_a_predecessor_judges_its_successors_again() {
     assert!(later().is_some(), "dated by the copy under the old key");
 
     let device = Fingerprint::of(&old.devices[0].0.public()).0;
+    let cause = Cause::PublishedDevice {
+        identity: fp(&old),
+        device,
+    };
+    let under = Some(fp(&old));
     s.core
-        .drop_revoked_presentations(&[(Some(fp(&old)), device)]);
+        .sweep_offers(vec![(Work::DropPresentedBy { under, device }, cause)]);
     s.core.judge_floors([fp(&new)]);
     assert!(later().is_none());
 }
@@ -4709,37 +4719,40 @@ fn a_deleted_accounts_purge_that_cannot_be_done_is_owed_until_it_is() {
 
 #[test]
 fn a_registrar_device_sweep_follows_the_offers_its_identity_rotated() {
-    let (alice, bob, successor) = (person(1), person(2), person(4));
-    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
-    let (a, _) = device(&s.core, "alice", &alice, 0);
-    s.core
-        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
-        .unwrap();
-    let record = Rotation {
-        identity: alice.id.public(),
-        successor: successor.id.public(),
-        time: now(),
-        next: None,
+    // Whether or not the rotation's record was kept here: the move the
+    // rotation made is.
+    for kept in [true, false] {
+        let (alice, bob, successor) = (person(1), person(2), person(4));
+        let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+            (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+            (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+        ])));
+        let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+        let (a, _) = device(&s.core, "alice", &alice, 0);
+        s.core
+            .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+            .unwrap();
+        if kept {
+            s.core.keep_rotation_record(&rotation(&alice, &successor));
+        }
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+        s.core
+            .rotate_identity(&fp(&alice), &fp(&successor))
+            .unwrap();
+        let carried = || {
+            let ms = Mailbox::identified("alice", fp(&successor));
+            let mb = Mailbox::identified("bob", fp(&bob));
+            let row = s.rel.relationship(&ms, &mb, s.core.clock().wall()).unwrap();
+            row.and_then(|r| r.pending_out).and_then(|p| p.offer)
+        };
+        assert!(carried().is_some(), "moved with the rotation, kept {kept}");
+        drop(s.core.set_published_revocations(Published {
+            devices: [(fp(&alice), Fingerprint::of(&alice.devices[0].0.public()).0)].into(),
+            covered: [fp(&alice)].into(),
+            ..Default::default()
+        }));
+        assert_eq!(carried(), None, "found under the successor, kept {kept}");
     }
-    .sign(&alice.id, &successor.id)
-    .unwrap();
-    s.core.keep_rotation_record(&record);
-    s.core
-        .rotate_identity(&fp(&alice), &fp(&successor))
-        .unwrap();
-    let carried = || {
-        let ms = Mailbox::identified("alice", fp(&successor));
-        let mb = Mailbox::identified("bob", fp(&bob));
-        let row = s.rel.relationship(&ms, &mb, s.core.clock().wall()).unwrap();
-        row.and_then(|r| r.pending_out).and_then(|p| p.offer)
-    };
-    assert!(carried().is_some(), "moved with the rotation");
-    drop(s.core.set_published_revocations(Published {
-        devices: [(fp(&alice), Fingerprint::of(&alice.devices[0].0.public()).0)].into(),
-        covered: [fp(&alice)].into(),
-        ..Default::default()
-    }));
-    assert_eq!(carried(), None, "found under the successor");
 }
 
 #[test]
@@ -4961,4 +4974,301 @@ fn a_dismissed_upgrade_beside_a_friendship_is_told_to_the_dismissers_sessions() 
         })
         .collect();
     assert_eq!(entries, [(RosterState::Accepted, None)], "the offer gone");
+}
+
+/// Alice and Bob friends by what each presented, her account then giving
+/// up its link with the drop of her presentations failing: the server, its
+/// directory, and Bob's presentation of her.
+fn unlinked_owing() -> (Person, Person, Server, Switch) {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    made(&s, &alice, &bob);
+    assert!(s
+        .rel
+        .presentation(&fp(&alice), &fp(&bob))
+        .unwrap()
+        .is_some());
+    accounts.0.lock().unwrap()[0].0 = Mailbox::login("alice");
+    s.fail.fail_next("presentations");
+    s.core.friendships_unlinked(&fp(&alice));
+    assert_eq!(s.fail.failed(), Some("presentations"));
+    (alice, bob, s, accounts)
+}
+
+/// A core on `s`'s stores, as a server started again on its database
+/// builds one.
+fn started_again(s: &Server, accounts: &Switch) -> Core {
+    Core::new()
+        .with_inbox(
+            s.inbox.clone(),
+            Arc::new(accounts.clone()),
+            InboxPolicy::default(),
+        )
+        .with_relationships(s.fail.clone())
+        .with_messaging(policy())
+        .with_record_cache(Arc::new(MemoryRecordCache::default()))
+}
+
+#[test]
+fn presentations_an_unlink_could_not_drop_are_dropped_by_the_server_started_after() {
+    let (alice, bob, s, accounts) = unlinked_owing();
+    let core = started_again(&s, &accounts);
+    drop(s.core);
+    core.owed_tick();
+    assert!(
+        (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_none(),
+        "the drop owed before the restart, done after it"
+    );
+}
+
+#[test]
+fn presentations_an_unlink_could_not_drop_are_dropped_where_a_rotation_moved_them() {
+    let (alice, bob, s, _) = unlinked_owing();
+    let successor = person(4);
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    assert!(s
+        .rel
+        .presentation(&fp(&successor), &fp(&bob))
+        .unwrap()
+        .is_some());
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(
+        (s.rel.presentation(&fp(&successor), &fp(&bob)).unwrap()).is_none(),
+        "dropped under the key the rows moved to"
+    );
+}
+
+#[test]
+fn an_orphan_whose_judging_was_owed_is_judged_where_a_rotation_moved_it() {
+    let (mut alice, bob, carol, successor) = (person(1), person(2), person(3), person(4));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+        (Mailbox::identified("carol", fp(&carol)), messaging_bits()),
+    ])));
+    let s1 = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let s = server_of(
+        accounts.clone(),
+        MessagingPolicy {
+            max_roster: 1,
+            ..policy()
+        },
+        InboxPolicy::default(),
+        None,
+    );
+    let t = s.core.clock().unix();
+    let (a, _) = device(&s.core, "alice", &alice, 1);
+    s.core.inbox_block(a, "carol", true).unwrap();
+    s.core
+        .friendships_present(a, vec![], vec![f.clone()])
+        .unwrap();
+    s.core.clock().advance(std::time::Duration::from_secs(10));
+    reset(&s, &alice, 1, t + 5);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&held));
+    let renewed = enroll(&mut alice, 1);
+    let (a2, _) = device(&s.core, "alice", &alice, renewed);
+    s.fail.fail_next("presentation");
+    assert_eq!(s.core.friend_remove_by_key(a2, &fp(&bob), None), Ok(()));
+    assert_eq!(s.fail.failed(), Some("presentation"));
+
+    // Bob's, held by Alice's taking alone, moves with her rotation, which
+    // a start judges nothing of.
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    s.core
+        .rotate_identity_linking(&fp(&alice), &fp(&successor), true, |to| *to, |_| Ok(()))
+        .unwrap();
+    let bobs = || s.rel.presentation(&fp(&bob), &fp(&successor)).unwrap();
+    assert!(bobs().is_some());
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(bobs().is_none(), "judged where the rotation moved it");
+}
+
+#[test]
+fn a_claims_settling_that_cannot_be_written_is_owed_until_it_is() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = session(&s.core, "alice", &alice, 0, false, u64::MAX);
+    let (b, _) = session(&s.core, "bob", &bob, 0, false, u64::MAX);
+    s.core.friend_add(a, "bob", None).unwrap();
+    assert_eq!(
+        s.core.friend_answer(b, "alice", true, None),
+        Ok(RosterState::Accepted)
+    );
+    // Bob asks the account while it links nothing: a row by its login.
+    accounts.0.lock().unwrap()[0].0 = Mailbox::login("alice");
+    assert_eq!(
+        s.core.friend_add(b, "alice", None),
+        Ok(RosterState::PendingOut)
+    );
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+    let asking = || {
+        let (ma, mb) = mailboxes(&alice, &bob);
+        let row = s.rel.relationship(&mb, &ma, s.core.clock().wall());
+        let row = row.unwrap().unwrap();
+        assert!(row.friendship.is_some());
+        row.pending_out.is_some()
+    };
+    s.fail.fail_next("write");
+    s.core.inbox_claim("alice", &fp(&alice));
+    assert_eq!(s.fail.failed(), Some("write"));
+    assert!(
+        asking(),
+        "the fold left Bob's request beside the friendship"
+    );
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(!asking(), "settled by a tick");
+}
+
+/// Alice's offer to Bob, on a server whose directory a test changes.
+fn offered_by_alice() -> (Person, Person, Server, Switch) {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    (alice, bob, s, accounts)
+}
+
+/// Whether `by`'s request to `to` carries its offer, under `by`'s key.
+fn offering(s: &Server, by: &Person, to: &Person) -> bool {
+    let (mb, mt) = (
+        Mailbox::identified("", fp(by)),
+        Mailbox::identified("", fp(to)),
+    );
+    let row = s.rel.relationship(&mb, &mt, s.core.clock().wall()).unwrap();
+    row.and_then(|r| r.pending_out)
+        .is_some_and(|p| p.offer.is_some())
+}
+
+fn revoked_device(who: &Person) -> Published {
+    Published {
+        devices: [(fp(who), Fingerprint::of(&who.devices[0].0.public()).0)].into(),
+        covered: [fp(who)].into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_revocations_drop_owed_across_a_restart_is_done_before_any_list_is_read_again() {
+    let (alice, bob, s, accounts) = offered_by_alice();
+    s.fail.fail_next("write");
+    drop(s.core.set_published_revocations(revoked_device(&alice)));
+    assert_eq!(s.fail.failed(), Some("write"));
+    assert!(offering(&s, &alice, &bob), "owed");
+    let core = started_again(&s, &accounts);
+    core.owed_tick();
+    assert!(
+        !offering(&s, &alice, &bob),
+        "a key no list read covers is judged as revoked still"
+    );
+}
+
+#[test]
+fn a_rotation_waits_for_work_that_could_not_be_owed() {
+    let (alice, bob, s, accounts) = offered_by_alice();
+    let successor = person(4);
+    s.fail.fail_from(1);
+    drop(s.core.set_published_revocations(revoked_device(&alice)));
+    s.fail.fail_nth(0);
+    assert_eq!(s.core.owed_unwritten().len(), 2, "kept in memory alone");
+    assert!(s.rel.owed().unwrap().is_empty());
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+    s.fail.fail_next("owe");
+    assert!(s
+        .core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .is_err());
+    assert!(offering(&s, &alice, &bob), "nothing moved");
+    assert_eq!(s.core.owed_unwritten().len(), 2);
+
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    assert!(
+        offering(&s, &successor, &bob),
+        "moved, once the work was written"
+    );
+    let owed = s.rel.owed().unwrap();
+    let moved = Work::DropOffersBy {
+        under: Some(fp(&successor)),
+        device: Fingerprint::of(&alice.devices[0].0.public()).0,
+    };
+    assert!(
+        owed.iter().any(|o| o.work == moved),
+        "and moved with it: {owed:?}"
+    );
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(!offering(&s, &successor, &bob), "dropped where it went");
+}
+
+#[test]
+fn a_link_that_fails_after_settling_owes_the_unlinks_work_again() {
+    let (alice, _, s, accounts) = unlinked_owing();
+    let unlinked = || {
+        let owed = s.rel.owed().unwrap().into_iter();
+        let ours = owed.filter(|o| o.work == Work::DropPresentationsOf(fp(&alice)));
+        ours.map(|o| o.cause).collect::<Vec<_>>()
+    };
+    assert_eq!(unlinked(), [Cause::Unlinked]);
+    let refused = s.core.friendships_linking(&fp(&alice), |settle| {
+        settle()?;
+        Err::<(), _>(StoreError("the link's write".into()))
+    });
+    assert!(refused.is_err());
+    assert_eq!(unlinked(), [Cause::Unlinked], "owed again");
+    let linked = s.core.friendships_linking(&fp(&alice), |settle| {
+        settle()?;
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+        Ok::<_, StoreError>(())
+    });
+    assert!(linked.is_ok());
+    assert!(unlinked().is_empty(), "settled by the link");
+}
+
+#[test]
+fn a_link_made_again_keeps_its_presentations_while_a_rotation_moves_its_link() {
+    let (alice, bob, s, accounts) = unlinked_owing();
+    let successor = person(4);
+    let linked = s.core.friendships_linking(&fp(&alice), |settle| {
+        settle()?;
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+        Ok::<_, StoreError>(())
+    });
+    assert!(linked.is_ok());
+    // The link moves to the successor before the rows do, as a rotation's
+    // `rotate_link` does ahead of `rotate_identity`; a tick between.
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(
+        s.rel
+            .presentation(&fp(&alice), &fp(&bob))
+            .unwrap()
+            .is_some(),
+        "the relinked account's presentation kept"
+    );
 }

@@ -65,7 +65,8 @@ use crate::identity_records::{KeptEpoch, MemoryRecordCache, RecordCache};
 use crate::inbox::{Mailbox, MemoryStore};
 use crate::relationships::failing::Failing;
 use crate::relationships::{
-    PendingOut, Presentation, RelationId, RelationshipStore, Report, Requester, StoredOffer,
+    Cause, Owed, PendingOut, Presentation, RelationId, RelationshipStore, Report, Requester,
+    StoredOffer, Work,
 };
 use crate::roster::{AttachInfo, Event, InboxPolicy, Uid};
 use crate::{
@@ -419,6 +420,8 @@ struct Run {
     refused_over: bool,
     /// The keys the last list published covered.
     covered: HashSet<[u8; 32]>,
+    /// Every piece of work owed in the run, as last read.
+    ever_owed: Vec<Owed>,
 }
 
 /// An ask's answer, and what its actor's sessions were told.
@@ -470,6 +473,24 @@ fn now() -> u64 {
 
 fn mailbox(login: &str, p: &Person) -> Mailbox {
     Mailbox::identified(login, p.fp())
+}
+
+/// `work` with each identity key mapped by `m`, never its device.
+fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
+    match work {
+        Work::DropOffersBy { under, device } => Work::DropOffersBy {
+            under: under.as_ref().map(&m),
+            device: *device,
+        },
+        Work::DropPresentedBy { under, device } => Work::DropPresentedBy {
+            under: under.as_ref().map(&m),
+            device: *device,
+        },
+        Work::DropOffersNaming(k) => Work::DropOffersNaming(m(k)),
+        Work::DropPresentationsOf(k) => Work::DropPresentationsOf(m(k)),
+        Work::Judge(a, b) => Work::Judge(m(a), m(b)),
+        Work::Settle(k) => Work::Settle(m(k)),
+    }
 }
 
 impl Run {
@@ -568,6 +589,7 @@ impl Run {
             upgrading: [false, false],
             refused_over: false,
             covered: HashSet::new(),
+            ever_owed: Vec::new(),
         }
     }
 
@@ -891,9 +913,15 @@ impl Run {
                 // sessions, which make friendship acts no more, sign in
                 // again.
                 let fp = me.fp();
-                self.dir.0.lock().unwrap()[p].0.fingerprint = None;
-                core.friendships_unlinked(&fp);
-                self.dir.0.lock().unwrap()[p].0.fingerprint = Some(fp);
+                if !self.unlink(p, &fp) {
+                    return false;
+                }
+                // One refused is made again with nothing failing, as the
+                // account's next login would.
+                if !self.relink(p, &fp) {
+                    self.fail.fail_nth(0);
+                    assert!(self.relink(p, &fp), "a link made again");
+                }
                 self.sign_in_again(p);
                 true
             }
@@ -1293,6 +1321,32 @@ impl Run {
         self.resync(p);
     }
 
+    /// `p`'s account gives up its link to `fp`, as the identity layer
+    /// unlinks: refused where its drops cannot be owed.
+    fn unlink(&self, p: usize, fp: &[u8; 32]) -> bool {
+        let unlinked = self.core.friendships_unlinking(fp, |owe| {
+            owe()?;
+            self.dir.0.lock().unwrap()[p].0.fingerprint = None;
+            Ok::<_, crate::inbox::StoreError>(())
+        });
+        unlinked.is_ok()
+    }
+
+    /// `p`'s account links `fp` again, as the identity layer links, and
+    /// claims what its login kept: refused where what an unlink owes cannot
+    /// be settled.
+    fn relink(&self, p: usize, fp: &[u8; 32]) -> bool {
+        let linked = self.core.friendships_linking(fp, |settle| {
+            settle()?;
+            self.dir.0.lock().unwrap()[p].0.fingerprint = Some(*fp);
+            Ok::<_, crate::inbox::StoreError>(())
+        });
+        if linked.is_ok() {
+            self.core.inbox_claim(LOGINS[p], fp);
+        }
+        linked.is_ok()
+    }
+
     /// Where entries were told from a read after their step, since last
     /// asked.
     /// Whether each party's pending out is an upgrade, which a block that
@@ -1452,7 +1506,7 @@ impl Run {
             .filter(|p| p.delivered && !p.upgrade);
         let free = before.friendship.is_none() && !mine;
         let predecessor = self.names_a_predecessor();
-        let owed = self.core.owed_sweeps();
+        let owed = self.store.owed().unwrap();
         let upgrading = self.upgrading_now();
         let ok = self.act(step, p, d);
         self.fail.fail_nth(0);
@@ -1689,12 +1743,35 @@ impl Run {
         self.shown(&what, !lapsing, blocking);
     }
 
-    /// Each sweep owed before a step and gone after it ended on positive
-    /// evidence: its work done, or what owed it lifted by a list that
-    /// covers it.
-    fn ended_owed(&self, what: &str, before: &[crate::messaging::Sweep]) {
-        use crate::messaging::Sweep;
-        let now = self.core.owed_sweeps();
+    /// Each piece of work owed before a step, matched by its id, and gone
+    /// after it ended on positive evidence, as the run reads it: its work
+    /// done over every key its rows moved along, or what owed it lifted.
+    /// One a rotation folded into work owed already, standing after the
+    /// step, has not ended.
+    fn ended_owed(&mut self, what: &str, before: &[Owed]) {
+        let now = self.store.owed().unwrap();
+        for o in &now {
+            self.ever_owed.retain(|e| e.id != o.id);
+            self.ever_owed.push(o.clone());
+        }
+        let current = |k: &[u8; 32]| {
+            let party = (0..2).find(|q| self.keys(*q).contains(k));
+            party.map_or(*k, |q| self.people[q].fp())
+        };
+        for o in before.iter().filter(|o| !now.iter().any(|n| n.id == o.id)) {
+            let folded = now
+                .iter()
+                .any(|n| n.cause == o.cause && n.work == rekeyed(&o.work, current));
+            assert!(
+                folded || self.done(&o.work) || self.lifted(&o.work, &o.cause),
+                "{what}: {o:?} ended undone and not lifted"
+            );
+        }
+    }
+
+    /// Whether what `work` owes is done, read from the store over every key
+    /// of the chains its keys are on.
+    fn done(&self, work: &Work) -> bool {
         let offers: Vec<(DeviceCert, [u8; 32])> = self
             .stored_offers()
             .iter()
@@ -1703,74 +1780,61 @@ impl Run {
                 (DeviceCert::parse(&o.cert).expect("a certificate"), o.to.0)
             })
             .collect();
-        let names = |fp: &[u8; 32]| {
-            offers
+        let all = self.all_presentations();
+        let under =
+            |i: &Option<[u8; 32]>, k: &[u8; 32]| i.is_none_or(|i| self.chain(&i).contains(k));
+        match work {
+            Work::DropOffersBy { under: i, device } => !offers.iter().any(|(c, _)| {
+                under(i, &Fingerprint::of(&c.identity).0) && Fingerprint::of(&c.device).0 == *device
+            }),
+            Work::DropOffersNaming(k) => {
+                let chain = self.chain(k);
+                !offers.iter().any(|(c, to)| {
+                    chain.contains(&Fingerprint::of(&c.identity).0) || chain.contains(to)
+                })
+            }
+            Work::DropPresentedBy { under: i, device } => !all
                 .iter()
-                .any(|(c, to)| Fingerprint::of(&c.identity).0 == *fp || to == fp)
-        };
-        for sweep in before.iter().filter(|s| !now.contains(s)) {
-            let done = match sweep {
-                Sweep::Device {
-                    identity, device, ..
-                } => !offers.iter().any(|(c, _)| {
-                    identity.is_none_or(|i| Fingerprint::of(&c.identity).0 == i)
-                        && Fingerprint::of(&c.device).0 == *device
-                }),
-                Sweep::Identity { identity, .. } => !names(identity),
-                Sweep::Unlinked(fp) => !names(fp),
-                Sweep::Presented { device, .. } => {
-                    !self.presentations().iter().any(|p| p.device == *device)
-                }
-                Sweep::Unpresented(fp) => !self.presentations().iter().any(|p| p.presenter == *fp),
-                // What it judged stands, or is gone.
-                Sweep::Judge(a, b) => {
-                    let all = self.presentations();
-                    all.iter()
-                        .filter(|p| {
-                            [(p.presenter, p.other), (p.other, p.presenter)].contains(&(*a, *b))
-                        })
-                        .filter(|p| p.evidence())
-                        .all(|p| self.judged(p, &all) != Some(false))
-                }
-                Sweep::Purge(of) => {
-                    let wall = self.core.clock.wall();
-                    self.store.relationships(of, wall).unwrap().is_empty()
-                        && self.store.pending_in(of, wall).unwrap().is_empty()
-                }
-            };
-            let lifted = match sweep.clone() {
-                Sweep::Device {
-                    device,
-                    operator: true,
-                    ..
-                }
-                | Sweep::Presented {
-                    identity: None,
-                    device,
-                } => !self.revoked.contains(&device),
-                Sweep::Device {
-                    identity: Some(identity),
-                    device,
-                    ..
-                }
-                | Sweep::Presented {
-                    identity: Some(identity),
-                    device,
-                } => {
-                    self.covered.contains(&identity)
-                        && !self.listed.devices.contains(&(identity, device))
-                }
-                Sweep::Device { identity: None, .. } => false,
-                Sweep::Identity { identity, .. } => {
-                    self.covered.contains(&identity) && !self.listed.identities.contains(&identity)
-                }
-                Sweep::Unlinked(_) | Sweep::Unpresented(_) => true,
-                Sweep::Judge(..) | Sweep::Purge(_) => false,
-            };
-            assert!(
-                done || lifted,
-                "{what}: {sweep:?} ended undone and not lifted"
-            );
+                .any(|p| p.device == *device && under(i, &p.presenter)),
+            Work::DropPresentationsOf(k) => {
+                let chain = self.chain(k);
+                !all.iter().any(|p| chain.contains(&p.presenter))
+            }
+            // What it judged stands, or is gone.
+            Work::Judge(a, b) => {
+                let (xs, ys) = (self.chain(a), self.chain(b));
+                let between = |p: &&Presentation| {
+                    (xs.contains(&p.presenter) && ys.contains(&p.other))
+                        || (ys.contains(&p.presenter) && xs.contains(&p.other))
+                };
+                all.iter()
+                    .filter(between)
+                    .filter(|p| p.evidence())
+                    .all(|p| self.judged(p, &all) != Some(false))
+            }
+            Work::Settle(_) => self.illegal().is_none(),
+        }
+    }
+
+    /// Whether what owed `work` was lifted, by the run's own account of
+    /// what it installed and linked.
+    fn lifted(&self, work: &Work, cause: &Cause) -> bool {
+        match cause {
+            Cause::OperatorDevice(device) => !self.revoked.contains(device),
+            // The run revokes no identity by the operator's list.
+            Cause::OperatorIdentity(_) => false,
+            Cause::PublishedDevice { identity, device } => {
+                self.covered.contains(identity)
+                    && !self.listed.devices.contains(&(*identity, *device))
+            }
+            Cause::PublishedIdentity(identity) => {
+                self.covered.contains(identity) && !self.listed.identities.contains(identity)
+            }
+            Cause::Unlinked => match work {
+                Work::DropOffersNaming(k) | Work::DropPresentationsOf(k) => self.chain_linked(k),
+                _ => false,
+            },
+            Cause::Always => false,
         }
     }
 
@@ -1827,12 +1891,22 @@ impl Run {
     /// backoffs past: then it holds no offer and no presentation that
     /// what is installed forbids.
     fn converged(&mut self) {
-        let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
         self.fail.fail_nth(0);
+        let listed: Vec<[u8; 32]> = self.floors.keys().copied().collect();
         for _ in 0..8 {
             self.core.clock.advance(Duration::from_secs(3700));
             self.core.owed_tick();
             self.core.reconcile_due(listed.iter().copied());
+        }
+        let owed = self.store.owed().unwrap();
+        assert!(owed.is_empty(), "converged owing {owed:?}");
+        // State a crowded rotation wrote by hand, which no act made, is not
+        // held to work that ended before it was written.
+        for o in self.ever_owed.iter().filter(|_| !self.crowded) {
+            assert!(
+                self.done(&o.work) || self.lifted(&o.work, &o.cause),
+                "converged on {o:?} undone and not lifted"
+            );
         }
         for o in self.stored_offers() {
             let detail = Offer::check(&o, u64::MAX, &[], |_| 0).map(|o| {
@@ -1858,13 +1932,64 @@ impl Run {
                     p.reset.is_some()
                 ),
                 (p.device[0], self.revoked.contains(&p.device)),
-                self.core.owed_sweeps()
+                self.core.owed_unwritten()
             );
+        }
+        if let Some(illegal) = self.illegal() {
+            panic!("converged: {illegal}");
         }
     }
 
-    /// Each direction's pending state one the model allows.
+    /// Every presentation between any key of either party and any of the
+    /// other's.
+    fn all_presentations(&self) -> Vec<Presentation> {
+        let (xs, ys) = (self.keys(0), self.keys(1));
+        let mut out = Vec::new();
+        for x in &xs {
+            for y in &ys {
+                for (p, q) in [(x, y), (y, x)] {
+                    out.extend(self.store.presentation(p, q).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every key of the party `fp` is one of the keys of, or `fp` alone.
+    fn chain(&self, fp: &[u8; 32]) -> Vec<[u8; 32]> {
+        (0..2)
+            .map(|q| self.keys(q))
+            .find(|keys| keys.contains(fp))
+            .unwrap_or_else(|| vec![*fp])
+    }
+
+    /// Whether an account links a key of `fp`'s chain.
+    fn chain_linked(&self, fp: &[u8; 32]) -> bool {
+        let chain = self.chain(fp);
+        let dir = self.dir.0.lock().unwrap();
+        dir.iter()
+            .any(|(m, _)| m.fingerprint.is_some_and(|k| chain.contains(&k)))
+    }
+
+    /// Each direction's pending state one the model allows, but while a
+    /// [`Work::Settle`] owed names a key of either party: what is left to
+    /// settle is what it owes.
     fn legal(&self, what: &str) {
+        let settling = |k: &[u8; 32]| (0..2).any(|q| self.keys(q).contains(k));
+        let owed = self.store.owed().unwrap();
+        if owed
+            .iter()
+            .any(|o| matches!(&o.work, Work::Settle(k) if settling(k)))
+        {
+            return;
+        }
+        if let Some(illegal) = self.illegal() {
+            panic!("{what}: {illegal}");
+        }
+    }
+
+    /// The first state of a direction's that the model does not allow.
+    fn illegal(&self) -> Option<String> {
         let now = self.core.clock.wall();
         let blocked = (0..2).any(|q| {
             self.store
@@ -1884,44 +2009,36 @@ impl Run {
                     .unwrap()
                     .and_then(|p: Presentation| p.reset)
             };
-            if friends || blocked {
-                assert!(
-                    pending.is_none(),
-                    "{what}: {who}'s request beside a friendship or a block"
-                );
+            if (friends || blocked) && pending.is_some() {
+                return Some(format!("{who}'s request beside a friendship or a block"));
             }
-            if blocked {
-                assert!(
-                    upgrade.is_none(),
-                    "{what}: {who}'s upgrade offer beside a block"
-                );
+            if blocked && upgrade.is_some() {
+                return Some(format!("{who}'s upgrade offer beside a block"));
             }
-            if blocked {
-                assert!(record(&y, &x).is_none(), "{what}: a record beside a block");
+            if blocked && record(&y, &x).is_some() {
+                return Some("a record beside a block".into());
             }
             match &pending {
                 // Its offer may lapse before its pending out, which lapses
                 // as a request would; the record stays while either does.
-                Some(p) if p.upgrade => {
-                    assert!(
-                        p.offer.is_none(),
-                        "{what}: {who}'s upgrade with a request's offer"
-                    );
-                    assert!(
-                        record(&y, &x).is_some(),
-                        "{what}: {who}'s upgrade without the record it was taken on"
-                    );
+                Some(p) if p.upgrade && p.offer.is_some() => {
+                    return Some(format!("{who}'s upgrade with a request's offer"));
                 }
-                Some(_) => assert!(
-                    upgrade.is_none(),
-                    "{what}: {who}'s request beside an upgrade"
-                ),
-                None => assert!(
-                    friends || upgrade.is_none(),
-                    "{what}: {who}'s upgrade offer with no pending out"
-                ),
+                Some(p) if p.upgrade && record(&y, &x).is_none() => {
+                    return Some(format!(
+                        "{who}'s upgrade without the record it was taken on"
+                    ));
+                }
+                Some(p) if !p.upgrade && upgrade.is_some() => {
+                    return Some(format!("{who}'s request beside an upgrade"));
+                }
+                None if !friends && upgrade.is_some() => {
+                    return Some(format!("{who}'s upgrade offer with no pending out"));
+                }
+                _ => {}
             }
         }
+        None
     }
 
     /// Every live session of each party shows what a fresh read of its
@@ -2140,8 +2257,10 @@ fn try_attach(
 /// revocation's sweep was owed, one asked of a revoked identity, and a
 /// rotation whose successor's own upgrade wins the merge, and an unlink's
 /// sweep owed for an account that lost messaging and was linked again,
-/// an ask its twin answered across a second's edge the run did not, and
-/// a revoked device's presentations owed through a rotation.
+/// an ask its twin answered across a second's edge the run did not, a
+/// revoked device's presentations owed through a rotation, a link made
+/// again that was refused, and a crowded rotation after a revocation's
+/// drop.
 pub const FOUND: &[&[u32]] = &[
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
@@ -2185,6 +2304,8 @@ pub const FOUND: &[&[u32]] = &[
         1144741207, 3717504557, 1248828497, 1455716137,
     ],
     &[1702465536, 609691418, 2400948381, 958047247],
+    &[2980784683, 839393586, 136405568],
+    &[1784966391, 69004476, 3951691538, 3192174383, 1465714621],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in

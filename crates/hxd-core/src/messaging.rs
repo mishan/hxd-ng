@@ -37,8 +37,8 @@ use tracing::warn;
 use crate::access::bit;
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    AccountUpdate, Charge, Did, Ending, LedgerEntry, Left, Part, PendingOut, Profile, RelationId,
-    Relationship, RelationshipStore, Report, RequestKind, Requester,
+    AccountUpdate, Cause, Charge, Did, Ending, LedgerEntry, Left, Part, PendingOut, Profile,
+    RelationId, Relationship, RelationshipStore, Report, RequestKind, Requester, Work,
 };
 use crate::roster::{Announced, Event, RosterInner, SessionStatus, Uid, UserSession};
 use crate::Core;
@@ -55,7 +55,7 @@ mod tests;
 pub(crate) use im::understands_requests;
 pub use im::{Im, ImSent};
 pub use portable::{Fetched, PresentResult, Presented, MAX_OBJECTS};
-pub(crate) use portable::{KeptFloors, OwedSweep, Reconciled, Sweep, Watched};
+pub(crate) use portable::{KeptFloors, OwedIndex, Reconciled, Watched};
 pub use requests::{Cleared, RequestAction, RequestGroup, RequestsListing};
 
 /// [`Core::friend_writes`] held: what a step that must share its caller's
@@ -800,7 +800,10 @@ impl Core {
             Err(e) => warn!("relationships: reading what {login} keeps alone: {e}"),
         }
         let writing = self.friend_writes();
-        let rekeyed = match store.claim(login, &fp, &[]) {
+        // What the fold leaves to settle is owed in its step, and settled
+        // once it is.
+        let settling = [(Work::Settle(fp), Cause::Always)];
+        let rekeyed = match store.claim(login, &fp, &settling) {
             Ok(rekeyed) => rekeyed,
             Err(e) => {
                 warn!("relationships: claiming {login}'s: {e}");
@@ -811,10 +814,12 @@ impl Core {
             warn!("inbox: re-stamping {login}'s merged friendships: {e}");
         }
         self.rekey_friends(&writing, &Mailbox::login(login), claimed);
-        // Only a claim that moved rows can have folded a block beside a
-        // friendship.
-        if rekeyed.moved > 0 {
-            self.after_merge(&writing, claimed);
+        // Settled only once its settling is whole, though nothing moved:
+        // the step may have answered a `Settle` owed before it.
+        if self.after_merge(&writing, claimed) {
+            if let Err(e) = store.settle(&rekeyed.owed) {
+                warn!("relationships: settling {login}'s claim: {e}");
+            }
         }
     }
 
@@ -1764,19 +1769,20 @@ impl Core {
     /// live friendship or approval, or a request beside a friendship:
     /// end each, and tell both parties, as the act that would have ended
     /// it would have (`docs/instant-messaging.md` §6). Under the hold the
-    /// fold was made in.
-    pub(crate) fn after_merge(&self, _writing: &FriendWrites<'_>, me: &Mailbox) {
+    /// fold was made in. Whether every read and write of it was made.
+    pub(crate) fn after_merge(&self, _writing: &FriendWrites<'_>, me: &Mailbox) -> bool {
         let Some(store) = self.relationships.as_ref() else {
-            return;
+            return true;
         };
         let now = self.clock.wall();
         let rows = match store.relationships(me, now) {
             Ok(rows) => rows,
             Err(e) => {
                 warn!("relationships: reading {}'s after a merge: {e}", me.login);
-                return;
+                return false;
             }
         };
+        let mut whole = true;
         let mut told: Vec<(Left, [bool; 2])> = Vec::new();
         for mine in rows {
             let other = mine.other.clone();
@@ -1787,6 +1793,7 @@ impl Core {
                         "relationships: reading {}'s after a merge: {e}",
                         other.login
                     );
+                    whole = false;
                     continue;
                 }
             };
@@ -1840,7 +1847,10 @@ impl Core {
                         let to = to(&left);
                         told.push((left, to));
                     }
-                    Err(e) => warn!("relationships: settling a merge: {e}"),
+                    Err(e) => {
+                        warn!("relationships: settling a merge: {e}");
+                        whole = false;
+                    }
                 }
             }
             let friends = mine.friendship.is_some() && !blocked;
@@ -1858,13 +1868,17 @@ impl Core {
                         let to = to(&left);
                         told.push((left, to));
                     }
-                    Err(e) => warn!("relationships: settling a merge: {e}"),
+                    Err(e) => {
+                        warn!("relationships: settling a merge: {e}");
+                        whole = false;
+                    }
                 }
             }
         }
         for (left, to) in told {
             self.tell_left(&left, to);
         }
+        whole
     }
 
     /// Everything a claim or a rotation re-keyed from `from` to `to` is
@@ -1947,8 +1961,7 @@ impl Core {
         if self.purge_relationships(of) {
             return true;
         }
-        let owed = portable::OwedSweep::failed(Sweep::Purge(of.clone()), 0, self.clock.unix());
-        self.offer_sweeps.lock().unwrap().push(owed);
+        self.owe_purge(of.clone());
         false
     }
 

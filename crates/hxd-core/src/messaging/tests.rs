@@ -2515,8 +2515,23 @@ fn a_rotation_overtaken_by_its_successors_moves_everything_to_one_key() {
     assert_eq!(s.inbox.pending_count(&at_last).unwrap(), 1, "the mail");
     let row = s.rel.relationship(&bob, &at_last, now).unwrap();
     assert!(row.is_some_and(|r| r.friendship.is_some()), "the row");
-    let works: Vec<_> = s.rel.owed().unwrap().into_iter().map(|o| o.work).collect();
-    assert_eq!(works, [Work::DropOffersNaming(last)], "the owed work");
+    let owed = s.rel.owed().unwrap();
+    let seeded: Vec<_> = owed.iter().filter(|o| o.cause == Cause::Always).collect();
+    assert_eq!(seeded.len(), 1, "the owed work");
+    assert_eq!(
+        seeded[0].work,
+        Work::DropOffersNaming(last),
+        "the owed work"
+    );
+    // What the rotation onto a key no account linked yet owed went with
+    // the rest.
+    for o in &owed {
+        let named = match o.work {
+            Work::DropOffersNaming(k) | Work::DropPresentationsOf(k) => k,
+            _ => panic!("owed {o:?}"),
+        };
+        assert_eq!(named, last, "owed {o:?}");
+    }
     let (shown, stored) = friend_sets(&s, &bob);
     assert_eq!(stored, HashSet::from([Key::of(&at_last)]), "stored");
     assert_eq!(shown, stored, "the roster's friend set");

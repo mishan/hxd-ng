@@ -2177,7 +2177,11 @@ fn reconcile_login(
         // backend's exclusive op, so two tunnelled logins by one
         // identity can't both decide the identity is free.
         None if account.identity.allow_self_link && link.may_link => {
-            match auth.link_identity(&account.login, &fp, &|| Ok(()))? {
+            let linked = core.friendships_linking(&fp, |settle| {
+                let settle = || settle().map_err(|e| AuthError::Backend(e.to_string()));
+                auth.link_identity(&account.login, &fp, &settle)
+            });
+            match linked? {
                 LinkOutcome::Linked(a) => {
                     info!(login = %a.login, "identity linked by tunnelled login");
                     // §4 of docs/private-messages.md: a link that doesn't

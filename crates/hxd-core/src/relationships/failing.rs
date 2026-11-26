@@ -53,6 +53,10 @@ enum Plan {
     Off,
     /// This many calls from now, the last fails.
     Nth(usize),
+    /// This many calls from now, the last and every one after it fail,
+    /// until the plan is set again.
+    #[cfg(test)]
+    From(usize),
     /// The call of this method this many calls of it from now fails.
     #[cfg(test)]
     Next(&'static str, usize),
@@ -150,6 +154,14 @@ impl Failing {
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::Nth(n) };
     }
 
+    /// The `n`-th call from now and every one after it fail, until the
+    /// plan is set again; 1 is the next.
+    #[cfg(test)]
+    pub(crate) fn fail_from(&self, n: usize) {
+        self.calls.lock().unwrap().clear();
+        *self.plan.lock().unwrap() = Plan::From(n.max(1));
+    }
+
     /// The next call of `method` fails.
     #[cfg(test)]
     pub(crate) fn fail_next(&self, method: &'static str) {
@@ -204,6 +216,16 @@ impl Failing {
             Plan::Nth(n) => {
                 *n -= 1;
                 *n == 0
+            }
+            #[cfg(test)]
+            Plan::From(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            #[cfg(test)]
+            Plan::From(_) => {
+                *self.failed.lock().unwrap() = Some(method);
+                return Err(StoreError(format!("{method} failed")));
             }
             #[cfg(test)]
             Plan::Next(m, n) if *m == method => {

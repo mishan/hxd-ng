@@ -11,11 +11,10 @@ as AGENTS.md's "Releasing" describes it.
 
 - The main SQLite store migrates from schema 41 to 43 on first start,
   adding an empty `friend_owed` table, where friendship work a failed
-  store call leaves undone is to be kept across restarts, and an empty
+  store call leaves undone is kept across restarts, and an empty
   `friend_moved` table, where each identity rotation records the key
-  its friendships moved to. The server owes no work there yet. A build
-  from before refuses the migrated file: take a backup first if you may
-  roll back.
+  its friendships moved to. A build from before refuses the migrated
+  file: take a backup first if you may roll back.
 
 - Pronouns: a user sets their account's with `/pronouns <text>` to the
   system account (`/pronouns clear` takes them down), and a classic
@@ -360,6 +359,21 @@ as AGENTS.md's "Releasing" describes it.
   account file with `bot`.
 
 ### Fixed
+
+- Friendship work a failed store call leaves undone (dropping a revoked
+  device's or identity's offers and presentations, an unlinked
+  identity's, judging again what a drop left, settling what a claim or
+  a rotation folded) is kept in the database, so a restart no longer
+  forgets it, and is moved with the rows a rotation moves, so it is no
+  longer looked for under the key rotated away from. It ends only once
+  a fresh read shows it done, or its revocation lifted, or its identity
+  linked again. An unlink whose drops cannot be recorded is refused, as
+  a link is when what an earlier unlink of the identity still owes
+  cannot be settled, so no link stands beside work that would drop its
+  account's offers. A claim's or a rotation's settling of a block or a
+  request left beside a friendship, which a failed write used to leave
+  for good, is retried until done. A rotation to a key no account here
+  links owes the drop of what moved to it, as an unlink does.
 
 - Friendship work a failed store call left owed (dropping an unlinked
   identity's or a revoked device's offers and presentations, a deleted

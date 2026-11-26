@@ -144,10 +144,18 @@ ended (`Core::friend_act`), as a send does under `flushing`, so a
 rotation that ends its sessions under the one and then takes the other
 leaves none of their writes behind. A rotation holds `rotations` from
 start to end, so none of its destination onward lands while it moves
-anything. Locks go `rotations`, then `friend_writes`, then `flushing`, then
-`pm_reacting`, then the roster or a store (the publication lock read
-beneath it); nothing holding one of those takes `friend_writes`. A step
-that must share its caller's hold takes the guard (`FriendWrites`).
+anything. Locks go `rotations`, then `friend_writes`, then the auth
+backend's link lock (`FileAuth`'s `assoc`: a link or an unlink of an
+identity is written inside `Core::friendships_linking` or
+`friendships_unlinking`, which settle or owe the unlink's work in the
+backend's own step), then `flushing`, then `pm_reacting`, then the roster
+or a store (the publication lock read beneath it); nothing holding one of
+those takes `friend_writes`. A step that must share its caller's hold
+takes the guard (`FriendWrites`). Friendship work a step leaves undone is
+a row of the store (`RelationshipStore::owe`), moved by a rotation with
+the rows it names, and ends only when a sweep or the step that does it
+finds it done, or what owed it lifted; the core keeps only when each is
+due.
 
 **Outbox seqs are gapless.** Every event a session should see consumes a
 seq, including events the ng protocol can't express yet — those become

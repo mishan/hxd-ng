@@ -1352,15 +1352,15 @@ impl IdentityState {
                                 .map(|g| g.access)
                                 .unwrap_or_else(|_| AccessBits::empty()),
                         };
+                        let fp = &fingerprint.0;
                         let (created, is_new) = self
-                            .auth
-                            .find_or_create_linked(
-                                &proposed,
-                                &card.name,
-                                &fingerprint.0,
-                                access,
-                                &|| Ok(()),
-                            )
+                            .core
+                            .friendships_linking(fp, |settle| {
+                                let settle = || settle().map_err(backend);
+                                (self.auth).find_or_create_linked(
+                                    &proposed, &card.name, fp, access, &settle,
+                                )
+                            })
                             .map_err(|e| {
                                 tracing::warn!("account creation failed: {e}");
                                 AuthRefused::Backend
@@ -1733,8 +1733,11 @@ impl IdentityState {
             None => {}
         }
         let outcome = self
-            .auth
-            .link_identity(login, &fp.0, &|| Ok(()))
+            .core
+            .friendships_linking(&fp.0, |settle| {
+                let settle = || settle().map_err(backend);
+                self.auth.link_identity(login, &fp.0, &settle)
+            })
             .map_err(|e| {
                 tracing::warn!("link write failed: {e}");
                 AuthRefused::Backend
@@ -1843,16 +1846,19 @@ impl IdentityState {
         if !ident.allows(caps::MANAGE) {
             return Err(AuthRefused::NoManage);
         }
+        let fp = &ident.fingerprint.0;
         let outcome = self
-            .auth
-            .unlink_identity(&ident.fingerprint.0, &|| Ok(()))
+            .core
+            .friendships_unlinking(fp, |owe| {
+                let owe = || owe().map_err(backend);
+                self.auth.unlink_identity(fp, &owe)
+            })
             .map_err(|e| {
                 tracing::warn!("unlink write failed: {e}");
                 AuthRefused::Backend
             })?;
         match outcome {
             UnlinkOutcome::Unlinked(a) => {
-                self.core.friendships_unlinked(&ident.fingerprint.0);
                 self.core.inbox_unlinked(&a.login, &ident.fingerprint.0);
                 let stays = self
                     .core
@@ -2644,6 +2650,11 @@ fn walk(
         }
     }
     keys
+}
+
+/// A store error a link's check met, as the backend's refusal.
+fn backend(e: hxd_core::inbox::StoreError) -> AuthError {
+    AuthError::Backend(e.to_string())
 }
 
 /// Insert a device record, evicting expired entries and then the
