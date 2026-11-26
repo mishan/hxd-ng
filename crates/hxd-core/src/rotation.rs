@@ -15,56 +15,55 @@ use crate::Core;
 impl Core {
     /// Move `from`'s mail, blocks, news subscriptions and authorship,
     /// avatar and standing bans to `to`, or to where `to`'s went
-    /// ([`Self::rotation_destination`]), and drop its push devices, which
+    /// ([`destination`]), and drop its push devices, which
     /// the successor has not vouched for. Every step is idempotent, so a
     /// caller that gets an error calls again until it succeeds; a ban
     /// moved this way ends the successor's sessions as any new ban does.
-    /// Called once the account link has moved, it ends every session
-    /// still keyed by `from` before anything moves, so nothing is written
-    /// there while the rest does.
+    /// For a caller with no account link to move: see
+    /// [`Self::rotate_identity_linking`].
     pub fn rotate_identity(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<(), StoreError> {
-        self.rotate_identity_judging(from, to, true)
+        self.rotate_identity_linking(from, to, false, |_| Ok(()))
     }
 
-    /// [`Self::rotate_identity`], leaving the predecessor's friendships to
-    /// the pass a start makes over them ([`Self::reconcile_kept`]): for a
-    /// caller on the reactor as the server starts.
-    pub fn rotate_identity_at_start(
+    /// [`Self::rotate_identity`], moving the account link first, with
+    /// `link`, to the key everything else then moves to: the destination
+    /// is read once, and rotations are made one at a time, so a rotation
+    /// of `to` on cannot land between the link and the rest. Where `link`
+    /// fails, nothing has moved. Every session still keyed by `from` is
+    /// ended once the link has moved and before anything else does, so
+    /// nothing is written there while the rest moves. `at_start` for a
+    /// caller on the reactor as the server starts, leaving the
+    /// predecessor's friendships to the pass a start makes over them
+    /// ([`Self::reconcile_kept`]).
+    pub fn rotate_identity_linking(
         &self,
         from: &[u8; 32],
         to: &[u8; 32],
-    ) -> Result<(), StoreError> {
-        self.rotate_identity_judging(from, to, false)
-    }
-
-    /// Where `from`'s rotation to `to` moves what it moves: where the
-    /// relationship store moves its rows ([`destination`]), so a rotation
-    /// into a key that has rotated on since follows it there.
-    pub fn rotation_destination(
-        &self,
-        from: &[u8; 32],
-        to: &[u8; 32],
-    ) -> Result<[u8; 32], StoreError> {
-        let Some(store) = self.relationships.as_ref() else {
-            return Ok(*to);
-        };
-        Ok(destination(from, to, store.moved(to)?).unwrap_or(*to))
-    }
-
-    fn rotate_identity_judging(
-        &self,
-        from: &[u8; 32],
-        to: &[u8; 32],
-        judging: bool,
+        at_start: bool,
+        link: impl FnOnce(&[u8; 32]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         // A rotation to itself moves nothing.
         if from == to {
             return Ok(());
         }
+        let _rotating = self.rotations.lock().unwrap_or_else(|e| e.into_inner());
+        // One hold from the link's move to the roster's following the
+        // friendships and what their merge left settled: an act of a
+        // session ended below that is under way finishes first and its
+        // rows move, and one after it is refused; no keep lands between
+        // the judging and the merge, which keeps the later cutoff of two
+        // for one key whichever stands; and no act finds the store moved
+        // and the roster not.
+        let writing = self.friend_writes();
+        let dest = match self.relationships.as_ref() {
+            Some(store) => destination(from, to, store.moved(to)?).unwrap_or(*to),
+            None => *to,
+        };
+        let to = &dest;
+        link(to)?;
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");
         }
-        let to = &self.rotation_destination(from, to)?;
         let (old, new) = (
             crate::inbox::Mailbox::identified(String::new(), *from),
             crate::inbox::Mailbox::identified(String::new(), *to),
@@ -76,14 +75,6 @@ impl Core {
             .as_ref()
             .and_then(|d| d.account_by_key(to))
             .map_or_else(|| new.clone(), |(m, _)| m);
-        // One hold from before the mail moves to the roster's following
-        // the friendships and what their merge left settled: an act of a
-        // session ended above that is under way finishes first and its
-        // rows move, and one after it is refused; no keep lands between
-        // the judging and the merge, which keeps the later cutoff of two
-        // for one key whichever stands; and no act finds the store moved
-        // and the roster not.
-        let writing = self.friend_writes();
         if let Some(store) = self.inbox.as_ref() {
             // As a send writes under it, and as a claim holds the other.
             let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,7 +128,7 @@ impl Core {
             }
         }
         drop(writing);
-        if judging {
+        if !at_start {
             self.reconcile_predecessor(*from);
         }
         self.news_rotate(from, to)?;

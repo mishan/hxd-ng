@@ -141,8 +141,10 @@ and a rotation too: the store op, the roster's friend sets following it
 and what it tells, in one hold, so no act finds the store moved and the
 roster not. An act asks under the hold whether its session is being
 ended (`Core::friend_act`), as a send does under `flushing`, so a
-rotation that ends its sessions and then holds both leaves none of
-their writes behind. Locks go `friend_writes`, then `flushing`, then
+rotation that ends its sessions under the one and then takes the other
+leaves none of their writes behind. A rotation holds `rotations` from
+start to end, so none of its destination onward lands while it moves
+anything. Locks go `rotations`, then `friend_writes`, then `flushing`, then
 `pm_reacting`, then the roster or a store (the publication lock read
 beneath it); nothing holding one of those takes `friend_writes`. A step
 that must share its caller's hold takes the guard (`FriendWrites`).
