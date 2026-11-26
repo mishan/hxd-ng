@@ -1144,28 +1144,54 @@ fn owe(tx: &Connection, work: &Work, cause: &Cause) -> Result<OwedId, StoreError
     Ok(tx.last_insert_rowid() as OwedId)
 }
 
-/// So many moves followed from a key, past which a chain is taken to end,
-/// as a guard: recording a move forgets any from the key moved to, which
-/// holds rows again, so no chain loops.
-const MAX_MOVES: usize = 64;
+/// The move recorded from the key `hex`, if any.
+fn move_from(tx: &Connection, hex: &str) -> Result<Option<String>, StoreError> {
+    sql(tx
+        .query_row(
+            "SELECT \"to\" FROM friend_moved WHERE \"from\" = ?1",
+            params![hex],
+            |r| r.get(0),
+        )
+        .optional())
+}
 
-/// Where the rows of the key `hex` are now, by the moves rotations made.
+/// Where the rows of the key `hex` are now, by the moves rotations made;
+/// moves that loop are a damaged history, refused rather than cut short.
 fn tail(tx: &Connection, hex: &str) -> Result<String, StoreError> {
     let mut key = hex.to_string();
-    for _ in 0..MAX_MOVES {
-        let to: Option<String> = sql(tx
-            .query_row(
-                "SELECT \"to\" FROM friend_moved WHERE \"from\" = ?1",
-                params![key],
-                |r| r.get(0),
-            )
-            .optional())?;
-        match to {
-            Some(to) => key = to,
-            None => break,
+    let mut seen = std::collections::HashSet::new();
+    while let Some(to) = move_from(tx, &key)? {
+        if !seen.insert(key) {
+            return Err(StoreError("the rotations' moves loop".into()));
         }
+        key = to;
     }
     Ok(key)
+}
+
+/// Record a move from `from` to `to`, forgetting the move from `to` only
+/// where the moves from it lead back to `from`: a rotation back to a key
+/// the rows left. One made again keeps the moves made after it.
+fn record_move(tx: &Connection, from: &str, to: &str) -> Result<(), StoreError> {
+    let mut key = to.to_string();
+    let mut seen = std::collections::HashSet::new();
+    while key != from {
+        let Some(next) = move_from(tx, &key)? else {
+            break;
+        };
+        if !seen.insert(key) {
+            return Err(StoreError("the rotations' moves loop".into()));
+        }
+        key = next;
+    }
+    if key == from {
+        sql(tx.execute("DELETE FROM friend_moved WHERE \"from\" = ?1", params![to]))?;
+    }
+    sql(tx.execute(
+        "INSERT OR REPLACE INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2)",
+        params![from, to],
+    ))?;
+    Ok(())
 }
 
 fn settle(tx: &Connection, id: OwedId) -> Result<(), StoreError> {
@@ -1685,11 +1711,7 @@ impl SqliteStore {
             if portable {
                 rotate_portable(tx, from, to, &mut rekeyed)?;
                 rekeyed.owed_merged = restamp_owed(tx, from, to)?;
-                sql(tx.execute("DELETE FROM friend_moved WHERE \"from\" = ?1", params![to]))?;
-                sql(tx.execute(
-                    "INSERT OR REPLACE INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2)",
-                    params![from, to],
-                ))?;
+                record_move(tx, from, to)?;
                 settle_upgrades(tx, to)?;
                 for (other, record) in moving {
                     let owner = to.to_string();

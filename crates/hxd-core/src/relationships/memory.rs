@@ -340,7 +340,10 @@ impl Inner {
     }
 
     fn owe(&mut self, work: &Work, cause: &Cause) -> OwedId {
-        let work = &rekeyed(work, |k| self.tail(k));
+        let work = &rekeyed(work, |k| {
+            self.tail(k)
+                .expect("moves never loop: a rotation breaks one as it records its move")
+        });
         if let Some(o) = (self.owed.iter()).find(|o| o.work == *work && o.cause == *cause) {
             return o.id;
         }
@@ -353,16 +356,36 @@ impl Inner {
         self.last_owed
     }
 
-    /// Where `key`'s rows are now, by the moves rotations made.
-    fn tail(&self, key: &[u8; 32]) -> [u8; 32] {
+    /// Where `key`'s rows are now, by the moves rotations made; moves
+    /// that loop are a damaged history, refused rather than cut short.
+    fn tail(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
         let mut key = *key;
-        for _ in 0..MAX_MOVES {
-            match self.moved.iter().find(|(from, _)| *from == key) {
-                Some((_, to)) => key = *to,
-                None => break,
+        let mut seen = BTreeSet::new();
+        while let Some((_, to)) = self.moved.iter().find(|(from, _)| *from == key) {
+            if !seen.insert(key) {
+                return Err(StoreError("the rotations' moves loop".into()));
+            }
+            key = *to;
+        }
+        Ok(key)
+    }
+
+    /// Record a move from `from` to `to`, forgetting the move from `to`
+    /// only where the moves from it lead back to `from`: a rotation back to
+    /// a key the rows left. One made again keeps the moves made after it.
+    fn record_move(&mut self, from: &[u8; 32], to: &[u8; 32]) {
+        let mut key = *to;
+        for _ in 0..self.moved.len() {
+            match self.moved.iter().find(|(f, _)| *f == key) {
+                Some((_, next)) if key != *from => key = *next,
+                _ => break,
             }
         }
-        key
+        if key == *from {
+            self.moved.retain(|(f, _)| f != to);
+        }
+        self.moved.retain(|(f, _)| f != from);
+        self.moved.push((*from, *to));
     }
 
     /// A rotation's re-stamp of owed work, in id order: a piece that
@@ -1711,7 +1734,7 @@ impl RelationshipStore for MemoryRelationships {
     }
 
     fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
-        Ok(self.inner.lock().unwrap().tail(key))
+        self.inner.lock().unwrap().tail(key)
     }
 
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
@@ -2010,8 +2033,7 @@ impl RelationshipStore for MemoryRelationships {
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
         rekeyed.owed_merged = inner.restamp_owed(from, to);
-        inner.moved.retain(|(f, _)| f != from && f != to);
-        inner.moved.push((*from, *to));
+        inner.record_move(from, to);
         rekeyed.owed = owe.iter().map(|(w, c)| inner.owe(w, c)).collect();
         inner.settle_upgrades(to);
         for (other, record) in moving {
@@ -2132,11 +2154,6 @@ fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
     }
 }
 
-/// So many moves followed from a key, past which a chain is taken to end,
-/// as a guard: recording a move forgets any from the key moved to, which
-/// holds rows again, so no chain loops.
-const MAX_MOVES: usize = 64;
-
 fn floor_presentation(p: &Presentation) -> Presentation {
     Presentation {
         at: floor(p.at),
@@ -2152,5 +2169,12 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         super::super::conformance::run(&|| Box::new(MemoryRelationships::new()));
+    }
+
+    #[test]
+    fn moves_that_loop_are_refused_rather_than_cut_short() {
+        let s = MemoryRelationships::new();
+        s.inner.lock().unwrap().moved = vec![([1; 32], [2; 32]), ([2; 32], [1; 32])];
+        assert!(s.moved(&[1; 32]).is_err());
     }
 }

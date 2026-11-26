@@ -5494,6 +5494,26 @@ mod tests {
         assert_eq!(owed[0].work, Work::DropPresentationsOf([8; 32]));
     }
 
+    #[test]
+    fn moves_that_loop_are_refused_rather_than_cut_short() {
+        use hxd_core::relationships::{Cause, Work};
+        let store = SqliteStore::in_memory().unwrap();
+        let (a, b) = (fp_hex(&[1; 32]), fp_hex(&[2; 32]));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2), (?2, ?1)",
+                params![a, b],
+            )
+            .unwrap();
+        assert!(store.moved(&[1; 32]).is_err());
+        assert!(store
+            .owe(&[(Work::Settle([1; 32]), Cause::Always)])
+            .is_err());
+    }
+
     /// A presentation from before its taking time was kept takes the
     /// time it was last presented.
     #[test]

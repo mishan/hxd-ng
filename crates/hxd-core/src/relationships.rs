@@ -1170,7 +1170,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
 
     /// Where `key`'s rows are now: the end of the moves the rotations
     /// [`RelationshipStore::rotate`] made from it, each recorded in its
-    /// own step whether or not its record was kept, or `key` itself.
+    /// own step whether or not its record was kept, or `key` itself; an
+    /// error where the moves loop, which no rotation leaves.
     fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError>;
 
     // --- The account -------------------------------------------------------

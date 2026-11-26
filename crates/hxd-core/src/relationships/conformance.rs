@@ -74,6 +74,8 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     owed_work_is_written_and_settled_whole_with_its_write(&*new_store());
     a_rotation_moves_owed_work_and_folds_what_it_duplicates(&*new_store());
     work_owed_after_a_rotation_is_owed_where_its_rows_went(&*new_store());
+    a_rotation_made_again_keeps_the_moves_made_after_it(&*new_store());
+    a_chain_of_moves_is_followed_to_its_end(&*new_store());
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -2897,4 +2899,51 @@ fn work_owed_after_a_rotation_is_owed_where_its_rows_went(s: &dyn RelationshipSt
     for k in [1, 2, 3] {
         assert_eq!(s.moved(&fp(k)).unwrap(), fp(1), "{case}: {k} moved back");
     }
+}
+
+/// A rotation made again, as a caller retries one, after its successor
+/// rotated on, leaves the key resolving where the rows went; a chain
+/// forward keeps every move; and a rotation back to a key the rows left,
+/// over one move or two, leaves no loop, also when made again.
+fn a_rotation_made_again_keeps_the_moves_made_after_it(s: &dyn RelationshipStore) {
+    let case = "a_rotation_made_again_keeps_the_moves_made_after_it";
+    s.rotate(&fp(1), &fp(2)).unwrap();
+    s.rotate(&fp(2), &fp(3)).unwrap();
+    for k in [1, 2, 3] {
+        assert_eq!(s.moved(&fp(k)).unwrap(), fp(3), "{case}: {k} forward");
+    }
+    s.rotate(&fp(1), &fp(2)).unwrap();
+    for k in [1, 2, 3] {
+        assert_eq!(s.moved(&fp(k)).unwrap(), fp(3), "{case}: {k} made again");
+    }
+    let id = s.owe(&[(Work::Settle(fp(1)), Cause::Always)]).unwrap()[0];
+    let owed = s.owed().unwrap();
+    assert_eq!(
+        owed.iter().find(|o| o.id == id).map(|o| &o.work),
+        Some(&Work::Settle(fp(3))),
+        "{case}: owed where the rows are"
+    );
+    s.rotate(&fp(4), &fp(5)).unwrap();
+    for _ in 0..2 {
+        s.rotate(&fp(5), &fp(4)).unwrap();
+        for k in [4, 5] {
+            assert_eq!(s.moved(&fp(k)).unwrap(), fp(4), "{case}: {k} back");
+        }
+    }
+    s.rotate(&fp(6), &fp(7)).unwrap();
+    s.rotate(&fp(7), &fp(8)).unwrap();
+    s.rotate(&fp(8), &fp(6)).unwrap();
+    s.rotate(&fp(7), &fp(8)).unwrap();
+    for k in [6, 7, 8] {
+        assert_eq!(s.moved(&fp(k)).unwrap(), fp(6), "{case}: {k} back over two");
+    }
+}
+
+/// A chain of moves is followed to its end, however long.
+fn a_chain_of_moves_is_followed_to_its_end(s: &dyn RelationshipStore) {
+    let case = "a_chain_of_moves_is_followed_to_its_end";
+    for n in 100..165 {
+        s.rotate(&fp(n), &fp(n + 1)).unwrap();
+    }
+    assert_eq!(s.moved(&fp(100)).unwrap(), fp(165), "{case}: 65 moves");
 }
