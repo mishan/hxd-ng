@@ -1169,8 +1169,12 @@ impl Run {
     /// presented a friendship it made with the successor elsewhere.
     fn rotate(&mut self, p: usize, into: bool, crowded: bool) -> bool {
         let n = self.former[p].len();
-        // A registrar publishes no rotation of an identity it revoked.
-        if n == 2 || self.identity_revoked(&self.people[p].fp()) {
+        // A registrar publishes no rotation of an identity it revoked,
+        // whether its lists are installed or held over a restart.
+        let fp = self.people[p].fp();
+        let held = (self.unpublished.as_ref())
+            .is_some_and(|(l, _)| self.chain(&fp).iter().any(|k| l.identities.contains(k)));
+        if n == 2 || self.identity_revoked(&fp) || held {
             return false;
         }
         let now = self.core.clock.unix();
