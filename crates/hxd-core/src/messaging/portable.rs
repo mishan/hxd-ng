@@ -932,10 +932,7 @@ impl Core {
         let (key, rows, keys, stamp, cleared, held, offers) = {
             let _writing = self.friend_writes();
             let (key, rows) = self.epoch_key(&fp)?;
-            let successors = self.chain_from(store, fp)?;
-            let keys: Vec<[u8; 32]> = std::iter::once(fp)
-                .chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0))
-                .collect();
+            let keys = self.chain_keys(store, fp)?;
             let (stamp, cleared) = {
                 let r = self.reconciled.lock().unwrap();
                 (r.of(&keys), r.cleared)
@@ -1120,9 +1117,8 @@ impl Core {
     ) {
         let mut keys = Vec::new();
         for fp in fps {
-            keys.push(fp);
-            match self.chain_from(store, fp) {
-                Ok(chain) => keys.extend(chain.iter().map(|r| Fingerprint::of(&r.successor).0)),
+            match self.chain_keys(store, fp) {
+                Ok(chain) => keys.extend(chain),
                 Err(e) => {
                     warn!("relationships: reading a rotation to forget its judging: {e}");
                     self.unjudge_all();
@@ -1162,6 +1158,25 @@ impl Core {
             key = to;
         }
         Ok(out)
+    }
+
+    /// `fp` and each key it rotated to: by the records kept, and by where
+    /// its rows moved, which a rotation records in its own step whether or
+    /// not its record could be kept.
+    fn chain_keys(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fp: [u8; 32],
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let successors = self.chain_from(store, fp)?;
+        let mut keys: Vec<[u8; 32]> = std::iter::once(fp)
+            .chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0))
+            .collect();
+        let end = store.moved(&fp)?;
+        if !keys.contains(&end) {
+            keys.push(end);
+        }
+        Ok(keys)
     }
 
     fn rotations_for(
@@ -2118,11 +2133,7 @@ impl Core {
         f: &Friendship,
         bytes: &[u8],
     ) -> Result<Vec<Presentation>, StoreError> {
-        let chain = |fp: Fingerprint| -> Result<Vec<[u8; 32]>, StoreError> {
-            let successors = self.chain_from(store, fp.0)?;
-            let keys = successors.iter().map(|r| Fingerprint::of(&r.successor).0);
-            Ok(std::iter::once(fp.0).chain(keys).collect())
-        };
+        let chain = |fp: Fingerprint| self.chain_keys(store, fp.0);
         let (lo, hi) = f.pair().fingerprints();
         let (xs, ys) = (chain(lo)?, chain(hi)?);
         let mut out = Vec::new();
@@ -3103,11 +3114,7 @@ impl Core {
     ) -> Result<(), StoreError> {
         // A rotation re-stamps a presentation's presenter.
         let keys = match identity {
-            Some(i) => {
-                let next = self.chain_from(store, i)?;
-                let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
-                Some(std::iter::once(i).chain(next).collect::<Vec<_>>())
-            }
+            Some(i) => Some(self.chain_keys(store, i)?),
             None => None,
         };
         let made = store.presented_by(device)?;
@@ -3567,11 +3574,7 @@ impl Core {
                 // Under the named key and each it rotated to, which an
                 // outgoing offer moves with; the operator's, under any.
                 let identities = match under {
-                    Some(i) => {
-                        let next = self.chain_from(store, i)?;
-                        let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
-                        std::iter::once(i).chain(next).collect()
-                    }
+                    Some(i) => self.chain_keys(store, i)?,
                     None => store.offerers(wall)?,
                 };
                 let mut offers = Vec::new();

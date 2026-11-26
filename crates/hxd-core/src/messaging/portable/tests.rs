@@ -3578,6 +3578,29 @@ fn an_offer_moved_to_a_successor_goes_with_its_predecessors_floor() {
 }
 
 #[test]
+fn a_friendship_moved_by_a_rotation_whose_record_was_not_kept_goes_with_its_predecessors_floor() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let s = server_of(accounts.clone(), policy(), InboxPolicy::default(), None);
+    made(&s, &alice, &bob);
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+    s.fail.fail_next("keep_rotation");
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    assert_eq!(s.fail.failed(), Some("keep_rotation"));
+    s.core
+        .rotate_identity(&fp(&alice), &fp(&successor))
+        .unwrap();
+    let moved = || s.rel.presentation(&fp(&successor), &fp(&bob)).unwrap();
+    assert!(moved().is_some());
+
+    reset(&s, &alice, 1, now() - 30);
+    assert!(moved().is_none());
+}
+
+#[test]
 fn a_grant_judged_before_an_install_is_judged_by_the_pass_after_it() {
     let (mut alice, bob) = (person(1), person(2));
     let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
