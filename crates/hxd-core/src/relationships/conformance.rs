@@ -74,8 +74,10 @@ pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     owed_work_is_written_and_settled_whole_with_its_write(&*new_store());
     a_rotation_moves_owed_work_and_folds_what_it_duplicates(&*new_store());
     work_owed_after_a_rotation_is_owed_where_its_rows_went(&*new_store());
-    a_rotation_made_again_keeps_the_moves_made_after_it(&*new_store());
     a_chain_of_moves_is_followed_to_its_end(&*new_store());
+    for steps in MOVES_FOUND {
+        the_moves_say_where_the_rows_are(&*new_store(), steps);
+    }
 }
 
 fn presentation(presenter: u8, other: u8, hash: u8, device: u8) -> Presentation {
@@ -2901,44 +2903,6 @@ fn work_owed_after_a_rotation_is_owed_where_its_rows_went(s: &dyn RelationshipSt
     }
 }
 
-/// A rotation made again, as a caller retries one, after its successor
-/// rotated on, leaves the key resolving where the rows went; a chain
-/// forward keeps every move; and a rotation back to a key the rows left,
-/// over one move or two, leaves no loop, also when made again.
-fn a_rotation_made_again_keeps_the_moves_made_after_it(s: &dyn RelationshipStore) {
-    let case = "a_rotation_made_again_keeps_the_moves_made_after_it";
-    s.rotate(&fp(1), &fp(2)).unwrap();
-    s.rotate(&fp(2), &fp(3)).unwrap();
-    for k in [1, 2, 3] {
-        assert_eq!(s.moved(&fp(k)).unwrap(), fp(3), "{case}: {k} forward");
-    }
-    s.rotate(&fp(1), &fp(2)).unwrap();
-    for k in [1, 2, 3] {
-        assert_eq!(s.moved(&fp(k)).unwrap(), fp(3), "{case}: {k} made again");
-    }
-    let id = s.owe(&[(Work::Settle(fp(1)), Cause::Always)]).unwrap()[0];
-    let owed = s.owed().unwrap();
-    assert_eq!(
-        owed.iter().find(|o| o.id == id).map(|o| &o.work),
-        Some(&Work::Settle(fp(3))),
-        "{case}: owed where the rows are"
-    );
-    s.rotate(&fp(4), &fp(5)).unwrap();
-    for _ in 0..2 {
-        s.rotate(&fp(5), &fp(4)).unwrap();
-        for k in [4, 5] {
-            assert_eq!(s.moved(&fp(k)).unwrap(), fp(4), "{case}: {k} back");
-        }
-    }
-    s.rotate(&fp(6), &fp(7)).unwrap();
-    s.rotate(&fp(7), &fp(8)).unwrap();
-    s.rotate(&fp(8), &fp(6)).unwrap();
-    s.rotate(&fp(7), &fp(8)).unwrap();
-    for k in [6, 7, 8] {
-        assert_eq!(s.moved(&fp(k)).unwrap(), fp(6), "{case}: {k} back over two");
-    }
-}
-
 /// A chain of moves is followed to its end, however long.
 fn a_chain_of_moves_is_followed_to_its_end(s: &dyn RelationshipStore) {
     let case = "a_chain_of_moves_is_followed_to_its_end";
@@ -2946,4 +2910,127 @@ fn a_chain_of_moves_is_followed_to_its_end(s: &dyn RelationshipStore) {
         s.rotate(&fp(n), &fp(n + 1)).unwrap();
     }
     assert_eq!(s.moved(&fp(100)).unwrap(), fp(165), "{case}: 65 moves");
+}
+
+/// Sequences [`the_moves_say_where_the_rows_are`] failed on, kept: a
+/// rotation to itself, then work owed there; one into a key that moved
+/// on, holding rows; one made again after its successor moved on; one
+/// from a key that moved on, to another; and one made again after the
+/// rows went back and on.
+pub const MOVES_FOUND: &[&[u32]] = &[
+    &[rot(6, 6), owe(6)],
+    &[rot(1, 2), rot(2, 3), place(4), rot(4, 2)],
+    &[place(1), rot(1, 2), rot(2, 3), again(0), owe(1)],
+    &[place(4), rot(4, 2), rot(4, 5)],
+    &[place(1), rot(2, 1), rot(1, 2), rot(2, 3), again(0)],
+];
+
+const fn place(k: u32) -> u32 {
+    (k - 1) << 8
+}
+
+const fn owe(k: u32) -> u32 {
+    1 | (k - 1) << 8
+}
+
+/// The `i`th rotation made again.
+const fn again(i: u32) -> u32 {
+    2 | i << 8
+}
+
+const fn rot(from: u32, to: u32) -> u32 {
+    3 | (from - 1) << 8 | (to - 1) << 16
+}
+
+/// Rotations drawn from `steps` over a few keys, each key's rows placed
+/// while they are its own, and work owed under any key: after every step
+/// each key's [`RelationshipStore::moved`] answers where its rows are,
+/// never an error, and each piece of owed work sits where the rows of the
+/// key it was owed under are. Where the rows are is a model's: a rotation
+/// from a key to itself moves nothing, one into a key that moved on moves
+/// to where that key's rows went, and one back to an earlier key moves
+/// there.
+pub fn the_moves_say_where_the_rows_are(s: &dyn RelationshipStore, steps: &[u32]) {
+    const KEYS: u32 = 6;
+    let key = |n: u32| ((n & 0xff) % KEYS) as u8 + 1;
+    // Where each key's rows are, by the model.
+    let mut model: Vec<u8> = (0..=KEYS as u8).collect();
+    let mut placed = [false; KEYS as usize + 1];
+    // Owed work, by the cause it is told apart by: the key it was owed
+    // under.
+    let mut owed: Vec<u8> = Vec::new();
+    let mut rotations: Vec<(u8, u8)> = Vec::new();
+    let owner = |k: u8| Mailbox::identified(format!("o{k}"), fp(k));
+    let blocked = |k: u8| Mailbox::login(format!("x{k}"));
+    let mut done = Vec::new();
+    for (i, &n) in steps.iter().enumerate() {
+        let (a, b) = (key(n >> 8), key(n >> 16));
+        let step = match n % 8 {
+            0 if !placed[a as usize] && model[a as usize] == a => {
+                placed[a as usize] = true;
+                s.set_blocked(&owner(a), &blocked(a), true, at(1)).unwrap();
+                format!("place {a}")
+            }
+            1 if owed.len() < 64 => {
+                let cause = Cause::OperatorIdentity([owed.len() as u8; 32]);
+                owed.push(a);
+                s.owe(&[(Work::Settle(fp(a)), cause)])
+                    .unwrap_or_else(|e| panic!("{steps:?} step {i}: owe under {a}: {e}"));
+                format!("owe under {a}")
+            }
+            2 if !rotations.is_empty() => {
+                let (from, to) = rotations[(n >> 8 & 0xff) as usize % rotations.len()];
+                rotate(s, &mut model, from, to, steps, i);
+                format!("again {from} -> {to}")
+            }
+            _ => {
+                rotations.push((a, b));
+                rotate(s, &mut model, a, b, steps, i);
+                format!("{a} -> {b}")
+            }
+        };
+        done.push(step);
+        let what = format!("{steps:?}: {}", done.join(", "));
+        for k in 1..=KEYS as u8 {
+            let moved = s
+                .moved(&fp(k))
+                .unwrap_or_else(|e| panic!("{what}: moved({k}): {e}"));
+            assert_eq!(moved, fp(model[k as usize]), "{what}: moved({k})");
+            let mut holds = logins(s.blocked(&Mailbox::identified("", fp(k))).unwrap());
+            holds.sort();
+            let mut rows: Vec<String> = (1..=KEYS as u8)
+                .filter(|&t| placed[t as usize] && model[t as usize] == k)
+                .map(|t| format!("x{t}"))
+                .collect();
+            rows.sort();
+            assert_eq!(holds, rows, "{what}: the rows at {k}");
+        }
+        let mut stored: Vec<_> = (s.owed().unwrap().into_iter())
+            .map(|o| match (o.work, o.cause) {
+                (Work::Settle(k), Cause::OperatorIdentity(c)) => (c[0], k[0]),
+                other => panic!("{what}: {other:?}"),
+            })
+            .collect();
+        stored.sort();
+        let owing: Vec<_> = (owed.iter().enumerate())
+            .map(|(c, &k)| (c as u8, model[k as usize]))
+            .collect();
+        assert_eq!(stored, owing, "{what}: owed where the rows are");
+    }
+}
+
+/// A rotation, made in the store and in the model of where rows are.
+fn rotate(s: &dyn RelationshipStore, model: &mut [u8], from: u8, to: u8, steps: &[u32], i: usize) {
+    s.rotate(&fp(from), &fp(to))
+        .unwrap_or_else(|e| panic!("{steps:?} step {i}: {from} -> {to}: {e}"));
+    if from == to {
+        return;
+    }
+    let end = model[to as usize];
+    let dest = if end == from { to } else { end };
+    for k in model.iter_mut() {
+        if *k == from {
+            *k = dest;
+        }
+    }
 }

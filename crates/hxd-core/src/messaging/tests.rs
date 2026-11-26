@@ -2434,6 +2434,46 @@ fn a_rotation_tells_a_friend_with_no_row_naming_the_successor() {
     );
 }
 
+/// A rotation into a key that rotated on before it finishes moves the
+/// mail where the relationship store moves the rows: to where that key's
+/// went, not to the key it retired.
+#[test]
+fn a_rotation_into_a_key_rotated_on_moves_everything_where_the_rows_went() {
+    let (first, middle, last) = ([4u8; 32], [5u8; 32], [6u8; 32]);
+    let s = server(&["alice", "bob"]);
+    let bob = Mailbox::login("bob");
+    let now = s.core.clock.wall();
+    s.rel
+        .set_blocked(&Mailbox::identified("alice", first), &bob, true, now)
+        .unwrap();
+    s.inbox
+        .push(
+            &NewMessage {
+                recipient: Mailbox::identified("alice", first),
+                sender: Some(bob.clone()),
+                sender_nick: "bob".into(),
+                body: "to the first key".into(),
+                sent_at: now,
+                guid: None,
+                kind: MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship: None,
+                sender_address: None,
+                re: None,
+                emoji: None,
+            },
+            10,
+        )
+        .unwrap();
+    s.core.rotate_identity(&middle, &last).unwrap();
+    s.core.rotate_identity(&first, &middle).unwrap();
+    assert_eq!(s.rel.moved(&first).unwrap(), last);
+    let at_last = Mailbox::identified("alice", last);
+    assert!(s.rel.is_blocked(&at_last, &bob).unwrap(), "the block");
+    assert_eq!(s.inbox.pending_count(&at_last).unwrap(), 1, "the mail");
+}
+
 /// A directory whose lookups can be held: by login, as an act names
 /// another, and by key, as a rotation looks up its successor.
 struct Holding(Directory, Arc<Park>);

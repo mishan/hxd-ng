@@ -2587,7 +2587,15 @@ impl IdentityState {
         let Some(anchors) = &self.anchors else {
             return;
         };
-        let account = match self.auth.rotate_link(&from.0, &to.0) {
+        // Where the core moves the rest, the link goes too.
+        let dest = match self.core.rotation_destination(&from.0, &to.0) {
+            Ok(dest) => Fingerprint(dest),
+            Err(e) => {
+                tracing::warn!(predecessor = %from.short(), "rotation: where it moves to went unread: {e}");
+                return;
+            }
+        };
+        let account = match self.auth.rotate_link(&from.0, &dest.0) {
             Ok(account) => account,
             Err(e) => {
                 tracing::warn!(predecessor = %from.short(), "rotation: the account link did not move: {e}");
@@ -2603,7 +2611,7 @@ impl IdentityState {
             return;
         }
         if let Some(account) = account {
-            info!(account = %account.login, successor = %to.short(), "rotation: the account now links the successor");
+            info!(account = %account.login, successor = %dest.short(), "rotation: the account now links the successor");
         }
         anchors.moved(&from);
     }

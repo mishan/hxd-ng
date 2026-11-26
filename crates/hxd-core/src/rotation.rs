@@ -9,12 +9,13 @@ use crate::ban::{Ban, BanTarget};
 use crate::inbox::StoreError;
 use crate::messaging::Key;
 use crate::push::PushStore;
-use crate::relationships::Report;
+use crate::relationships::{destination, Report};
 use crate::Core;
 
 impl Core {
     /// Move `from`'s mail, blocks, news subscriptions and authorship,
-    /// avatar and standing bans to `to`, and drop its push devices, which
+    /// avatar and standing bans to `to`, or to where `to`'s went
+    /// ([`Self::rotation_destination`]), and drop its push devices, which
     /// the successor has not vouched for. Every step is idempotent, so a
     /// caller that gets an error calls again until it succeeds; a ban
     /// moved this way ends the successor's sessions as any new ban does.
@@ -36,15 +37,34 @@ impl Core {
         self.rotate_identity_judging(from, to, false)
     }
 
+    /// Where `from`'s rotation to `to` moves what it moves: where the
+    /// relationship store moves its rows ([`destination`]), so a rotation
+    /// into a key that has rotated on since follows it there.
+    pub fn rotation_destination(
+        &self,
+        from: &[u8; 32],
+        to: &[u8; 32],
+    ) -> Result<[u8; 32], StoreError> {
+        let Some(store) = self.relationships.as_ref() else {
+            return Ok(*to);
+        };
+        Ok(destination(from, to, store.moved(to)?).unwrap_or(*to))
+    }
+
     fn rotate_identity_judging(
         &self,
         from: &[u8; 32],
         to: &[u8; 32],
         judging: bool,
     ) -> Result<(), StoreError> {
+        // A rotation to itself moves nothing.
+        if from == to {
+            return Ok(());
+        }
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");
         }
+        let to = &self.rotation_destination(from, to)?;
         let (old, new) = (
             crate::inbox::Mailbox::identified(String::new(), *from),
             crate::inbox::Mailbox::identified(String::new(), *to),

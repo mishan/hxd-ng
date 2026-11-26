@@ -742,6 +742,21 @@ pub struct Owed {
     pub cause: Cause,
 }
 
+/// Where a rotation from `from` to `to` moves the rows, `end` being where
+/// `to`'s are ([`RelationshipStore::moved`]): nowhere for a rotation to
+/// itself; to `to` where its moves lead back to `from`, a rotation back to
+/// a key the rows left; else to `end`, so one into a key that has moved on
+/// moves to where that key's rows went, and one made again finds its rows
+/// there. Both stores and [`crate::Core::rotate_identity`] go by it, so
+/// the moves always say where a key's rows are, and never loop.
+pub fn destination(from: &[u8; 32], to: &[u8; 32], end: [u8; 32]) -> Option<[u8; 32]> {
+    match (from == to, end == *from) {
+        (true, _) => None,
+        (false, true) => Some(*to),
+        (false, false) => Some(end),
+    }
+}
+
 /// The relationship store, behind a trait as the inbox is, so the
 /// in-memory store can carry the domain's tests and SQLite's the server.
 pub trait RelationshipStore: Send + Sync + 'static {
@@ -1201,7 +1216,7 @@ pub trait RelationshipStore: Send + Sync + 'static {
     fn claimable(&self, login: &str) -> Result<bool, StoreError>;
 
     /// The identity rotated to a successor key: re-stamp everything keyed
-    /// by `from` with `to`, merging as `claim` does, presentations,
+    /// by `from` with the key [`destination`] names, merging as `claim` does, presentations,
     /// offers and the withdrawals it counts toward among it; a successor
     /// already holding one for the same other party keeps its own, and a
     /// pair that had evidence both ways and has it no more ends its edge.
@@ -1209,7 +1224,8 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// [`RelationshipStore::drop_offers`] drops one. Owed work moves with
     /// the rows, its causes left as they were: one piece that becomes the
     /// same as another already owed is folded into it. The move is
-    /// recorded for [`RelationshipStore::moved`].
+    /// recorded for [`RelationshipStore::moved`], but for a key that moved
+    /// on before, whose rows are where its own move says.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
         self.rotate_reporting(from, to, &Report::none(), &[])
             .map(|(rekeyed, _)| rekeyed)

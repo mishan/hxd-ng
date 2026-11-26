@@ -370,22 +370,14 @@ impl Inner {
         Ok(key)
     }
 
-    /// Record a move from `from` to `to`, forgetting the move from `to`
-    /// only where the moves from it lead back to `from`: a rotation back to
-    /// a key the rows left. One made again keeps the moves made after it.
-    fn record_move(&mut self, from: &[u8; 32], to: &[u8; 32]) {
-        let mut key = *to;
-        for _ in 0..self.moved.len() {
-            match self.moved.iter().find(|(f, _)| *f == key) {
-                Some((_, next)) if key != *from => key = *next,
-                _ => break,
-            }
+    /// Record that the rows at `from` moved to `dest`, which holds them
+    /// now and so has no move of its own; a key that moved on before
+    /// keeps its move, as the rows that left it are where it says.
+    fn record_move(&mut self, from: &[u8; 32], dest: &[u8; 32]) {
+        self.moved.retain(|(f, _)| f != dest);
+        if !self.moved.iter().any(|(f, _)| f == from) {
+            self.moved.push((*from, *dest));
         }
-        if key == *from {
-            self.moved.retain(|(f, _)| f != to);
-        }
-        self.moved.retain(|(f, _)| f != from);
-        self.moved.push((*from, *to));
     }
 
     /// A rotation's re-stamp of owed work, in id order: a piece that
@@ -1989,6 +1981,13 @@ impl RelationshipStore for MemoryRelationships {
         owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        let Some(to) = &super::destination(from, to, inner.tail(to)?) else {
+            let rekeyed = Rekeyed {
+                owed: owe.iter().map(|(w, c)| inner.owe(w, c)).collect(),
+                ..Rekeyed::default()
+            };
+            return Ok((rekeyed, inner.left(report)));
+        };
         // What waits for the key that retires goes, an upgrade's pending
         // out with its offer.
         let incoming: Vec<[u8; 32]> = inner
@@ -2169,6 +2168,17 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         super::super::conformance::run(&|| Box::new(MemoryRelationships::new()));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        #[test]
+        fn the_moves_say_where_the_rows_are(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..40)
+        ) {
+            let s = MemoryRelationships::new();
+            super::super::conformance::the_moves_say_where_the_rows_are(&s, &steps);
+        }
     }
 
     #[test]

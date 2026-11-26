@@ -1169,27 +1169,17 @@ fn tail(tx: &Connection, hex: &str) -> Result<String, StoreError> {
     Ok(key)
 }
 
-/// Record a move from `from` to `to`, forgetting the move from `to` only
-/// where the moves from it lead back to `from`: a rotation back to a key
-/// the rows left. One made again keeps the moves made after it.
-fn record_move(tx: &Connection, from: &str, to: &str) -> Result<(), StoreError> {
-    let mut key = to.to_string();
-    let mut seen = std::collections::HashSet::new();
-    while key != from {
-        let Some(next) = move_from(tx, &key)? else {
-            break;
-        };
-        if !seen.insert(key) {
-            return Err(StoreError("the rotations' moves loop".into()));
-        }
-        key = next;
-    }
-    if key == from {
-        sql(tx.execute("DELETE FROM friend_moved WHERE \"from\" = ?1", params![to]))?;
-    }
+/// Record that the rows at `from` moved to `dest`, which holds them now
+/// and so has no move of its own; a key that moved on before keeps its
+/// move, as the rows that left it are where it says.
+fn record_move(tx: &Connection, from: &str, dest: &str) -> Result<(), StoreError> {
     sql(tx.execute(
-        "INSERT OR REPLACE INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2)",
-        params![from, to],
+        "DELETE FROM friend_moved WHERE \"from\" = ?1",
+        params![dest],
+    ))?;
+    sql(tx.execute(
+        "INSERT OR IGNORE INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2)",
+        params![from, dest],
     ))?;
     Ok(())
 }
@@ -1629,6 +1619,26 @@ impl SqliteStore {
         owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         self.with_tx(|tx| {
+            let dest = match portable {
+                true => {
+                    let end = fp_from_hex(&tail(tx, to)?)?;
+                    hxd_core::relationships::destination(
+                        &fp_from_hex(from)?,
+                        &fp_from_hex(to)?,
+                        end,
+                    )
+                    .map(|d| fp_hex(&d))
+                }
+                false => Some(to.to_string()),
+            };
+            let Some(to) = dest.as_deref() else {
+                let owed = (owe.iter()).map(|(w, c)| self::owe(tx, w, c));
+                let rekeyed = Rekeyed {
+                    owed: owed.collect::<Result<_, _>>()?,
+                    ..Rekeyed::default()
+                };
+                return Ok((rekeyed, left(tx, report)?));
+            };
             // What waits for the key that retires goes first; then each
             // upgrade the key that moves has waiting, with the record it
             // was taken on, where the successor has nothing pending for

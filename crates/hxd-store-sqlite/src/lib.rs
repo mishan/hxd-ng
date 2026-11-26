@@ -4767,6 +4767,17 @@ mod tests {
         hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn the_moves_say_where_the_rows_are(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..40)
+        ) {
+            let s = SqliteStore::in_memory().unwrap();
+            hxd_core::relationships::conformance::the_moves_say_where_the_rows_are(&s, &steps);
+        }
+    }
+
     /// Every row of every table, for a test to tell whether an act
     /// changed any of it.
     fn dump(store: &SqliteStore) -> String {
