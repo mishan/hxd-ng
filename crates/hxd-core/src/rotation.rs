@@ -89,7 +89,7 @@ impl Core {
                     .collect(),
                 now: wall,
             };
-            let (rekeyed, left) = store.rotate_reporting(from, to, &report)?;
+            let (rekeyed, left) = store.rotate_reporting(from, to, &report, &[])?;
             let (audience, ended_left) = left.split_at(report.pairs.len());
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
             self.unjudge(store, [*from, *to].into_iter().chain(merged));

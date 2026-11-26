@@ -1354,7 +1354,13 @@ impl IdentityState {
                         };
                         let (created, is_new) = self
                             .auth
-                            .find_or_create_linked(&proposed, &card.name, &fingerprint.0, access)
+                            .find_or_create_linked(
+                                &proposed,
+                                &card.name,
+                                &fingerprint.0,
+                                access,
+                                &|| Ok(()),
+                            )
                             .map_err(|e| {
                                 tracing::warn!("account creation failed: {e}");
                                 AuthRefused::Backend
@@ -1725,10 +1731,13 @@ impl IdentityState {
             Some(hxd_core::KeyRefusal::Unrevoked) => return Err(AuthRefused::Denied),
             None => {}
         }
-        let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
-            tracing::warn!("link write failed: {e}");
-            AuthRefused::Backend
-        })?;
+        let outcome = self
+            .auth
+            .link_identity(login, &fp.0, &|| Ok(()))
+            .map_err(|e| {
+                tracing::warn!("link write failed: {e}");
+                AuthRefused::Backend
+            })?;
         if let LinkOutcome::Linked(a) = &outcome {
             let moved = self.core.inbox_claim(&a.login, &fp.0);
             if moved > 0 {
@@ -1835,7 +1844,7 @@ impl IdentityState {
         }
         let outcome = self
             .auth
-            .unlink_identity(&ident.fingerprint.0)
+            .unlink_identity(&ident.fingerprint.0, &|| Ok(()))
             .map_err(|e| {
                 tracing::warn!("unlink write failed: {e}");
                 AuthRefused::Backend
@@ -3276,7 +3285,12 @@ mod tests {
             }))
         }
 
-        fn link_identity(&self, login: &str, fp: &[u8; 32]) -> Result<LinkOutcome, AuthError> {
+        fn link_identity(
+            &self,
+            login: &str,
+            fp: &[u8; 32],
+            check: hxd_core::LinkCheck<'_>,
+        ) -> Result<LinkOutcome, AuthError> {
             // The whole decision under one lock, as the trait requires.
             let mut a = self.accounts.lock().unwrap();
             let account = a.get(login).cloned().ok_or(AuthError::NoSuchAccount)?;
@@ -3297,11 +3311,16 @@ mod tests {
             if let Some(other) = a.values().find(|x| x.identity.fingerprint == Some(*fp)) {
                 return Ok(LinkOutcome::Taken(other.clone()));
             }
+            check()?;
             let entry = a.get_mut(login).expect("read above");
             entry.identity.fingerprint = Some(*fp);
             Ok(LinkOutcome::Linked(entry.clone()))
         }
-        fn unlink_identity(&self, fp: &[u8; 32]) -> Result<UnlinkOutcome, AuthError> {
+        fn unlink_identity(
+            &self,
+            fp: &[u8; 32],
+            check: hxd_core::LinkCheck<'_>,
+        ) -> Result<UnlinkOutcome, AuthError> {
             let mut a = self.accounts.lock().unwrap();
             let Some(login) = a
                 .values()
@@ -3314,6 +3333,7 @@ mod tests {
             if !entry.has_password {
                 return Ok(UnlinkOutcome::WouldOrphan(entry.clone()));
             }
+            check()?;
             let before = entry.clone();
             entry.identity.fingerprint = None;
             Ok(UnlinkOutcome::Unlinked(before))
@@ -3324,11 +3344,13 @@ mod tests {
             name: &str,
             fp: &[u8; 32],
             access: AccessBits,
+            check: hxd_core::LinkCheck<'_>,
         ) -> Result<(Account, bool), AuthError> {
             let mut a = self.accounts.lock().unwrap();
             if let Some(existing) = a.values().find(|x| x.identity.fingerprint == Some(*fp)) {
                 return Ok((existing.clone(), false));
             }
+            check()?;
             let login = if a.contains_key(proposed) {
                 format!("{proposed}-2")
             } else {

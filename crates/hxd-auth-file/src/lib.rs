@@ -46,8 +46,8 @@ use hxd_core::account::FIELD_MAX_CHARS;
 use hxd_core::inbox::Mailbox;
 use hxd_core::{
     Account, AccountAdmin, AccountConfig, AccountDirectory, AccountEdit, AdminError, AuthBackend,
-    AuthError, Extras, IdentityLink, LinkOutcome, Proof, RoleChange, RoleCheck, RoleEdit, RoleView,
-    UnlinkOutcome, WriteCheck,
+    AuthError, Extras, IdentityLink, LinkCheck, LinkOutcome, Proof, RoleChange, RoleCheck,
+    RoleEdit, RoleView, UnlinkOutcome, WriteCheck,
 };
 use serde::Deserialize;
 
@@ -752,7 +752,12 @@ impl AuthBackend for FileAuth {
         }
     }
 
-    fn link_identity(&self, login: &str, fingerprint: &[u8; 32]) -> Result<LinkOutcome, AuthError> {
+    fn link_identity(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        check: LinkCheck<'_>,
+    ) -> Result<LinkOutcome, AuthError> {
         let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
         let account = self.lookup(login)?;
         if account.identity.fingerprint == Some(*fingerprint) {
@@ -773,6 +778,7 @@ impl AuthBackend for FileAuth {
         if let Some(other) = self.find_by_fingerprint(fingerprint)? {
             return Ok(LinkOutcome::Taken(other));
         }
+        check()?;
         self.write_link(&account.login, Some(*fingerprint))?;
         Ok(LinkOutcome::Linked(self.lookup(&account.login)?))
     }
@@ -792,7 +798,11 @@ impl AuthBackend for FileAuth {
         self.lookup(&login).map(Some)
     }
 
-    fn unlink_identity(&self, fingerprint: &[u8; 32]) -> Result<UnlinkOutcome, AuthError> {
+    fn unlink_identity(
+        &self,
+        fingerprint: &[u8; 32],
+        check: LinkCheck<'_>,
+    ) -> Result<UnlinkOutcome, AuthError> {
         let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
         let Some(account) = self.find_by_fingerprint(fingerprint)? else {
             return Ok(UnlinkOutcome::NotLinked);
@@ -800,6 +810,7 @@ impl AuthBackend for FileAuth {
         if !account.has_password {
             return Ok(UnlinkOutcome::WouldOrphan(account));
         }
+        check()?;
         self.write_link(&account.login, None)?;
         Ok(UnlinkOutcome::Unlinked(account))
     }
@@ -810,11 +821,13 @@ impl AuthBackend for FileAuth {
         name: &str,
         fingerprint: &[u8; 32],
         access: AccessBits,
+        check: LinkCheck<'_>,
     ) -> Result<(Account, bool), AuthError> {
         let _guard = self.assoc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = self.find_by_fingerprint(fingerprint)? {
             return Ok((existing, false));
         }
+        check()?;
         let base: String = proposed
             .to_ascii_lowercase()
             .chars()
@@ -1953,7 +1966,7 @@ mod tests {
         let fp = [0xabu8; 32];
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
         assert!(matches!(
-            auth.link_identity("alice", &fp).unwrap(),
+            auth.link_identity("alice", &fp, &|| Ok(())).unwrap(),
             LinkOutcome::Linked(_)
         ));
         let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
@@ -1971,22 +1984,75 @@ mod tests {
         assert_eq!(auth.lookup("Alice").unwrap().identity.fingerprint, Some(fp));
         // Linking again is a no-op, not an error.
         assert!(matches!(
-            auth.link_identity("alice", &fp).unwrap(),
+            auth.link_identity("alice", &fp, &|| Ok(())).unwrap(),
             LinkOutcome::Already(_)
         ));
         // Unlink removes only the fingerprint.
         assert!(matches!(
-            auth.unlink_identity(&fp).unwrap(),
+            auth.unlink_identity(&fp, &|| Ok(())).unwrap(),
             UnlinkOutcome::Unlinked(_)
         ));
         let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
         assert!(!text.contains("fingerprint"), "{text}");
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
-        assert_eq!(auth.unlink_identity(&fp).unwrap(), UnlinkOutcome::NotLinked);
         assert_eq!(
-            auth.link_identity("nobody", &fp).unwrap_err(),
+            auth.unlink_identity(&fp, &|| Ok(())).unwrap(),
+            UnlinkOutcome::NotLinked
+        );
+        assert_eq!(
+            auth.link_identity("nobody", &fp, &|| Ok(())).unwrap_err(),
             AuthError::NoSuchAccount
         );
+    }
+
+    /// A link, an unlink and a creation each call their check once they are
+    /// decided, and a check that fails refuses the write, leaving every file
+    /// as it was.
+    #[test]
+    fn a_failing_check_refuses_the_link_it_was_called_for() {
+        let (td, auth) = backend();
+        write(
+            td.path(),
+            "alice.toml",
+            "name = \"Alice\"\npassword = \"pw\"\n",
+        );
+        let (fp, fresh) = ([0xabu8; 32], [0xcdu8; 32]);
+        let refused = || Err(AuthError::Backend("refused".into()));
+        let files = || {
+            let mut names: Vec<_> = std::fs::read_dir(td.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            names.sort();
+            let read = |p: &std::path::PathBuf| std::fs::read_to_string(p).unwrap();
+            names
+                .iter()
+                .map(|p| (p.clone(), read(p)))
+                .collect::<Vec<_>>()
+        };
+        let before = files();
+        let link = auth.link_identity("alice", &fp, &refused);
+        assert_eq!(link.unwrap_err(), AuthError::Backend("refused".into()));
+        let made = auth.find_or_create_linked("bob", "Bob", &fresh, AccessBits::empty(), &refused);
+        assert!(made.is_err());
+        assert_eq!(files(), before, "neither written");
+
+        let called = std::cell::Cell::new(0);
+        let count = || {
+            called.set(called.get() + 1);
+            Ok(())
+        };
+        auth.link_identity("alice", &fp, &count).unwrap();
+        auth.link_identity("alice", &fp, &count).unwrap();
+        assert_eq!(called.get(), 1, "a link already made is not decided again");
+        let linked = files();
+        assert!(auth.unlink_identity(&fp, &refused).is_err());
+        assert_eq!(files(), linked, "the unlink not written");
+        assert!(matches!(
+            auth.unlink_identity(&fp, &count).unwrap(),
+            UnlinkOutcome::Unlinked(_)
+        ));
+        assert_eq!(called.get(), 2);
     }
 
     #[test]
@@ -2005,7 +2071,7 @@ mod tests {
             "alice"
         );
         assert!(matches!(
-            auth.unlink_identity(&fp).unwrap(),
+            auth.unlink_identity(&fp, &|| Ok(())).unwrap(),
             UnlinkOutcome::Unlinked(_)
         ));
         let text = std::fs::read_to_string(td.path().join("alice.toml")).unwrap();
@@ -2071,20 +2137,21 @@ mod tests {
         );
         let fp = [1u8; 32];
         assert!(matches!(
-            auth.link_identity("alice", &fp).unwrap(),
+            auth.link_identity("alice", &fp, &|| Ok(())).unwrap(),
             LinkOutcome::Linked(_)
         ));
-        match auth.link_identity("other", &fp).unwrap() {
+        match auth.link_identity("other", &fp, &|| Ok(())).unwrap() {
             LinkOutcome::Taken(a) => assert_eq!(a.login, "alice"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            auth.link_identity("closed", &[2u8; 32]).unwrap(),
+            auth.link_identity("closed", &[2u8; 32], &|| Ok(()))
+                .unwrap(),
             LinkOutcome::Refused(_)
         ));
         // An account that already links someone else refuses too.
         assert!(matches!(
-            auth.link_identity("alice", &[2u8; 32]).unwrap(),
+            auth.link_identity("alice", &[2u8; 32], &|| Ok(())).unwrap(),
             LinkOutcome::Refused(_)
         ));
     }
@@ -2098,14 +2165,14 @@ mod tests {
         let (td, auth) = backend();
         write(td.path(), "kiosk.toml", "name = \"Kiosk\"\n");
         assert!(matches!(
-            auth.link_identity("kiosk", &[9u8; 32]).unwrap(),
+            auth.link_identity("kiosk", &[9u8; 32], &|| Ok(())).unwrap(),
             LinkOutcome::Refused(_)
         ));
         assert!(auth.lookup("kiosk").unwrap().identity.fingerprint.is_none());
         // With a password it links as usual.
         write(td.path(), "kiosk.toml", "password = \"pw\"\n");
         assert!(matches!(
-            auth.link_identity("kiosk", &[9u8; 32]).unwrap(),
+            auth.link_identity("kiosk", &[9u8; 32], &|| Ok(())).unwrap(),
             LinkOutcome::Linked(_)
         ));
     }
@@ -2122,7 +2189,7 @@ mod tests {
                 hl_identity::Fingerprint(fp)
             ),
         );
-        match auth.unlink_identity(&fp).unwrap() {
+        match auth.unlink_identity(&fp, &|| Ok(())).unwrap() {
             UnlinkOutcome::WouldOrphan(a) => assert_eq!(a.login, "created"),
             other => panic!("{other:?}"),
         }
@@ -2188,9 +2255,9 @@ mod tests {
         write(td.path(), "alice.toml", "password = \"pw\"\n");
         write(td.path(), "bob.toml", &linked);
         assert_eq!(auth.find_by_fingerprint(&fp).unwrap().unwrap().login, "bob");
-        auth.unlink_identity(&fp).unwrap();
+        auth.unlink_identity(&fp, &|| Ok(())).unwrap();
         assert!(auth.find_by_fingerprint(&fp).unwrap().is_none());
-        auth.link_identity("alice", &fp).unwrap();
+        auth.link_identity("alice", &fp, &|| Ok(())).unwrap();
         assert_eq!(
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
             "alice"
@@ -2363,8 +2430,10 @@ mod tests {
             .join(format!("alice.toml.{}.tmp", std::process::id()));
         std::fs::write(&stray, "half").unwrap();
         std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let a = auth
-            .find_or_create_linked("alice", "Alice", &[9u8; 32], AccessBits::empty())
+        let a =
+            auth.find_or_create_linked("alice", "Alice", &[9u8; 32], AccessBits::empty(), &|| {
+                Ok(())
+            })
             .unwrap()
             .0;
         let mode = std::fs::metadata(td.path().join(format!("{}.toml", a.login)))
@@ -2417,7 +2486,7 @@ mod tests {
         let (td, auth) = backend();
         let access = AccessBits::empty().with(bit::SEND_CHAT).with(61).with(62);
         let (a, created) = auth
-            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access)
+            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access, &|| Ok(()))
             .unwrap();
         assert!(created);
         let text = std::fs::read_to_string(td.path().join(format!("{}.toml", a.login))).unwrap();
@@ -2433,8 +2502,10 @@ mod tests {
         // identity paths special-case. A handle of `guest@registrar`
         // used to write a password-less `guest.toml` with a fingerprint.
         let (td, auth) = backend();
-        let (acct, made) = auth
-            .find_or_create_linked("guest", "Guest", &[5u8; 32], AccessBits::empty())
+        let (acct, made) =
+            auth.find_or_create_linked("guest", "Guest", &[5u8; 32], AccessBits::empty(), &|| {
+                Ok(())
+            })
             .unwrap();
         assert!(made);
         assert_eq!(acct.login, "guest-2");
@@ -2463,7 +2534,9 @@ mod tests {
         let (td, auth) = backend();
         let auth = auth.reserving("server");
         let (acct, made) = auth
-            .find_or_create_linked("server", "Server", &[6u8; 32], AccessBits::empty())
+            .find_or_create_linked("server", "Server", &[6u8; 32], AccessBits::empty(), &|| {
+                Ok(())
+            })
             .unwrap();
         assert!(made);
         assert_eq!(acct.login, "server-2");
@@ -2503,7 +2576,7 @@ mod tests {
         }
         assert!(!td.path().join("@mods.toml").exists());
         let (made, _) = auth
-            .find_or_create_linked("@mods", "Mods", &[5u8; 32], AccessBits::empty())
+            .find_or_create_linked("@mods", "Mods", &[5u8; 32], AccessBits::empty(), &|| Ok(()))
             .unwrap();
         assert_eq!(made.login, "mods");
     }
@@ -2517,7 +2590,7 @@ mod tests {
             .with(bit::READ_CHAT)
             .with(bit::SEND_CHAT);
         let (a, created) = auth
-            .find_or_create_linked("alice", "Alice", &fp, access)
+            .find_or_create_linked("alice", "Alice", &fp, access, &|| Ok(()))
             .unwrap();
         assert!(created);
         assert_eq!(a.login, "alice-2");
@@ -2536,18 +2609,20 @@ mod tests {
         );
         // Called again for the same identity it finds, never creates.
         let (again, created) = auth
-            .find_or_create_linked("alice", "Alice", &fp, access)
+            .find_or_create_linked("alice", "Alice", &fp, access, &|| Ok(()))
             .unwrap();
         assert!(!created);
         assert_eq!(again.login, "alice-2");
         // Hostile proposals are sanitised.
-        let b = auth
-            .find_or_create_linked("../../etc", "x", &[8u8; 32], AccessBits::empty())
+        let b =
+            auth.find_or_create_linked("../../etc", "x", &[8u8; 32], AccessBits::empty(), &|| {
+                Ok(())
+            })
             .unwrap()
             .0;
         assert_eq!(b.login, "etc");
         let c = auth
-            .find_or_create_linked("", "x", &[9u8; 32], AccessBits::empty())
+            .find_or_create_linked("", "x", &[9u8; 32], AccessBits::empty(), &|| Ok(()))
             .unwrap()
             .0;
         assert!(c.login.starts_with("id-"), "{}", c.login);
@@ -2568,7 +2643,10 @@ mod tests {
         let linked: Vec<_> = (0..8)
             .map(|n| {
                 let auth = auth.clone();
-                std::thread::spawn(move || auth.link_identity(&format!("a{n}"), &fp).unwrap())
+                std::thread::spawn(move || {
+                    auth.link_identity(&format!("a{n}"), &fp, &|| Ok(()))
+                        .unwrap()
+                })
             })
             .map(|h| h.join().unwrap())
             .collect();
@@ -2596,8 +2674,14 @@ mod tests {
             .map(|_| {
                 let auth = auth.clone();
                 std::thread::spawn(move || {
-                    auth.find_or_create_linked("newbie", "Newbie", &fp2, AccessBits::empty())
-                        .unwrap()
+                    auth.find_or_create_linked(
+                        "newbie",
+                        "Newbie",
+                        &fp2,
+                        AccessBits::empty(),
+                        &|| Ok(()),
+                    )
+                    .unwrap()
                 })
             })
             .map(|h| h.join().unwrap())
@@ -2722,7 +2806,7 @@ mod tests {
         // what stops a reused login being rung for its previous holder.
         let fp = [0x4eu8; 32];
         assert!(matches!(
-            auth.link_identity("carol", &fp).unwrap(),
+            auth.link_identity("carol", &fp, &|| Ok(())).unwrap(),
             LinkOutcome::Linked(_)
         ));
         assert_eq!(auth.mailbox_access(&by_login), None);
@@ -3242,7 +3326,7 @@ mod tests {
             .with(bit::READ_NEWS)
             .with(bit::SEND_CHAT);
         let (account, created) = auth
-            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access)
+            .find_or_create_linked("newbie", "Newbie", &[5u8; 32], access, &|| Ok(()))
             .unwrap();
         assert!(created);
         assert_eq!(account.access, access);

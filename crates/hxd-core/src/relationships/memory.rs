@@ -138,6 +138,8 @@ struct Inner {
     /// In id order.
     owed: Vec<Owed>,
     last_owed: OwedId,
+    /// The latest move from each key, `(from, to)`.
+    moved: Vec<([u8; 32], [u8; 32])>,
 }
 
 #[derive(Default)]
@@ -157,7 +159,7 @@ impl MemoryRelationships {
         let i = self.inner.lock().unwrap();
         let made: std::collections::BTreeMap<_, _> = i.made.iter().collect();
         format!(
-            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
+            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
             i.next_seq,
             i.next_relation,
             i.rows,
@@ -170,7 +172,8 @@ impl MemoryRelationships {
             i.offers,
             i.rotations,
             i.owed,
-            i.last_owed
+            i.last_owed,
+            i.moved
         )
     }
 
@@ -337,6 +340,7 @@ impl Inner {
     }
 
     fn owe(&mut self, work: &Work, cause: &Cause) -> OwedId {
+        let work = &rekeyed(work, |k| self.tail(k));
         if let Some(o) = (self.owed.iter()).find(|o| o.work == *work && o.cause == *cause) {
             return o.id;
         }
@@ -349,6 +353,18 @@ impl Inner {
         self.last_owed
     }
 
+    /// Where `key`'s rows are now, by the moves rotations made.
+    fn tail(&self, key: &[u8; 32]) -> [u8; 32] {
+        let mut key = *key;
+        for _ in 0..MAX_MOVES {
+            match self.moved.iter().find(|(from, _)| *from == key) {
+                Some((_, to)) => key = *to,
+                None => break,
+            }
+        }
+        key
+    }
+
     /// A rotation's re-stamp of owed work, in id order: a piece that
     /// becomes one already owed is folded into it.
     fn restamp_owed(&mut self, from: &[u8; 32], to: &[u8; 32]) -> Vec<(OwedId, OwedId)> {
@@ -356,7 +372,7 @@ impl Inner {
         let mut i = 0;
         while i < self.owed.len() {
             let o = &self.owed[i];
-            let work = restamped(&o.work, from, to);
+            let work = rekeyed(&o.work, |k| if k == from { *to } else { *k });
             if work == o.work {
                 i += 1;
                 continue;
@@ -1694,6 +1710,10 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
+    fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
+        Ok(self.inner.lock().unwrap().tail(key))
+    }
+
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -1907,9 +1927,16 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
-    fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
+    fn claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        owe: &[(Work, Cause)],
+    ) -> Result<Rekeyed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        Ok(inner.rekey(|m| m.fingerprint.is_none() && m.login == login, fingerprint))
+        let mut rekeyed = inner.rekey(|m| m.fingerprint.is_none() && m.login == login, fingerprint);
+        rekeyed.owed = owe.iter().map(|(w, c)| inner.owe(w, c)).collect();
+        Ok(rekeyed)
     }
 
     fn claimable(&self, login: &str) -> Result<bool, StoreError> {
@@ -1936,6 +1963,7 @@ impl RelationshipStore for MemoryRelationships {
         from: &[u8; 32],
         to: &[u8; 32],
         report: &Report,
+        owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         // What waits for the key that retires goes, an upgrade's pending
@@ -1982,6 +2010,9 @@ impl RelationshipStore for MemoryRelationships {
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
         rekeyed.owed_merged = inner.restamp_owed(from, to);
+        inner.moved.retain(|(f, _)| f != from && f != to);
+        inner.moved.push((*from, *to));
+        rekeyed.owed = owe.iter().map(|(w, c)| inner.owe(w, c)).collect();
         inner.settle_upgrades(to);
         for (other, record) in moving {
             let kept = inner
@@ -2083,8 +2114,8 @@ impl RelationshipStore for MemoryRelationships {
     }
 }
 
-fn restamped(work: &Work, from: &[u8; 32], to: &[u8; 32]) -> Work {
-    let m = |k: &[u8; 32]| if k == from { *to } else { *k };
+/// `work` with each identity key mapped by `m`, never its device.
+fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
     match work {
         Work::DropOffersBy { under, device } => Work::DropOffersBy {
             under: under.as_ref().map(m),
@@ -2100,6 +2131,11 @@ fn restamped(work: &Work, from: &[u8; 32], to: &[u8; 32]) -> Work {
         Work::Settle(k) => Work::Settle(m(k)),
     }
 }
+
+/// So many moves followed from a key, past which a chain is taken to end,
+/// as a guard: recording a move forgets any from the key moved to, which
+/// holds rows again, so no chain loops.
+const MAX_MOVES: usize = 64;
 
 fn floor_presentation(p: &Presentation) -> Presentation {
     Presentation {

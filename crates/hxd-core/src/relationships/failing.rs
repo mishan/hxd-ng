@@ -43,6 +43,7 @@ pub(crate) const READS: &[&str] = &[
     "rotation_from",
     "rotation_to",
     "owed",
+    "moved",
     "account",
     "claimable",
     "purge_count",
@@ -326,11 +327,12 @@ through! {
     fn owe(owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError>;
     fn owed() -> Result<Vec<Owed>, StoreError>;
     fn settle(ids: &[OwedId]) -> Result<(), StoreError>;
+    fn moved(key: &[u8; 32]) -> Result<[u8; 32], StoreError>;
     fn account(of: &Mailbox) -> Result<MessagingAccount, StoreError>;
     fn update_account(of: &Mailbox, update: &AccountUpdate) -> Result<(), StoreError>;
-    fn claim(login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
+    fn claim(login: &str, fingerprint: &[u8; 32], owe: &[(Work, Cause)]) -> Result<Rekeyed, StoreError>;
     fn claimable(login: &str) -> Result<bool, StoreError>;
-    fn rotate_reporting(from: &[u8; 32], to: &[u8; 32], report: &Report) -> Result<(Rekeyed, Vec<Left>), StoreError>;
+    fn rotate_reporting(from: &[u8; 32], to: &[u8; 32], report: &Report, owe: &[(Work, Cause)]) -> Result<(Rekeyed, Vec<Left>), StoreError>;
     fn purge(of: &Mailbox) -> Result<usize, StoreError>;
     fn purge_count(of: &Mailbox) -> Result<usize, StoreError>;
     fn cleanup(lapsed_before: SystemTime, ledger_before: SystemTime, batch: usize) -> Result<usize, StoreError>;

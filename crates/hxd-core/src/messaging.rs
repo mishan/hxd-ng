@@ -800,7 +800,7 @@ impl Core {
             Err(e) => warn!("relationships: reading what {login} keeps alone: {e}"),
         }
         let writing = self.friend_writes();
-        let rekeyed = match store.claim(login, &fp) {
+        let rekeyed = match store.claim(login, &fp, &[]) {
             Ok(rekeyed) => rekeyed,
             Err(e) => {
                 warn!("relationships: claiming {login}'s: {e}");

@@ -9,11 +9,13 @@ as AGENTS.md's "Releasing" describes it.
 
 ### Upgrading
 
-- The main SQLite store migrates from schema 41 to 42 on first start,
+- The main SQLite store migrates from schema 41 to 43 on first start,
   adding an empty `friend_owed` table, where friendship work a failed
-  store call leaves undone is to be kept across restarts. Nothing
-  writes to it yet. A build from before refuses the migrated file: take
-  a backup first if you may roll back.
+  store call leaves undone is to be kept across restarts, and an empty
+  `friend_moved` table, where each identity rotation records the key
+  its friendships moved to. The server owes no work there yet. A build
+  from before refuses the migrated file: take a backup first if you may
+  roll back.
 
 - Pronouns: a user sets their account's with `/pronouns <text>` to the
   system account (`/pronouns clear` takes them down), and a classic
