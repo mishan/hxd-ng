@@ -1126,7 +1126,12 @@ fn owed_id(
 }
 
 fn owe(tx: &Connection, work: &Work, cause: &Cause) -> Result<OwedId, StoreError> {
-    let row = owed_columns(work, cause);
+    let mut row = owed_columns(work, cause);
+    for k in [&mut row.0 .1, &mut row.0 .2] {
+        if !k.is_empty() {
+            *k = tail(tx, k)?;
+        }
+    }
     if let Some(id) = owed_id(tx, &row)? {
         return Ok(id as OwedId);
     }
@@ -1137,6 +1142,46 @@ fn owe(tx: &Connection, work: &Work, cause: &Cause) -> Result<OwedId, StoreError
         params![kind, key, other, device, cause, a, b],
     ))?;
     Ok(tx.last_insert_rowid() as OwedId)
+}
+
+/// The move recorded from the key `hex`, if any.
+fn move_from(tx: &Connection, hex: &str) -> Result<Option<String>, StoreError> {
+    sql(tx
+        .query_row(
+            "SELECT \"to\" FROM friend_moved WHERE \"from\" = ?1",
+            params![hex],
+            |r| r.get(0),
+        )
+        .optional())
+}
+
+/// Where the rows of the key `hex` are now, by the moves rotations made;
+/// moves that loop are a damaged history, refused rather than cut short.
+fn tail(tx: &Connection, hex: &str) -> Result<String, StoreError> {
+    let mut key = hex.to_string();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(to) = move_from(tx, &key)? {
+        if !seen.insert(key) {
+            return Err(StoreError("the rotations' moves loop".into()));
+        }
+        key = to;
+    }
+    Ok(key)
+}
+
+/// Record that the rows at `from` moved to `dest`, which holds them now
+/// and so has no move of its own; a key that moved on before keeps its
+/// move, as the rows that left it are where it says.
+fn record_move(tx: &Connection, from: &str, dest: &str) -> Result<(), StoreError> {
+    sql(tx.execute(
+        "DELETE FROM friend_moved WHERE \"from\" = ?1",
+        params![dest],
+    ))?;
+    sql(tx.execute(
+        "INSERT OR IGNORE INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2)",
+        params![from, dest],
+    ))?;
+    Ok(())
 }
 
 fn settle(tx: &Connection, id: OwedId) -> Result<(), StoreError> {
@@ -1571,8 +1616,29 @@ impl SqliteStore {
         from: &str,
         portable: bool,
         report: &Report,
+        owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         self.with_tx(|tx| {
+            let dest = match portable {
+                true => {
+                    let end = fp_from_hex(&tail(tx, to)?)?;
+                    hxd_core::relationships::destination(
+                        &fp_from_hex(from)?,
+                        &fp_from_hex(to)?,
+                        end,
+                    )
+                    .map(|d| fp_hex(&d))
+                }
+                false => Some(to.to_string()),
+            };
+            let Some(to) = dest.as_deref() else {
+                let owed = (owe.iter()).map(|(w, c)| self::owe(tx, w, c));
+                let rekeyed = Rekeyed {
+                    owed: owed.collect::<Result<_, _>>()?,
+                    ..Rekeyed::default()
+                };
+                return Ok((rekeyed, left(tx, report)?));
+            };
             // What waits for the key that retires goes first; then each
             // upgrade the key that moves has waiting, with the record it
             // was taken on, where the successor has nothing pending for
@@ -1655,6 +1721,7 @@ impl SqliteStore {
             if portable {
                 rotate_portable(tx, from, to, &mut rekeyed)?;
                 rekeyed.owed_merged = restamp_owed(tx, from, to)?;
+                record_move(tx, from, to)?;
                 settle_upgrades(tx, to)?;
                 for (other, record) in moving {
                     let owner = to.to_string();
@@ -1672,6 +1739,9 @@ impl SqliteStore {
                     }
                 }
             }
+            rekeyed.owed = (owe.iter())
+                .map(|(w, c)| self::owe(tx, w, c))
+                .collect::<Result<_, _>>()?;
             let left = left(tx, &report.and_ended(&rekeyed.ended))?;
             Ok((rekeyed, left))
         })
@@ -2454,6 +2524,11 @@ impl RelationshipStore for SqliteStore {
         self.with_tx(|tx| ids.iter().try_for_each(|id| settle(tx, *id)))
     }
 
+    fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
+        let conn = self.conn.lock().unwrap();
+        fp_from_hex(&tail(&conn, &fp_hex(key))?)
+    }
+
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let found: Option<(String, Vec<u8>)> = sql(conn
@@ -2469,15 +2544,16 @@ impl RelationshipStore for SqliteStore {
             .transpose()
     }
 
-    fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rekey(
-            claim_moves,
-            &fp_hex(fingerprint),
-            login,
-            false,
-            &Report::none(),
-        )
-        .map(|(rekeyed, _)| rekeyed)
+    fn claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        owe: &[(Work, Cause)],
+    ) -> Result<Rekeyed, StoreError> {
+        let none = Report::none();
+        let fp = fp_hex(fingerprint);
+        self.rekey(claim_moves, &fp, login, false, &none, owe)
+            .map(|(rekeyed, _)| rekeyed)
     }
 
     fn claimable(&self, login: &str) -> Result<bool, StoreError> {
@@ -2498,8 +2574,10 @@ impl RelationshipStore for SqliteStore {
         from: &[u8; 32],
         to: &[u8; 32],
         report: &Report,
+        owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
-        self.rekey(rotate_moves, &fp_hex(to), &fp_hex(from), true, report)
+        let (to, from) = (fp_hex(to), fp_hex(from));
+        self.rekey(rotate_moves, &to, &from, true, report, owe)
     }
 
     fn purge(&self, of: &Mailbox) -> Result<usize, StoreError> {

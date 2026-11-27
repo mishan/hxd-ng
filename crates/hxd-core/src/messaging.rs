@@ -777,8 +777,8 @@ impl Core {
 
     /// [`Self::friend_writes`] for an act of `uid`'s, refused once the
     /// session is on its way out. Asked under the hold, so a rotation,
-    /// which ends its sessions before it takes the hold, finds no act of
-    /// one still to write.
+    /// which ends its sessions under the hold, finds no act of one still
+    /// to write.
     pub(crate) fn friend_act(&self, uid: Uid) -> Result<FriendWrites<'_>, MessagingError> {
         let writing = self.friend_writes();
         self.staying(uid)?;
@@ -800,7 +800,7 @@ impl Core {
             Err(e) => warn!("relationships: reading what {login} keeps alone: {e}"),
         }
         let writing = self.friend_writes();
-        let rekeyed = match store.claim(login, &fp) {
+        let rekeyed = match store.claim(login, &fp, &[]) {
             Ok(rekeyed) => rekeyed,
             Err(e) => {
                 warn!("relationships: claiming {login}'s: {e}");

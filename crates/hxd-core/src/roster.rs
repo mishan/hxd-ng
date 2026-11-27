@@ -2178,6 +2178,10 @@ pub struct Core {
     /// what it changed, and across loading a mailbox's friends, so the
     /// two agree. Taken before `roster`, never while it is held.
     pub(crate) friend_writes: Mutex<()>,
+    /// Held across a whole rotation, from its read of where it goes to
+    /// its last move, so a rotation of that key onward waits for it.
+    /// Taken before `friend_writes`; nothing else takes it.
+    pub(crate) rotations: Mutex<()>,
     /// The device epochs each identity's stored friendships were last
     /// reconciled whole at, and what has changed them since
     /// (`Core::judge_floors`). Taken last, and held for no other lock.

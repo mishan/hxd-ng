@@ -138,6 +138,8 @@ struct Inner {
     /// In id order.
     owed: Vec<Owed>,
     last_owed: OwedId,
+    /// The latest move from each key, `(from, to)`.
+    moved: Vec<([u8; 32], [u8; 32])>,
 }
 
 #[derive(Default)]
@@ -157,7 +159,7 @@ impl MemoryRelationships {
         let i = self.inner.lock().unwrap();
         let made: std::collections::BTreeMap<_, _> = i.made.iter().collect();
         format!(
-            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {}",
+            "{} {} {:?} {:?} {made:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
             i.next_seq,
             i.next_relation,
             i.rows,
@@ -170,7 +172,8 @@ impl MemoryRelationships {
             i.offers,
             i.rotations,
             i.owed,
-            i.last_owed
+            i.last_owed,
+            i.moved
         )
     }
 
@@ -337,6 +340,10 @@ impl Inner {
     }
 
     fn owe(&mut self, work: &Work, cause: &Cause) -> OwedId {
+        let work = &rekeyed(work, |k| {
+            self.tail(k)
+                .expect("moves never loop: a rotation breaks one as it records its move")
+        });
         if let Some(o) = (self.owed.iter()).find(|o| o.work == *work && o.cause == *cause) {
             return o.id;
         }
@@ -349,6 +356,30 @@ impl Inner {
         self.last_owed
     }
 
+    /// Where `key`'s rows are now, by the moves rotations made; moves
+    /// that loop are a damaged history, refused rather than cut short.
+    fn tail(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
+        let mut key = *key;
+        let mut seen = BTreeSet::new();
+        while let Some((_, to)) = self.moved.iter().find(|(from, _)| *from == key) {
+            if !seen.insert(key) {
+                return Err(StoreError("the rotations' moves loop".into()));
+            }
+            key = *to;
+        }
+        Ok(key)
+    }
+
+    /// Record that the rows at `from` moved to `dest`, which holds them
+    /// now and so has no move of its own; a key that moved on before
+    /// keeps its move, as the rows that left it are where it says.
+    fn record_move(&mut self, from: &[u8; 32], dest: &[u8; 32]) {
+        self.moved.retain(|(f, _)| f != dest);
+        if !self.moved.iter().any(|(f, _)| f == from) {
+            self.moved.push((*from, *dest));
+        }
+    }
+
     /// A rotation's re-stamp of owed work, in id order: a piece that
     /// becomes one already owed is folded into it.
     fn restamp_owed(&mut self, from: &[u8; 32], to: &[u8; 32]) -> Vec<(OwedId, OwedId)> {
@@ -356,7 +387,7 @@ impl Inner {
         let mut i = 0;
         while i < self.owed.len() {
             let o = &self.owed[i];
-            let work = restamped(&o.work, from, to);
+            let work = rekeyed(&o.work, |k| if k == from { *to } else { *k });
             if work == o.work {
                 i += 1;
                 continue;
@@ -1694,6 +1725,10 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
+    fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError> {
+        self.inner.lock().unwrap().tail(key)
+    }
+
     fn rotation_to(&self, to: &[u8; 32]) -> Result<Option<RotationRecord>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
@@ -1907,9 +1942,16 @@ impl RelationshipStore for MemoryRelationships {
         Ok(())
     }
 
-    fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError> {
+    fn claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        owe: &[(Work, Cause)],
+    ) -> Result<Rekeyed, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        Ok(inner.rekey(|m| m.fingerprint.is_none() && m.login == login, fingerprint))
+        let mut rekeyed = inner.rekey(|m| m.fingerprint.is_none() && m.login == login, fingerprint);
+        rekeyed.owed = owe.iter().map(|(w, c)| inner.owe(w, c)).collect();
+        Ok(rekeyed)
     }
 
     fn claimable(&self, login: &str) -> Result<bool, StoreError> {
@@ -1936,8 +1978,16 @@ impl RelationshipStore for MemoryRelationships {
         from: &[u8; 32],
         to: &[u8; 32],
         report: &Report,
+        owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        let Some(to) = &super::destination(from, to, inner.tail(to)?) else {
+            let rekeyed = Rekeyed {
+                owed: owe.iter().map(|(w, c)| inner.owe(w, c)).collect(),
+                ..Rekeyed::default()
+            };
+            return Ok((rekeyed, inner.left(report)));
+        };
         // What waits for the key that retires goes, an upgrade's pending
         // out with its offer.
         let incoming: Vec<[u8; 32]> = inner
@@ -1982,6 +2032,8 @@ impl RelationshipStore for MemoryRelationships {
         let mut rekeyed = inner.rekey(|m| m.fingerprint.as_ref() == Some(from), to);
         inner.rotate_portable(from, to, &mut rekeyed);
         rekeyed.owed_merged = inner.restamp_owed(from, to);
+        inner.record_move(from, to);
+        rekeyed.owed = owe.iter().map(|(w, c)| inner.owe(w, c)).collect();
         inner.settle_upgrades(to);
         for (other, record) in moving {
             let kept = inner
@@ -2083,8 +2135,8 @@ impl RelationshipStore for MemoryRelationships {
     }
 }
 
-fn restamped(work: &Work, from: &[u8; 32], to: &[u8; 32]) -> Work {
-    let m = |k: &[u8; 32]| if k == from { *to } else { *k };
+/// `work` with each identity key mapped by `m`, never its device.
+fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
     match work {
         Work::DropOffersBy { under, device } => Work::DropOffersBy {
             under: under.as_ref().map(m),
@@ -2116,5 +2168,23 @@ mod tests {
     #[test]
     fn passes_the_conformance_suite() {
         super::super::conformance::run(&|| Box::new(MemoryRelationships::new()));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        #[test]
+        fn the_moves_say_where_the_rows_are(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..40)
+        ) {
+            let s = MemoryRelationships::new();
+            super::super::conformance::the_moves_say_where_the_rows_are(&s, &steps);
+        }
+    }
+
+    #[test]
+    fn moves_that_loop_are_refused_rather_than_cut_short() {
+        let s = MemoryRelationships::new();
+        s.inner.lock().unwrap().moved = vec![([1; 32], [2; 32]), ([2; 32], [1; 32])];
+        assert!(s.moved(&[1; 32]).is_err());
     }
 }

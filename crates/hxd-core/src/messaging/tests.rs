@@ -2434,6 +2434,94 @@ fn a_rotation_tells_a_friend_with_no_row_naming_the_successor() {
     );
 }
 
+/// A rotation into a key that rotated on before it finishes moves the
+/// mail where the relationship store moves the rows: to where that key's
+/// went, not to the key it retired.
+#[test]
+fn a_rotation_into_a_key_rotated_on_moves_everything_where_the_rows_went() {
+    let (first, middle, last) = ([4u8; 32], [5u8; 32], [6u8; 32]);
+    let s = server(&["alice", "bob"]);
+    let bob = Mailbox::login("bob");
+    let now = s.core.clock.wall();
+    s.rel
+        .set_blocked(&Mailbox::identified("alice", first), &bob, true, now)
+        .unwrap();
+    s.inbox
+        .push(
+            &NewMessage {
+                recipient: Mailbox::identified("alice", first),
+                sender: Some(bob.clone()),
+                sender_nick: "bob".into(),
+                body: "to the first key".into(),
+                sent_at: now,
+                guid: None,
+                kind: MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship: None,
+                sender_address: None,
+                re: None,
+                emoji: None,
+            },
+            10,
+        )
+        .unwrap();
+    s.core.rotate_identity(&middle, &last).unwrap();
+    s.core.rotate_identity(&first, &middle).unwrap();
+    assert_eq!(s.rel.moved(&first).unwrap(), last);
+    let at_last = Mailbox::identified("alice", last);
+    assert!(s.rel.is_blocked(&at_last, &bob).unwrap(), "the block");
+    assert_eq!(s.inbox.pending_count(&at_last).unwrap(), 1, "the mail");
+}
+
+/// A rotation that read where it moves before a rotation of that key on
+/// committed moves its mail, rows, owed work and the roster's friend
+/// sets all to where the rows went.
+#[test]
+fn a_rotation_overtaken_by_its_successors_moves_everything_to_one_key() {
+    let (first, middle, last) = ([4u8; 32], [5u8; 32], [6u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, _b, _rb) = rotating(first, last, &park);
+    let (bob, now) = (Mailbox::login("bob"), s.core.clock.wall());
+    s.inbox
+        .push(
+            &NewMessage {
+                recipient: Mailbox::identified("alice", first),
+                sender: Some(bob.clone()),
+                sender_nick: "bob".into(),
+                body: "to the first key".into(),
+                sent_at: now,
+                guid: None,
+                kind: MessageKind::Message,
+                media: None,
+                signed: None,
+                friendship: None,
+                sender_address: None,
+                re: None,
+                emoji: None,
+            },
+            10,
+        )
+        .unwrap();
+    use crate::relationships::{Cause, Work};
+    let owed = Work::DropOffersNaming(first);
+    s.rel.owe(&[(owed, Cause::Always)]).unwrap();
+    beside(
+        || s.core.rotate_identity(&first, &middle).unwrap(),
+        s.fail.park.arm("moved"),
+        || s.core.rotate_identity(&middle, &last).unwrap(),
+    );
+    let at_last = Mailbox::identified("alice", last);
+    assert_eq!(s.inbox.pending_count(&at_last).unwrap(), 1, "the mail");
+    let row = s.rel.relationship(&bob, &at_last, now).unwrap();
+    assert!(row.is_some_and(|r| r.friendship.is_some()), "the row");
+    let works: Vec<_> = s.rel.owed().unwrap().into_iter().map(|o| o.work).collect();
+    assert_eq!(works, [Work::DropOffersNaming(last)], "the owed work");
+    let (shown, stored) = friend_sets(&s, &bob);
+    assert_eq!(stored, HashSet::from([Key::of(&at_last)]), "stored");
+    assert_eq!(shown, stored, "the roster's friend set");
+}
+
 /// A directory whose lookups can be held: by login, as an act names
 /// another, and by key, as a rotation looks up its successor.
 struct Holding(Directory, Arc<Park>);
@@ -2725,6 +2813,27 @@ fn an_act_a_rotation_overtakes_writes_nothing_under_the_old_key() {
     }
 }
 
+/// A password login of alice's while her account linked `key`, attached
+/// and not yet announced.
+fn keyed_by(core: &Core, key: [u8; 32]) -> (Uid, Events) {
+    let (uid, rx) = unannounced(
+        core,
+        "alice",
+        messaging_bits(),
+        "10.0.0.7",
+        crate::Transport::default(),
+        false,
+    );
+    core.roster
+        .lock()
+        .unwrap()
+        .users
+        .get_mut(&uid)
+        .unwrap()
+        .identity = Some(key);
+    (uid, rx)
+}
+
 #[test]
 fn a_session_of_the_old_key_admitted_during_a_rotation_is_ended_too() {
     let (old, new) = ([4u8; 32], [5u8; 32]);
@@ -2735,13 +2844,44 @@ fn a_session_of_the_old_key_admitted_during_a_rotation_is_ended_too() {
     let late = std::thread::scope(|t| {
         let rotation = t.spawn(|| s.core.rotate_identity(&old, &new).unwrap());
         parked.arrived();
-        let (late, _rx) = attach_identified(&s.core, "alice", old);
+        // Announced once the rotation lets go, as its presence load waits
+        // on the hold the lookup is under.
+        let (late, _rx) = keyed_by(&s.core, old);
         parked.release();
         rotation.join().unwrap();
+        s.core.announce(late);
         late
     });
     let r = s.core.roster.lock().unwrap();
     assert!(r.users.get(&late).is_none_or(|u| u.kicked), "ended");
+}
+
+#[test]
+fn a_login_of_the_old_key_while_a_rotation_waits_is_ended_before_anything_moves() {
+    let (old, new) = ([4u8; 32], [5u8; 32]);
+    let park = Arc::new(Park::default());
+    let (s, _b, _rb) = rotating(old, new, &park);
+    let parked = s.fail.park.arm("rotate_reporting");
+    let writing = s.core.friend_writes();
+    std::thread::scope(|t| {
+        let rotation = t.spawn(|| s.core.rotate_identity(&old, &new).unwrap());
+        // Let the rotation reach the hold.
+        std::thread::sleep(Duration::from_millis(100));
+        let (late, _rx) = keyed_by(&s.core, old);
+        drop(writing);
+        parked.arrived();
+        let kicked = s
+            .core
+            .roster
+            .lock()
+            .unwrap()
+            .users
+            .get(&late)
+            .map(|u| u.kicked);
+        parked.release();
+        rotation.join().unwrap();
+        assert_eq!(kicked, Some(true), "ended before the rows moved");
+    });
 }
 
 #[test]

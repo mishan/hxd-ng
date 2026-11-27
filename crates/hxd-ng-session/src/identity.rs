@@ -1354,7 +1354,13 @@ impl IdentityState {
                         };
                         let (created, is_new) = self
                             .auth
-                            .find_or_create_linked(&proposed, &card.name, &fingerprint.0, access)
+                            .find_or_create_linked(
+                                &proposed,
+                                &card.name,
+                                &fingerprint.0,
+                                access,
+                                &|| Ok(()),
+                            )
                             .map_err(|e| {
                                 tracing::warn!("account creation failed: {e}");
                                 AuthRefused::Backend
@@ -1598,10 +1604,11 @@ impl IdentityState {
 
         // Step 4, continued: what the registrars that attested it publish.
         let attestations = self.apply_records(card, cert, found, floor)?;
-        // A rotation to this key whose moves have not all landed would
-        // leave it to be admitted without the predecessor's account, and
-        // `new_accounts = create` to make it another one; it is admitted
-        // once the moves land, which this admission has just retried.
+        // A rotation landing on this key whose moves have not all landed
+        // would leave it to be admitted without the predecessor's account,
+        // and `new_accounts = create` to make it another one; it is
+        // admitted once the moves land, which this admission has just
+        // retried.
         if self
             .anchors
             .as_ref()
@@ -1725,10 +1732,13 @@ impl IdentityState {
             Some(hxd_core::KeyRefusal::Unrevoked) => return Err(AuthRefused::Denied),
             None => {}
         }
-        let outcome = self.auth.link_identity(login, &fp.0).map_err(|e| {
-            tracing::warn!("link write failed: {e}");
-            AuthRefused::Backend
-        })?;
+        let outcome = self
+            .auth
+            .link_identity(login, &fp.0, &|| Ok(()))
+            .map_err(|e| {
+                tracing::warn!("link write failed: {e}");
+                AuthRefused::Backend
+            })?;
         if let LinkOutcome::Linked(a) = &outcome {
             let moved = self.core.inbox_claim(&a.login, &fp.0);
             if moved > 0 {
@@ -1835,7 +1845,7 @@ impl IdentityState {
         }
         let outcome = self
             .auth
-            .unlink_identity(&ident.fingerprint.0)
+            .unlink_identity(&ident.fingerprint.0, &|| Ok(()))
             .map_err(|e| {
                 tracing::warn!("unlink write failed: {e}");
                 AuthRefused::Backend
@@ -2569,43 +2579,71 @@ impl IdentityState {
     }
 
     /// Move what `from`'s rotation to `to` moves (`docs/identity-records.md`
-    /// §4): its account link, then what the core keeps under its key. It
-    /// is noted done only once all of it has moved; until then it is
-    /// asked again at each start and at every admission of the successor,
-    /// which every step allows. `at_start` for a caller on the reactor as
-    /// the server starts, whose start judges the friendships after it.
+    /// §4): its account link, then what the core keeps under its key, both
+    /// to the one key the core moves to, past every rotation of the
+    /// successor on ([`Anchors::lands`]). It is noted done only once all of
+    /// it has moved; until then it is asked again at each start and at
+    /// every admission of the key it lands on, which every step allows.
+    /// `at_start` for a caller on the reactor as the server starts, whose
+    /// start judges the friendships after it.
     fn finish_rotation(&self, from: Fingerprint, to: Fingerprint, at_start: bool) {
         let Some(anchors) = &self.anchors else {
             return;
         };
-        let account = match self.auth.rotate_link(&from.0, &to.0) {
-            Ok(account) => account,
-            Err(e) => {
-                tracing::warn!(predecessor = %from.short(), "rotation: the account link did not move: {e}");
-                return;
+        let lands = |to: &[u8; 32]| anchors.lands(&Fingerprint(*to)).0;
+        // Under the core's hold, so a rotation it lands through recorded
+        // since the caller listed what to finish is seen too: until that
+        // one is done, the key it lands on may be owed to its account.
+        let link = |dest: &[u8; 32]| {
+            if anchors.waits(&to) {
+                let e = "it lands through a rotation that has not finished";
+                return Err(hxd_core::StoreError(e.into()));
             }
+            let account = self
+                .auth
+                .rotate_link(&from.0, dest)
+                .map_err(|e| hxd_core::StoreError(format!("the account link did not move: {e}")))?;
+            if let Some(account) = account {
+                info!(account = %account.login, successor = %Fingerprint(*dest).short(), "rotation: the account now links the successor");
+            }
+            Ok(())
         };
-        let moved = match at_start {
-            true => self.core.rotate_identity_at_start(&from.0, &to.0),
-            false => self.core.rotate_identity(&from.0, &to.0),
-        };
+        let moved = self
+            .core
+            .rotate_identity_linking(&from.0, &to.0, at_start, lands, link);
         if let Err(e) = moved {
-            tracing::warn!(predecessor = %from.short(), "rotation: what the server keeps did not all move: {e}");
+            tracing::warn!(predecessor = %from.short(), "rotation: what it moves did not all move: {e}");
             return;
-        }
-        if let Some(account) = account {
-            info!(account = %account.login, successor = %to.short(), "rotation: the account now links the successor");
         }
         anchors.moved(&from);
     }
 
-    /// [`Self::finish_rotation`] for each rotation, to `to` or to
-    /// anyone, whose moves have not all landed.
+    /// [`Self::finish_rotation`] for each rotation, landing on `to` or
+    /// anywhere, whose moves have not all landed.
     fn finish_rotations(&self, to: Option<&Fingerprint>, at_start: bool) {
         for (from, to) in self.anchors.iter().flat_map(|a| a.unmoved(to)) {
             self.finish_rotation(from, to, at_start);
         }
     }
+}
+
+/// The keys a rotation to `to` passes on its way to where it lands
+/// ([`Anchors::lands`]), over the rotations as they are held. `rotate` takes
+/// no rotation into a key that has rotated away, so the walk ends; the
+/// bound is for a file an older build left. `to` first, where it lands
+/// last.
+fn walk(
+    rotated: &HashMap<Fingerprint, (Fingerprint, Moves)>,
+    to: &Fingerprint,
+) -> Vec<Fingerprint> {
+    let mut keys = vec![*to];
+    while keys.len() <= rotated.len() {
+        match rotated.get(&keys[keys.len() - 1]) {
+            Some((next, m)) if *m != Moves::Held => keys.push(*next),
+            _ => break,
+        }
+    }
+    keys
 }
 
 /// Insert a device record, evicting expired entries and then the
@@ -2964,15 +3002,38 @@ impl Anchors {
         rotated.get(fp).is_some_and(|(_, m)| *m == Moves::Held)
     }
 
-    /// The rotations whose moves have not all landed, to `to` or, with
-    /// `None`, to anyone.
+    /// The rotations whose moves have not all landed, landing on `to`
+    /// ([`Anchors::lands`]) or, with `None`, anywhere: the nearest the key
+    /// it lands on first, so one pass finishes a chain, a rotation landing
+    /// through another waiting for it ([`Anchors::waits`]).
     fn unmoved(&self, to: Option<&Fingerprint>) -> Vec<(Fingerprint, Fingerprint)> {
         let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
-        rotated
+        let mut pending: Vec<_> = rotated
             .iter()
-            .filter(|(_, (t, m))| *m == Moves::Pending && to.is_none_or(|to| t == to))
-            .map(|(from, (t, _))| (*from, *t))
-            .collect()
+            .filter(|(_, (_, m))| *m == Moves::Pending)
+            .map(|(from, (t, _))| (walk(&rotated, t), (*from, *t)))
+            .filter(|(keys, _)| to.is_none_or(|to| keys.last() == Some(to)))
+            .collect();
+        pending.sort_by_key(|(keys, _)| keys.len());
+        pending.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// Where a rotation to `to` lands: `to`, or where `to` rotated on
+    /// to, followed through every rotation that moves (a held one moves
+    /// nothing), whether or not its moves have landed yet.
+    fn lands(&self, to: &Fingerprint) -> Fingerprint {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        *walk(&rotated, to).last().expect("the walk starts at `to`")
+    }
+
+    /// Whether a rotation to `to` lands through one whose moves have not
+    /// all landed.
+    fn waits(&self, to: &Fingerprint) -> bool {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = walk(&rotated, to);
+        keys[..keys.len() - 1]
+            .iter()
+            .any(|k| rotated.get(k).is_some_and(|(_, m)| *m == Moves::Pending))
     }
 
     /// Note that `from`'s rotation has moved all it moves.
@@ -3191,6 +3252,12 @@ mod tests {
     #[derive(Default)]
     struct MemAuth {
         accounts: Mutex<HashMap<String, Account>>,
+        /// Fails each `rotate_link` while set.
+        fail_link: std::sync::atomic::AtomicBool,
+        /// Fails `rotate_link` for the account of this login.
+        fail_link_of: Mutex<Option<String>>,
+        /// The next `rotate_link` says it arrived and waits to be let go.
+        park_link: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
 
     fn account(login: &str, password: bool) -> Account {
@@ -3263,7 +3330,21 @@ mod tests {
             from: &[u8; 32],
             to: &[u8; 32],
         ) -> Result<Option<Account>, AuthError> {
+            let parked = self.park_link.lock().unwrap().take();
+            if let Some((arrive, wait)) = parked {
+                let _ = arrive.send(());
+                let _ = wait.recv();
+            }
+            if self.fail_link.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AuthError::Backend("unwritable".into()));
+            }
             let mut a = self.accounts.lock().unwrap();
+            let failing = self.fail_link_of.lock().unwrap();
+            if a.values().any(|x| {
+                x.identity.fingerprint == Some(*from) && failing.as_ref() == Some(&x.login)
+            }) {
+                return Err(AuthError::Backend("unwritable".into()));
+            }
             if a.values().any(|x| x.identity.fingerprint == Some(*to)) {
                 return Ok(None);
             }
@@ -3276,7 +3357,12 @@ mod tests {
             }))
         }
 
-        fn link_identity(&self, login: &str, fp: &[u8; 32]) -> Result<LinkOutcome, AuthError> {
+        fn link_identity(
+            &self,
+            login: &str,
+            fp: &[u8; 32],
+            check: hxd_core::LinkCheck<'_>,
+        ) -> Result<LinkOutcome, AuthError> {
             // The whole decision under one lock, as the trait requires.
             let mut a = self.accounts.lock().unwrap();
             let account = a.get(login).cloned().ok_or(AuthError::NoSuchAccount)?;
@@ -3297,11 +3383,16 @@ mod tests {
             if let Some(other) = a.values().find(|x| x.identity.fingerprint == Some(*fp)) {
                 return Ok(LinkOutcome::Taken(other.clone()));
             }
+            check()?;
             let entry = a.get_mut(login).expect("read above");
             entry.identity.fingerprint = Some(*fp);
             Ok(LinkOutcome::Linked(entry.clone()))
         }
-        fn unlink_identity(&self, fp: &[u8; 32]) -> Result<UnlinkOutcome, AuthError> {
+        fn unlink_identity(
+            &self,
+            fp: &[u8; 32],
+            check: hxd_core::LinkCheck<'_>,
+        ) -> Result<UnlinkOutcome, AuthError> {
             let mut a = self.accounts.lock().unwrap();
             let Some(login) = a
                 .values()
@@ -3314,6 +3405,7 @@ mod tests {
             if !entry.has_password {
                 return Ok(UnlinkOutcome::WouldOrphan(entry.clone()));
             }
+            check()?;
             let before = entry.clone();
             entry.identity.fingerprint = None;
             Ok(UnlinkOutcome::Unlinked(before))
@@ -3324,11 +3416,13 @@ mod tests {
             name: &str,
             fp: &[u8; 32],
             access: AccessBits,
+            check: hxd_core::LinkCheck<'_>,
         ) -> Result<(Account, bool), AuthError> {
             let mut a = self.accounts.lock().unwrap();
             if let Some(existing) = a.values().find(|x| x.identity.fingerprint == Some(*fp)) {
                 return Ok((existing.clone(), false));
             }
+            check()?;
             let login = if a.contains_key(proposed) {
                 format!("{proposed}-2")
             } else {
@@ -3942,6 +4036,268 @@ mod tests {
                 );
             }
         }
+    }
+
+    use hxd_core::relationships::{MemoryRelationships, RelationshipStore};
+
+    /// A state whose core keeps friendships, with alice's account linked
+    /// to the first of `keys` and each rotation between them on file.
+    fn rotating_state(
+        keys: &[Fingerprint],
+        stored: bool,
+        mut cfg: IdentityConfig,
+        path: std::path::PathBuf,
+    ) -> (IdentityState, Arc<MemAuth>, Arc<MemoryRelationships>) {
+        let auth = MemAuth::new();
+        auth.accounts
+            .lock()
+            .unwrap()
+            .get_mut("alice")
+            .unwrap()
+            .identity
+            .fingerprint = Some(keys[0].0);
+        cfg.anchors = Some(path);
+        cfg.hosts.push(TEST_HOST.into());
+        let friends = Arc::new(MemoryRelationships::new());
+        let core = match stored {
+            true => hxd_core::Core::new().with_relationships(friends.clone()),
+            false => hxd_core::Core::new(),
+        };
+        let st = IdentityState::new(
+            ServerKey::from_seed(&[5u8; 32]),
+            cfg,
+            auth.clone(),
+            Arc::new(core),
+        );
+        for pair in keys.windows(2) {
+            assert!(st
+                .anchors
+                .as_ref()
+                .unwrap()
+                .rotate(&pair[0], &pair[1], None));
+        }
+        (st, auth, friends)
+    }
+
+    fn linked(auth: &MemAuth) -> Option<[u8; 32]> {
+        auth.lookup("alice").unwrap().identity.fingerprint
+    }
+
+    #[test]
+    fn a_rotation_overtaken_by_its_successors_leaves_the_link_where_the_rest_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            Fingerprint([1; 32]),
+            Fingerprint([2; 32]),
+            Fingerprint([3; 32]),
+        );
+        let (st, auth, _) = rotating_state(
+            &[a, b],
+            true,
+            IdentityConfig::default(),
+            dir.path().join("successors"),
+        );
+        let (arrive, arrived) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel();
+        *auth.park_link.lock().unwrap() = Some((arrive, wait));
+        std::thread::scope(|t| {
+            let first = t.spawn(|| st.finish_rotation(a, b, false));
+            arrived.recv_timeout(Duration::from_secs(10)).unwrap();
+            // B's rotation on, while A's link waits to move.
+            let onward = t.spawn(|| {
+                assert!(st.anchors.as_ref().unwrap().rotate(&b, &c, None));
+                st.finish_rotation(b, c, false)
+            });
+            let until = Instant::now() + Duration::from_millis(300);
+            while !onward.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            go.send(()).unwrap();
+            first.join().unwrap();
+            onward.join().unwrap();
+        });
+        assert_eq!(linked(&auth), Some(c.0), "the link at the end of the chain");
+        assert!(st.anchors.as_ref().unwrap().unmoved(None).is_empty());
+    }
+
+    #[test]
+    fn a_rotation_recorded_after_a_pass_listed_its_own_holds_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let [a, b, c] = [1u8, 2, 3].map(|s| Fingerprint([s; 32]));
+        let (st, auth, _) = rotating_state(
+            &[a, b],
+            true,
+            IdentityConfig::default(),
+            dir.path().join("s"),
+        );
+        let mut theirs = account("yan", false);
+        theirs.identity.fingerprint = Some(b.0);
+        auth.accounts.lock().unwrap().insert("yan".into(), theirs);
+        let anchors = st.anchors.as_ref().unwrap();
+        let listed = anchors.unmoved(None);
+        assert_eq!(listed, [(a, b)]);
+        // As `accept_rotation(B, C)` records it, before its own finish.
+        assert!(anchors.rotate(&b, &c, None));
+        for (from, to) in listed {
+            st.finish_rotation(from, to, false);
+        }
+        let of = |login| auth.lookup(login).unwrap().identity.fingerprint;
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "alice's does not take C ahead of yan's"
+        );
+        st.finish_rotations(None, false);
+        assert!(anchors.unmoved(None).is_empty(), "both done");
+        assert_eq!(of("yan"), Some(c.0));
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "the key yan's account holds is not taken"
+        );
+    }
+
+    #[test]
+    fn a_rotation_whose_link_cannot_move_moves_nothing_and_is_finished_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (Fingerprint([1; 32]), Fingerprint([2; 32]));
+        let (st, auth, friends) = rotating_state(
+            &[a, b],
+            true,
+            IdentityConfig::default(),
+            dir.path().join("successors"),
+        );
+        auth.fail_link
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        st.finish_rotation(a, b, false);
+        let anchors = st.anchors.as_ref().unwrap();
+        assert_eq!(anchors.unmoved(None), [(a, b)], "not done");
+        assert_eq!(linked(&auth), Some(a.0), "the link stays");
+        assert_eq!(friends.moved(&a.0).unwrap(), a.0, "nothing moved");
+        auth.fail_link
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        st.finish_rotations(None, false);
+        assert!(anchors.unmoved(None).is_empty(), "done");
+        assert_eq!(linked(&auth), Some(b.0), "the link moved");
+        assert_eq!(friends.moved(&a.0).unwrap(), b.0, "the rest moved");
+    }
+
+    /// Z->A and A->B, whose links could not move, pending behind B->C,
+    /// which finished: what both move lands on C, with a relationship
+    /// store to say where B's rows went or without one.
+    fn pending_behind_its_successor(
+        stored: bool,
+        cfg: IdentityConfig,
+        path: std::path::PathBuf,
+    ) -> (IdentityState, Arc<MemAuth>, Fingerprint) {
+        let keys = [1u8, 2, 3, 4].map(|s| IdentityKey::from_seed(&[s; 32]).fingerprint());
+        let [z, a, b, c] = keys;
+        let (st, auth, _) = rotating_state(&keys, stored, cfg, path);
+        let fail = |on| {
+            auth.fail_link
+                .store(on, std::sync::atomic::Ordering::Relaxed)
+        };
+        fail(true);
+        st.finish_rotation(z, a, false);
+        st.finish_rotation(a, b, false);
+        fail(false);
+        st.finish_rotation(b, c, false);
+        let pending: HashSet<_> = st
+            .anchors
+            .as_ref()
+            .unwrap()
+            .unmoved(None)
+            .into_iter()
+            .collect();
+        assert_eq!(pending, HashSet::from([(z, a), (a, b)]));
+        (st, auth, c)
+    }
+
+    #[test]
+    fn a_successor_further_on_waits_for_the_pending_rotations_that_land_on_it() {
+        for stored in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = IdentityConfig {
+                new_accounts: NewAccounts::Create,
+                unattested: Unattested::Allow,
+                ..Default::default()
+            };
+            let (st, auth, c) = pending_behind_its_successor(stored, cfg, dir.path().join("s"));
+            let (id, dev) = (
+                IdentityKey::from_seed(&[4; 32]),
+                DeviceKey::from_seed(&[9; 32]),
+            );
+            let (card, cert) = objects(&id, &dev);
+            let auth_c = || {
+                let proof = proof_for(&st, &dev);
+                st.auth_with_proof(
+                    &card,
+                    &cert,
+                    &proof,
+                    Some(TEST_HOST),
+                    AuthRequest::default(),
+                )
+                .map(|(_, ident)| ident.account)
+            };
+            let accounts = || auth.accounts.lock().unwrap().len();
+            let before = accounts();
+            auth.fail_link
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                auth_c(),
+                Err(AuthRefused::Backend),
+                "{stored}: refused while they wait"
+            );
+            assert_eq!(accounts(), before, "{stored}: no second account");
+            auth.fail_link
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(auth_c(), Ok(Some("alice".into())), "{stored}");
+            assert_eq!(accounts(), before, "{stored}: no second account");
+            assert_eq!(linked(&auth), Some(c.0), "{stored}");
+        }
+    }
+
+    #[test]
+    fn finishing_the_rotations_to_a_key_finishes_those_that_land_on_it() {
+        for stored in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (st, auth, c) = pending_behind_its_successor(
+                stored,
+                IdentityConfig::default(),
+                dir.path().join("s"),
+            );
+            st.finish_rotations(Some(&c), false);
+            let left = st.anchors.as_ref().unwrap().unmoved(None);
+            assert!(left.is_empty(), "{stored}: {left:?}");
+            assert_eq!(linked(&auth), Some(c.0), "{stored}");
+        }
+    }
+
+    #[test]
+    fn a_rotation_through_one_that_did_not_finish_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = [1u8, 2, 3].map(|s| Fingerprint([s; 32]));
+        let [a, b, c] = keys;
+        let (st, auth, _) =
+            rotating_state(&keys, true, IdentityConfig::default(), dir.path().join("s"));
+        let mut theirs = account("yan", false);
+        theirs.identity.fingerprint = Some(b.0);
+        auth.accounts.lock().unwrap().insert("yan".into(), theirs);
+        let anchors = st.anchors.as_ref().unwrap();
+        let of = |login| auth.lookup(login).unwrap().identity.fingerprint;
+        *auth.fail_link_of.lock().unwrap() = Some("yan".into());
+        st.finish_rotations(None, false);
+        assert_eq!(of("alice"), Some(a.0), "alice's waits for yan's");
+        assert_eq!(anchors.unmoved(None).len(), 2, "neither done");
+        *auth.fail_link_of.lock().unwrap() = None;
+        st.finish_rotations(None, false);
+        assert!(anchors.unmoved(None).is_empty(), "both done");
+        assert_eq!(of("yan"), Some(c.0));
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "the key yan's account holds is not taken"
+        );
     }
 
     #[test]

@@ -295,6 +295,8 @@ pub struct Rekeyed {
     /// A rotation's: `(lost, kept)`, owed work re-stamped into the same
     /// work already owed, which stands in its place.
     pub owed_merged: Vec<(OwedId, OwedId)>,
+    /// The ids of the work the step was asked to owe, in order.
+    pub owed: Vec<OwedId>,
 }
 
 /// Who sent a request, as its bounds and holds count it: an account by
@@ -740,6 +742,21 @@ pub struct Owed {
     pub cause: Cause,
 }
 
+/// Where a rotation from `from` to `to` moves the rows, `end` being where
+/// `to`'s are ([`RelationshipStore::moved`]): nowhere for a rotation to
+/// itself; to `to` where its moves lead back to `from`, a rotation back to
+/// a key the rows left; else to `end`, so one into a key that has moved on
+/// moves to where that key's rows went, and one made again finds its rows
+/// there. Both stores and [`crate::Core::rotate_identity`] go by it, so
+/// the moves always say where a key's rows are, and never loop.
+pub fn destination(from: &[u8; 32], to: &[u8; 32], end: [u8; 32]) -> Option<[u8; 32]> {
+    match (from == to, end == *from) {
+        (true, _) => None,
+        (false, true) => Some(*to),
+        (false, false) => Some(end),
+    }
+}
+
 /// The relationship store, behind a trait as the inbox is, so the
 /// in-memory store can carry the domain's tests and SQLite's the server.
 pub trait RelationshipStore: Send + Sync + 'static {
@@ -1154,6 +1171,10 @@ pub trait RelationshipStore: Send + Sync + 'static {
 
     /// Record each piece of work, as one step, answering its id in order:
     /// work already owed for the same cause is kept, and its id answered.
+    /// Each key of the work is written as [`RelationshipStore::moved`]
+    /// answers it in the same step, so work owed under a key a rotation
+    /// moved from is owed where the rows went; a cause's keys are kept as
+    /// given. [`Part::Owe`] does the same.
     fn owe(&self, owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError>;
 
     /// Every piece of work owed, oldest first.
@@ -1161,6 +1182,12 @@ pub trait RelationshipStore: Send + Sync + 'static {
 
     /// Done or moot: gone. An id already gone is not an error.
     fn settle(&self, ids: &[OwedId]) -> Result<(), StoreError>;
+
+    /// Where `key`'s rows are now: the end of the moves the rotations
+    /// [`RelationshipStore::rotate`] made from it, each recorded in its
+    /// own step whether or not its record was kept, or `key` itself; an
+    /// error where the moves loop, which no rotation leaves.
+    fn moved(&self, key: &[u8; 32]) -> Result<[u8; 32], StoreError>;
 
     // --- The account -------------------------------------------------------
 
@@ -1177,33 +1204,43 @@ pub trait RelationshipStore: Send + Sync + 'static {
     /// holds and its ledger, so it follows the identity. Two rows for one
     /// pair become one ([`Relationship::absorb`]), and an account's own
     /// record already on the fingerprint is the one kept. Idempotent.
-    fn claim(&self, login: &str, fingerprint: &[u8; 32]) -> Result<Rekeyed, StoreError>;
+    /// `owe` is owed in the same step, its ids in [`Rekeyed::owed`].
+    fn claim(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        owe: &[(Work, Cause)],
+    ) -> Result<Rekeyed, StoreError>;
 
     /// Whether `claim` would find anything keyed by `login` alone.
     fn claimable(&self, login: &str) -> Result<bool, StoreError>;
 
     /// The identity rotated to a successor key: re-stamp everything keyed
-    /// by `from` with `to`, merging as `claim` does, presentations,
+    /// by `from` with the key [`destination`] names, merging as `claim` does, presentations,
     /// offers and the withdrawals it counts toward among it; a successor
     /// already holding one for the same other party keeps its own, and a
     /// pair that had evidence both ways and has it no more ends its edge.
     /// An offer to `from`, which names it, goes, as
     /// [`RelationshipStore::drop_offers`] drops one. Owed work moves with
     /// the rows, its causes left as they were: one piece that becomes the
-    /// same as another already owed is folded into it.
+    /// same as another already owed is folded into it. The move is
+    /// recorded for [`RelationshipStore::moved`], but for a key that moved
+    /// on before, whose rows are where its own move says.
     fn rotate(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<Rekeyed, StoreError> {
-        self.rotate_reporting(from, to, &Report::none())
+        self.rotate_reporting(from, to, &Report::none(), &[])
             .map(|(rekeyed, _)| rekeyed)
     }
 
     /// [`RelationshipStore::rotate`], and what it left of `report`'s pairs
     /// and then of each edge it ended, by the parties as their rows keep
-    /// them, in order, read inside the same step.
+    /// them, in order, read inside the same step; `owe` is owed in that
+    /// step once the rows have moved, its ids in [`Rekeyed::owed`].
     fn rotate_reporting(
         &self,
         from: &[u8; 32],
         to: &[u8; 32],
         report: &Report,
+        owe: &[(Work, Cause)],
     ) -> Result<(Rekeyed, Vec<Left>), StoreError>;
 
     /// An account was deleted: its rows and the rows naming it, the

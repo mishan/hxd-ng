@@ -45,7 +45,8 @@
 //!
 //! [`run_failing_each_call`] replays sequences with each store call a step
 //! makes failing in turn: a step answered with an error leaves the store as
-//! it was and tells nothing.
+//! it was and tells nothing, but for a refusal it answers over its change,
+//! as a removal of a friend whose withdrawal is refused does.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -412,6 +413,10 @@ struct Run {
     crowded: bool,
     /// Whether each party's pending out was an upgrade before the step.
     upgrading: [bool; 2],
+    /// Whether the last act answered a refusal over the change it made, as
+    /// a removal of a friend whose withdrawal is refused does: an answer,
+    /// not a failure.
+    refused_over: bool,
     /// The keys the last list published covered.
     covered: HashSet<[u8; 32]>,
 }
@@ -561,6 +566,7 @@ impl Run {
             requested: 0,
             crowded: false,
             upgrading: [false, false],
+            refused_over: false,
             covered: HashSet::new(),
         }
     }
@@ -851,7 +857,15 @@ impl Run {
             Step::Remove { withdraw, early } => {
                 let w = withdraw.then(|| me.withdraw(d, them, cut(early), now));
                 self.carried = w.clone().map(|w| (p, w));
-                core.friend_unfriend(uid, other, w).is_ok()
+                let friends = self.pairing().friendship.is_some();
+                let removed = core.friend_unfriend(uid, other, w);
+                // Only once the friendship ended here: a refusal before
+                // that changed nothing.
+                self.refused_over = withdraw
+                    && friends
+                    && removed.is_err_and(|e| e != super::MessagingError::ServerError)
+                    && self.pairing().friendship.is_none();
+                removed.is_ok()
             }
             Step::BlockWithdrawal => {
                 let w = me.withdraw(d, them, now, now);
@@ -2177,7 +2191,9 @@ pub const FOUND: &[&[u32]] = &[
 /// order: an unblock, an alias, a floor's pass, an offer below a floor, a
 /// removal by key, a revoked device's presentation and an unlinked
 /// identity's. For [`run_failing_each_call`], so that a read failing after
-/// each act's write is drawn whatever proptest draws.
+/// each act's write is drawn whatever proptest draws; then a step after a
+/// crowded rotation, and a removal whose withdrawal is refused, a read
+/// after its write failing.
 pub const FOUND_TELLING: &[&[u32]] = &[
     &[4190456556, 4269538169],
     &[4275179230],
@@ -2186,6 +2202,8 @@ pub const FOUND_TELLING: &[&[u32]] = &[
     &[4282268916, 4210818445],
     &[4228555290, 4200952286],
     &[4163459622, 4184817938],
+    &[3553310280, 1266791837, 1805439339, 0],
+    &[5078164, 4015546323, 300212360],
 ];
 
 /// Run `steps` against a store from `new_store`, each step held to the
@@ -2231,7 +2249,8 @@ pub fn run(new_store: &dyn Fn() -> Arc<dyn RelationshipStore>, steps: &[u32]) {
 /// Each step of `steps` with each store call it makes failing in turn,
 /// the steps before it replayed on a fresh store from `new_store`, whose
 /// second half dumps all it holds: a step answered with an error leaves
-/// the store as it was and tells nothing.
+/// the store as it was and tells nothing, but for a refusal it answers
+/// over its change.
 pub fn run_failing_each_call(
     new_store: &dyn Fn() -> (Arc<dyn RelationshipStore>, Dump),
     steps: &[u32],
@@ -2248,6 +2267,10 @@ pub fn run_failing_each_call(
                 for &m in &steps[..i] {
                     let p = run.actor(m);
                     run.step(m, p);
+                    // As in `run`, nothing after a crowded rotation is judged.
+                    if run.crowded {
+                        return;
+                    }
                 }
                 let p = run.actor(n);
                 let (step, _, d, _) = Step::of(n);
@@ -2260,6 +2283,7 @@ pub fn run_failing_each_call(
                     false => run.fail.fail_nth(k),
                     true => run.fail.fail_write_part(k),
                 }
+                run.refused_over = false;
                 let ok = run.act(step, p, d);
                 let writes = run.fail.writes();
                 run.fail.fail_nth(0);
@@ -2271,7 +2295,7 @@ pub fn run_failing_each_call(
                     true => format!("{step:?} by {}, a write failing after part {k}", LOGINS[p]),
                 };
                 let what = format!("{what} after {writes:?}");
-                if !ok {
+                if !ok && !run.refused_over {
                     assert_eq!(held(&run), before, "{what}: an error left a change");
                     let told = run.told();
                     assert!(

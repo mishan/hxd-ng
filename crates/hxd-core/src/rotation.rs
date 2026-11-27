@@ -9,39 +9,62 @@ use crate::ban::{Ban, BanTarget};
 use crate::inbox::StoreError;
 use crate::messaging::Key;
 use crate::push::PushStore;
-use crate::relationships::Report;
+use crate::relationships::{destination, Report};
 use crate::Core;
 
 impl Core {
     /// Move `from`'s mail, blocks, news subscriptions and authorship,
-    /// avatar and standing bans to `to`, and drop its push devices, which
+    /// avatar and standing bans to `to`, or to where `to`'s went
+    /// ([`destination`]), and drop its push devices, which
     /// the successor has not vouched for. Every step is idempotent, so a
     /// caller that gets an error calls again until it succeeds; a ban
     /// moved this way ends the successor's sessions as any new ban does.
-    /// Called once the account link has moved, it ends every session
-    /// still keyed by `from` before anything moves, so nothing is written
-    /// there while the rest does.
+    /// For a caller with no account link to move: see
+    /// [`Self::rotate_identity_linking`].
     pub fn rotate_identity(&self, from: &[u8; 32], to: &[u8; 32]) -> Result<(), StoreError> {
-        self.rotate_identity_judging(from, to, true)
+        self.rotate_identity_linking(from, to, false, |to| *to, |_| Ok(()))
     }
 
-    /// [`Self::rotate_identity`], leaving the predecessor's friendships to
-    /// the pass a start makes over them ([`Self::reconcile_kept`]): for a
-    /// caller on the reactor as the server starts.
-    pub fn rotate_identity_at_start(
+    /// [`Self::rotate_identity`], moving the account link first, with
+    /// `link`, to the key everything else then moves to: the destination
+    /// is read once, and rotations are made one at a time, so a rotation
+    /// of `to` on cannot land between the link and the rest. Where `link`
+    /// fails, nothing has moved. Every session still keyed by `from` is
+    /// ended once the link has moved and before anything else does, so
+    /// nothing is written there while the rest moves. `at_start` for a
+    /// caller on the reactor as the server starts, leaving the
+    /// predecessor's friendships to the pass a start makes over them
+    /// ([`Self::reconcile_kept`]). `lands` says, under the hold, where a
+    /// rotation into `to` lands by the caller's record of rotations, for
+    /// the store's moves to resolve further.
+    pub fn rotate_identity_linking(
         &self,
         from: &[u8; 32],
         to: &[u8; 32],
+        at_start: bool,
+        lands: impl FnOnce(&[u8; 32]) -> [u8; 32],
+        link: impl FnOnce(&[u8; 32]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        self.rotate_identity_judging(from, to, false)
-    }
-
-    fn rotate_identity_judging(
-        &self,
-        from: &[u8; 32],
-        to: &[u8; 32],
-        judging: bool,
-    ) -> Result<(), StoreError> {
+        // A rotation to itself moves nothing.
+        if from == to {
+            return Ok(());
+        }
+        let _rotating = self.rotations.lock().unwrap_or_else(|e| e.into_inner());
+        // One hold from the link's move to the roster's following the
+        // friendships and what their merge left settled: an act of a
+        // session ended below that is under way finishes first and its
+        // rows move, and one after it is refused; no keep lands between
+        // the judging and the merge, which keeps the later cutoff of two
+        // for one key whichever stands; and no act finds the store moved
+        // and the roster not.
+        let writing = self.friend_writes();
+        let to = &lands(to);
+        let dest = match self.relationships.as_ref() {
+            Some(store) => destination(from, to, store.moved(to)?).unwrap_or(*to),
+            None => *to,
+        };
+        let to = &dest;
+        link(to)?;
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");
         }
@@ -56,14 +79,6 @@ impl Core {
             .as_ref()
             .and_then(|d| d.account_by_key(to))
             .map_or_else(|| new.clone(), |(m, _)| m);
-        // One hold from before the mail moves to the roster's following
-        // the friendships and what their merge left settled: an act of a
-        // session ended above that is under way finishes first and its
-        // rows move, and one after it is refused; no keep lands between
-        // the judging and the merge, which keeps the later cutoff of two
-        // for one key whichever stands; and no act finds the store moved
-        // and the roster not.
-        let writing = self.friend_writes();
         if let Some(store) = self.inbox.as_ref() {
             // As a send writes under it, and as a claim holds the other.
             let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
@@ -89,7 +104,7 @@ impl Core {
                     .collect(),
                 now: wall,
             };
-            let (rekeyed, left) = store.rotate_reporting(from, to, &report)?;
+            let (rekeyed, left) = store.rotate_reporting(from, to, &report, &[])?;
             let (audience, ended_left) = left.split_at(report.pairs.len());
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
             self.unjudge(store, [*from, *to].into_iter().chain(merged));
@@ -117,7 +132,7 @@ impl Core {
             }
         }
         drop(writing);
-        if judging {
+        if !at_start {
             self.reconcile_predecessor(*from);
         }
         self.news_rotate(from, to)?;

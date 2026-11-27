@@ -430,6 +430,10 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+/// What a backend calls inside a link's step, once the link is decided and
+/// before it is written: its error refuses the link.
+pub type LinkCheck<'a> = &'a dyn Fn() -> Result<(), AuthError>;
+
 /// The pluggable authentication backend.
 ///
 /// Synchronous by design for now: the file backend is a couple of small
@@ -477,12 +481,25 @@ pub trait AuthBackend: Send + Sync + 'static {
     /// the empty password verifies for anyone. Self-linking is "prove
     /// you own the account, then bind it to your key"; without a
     /// password there is nothing to prove.
-    fn link_identity(&self, login: &str, fingerprint: &[u8; 32]) -> Result<LinkOutcome, AuthError>;
+    ///
+    /// `check` is called once the link is decided and before it is
+    /// written, inside the same step; its error refuses the link.
+    fn link_identity(
+        &self,
+        login: &str,
+        fingerprint: &[u8; 32],
+        check: LinkCheck<'_>,
+    ) -> Result<LinkOutcome, AuthError>;
 
     /// Clear the link on whichever account `fingerprint` links (§8.4).
     /// Atomic for the same reason as [`AuthBackend::link_identity`], and
     /// it refuses to leave a password-less account with no way in.
-    fn unlink_identity(&self, fingerprint: &[u8; 32]) -> Result<UnlinkOutcome, AuthError>;
+    /// `check` is called as `link_identity` calls it.
+    fn unlink_identity(
+        &self,
+        fingerprint: &[u8; 32],
+        check: LinkCheck<'_>,
+    ) -> Result<UnlinkOutcome, AuthError>;
 
     /// The identity `from` links rotated to `to` (`identity-registrar.md`
     /// §7.4): its account links `to` instead, and is answered. Done once
@@ -499,13 +516,16 @@ pub trait AuthBackend: Send + Sync + 'static {
     ///
     /// The `bool` is true when the account was created by this call.
     /// Atomic: without that, two logins by one never-seen identity make
-    /// two accounts for it.
+    /// two accounts for it. `check` is called before one is created, as
+    /// [`AuthBackend::link_identity`] calls it; the creation can still
+    /// fail after it, as a link's write can.
     fn find_or_create_linked(
         &self,
         proposed: &str,
         name: &str,
         fingerprint: &[u8; 32],
         access: AccessBits,
+        check: LinkCheck<'_>,
     ) -> Result<(Account, bool), AuthError>;
 
     /// Which account, if any, reserves `name` as a display name (§9):

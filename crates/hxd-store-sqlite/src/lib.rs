@@ -82,7 +82,7 @@ pub use registrar::SqliteRegistrarStore;
 
 /// The schema this build writes. Bumping it means adding an arm to
 /// [`migrate`].
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 43;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE message (
@@ -1161,6 +1161,17 @@ CREATE INDEX friend_owed_key ON friend_owed (key);
 CREATE INDEX friend_owed_other ON friend_owed (other);
 ";
 
+/// Each move a rotation made of a key's rows, recorded in the step that
+/// made it whether or not its record was kept: what work owed under a key
+/// since rotated from is written under. Apart from `identity_rotation`,
+/// whose records are verified as they are read and served to clients.
+const SCHEMA_V43: &str = "
+CREATE TABLE friend_moved (
+  \"from\" TEXT PRIMARY KEY,
+  \"to\"   TEXT NOT NULL
+);
+";
+
 /// The bans this server asked linked servers for (`docs/server-link.md`
 /// §7.5), which its operator lists and lifts: a ban of another server's
 /// user is that server's row, and this is only the record of asking.
@@ -1934,6 +1945,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 42 {
         steps.push_str(SCHEMA_V42);
+    }
+    if version < 43 {
+        steps.push_str(SCHEMA_V43);
     }
     steps.push_str(&format!(
         "\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;\n"
@@ -4753,6 +4767,17 @@ mod tests {
         hxd_core::relationships::conformance::run(&|| Box::new(SqliteStore::in_memory().unwrap()));
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn the_moves_say_where_the_rows_are(
+            steps in proptest::collection::vec(proptest::prelude::any::<u32>(), 1..40)
+        ) {
+            let s = SqliteStore::in_memory().unwrap();
+            hxd_core::relationships::conformance::the_moves_say_where_the_rows_are(&s, &steps);
+        }
+    }
+
     /// Every row of every table, for a test to tell whether an act
     /// changed any of it.
     fn dump(store: &SqliteStore) -> String {
@@ -5450,6 +5475,54 @@ mod tests {
             ids,
             "the same rows, by the unique key"
         );
+    }
+
+    /// A file from before rotations' moves were recorded keeps what it
+    /// owed, and records a move from then on, across a reopen.
+    #[test]
+    fn version_forty_two_migrates_into_a_store_that_records_moves() {
+        use hxd_core::relationships::{Cause, Work};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let owing = [(Work::DropPresentationsOf([7; 32]), Cause::Unlinked)];
+        let id = {
+            let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+            let id = store.owe(&owing).unwrap()[0];
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE friend_moved; PRAGMA user_version = 42;")
+                .unwrap();
+            id
+        };
+        {
+            let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+            assert_eq!(store.owed().unwrap()[0].id, id, "kept what it owed");
+            assert_eq!(store.moved(&[7; 32]).unwrap(), [7; 32]);
+            RelationshipStore::rotate(&store, &[7; 32], &[8; 32]).unwrap();
+        }
+        let store = SqliteStore::open(&path, Synchronous::Normal).unwrap();
+        assert_eq!(store.moved(&[7; 32]).unwrap(), [8; 32], "the move kept");
+        let owed = store.owed().unwrap();
+        assert_eq!(owed[0].work, Work::DropPresentationsOf([8; 32]));
+    }
+
+    #[test]
+    fn moves_that_loop_are_refused_rather_than_cut_short() {
+        use hxd_core::relationships::{Cause, Work};
+        let store = SqliteStore::in_memory().unwrap();
+        let (a, b) = (fp_hex(&[1; 32]), fp_hex(&[2; 32]));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO friend_moved (\"from\", \"to\") VALUES (?1, ?2), (?2, ?1)",
+                params![a, b],
+            )
+            .unwrap();
+        assert!(store.moved(&[1; 32]).is_err());
+        assert!(store
+            .owe(&[(Work::Settle([1; 32]), Cause::Always)])
+            .is_err());
     }
 
     /// A presentation from before its taking time was kept takes the

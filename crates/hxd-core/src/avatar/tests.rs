@@ -191,6 +191,58 @@ fn a_rotated_identity_s_avatar_is_its_successor_s() {
 }
 
 #[test]
+fn a_rotation_reads_where_it_lands_and_moves_the_link_under_its_hold() {
+    let core = core();
+    let held = || core.rotations.try_lock().is_err();
+    let (mut landed, mut linked) = (None, None);
+    core.rotate_identity_linking(
+        &[4; 32],
+        &[5; 32],
+        false,
+        |to| {
+            landed = Some(held());
+            [to[0] + 1; 32]
+        },
+        |dest| {
+            linked = Some((held(), *dest));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(landed, Some(true), "where it lands, under the hold");
+    assert_eq!(
+        linked,
+        Some((true, [6; 32])),
+        "the link, there, under the hold"
+    );
+}
+
+#[test]
+fn a_rotation_overtaken_after_its_hold_moves_the_avatar_where_the_rest_went() {
+    let core =
+        core().with_relationships(Arc::new(crate::relationships::MemoryRelationships::new()));
+    let (old, _) = join(&core, Who::Guest(Some([4; 32])));
+    let meta = core.set_avatar(old, b"keyed").unwrap();
+    core.end_session(old);
+    // Parked once its hold is let go, before the avatar moves.
+    let parked = core.reconciling.arm("read");
+    std::thread::scope(|t| {
+        let first = t.spawn(|| core.rotate_identity(&[4; 32], &[5; 32]).unwrap());
+        parked.arrived();
+        let onward = t.spawn(|| core.rotate_identity(&[5; 32], &[6; 32]).unwrap());
+        let until = std::time::Instant::now() + Duration::from_millis(300);
+        while !onward.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        parked.release();
+        first.join().unwrap();
+        onward.join().unwrap();
+    });
+    let (last, _) = join(&core, Who::Guest(Some([6; 32])));
+    assert_eq!(user(&core, last).avatar, Some(meta));
+}
+
+#[test]
 fn a_clear_is_announced_once_and_clearing_nothing_is_quiet() {
     let core = core();
     let (alice, mut rx) = join(&core, Who::Account("alice"));
