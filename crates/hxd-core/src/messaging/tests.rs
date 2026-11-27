@@ -837,6 +837,34 @@ fn a_claim_that_folds_a_block_beside_a_friendship_ends_it() {
 }
 
 #[test]
+fn a_claim_settles_a_fold_in_a_row_that_names_it_alone() {
+    let s = server(&["alice", "bob"]);
+    let bob = Mailbox::login("bob");
+    let alice_fp = Mailbox::identified("alice", [7u8; 32]);
+    let now = s.core.clock.wall();
+    // Bob blocked alice's identity and asked her login: linking makes the
+    // two one row of his, and she has none.
+    s.rel.set_blocked(&bob, &alice_fp, true, now).unwrap();
+    let asked = PendingOut {
+        sent_at: now,
+        lapses_at: now + Duration::from_secs(3600),
+        delivered: true,
+        note: None,
+        offer: None,
+        upgrade: false,
+    };
+    (s.rel)
+        .set_pending_out(&bob, &Mailbox::login("alice"), Some(&asked))
+        .unwrap();
+
+    s.core.inbox_claim("alice", &[7u8; 32]);
+    let row = s.rel.relationship(&bob, &alice_fp, now).unwrap().unwrap();
+    assert!(row.blocked_at.is_some(), "the block");
+    assert_eq!(row.pending_out, None, "the request beside it");
+    assert_eq!(s.rel.owed().unwrap(), [], "the settling");
+}
+
+#[test]
 fn a_claim_restamps_what_was_sent_on_a_friendship_it_merged() {
     let s = server(&["alice", "bob"]);
     let (alice, bob) = (Mailbox::login("alice"), Mailbox::login("bob"));

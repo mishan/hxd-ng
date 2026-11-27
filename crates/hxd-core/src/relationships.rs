@@ -777,6 +777,9 @@ pub trait RelationshipStore: Send + Sync + 'static {
         now: SystemTime,
     ) -> Result<Vec<Relationship>, StoreError>;
 
+    /// Every row others have about `other`, oldest first.
+    fn naming(&self, other: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
+
     /// Others' rows whose pending out is an upgrade offer to `owner`,
     /// which no listing of requests shows it: for telling their owners
     /// what a change to `owner` takes from them.

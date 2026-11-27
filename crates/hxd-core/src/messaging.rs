@@ -1775,8 +1775,19 @@ impl Core {
             return true;
         };
         let now = self.clock.wall();
-        let rows = match store.relationships(me, now) {
-            Ok(rows) => rows,
+        // Every pair a row of either party names `me` in, each once: a
+        // fold can leave state in a row of the other's alone.
+        let others = store.relationships(me, now).and_then(|mine| {
+            let theirs = store.naming(me, now)?;
+            let mut seen = HashSet::new();
+            let others =
+                (mine.into_iter().map(|r| r.other)).chain(theirs.into_iter().map(|r| r.owner));
+            Ok(others
+                .filter(|o| seen.insert(Key::of(o)))
+                .collect::<Vec<_>>())
+        });
+        let others = match others {
+            Ok(others) => others,
             Err(e) => {
                 warn!("relationships: reading {}'s after a merge: {e}", me.login);
                 return false;
@@ -1784,10 +1795,16 @@ impl Core {
         };
         let mut whole = true;
         let mut told: Vec<(Left, [bool; 2])> = Vec::new();
-        for mine in rows {
-            let other = mine.other.clone();
-            let theirs = match store.relationship(&other, me, now) {
-                Ok(theirs) => theirs,
+        for other in others {
+            let read = store.relationship(me, &other, now).and_then(|mine| {
+                let theirs = store.relationship(&other, me, now)?;
+                Ok((
+                    mine.unwrap_or_else(|| Relationship::new(me, &other)),
+                    theirs,
+                ))
+            });
+            let (mine, theirs) = match read {
+                Ok(read) => read,
                 Err(e) => {
                     warn!(
                         "relationships: reading {}'s after a merge: {e}",

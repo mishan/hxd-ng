@@ -294,6 +294,7 @@ macro_rules! through {
 through! {
     fn relationship(owner: &Mailbox, other: &Mailbox, now: SystemTime) -> Result<Option<Relationship>, StoreError>;
     fn relationships(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
+    fn naming(other: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn pending_in(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn upgrades_to(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn roster_size(owner: &Mailbox, now: SystemTime) -> Result<usize, StoreError>;

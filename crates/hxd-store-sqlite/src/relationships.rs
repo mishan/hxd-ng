@@ -1775,6 +1775,18 @@ impl RelationshipStore for SqliteStore {
             .collect())
     }
 
+    fn naming(&self, other: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let text = format!(
+            "SELECT {COLUMNS} FROM relationship WHERE {} ORDER BY id",
+            mailbox_sql(other, "other", 1)
+        );
+        Ok(rows(&conn, &text, &[&bind(other)])?
+            .into_iter()
+            .filter_map(|(_, r)| r.as_of(now))
+            .collect())
+    }
+
     fn upgrades_to(
         &self,
         owner: &Mailbox,
