@@ -5466,6 +5466,52 @@ fn an_unlinks_drop_is_left_owed_while_the_link_cannot_be_read() {
 }
 
 #[test]
+fn a_rotation_moves_no_link_while_an_unlinks_drop_cannot_be_judged() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts.clone(), Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    // An unlink's drop owed, and moot once she links again.
+    s.fail.fail_next("write");
+    unlinked(&s, &accounts, &fp(&alice));
+    s.fail.fail_next("owed");
+    let relinked = s.core.friendships_linking(&fp(&alice), || {
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+        Ok::<_, StoreError>(())
+    });
+    assert!(relinked.is_ok());
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    let moved = std::cell::Cell::new(false);
+    let link = |_: &[u8; 32]| {
+        moved.set(true);
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+        Ok(())
+    };
+
+    dir.1.store(true, Ordering::SeqCst);
+    let rotated =
+        (s.core).rotate_identity_linking(&fp(&alice), &fp(&successor), false, |to| *to, link);
+    assert!(rotated.is_err(), "refused");
+    assert!(!moved.get(), "the link left where it was");
+
+    dir.1.store(false, Ordering::SeqCst);
+    (s.core)
+        .rotate_identity_linking(&fp(&alice), &fp(&successor), false, |to| *to, link)
+        .unwrap();
+    assert!(moved.get());
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert!(offering(&s, &successor, &bob), "her offer, moved");
+}
+
+#[test]
 fn a_link_made_again_keeps_its_presentations_while_a_rotation_moves_its_link() {
     let (alice, bob, s, accounts) = unlinked_owing();
     let successor = person(4);

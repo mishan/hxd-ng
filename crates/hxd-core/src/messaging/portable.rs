@@ -3738,17 +3738,15 @@ impl Core {
             return Ok(());
         };
         let key = store.moved(fingerprint)?;
-        let moot = |o: &crate::relationships::Owed| {
-            o.cause == Cause::Unlinked
-                && key_of(&o.work) == Some(key)
-                && self.still_owed(&o.work, &o.cause).is_ok_and(|owed| !owed)
-        };
-        let owed: Vec<_> = store
-            .owed()?
-            .into_iter()
-            .filter(moot)
-            .map(|o| o.id)
-            .collect();
+        let mut owed = Vec::new();
+        for o in store.owed()? {
+            // One that cannot be judged is an error, not a row left owed
+            // quietly: a rotation must not move the link past it.
+            let unlinked = o.cause == Cause::Unlinked && key_of(&o.work) == Some(key);
+            if unlinked && !self.still_owed(&o.work, &o.cause)? {
+                owed.push(o.id);
+            }
+        }
         match owed.is_empty() {
             true => Ok(()),
             false => store.settle(&owed),
