@@ -872,6 +872,7 @@ fn a_claim_settles_a_fold_in_a_row_that_names_it_alone() {
         let (a, mut ra) = attach_identified(&s.core, "alice", [7u8; 32]);
         s.core.friends_roster(a).unwrap();
         drain(&mut ra);
+        let (_b, mut rb) = messenger(&s.core, "bob");
 
         s.core.inbox_claim("alice", &[7u8; 32]);
         let row = s.rel.relationship(&bob, &alice_fp, now).unwrap().unwrap();
@@ -879,6 +880,11 @@ fn a_claim_settles_a_fold_in_a_row_that_names_it_alone() {
         assert_eq!(row.pending_out, None, "the request beside it");
         assert_eq!(s.rel.owed().unwrap(), [], "the settling");
         assert_eq!(entries(&drain(&mut ra)), told, "delivered: {delivered}");
+        let blocker: Vec<_> = entries(&drain(&mut rb))
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(blocker, ["alice"], "the blocker told either way");
     }
 }
 

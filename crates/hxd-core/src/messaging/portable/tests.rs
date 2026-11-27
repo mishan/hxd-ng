@@ -950,7 +950,7 @@ fn a_blocks_withdrawal_tells_nothing_of_a_blocker() {
 }
 
 #[test]
-fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
+fn a_device_revoked_while_an_act_waits_for_the_lock_leaves_no_presentation() {
     let (alice, bob) = (person(1), person(2));
     let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
     let f = accept(&offer(&alice, 0, &bob, now() - 60), &bob, 0, now() - 60);
