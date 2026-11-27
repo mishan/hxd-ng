@@ -539,9 +539,10 @@ fn rekeyed(work: &Work, m: impl Fn(&[u8; 32]) -> [u8; 32]) -> Work {
     }
 }
 
-/// A core on the run's stores, its clock standing still at `at` but for
-/// what the run advances, as its twin's does from the same time: a lapse
-/// at a second's edge lands alike in both.
+/// A core on the run's stores, its clock and its roster's one clock
+/// standing still at `at` but for what the run advances, as its twin's
+/// does from the same time: a lapse at a second's edge lands alike in
+/// both.
 fn core_on(
     inbox: &Arc<MemoryStore>,
     dir: &Arc<Directory>,
@@ -556,6 +557,7 @@ fn core_on(
         .with_messaging(policy)
         .with_record_cache(records.clone());
     core.clock = crate::clock::Clock::frozen(at);
+    core.roster.lock().unwrap().clock = core.clock.clone();
     core
 }
 
@@ -1823,13 +1825,21 @@ impl Run {
             !ended || ends,
             "{what}: ended what it may not: {before:?} -> {after:?}"
         );
-        // An unlink takes what the unlinked identity presented, and only it.
+        // An unlink takes what the unlinked identity presented, and of the
+        // other's only a copy that, judged alone once that is gone, no
+        // longer holds.
         if matches!(step, Step::Unlink) {
             let keys = self.keys(p);
+            let left: Vec<Presentation> = (presented.iter())
+                .filter(|x| !keys.contains(&x.presenter))
+                .cloned()
+                .collect();
             let gone = before.rows.iter().filter(|r| !after.rows.contains(r));
-            for (presenter, ..) in gone {
+            for row in gone {
+                let orphaned = (left.iter().find(|x| row_of(x) == *row))
+                    .is_some_and(|x| self.judged(x, &left) == Some(false));
                 assert!(
-                    keys.contains(presenter),
+                    keys.contains(&row.0) || orphaned,
                     "{what}: took the other's evidence"
                 );
             }
@@ -2005,11 +2015,19 @@ impl Run {
         let displaced = (self.at_successor.iter())
             .any(|x| (x.presenter, x.other) == (by, to) && x.hash != p.hash);
         !displaced
-            && !self.revoked.contains(&p.device)
-            && !(listed.devices.iter()).any(|(i, d)| *d == p.device && chain.contains(i))
+            && !self.device_revoked(listed, p)
             && self.chain_linked(&p.presenter)
             && !self.unlinking.iter().any(|k| chain.contains(k))
             && self.judged(p, all) != Some(false)
+    }
+
+    /// Whether the operator revoked `p`'s presenting device, or `listed`
+    /// revokes it under a key of its presenter's chain, which a rotation
+    /// restamps.
+    fn device_revoked(&self, listed: &Published, p: &Presentation) -> bool {
+        let chain = self.chain(&p.presenter);
+        self.revoked.contains(&p.device)
+            || (listed.devices.iter()).any(|(i, d)| *d == p.device && chain.contains(i))
     }
 
     /// Each piece of work owed before a step, matched by its id, and gone
@@ -2207,10 +2225,8 @@ impl Run {
             );
         }
         for p in self.all_presentations() {
-            let revoked = self.revoked.contains(&p.device)
-                || self.listed.devices.contains(&(p.presenter, p.device));
             assert!(
-                !revoked,
+                !self.device_revoked(&self.listed, &p),
                 "converged on a revoked device's presentation: {:?} by {:?}, owing {:?}",
                 (
                     p.presenter[0],
@@ -2599,7 +2615,10 @@ fn try_attach(
 /// and a freeze doing a revocation's drop kept unwritten, and a floor's
 /// judging, and a restart after a revocation owing its drop was lifted,
 /// and a floor and a rotation while the store fails, and an offer a
-/// rotation moved under an identity revoked while it fails.
+/// rotation moved under an identity revoked while it fails, and an unlink
+/// leaving the other's copy of a friendship, taken after a reset, judged
+/// alone, and a device a registrar revoked presenting across a restart,
+/// its presentation moved by a rotation before the list is read again.
 pub const FOUND: &[&[u32]] = &[
     &[438445040, 1676041906, 1998886976, 2415919104, 2986571058],
     &[1073741952, 1073741843, 1073741988],
@@ -2669,6 +2688,8 @@ pub const FOUND: &[&[u32]] = &[
     &[
         1793414368, 3343849085, 1912602624, 3282849468, 3097260335, 3758105620,
     ],
+    &[423699607, 2813569491, 1392968753, 1265456743, 746386130],
+    &[1073741914, 1073742226, 1073741895, 1073741853],
 ];
 
 /// Sequences each reaching an act that tells from what its step left, in
@@ -2838,6 +2859,35 @@ mod tests {
                 (store as _, Box::new(move || dumped.dump()) as super::Dump)
             }, &steps);
         }
+    }
+
+    #[test]
+    fn a_runs_roster_judges_by_the_time_its_core_keeps() {
+        let run = super::Run::new(
+            std::sync::Arc::new(MemoryRelationships::new()),
+            1,
+            super::now(),
+        );
+        let (uid, _rx) = super::attach(&run.core, super::LOGINS[0], &run.people[0], 0, true);
+        let mut r = run.core.roster.lock().unwrap();
+        let sess = r.users.get_mut(&uid).unwrap();
+        let tag = sess.info.transport.identity.as_mut().unwrap();
+        tag.sealed = Some(std::sync::Arc::new(crate::sealed::SealedDevice {
+            cert: Vec::new(),
+            enc: [0; 32],
+            expires: run.core.clock.unix() + super::DAY,
+        }));
+        assert!(
+            r.sealable(&r.users[&uid]).is_some(),
+            "sealable until it expires"
+        );
+        run.core
+            .clock
+            .advance(std::time::Duration::from_secs(2 * super::DAY));
+        assert!(
+            r.sealable(&r.users[&uid]).is_none(),
+            "expired by the core's clock"
+        );
     }
 
     #[test]
