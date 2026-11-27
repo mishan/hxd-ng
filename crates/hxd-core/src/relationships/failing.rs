@@ -18,6 +18,7 @@ use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 pub(crate) const READS: &[&str] = &[
     "relationship",
     "relationships",
+    "naming",
     "pending_in",
     "upgrades_to",
     "roster_size",
@@ -359,4 +360,24 @@ through! {
     fn purge(of: &Mailbox) -> Result<usize, StoreError>;
     fn purge_count(of: &Mailbox) -> Result<usize, StoreError>;
     fn cleanup(lapsed_before: SystemTime, ledger_before: SystemTime, batch: usize) -> Result<usize, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+    use crate::relationships::MemoryRelationships;
+
+    #[test]
+    fn a_failing_write_is_counted_past_the_reads() {
+        let s = Failing::new(Arc::new(MemoryRelationships::new()));
+        let (a, b) = (Mailbox::login("a"), Mailbox::login("b"));
+        s.fail_nth_write(1);
+        assert!(s.naming(&a, UNIX_EPOCH).is_ok(), "a read");
+        assert!(
+            s.set_blocked(&a, &b, true, UNIX_EPOCH).is_err(),
+            "the write"
+        );
+    }
 }
