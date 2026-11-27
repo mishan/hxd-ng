@@ -1355,10 +1355,13 @@ impl IdentityState {
                         let fp = &fingerprint.0;
                         let (created, is_new) = self
                             .core
-                            .friendships_linking(fp, |settle| {
-                                let settle = || settle().map_err(backend);
+                            .friendships_linking(fp, || {
                                 (self.auth).find_or_create_linked(
-                                    &proposed, &card.name, fp, access, &settle,
+                                    &proposed,
+                                    &card.name,
+                                    fp,
+                                    access,
+                                    &|| Ok(()),
                                 )
                             })
                             .map_err(|e| {
@@ -1734,10 +1737,7 @@ impl IdentityState {
         }
         let outcome = self
             .core
-            .friendships_linking(&fp.0, |settle| {
-                let settle = || settle().map_err(backend);
-                self.auth.link_identity(login, &fp.0, &settle)
-            })
+            .friendships_linking(&fp.0, || self.auth.link_identity(login, &fp.0, &|| Ok(())))
             .map_err(|e| {
                 tracing::warn!("link write failed: {e}");
                 AuthRefused::Backend

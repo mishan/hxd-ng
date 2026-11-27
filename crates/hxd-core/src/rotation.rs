@@ -67,6 +67,10 @@ impl Core {
             None => *to,
         };
         let to = &dest;
+        // What an unlink of a key linked again still owes is moot, settled
+        // before the link moves on: once it has, the key reads as unlinked
+        // until the rows follow, and a drop between would take its offers.
+        self.settle_relinked(from)?;
         link(to)?;
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");

@@ -154,6 +154,33 @@ fn hash(friendship: &[u8]) -> [u8; 32] {
     Sha256::digest(friendship).into()
 }
 
+/// [`linked`], with the directory its unlinks are written to.
+fn switched(policy: MessagingPolicy, accounts: &[(&str, &[u8; 32])]) -> (Server, Switch) {
+    let dir = Switch(Arc::new(std::sync::Mutex::new(
+        (accounts.iter())
+            .map(|(l, fp)| (Mailbox::identified(*l, **fp), messaging_bits()))
+            .collect(),
+    )));
+    let s = server_of(dir.clone(), policy, InboxPolicy::default(), None);
+    (s, dir)
+}
+
+/// The account linking `fingerprint` gives the link up, as the identity
+/// layer unlinks: written to the directory, then the unlink's work owed.
+fn unlinked(s: &Server, dir: &Switch, fingerprint: &[u8; 32]) {
+    s.core
+        .friendships_unlinking(fingerprint, |owe| {
+            owe()?;
+            for (m, _) in dir.0.lock().unwrap().iter_mut() {
+                if m.fingerprint == Some(*fingerprint) {
+                    *m = Mailbox::login(&m.login);
+                }
+            }
+            Ok::<_, StoreError>(())
+        })
+        .unwrap();
+}
+
 /// A server whose accounts link these identities.
 fn linked(accounts: &[(&str, &[u8; 32])]) -> Server {
     linked_with(policy(), accounts)
@@ -430,6 +457,43 @@ fn a_revoked_device_takes_its_presentations_with_it() {
     let (_, back) = s.core.friendships_present(a2, vec![], vec![f]).unwrap();
     assert!(ok_all(&back));
     assert!(s.rel.is_live(id));
+}
+
+#[test]
+fn a_revocation_lifted_before_its_sweep_runs_drops_nothing() {
+    let (alice, bob) = (person(1), person(2));
+    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    made(&s, &alice, &bob);
+    let revoked = Fingerprint::of(&alice.devices[0].0.public()).0;
+    let installed = || {
+        s.core
+            .revoked
+            .read()
+            .unwrap()
+            .local
+            .devices
+            .contains(&revoked)
+    };
+    // The first install's sweep waits on the hold while a second lifts it.
+    std::thread::scope(|t| {
+        let writing = s.core.friend_writes();
+        let first = t.spawn(|| {
+            s.core.set_revocations(Revocations {
+                devices: [revoked].into(),
+                ..Default::default()
+            })
+        });
+        while !installed() {
+            std::thread::yield_now();
+        }
+        s.core.set_revocations(Revocations::default());
+        drop(writing);
+        first.join().unwrap();
+    });
+    assert!(
+        (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_some(),
+        "the lifted device's presentation"
+    );
 }
 
 #[test]
@@ -847,9 +911,9 @@ fn too_many_objects_or_two_withdrawals_for_a_pair_are_malformed() {
 #[test]
 fn an_unlinked_identitys_sessions_make_no_more_friendship_acts() {
     let (alice, bob) = (person(1), person(2));
-    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (s, dir) = switched(policy(), &[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
     let (a, _, _, _, f) = made(&s, &alice, &bob);
-    s.core.friendships_unlinked(&fp(&alice));
+    unlinked(&s, &dir, &fp(&alice));
     assert!(s
         .rel
         .presentation(&fp(&alice), &fp(&bob))
@@ -976,17 +1040,27 @@ fn reset_elsewhere(
     bob: &Person,
     policy: MessagingPolicy,
 ) -> (Server, Vec<u8>, usize, [(Uid, Events); 3]) {
+    let (s, _, f, renewed, sessions) = reset_elsewhere_switched(alice, bob, policy);
+    (s, f, renewed, sessions)
+}
+
+/// [`reset_elsewhere`], with the directory its unlinks are written to.
+fn reset_elsewhere_switched(
+    alice: &mut Person,
+    bob: &Person,
+    policy: MessagingPolicy,
+) -> (Server, Switch, Vec<u8>, usize, [(Uid, Events); 3]) {
     let carol = fp(&person(5));
     let accounts = [("alice", &fp(alice)), ("bob", &fp(bob)), ("carol", &carol)];
     let (_, _, _, _, f) = made(&linked(&accounts), alice, bob);
-    let s = linked_with(policy, &accounts);
+    let (s, dir) = switched(policy, &accounts);
     reset(&s, alice, 1, s.core.clock().unix() - 1);
     let renewed = enroll(alice, 1);
     let a = device(&s.core, "alice", alice, renewed);
     let b = device(&s.core, "bob", bob, 0);
     let plain = session(&s.core, "bob", bob, 1, false, u64::MAX);
     s.core.friends_roster(plain.0).unwrap();
-    (s, f, renewed, [a, b, plain])
+    (s, dir, f, renewed, [a, b, plain])
 }
 
 /// Whether `target` is shown a request from `sender`.
@@ -1742,7 +1816,7 @@ fn an_unlink_takes_the_presentation_only_it_held() {
     let accounts = [("alice", &fp(&alice)), ("bob", &fp(&bob))];
     let s1 = linked(&accounts);
     let (_, _, _, _, f) = made(&s1, &alice, &bob);
-    let s = linked(&accounts);
+    let (s, dir) = switched(policy(), &accounts);
     let t = s.core.clock().unix();
     let (a, _) = device(&s.core, "alice", &alice, 1);
     s.core
@@ -1754,7 +1828,7 @@ fn an_unlink_takes_the_presentation_only_it_held() {
     let (_, held) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
     assert!(ok_all(&held));
 
-    s.core.friendships_unlinked(&fp(&alice));
+    unlinked(&s, &dir, &fp(&alice));
     assert!(s
         .rel
         .presentation(&fp(&bob), &fp(&alice))
@@ -2181,10 +2255,10 @@ fn presented_both_ways(s: &Server, alice: &Person, bob: &Person) -> bool {
 #[test]
 fn an_unlink_ends_the_friendship_its_presentations_held() {
     let (alice, bob) = (person(1), person(2));
-    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (s, dir) = switched(policy(), &[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
     let (_, _, _, mut rb, _) = made(&s, &alice, &bob);
     let id = friendship_of(&s, &alice, &bob).unwrap();
-    s.core.friendships_unlinked(&fp(&alice));
+    unlinked(&s, &dir, &fp(&alice));
     assert_eq!(friendship_of(&s, &alice, &bob), None);
     assert_eq!(
         told(&mut rb),
@@ -4299,7 +4373,7 @@ fn an_offer_goes_with_its_device_its_identity_and_its_link() {
     };
     for how in ["device", "identity", "unlink"] {
         let (alice, bob) = (person(1), person(2));
-        let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+        let (s, dir) = switched(policy(), &[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
         let (a, _) = device(&s.core, "alice", &alice, 0);
         let (b, _) = device(&s.core, "bob", &bob, 0);
         let o = offer(&alice, 0, &bob, now());
@@ -4314,7 +4388,7 @@ fn an_offer_goes_with_its_device_its_identity_and_its_link() {
                 identities: [fp(&alice)].into(),
                 ..Default::default()
             })),
-            _ => s.core.friendships_unlinked(&fp(&alice)),
+            _ => unlinked(&s, &dir, &fp(&alice)),
         }
         assert_eq!(shown(&s, b), None, "{how}");
     }
@@ -4403,21 +4477,19 @@ fn an_upgrade_that_cannot_be_read_is_answered_as_a_failure() {
 }
 
 #[test]
-fn an_upgrade_an_unlink_takes_is_told_to_both() {
+fn an_upgrade_an_unlink_takes_is_told_to_the_friend() {
     let (mut alice, bob) = (person(1), person(2));
-    let (s, f, renewed, [(a, mut ra), (b, mut rb), _]) =
-        reset_elsewhere(&mut alice, &bob, policy());
+    let (s, dir, f, renewed, [(a, mut ra), (b, mut rb), _]) =
+        reset_elsewhere_switched(&mut alice, &bob, policy());
     s.core.friendships_present(b, vec![], vec![f]).unwrap();
     let o = offer(&alice, renewed, &bob, now());
     s.core.friend_ask(a, "bob", None, Some(o)).unwrap();
     drain(&mut ra);
     drain(&mut rb);
-    s.core.friendships_unlinked(&fp(&alice));
-    assert_eq!(
-        told(&mut ra),
-        [("bob".into(), RosterState::Removed, vec![], None)],
-        "the sender's pending out gone"
-    );
+    unlinked(&s, &dir, &fp(&alice));
+    // Her account no longer links the key the request was under, and her
+    // sessions that proved it make friendship acts no more.
+    assert_eq!(told(&mut ra), [], "the sender's account");
     assert_eq!(
         told(&mut rb),
         [("alice".into(), RosterState::Removed, vec![], None)],
@@ -5015,9 +5087,8 @@ fn unlinked_owing() -> (Person, Person, Server, Switch) {
         .presentation(&fp(&alice), &fp(&bob))
         .unwrap()
         .is_some());
-    accounts.0.lock().unwrap()[0].0 = Mailbox::login("alice");
     s.fail.fail_next("presentations");
-    s.core.friendships_unlinked(&fp(&alice));
+    unlinked(&s, &accounts, &fp(&alice));
     assert_eq!(s.fail.failed(), Some("presentations"));
     (alice, bob, s, accounts)
 }
@@ -5248,36 +5319,63 @@ fn a_rotation_waits_for_work_that_could_not_be_owed() {
     assert!(!offering(&s, &successor, &bob), "dropped where it went");
 }
 
+/// The server dies inside `link`, before `friendships_linking` returns:
+/// the core started again on its stores, its next tick run.
+fn linking_cut_short(s: &Server, accounts: &Switch, fp: &[u8; 32], link: impl FnOnce()) {
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.core
+            .friendships_linking(fp, || -> Result<(), StoreError> {
+                link();
+                panic!("the server dies");
+            })
+    }));
+    assert!(crashed.is_err());
+    started_again(s, accounts).owed_tick();
+}
+
 #[test]
-fn a_link_that_fails_after_settling_owes_the_unlinks_work_again() {
-    let (alice, _, s, accounts) = unlinked_owing();
-    let unlinked = || {
-        let owed = s.rel.owed().unwrap().into_iter();
-        let ours = owed.filter(|o| o.work == Work::DropPresentationsOf(fp(&alice)));
-        ours.map(|o| o.cause).collect::<Vec<_>>()
-    };
-    assert_eq!(unlinked(), [Cause::Unlinked]);
-    let refused = s.core.friendships_linking(&fp(&alice), |settle| {
-        settle()?;
-        Err::<(), _>(StoreError("the link's write".into()))
-    });
-    assert!(refused.is_err());
-    assert_eq!(unlinked(), [Cause::Unlinked], "owed again");
-    let linked = s.core.friendships_linking(&fp(&alice), |settle| {
-        settle()?;
+fn an_unlinks_drops_outlive_a_link_cut_short_before_its_write() {
+    let (alice, bob, s, accounts) = unlinked_owing();
+    linking_cut_short(&s, &accounts, &fp(&alice), || {});
+    assert!(
+        (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_none(),
+        "dropped for the identity no account links"
+    );
+}
+
+#[test]
+fn an_unlinks_drops_are_moot_once_a_link_is_written_however_its_call_ends() {
+    let (alice, bob, s, accounts) = unlinked_owing();
+    let relink = || accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+    linking_cut_short(&s, &accounts, &fp(&alice), relink);
+    let kept = || (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_some();
+    assert!(kept(), "the linked identity's presentation");
+    assert_eq!(s.rel.owed().unwrap(), [], "settled unrun");
+
+    // And where settling them fails, a tick finds them moot.
+    let (alice, bob, s, accounts) = unlinked_owing();
+    s.fail.fail_next("owed");
+    let linked = s.core.friendships_linking(&fp(&alice), || {
         accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
         Ok::<_, StoreError>(())
     });
     assert!(linked.is_ok());
-    assert!(unlinked().is_empty(), "settled by the link");
+    assert_eq!(s.fail.failed(), Some("owed"));
+    assert_ne!(s.rel.owed().unwrap(), [], "left owed");
+    s.core.clock().advance(std::time::Duration::from_secs(61));
+    s.core.owed_tick();
+    assert!(
+        (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_some(),
+        "kept"
+    );
+    assert_eq!(s.rel.owed().unwrap(), [], "settled unrun");
 }
 
 #[test]
 fn a_link_made_again_keeps_its_presentations_while_a_rotation_moves_its_link() {
     let (alice, bob, s, accounts) = unlinked_owing();
     let successor = person(4);
-    let linked = s.core.friendships_linking(&fp(&alice), |settle| {
-        settle()?;
+    let linked = s.core.friendships_linking(&fp(&alice), || {
         accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
         Ok::<_, StoreError>(())
     });

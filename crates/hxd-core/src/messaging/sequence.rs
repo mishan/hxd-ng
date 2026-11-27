@@ -916,12 +916,7 @@ impl Run {
                 if !self.unlink(p, &fp) {
                     return false;
                 }
-                // One refused is made again with nothing failing, as the
-                // account's next login would.
-                if !self.relink(p, &fp) {
-                    self.fail.fail_nth(0);
-                    assert!(self.relink(p, &fp), "a link made again");
-                }
+                self.relink(p, &fp);
                 self.sign_in_again(p);
                 true
             }
@@ -1334,18 +1329,14 @@ impl Run {
     }
 
     /// `p`'s account links `fp` again, as the identity layer links, and
-    /// claims what its login kept: refused where what an unlink owes cannot
-    /// be settled.
-    fn relink(&self, p: usize, fp: &[u8; 32]) -> bool {
-        let linked = self.core.friendships_linking(fp, |settle| {
-            settle()?;
+    /// claims what its login kept.
+    fn relink(&self, p: usize, fp: &[u8; 32]) {
+        let linked = self.core.friendships_linking(fp, || {
             self.dir.0.lock().unwrap()[p].0.fingerprint = Some(*fp);
             Ok::<_, crate::inbox::StoreError>(())
         });
-        if linked.is_ok() {
-            self.core.inbox_claim(LOGINS[p], fp);
-        }
-        linked.is_ok()
+        assert!(linked.is_ok(), "the link is written");
+        self.core.inbox_claim(LOGINS[p], fp);
     }
 
     /// Where entries were told from a read after their step, since last

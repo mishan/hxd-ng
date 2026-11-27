@@ -214,13 +214,11 @@ pub(crate) struct OwedIndex {
     purges: Vec<(Mailbox, Backoff)>,
 }
 
-/// A piece of work a sweep does: one an install names now, or one owed;
-/// `checked`, held to what owes it before it is done.
+/// A piece of work a sweep does: one an install names now, or one owed.
 struct Item {
     work: Work,
     cause: Cause,
     id: Option<OwedId>,
-    checked: bool,
 }
 
 /// A drop of offers read for a sweep's write, each pair it names with
@@ -3141,7 +3139,7 @@ impl Core {
     }
 
     /// [`Self::sweep_offers`] under the hold the caller took, with the rows
-    /// `first` names, just owed, tried as `fresh` is: by what owes them.
+    /// `first` names, just owed, due whatever their backoff.
     fn sweep_held(&self, writing: &FriendWrites<'_>, fresh: Vec<(Work, Cause)>, first: &[OwedId]) {
         let Some(store) = self.relationships.as_ref() else {
             return;
@@ -3184,10 +3182,8 @@ impl Core {
             work,
             cause,
             id: None,
-            checked: false,
         });
         let owed = rows.into_iter().map(|o| Item {
-            checked: !first.contains(&o.id),
             id: Some(o.id),
             work: o.work,
             cause: o.cause,
@@ -3196,7 +3192,10 @@ impl Core {
         // Drops of offers next to each other in one write.
         let mut batch: Vec<Batched> = Vec::new();
         for item in fresh.chain(owed) {
-            if item.checked && !self.still_owed(&item.work, &item.cause) {
+            // Named now or owed, each is held to what owes it here, under
+            // the hold: a list replaced or a key linked since it was named
+            // makes it moot.
+            if !self.still_owed(&item.work, &item.cause) {
                 settled.extend(item.id);
                 continue;
             }
@@ -3669,13 +3668,6 @@ impl Core {
         out
     }
 
-    /// [`Self::friendships_unlinking`] of an unlink that can refuse nothing.
-    #[cfg(test)]
-    pub(crate) fn friendships_unlinked(&self, fingerprint: &[u8; 32]) {
-        let unlinked = self.friendships_unlinking(fingerprint, |owe| owe());
-        logged("owing an unlink's drops", unlinked);
-    }
-
     /// What `fingerprint`'s unlink owes, first tried: `first`.
     fn unlinked_held(&self, writing: &FriendWrites<'_>, fingerprint: &[u8; 32], first: &[OwedId]) {
         if self.relationships.is_none() {
@@ -3696,42 +3688,48 @@ impl Core {
         self.sweep_held(writing, Vec::new(), first);
     }
 
-    /// An account links `fingerprint` through `link`, which calls the
-    /// settle it is handed once its refusals are past and before it
-    /// writes, and refuses the link should that fail: what an unlink of
-    /// the key still owes is moot, settled under the hold, so no link
-    /// stands beside work that would drop the account's offers. Should
-    /// `link` fail after settling, what it settled is owed again.
+    /// An account links `fingerprint` through `link`, under the hold every
+    /// drop is dispatched under, so none falls between its write and the
+    /// key's first read as linked. What an unlink of the key still owes is
+    /// left owed: each drop reads the link again before it runs, so a link
+    /// written makes them moot whatever becomes of this call, and they are
+    /// settled here only to save a tick the work.
     pub fn friendships_linking<T, E>(
         &self,
         fingerprint: &[u8; 32],
-        link: impl FnOnce(&dyn Fn() -> Result<(), StoreError>) -> Result<T, E>,
+        link: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
         let _writing = self.friend_writes();
-        let settled = RefCell::new(Vec::new());
-        let out = link(&|| {
-            let Some(store) = self.relationships.as_ref() else {
-                return Ok(());
-            };
-            // Owed where its rows are, which a rotation may have moved.
-            let key = store.moved(fingerprint)?;
-            let unlinked = |o: &crate::relationships::Owed| {
-                o.cause == Cause::Unlinked && key_of(&o.work) == Some(key)
-            };
-            let owed: Vec<_> = store.owed()?.into_iter().filter(unlinked).collect();
-            if !owed.is_empty() {
-                store.settle(&owed.iter().map(|o| o.id).collect::<Vec<_>>())?;
-            }
-            *settled.borrow_mut() = owed;
-            Ok(())
-        });
-        if out.is_err() {
-            let now = self.clock.unix();
-            for o in settled.into_inner() {
-                self.owe_failed(o.work, o.cause, Backoff::after(None, now));
-            }
-        }
+        let out = link();
+        logged(
+            "settling an unlink's moot drops",
+            self.settle_relinked(fingerprint),
+        );
         out
+    }
+
+    /// The drops an unlink of `fingerprint` owes, where its rows are now,
+    /// settled where the key reads as linked.
+    pub(crate) fn settle_relinked(&self, fingerprint: &[u8; 32]) -> Result<(), StoreError> {
+        let Some(store) = self.relationships.as_ref() else {
+            return Ok(());
+        };
+        let key = store.moved(fingerprint)?;
+        let moot = |o: &crate::relationships::Owed| {
+            o.cause == Cause::Unlinked
+                && key_of(&o.work) == Some(key)
+                && !self.still_owed(&o.work, &o.cause)
+        };
+        let owed: Vec<_> = store
+            .owed()?
+            .into_iter()
+            .filter(moot)
+            .map(|o| o.id)
+            .collect();
+        match owed.is_empty() {
+            true => Ok(()),
+            false => store.settle(&owed),
+        }
     }
 
     /// What `fingerprint` presented, dropped, each pair as one step.
