@@ -15,6 +15,7 @@ pub mod frame;
 mod friends;
 mod hope;
 pub mod media;
+mod names;
 pub mod news;
 pub mod peer;
 pub mod reactions;

@@ -14,6 +14,7 @@
 //! what 1.2 and 1.5 clients expect. Deviations are deliberate and
 //! commented.
 
+use crate::names::Names;
 use crate::peer::peer_answer;
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
@@ -991,60 +992,44 @@ fn notify(tx: &Tx, ty: u32, chunks: Vec<(u16, Vec<u8>)>) {
     enqueue(tx, Outbound::Notify { ty, chunks });
 }
 
-/// The domain is UTF-8; this edge speaks the connection's encoding. On
-/// Mac Roman egress is lossy (`?` for unmappable), and either way a nick
-/// is cut to the wire's 31 bytes *after* conversion, at a character
-/// boundary.
-pub(crate) fn wire_nick(enc: TextEncoding, nick: &str) -> Vec<u8> {
-    enc.encode_capped(nick, 31)
+/// What a user's name is shown with on this wire: for a ghost of a
+/// server whose operator tags them, `@tag`, and for a bot, the bot suffix.
+fn marker(names: &Names, u: &UserInfo) -> Option<String> {
+    tag(u).or_else(|| names.bot_marker().filter(|_| u.bot).map(str::to_owned))
 }
 
-/// What a user's name is shown with: for a ghost of a server whose
-/// operator tags them, `@tag`, and for a bot, `[server] bot_suffix`.
-fn name_suffix(u: &UserInfo, bot_suffix: &str) -> Option<String> {
-    match u.remote.as_ref().filter(|r| r.tagged) {
-        Some(r) => Some(format!("@{}", r.home_tag)),
-        None => (u.bot && !bot_suffix.is_empty()).then(|| bot_suffix.to_owned()),
-    }
+/// A tagged ghost's `@tag`: the part of its marker its lines are logged
+/// with.
+fn tag(u: &UserInfo) -> Option<String> {
+    u.remote
+        .as_ref()
+        .filter(|r| r.tagged)
+        .map(|r| format!("@{}", r.home_tag))
 }
 
-/// The name a user is shown under: its own, then its [`name_suffix`].
-/// The name is cut to leave the suffix room, never the suffix, which is
-/// what says where the user is from or that it is a bot.
-fn shown_nick(enc: TextEncoding, u: &UserInfo, bot_suffix: &str) -> Vec<u8> {
-    suffixed(enc, &u.nick, name_suffix(u, bot_suffix).as_deref())
+/// The name a user is shown under: its own, then its [`marker`].
+fn shown_nick(names: &Names, u: &UserInfo) -> Vec<u8> {
+    names.nick(&u.nick, marker(names, u).as_deref())
 }
 
-/// [`shown_nick`] of a name and the tag it is shown with, if any: what a
-/// history entry names a line's sender by, live or paged back, so the two
-/// agree with each other.
-fn shown_name(enc: TextEncoding, nick: &str, tag: Option<&str>) -> Vec<u8> {
-    suffixed(enc, nick, tag.map(|tag| format!("@{tag}")).as_deref())
-}
-
-fn suffixed(enc: TextEncoding, nick: &str, suffix: Option<&str>) -> Vec<u8> {
-    match suffix {
-        Some(suffix) => {
-            let suffix = enc.encode_capped(suffix, 31);
-            let mut name = enc.encode_capped(nick, 31 - suffix.len());
-            name.extend(suffix);
-            name
-        }
-        None => wire_nick(enc, nick),
+/// A logged line's sender as a history entry names it, live or paged
+/// back, so the two agree: a tagged ghost is logged under its shown name,
+/// which is cut here as the user list cuts it, and a bot under its own.
+fn line_name(names: &Names, nick: &str, home: Option<&hxd_core::history::LineHome>) -> Vec<u8> {
+    let tagged = home.filter(|h| h.tagged).and_then(|h| {
+        let name = nick.strip_suffix(&format!("@{}", h.tag))?;
+        Some((name, h.tag.as_str()))
+    });
+    match tagged {
+        Some((name, tag)) => names.nick(name, Some(&format!("@{tag}"))),
+        None => names.nick(nick, None),
     }
 }
 
 /// A name as public chat's 13-column name field shows it: cut short so
-/// the field never cuts its [`name_suffix`].
-fn chat_nick(enc: TextEncoding, u: &UserInfo, bot_suffix: &str) -> Vec<u8> {
-    match name_suffix(u, bot_suffix) {
-        Some(suffix) => {
-            let keep = 13usize.saturating_sub(suffix.chars().count());
-            let name: String = u.nick.chars().take(keep).collect();
-            suffixed(enc, &name, Some(&suffix))
-        }
-        None => wire_nick(enc, &u.nick),
-    }
+/// the field never cuts its [`marker`].
+fn chat_nick(names: &Names, u: &UserInfo) -> Vec<u8> {
+    names.column(&u.nick, marker(names, u).as_deref())
 }
 
 /// A chat subject, cut to the wire's 255 bytes after conversion. Inbound
@@ -1112,7 +1097,7 @@ fn userlist_payload(
     enc: TextEncoding,
     nick_colors: bool,
 ) -> Vec<u8> {
-    let nick = shown_nick(enc, u, ctx.core.bot_suffix());
+    let nick = shown_nick(&Names::of(enc, &ctx.core), u);
     let mut v = Vec::with_capacity(12 + nick.len());
     v.extend_from_slice(&u.uid.to_be_bytes());
     v.extend_from_slice(&u.icon.to_be_bytes());
@@ -1138,7 +1123,7 @@ fn user_change_chunks(
             tag::COLOUR,
             wire_color(u, ctx.cfg.mark_cleartext).to_be_bytes().to_vec(),
         ),
-        (tag::NAME, shown_nick(enc, u, ctx.core.bot_suffix())),
+        (tag::NAME, shown_nick(&Names::of(enc, &ctx.core), u)),
     ];
     if nick_colors {
         chunks.push((tag::COLOR, nick_color(u).to_vec()));
@@ -1366,7 +1351,8 @@ fn format_chat(enc: TextEncoding, nick: &[u8], text: &[u8], style: u16) -> Vec<u
 /// allow, and the store keeps the body as it was said. The split is on
 /// the encoded bytes so nothing the encoding produces can slip through
 /// either.
-fn format_replay(line: &hxd_core::LogLine, enc: TextEncoding) -> Vec<u8> {
+fn format_replay(line: &hxd_core::LogLine, names: &Names) -> Vec<u8> {
+    let enc = names.enc;
     let seconds = line
         .at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1380,10 +1366,10 @@ fn format_replay(line: &hxd_core::LogLine, enc: TextEncoding) -> Vec<u8> {
     let mut attribution = enc.encode(&prefix);
     if line.flags.contains(hxd_core::LineFlags::ACTION) {
         attribution.extend_from_slice(b"*** ");
-        attribution.extend(wire_nick(enc, &line.from_nick));
+        attribution.extend(line_name(names, &line.from_nick, line.home.as_ref()));
         attribution.push(b' ');
     } else {
-        attribution.extend(wire_nick(enc, &line.from_nick));
+        attribution.extend(line_name(names, &line.from_nick, line.home.as_ref()));
         attribution.extend_from_slice(b":  ");
     }
     let body = enc.encode(&line.text);
@@ -2975,7 +2961,7 @@ fn system_msg(tx: &Tx, ctx: &ServerCtx, sess: &Session, text: &str) {
         vec![
             (tag::UID, uid.to_be_bytes().to_vec()),
             (tag::BODY, sess.enc.body(text)),
-            (tag::NAME, wire_nick(sess.enc, &nick)),
+            (tag::NAME, Names::of(sess.enc, &ctx.core).nick(&nick, None)),
         ],
     );
 }
@@ -3154,9 +3140,9 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             // 13-column name alignment stays correct for its renderer.
             // An emote has no name column to fit.
             let nick = if style == 1 {
-                shown_nick(sess.enc, &from, ctx.core.bot_suffix())
+                shown_nick(&Names::of(sess.enc, &ctx.core), &from)
             } else {
-                chat_nick(sess.enc, &from, ctx.core.bot_suffix())
+                chat_nick(&Names::of(sess.enc, &ctx.core), &from)
             };
             let line = format_chat(sess.enc, &nick, &sess.enc.encode(&text), style);
             let mut chunks = vec![(tag::BODY, line)];
@@ -3215,7 +3201,7 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                         },
                     icon: from.icon,
                     // As it is logged, so as a 700 entry names it.
-                    nick: &shown_nick(sess.enc, &from, ""),
+                    nick: &Names::of(sess.enc, &ctx.core).nick(&from.nick, tag(&from).as_deref()),
                     text,
                     subfields: &subfields,
                 };
@@ -3265,7 +3251,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                 vec![
                     (tag::CHAT_ID, cid.to_be_bytes().to_vec()),
                     (tag::UID, from.to_be_bytes().to_vec()),
-                    (tag::NAME, wire_nick(sess.enc, &from_nick)),
+                    (
+                        tag::NAME,
+                        Names::of(sess.enc, &ctx.core).nick(&from_nick, None),
+                    ),
                 ],
             );
         }
@@ -3283,7 +3272,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                             .to_be_bytes()
                             .to_vec(),
                     ),
-                    (tag::NAME, wire_nick(sess.enc, &user.nick)),
+                    (
+                        tag::NAME,
+                        shown_nick(&Names::of(sess.enc, &ctx.core), &user),
+                    ),
                 ]
                 .into_iter()
                 .chain(
@@ -3352,7 +3344,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
             let mut chunks = vec![
                 (tag::UID, uid.to_be_bytes().to_vec()),
                 (tag::BODY, sess.enc.body(&body)),
-                (tag::NAME, wire_nick(sess.enc, &from_nick)),
+                (
+                    tag::NAME,
+                    Names::of(sess.enc, &ctx.core).nick(&from_nick, None),
+                ),
             ];
             if let Some(media) = media.filter(|_| sess.caps.has(cap::INLINE_MEDIA)) {
                 chunks.extend(media::companion_chunks(&media));
@@ -3398,7 +3393,10 @@ async fn deliver_event(tx: &Tx, ctx: &ServerCtx, sess: &mut Session, ev: Event) 
                 vec![
                     (tag::UID, from.to_be_bytes().to_vec()),
                     (tag::BODY, sess.enc.body(&text)),
-                    (tag::NAME, wire_nick(sess.enc, &from_nick)),
+                    (
+                        tag::NAME,
+                        Names::of(sess.enc, &ctx.core).nick(&from_nick, None),
+                    ),
                 ],
             );
         }
@@ -4022,7 +4020,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                                 push(
                                     tx,
                                     hdr::CHAT,
-                                    vec![(tag::BODY, format_replay(&line, sess.enc))],
+                                    vec![(
+                                        tag::BODY,
+                                        format_replay(&line, &Names::of(sess.enc, &ctx.core)),
+                                    )],
                                 );
                             }
                         }
@@ -5101,16 +5102,14 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     let media_reader = sess.has_cap(cap::INLINE_MEDIA);
                     for line in page.lines {
                         let deleted = line.flags.contains(hxd_core::LineFlags::DELETED);
-                        // A tagged ghost is logged under its shown name,
-                        // which is cut here as the user list cuts it.
-                        let tagged = line.home.as_ref().filter(|h| h.tagged).and_then(|h| {
-                            let name = line.from_nick.strip_suffix(&format!("@{}", h.tag))?;
-                            Some((name, h.tag.as_str()))
-                        });
-                        let nick = match tagged {
-                            _ if deleted => Vec::new(),
-                            Some((name, tag)) => shown_name(sess.enc, name, Some(tag)),
-                            None => shown_name(sess.enc, &line.from_nick, None),
+                        let nick = if deleted {
+                            Vec::new()
+                        } else {
+                            line_name(
+                                &Names::of(sess.enc, &ctx.core),
+                                &line.from_nick,
+                                line.home.as_ref(),
+                            )
                         };
                         // A line that was only an image reads as "[image]"
                         // to a reader that cannot show one, rather than as
@@ -5247,7 +5246,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                                 .to_be_bytes()
                                 .to_vec(),
                         ),
-                        (tag::NAME, wire_nick(sess.enc, &me.nick)),
+                        (tag::NAME, shown_nick(&Names::of(sess.enc, &ctx.core), &me)),
                     ],
                 ),
                 Err(e) => reply_error(tx, f.trans, err_text(e)),
@@ -5451,6 +5450,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
             if let Some(info) = ctx.core.peer_user_info(target) {
                 let (tx, trans, enc) = (tx.clone(), f.trans, sess.enc);
                 let pronouns = ctx.core.pronouns_enabled();
+                let name = Names::of(enc, &ctx.core).nick(&info.nick, None);
                 tokio::spawn(async move {
                     let mut text = format!("  server: {}\r", info.home);
                     if let Ok(more) = peer_answer(info.answer).await {
@@ -5468,10 +5468,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                     reply(
                         &tx,
                         trans,
-                        vec![
-                            (tag::BODY, enc.body(&text)),
-                            (tag::NAME, wire_nick(enc, &info.nick)),
-                        ],
+                        vec![(tag::BODY, enc.body(&text)), (tag::NAME, name)],
                     );
                 });
                 return;
@@ -5498,9 +5495,10 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 Some(p) if sess.enc.keeps(&p) => format!("pronouns: {p}\r"),
                 _ => String::new(),
             };
+            let names = Names::of(sess.enc, &ctx.core);
             let info = format!(
                 "    name: {}\r{pronouns}   login: {}\r{roles} address: {}\r  online: {}h {}m {}s\r",
-                d.info.nick,
+                sess.enc.decode(&shown_nick(&names, &d.info)),
                 if full { d.login.as_str() } else { "-" },
                 d.addr
                     .filter(|_| full)
@@ -5514,7 +5512,7 @@ async fn dispatch(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &mut Session) {
                 f.trans,
                 vec![
                     (tag::BODY, sess.enc.body(&info)),
-                    (tag::NAME, wire_nick(sess.enc, &d.info.nick)),
+                    (tag::NAME, shown_nick(&names, &d.info)),
                 ],
             );
         }
@@ -6457,7 +6455,7 @@ async fn get_reactions(f: &Frame, tx: &Tx, ctx: &ServerCtx, sess: &Session) {
     })
     .await;
     match answered {
-        Some(Ok(answers)) => match reactions::asked(&answers, sess.enc) {
+        Some(Ok(answers)) => match reactions::asked(&answers, &Names::of(sess.enc, &ctx.core)) {
             Some(chunks) => reply(tx, f.trans, chunks),
             None => refuse_with_reason(
                 tx,
@@ -6571,23 +6569,25 @@ mod tests {
             pronouns: None,
             bot: !ghost,
         };
+        let names = |enc| Names::with(enc, " [bot]", false);
         let long = "\u{3042}".repeat(12);
         for (ghost, suffix, cut) in [
             (true, "@bb", &b"roberta-lo@bb"[..]),
             (false, " [bot]", b"roberta [bot]"),
         ] {
             for enc in [TextEncoding::MacRoman, TextEncoding::Utf8] {
-                let chat = |nick| chat_nick(enc, &user(nick, ghost), " [bot]");
+                let chat = |nick| chat_nick(&names(enc), &user(nick, ghost));
                 assert!(chat(&long).ends_with(suffix.as_bytes()), "{enc:?}");
                 assert_eq!(chat("roberta-long"), cut);
-                let listed = shown_nick(enc, &user(&"r".repeat(31), ghost), " [bot]");
+                let listed = shown_nick(&names(enc), &user(&"r".repeat(31), ghost));
                 assert_eq!(listed.len(), 31);
                 assert!(listed.ends_with(suffix.as_bytes()));
             }
         }
         let bot = user("roberta", false);
-        assert_eq!(shown_nick(TextEncoding::Utf8, &bot, ""), b"roberta");
-        assert_eq!(chat_nick(TextEncoding::Utf8, &bot, ""), b"roberta");
+        let off = Names::with(TextEncoding::Utf8, "", false);
+        assert_eq!(shown_nick(&off, &bot), b"roberta");
+        assert_eq!(chat_nick(&off, &bot), b"roberta");
     }
 
     #[test]

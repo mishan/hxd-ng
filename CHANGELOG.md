@@ -359,6 +359,22 @@ as AGENTS.md's "Releasing" describes it.
   logs in as a bot yet. A build from before this release refuses an
   account file with `bot`.
 
+- Where `[server] bot_suffix` or `[link] show_tags` is set, a classic
+  client is sent no name ending in what that wire marks a bot or a
+  linked server's user with, unless the server put it there: the
+  suffix, or an `@` and up to 8 printable ASCII characters. It is judged
+  on what the client is sent, written in its encoding, cut to the user
+  list's 31 bytes or chat's 13 columns, without the characters that draw
+  as nothing (which such a server leaves out of every name, joiners
+  included), and taken off: `alice [bot]` and `alice@bb` read as `alice`
+  in the user list, user info, chat, history, private chats and
+  messages, reactions and news authors, and a name of nothing else as
+  `?`. The lines the server writes about users, mhxd's kick notices
+  among them, are as before. The nick itself, and what an ng client is
+  shown, are as the user set them; a server with neither key set shows
+  every name as before. `bot_suffix` is now printable ASCII, beginning
+  with a space or a mark.
+
 ### Fixed
 
 - Friendship work a failed store call left owed (dropping an unlinked

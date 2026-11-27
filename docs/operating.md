@@ -864,7 +864,10 @@ classic = true          # false: ng clients only, nothing of the classic
 coalesce = false        # true: a person's sessions are one user (Persons)
 pronouns = true         # false: no pronouns shown or set (system-account.md §3)
 bot_suffix = ""         # appended to a bot account's nick on the classic wire
-                        # alone, at most 12 bytes: " [bot]", say
+                        # alone; "" for none. Up to 12 printable ASCII
+                        # characters, not all spaces and no ?, beginning
+                        # with a space or a mark (" [bot]"); no other name
+                        # that wire sends ends in it
 name = "hxd-ng"
 version = 254           # 0 mimics a pre-1.5 server
 login_timeout = 10
@@ -2006,7 +2009,9 @@ tag = "hx"                         # required; 1-8 printable ASCII, unique in th
 key = "link-server.key"            # generated on first start; the log shows
                                    # its public key to give your peers
 show_tags = false                  # on to put the home server's tag in every
-                                   # other server's user's name
+                                   # other server's user's name; no other
+                                   # name the classic wire sends then ends in
+                                   # an @tag
 max_ghosts = 2000                  # other servers' users shown, across links
 grace = 60                         # seconds an interrupted link's users stay
 
