@@ -2316,9 +2316,10 @@ mod tests {
         assert!(auth.account_by_key(&fp).unwrap().is_some());
         let path = td.path().join("alice.toml");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // A user file modes do not bind, as root, cannot be shown it.
+        // As root, file modes do not bind, so this cannot be shown.
         if std::fs::read(&path).is_ok() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skipped: file modes do not bind this user");
             return;
         }
         // A server started on the directory, as one reading it after the
@@ -2359,6 +2360,7 @@ mod tests {
         let looked = std::fs::metadata(td.path().join("alice.toml"));
         if looked.is_ok() {
             mode(0o700).unwrap();
+            eprintln!("skipped: file modes do not bind this user");
             return;
         }
         let fresh = FileAuth::new(td.path());
