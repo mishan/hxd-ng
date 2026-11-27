@@ -3630,17 +3630,21 @@ fn build_identity(
 pub fn check_config(config: &Config) -> Result<(), String> {
     let suffix = &config.server.bot_suffix;
     // Printable ASCII, so it reads the same in Mac Roman and UTF-8 and can
-    // be told in a name as it is sent; and apart from the name, so a
-    // user's own nick is never one with it.
+    // be told in a name as it is sent, and no `?`, which Mac Roman writes
+    // for what it cannot; and apart from the name, so a user's own nick
+    // is never one with it.
     if !suffix.is_empty()
         && (suffix.len() > BOT_SUFFIX_MAX
-            || !suffix.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+            || !suffix
+                .bytes()
+                .all(|b| b == b' ' || (b.is_ascii_graphic() && b != b'?'))
             || suffix.trim().is_empty()
             || suffix.starts_with(|c: char| c.is_ascii_alphanumeric()))
     {
         return Err(format!(
             "[server] bot_suffix is up to {BOT_SUFFIX_MAX} printable ASCII characters, \
-             beginning with a space or a mark rather than a letter or digit: \" [bot]\", say"
+             not all spaces and with no `?`, beginning with a space or a mark rather than a \
+             letter or digit: \" [bot]\", say"
         ));
     }
     if !config.server.classic {
@@ -6772,6 +6776,8 @@ sync = "full"
             ("bot", false),
             ("   ", false),
             (" \u{2699}", false),
+            ("?", false),
+            (" [?]", false),
             (" bot\\t", true),
             (" bot\t", false),
         ] {

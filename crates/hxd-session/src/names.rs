@@ -70,13 +70,21 @@ impl<'a> Names<'a> {
     }
 
     /// A name as it is set into text shared by every connection, as the
-    /// 1.2 news view: judged as UTF-8 writes it.
+    /// 1.2 news view: judged as UTF-8 writes it and as Mac Roman does,
+    /// whose `?` for what it cannot write could make a tag. Mac Roman
+    /// writes one byte a character, so the two are cut at the same place.
     pub(crate) fn text(&self, nick: &str) -> String {
-        Names {
-            enc: TextEncoding::Utf8,
-            ..*self
+        let as_in = |enc| Names { enc, ..*self };
+        let mut name = as_in(TextEncoding::Utf8).shown(nick, usize::MAX, usize::MAX);
+        loop {
+            let mac = TextEncoding::MacRoman;
+            let seen = as_in(mac).unmarked(&mac.decode(&mac.encode(&name)));
+            let kept: String = name.chars().take(seen.chars().count()).collect();
+            if kept == name {
+                return name;
+            }
+            name = as_in(TextEncoding::Utf8).shown(&kept, usize::MAX, usize::MAX);
         }
-        .shown(nick, usize::MAX, usize::MAX)
     }
 
     /// The same in public chat's 13 columns, so the column never cuts the
@@ -141,7 +149,9 @@ impl<'a> Names<'a> {
             }
             if self.tags {
                 if let Some((rest, tag)) = name.rsplit_once('@') {
-                    if (1..=8).contains(&tag.len()) && tag.bytes().all(|b| b.is_ascii_graphic()) {
+                    // A bare `@` too, which a marker after it would make
+                    // a tag of.
+                    if tag.len() <= 8 && tag.bytes().all(|b| b.is_ascii_graphic()) {
                         name = rest.trim_end();
                     }
                 }
@@ -231,6 +241,8 @@ mod tests {
             ("alice@bb", false, "alice@bb", "alice@bb"),
             ("alice@bb", true, "alice", "alice"),
             ("a@b@c", true, "a", "a"),
+            ("alice@", true, "alice", "alice"),
+            ("alice@", false, "alice@", "alice@"),
             ("alice@ninechars", true, "alice@ninechars", "alice"),
             ("abcd@bbbbbbbbZZ", true, "abcd@bbbbbbbbZZ", "abcd"),
             ("[bot]", false, "?", "?"),
@@ -248,6 +260,13 @@ mod tests {
         // Mac Roman writes what it cannot as `?`, which a tag may be.
         let n = names(TextEncoding::MacRoman, true);
         assert_eq!(n.nick("alice@\u{4e2d}\u{6587}", None), b"alice");
+        // Text every connection shares is judged as Mac Roman writes it
+        // too, and cut where both agree.
+        let n = names(TextEncoding::Utf8, true);
+        assert_eq!(n.text("Bob@\u{4e2d}"), "Bob");
+        assert_eq!(n.text("Bob \u{4e2d}"), "Bob \u{4e2d}");
+        // A bot named with a bare `@` reads as no tag beside the marker.
+        assert_eq!(n.nick("Alice@", Some("!")), b"Alice!");
         // The server's own marker is kept whole, after the name's own
         // is taken off.
         let n = names(TextEncoding::Utf8, true);
