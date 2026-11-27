@@ -372,8 +372,11 @@ as AGENTS.md's "Releasing" describes it.
   It ends only once a fresh read shows it done, or its revocation
   lifted, or its identity linked again, and every drop, owed or new,
   reads what owes it again just before it runs, so a revocation
-  replaced or an identity linked since drops nothing. An unlink whose
-  drops cannot be recorded is refused. A claim's or a rotation's
+  replaced or an identity linked since drops nothing, while one whose
+  cause cannot be read is left owed. An account file that cannot be
+  read now fails a lookup of an identity's account, where it used to be
+  taken for one linking no key; a malformed one is still skipped and
+  logged. An unlink whose drops cannot be recorded is refused. A claim's or a rotation's
   settling of a block or a request left beside a friendship, in a row
   of either party's, which a failed write used to leave for good, is
   retried until done. A rotation to a key no account here links owes
