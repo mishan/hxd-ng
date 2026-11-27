@@ -1489,6 +1489,8 @@ impl FileAuth {
                 continue;
             }
             let stamp = match entry.metadata() {
+                // Nothing an account can be kept in.
+                Ok(m) if !m.is_file() => continue,
                 Ok(m) => FileStamp {
                     len: m.len(),
                     modified: m.modified().ok(),
@@ -1535,7 +1537,7 @@ impl FileAuth {
                 .is_ok()
         });
         let now = SystemTime::now();
-        let mut found = None;
+        let (mut found, mut unread) = (None, None);
         for (login, stamp) in entries {
             // A stamp that hasn't settled is used for this lookup and
             // then forgotten. Remembering it was the same bug the
@@ -1560,9 +1562,12 @@ impl FileAuth {
                         tracing::warn!("{login}.toml: {e}; skipped in fingerprint lookup");
                         None
                     }
-                    // A file that could not be read may carry the key: the
-                    // lookup cannot say that none does.
-                    Err(e) => return Err(e),
+                    // A file that could not be read may carry the key: past
+                    // the scan, the lookup cannot say that none does.
+                    Err(e) => {
+                        unread.get_or_insert(e);
+                        continue;
+                    }
                 };
                 if settled {
                     index.insert(login.clone(), (stamp, fp.clone()));
@@ -1580,7 +1585,10 @@ impl FileAuth {
         if let Some(login) = &found {
             by_fp.insert(want, login.clone());
         }
-        Ok(found)
+        match (found, unread) {
+            (None, Some(e)) => Err(e),
+            (found, _) => Ok(found),
+        }
     }
 
     /// Does `login`'s file still carry the fingerprint `want`? One
@@ -2297,7 +2305,7 @@ mod tests {
         write(td.path(), "alice.toml", &linked);
         assert!(auth.account_by_key(&fp).unwrap().is_some());
         let path = td.path().join("alice.toml");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert!(
             std::fs::read(&path).is_err(),
             "the file must be unreadable to this user"
@@ -2307,6 +2315,17 @@ mod tests {
         let fresh = FileAuth::new(td.path());
         assert!(fresh.account_by_key(&fp).is_err(), "not answered as nobody");
         assert!(fresh.find_by_fingerprint(&fp).is_err());
+        // A key another file carries is found all the same.
+        let other = [7u8; 32];
+        let bob = format!(
+            "[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(other)
+        );
+        write(td.path(), "bob.toml", &bob);
+        assert_eq!(
+            fresh.find_by_fingerprint(&other).unwrap().unwrap().login,
+            "bob"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 

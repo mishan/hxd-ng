@@ -373,10 +373,12 @@ as AGENTS.md's "Releasing" describes it.
   lifted, or its identity linked again, and every drop, owed or new,
   reads what owes it again just before it runs, so a revocation
   replaced or an identity linked since drops nothing, while one whose
-  cause cannot be read is left owed. An account file that cannot be
-  read now fails a lookup of an identity's account, where it used to be
-  taken for one linking no key; a malformed one is still skipped and
-  logged. An unlink whose drops cannot be recorded is refused. A claim's or a rotation's
+  cause cannot be read is left owed. An account file the server cannot
+  read now fails a lookup of an identity's account that no other file
+  answers, where it used to be taken for one linking no key: while such
+  a file is there, a login or a link by an identity no readable file
+  links is refused. A malformed file is still skipped and logged. An
+  unlink whose drops cannot be recorded is refused. A claim's or a rotation's
   settling of a block or a request left beside a friendship, in a row
   of either party's, which a failed write used to leave for good, is
   retried until done. A rotation to a key no account here links owes
