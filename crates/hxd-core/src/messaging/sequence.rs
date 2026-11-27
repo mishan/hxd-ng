@@ -1042,9 +1042,10 @@ impl Run {
             }
             Step::Relink => {
                 let fp = me.fp();
-                if self.linked(p) || !self.relink(p, &fp) {
+                if self.linked(p) {
                     return false;
                 }
+                self.relink(p, &fp);
                 self.sign_in_again(p);
                 true
             }
@@ -1227,7 +1228,10 @@ impl Run {
         let owed = self.store.owed().unwrap();
         if owed.iter().any(|o| o.work == Work::Settle(to)) {
             let writing = self.core.friend_writes();
-            let successor = Mailbox::identified(LOGINS[p], to);
+            // As the core settles it: under the account's login where one
+            // links the successor.
+            let login = if self.linked(p) { LOGINS[p] } else { "" };
+            let successor = Mailbox::identified(login, to);
             assert!(self.core.after_merge(&writing, &successor), "settled");
         }
         self.settled(p, from, to, &before);
