@@ -2591,7 +2591,14 @@ impl IdentityState {
             return;
         };
         let lands = |to: &[u8; 32]| anchors.lands(&Fingerprint(*to)).0;
+        // Under the core's hold, so a rotation it lands through recorded
+        // since the caller listed what to finish is seen too: until that
+        // one is done, the key it lands on may be owed to its account.
         let link = |dest: &[u8; 32]| {
+            if anchors.waits(&to) {
+                let e = "it lands through a rotation that has not finished";
+                return Err(hxd_core::StoreError(e.into()));
+            }
             let account = self
                 .auth
                 .rotate_link(&from.0, dest)
@@ -2620,22 +2627,23 @@ impl IdentityState {
     }
 }
 
-/// [`Anchors::lands`], over the rotations as they are held. `rotate` takes
+/// The keys a rotation to `to` passes on its way to where it lands
+/// ([`Anchors::lands`]), over the rotations as they are held. `rotate` takes
 /// no rotation into a key that has rotated away, so the walk ends; the
-/// bound is for a file an older build left. Answers where it ends,
-/// and how many rotations on it passes.
-fn lands(
+/// bound is for a file an older build left. `to` first, where it lands
+/// last.
+fn walk(
     rotated: &HashMap<Fingerprint, (Fingerprint, Moves)>,
     to: &Fingerprint,
-) -> (Fingerprint, usize) {
-    let mut at = (*to, 0);
-    while at.1 < rotated.len() {
-        match rotated.get(&at.0) {
-            Some((next, m)) if *m != Moves::Held => at = (*next, at.1 + 1),
+) -> Vec<Fingerprint> {
+    let mut keys = vec![*to];
+    while keys.len() <= rotated.len() {
+        match rotated.get(&keys[keys.len() - 1]) {
+            Some((next, m)) if *m != Moves::Held => keys.push(*next),
             _ => break,
         }
     }
-    at
+    keys
 }
 
 /// Insert a device record, evicting expired entries and then the
@@ -2996,17 +3004,17 @@ impl Anchors {
 
     /// The rotations whose moves have not all landed, landing on `to`
     /// ([`Anchors::lands`]) or, with `None`, anywhere: the nearest the key
-    /// it lands on first, so a successor already linked to an account
-    /// moves on with it before a predecessor's arrives.
+    /// it lands on first, so one pass finishes a chain, a rotation landing
+    /// through another waiting for it ([`Anchors::waits`]).
     fn unmoved(&self, to: Option<&Fingerprint>) -> Vec<(Fingerprint, Fingerprint)> {
         let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending: Vec<_> = rotated
             .iter()
             .filter(|(_, (_, m))| *m == Moves::Pending)
-            .map(|(from, (t, _))| (lands(&rotated, t), (*from, *t)))
-            .filter(|((end, _), _)| to.is_none_or(|to| end == to))
+            .map(|(from, (t, _))| (walk(&rotated, t), (*from, *t)))
+            .filter(|(keys, _)| to.is_none_or(|to| keys.last() == Some(to)))
             .collect();
-        pending.sort_by_key(|((_, hops), _)| *hops);
+        pending.sort_by_key(|(keys, _)| keys.len());
         pending.into_iter().map(|(_, p)| p).collect()
     }
 
@@ -3014,7 +3022,18 @@ impl Anchors {
     /// to, followed through every rotation that moves (a held one moves
     /// nothing), whether or not its moves have landed yet.
     fn lands(&self, to: &Fingerprint) -> Fingerprint {
-        lands(&self.rotated.lock().unwrap_or_else(|e| e.into_inner()), to).0
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        *walk(&rotated, to).last().expect("the walk starts at `to`")
+    }
+
+    /// Whether a rotation to `to` lands through one whose moves have not
+    /// all landed.
+    fn waits(&self, to: &Fingerprint) -> bool {
+        let rotated = self.rotated.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = walk(&rotated, to);
+        keys[..keys.len() - 1]
+            .iter()
+            .any(|k| rotated.get(k).is_some_and(|(_, m)| *m == Moves::Pending))
     }
 
     /// Note that `from`'s rotation has moved all it moves.
@@ -3235,6 +3254,8 @@ mod tests {
         accounts: Mutex<HashMap<String, Account>>,
         /// Fails each `rotate_link` while set.
         fail_link: std::sync::atomic::AtomicBool,
+        /// Fails `rotate_link` for the account of this login.
+        fail_link_of: Mutex<Option<String>>,
         /// The next `rotate_link` says it arrived and waits to be let go.
         park_link: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
@@ -3318,6 +3339,12 @@ mod tests {
                 return Err(AuthError::Backend("unwritable".into()));
             }
             let mut a = self.accounts.lock().unwrap();
+            let failing = self.fail_link_of.lock().unwrap();
+            if a.values().any(|x| {
+                x.identity.fingerprint == Some(*from) && failing.as_ref() == Some(&x.login)
+            }) {
+                return Err(AuthError::Backend("unwritable".into()));
+            }
             if a.values().any(|x| x.identity.fingerprint == Some(*to)) {
                 return Ok(None);
             }
@@ -4065,7 +4092,7 @@ mod tests {
             Fingerprint([3; 32]),
         );
         let (st, auth, _) = rotating_state(
-            &[a, b, c],
+            &[a, b],
             true,
             IdentityConfig::default(),
             dir.path().join("successors"),
@@ -4077,7 +4104,10 @@ mod tests {
             let first = t.spawn(|| st.finish_rotation(a, b, false));
             arrived.recv_timeout(Duration::from_secs(10)).unwrap();
             // B's rotation on, while A's link waits to move.
-            let onward = t.spawn(|| st.finish_rotation(b, c, false));
+            let onward = t.spawn(|| {
+                assert!(st.anchors.as_ref().unwrap().rotate(&b, &c, None));
+                st.finish_rotation(b, c, false)
+            });
             let until = Instant::now() + Duration::from_millis(300);
             while !onward.is_finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(5));
@@ -4088,6 +4118,43 @@ mod tests {
         });
         assert_eq!(linked(&auth), Some(c.0), "the link at the end of the chain");
         assert!(st.anchors.as_ref().unwrap().unmoved(None).is_empty());
+    }
+
+    #[test]
+    fn a_rotation_recorded_after_a_pass_listed_its_own_holds_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let [a, b, c] = [1u8, 2, 3].map(|s| Fingerprint([s; 32]));
+        let (st, auth, _) = rotating_state(
+            &[a, b],
+            true,
+            IdentityConfig::default(),
+            dir.path().join("s"),
+        );
+        let mut theirs = account("yan", false);
+        theirs.identity.fingerprint = Some(b.0);
+        auth.accounts.lock().unwrap().insert("yan".into(), theirs);
+        let anchors = st.anchors.as_ref().unwrap();
+        let listed = anchors.unmoved(None);
+        assert_eq!(listed, [(a, b)]);
+        // As `accept_rotation(B, C)` records it, before its own finish.
+        assert!(anchors.rotate(&b, &c, None));
+        for (from, to) in listed {
+            st.finish_rotation(from, to, false);
+        }
+        let of = |login| auth.lookup(login).unwrap().identity.fingerprint;
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "alice's does not take C ahead of yan's"
+        );
+        st.finish_rotations(None, false);
+        assert!(anchors.unmoved(None).is_empty(), "both done");
+        assert_eq!(of("yan"), Some(c.0));
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "the key yan's account holds is not taken"
+        );
     }
 
     #[test]
@@ -4207,35 +4274,30 @@ mod tests {
     }
 
     #[test]
-    fn a_successor_linked_to_an_account_keeps_it_through_its_own_rotation_on() {
-        // The retries' order is a hash map's, so run it often enough that
-        // both orders come up.
-        for _ in 0..16 {
-            let dir = tempfile::tempdir().unwrap();
-            let keys = [1u8, 2, 3].map(|s| Fingerprint([s; 32]));
-            let [a, b, c] = keys;
-            let (st, auth, _) =
-                rotating_state(&keys, true, IdentityConfig::default(), dir.path().join("s"));
-            let mut theirs = account("yan", false);
-            theirs.identity.fingerprint = Some(b.0);
-            auth.accounts.lock().unwrap().insert("yan".into(), theirs);
-            let fail = |on| {
-                auth.fail_link
-                    .store(on, std::sync::atomic::Ordering::Relaxed)
-            };
-            fail(true);
-            st.finish_rotation(a, b, false);
-            st.finish_rotation(b, c, false);
-            fail(false);
-            st.finish_rotations(None, false);
-            let of = |login| auth.lookup(login).unwrap().identity.fingerprint;
-            assert_eq!(of("yan"), Some(c.0), "the successor's account moves on");
-            assert_eq!(
-                of("alice"),
-                Some(a.0),
-                "the predecessor's is left for the operator"
-            );
-        }
+    fn a_rotation_through_one_that_did_not_finish_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = [1u8, 2, 3].map(|s| Fingerprint([s; 32]));
+        let [a, b, c] = keys;
+        let (st, auth, _) =
+            rotating_state(&keys, true, IdentityConfig::default(), dir.path().join("s"));
+        let mut theirs = account("yan", false);
+        theirs.identity.fingerprint = Some(b.0);
+        auth.accounts.lock().unwrap().insert("yan".into(), theirs);
+        let anchors = st.anchors.as_ref().unwrap();
+        let of = |login| auth.lookup(login).unwrap().identity.fingerprint;
+        *auth.fail_link_of.lock().unwrap() = Some("yan".into());
+        st.finish_rotations(None, false);
+        assert_eq!(of("alice"), Some(a.0), "alice's waits for yan's");
+        assert_eq!(anchors.unmoved(None).len(), 2, "neither done");
+        *auth.fail_link_of.lock().unwrap() = None;
+        st.finish_rotations(None, false);
+        assert!(anchors.unmoved(None).is_empty(), "both done");
+        assert_eq!(of("yan"), Some(c.0));
+        assert_eq!(
+            of("alice"),
+            Some(a.0),
+            "the key yan's account holds is not taken"
+        );
     }
 
     #[test]

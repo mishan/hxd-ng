@@ -229,7 +229,10 @@ then it is retried at each start and at every admission of the key
 it lands on, which is refused, as a server error, until they have: the
 key reached by following the successor's rotations on, whether or not
 their moves have landed, a held one aside. The moves go to that key
-too, and retries nearest it go first. Once
+too, and retries nearest it go first. One that lands through a
+rotation whose moves have not all landed, as read under the hold its
+moves are made under, waits and is tried again later, so it never
+takes a key owed to the account of the rotation it passes. Once
 the account link has moved, every session still keyed by the
 predecessor ends, a password login to the account included, so nothing
 is written under the old key afterwards. A key it lands on already
