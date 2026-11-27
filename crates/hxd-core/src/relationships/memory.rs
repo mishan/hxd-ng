@@ -1219,6 +1219,16 @@ impl RelationshipStore for MemoryRelationships {
             .collect())
     }
 
+    fn naming(&self, other: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .rows
+            .iter()
+            .filter(|r| is(&r.rel.other, other))
+            .filter_map(|r| r.rel.clone().as_of(floor(now)))
+            .collect())
+    }
+
     fn upgrades_to(
         &self,
         owner: &Mailbox,

@@ -656,20 +656,30 @@ impl FileAuth {
     }
 
     fn load(&self, login: &str) -> Result<AccountFile, AuthError> {
+        self.load_or_malformed(login)?
+    }
+
+    /// [`Self::load`], a file that was read but does not parse answered
+    /// apart, inside, from one that could not be read at all.
+    fn load_or_malformed(&self, login: &str) -> Result<Result<AccountFile, AuthError>, AuthError> {
         if self.is_reserved(login) {
             return Err(AuthError::NoSuchAccount);
         }
         let path = self.dir.join(format!("{login}.toml"));
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                AuthError::NoSuchAccount
-            } else {
-                AuthError::Backend(format!("{}: {e}", path.display()))
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AuthError::NoSuchAccount)
             }
-        })?;
-        let parsed: AccountFile = toml::from_str(&text)
-            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))?;
-        Ok(parsed)
+            // Bytes that are not text are a file's own fault, as a
+            // parse is.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(Err(AuthError::Backend(format!("{}: {e}", path.display()))))
+            }
+            Err(e) => return Err(AuthError::Backend(format!("{}: {e}", path.display()))),
+        };
+        Ok(toml::from_str(&text)
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display()))))
     }
 }
 
@@ -1478,13 +1488,24 @@ impl FileAuth {
             if !valid_login(login) {
                 continue;
             }
-            let stamp = match entry.metadata() {
+            // Through a symlink, as the read is.
+            let stamp = match std::fs::metadata(entry.path()) {
+                // Nothing an account can be kept in.
+                Ok(m) if !m.is_file() => continue,
                 Ok(m) => FileStamp {
                     len: m.len(),
                     modified: m.modified().ok(),
                 },
-                // Vanished mid-scan; the read below would say the same.
-                Err(_) => continue,
+                // Vanished mid-scan, or a link to nothing; the read below
+                // would say the same.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Listed with no stamp, which never settles, so the file is
+                // read, and a read that fails says so, rather than the
+                // account going unseen.
+                Err(_) => FileStamp {
+                    len: 0,
+                    modified: None,
+                },
             };
             out.push((login.to_owned(), stamp));
         }
@@ -1525,7 +1546,7 @@ impl FileAuth {
                 .is_ok()
         });
         let now = SystemTime::now();
-        let mut found = None;
+        let (mut found, mut unread) = (None, None);
         for (login, stamp) in entries {
             // A stamp that hasn't settled is used for this lookup and
             // then forgotten. Remembering it was the same bug the
@@ -1541,14 +1562,20 @@ impl FileAuth {
             let fp = if cached {
                 index.get(&login).and_then(|(_, fp)| fp.clone())
             } else {
-                let fp = match self.load(&login) {
-                    Ok(f) => f.identity.fingerprint,
+                let fp = match self.load_or_malformed(&login) {
+                    Ok(Ok(f)) => f.identity.fingerprint,
                     Err(AuthError::NoSuchAccount) => continue,
                     // One malformed account file used to make every
                     // identity auth on the server a 500. Skip it, loudly.
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("{login}.toml: {e}; skipped in fingerprint lookup");
                         None
+                    }
+                    // A file that could not be read may carry the key: past
+                    // the scan, the lookup cannot say that none does.
+                    Err(e) => {
+                        unread.get_or_insert(e);
+                        continue;
                     }
                 };
                 if settled {
@@ -1567,7 +1594,10 @@ impl FileAuth {
         if let Some(login) = &found {
             by_fp.insert(want, login.clone());
         }
-        Ok(found)
+        match (found, unread) {
+            (None, Some(e)) => Err(e),
+            (found, _) => Ok(found),
+        }
     }
 
     /// Does `login`'s file still carry the fingerprint `want`? One
@@ -1737,8 +1767,13 @@ impl AccountDirectory for FileAuth {
         Some(keyed(account))
     }
 
-    fn account_by_key(&self, fingerprint: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
-        Some(keyed(self.find_by_fingerprint(fingerprint).ok()??))
+    fn account_by_key(
+        &self,
+        fingerprint: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, hxd_core::inbox::StoreError> {
+        let found = self.find_by_fingerprint(fingerprint);
+        let found = found.map_err(|e| hxd_core::inbox::StoreError(e.to_string()))?;
+        Ok(found.map(keyed))
     }
 }
 
@@ -2265,6 +2300,73 @@ mod tests {
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
             "alice"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_leaves_a_key_lookup_unanswered() {
+        use std::os::unix::fs::PermissionsExt;
+        let (td, auth) = backend();
+        let fp = [6u8; 32];
+        let linked = format!(
+            "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &linked);
+        assert!(auth.account_by_key(&fp).unwrap().is_some());
+        let path = td.path().join("alice.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // As root, file modes do not bind, so this cannot be shown.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("skipped: file modes do not bind this user");
+            return;
+        }
+        // A server started on the directory, as one reading it after the
+        // file was rewritten would.
+        let fresh = FileAuth::new(td.path());
+        assert!(fresh.account_by_key(&fp).is_err(), "not answered as nobody");
+        assert!(fresh.find_by_fingerprint(&fp).is_err());
+        // A key another file carries is found all the same.
+        let other = [7u8; 32];
+        let bob = format!(
+            "[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(other)
+        );
+        write(td.path(), "bob.toml", &bob);
+        assert_eq!(
+            fresh.find_by_fingerprint(&other).unwrap().unwrap().login,
+            "bob"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_account_file_that_cannot_be_looked_at_leaves_a_key_lookup_unanswered() {
+        use std::os::unix::fs::PermissionsExt;
+        let (td, auth) = backend();
+        let fp = [6u8; 32];
+        let linked = format!(
+            "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &linked);
+        assert!(auth.account_by_key(&fp).unwrap().is_some());
+        // The directory listed but not searched: each entry's metadata
+        // fails, and not as missing.
+        let mode = |m| std::fs::set_permissions(td.path(), std::fs::Permissions::from_mode(m));
+        mode(0o400).unwrap();
+        let looked = std::fs::metadata(td.path().join("alice.toml"));
+        if looked.is_ok() {
+            mode(0o700).unwrap();
+            eprintln!("skipped: file modes do not bind this user");
+            return;
+        }
+        let fresh = FileAuth::new(td.path());
+        let answer = fresh.account_by_key(&fp);
+        mode(0o700).unwrap();
+        assert!(answer.is_err(), "not answered as nobody: {answer:?}");
     }
 
     #[test]
@@ -2835,11 +2937,11 @@ mod tests {
         let (mailbox, access) = auth.account("Boss").expect("by login");
         assert_eq!(mailbox, Mailbox::identified("boss", fp));
         assert!(access.has(bit::CANT_BE_DISCONNECTED));
-        let (mailbox, access) = auth.account_by_key(&fp).expect("by key");
+        let (mailbox, access) = auth.account_by_key(&fp).unwrap().expect("by key");
         assert_eq!(mailbox.login, "boss");
         assert!(access.has(bit::CANT_BE_DISCONNECTED));
         assert_eq!(auth.account("nobody"), None);
-        assert_eq!(auth.account_by_key(&[0x4fu8; 32]), None);
+        assert_eq!(auth.account_by_key(&[0x4fu8; 32]).unwrap(), None);
     }
 
     #[test]

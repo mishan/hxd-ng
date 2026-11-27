@@ -31,11 +31,15 @@ impl AccountDirectory for Directory {
             .map(|(_, a)| *a)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
-        self.0
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
+        Ok(self
+            .0
             .iter()
             .find(|(m, _)| m.fingerprint == Some(*fp))
-            .cloned()
+            .cloned())
     }
 }
 
@@ -834,6 +838,54 @@ fn a_claim_that_folds_a_block_beside_a_friendship_ends_it() {
     assert_eq!(state_of(&s.core, b, "alice"), None);
     let row = s.rel.relationship(&alice_fp, &bob, now).unwrap().unwrap();
     assert!(row.blocked_at.is_some() && row.friendship.is_none());
+}
+
+#[test]
+fn a_claim_settles_a_fold_in_a_row_that_names_it_alone() {
+    // Told as a block is: a request alice was never shown goes unsaid.
+    for (delivered, told) in [
+        (true, vec![("bob".into(), RosterState::Removed)]),
+        (false, vec![]),
+    ] {
+        let alice_fp = Mailbox::identified("alice", [7u8; 32]);
+        let dir = Directory(vec![
+            (alice_fp.clone(), messaging_bits()),
+            (Mailbox::login("bob"), messaging_bits()),
+        ]);
+        let s = server_of(dir, policy(), InboxPolicy::default(), None);
+        let bob = Mailbox::login("bob");
+        let now = s.core.clock.wall();
+        // Bob blocked alice's identity and asked her login: linking makes
+        // the two one row of his, and she has none.
+        s.rel.set_blocked(&bob, &alice_fp, true, now).unwrap();
+        let asked = PendingOut {
+            sent_at: now,
+            lapses_at: now + Duration::from_secs(3600),
+            delivered,
+            note: None,
+            offer: None,
+            upgrade: false,
+        };
+        (s.rel)
+            .set_pending_out(&bob, &Mailbox::login("alice"), Some(&asked))
+            .unwrap();
+        let (a, mut ra) = attach_identified(&s.core, "alice", [7u8; 32]);
+        s.core.friends_roster(a).unwrap();
+        drain(&mut ra);
+        let (_b, mut rb) = messenger(&s.core, "bob");
+
+        s.core.inbox_claim("alice", &[7u8; 32]);
+        let row = s.rel.relationship(&bob, &alice_fp, now).unwrap().unwrap();
+        assert!(row.blocked_at.is_some(), "the block");
+        assert_eq!(row.pending_out, None, "the request beside it");
+        assert_eq!(s.rel.owed().unwrap(), [], "the settling");
+        assert_eq!(entries(&drain(&mut ra)), told, "delivered: {delivered}");
+        let blocker: Vec<_> = entries(&drain(&mut rb))
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(blocker, ["alice"], "the blocker told either way");
+    }
 }
 
 #[test]
@@ -2515,8 +2567,21 @@ fn a_rotation_overtaken_by_its_successors_moves_everything_to_one_key() {
     assert_eq!(s.inbox.pending_count(&at_last).unwrap(), 1, "the mail");
     let row = s.rel.relationship(&bob, &at_last, now).unwrap();
     assert!(row.is_some_and(|r| r.friendship.is_some()), "the row");
-    let works: Vec<_> = s.rel.owed().unwrap().into_iter().map(|o| o.work).collect();
-    assert_eq!(works, [Work::DropOffersNaming(last)], "the owed work");
+    let mut owed: Vec<_> = (s.rel.owed().unwrap().into_iter())
+        .map(|o| (o.work, o.cause))
+        .collect();
+    owed.sort_by_key(|o| format!("{o:?}"));
+    // What the rotation onto a key no account linked yet owed went with
+    // the rest.
+    assert_eq!(
+        owed,
+        [
+            (Work::DropOffersNaming(last), Cause::Always),
+            (Work::DropOffersNaming(last), Cause::Unlinked),
+            (Work::DropPresentationsOf(last), Cause::Unlinked),
+        ],
+        "the owed work"
+    );
     let (shown, stored) = friend_sets(&s, &bob);
     assert_eq!(stored, HashSet::from([Key::of(&at_last)]), "stored");
     assert_eq!(shown, stored, "the roster's friend set");
@@ -2536,7 +2601,10 @@ impl AccountDirectory for Holding {
         self.0.mailbox_access(who)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
         self.1.at("account_by_key");
         self.0.account_by_key(fp)
     }

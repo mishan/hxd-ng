@@ -18,6 +18,7 @@ use crate::inbox::{Mailbox, MessageGuid, Sent};
 pub fn run(new_store: &dyn Fn() -> Box<dyn RelationshipStore>) {
     blocks_are_directional_and_idempotent(&*new_store());
     blocks_follow_an_identity_and_are_listed(&*new_store());
+    the_rows_naming_a_mailbox_are_found_by_its_key(&*new_store());
     a_merge_leaves_one_block_per_pair(&*new_store());
     a_claim_folds_two_rows_for_one_pair_into_the_older_claim(&*new_store());
     a_rename_keeps_an_identitys_rows_and_frees_the_login(&*new_store());
@@ -889,6 +890,51 @@ fn blocks_are_directional_and_idempotent(s: &dyn RelationshipStore) {
         s.relationship(&dave, &spammer, at(5)).unwrap(),
         None,
         "{case}: a row with nothing in it is not kept"
+    );
+}
+
+fn the_rows_naming_a_mailbox_are_found_by_its_key(s: &dyn RelationshipStore) {
+    let case = "the_rows_naming_a_mailbox_are_found_by_its_key";
+    let alice = Mailbox::identified("alice", fp(1));
+    s.set_blocked(
+        &Mailbox::login("bob"),
+        &Mailbox::login("alice"),
+        true,
+        at(1),
+    )
+    .unwrap();
+    s.set_blocked(&Mailbox::login("carol"), &alice, true, at(2))
+        .unwrap();
+    s.set_blocked(&alice, &Mailbox::login("dave"), true, at(3))
+        .unwrap();
+    let owners = |m: &Mailbox| {
+        logins(
+            s.naming(m, at(4))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.owner)
+                .collect(),
+        )
+    };
+    assert_eq!(
+        owners(&alice),
+        ["carol"],
+        "{case}: by its key, never its own"
+    );
+    assert_eq!(
+        owners(&Mailbox::login("alice")),
+        ["bob"],
+        "{case}: by its login alone"
+    );
+    s.claim("alice", &fp(1), &[]).unwrap();
+    assert_eq!(
+        owners(&Mailbox::identified("", fp(1))),
+        ["bob", "carol"],
+        "{case}: whatever login it is asked by"
+    );
+    assert!(
+        owners(&Mailbox::login("alice")).is_empty(),
+        "{case}: claimed"
     );
 }
 

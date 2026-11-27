@@ -18,6 +18,7 @@ use crate::inbox::{Mailbox, MessageGuid, Sent, StoreError};
 pub(crate) const READS: &[&str] = &[
     "relationship",
     "relationships",
+    "naming",
     "pending_in",
     "upgrades_to",
     "roster_size",
@@ -53,6 +54,10 @@ enum Plan {
     Off,
     /// This many calls from now, the last fails.
     Nth(usize),
+    /// This many calls from now, the last and every one after it fail,
+    /// until the plan is set again.
+    #[cfg(test)]
+    From(usize),
     /// The call of this method this many calls of it from now fails.
     #[cfg(test)]
     Next(&'static str, usize),
@@ -150,6 +155,14 @@ impl Failing {
         *self.plan.lock().unwrap() = if n == 0 { Plan::Off } else { Plan::Nth(n) };
     }
 
+    /// The `n`-th call from now and every one after it fail, until the
+    /// plan is set again; 1 is the next.
+    #[cfg(test)]
+    pub(crate) fn fail_from(&self, n: usize) {
+        self.calls.lock().unwrap().clear();
+        *self.plan.lock().unwrap() = Plan::From(n.max(1));
+    }
+
     /// The next call of `method` fails.
     #[cfg(test)]
     pub(crate) fn fail_next(&self, method: &'static str) {
@@ -204,6 +217,16 @@ impl Failing {
             Plan::Nth(n) => {
                 *n -= 1;
                 *n == 0
+            }
+            #[cfg(test)]
+            Plan::From(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            #[cfg(test)]
+            Plan::From(_) => {
+                *self.failed.lock().unwrap() = Some(method);
+                return Err(StoreError(format!("{method} failed")));
             }
             #[cfg(test)]
             Plan::Next(m, n) if *m == method => {
@@ -272,6 +295,7 @@ macro_rules! through {
 through! {
     fn relationship(owner: &Mailbox, other: &Mailbox, now: SystemTime) -> Result<Option<Relationship>, StoreError>;
     fn relationships(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
+    fn naming(other: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn pending_in(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn upgrades_to(owner: &Mailbox, now: SystemTime) -> Result<Vec<Relationship>, StoreError>;
     fn roster_size(owner: &Mailbox, now: SystemTime) -> Result<usize, StoreError>;
@@ -336,4 +360,24 @@ through! {
     fn purge(of: &Mailbox) -> Result<usize, StoreError>;
     fn purge_count(of: &Mailbox) -> Result<usize, StoreError>;
     fn cleanup(lapsed_before: SystemTime, ledger_before: SystemTime, batch: usize) -> Result<usize, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+    use crate::relationships::MemoryRelationships;
+
+    #[test]
+    fn a_failing_write_is_counted_past_the_reads() {
+        let s = Failing::new(Arc::new(MemoryRelationships::new()));
+        let (a, b) = (Mailbox::login("a"), Mailbox::login("b"));
+        s.fail_nth_write(1);
+        assert!(s.naming(&a, UNIX_EPOCH).is_ok(), "a read");
+        assert!(
+            s.set_blocked(&a, &b, true, UNIX_EPOCH).is_err(),
+            "the write"
+        );
+    }
 }

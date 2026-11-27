@@ -197,6 +197,11 @@ async fn restart(s: Server, dir: &Path, alice: &Person, bob: &Person) -> Server 
 /// owed-work task, run every `every`.
 async fn configured(dir: &Path, alice: &Person, bob: &Person, every: Duration) -> Server {
     accounts(dir, alice, bob);
+    configured_again(dir, every).await
+}
+
+/// [`configured`] started again on what it left in `dir`.
+async fn configured_again(dir: &Path, every: Duration) -> Server {
     let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (classic, ng) = (l1.local_addr().unwrap(), l2.local_addr().unwrap());
@@ -1026,4 +1031,58 @@ async fn an_offer_an_unlink_could_not_drop_is_dropped_once_its_backoff_is_over()
     })
     .await
     .expect("the owed drop, done by the binary's tick");
+}
+
+#[tokio::test]
+async fn an_offer_an_unlink_could_not_drop_is_dropped_by_the_server_started_after() {
+    let (alice, bob) = (person(1), person(2));
+    let d = tempfile::tempdir().unwrap();
+    let s = configured(d.path(), &alice, &bob, Duration::from_millis(20)).await;
+    let mut alice0 = device(&s, &alice, 0, "alice").await;
+    let o = offer(&alice, 0, &bob, now() - 60);
+    ok(
+        &mut alice0,
+        "friend_add",
+        json!({ "login": "bob", "offer": b64(&o) }),
+    )
+    .await;
+    let db = rusqlite::Connection::open(d.path().join("hx.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let offers = || {
+        let q = "SELECT count(*) FROM relationship WHERE pending_offer IS NOT NULL";
+        db.query_row(q, [], |r| r.get::<_, i64>(0)).unwrap()
+    };
+    db.execute_batch(
+        "CREATE TRIGGER held BEFORE UPDATE OF pending_offer ON relationship
+          WHEN NEW.pending_offer IS NULL BEGIN SELECT RAISE(ABORT, 'held'); END",
+    )
+    .unwrap();
+    let t = token(&s, &alice, 1, &card(&alice, "alice"), json!({}))
+        .await
+        .unwrap();
+    let unlinked = http_as(s.ng, "/identity/unlink", b"", Some(&t)).await;
+    assert_eq!(unlinked["unlinked"], "alice", "{unlinked}");
+    drop(alice0);
+    s.stop.iter().for_each(tokio::task::AbortHandle::abort);
+    // Stopped only once no tick under way still holds the core.
+    let core = s.core.clone();
+    drop(s);
+    timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&core) > 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first server's tasks gone");
+    drop(core);
+    db.execute_batch("DROP TRIGGER held").unwrap();
+    assert_eq!(offers(), 1, "owed when the server stopped");
+    let _s = configured_again(d.path(), Duration::from_millis(20)).await;
+    timeout(Duration::from_secs(10), async {
+        while offers() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the drop owed before the restart, done by the next server's tick");
 }

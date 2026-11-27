@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use tracing::info;
 
 use crate::ending::EndedBy;
-use crate::messaging::Sweep;
 use crate::push::Unrevoked;
+use crate::relationships::{Cause, Work};
 use crate::roster::{is_buffering, Core, Event, IdentityTag, Uid, UserSession};
 
 /// A device certificate as the lists judge it: the identity that signed
@@ -311,12 +311,16 @@ impl Core {
     /// registrations newly revoked keys made (push-notifications.md
     /// §5.1): store work, so this is called off the reactor.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
+        // A list changes, and what it drops is swept, under the hold every
+        // drop is judged and written under: no sweep reads one list and
+        // writes under the next.
+        let writing = self.friend_writes();
         let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
                 .devices
                 .difference(&refused.local.devices)
-                .map(|d| (None, *d))
+                .map(|d| (None::<[u8; 32]>, *d))
                 .collect();
             let ids = list
                 .identities
@@ -335,22 +339,37 @@ impl Core {
             false => self.end_revoked(|tag| list.refuses(tag), |_| Some(EndedBy::Revoked)),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.take_revoked(keys.chain(ids).collect());
+        let taken: Vec<_> = keys.chain(ids).collect();
         if !list.is_empty() {
-            self.drop_revoked_presentations(&devices);
-            // The operator names a device alone: its offers are found by
-            // what signed them, under whichever identity.
-            let devices = devices.iter().map(|(_, device)| Sweep::Device {
-                identity: None,
-                device: *device,
-                operator: true,
+            // The operator names a device alone: what it presented and the
+            // offers it signed are found by it, under whichever identity.
+            let presented = devices.iter().map(|(_, device)| {
+                let work = Work::DropPresentedBy {
+                    under: None,
+                    device: *device,
+                };
+                (work, Cause::OperatorDevice(*device))
             });
-            let identities = identities.iter().map(|i| Sweep::Identity {
-                identity: *i,
-                operator: true,
+            let devices = devices.iter().map(|(_, device)| {
+                let work = Work::DropOffersBy {
+                    under: None,
+                    device: *device,
+                };
+                (work, Cause::OperatorDevice(*device))
             });
-            self.sweep_offers(devices.chain(identities).collect());
+            let identities = identities
+                .iter()
+                .map(|i| (Work::DropOffersNaming(*i), Cause::OperatorIdentity(*i)));
+            self.sweep_held(
+                &writing,
+                presented.chain(devices).chain(identities).collect(),
+                &[],
+            );
         }
+        // The push store's deletes touch no friendship, and wait on its
+        // own writes: not under the hold.
+        drop(writing);
+        self.take_revoked(taken);
         ended
     }
 
@@ -393,6 +412,8 @@ impl Core {
         mut list: Published,
         kept: &[[u8; 32]],
     ) -> Vec<(Uid, String)> {
+        // Under the hold, as `set_revocations` installs its list.
+        let writing = self.friend_writes();
         let (identities, devices, floors, newly): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             for id in kept {
@@ -442,22 +463,40 @@ impl Core {
             ),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.take_revoked(keys.chain(ids).chain(floors).collect());
+        let taken: Vec<_> = keys.chain(ids).chain(floors).collect();
         if !list.is_empty() {
-            self.drop_revoked_presentations(&devices);
-            let devices = devices.iter().filter_map(|(i, d)| {
-                i.map(|identity| Sweep::Device {
-                    identity: Some(identity),
-                    device: *d,
-                    operator: false,
-                })
+            let devices: Vec<_> = (devices.iter())
+                .filter_map(|(i, d)| Some((i.as_ref()?, d)))
+                .collect();
+            let cause = |identity: &[u8; 32], device: &[u8; 32]| Cause::PublishedDevice {
+                identity: *identity,
+                device: *device,
+            };
+            let presented = devices.iter().map(|(i, d)| {
+                let work = Work::DropPresentedBy {
+                    under: Some(**i),
+                    device: **d,
+                };
+                (work, cause(i, d))
             });
-            let identities = newly.iter().map(|i| Sweep::Identity {
-                identity: *i,
-                operator: false,
+            let offered = devices.iter().map(|(i, d)| {
+                let work = Work::DropOffersBy {
+                    under: Some(**i),
+                    device: **d,
+                };
+                (work, cause(i, d))
             });
-            self.sweep_offers(devices.chain(identities).collect());
+            let identities = newly
+                .iter()
+                .map(|i| (Work::DropOffersNaming(*i), Cause::PublishedIdentity(*i)));
+            self.sweep_held(
+                &writing,
+                presented.chain(offered).chain(identities).collect(),
+                &[],
+            );
         }
+        drop(writing);
+        self.take_revoked(taken);
         self.reconcile_due(list.floors.keys().copied());
         ended
     }
@@ -571,7 +610,8 @@ impl Core {
 
     /// The sessions `list` refuses, ended, each that `revoked` names a
     /// reason for as revoked. Run after the list is written, and with
-    /// nothing else held: an `attach` from then on is refused, and one
+    /// nothing held but the friendship hold: an `attach` from then on is
+    /// refused, and one
     /// that got in before is on the roster to be found here.
     fn end_revoked(
         &self,

@@ -11,11 +11,12 @@ as AGENTS.md's "Releasing" describes it.
 
 - The main SQLite store migrates from schema 41 to 43 on first start,
   adding an empty `friend_owed` table, where friendship work a failed
-  store call leaves undone is to be kept across restarts, and an empty
+  store call leaves undone is kept across restarts (work whose recording
+  fails too is kept in memory until it can be written, and a restart
+  before then loses it), and an empty
   `friend_moved` table, where each identity rotation records the key
-  its friendships moved to. The server owes no work there yet. A build
-  from before refuses the migrated file: take a backup first if you may
-  roll back.
+  its friendships moved to. A build from before refuses the migrated
+  file: take a backup first if you may roll back.
 
 - Pronouns: a user sets their account's with `/pronouns <text>` to the
   system account (`/pronouns clear` takes them down), and a classic
@@ -376,6 +377,30 @@ as AGENTS.md's "Releasing" describes it.
   with a space or a mark.
 
 ### Fixed
+
+- Friendship work a failed store call leaves undone (dropping a revoked
+  device's or identity's offers and presentations, an unlinked
+  identity's, judging again what a drop left, settling what a claim or
+  a rotation folded) is kept in the database, so a restart no longer
+  forgets it, unless recording it failed too and the restart came
+  before a retry could write it. It is moved with the rows a rotation
+  moves, so it is no longer looked for under the key rotated away from.
+  It ends only once a fresh read shows it done, or its revocation
+  lifted, or its identity linked again, and every drop, owed or new,
+  reads what owes it again just before it runs, so a revocation
+  replaced or an identity linked since drops nothing, while one whose
+  cause cannot be read is left owed. An account file the server cannot
+  read now fails a lookup of an identity's account that no other file
+  answers, where it used to be taken for one linking no key: while such
+  a file is there, a login or a link by an identity no readable file
+  links is refused, and so is a friendship act naming such a key
+  (presenting, fetching, finding or removing by key, answering a
+  request), while the friendship work owed for one waits. A malformed file is still skipped and logged. An
+  unlink whose drops cannot be recorded is refused. A claim's or a rotation's
+  settling of a block or a request left beside a friendship, in a row
+  of either party's, which a failed write used to leave for good, is
+  retried until done. A rotation to a key no account here links owes
+  the drop of what moved to it, as an unlink does.
 
 - Friendship work a failed store call left owed (dropping an unlinked
   identity's or a revoked device's offers and presentations, a deleted

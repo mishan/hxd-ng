@@ -35,12 +35,14 @@ use hl_identity::{
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
-use super::{store_failed, takes_part, FriendEntry, Key, MessagingError, RosterState};
+use super::{
+    store_failed, takes_part, FriendEntry, FriendWrites, Key, MessagingError, RosterState,
+};
 use crate::identity_records::{CachedList, KeptEpoch, RecordCache};
 use crate::inbox::{Mailbox, StoreError};
 use crate::relationships::{
-    Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Left, Part, PendingOut, Presentation,
-    RelationId, Relationship, RelationshipStore, Report, StoredOffer,
+    Cause, Charge, Did, Ended, Ending, FpPair, HeldWithdrawal, Left, OwedId, Part, PendingOut,
+    Presentation, RelationId, Relationship, RelationshipStore, Report, StoredOffer, Work,
 };
 use crate::roster::{Event, Uid};
 use crate::Core;
@@ -178,55 +180,58 @@ const CLEANUP_BATCH: usize = 1000;
 /// at a time it took a moment before still finds what it should.
 const CLEANUP_MARGIN: Duration = Duration::from_secs(3600);
 
-/// Offers owed a drop: a revoked device's, by the operator or by a
-/// registrar, under the identity it signed for; a revoked identity's,
-/// from or to it; or an unlinked one's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Sweep {
-    /// A deleted account's relationships, purged under the mailbox it
-    /// held, so that whoever is given the login next inherits none.
-    Purge(Mailbox),
-    /// The offers a device signed: under the identity a registrar names
-    /// it for, or, the operator's naming none, under whichever.
-    Device {
-        identity: Option<[u8; 32]>,
-        device: [u8; 32],
-        operator: bool,
-    },
-    Identity {
-        identity: [u8; 32],
-        operator: bool,
-    },
-    Unlinked([u8; 32]),
-    /// The presentations an unlinked identity made.
-    Unpresented([u8; 32]),
-    /// What two keys hold of each other judged again, after a drop that
-    /// left one held by its own taking alone could not be judged.
-    Judge([u8; 32], [u8; 32]),
-    /// A revoked device's presentations, the operator's by device alone.
-    Presented {
-        identity: Option<[u8; 32]>,
-        device: [u8; 32],
-    },
-}
-
-/// A sweep that could not read or drop what it owes, until its
-/// backoff is over or what owed it is lifted.
-pub(crate) struct OwedSweep {
-    sweep: Sweep,
+/// When a piece of owed work is tried again: after so many failed tries,
+/// at so late.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Backoff {
     failures: u32,
     due: u64,
 }
 
-impl OwedSweep {
-    pub(super) fn failed(sweep: Sweep, failures: u32, now: u64) -> Self {
-        let failures = failures + 1;
+impl Backoff {
+    /// After one more failed try than `last`, at `now`.
+    fn after(last: Option<Backoff>, now: u64) -> Self {
+        let failures = last.map_or(0, |b| b.failures) + 1;
         let wait = SWEEP_BACKOFF.saturating_mul(1 << (failures - 1).min(6));
-        OwedSweep {
-            sweep,
+        Backoff {
             failures,
             due: now + wait.min(SWEEP_BACKOFF_MAX),
         }
+    }
+}
+
+/// When owed work is tried again, beside the rows that record it
+/// ([`RelationshipStore::owed`]): a cache of scheduling alone, so a row
+/// with no entry here is due now, as every row is after a restart.
+#[derive(Default)]
+pub(crate) struct OwedIndex {
+    /// Each row's backoff since a failed try, by its id.
+    backoff: HashMap<OwedId, Backoff>,
+    /// Work whose try and whose owing both failed, written by the next
+    /// sweep that can.
+    unwritten: Vec<(Work, Cause, Backoff)>,
+    /// A deleted account's purge, which no row records.
+    purges: Vec<(Mailbox, Backoff)>,
+}
+
+/// A piece of work a sweep does: one an install names now, or one owed.
+struct Item {
+    work: Work,
+    cause: Cause,
+    id: Option<OwedId>,
+}
+
+/// A drop of offers read for a sweep's write, each pair it names with
+/// which of its parties to tell, and the work it is.
+type Batched = (Part, Vec<(Mailbox, Mailbox, [bool; 2])>, Item);
+
+/// The key whose rows `work` is owed for, which a link of it makes
+/// [`Cause::Unlinked`] moot.
+fn key_of(work: &Work) -> Option<[u8; 32]> {
+    match work {
+        Work::DropOffersBy { under, .. } | Work::DropPresentedBy { under, .. } => *under,
+        Work::DropOffersNaming(k) | Work::DropPresentationsOf(k) | Work::Settle(k) => Some(*k),
+        Work::Judge(a, _) => Some(*a),
     }
 }
 
@@ -814,22 +819,13 @@ impl Core {
         self.judge_floors(due);
     }
 
-    /// The owed sweeps whose backoff is over, tried again, the `Reset`
+    /// The owed work whose backoff is over, tried again, the `Reset`
     /// records past [`RESET_KEPT`] lapsed and the rows that lapsed
     /// reclaimed: the periodic retry of what a failed store call left
     /// owed, and the housekeeping beside it. Store work, so called off the
     /// reactor.
     pub fn owed_tick(&self) {
-        let now = self.clock.unix();
-        if self
-            .offer_sweeps
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|o| o.due <= now)
-        {
-            self.sweep_offers(Vec::new());
-        }
+        self.sweep_offers(Vec::new());
         if let Some(store) = &self.relationships {
             // Under the hold an 802 judges a record under, so that none
             // lapses between the judging and the offer it keeps waiting.
@@ -934,10 +930,7 @@ impl Core {
         let (key, rows, keys, stamp, cleared, held, offers) = {
             let _writing = self.friend_writes();
             let (key, rows) = self.epoch_key(&fp)?;
-            let successors = self.chain_from(store, fp)?;
-            let keys: Vec<[u8; 32]> = std::iter::once(fp)
-                .chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0))
-                .collect();
+            let keys = self.chain_keys(store, fp)?;
             let (stamp, cleared) = {
                 let r = self.reconciled.lock().unwrap();
                 (r.of(&keys), r.cleared)
@@ -1031,7 +1024,7 @@ impl Core {
             let below = floors.below(&o);
             floors.failed()?;
             if below {
-                let pair = self.mailbox_of(&other).zip(self.mailbox_of(&owner));
+                let pair = self.mailbox_of(&other)?.zip(self.mailbox_of(&owner)?);
                 let asked: Vec<_> = pair.iter().map(|(x, y)| (x, y)).collect();
                 let drop = Part::DropOffers(vec![(owner, other)]);
                 let (_, left) = self.write_left(store, &[drop], &asked, wall)?;
@@ -1122,9 +1115,8 @@ impl Core {
     ) {
         let mut keys = Vec::new();
         for fp in fps {
-            keys.push(fp);
-            match self.chain_from(store, fp) {
-                Ok(chain) => keys.extend(chain.iter().map(|r| Fingerprint::of(&r.successor).0)),
+            match self.chain_keys(store, fp) {
+                Ok(chain) => keys.extend(chain),
                 Err(e) => {
                     warn!("relationships: reading a rotation to forget its judging: {e}");
                     self.unjudge_all();
@@ -1135,10 +1127,18 @@ impl Core {
         self.reconciled.lock().unwrap().bump(keys);
     }
 
-    /// The account linked to `fp` that takes part, if there is one.
-    fn mailbox_of(&self, fp: &[u8; 32]) -> Option<Mailbox> {
-        let (m, access) = self.directory.as_ref()?.account_by_key(fp)?;
-        takes_part(&m.login, access).then_some(m)
+    /// The account linked to `fp` that takes part, if there is one; an
+    /// error, logged, where the directory could not be read. A caller
+    /// does not guess past one: work is left to be tried again, and a
+    /// request is answered as the server's failure, never as nobody.
+    fn mailbox_of(&self, fp: &[u8; 32]) -> Result<Option<Mailbox>, StoreError> {
+        let Some(dir) = self.directory.as_ref() else {
+            return Ok(None);
+        };
+        let found = dir.account_by_key(fp).inspect_err(|e| {
+            warn!("relationships: looking up the account an identity links: {e}");
+        })?;
+        Ok(found.and_then(|(m, access)| takes_part(&m.login, access).then_some(m)))
     }
 
     /// The rotations this server applied from `fp` on, in chain order,
@@ -1164,6 +1164,25 @@ impl Core {
             key = to;
         }
         Ok(out)
+    }
+
+    /// `fp` and each key it rotated to: by the records kept, and by where
+    /// its rows moved, which a rotation records in its own step whether or
+    /// not its record could be kept.
+    fn chain_keys(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        fp: [u8; 32],
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let successors = self.chain_from(store, fp)?;
+        let mut keys: Vec<[u8; 32]> = std::iter::once(fp)
+            .chain(successors.iter().map(|r| Fingerprint::of(&r.successor).0))
+            .collect();
+        let end = store.moved(&fp)?;
+        if !keys.contains(&end) {
+            keys.push(end);
+        }
+        Ok(keys)
     }
 
     fn rotations_for(
@@ -2026,7 +2045,12 @@ impl Core {
     /// A `Reset` record left `left`'s pair: both parties told their
     /// entries as the drop left them, where the directory names both.
     fn record_left(&self, left: &Left) {
-        let named = |m: &Mailbox| m.fingerprint.and_then(|fp| self.mailbox_of(&fp));
+        // The drop is written already: one the directory cannot answer
+        // for is told nothing rather than told on a guess.
+        let named = |m: &Mailbox| {
+            m.fingerprint
+                .and_then(|fp| self.mailbox_of(&fp).ok().flatten())
+        };
         if left.pair.iter().all(|m| named(m).is_some()) {
             self.tell_left(left, [true, true]);
         }
@@ -2120,11 +2144,7 @@ impl Core {
         f: &Friendship,
         bytes: &[u8],
     ) -> Result<Vec<Presentation>, StoreError> {
-        let chain = |fp: Fingerprint| -> Result<Vec<[u8; 32]>, StoreError> {
-            let successors = self.chain_from(store, fp.0)?;
-            let keys = successors.iter().map(|r| Fingerprint::of(&r.successor).0);
-            Ok(std::iter::once(fp.0).chain(keys).collect())
-        };
+        let chain = |fp: Fingerprint| self.chain_keys(store, fp.0);
         let (lo, hi) = f.pair().fingerprints();
         let (xs, ys) = (chain(lo)?, chain(hi)?);
         let mut out = Vec::new();
@@ -2173,7 +2193,7 @@ impl Core {
         if let Some(r) = store.relationship(&y, &x, wall)? {
             return Ok(Some((r.other, r.owner)));
         }
-        Ok(self.mailbox_of(a).zip(self.mailbox_of(b)))
+        Ok(self.mailbox_of(a)?.zip(self.mailbox_of(b)?))
     }
 
     /// Whether `p`, held by its own taking alone, no longer is, once the
@@ -2264,7 +2284,7 @@ impl Core {
         // shown as pending in carries: each from where it is kept.
         e.offer = match e.state {
             RosterState::Accepted => store.offer(&theirs, &mine, now).ok().flatten(),
-            RosterState::PendingIn => self.mailbox_of(&theirs).and_then(|them| {
+            RosterState::PendingIn => self.mailbox_of(&theirs).ok().flatten().and_then(|them| {
                 let row = store.relationship(&them, of, now).ok().flatten()?;
                 row.pending_out.filter(|p| !p.upgrade)?.offer
             }),
@@ -2285,6 +2305,7 @@ impl Core {
     ) -> Result<super::FoundUser, MessagingError> {
         let them = self
             .mailbox_of(fingerprint)
+            .map_err(|_| MessagingError::ServerError)?
             .ok_or(MessagingError::AccountNotFound)?;
         self.found(uid, &them.login, profile)
     }
@@ -2301,7 +2322,10 @@ impl Core {
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
         let store = self.friends_store()?;
-        if let Some(them) = self.mailbox_of(fingerprint) {
+        if let Some(them) = self
+            .mailbox_of(fingerprint)
+            .map_err(|_| MessagingError::ServerError)?
+        {
             let friends = store
                 .relationship(&me.mailbox, &them, self.clock.wall())
                 .map_err(store_failed)?
@@ -2706,7 +2730,10 @@ impl Core {
             None => record(None, None),
         };
         // Step 2: the other party.
-        let them = match self.mailbox_of(&theirs) {
+        let them = match self
+            .mailbox_of(&theirs)
+            .map_err(|_| MessagingError::ServerError)?
+        {
             Some(them)
                 if !store.is_blocked(&them, me).map_err(store_failed)?
                     && !store.is_blocked(me, &them).map_err(store_failed)? =>
@@ -3019,7 +3046,10 @@ impl Core {
             {
                 continue;
             }
-            let Some(them) = self.mailbox_of(&other) else {
+            let Some(them) = self
+                .mailbox_of(&other)
+                .map_err(|_| MessagingError::ServerError)?
+            else {
                 continue;
             };
             if store
@@ -3095,29 +3125,6 @@ impl Core {
         }
     }
 
-    /// Drop what the devices now revoked here presented (§6): the
-    /// operator's by device, the registrars' by device and identity.
-    pub(crate) fn drop_revoked_presentations(&self, devices: &[(Option<[u8; 32]>, [u8; 32])]) {
-        let Some(store) = self.relationships.as_ref() else {
-            return;
-        };
-        let _writing = self.friend_writes();
-        let now = self.clock.unix();
-        for (identity, device) in devices {
-            if let Err(e) = self.drop_device_presentations(store, *identity, device) {
-                warn!("relationships: dropping a revoked device's presentations: {e}");
-                let sweep = Sweep::Presented {
-                    identity: *identity,
-                    device: *device,
-                };
-                self.offer_sweeps
-                    .lock()
-                    .unwrap()
-                    .push(OwedSweep::failed(sweep, 0, now));
-            }
-        }
-    }
-
     /// What `device` presented, for `identity` or a key it rotated to
     /// where one is named, dropped, each pair as one step.
     fn drop_device_presentations(
@@ -3128,11 +3135,7 @@ impl Core {
     ) -> Result<(), StoreError> {
         // A rotation re-stamps a presentation's presenter.
         let keys = match identity {
-            Some(i) => {
-                let next = self.chain_from(store, i)?;
-                let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
-                Some(std::iter::once(i).chain(next).collect::<Vec<_>>())
-            }
+            Some(i) => Some(self.chain_keys(store, i)?),
             None => None,
         };
         let made = store.presented_by(device)?;
@@ -3148,82 +3151,171 @@ impl Core {
         Ok(())
     }
 
-    /// Drop what `sweeps` owe and what owed sweeps whose backoff is over
-    /// owe, as one step, every pair it changes told to its parties from
-    /// what the step left: one that cannot be read or written owed again,
-    /// and one whose revocation was lifted, or whose identity was linked
-    /// again, moot.
-    pub(crate) fn sweep_offers(&self, sweeps: Vec<Sweep>) {
+    /// Do what `fresh` names, as an install names it now, and the owed work
+    /// that is due: each pair a drop of offers changes told to its parties
+    /// from what the step left. Work that cannot be done is owed again, or
+    /// for the first time, and owed work whose cause was lifted, or whose
+    /// identity was linked again, is moot.
+    pub(crate) fn sweep_offers(&self, fresh: Vec<(Work, Cause)>) {
+        let writing = self.friend_writes();
+        self.sweep_held(&writing, fresh, &[]);
+    }
+
+    /// [`Self::sweep_offers`] under the hold the caller took, with the rows
+    /// `first` names, just owed, due whatever their backoff.
+    pub(crate) fn sweep_held(
+        &self,
+        writing: &FriendWrites<'_>,
+        fresh: Vec<(Work, Cause)>,
+        first: &[OwedId],
+    ) {
         let Some(store) = self.relationships.as_ref() else {
             return;
         };
-        let _writing = self.friend_writes();
         let (wall, now) = (self.clock.wall(), self.clock.unix());
-        // Fresh ones stand by what owes them; those owed again are
-        // checked against it first.
-        let due: Vec<(Sweep, u32, bool)> = {
-            let mut owed = self.offer_sweeps.lock().unwrap();
-            let (due, later): (Vec<_>, Vec<_>) = owed.drain(..).partition(|o| o.due <= now);
-            *owed = later;
-            sweeps
-                .into_iter()
-                .map(|s| (s, 0, true))
-                .chain(
-                    due.into_iter()
-                        .map(|o| (o.sweep.clone(), o.failures, false)),
-                )
-                .collect()
+        if let Err(e) = self.flush_unwritten() {
+            warn!("relationships: recording owed friendship work: {e}");
+        }
+        let purges = {
+            let mut index = self.owed.lock().unwrap();
+            let (due, later) = index.purges.drain(..).partition(|(_, b)| b.due <= now);
+            index.purges = later;
+            due
         };
-        let mut parts = Vec::new();
-        let mut pairs: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
-        let mut read = Vec::new();
-        let mut owe = Vec::new();
-        for (sweep, failures, fresh) in due {
-            if !fresh && !self.still_owed(&sweep) {
-                continue;
+        for (of, last) in purges {
+            if !self.purge_relationships_held(writing, &of) {
+                let owed = (of, Backoff::after(Some(last), now));
+                self.owed.lock().unwrap().purges.push(owed);
             }
-            if let Sweep::Purge(of) = &sweep {
-                if !self.purge_relationships_held(&_writing, of) {
-                    owe.push(OwedSweep::failed(sweep, failures, now));
-                }
-                continue;
+        }
+        // Every row read is due but those whose backoff is not over, so a
+        // row the index never saw, as after a restart, is due now.
+        let rows = match store.owed() {
+            Ok(rows) => {
+                let mut index = self.owed.lock().unwrap();
+                let ids: HashSet<OwedId> = rows.iter().map(|o| o.id).collect();
+                index.backoff.retain(|id, _| ids.contains(id));
+                let due = |id: &OwedId| {
+                    first.contains(id) || index.backoff.get(id).is_none_or(|b| b.due <= now)
+                };
+                rows.into_iter().filter(|o| due(&o.id)).collect()
             }
-            if let Sweep::Presented { identity, device } = sweep {
-                if let Err(e) = self.drop_device_presentations(store, identity, &device) {
-                    warn!("relationships: dropping a revoked device's presentations: {e}");
-                    owe.push(OwedSweep::failed(sweep, failures, now));
-                }
-                continue;
+            Err(e) => {
+                warn!("relationships: reading the friendship work owed: {e}");
+                Vec::new()
             }
-            if let Sweep::Unpresented(fp) = sweep {
-                if let Err(e) = self.drop_unlinked_presentations(store, &fp) {
-                    warn!("relationships: dropping an unlinked account's presentations: {e}");
-                    owe.push(OwedSweep::failed(sweep, failures, now));
+        };
+        let fresh = fresh.into_iter().map(|(work, cause)| Item {
+            work,
+            cause,
+            id: None,
+        });
+        let owed = rows.into_iter().map(|o| Item {
+            id: Some(o.id),
+            work: o.work,
+            cause: o.cause,
+        });
+        let (mut settled, mut failed) = (Vec::new(), Vec::new());
+        // Drops of offers next to each other in one write.
+        let mut batch: Vec<Batched> = Vec::new();
+        for item in fresh.chain(owed) {
+            // Named now or owed, each is held to what owes it here, under
+            // the hold: a list replaced or a key linked since it was named
+            // makes it moot.
+            match self.still_owed(&item.work, &item.cause) {
+                Ok(true) => {}
+                Ok(false) => {
+                    settled.extend(item.id);
+                    continue;
                 }
-                continue;
-            }
-            if let Sweep::Judge(a, b) = sweep {
-                if let Err(e) = self.judge_pair(store, &a, &b) {
-                    warn!("relationships: judging what a drop left: {e}");
-                    owe.push(OwedSweep::failed(sweep, failures, now));
-                }
-                continue;
-            }
-            match self.owed_by(store, &sweep, wall) {
-                Ok((part, named)) => {
-                    parts.push(part);
-                    pairs.extend(named);
-                    read.push((sweep, failures));
-                }
+                // Neither run nor moot: what owes it could not be read.
                 Err(e) => {
-                    warn!("relationships: reading what a revocation or an unlink owes: {e}");
-                    owe.push(OwedSweep::failed(sweep, failures, now));
+                    warn!("relationships: reading what owes friendship work: {e}");
+                    failed.push(item);
+                    continue;
+                }
+            }
+            // One named now is done where its rows went; owed work is
+            // owed there already.
+            let work = match item.id {
+                Some(_) => Ok(item.work.clone()),
+                None => self.resolved(store, &item.work),
+            };
+            let offers = matches!(
+                work,
+                Ok(Work::DropOffersBy { .. } | Work::DropOffersNaming(_))
+            );
+            if !offers {
+                self.drop_offers_batch(store, &mut batch, &mut failed, wall);
+            }
+            let done = match work {
+                Err(e) => Err(e),
+                Ok(work @ (Work::DropOffersBy { .. } | Work::DropOffersNaming(_))) => {
+                    match self.owed_by(store, &work, &item.cause, wall) {
+                        Ok((part, named)) => {
+                            batch.push((part, named, item));
+                            continue;
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Ok(Work::DropPresentedBy { under, device }) => self
+                    .drop_device_presentations(store, under, &device)
+                    .map(|()| true),
+                Ok(Work::DropPresentationsOf(fp)) => {
+                    self.drop_unlinked_presentations(store, &fp).map(|()| true)
+                }
+                Ok(Work::Judge(a, b)) => self.judge_pair(store, &a, &b).map(|()| true),
+                Ok(Work::Settle(fp)) => {
+                    (self.settling(&fp)).map(|me| self.after_merge(writing, &me))
+                }
+            };
+            match done {
+                Ok(true) => settled.extend(item.id),
+                Ok(false) => failed.push(item),
+                Err(e) => {
+                    warn!("relationships: owed friendship work: {e}");
+                    failed.push(item);
                 }
             }
         }
-        // One tell a pair, whichever sweeps named it, by the keys a row
-        // is matched by: an unlink's recipients kept, each party told
-        // where any sweep would tell it.
+        self.drop_offers_batch(store, &mut batch, &mut failed, wall);
+        if !settled.is_empty() {
+            logged("settling the friendship work done", store.settle(&settled));
+        }
+        for item in failed {
+            let last = item
+                .id
+                .and_then(|id| self.owed.lock().unwrap().backoff.get(&id).copied());
+            let next = Backoff::after(last, now);
+            match item.id {
+                Some(id) => drop(self.owed.lock().unwrap().backoff.insert(id, next)),
+                None => self.owe_failed(item.work, item.cause, next),
+            }
+        }
+    }
+
+    /// The drops of offers `batch` holds, read already, written as one
+    /// step with the settling of the rows that owed them, every pair it
+    /// changes told once, by the keys a row is matched by: an unlink's
+    /// recipients kept, each party told where any drop would tell it.
+    fn drop_offers_batch(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        batch: &mut Vec<Batched>,
+        failed: &mut Vec<Item>,
+        wall: SystemTime,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let (mut parts, mut pairs) = (Vec::new(), Vec::new());
+        let mut items = Vec::new();
+        for (part, named, item) in batch.drain(..) {
+            pairs.extend(named);
+            parts.push(part);
+            items.push(item);
+        }
         let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
         let mut at: HashMap<(Key, Key), usize> = HashMap::new();
         for (a, b, to) in pairs {
@@ -3245,36 +3337,133 @@ impl Core {
             }
         }
         let pairs = coalesced;
-        if !parts.is_empty() {
-            let asked: Vec<(&Mailbox, &Mailbox)> = pairs.iter().map(|(a, b, _)| (a, b)).collect();
-            match self.write_left(store, &parts, &asked, wall) {
-                Ok((did, left)) => {
-                    // Told where an offer went, and nowhere else.
-                    let mut gone: HashSet<FpPair> = HashSet::new();
-                    for (part, did) in parts.iter().zip(did) {
-                        match (part, did) {
-                            (Part::DropOffers(signed), _) => gone.extend(signed),
-                            (_, Did::Named(named)) => gone.extend(named),
-                            _ => {}
-                        }
-                    }
-                    for ((a, b, to), left) in pairs.iter().zip(&left) {
-                        let dropped = a
-                            .fingerprint
-                            .zip(b.fingerprint)
-                            .is_some_and(|(x, y)| gone.contains(&(x, y)) || gone.contains(&(y, x)));
-                        if dropped {
-                            self.tell_left(left, *to);
-                        }
+        let drops = parts.len();
+        parts.extend(items.iter().filter_map(|i| i.id).map(Part::Settle));
+        let asked: Vec<(&Mailbox, &Mailbox)> = pairs.iter().map(|(a, b, _)| (a, b)).collect();
+        match self.write_left(store, &parts, &asked, wall) {
+            Ok((did, left)) => {
+                // Told where an offer went, and nowhere else.
+                let mut gone: HashSet<FpPair> = HashSet::new();
+                for (part, did) in parts[..drops].iter().zip(did) {
+                    match (part, did) {
+                        (Part::DropOffers(signed), _) => gone.extend(signed),
+                        (_, Did::Named(named)) => gone.extend(named),
+                        _ => {}
                     }
                 }
-                Err(e) => {
-                    warn!("relationships: dropping what a revocation or an unlink owes: {e}");
-                    owe.extend(read.into_iter().map(|(s, f)| OwedSweep::failed(s, f, now)));
+                for ((a, b, to), left) in pairs.iter().zip(&left) {
+                    let dropped = a
+                        .fingerprint
+                        .zip(b.fingerprint)
+                        .is_some_and(|(x, y)| gone.contains(&(x, y)) || gone.contains(&(y, x)));
+                    if dropped {
+                        self.tell_left(left, *to);
+                    }
                 }
             }
+            Err(e) => {
+                warn!("relationships: dropping what a revocation or an unlink owes: {e}");
+                failed.extend(items);
+            }
         }
-        self.offer_sweeps.lock().unwrap().extend(owe);
+    }
+
+    /// The work kept in memory because its owing failed, written, each
+    /// with the backoff it had.
+    pub(crate) fn flush_unwritten(&self) -> Result<(), StoreError> {
+        let kept = std::mem::take(&mut self.owed.lock().unwrap().unwritten);
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let owing: Vec<(Work, Cause)> = (kept.iter())
+            .map(|(w, c, _)| (w.clone(), c.clone()))
+            .collect();
+        match self.owe(&owing) {
+            Ok(ids) => {
+                let mut index = self.owed.lock().unwrap();
+                for (id, (_, _, b)) in ids.into_iter().zip(kept) {
+                    index.backoff.insert(id, b);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let mut index = self.owed.lock().unwrap();
+                let later = std::mem::replace(&mut index.unwritten, kept);
+                index.unwritten.extend(later);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record `owed`, as [`RelationshipStore::owe`] keys it: the one way
+    /// owed work is written but a step that owes its own.
+    pub(crate) fn owe(&self, owed: &[(Work, Cause)]) -> Result<Vec<OwedId>, StoreError> {
+        match self.relationships.as_ref() {
+            Some(store) => store.owe(owed),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Work whose try failed, owed to be tried again after `backoff`, or,
+    /// where that cannot be written either, kept to be written by the
+    /// next sweep.
+    fn owe_failed(&self, work: Work, cause: Cause, backoff: Backoff) {
+        match self.owe(&[(work.clone(), cause.clone())]) {
+            // One owed already keeps the backoff its own tries earned.
+            Ok(ids) => {
+                let mut index = self.owed.lock().unwrap();
+                for id in ids {
+                    index.backoff.entry(id).or_insert(backoff);
+                }
+            }
+            Err(e) => {
+                warn!("relationships: recording owed friendship work: {e}");
+                let kept = (work, cause, backoff);
+                self.owed.lock().unwrap().unwritten.push(kept);
+            }
+        }
+    }
+
+    /// A deleted account's purge, which could not be made, tried again by
+    /// a later sweep: kept in memory alone, since the delete is not
+    /// refused for it.
+    pub(crate) fn owe_purge(&self, of: Mailbox) {
+        let owed = (of, Backoff::after(None, self.clock.unix()));
+        self.owed.lock().unwrap().purges.push(owed);
+    }
+
+    /// `work` keyed where its rows are now, by the moves rotations made.
+    fn resolved(
+        &self,
+        store: &Arc<dyn RelationshipStore>,
+        work: &Work,
+    ) -> Result<Work, StoreError> {
+        let m = |k: &[u8; 32]| store.moved(k);
+        Ok(match work {
+            Work::DropOffersBy { under, device } => Work::DropOffersBy {
+                under: under.as_ref().map(m).transpose()?,
+                device: *device,
+            },
+            Work::DropPresentedBy { under, device } => Work::DropPresentedBy {
+                under: under.as_ref().map(m).transpose()?,
+                device: *device,
+            },
+            Work::DropOffersNaming(k) => Work::DropOffersNaming(m(k)?),
+            Work::DropPresentationsOf(k) => Work::DropPresentationsOf(m(k)?),
+            Work::Judge(a, b) => Work::Judge(m(a)?, m(b)?),
+            Work::Settle(k) => Work::Settle(m(k)?),
+        })
+    }
+
+    /// The mailbox a key's pairs are settled under: its account's, or the
+    /// key's alone; an error where the directory could not say which, so
+    /// the settling is tried again rather than told under a guess.
+    fn settling(&self, fp: &[u8; 32]) -> Result<Mailbox, StoreError> {
+        let account = match self.directory.as_ref() {
+            Some(d) => d.account_by_key(fp)?,
+            None => None,
+        };
+        Ok(account.map_or_else(|| Mailbox::identified("", *fp), |(m, _)| m))
     }
 
     /// What judging the withdrawals tidied, written once the act it was
@@ -3310,36 +3499,40 @@ impl Core {
     fn orphan_judged_or_owed(&self, store: &Arc<dyn RelationshipStore>, gone: &Presentation) {
         if let Err(e) = self.orphan_judged(store, gone) {
             warn!("relationships: judging an orphan: {e}");
-            let sweep = Sweep::Judge(gone.presenter, gone.other);
-            let now = self.clock.unix();
-            let owed = OwedSweep::failed(sweep, 0, now);
-            self.offer_sweeps.lock().unwrap().push(owed);
+            let work = Work::Judge(gone.presenter, gone.other);
+            self.owe_failed(work, Cause::Always, Backoff::after(None, self.clock.unix()));
         }
     }
 
-    /// The sweeps owed, for the sequence harness to hold each to ending
-    /// only once done or lifted.
+    /// The work kept in memory because its owing failed, for the sequence
+    /// harness, which matches every other piece by its id.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn owed_sweeps(&self) -> Vec<Sweep> {
-        let owed = self.offer_sweeps.lock().unwrap();
-        owed.iter().map(|o| o.sweep.clone()).collect()
+    pub(crate) fn owed_unwritten(&self) -> Vec<(Work, Cause)> {
+        let index = self.owed.lock().unwrap();
+        index
+            .unwritten
+            .iter()
+            .map(|(w, c, _)| (w.clone(), c.clone()))
+            .collect()
     }
 
-    /// What the core keeps of friendships beside the store, as text: the
-    /// sweeps owed, the withdrawals judged, the revocations installed and
+    /// What the core keeps of friendships beside the store, as text: when
+    /// owed work is due and what is owed in memory, the withdrawals judged, the revocations installed and
     /// what the passes recorded, for a test to tell whether an act changed
     /// any of it.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn friend_state(&self) -> String {
         use std::collections::{BTreeMap, BTreeSet};
-        let mut sweeps: Vec<String> = self
-            .offer_sweeps
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|o| format!("{:?} {} {}", o.sweep, o.failures, o.due))
-            .collect();
-        sweeps.sort();
+        let sweeps = {
+            let index = self.owed.lock().unwrap();
+            let backoff: BTreeMap<_, _> = index.backoff.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut unwritten: Vec<String> =
+                index.unwritten.iter().map(|o| format!("{o:?}")).collect();
+            let mut purges: Vec<String> = index.purges.iter().map(|o| format!("{o:?}")).collect();
+            unwritten.sort();
+            purges.sort();
+            format!("{backoff:?} {unwritten:?} {purges:?}")
+        };
         let judged: BTreeMap<_, _> = self
             .withdrawals_judged
             .lock()
@@ -3369,18 +3562,21 @@ impl Core {
             let generation: BTreeMap<_, _> = r.generation.iter().map(|(k, v)| (*k, *v)).collect();
             format!("{at:?} {generation:?} {} {:?}", r.cleared, r.next)
         };
-        format!("{sweeps:?} {judged:?} {revoked} {reconciled}")
+        format!("{sweeps} {judged:?} {revoked} {reconciled}")
     }
 
-    /// Whether what owed `sweep` still stands.
-    fn still_owed(&self, sweep: &Sweep) -> bool {
-        match sweep {
+    /// Whether what owes `work` still stands; an error where that could
+    /// not be read, which neither runs the work nor ends it.
+    fn still_owed(&self, work: &Work, cause: &Cause) -> Result<bool, StoreError> {
+        match cause {
+            Cause::Always => return Ok(true),
             // Linked again is the evidence, whatever the account may do.
-            Sweep::Unlinked(fp) | Sweep::Unpresented(fp) => {
-                let dir = self.directory.as_ref();
-                return dir.is_none_or(|d| d.account_by_key(fp).is_none());
+            Cause::Unlinked => {
+                return match (key_of(work), self.directory.as_ref()) {
+                    (Some(k), Some(d)) => Ok(d.account_by_key(&k)?.is_none()),
+                    _ => Ok(true),
+                };
             }
-            Sweep::Judge(..) | Sweep::Purge(_) => return true,
             _ => {}
         }
         // A registrar's lift is one only where the lists read cover the
@@ -3389,62 +3585,39 @@ impl Core {
         let r = self.revoked.read().unwrap();
         let published =
             |identity: &[u8; 32], listed: bool| listed || !r.published.covered.contains(identity);
-        match *sweep {
-            Sweep::Presented {
-                identity: None,
-                device,
-            }
-            | Sweep::Device {
-                device,
-                operator: true,
-                ..
-            } => r.local.devices.contains(&device),
-            Sweep::Presented {
-                identity: Some(identity),
-                device,
-            }
-            | Sweep::Device {
-                identity: Some(identity),
-                device,
-                ..
-            } => published(&identity, r.published.devices.contains(&(identity, device))),
-            Sweep::Device { identity: None, .. } => true,
-            Sweep::Identity {
+        Ok(match cause {
+            Cause::OperatorDevice(device) => r.local.devices.contains(device),
+            Cause::OperatorIdentity(identity) => r.local.identities.contains(identity),
+            Cause::PublishedDevice { identity, device } => published(
                 identity,
-                operator: true,
-            } => r.local.identities.contains(&identity),
-            Sweep::Identity { identity, .. } => {
-                published(&identity, r.published.identities.contains(&identity))
+                r.published.devices.contains(&(*identity, *device)),
+            ),
+            Cause::PublishedIdentity(identity) => {
+                published(identity, r.published.identities.contains(identity))
             }
-            Sweep::Unlinked(_) | Sweep::Unpresented(_) | Sweep::Judge(..) | Sweep::Purge(_) => {
-                unreachable!("answered above")
-            }
-        }
+            Cause::Unlinked | Cause::Always => unreachable!("answered above"),
+        })
     }
 
-    /// What `sweep` drops, read first, and each pair it names with which
-    /// of its parties to tell, the revoked or unlinked one first.
+    /// What `work`, a drop of offers, drops, read first, and each pair it
+    /// names with which of its parties to tell, the revoked or unlinked
+    /// one first.
     #[allow(clippy::type_complexity)]
     fn owed_by(
         &self,
         store: &Arc<dyn RelationshipStore>,
-        sweep: &Sweep,
+        work: &Work,
+        cause: &Cause,
         wall: SystemTime,
     ) -> Result<(Part, Vec<(Mailbox, Mailbox, [bool; 2])>), StoreError> {
-        Ok(match *sweep {
-            Sweep::Device {
-                identity, device, ..
-            } => {
+        Ok(match *work {
+            Work::DropOffersBy { under, device } => {
                 let mut signed = Vec::new();
                 let mut named = Vec::new();
                 // Under the named key and each it rotated to, which an
                 // outgoing offer moves with; the operator's, under any.
-                let identities = match identity {
-                    Some(i) => {
-                        let next = self.chain_from(store, i)?;
-                        let next = next.iter().map(|r| Fingerprint::of(&r.successor).0);
-                        std::iter::once(i).chain(next).collect()
-                    }
+                let identities = match under {
+                    Some(i) => self.chain_keys(store, i)?,
                     None => store.offerers(wall)?,
                 };
                 let mut offers = Vec::new();
@@ -3461,8 +3634,8 @@ impl Core {
                     }
                     signed.push((identity, other));
                     // Named as the pair's rows keep them, as the other
-                    // sweeps name theirs.
-                    if self.mailbox_of(&identity).is_some() && self.mailbox_of(&other).is_some() {
+                    // drops name theirs.
+                    if self.mailbox_of(&identity)?.is_some() && self.mailbox_of(&other)?.is_some() {
                         if let Some((a, b)) = self.pair_mailboxes(store, &identity, &other, wall)? {
                             named.push((a, b, [true, true]));
                         }
@@ -3470,21 +3643,16 @@ impl Core {
                 }
                 (Part::DropOffers(signed), named)
             }
-            Sweep::Identity { identity, .. } => {
-                let named = self.counterparts_of(store, &identity, wall)?;
-                let named = named.into_iter().map(|(me, o)| (me, o, [true, true]));
-                (Part::DropOffersNaming(identity), named.collect())
-            }
-            Sweep::Unlinked(fp) => {
-                let to = [self.mailbox_of(&fp).is_some(), true];
+            Work::DropOffersNaming(fp) => {
+                let to = match cause {
+                    Cause::Unlinked => [self.mailbox_of(&fp)?.is_some(), true],
+                    _ => [true, true],
+                };
                 let named = self.counterparts_of(store, &fp, wall)?;
                 let named = named.into_iter().map(|(me, o)| (me, o, to));
                 (Part::DropOffersNaming(fp), named.collect())
             }
-            Sweep::Presented { .. }
-            | Sweep::Unpresented(_)
-            | Sweep::Judge(..)
-            | Sweep::Purge(_) => unreachable!("not offers"),
+            _ => unreachable!("not offers"),
         })
     }
 
@@ -3515,14 +3683,40 @@ impl Core {
         Ok(out)
     }
 
-    /// An account gave up its link to `fingerprint`: what it presented
-    /// under it goes, and with it each edge that was its evidence (§4.3,
-    /// §4.4). A link made again starts from the presentations its clients
-    /// make then.
-    pub fn friendships_unlinked(&self, fingerprint: &[u8; 32]) {
-        let Some(store) = self.relationships.as_ref() else {
+    /// An account gives up its link to `fingerprint` through `unlink`,
+    /// which calls the owe it is handed once its refusals are past and
+    /// before it writes, and refuses the unlink should that fail: the
+    /// drops the unlink leaves, of the offers naming the identity and of
+    /// what it presented, with each edge that was its evidence (§4.3,
+    /// §4.4), are recorded by it, under the hold, so a crash after the
+    /// unlink owes them still, and are tried once `unlink` answers. A link
+    /// made again starts from the presentations its clients make then.
+    pub fn friendships_unlinking<T, E>(
+        &self,
+        fingerprint: &[u8; 32],
+        unlink: impl FnOnce(&dyn Fn() -> Result<(), StoreError>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let writing = self.friend_writes();
+        let owed = RefCell::new(None);
+        let out = unlink(&|| {
+            let ids = self.owe(&[
+                (Work::DropOffersNaming(*fingerprint), Cause::Unlinked),
+                (Work::DropPresentationsOf(*fingerprint), Cause::Unlinked),
+            ])?;
+            *owed.borrow_mut() = Some(ids);
+            Ok(())
+        });
+        if let (Ok(_), Some(ids)) = (&out, owed.into_inner()) {
+            self.unlinked_held(&writing, fingerprint, &ids);
+        }
+        out
+    }
+
+    /// What `fingerprint`'s unlink owes, first tried: `first`.
+    fn unlinked_held(&self, writing: &FriendWrites<'_>, fingerprint: &[u8; 32], first: &[OwedId]) {
+        if self.relationships.is_none() {
             return;
-        };
+        }
         // Its sessions that proved the identity make friendship acts no
         // more: the account no longer links it.
         for s in self.roster.lock().unwrap().users.values_mut() {
@@ -3535,12 +3729,48 @@ impl Core {
                 s.info.transport.friendships = false;
             }
         }
-        self.sweep_offers(vec![Sweep::Unlinked(*fingerprint)]);
+        self.sweep_held(writing, Vec::new(), first);
+    }
+
+    /// An account links `fingerprint` through `link`, under the hold every
+    /// drop is dispatched under, so none falls between its write and the
+    /// key's first read as linked. What an unlink of the key still owes is
+    /// left owed: each drop reads the link again before it runs, so a link
+    /// written makes them moot whatever becomes of this call, and they are
+    /// settled here only to save a tick the work.
+    pub fn friendships_linking<T, E>(
+        &self,
+        fingerprint: &[u8; 32],
+        link: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         let _writing = self.friend_writes();
-        if let Err(e) = self.drop_unlinked_presentations(store, fingerprint) {
-            warn!("relationships: dropping an unlinked account's presentations: {e}");
-            let owed = OwedSweep::failed(Sweep::Unpresented(*fingerprint), 0, self.clock.unix());
-            self.offer_sweeps.lock().unwrap().push(owed);
+        let out = link();
+        logged(
+            "settling an unlink's moot drops",
+            self.settle_relinked(fingerprint),
+        );
+        out
+    }
+
+    /// The drops an unlink of `fingerprint` owes, where its rows are now,
+    /// settled where the key reads as linked.
+    pub(crate) fn settle_relinked(&self, fingerprint: &[u8; 32]) -> Result<(), StoreError> {
+        let Some(store) = self.relationships.as_ref() else {
+            return Ok(());
+        };
+        let key = store.moved(fingerprint)?;
+        let mut owed = Vec::new();
+        for o in store.owed()? {
+            // One that cannot be judged is an error, not a row left owed
+            // quietly: a rotation must not move the link past it.
+            let unlinked = o.cause == Cause::Unlinked && key_of(&o.work) == Some(key);
+            if unlinked && !self.still_owed(&o.work, &o.cause)? {
+                owed.push(o.id);
+            }
+        }
+        match owed.is_empty() {
+            true => Ok(()),
+            false => store.settle(&owed),
         }
     }
 

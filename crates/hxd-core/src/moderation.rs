@@ -914,7 +914,7 @@ impl Core {
         // predecessor too, and over-protecting is this rule's safe side.
         let by_key = who
             .fingerprint
-            .and_then(|fp| directory.account_by_key(&fp))
+            .and_then(|fp| directory.account_by_key(&fp).ok().flatten())
             .map(|(_, access)| access);
         let by_login = (!who.login.is_empty())
             .then(|| directory.account(&who.login))
@@ -1112,7 +1112,7 @@ impl Core {
                     let login = self
                         .directory
                         .as_ref()
-                        .and_then(|d| d.account_by_key(fp))
+                        .and_then(|d| d.account_by_key(fp).ok().flatten())
                         .map(|(m, _)| m.login)
                         .filter(|l| !l.is_empty());
                     (login.clone(), login.unwrap_or_default())

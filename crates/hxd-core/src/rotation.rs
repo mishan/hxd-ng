@@ -9,7 +9,7 @@ use crate::ban::{Ban, BanTarget};
 use crate::inbox::StoreError;
 use crate::messaging::Key;
 use crate::push::PushStore;
-use crate::relationships::{destination, Report};
+use crate::relationships::{destination, Cause, Report, Work};
 use crate::Core;
 
 impl Core {
@@ -58,12 +58,19 @@ impl Core {
         // for one key whichever stands; and no act finds the store moved
         // and the roster not.
         let writing = self.friend_writes();
+        // Work owed in memory alone is written first, or none of it could
+        // follow the rows; until it can be, the rotation waits.
+        self.flush_unwritten()?;
         let to = &lands(to);
         let dest = match self.relationships.as_ref() {
             Some(store) => destination(from, to, store.moved(to)?).unwrap_or(*to),
             None => *to,
         };
         let to = &dest;
+        // What an unlink of a key linked again still owes is moot, settled
+        // before the link moves on: once it has, the key reads as unlinked
+        // until the rows follow, and a drop between would take its offers.
+        self.settle_relinked(from)?;
         link(to)?;
         for (uid, nick) in self.end_identity(*from) {
             tracing::info!(uid, nick = %nick, "session ended: its key rotated away");
@@ -74,11 +81,19 @@ impl Core {
         );
         // By the login the account link now gives it, so a friend with no
         // row of its own naming the successor is told too.
-        let successor = self
-            .directory
-            .as_ref()
-            .and_then(|d| d.account_by_key(to))
-            .map_or_else(|| new.clone(), |(m, _)| m);
+        // One the directory cannot answer for is not guessed past: the
+        // rotation goes on, the link being moved already, owing the drops
+        // of a key no account links, which are judged again, and leaving
+        // its merge's settling owed for a sweep that can read it.
+        let (account, unread) = match self.directory.as_ref().map(|d| d.account_by_key(to)) {
+            Some(Err(e)) => {
+                tracing::warn!("relationships: looking up a rotation's successor: {e}");
+                (None, true)
+            }
+            found => (found.and_then(Result::ok).flatten(), false),
+        };
+        let linked = account.is_some();
+        let successor = account.map_or_else(|| new.clone(), |(m, _)| m);
         if let Some(store) = self.inbox.as_ref() {
             // As a send writes under it, and as a claim holds the other.
             let _flushing = self.flushing.lock().unwrap_or_else(|e| e.into_inner());
@@ -104,7 +119,14 @@ impl Core {
                     .collect(),
                 now: wall,
             };
-            let (rekeyed, left) = store.rotate_reporting(from, to, &report, &[])?;
+            // What the merge leaves to settle is owed in its step, and so is
+            // the drop of what an identity no account links holds.
+            let mut owe = vec![(Work::Settle(*to), Cause::Always)];
+            if !linked {
+                owe.push((Work::DropOffersNaming(*to), Cause::Unlinked));
+                owe.push((Work::DropPresentationsOf(*to), Cause::Unlinked));
+            }
+            let (rekeyed, left) = store.rotate_reporting(from, to, &report, &owe)?;
             let (audience, ended_left) = left.split_at(report.pairs.len());
             let merged = rekeyed.dropped.iter().flat_map(|p| [p.presenter, p.other]);
             self.unjudge(store, [*from, *to].into_iter().chain(merged));
@@ -115,7 +137,12 @@ impl Core {
             }
             self.rekey_friends(&writing, &old, &successor);
             self.merge_dropped(&writing, store, &rekeyed, ended_left);
-            self.after_merge(&writing, &successor);
+            if !unread && self.after_merge(&writing, &successor) {
+                let settling: Vec<_> = rekeyed.owed.first().copied().into_iter().collect();
+                if let Err(e) = store.settle(&settling) {
+                    tracing::warn!("relationships: settling a rotation's merge: {e}");
+                }
+            }
             let ended: Vec<_> = rekeyed
                 .ended
                 .iter()
