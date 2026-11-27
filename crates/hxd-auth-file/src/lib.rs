@@ -656,20 +656,30 @@ impl FileAuth {
     }
 
     fn load(&self, login: &str) -> Result<AccountFile, AuthError> {
+        self.load_or_malformed(login)?
+    }
+
+    /// [`Self::load`], a file that was read but does not parse answered
+    /// apart, inside, from one that could not be read at all.
+    fn load_or_malformed(&self, login: &str) -> Result<Result<AccountFile, AuthError>, AuthError> {
         if self.is_reserved(login) {
             return Err(AuthError::NoSuchAccount);
         }
         let path = self.dir.join(format!("{login}.toml"));
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                AuthError::NoSuchAccount
-            } else {
-                AuthError::Backend(format!("{}: {e}", path.display()))
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AuthError::NoSuchAccount)
             }
-        })?;
-        let parsed: AccountFile = toml::from_str(&text)
-            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display())))?;
-        Ok(parsed)
+            // Bytes that are not text are a file's own fault, as a
+            // parse is.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(Err(AuthError::Backend(format!("{}: {e}", path.display()))))
+            }
+            Err(e) => return Err(AuthError::Backend(format!("{}: {e}", path.display()))),
+        };
+        Ok(toml::from_str(&text)
+            .map_err(|e| AuthError::Backend(format!("{}: {e}", path.display()))))
     }
 }
 
@@ -1541,15 +1551,18 @@ impl FileAuth {
             let fp = if cached {
                 index.get(&login).and_then(|(_, fp)| fp.clone())
             } else {
-                let fp = match self.load(&login) {
-                    Ok(f) => f.identity.fingerprint,
+                let fp = match self.load_or_malformed(&login) {
+                    Ok(Ok(f)) => f.identity.fingerprint,
                     Err(AuthError::NoSuchAccount) => continue,
                     // One malformed account file used to make every
                     // identity auth on the server a 500. Skip it, loudly.
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("{login}.toml: {e}; skipped in fingerprint lookup");
                         None
                     }
+                    // A file that could not be read may carry the key: the
+                    // lookup cannot say that none does.
+                    Err(e) => return Err(e),
                 };
                 if settled {
                     index.insert(login.clone(), (stamp, fp.clone()));
@@ -2270,6 +2283,31 @@ mod tests {
             auth.find_by_fingerprint(&fp).unwrap().unwrap().login,
             "alice"
         );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_leaves_a_key_lookup_unanswered() {
+        use std::os::unix::fs::PermissionsExt;
+        let (td, auth) = backend();
+        let fp = [6u8; 32];
+        let linked = format!(
+            "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &linked);
+        assert!(auth.account_by_key(&fp).unwrap().is_some());
+        let path = td.path().join("alice.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        assert!(
+            std::fs::read(&path).is_err(),
+            "the file must be unreadable to this user"
+        );
+        // A server started on the directory, as one reading it after the
+        // file was rewritten would.
+        let fresh = FileAuth::new(td.path());
+        assert!(fresh.account_by_key(&fp).is_err(), "not answered as nobody");
+        assert!(fresh.find_by_fingerprint(&fp).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
