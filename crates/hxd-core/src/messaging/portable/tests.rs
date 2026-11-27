@@ -460,7 +460,7 @@ fn a_revoked_device_takes_its_presentations_with_it() {
 }
 
 #[test]
-fn a_revocation_lifted_while_its_drop_is_read_drops_nothing() {
+fn a_revocation_list_waits_for_a_sweep_under_way() {
     let (alice, bob, s, _) = offered_by_alice();
     let revoked = Fingerprint::of(&alice.devices[0].0.public()).0;
     let parked = s.fail.park.arm("offers_from");
@@ -472,47 +472,23 @@ fn a_revocation_lifted_while_its_drop_is_read_drops_nothing() {
             })
         });
         parked.arrived();
-        s.core.set_revocations(Revocations::default());
+        let lift = t.spawn(|| s.core.set_revocations(Revocations::default()));
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while !lift.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let waited = !lift.is_finished();
         parked.release();
         first.join().unwrap();
-    });
-    assert!(offering(&s, &alice, &bob), "the lifted device's offer");
-}
-
-#[test]
-fn a_revocation_lifted_before_its_sweep_runs_drops_nothing() {
-    let (alice, bob) = (person(1), person(2));
-    let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
-    made(&s, &alice, &bob);
-    let revoked = Fingerprint::of(&alice.devices[0].0.public()).0;
-    let installed = || {
-        s.core
-            .revoked
-            .read()
-            .unwrap()
-            .local
-            .devices
-            .contains(&revoked)
-    };
-    // The first install's sweep waits on the hold while a second lifts it.
-    std::thread::scope(|t| {
-        let writing = s.core.friend_writes();
-        let first = t.spawn(|| {
-            s.core.set_revocations(Revocations {
-                devices: [revoked].into(),
-                ..Default::default()
-            })
-        });
-        while !installed() {
-            std::thread::yield_now();
-        }
-        s.core.set_revocations(Revocations::default());
-        drop(writing);
-        first.join().unwrap();
+        lift.join().unwrap();
+        assert!(
+            waited,
+            "the lift was installed while the sweep's drop was read"
+        );
     });
     assert!(
-        (s.rel.presentation(&fp(&alice), &fp(&bob)).unwrap()).is_some(),
-        "the lifted device's presentation"
+        !offering(&s, &alice, &bob),
+        "dropped under the list it was read by"
     );
 }
 
@@ -982,12 +958,12 @@ fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
     let device = Fingerprint::of(&alice.devices[0].0.public()).0;
     let core = s.core.clone();
     let present = {
-        // Held as a cleanup or another act would hold it, so the act
-        // waits with its authorization not yet asked for.
+        // Held as a cleanup or another act would hold it, so the act and
+        // the list both wait on it, the act with its authorization not
+        // yet asked for; whichever goes first, the other follows it.
         let writing = s.core.friend_writes();
         let presenting =
             std::thread::spawn(move || core.friendships_present(a, vec![], vec![f]).map(|_| ()));
-        std::thread::sleep(std::time::Duration::from_millis(100));
         let core = s.core.clone();
         let revoking = std::thread::spawn(move || {
             core.set_revocations(Revocations {
@@ -995,19 +971,15 @@ fn a_device_revoked_while_an_act_waits_for_the_lock_records_nothing() {
                 ..Default::default()
             })
         });
-        let cert = crate::CertRef {
-            identity: fp(&alice),
-            device,
-            epoch: 0,
-        };
-        while !s.core.refuses(&cert) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
         drop(writing);
         revoking.join().unwrap();
         presenting.join().unwrap()
     };
-    assert_eq!(present, Err(MessagingError::NotDeviceProved));
+    assert!(
+        matches!(present, Ok(()) | Err(MessagingError::NotDeviceProved)),
+        "{present:?}"
+    );
     assert!(s
         .rel
         .presentation(&fp(&alice), &fp(&bob))

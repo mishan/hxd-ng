@@ -157,7 +157,10 @@ the rows it names, and ends only when a sweep or the step that does it
 finds it done, or what owed it lifted; the core keeps only when each is
 due. Every drop, owed or named now, reads what owes it under the hold
 just before it runs, so a link written or a list replaced first makes
-it moot.
+it moot, and one whose cause cannot be read is neither run nor ended.
+A revocation list is installed, and what it drops swept, under
+`friend_writes` too (then the publication lock `revoked`, then the
+roster): no sweep reads one list and writes under the next.
 
 **Outbox seqs are gapless.** Every event a session should see consumes a
 seq, including events the ng protocol can't express yet — those become

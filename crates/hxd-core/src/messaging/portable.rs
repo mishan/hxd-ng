@@ -3140,7 +3140,12 @@ impl Core {
 
     /// [`Self::sweep_offers`] under the hold the caller took, with the rows
     /// `first` names, just owed, due whatever their backoff.
-    fn sweep_held(&self, writing: &FriendWrites<'_>, fresh: Vec<(Work, Cause)>, first: &[OwedId]) {
+    pub(crate) fn sweep_held(
+        &self,
+        writing: &FriendWrites<'_>,
+        fresh: Vec<(Work, Cause)>,
+        first: &[OwedId],
+    ) {
         let Some(store) = self.relationships.as_ref() else {
             return;
         };
@@ -3282,21 +3287,8 @@ impl Core {
         let (mut parts, mut pairs) = (Vec::new(), Vec::new());
         let mut items = Vec::new();
         for (part, named, item) in batch.drain(..) {
-            // Asked again just before the write: a list is installed
-            // without the hold, so one replaced while the batch was read
-            // makes the drop moot.
-            match self.still_owed(&item.work, &item.cause) {
-                Ok(true) => {
-                    pairs.extend(named);
-                    parts.push(part);
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!("relationships: reading what owes friendship work: {e}");
-                    failed.push(item);
-                    continue;
-                }
-            }
+            pairs.extend(named);
+            parts.push(part);
             items.push(item);
         }
         let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();

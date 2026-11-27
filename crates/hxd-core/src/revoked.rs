@@ -311,6 +311,10 @@ impl Core {
     /// registrations newly revoked keys made (push-notifications.md
     /// §5.1): store work, so this is called off the reactor.
     pub fn set_revocations(&self, list: Revocations) -> Vec<(Uid, String)> {
+        // A list changes, and what it drops is swept, under the hold every
+        // drop is judged and written under: no sweep reads one list and
+        // writes under the next.
+        let writing = self.friend_writes();
         let (identities, devices): (Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             let new = list
@@ -356,7 +360,11 @@ impl Core {
             let identities = identities
                 .iter()
                 .map(|i| (Work::DropOffersNaming(*i), Cause::OperatorIdentity(*i)));
-            self.sweep_offers(presented.chain(devices).chain(identities).collect());
+            self.sweep_held(
+                &writing,
+                presented.chain(devices).chain(identities).collect(),
+                &[],
+            );
         }
         ended
     }
@@ -400,6 +408,8 @@ impl Core {
         mut list: Published,
         kept: &[[u8; 32]],
     ) -> Vec<(Uid, String)> {
+        // Under the hold, as `set_revocations` installs its list.
+        let writing = self.friend_writes();
         let (identities, devices, floors, newly): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
             let mut refused = self.revoked.write().unwrap();
             for id in kept {
@@ -475,8 +485,13 @@ impl Core {
             let identities = newly
                 .iter()
                 .map(|i| (Work::DropOffersNaming(*i), Cause::PublishedIdentity(*i)));
-            self.sweep_offers(presented.chain(offered).chain(identities).collect());
+            self.sweep_held(
+                &writing,
+                presented.chain(offered).chain(identities).collect(),
+                &[],
+            );
         }
+        drop(writing);
         self.reconcile_due(list.floors.keys().copied());
         ended
     }
