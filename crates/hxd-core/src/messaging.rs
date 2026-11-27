@@ -1850,6 +1850,17 @@ impl Core {
                 Some((&other, me, at))
             });
             if let Some((x, y, at)) = block.filter(|_| ends) {
+                // Told as `block_changed` tells it: the blocked party only
+                // where it saw a request go, had an upgrade waiting or lost
+                // a friendship.
+                let (blockers, blockeds) = match Key::of(x) == Key::of(me) {
+                    true => (Some(&mine), theirs.as_ref()),
+                    false => (theirs.as_ref(), Some(&mine)),
+                };
+                let shown =
+                    (blockers.and_then(|r| r.pending_out.as_ref())).is_some_and(|p| p.delivered);
+                let upgraded =
+                    (blockeds.and_then(|r| r.pending_out.as_ref())).is_some_and(|p| p.upgrade);
                 let ending = self.end_here(store, x, y, &[]).map(|here| Ending {
                     block: Some(at),
                     friendship: true,
@@ -1857,11 +1868,14 @@ impl Core {
                 });
                 match ending.and_then(|end| self.end_friendship(store, x, y, &end)) {
                     Ok((ended, left)) => {
+                        let unsaid = ended.ended.is_none() && !shown && !upgraded;
                         if let Some(e) = ended.ended {
                             let [a, b] = &e.parties;
                             self.roster.lock().unwrap().friends_changed(a, b, false);
                         }
-                        let to = to(&left);
+                        let mut to = to(&left);
+                        let theirs_at = usize::from(Key::of(&left.pair[1]) == Key::of(y));
+                        to[theirs_at] &= !unsaid;
                         told.push((left, to));
                     }
                     Err(e) => {
