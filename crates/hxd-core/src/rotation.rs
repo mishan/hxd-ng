@@ -81,7 +81,17 @@ impl Core {
         );
         // By the login the account link now gives it, so a friend with no
         // row of its own naming the successor is told too.
-        let account = (self.directory.as_ref()).and_then(|d| d.account_by_key(to).ok().flatten());
+        // One the directory cannot answer for is not guessed past: the
+        // rotation goes on, the link being moved already, owing the drops
+        // of a key no account links, which are judged again, and leaving
+        // its merge's settling owed for a sweep that can read it.
+        let (account, unread) = match self.directory.as_ref().map(|d| d.account_by_key(to)) {
+            Some(Err(e)) => {
+                tracing::warn!("relationships: looking up a rotation's successor: {e}");
+                (None, true)
+            }
+            found => (found.and_then(Result::ok).flatten(), false),
+        };
         let linked = account.is_some();
         let successor = account.map_or_else(|| new.clone(), |(m, _)| m);
         if let Some(store) = self.inbox.as_ref() {
@@ -127,7 +137,7 @@ impl Core {
             }
             self.rekey_friends(&writing, &old, &successor);
             self.merge_dropped(&writing, store, &rekeyed, ended_left);
-            if self.after_merge(&writing, &successor) {
+            if !unread && self.after_merge(&writing, &successor) {
                 let settling: Vec<_> = rekeyed.owed.first().copied().into_iter().collect();
                 if let Err(e) = store.settle(&settling) {
                     tracing::warn!("relationships: settling a rotation's merge: {e}");

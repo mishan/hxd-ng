@@ -377,7 +377,9 @@ as AGENTS.md's "Releasing" describes it.
   read now fails a lookup of an identity's account that no other file
   answers, where it used to be taken for one linking no key: while such
   a file is there, a login or a link by an identity no readable file
-  links is refused. A malformed file is still skipped and logged. An
+  links is refused, and so is a friendship act naming such a key
+  (presenting, fetching, finding or removing by key, answering a
+  request), while the friendship work owed for one waits. A malformed file is still skipped and logged. An
   unlink whose drops cannot be recorded is refused. A claim's or a rotation's
   settling of a block or a request left beside a friendship, in a row
   of either party's, which a failed write used to leave for good, is

@@ -785,11 +785,13 @@ impl Core {
         action: RequestAction,
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
-        if let Some((them, _)) = self
-            .directory
-            .as_ref()
-            .and_then(|d| d.account_by_key(fingerprint).ok().flatten())
-        {
+        let account = match self.directory.as_ref() {
+            Some(d) => d
+                .account_by_key(fingerprint)
+                .map_err(|_| MessagingError::ServerError)?,
+            None => None,
+        };
+        if let Some((them, _)) = account {
             return self.answer_account(uid, &me, them, action);
         }
         if !self.names_identities(uid) {

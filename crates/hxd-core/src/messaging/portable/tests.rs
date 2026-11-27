@@ -5558,6 +5558,55 @@ fn a_presentation_the_directory_cannot_answer_for_is_the_servers_failure() {
 }
 
 #[test]
+fn a_rotation_whose_successor_cannot_be_read_leaves_its_settling_owed() {
+    let (alice, bob, successor) = (person(1), person(2), person(4));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts.clone(), Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    s.core.keep_rotation_record(&rotation(&alice, &successor));
+    let link = |_: &[u8; 32]| {
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&successor));
+        dir.1.store(true, Ordering::SeqCst);
+        Ok(())
+    };
+    (s.core)
+        .rotate_identity_linking(&fp(&alice), &fp(&successor), false, |to| *to, link)
+        .unwrap();
+    dir.1.store(false, Ordering::SeqCst);
+    let settles = || {
+        let owed = s.rel.owed().unwrap();
+        owed.iter()
+            .filter(|o| o.work == Work::Settle(fp(&successor)))
+            .count()
+    };
+    assert_eq!(settles(), 1, "left owed");
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert_eq!(settles(), 0, "settled once the directory answers");
+}
+
+#[test]
+fn a_request_answered_by_a_key_the_directory_cannot_read_is_the_servers_failure() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts, Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    let (b, _) = device(&s.core, "bob", &bob, 0);
+    dir.1.store(true, Ordering::SeqCst);
+    let answer = s
+        .core
+        .request_answer_by_key(b, &fp(&alice), RequestAction::Delete);
+    dir.1.store(false, Ordering::SeqCst);
+    assert_eq!(answer, Err(MessagingError::ServerError));
+}
+
+#[test]
 fn a_link_made_again_keeps_its_presentations_while_a_rotation_moves_its_link() {
     let (alice, bob, s, accounts) = unlinked_owing();
     let successor = person(4);
