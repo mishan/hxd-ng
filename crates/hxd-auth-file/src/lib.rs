@@ -1488,15 +1488,24 @@ impl FileAuth {
             if !valid_login(login) {
                 continue;
             }
-            let stamp = match entry.metadata() {
+            // Through a symlink, as the read is.
+            let stamp = match std::fs::metadata(entry.path()) {
                 // Nothing an account can be kept in.
                 Ok(m) if !m.is_file() => continue,
                 Ok(m) => FileStamp {
                     len: m.len(),
                     modified: m.modified().ok(),
                 },
-                // Vanished mid-scan; the read below would say the same.
-                Err(_) => continue,
+                // Vanished mid-scan, or a link to nothing; the read below
+                // would say the same.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Listed with no stamp, which never settles, so the file is
+                // read, and a read that fails says so, rather than the
+                // account going unseen.
+                Err(_) => FileStamp {
+                    len: 0,
+                    modified: None,
+                },
             };
             out.push((login.to_owned(), stamp));
         }
@@ -2327,6 +2336,33 @@ mod tests {
             "bob"
         );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_account_file_that_cannot_be_looked_at_leaves_a_key_lookup_unanswered() {
+        use std::os::unix::fs::PermissionsExt;
+        let (td, auth) = backend();
+        let fp = [6u8; 32];
+        let linked = format!(
+            "password = \"pw\"\n[identity]\nfingerprint = \"{}\"\n",
+            hl_identity::Fingerprint(fp)
+        );
+        write(td.path(), "alice.toml", &linked);
+        assert!(auth.account_by_key(&fp).unwrap().is_some());
+        // The directory listed but not searched: each entry's metadata
+        // fails, and not as missing.
+        let mode = |m| std::fs::set_permissions(td.path(), std::fs::Permissions::from_mode(m));
+        mode(0o400).unwrap();
+        let looked = std::fs::metadata(td.path().join("alice.toml"));
+        if looked.is_ok() {
+            mode(0o700).unwrap();
+            return;
+        }
+        let fresh = FileAuth::new(td.path());
+        let answer = fresh.account_by_key(&fp);
+        mode(0o700).unwrap();
+        assert!(answer.is_err(), "not answered as nobody: {answer:?}");
     }
 
     #[test]
