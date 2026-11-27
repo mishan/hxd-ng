@@ -2173,6 +2173,9 @@ pub struct Core {
     /// What the classic wire appends to a bot's nick
     /// (`[server] bot_suffix`); empty for nothing.
     pub(crate) bot_suffix: String,
+    /// `[link] show_tags`: the classic wire shows a linked server's users
+    /// as `name@tag`.
+    pub(crate) tagged_names: bool,
     pub(crate) request_keyer: crate::relationships::RequestKeyer,
     /// Held across a relationship store write and the roster's copy of
     /// what it changed, and across loading a mailbox's friends, so the
@@ -2471,6 +2474,15 @@ impl Core {
 
     pub fn bot_suffix(&self) -> &str {
         &self.bot_suffix
+    }
+
+    pub fn with_tagged_names(mut self, on: bool) -> Self {
+        self.tagged_names = on;
+        self
+    }
+
+    pub fn tagged_names(&self) -> bool {
+        self.tagged_names
     }
 
     pub fn new() -> Self {

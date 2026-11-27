@@ -388,7 +388,7 @@ pub(crate) fn parse_get<'a>(
 /// and with a key who holds it, by the nick each reacted under. `None`
 /// past what one frame carries, which only targets at the largest caps
 /// reach.
-pub(crate) fn asked(answers: &[Asked], enc: TextEncoding) -> Option<Chunks> {
+pub(crate) fn asked(answers: &[Asked], names: &crate::names::Names) -> Option<Chunks> {
     let mut out = Chunks::new();
     for a in answers {
         let Some(target) = pack_target(&a.target) else {
@@ -400,12 +400,7 @@ pub(crate) fn asked(answers: &[Asked], enc: TextEncoding) -> Option<Chunks> {
             out.push((DATA_REACTION_MINE, mine(&a.shown.mine)));
         }
         let from = a.from.iter().flatten();
-        out.extend(from.map(|nick| {
-            (
-                hxproto::messages::tag::NAME,
-                crate::session::wire_nick(enc, nick),
-            )
-        }));
+        out.extend(from.map(|nick| (hxproto::messages::tag::NAME, names.nick(nick, None))));
     }
     (group_len(&out) <= PAGE_BUDGET).then_some(out)
 }
@@ -1263,7 +1258,10 @@ mod tests {
             (DATA_TARGET, line_bytes(1, 0, 4)),
             (DATA_REACTION_SUMMARY, vec![0, 0]),
         ];
-        assert_eq!(asked(&answers, TextEncoding::Utf8), Some(want));
+        assert_eq!(
+            asked(&answers, &crate::names::Names::plain(TextEncoding::Utf8)),
+            Some(want)
+        );
     }
 
     /// A reply that fills a frame is sent, and one a byte past it is not.
@@ -1278,7 +1276,8 @@ mod tests {
                 )
             })
             .collect();
-        let used = group_len(&asked(&answers, TextEncoding::Utf8).unwrap());
+        let used =
+            group_len(&asked(&answers, &crate::names::Names::plain(TextEncoding::Utf8)).unwrap());
         // A target, and a summary of one key of `n` bytes.
         let rest = PAGE_BUDGET - used - (4 + 13) - (4 + 2 + 4 + 2 + 1);
         let last = |n: usize| {
@@ -1286,10 +1285,14 @@ mod tests {
             answer(Reply::Line { room: 7, id: 99 }, vec![(key, 1)], vec![])
         };
         answers.push(last(rest));
-        let full = asked(&answers, TextEncoding::Utf8).expect("a full frame");
+        let full =
+            asked(&answers, &crate::names::Names::plain(TextEncoding::Utf8)).expect("a full frame");
         assert_eq!(group_len(&full), PAGE_BUDGET);
         *answers.last_mut().unwrap() = last(rest + 1);
-        assert_eq!(asked(&answers, TextEncoding::Utf8), None);
+        assert_eq!(
+            asked(&answers, &crate::names::Names::plain(TextEncoding::Utf8)),
+            None
+        );
     }
 
     #[test]

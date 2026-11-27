@@ -593,7 +593,7 @@ fn catlist_post(core: &Core, who: Asker, l: &Listed) -> Vec<u8> {
     } else {
         (
             who.enc.encode_capped(&l.subject, 255),
-            who.enc.encode_capped(&l.nick, 255),
+            crate::names::Names::of(who.enc, core).field(&l.nick, 255),
         )
     };
     let parts = parts(l);
@@ -720,7 +720,7 @@ fn get_thread(
     } else {
         (
             who.enc.encode_capped(&a.subject, 255),
-            who.enc.encode_capped(&a.author.nick, 255),
+            crate::names::Names::of(who.enc, core).field(&a.author.nick, 255),
         )
     };
     // mhxd's field order. The neighbors are 0, "none": mhxd's are
@@ -934,7 +934,10 @@ fn flat_document(core: &Core, cfg: &LegacyNews, who: Asker) -> Result<Chunks, Ne
         return Ok(vec![(tag::NEWS, who.enc.body(THREADED_ONLY))]);
     };
     let articles = core.news_recent(who.uid, category, flat.articles.saturating_add(1))?;
-    Ok(vec![(tag::NEWS, render_document(who.enc, flat, &articles))])
+    Ok(vec![(
+        tag::NEWS,
+        render_document(&crate::names::Names::of(who.enc, core), flat, &articles),
+    )])
 }
 
 /// The flat document (§12.5): a masthead, then entries newest first until
@@ -944,7 +947,12 @@ fn flat_document(core: &Core, cfg: &LegacyNews, who: Asker) -> Result<Chunks, Ne
 ///
 /// `articles` is newest first and may be one longer than `flat.articles`,
 /// which is how "more than fits" is known without a count.
-pub(crate) fn render_document(enc: TextEncoding, flat: &FlatNews, articles: &[Article]) -> Vec<u8> {
+pub(crate) fn render_document(
+    names: &crate::names::Names,
+    flat: &FlatNews,
+    articles: &[Article],
+) -> Vec<u8> {
+    let enc = names.enc;
     let masthead = match flat.masthead.as_deref() {
         Some("") => None,
         Some(line) => Some(line.to_string()),
@@ -968,7 +976,7 @@ pub(crate) fn render_document(enc: TextEncoding, flat: &FlatNews, articles: &[Ar
     let mut oldest = None;
     let mut left_over = articles.len() > flat.articles;
     for (i, a) in articles.iter().take(flat.articles).enumerate() {
-        let entry = enc.body(&render_entry(a));
+        let entry = enc.body(&render_entry(a, names));
         let room = CHUNK_MAX.saturating_sub(out.len() + reserve);
         if entry.len() > room {
             if i > 0 {
@@ -997,13 +1005,13 @@ fn older_notice(oldest: ArticleId) -> String {
 /// (§12.5): mhxd's frame — who, when, a blank line, the text, the divider
 /// — with the id after the date and the two headers a 1.2 user types to
 /// set a subject and reply.
-pub(crate) fn render_entry(a: &Article) -> String {
+pub(crate) fn render_entry(a: &Article, names: &crate::names::Names) -> String {
     let mut s = String::new();
     if a.deleted {
         s.push_str("From (deleted)");
     } else {
         s.push_str("From ");
-        s.push_str(&a.author.nick);
+        s.push_str(&names.text(&a.author.nick));
         if let Some(login) = &a.author.login {
             s.push_str(" - ");
             s.push_str(login);
@@ -1256,7 +1264,10 @@ pub(crate) async fn flat_push(
                     Err(_) => return Err(()),
                 }
                 match core.news_article(who.uid, id) {
-                    Ok(article) => Ok(Some(Arc::from(render_entry(&article)))),
+                    Ok(article) => Ok(Some(Arc::from(render_entry(
+                        &article,
+                        &crate::names::Names::of(who.enc, core),
+                    )))),
                     Err(NewsError::NoSuchArticle) => Ok(None),
                     Err(_) => Err(()),
                 }
@@ -1431,7 +1442,7 @@ mod tests {
             "The derivative and the u16",
             "The part size.\n",
         );
-        let entry = render_entry(&a);
+        let entry = render_entry(&a, &crate::names::Names::plain(U8));
         assert_eq!(
             entry,
             format!(
@@ -1461,7 +1472,7 @@ mod tests {
             name: Some("screenshot.png".into()),
             legacy: None,
         }];
-        let entry = render_entry(&a);
+        let entry = render_entry(&a, &crate::names::Names::plain(U8));
         assert!(entry.contains("\n\nbold words\n[image: screenshot.png]\n"));
         assert!(!entry.contains("**"));
     }
@@ -1476,7 +1487,7 @@ mod tests {
             fingerprint: None,
         };
         assert_eq!(
-            render_entry(&a),
+            render_entry(&a, &crate::names::Names::plain(U8)),
             format!("From (deleted)\n[Wed Sep  9 12:00:00 2026 UTC]  #9\nRe: #3\n\n{DIVIDER}\n")
         );
     }
@@ -1488,7 +1499,7 @@ mod tests {
             .rev()
             .map(|id| article(id, None, "s", &big))
             .collect();
-        let doc = render_document(MR, &flat(100), &articles);
+        let doc = render_document(&crate::names::Names::plain(MR), &flat(100), &articles);
         assert!(doc.len() <= CHUNK_MAX);
         let text = String::from_utf8(doc).unwrap();
         assert!(text.contains("#5\r") && text.contains("#3\r"));
@@ -1496,10 +1507,10 @@ mod tests {
         assert!(text.ends_with("Older articles go on past #3, the oldest shown here.\r"));
 
         // Under the budget and the count, nothing is said.
-        let doc = render_document(MR, &flat(100), &articles[..2]);
+        let doc = render_document(&crate::names::Names::plain(MR), &flat(100), &articles[..2]);
         assert!(!String::from_utf8(doc).unwrap().contains("Older"));
         // Over the count, it is.
-        let doc = render_document(MR, &flat(1), &articles[..2]);
+        let doc = render_document(&crate::names::Names::plain(MR), &flat(1), &articles[..2]);
         let text = String::from_utf8(doc).unwrap();
         assert!(text.contains("#5\r") && !text.contains("#4\r"));
         assert!(text.contains("past #5"));
@@ -1512,14 +1523,14 @@ mod tests {
             article(1, None, "s", "small"),
         ];
         for enc in [MR, U8] {
-            let doc = render_document(enc, &flat(100), &articles);
+            let doc = render_document(&crate::names::Names::plain(enc), &flat(100), &articles);
             assert!(doc.len() <= CHUNK_MAX);
             let text = enc.decode(&doc);
             assert!(text.contains("#2"));
             assert!(text.contains('\u{2026}'));
             assert!(text.contains("past #2"));
         }
-        let doc = render_document(U8, &flat(100), &articles);
+        let doc = render_document(&crate::names::Names::plain(U8), &flat(100), &articles);
         assert!(std::str::from_utf8(&doc).is_ok(), "cut on a character");
     }
 
@@ -1528,14 +1539,17 @@ mod tests {
         let a = [article(1, None, "s", "b")];
         let mut f = flat(10);
         f.masthead = None;
-        let text = String::from_utf8(render_document(MR, &f, &a)).unwrap();
+        let text =
+            String::from_utf8(render_document(&crate::names::Names::plain(MR), &f, &a)).unwrap();
         assert!(text.starts_with("News from \"General\""));
         assert!(text.contains("Subject: and Re: #<number>"));
         f.masthead = Some("Welcome.".into());
-        let text = String::from_utf8(render_document(MR, &f, &a)).unwrap();
+        let text =
+            String::from_utf8(render_document(&crate::names::Names::plain(MR), &f, &a)).unwrap();
         assert!(text.starts_with(&format!("Welcome.\r{DIVIDER}\rFrom Alice")));
         f.masthead = Some(String::new());
-        let text = String::from_utf8(render_document(MR, &f, &a)).unwrap();
+        let text =
+            String::from_utf8(render_document(&crate::names::Names::plain(MR), &f, &a)).unwrap();
         assert!(text.starts_with("From Alice"));
     }
 
@@ -1545,7 +1559,7 @@ mod tests {
         let mut f = flat(10);
         for enc in [MR, U8] {
             f.masthead = Some("\u{e9}".repeat(70_000));
-            let doc = render_document(enc, &f, &a);
+            let doc = render_document(&crate::names::Names::plain(enc), &f, &a);
             assert!(doc.len() <= CHUNK_MAX, "{}", doc.len());
             let text = enc.decode(&doc);
             assert!(text.contains("]  #1"), "the entry is there");

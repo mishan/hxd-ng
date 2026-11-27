@@ -2776,8 +2776,7 @@ fn wider_than_one(wide: &str, n: usize, one: &str, per: usize) -> Result<(), Str
     Ok(())
 }
 
-/// In UTF-8 bytes, which is at least as many as the suffix takes on
-/// either encoding of the classic wire, out of a nick's 31.
+/// Out of a nick's 31 bytes.
 const BOT_SUFFIX_MAX: usize = 12;
 
 impl Default for ServerSection {
@@ -3630,10 +3629,18 @@ fn build_identity(
 /// messages never arrive.
 pub fn check_config(config: &Config) -> Result<(), String> {
     let suffix = &config.server.bot_suffix;
-    if suffix.len() > BOT_SUFFIX_MAX || suffix.chars().any(char::is_control) {
+    // Printable ASCII, so it reads the same in Mac Roman and UTF-8 and can
+    // be told in a name as it is sent; and apart from the name, so a
+    // user's own nick is never one with it.
+    if !suffix.is_empty()
+        && (suffix.len() > BOT_SUFFIX_MAX
+            || !suffix.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+            || suffix.trim().is_empty()
+            || suffix.starts_with(|c: char| c.is_ascii_alphanumeric()))
+    {
         return Err(format!(
-            "[server] bot_suffix is at most {BOT_SUFFIX_MAX} bytes, none of them control \
-             characters, so a bot's nick keeps room for its name"
+            "[server] bot_suffix is up to {BOT_SUFFIX_MAX} printable ASCII characters, \
+             beginning with a space or a mark rather than a letter or digit: \" [bot]\", say"
         ));
     }
     if !config.server.classic {
@@ -4865,7 +4872,8 @@ pub fn build_ctx(
         .with_bulk_rows(config.roles.bulk_rows)
         .with_coalesce(config.server.coalesce)
         .with_pronouns(config.server.pronouns)
-        .with_bot_suffix(config.server.bot_suffix.clone());
+        .with_bot_suffix(config.server.bot_suffix.clone())
+        .with_tagged_names(config.link.as_ref().is_some_and(|l| l.show_tags));
     let core = match &config.ng {
         Some(ng) => core.with_detached_per_login(ng.max_detached_per_login),
         None => core,
@@ -6755,11 +6763,15 @@ sync = "full"
     #[test]
     fn a_bot_suffix_leaves_a_nick_room_for_its_name() {
         for (suffix, ok) in [
+            ("", true),
             (" [bot]", true),
+            (" bot", true),
             ("[123456789]", true),
             ("[1234567890]", true),
             ("[12345678901]", false),
-            ("\u{1f916}\u{1f916}\u{1f916}\u{1f916}", false),
+            ("bot", false),
+            ("   ", false),
+            (" \u{2699}", false),
             (" bot\\t", true),
             (" bot\t", false),
         ] {

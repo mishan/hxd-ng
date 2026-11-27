@@ -201,6 +201,10 @@ from, and each frontend renders them.
 the name is cut to leave room for the tag within the 31-byte nick cap, so
 the cut never takes the tag. In chat lines, the name is cut to fit
 `@tag` inside `name_column`'s 13 columns, so the tag survives there too.
+No other name it sends ends in `@` and a tag's worth of characters, as
+written and cut (`hxd_session::names`), so no local user reads there as
+another server's; the lines the server writes about a user, mhxd's kick
+notices among them, keep the nick as it is.
 `wire_color` adds 4 (refuses private messages) from `refuses_msgs` and 8
 (refuses private chat) on every ghost, and never 16 (cleartext).
 
