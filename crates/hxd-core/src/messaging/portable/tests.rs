@@ -4086,6 +4086,7 @@ fn a_copy_dropped_under_a_predecessor_judges_its_successors_again() {
     let under = Some(fp(&old));
     s.core
         .sweep_offers(vec![(Work::DropPresentedBy { under, device }, cause)]);
+    assert!(later().is_some(), "made by another device");
     s.core.judge_floors([fp(&new)]);
     assert!(later().is_none());
 }

@@ -1076,6 +1076,14 @@ impl Run {
                 .rotate_identity(&from, &to)
                 .expect("a rotation made again");
         }
+        // A merge whose settling failed is owed it, done before what the
+        // merge left is judged, as the next tick would do it.
+        let owed = self.store.owed().unwrap();
+        if owed.iter().any(|o| o.work == Work::Settle(to)) {
+            let writing = self.core.friend_writes();
+            let successor = Mailbox::identified(LOGINS[p], to);
+            assert!(self.core.after_merge(&writing, &successor), "settled");
+        }
         self.settled(p, from, to, &before);
         self.rotated[p] = true;
         let old = std::mem::replace(&mut self.people[p], next);
@@ -1897,8 +1905,11 @@ impl Run {
             self.core.owed_tick();
             self.core.reconcile_due(listed.iter().copied());
         }
-        let owed = self.store.owed().unwrap();
-        assert!(owed.is_empty(), "converged owing {owed:?}");
+        let (owed, unwritten) = (self.store.owed().unwrap(), self.core.owed_unwritten());
+        assert!(
+            owed.is_empty() && unwritten.is_empty(),
+            "converged owing {owed:?}, and in memory {unwritten:?}"
+        );
         // State a crowded rotation wrote by hand, which no act made, is not
         // held to work that ended before it was written.
         for o in self.ever_owed.iter().filter(|_| !self.crowded) {
