@@ -788,7 +788,7 @@ impl Core {
         if let Some((them, _)) = self
             .directory
             .as_ref()
-            .and_then(|d| d.account_by_key(fingerprint))
+            .and_then(|d| d.account_by_key(fingerprint).ok().flatten())
         {
             return self.answer_account(uid, &me, them, action);
         }

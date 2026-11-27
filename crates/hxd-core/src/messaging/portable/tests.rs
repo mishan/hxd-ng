@@ -2542,12 +2542,15 @@ impl crate::AccountDirectory for Switch {
         found.map(|(_, a)| *a)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, crate::AccessBits)> {
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, crate::AccessBits)>, StoreError> {
         let accounts = self.0.lock().unwrap();
-        accounts
+        Ok(accounts
             .iter()
             .find(|(m, _)| m.fingerprint == Some(*fp))
-            .cloned()
+            .cloned())
     }
 }
 
@@ -2628,10 +2631,15 @@ impl crate::AccountDirectory for Unmessaging {
         self.0.mailbox_access(who).map(|b| self.access(who, b))
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, crate::AccessBits)> {
-        let (m, b) = self.0.account_by_key(fp)?;
-        let b = self.access(&m, b);
-        Some((m, b))
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, crate::AccessBits)>, StoreError> {
+        let found = self.0.account_by_key(fp)?;
+        Ok(found.map(|(m, b)| {
+            let b = self.access(&m, b);
+            (m, b)
+        }))
     }
 }
 
@@ -5390,6 +5398,71 @@ fn an_unlinks_drops_are_moot_once_a_link_is_written_however_its_call_ends() {
         "kept"
     );
     assert_eq!(s.rel.owed().unwrap(), [], "settled unrun");
+}
+
+/// A directory whose lookups by key can be made to fail, as a file
+/// directory's scan can.
+#[derive(Clone)]
+struct Unreadable(Switch, Arc<AtomicBool>);
+
+impl crate::AccountDirectory for Unreadable {
+    fn inbox_account(&self, login: &str) -> Option<Mailbox> {
+        self.0.inbox_account(login)
+    }
+
+    fn mailbox_access(&self, who: &Mailbox) -> Option<crate::AccessBits> {
+        self.0.mailbox_access(who)
+    }
+
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, crate::AccessBits)>, StoreError> {
+        match self.1.load(Ordering::SeqCst) {
+            true => Err(StoreError("the accounts directory".into())),
+            false => self.0.account_by_key(fp),
+        }
+    }
+}
+
+#[test]
+fn an_unlinks_drop_is_left_owed_while_the_link_cannot_be_read() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts.clone(), Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = device(&s.core, "alice", &alice, 0);
+    s.core
+        .friend_ask(a, "bob", None, Some(offer(&alice, 0, &bob, now())))
+        .unwrap();
+    // Unlinked with its drop failing, linked again with the settling after
+    // the link failing: owed, and moot.
+    s.fail.fail_next("write");
+    unlinked(&s, &accounts, &fp(&alice));
+    assert_eq!(s.fail.failed(), Some("write"));
+    s.fail.fail_next("owed");
+    let relinked = s.core.friendships_linking(&fp(&alice), || {
+        accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+        Ok::<_, StoreError>(())
+    });
+    assert!(relinked.is_ok());
+    let owed = || s.rel.owed().unwrap().len();
+    assert_ne!(owed(), 0);
+
+    dir.1.store(true, Ordering::SeqCst);
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert!(offering(&s, &alice, &bob), "the linked identity's offer");
+    assert_ne!(owed(), 0, "still owed");
+
+    dir.1.store(false, Ordering::SeqCst);
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert!(offering(&s, &alice, &bob), "kept");
+    assert_eq!(owed(), 0, "settled unrun once it reads as linked");
 }
 
 #[test]

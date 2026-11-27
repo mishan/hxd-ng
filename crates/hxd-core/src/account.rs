@@ -824,14 +824,17 @@ pub trait AccountDirectory: Send + Sync + 'static {
         Some((mailbox, access))
     }
 
-    /// The account linked to `fingerprint`, the same way.
+    /// The account linked to `fingerprint`, the same way: an error where
+    /// the directory could not be read, so that a caller deciding from a
+    /// key's link that it has none can tell that apart.
     fn account_by_key(
         &self,
         fingerprint: &[u8; 32],
-    ) -> Option<(crate::inbox::Mailbox, AccessBits)> {
+    ) -> Result<Option<(crate::inbox::Mailbox, AccessBits)>, crate::inbox::StoreError> {
         let mailbox = crate::inbox::Mailbox::identified(String::new(), *fingerprint);
-        let access = self.mailbox_access(&mailbox)?;
-        Some((mailbox, access))
+        Ok(self
+            .mailbox_access(&mailbox)
+            .map(|access| (mailbox, access)))
     }
 }
 

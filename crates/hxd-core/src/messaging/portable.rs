@@ -1129,7 +1129,7 @@ impl Core {
 
     /// The account linked to `fp` that takes part, if there is one.
     fn mailbox_of(&self, fp: &[u8; 32]) -> Option<Mailbox> {
-        let (m, access) = self.directory.as_ref()?.account_by_key(fp)?;
+        let (m, access) = self.directory.as_ref()?.account_by_key(fp).ok()??;
         takes_part(&m.login, access).then_some(m)
     }
 
@@ -3194,9 +3194,18 @@ impl Core {
             // Named now or owed, each is held to what owes it here, under
             // the hold: a list replaced or a key linked since it was named
             // makes it moot.
-            if !self.still_owed(&item.work, &item.cause) {
-                settled.extend(item.id);
-                continue;
+            match self.still_owed(&item.work, &item.cause) {
+                Ok(true) => {}
+                Ok(false) => {
+                    settled.extend(item.id);
+                    continue;
+                }
+                // Neither run nor moot: what owes it could not be read.
+                Err(e) => {
+                    warn!("relationships: reading what owes friendship work: {e}");
+                    failed.push(item);
+                    continue;
+                }
             }
             // One named now is done where its rows went; owed work is
             // owed there already.
@@ -3276,9 +3285,17 @@ impl Core {
             // Asked again just before the write: a list is installed
             // without the hold, so one replaced while the batch was read
             // makes the drop moot.
-            if self.still_owed(&item.work, &item.cause) {
-                pairs.extend(named);
-                parts.push(part);
+            match self.still_owed(&item.work, &item.cause) {
+                Ok(true) => {
+                    pairs.extend(named);
+                    parts.push(part);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!("relationships: reading what owes friendship work: {e}");
+                    failed.push(item);
+                    continue;
+                }
             }
             items.push(item);
         }
@@ -3424,7 +3441,7 @@ impl Core {
     /// The mailbox a key's pairs are settled under: its account's, or the
     /// key's alone.
     fn settling(&self, fp: &[u8; 32]) -> Mailbox {
-        let account = self.directory.as_ref().and_then(|d| d.account_by_key(fp));
+        let account = (self.directory.as_ref()).and_then(|d| d.account_by_key(fp).ok().flatten());
         account.map_or_else(|| Mailbox::identified("", *fp), |(m, _)| m)
     }
 
@@ -3527,15 +3544,17 @@ impl Core {
         format!("{sweeps} {judged:?} {revoked} {reconciled}")
     }
 
-    /// Whether what owes `work` still stands.
-    fn still_owed(&self, work: &Work, cause: &Cause) -> bool {
+    /// Whether what owes `work` still stands; an error where that could
+    /// not be read, which neither runs the work nor ends it.
+    fn still_owed(&self, work: &Work, cause: &Cause) -> Result<bool, StoreError> {
         match cause {
-            Cause::Always => return true,
+            Cause::Always => return Ok(true),
             // Linked again is the evidence, whatever the account may do.
             Cause::Unlinked => {
-                let dir = self.directory.as_ref();
-                return key_of(work)
-                    .is_none_or(|k| dir.is_none_or(|d| d.account_by_key(&k).is_none()));
+                return match (key_of(work), self.directory.as_ref()) {
+                    (Some(k), Some(d)) => Ok(d.account_by_key(&k)?.is_none()),
+                    _ => Ok(true),
+                };
             }
             _ => {}
         }
@@ -3545,7 +3564,7 @@ impl Core {
         let r = self.revoked.read().unwrap();
         let published =
             |identity: &[u8; 32], listed: bool| listed || !r.published.covered.contains(identity);
-        match cause {
+        Ok(match cause {
             Cause::OperatorDevice(device) => r.local.devices.contains(device),
             Cause::OperatorIdentity(identity) => r.local.identities.contains(identity),
             Cause::PublishedDevice { identity, device } => published(
@@ -3556,7 +3575,7 @@ impl Core {
                 published(identity, r.published.identities.contains(identity))
             }
             Cause::Unlinked | Cause::Always => unreachable!("answered above"),
-        }
+        })
     }
 
     /// What `work`, a drop of offers, drops, read first, and each pair it
@@ -3722,7 +3741,7 @@ impl Core {
         let moot = |o: &crate::relationships::Owed| {
             o.cause == Cause::Unlinked
                 && key_of(&o.work) == Some(key)
-                && !self.still_owed(&o.work, &o.cause)
+                && self.still_owed(&o.work, &o.cause).is_ok_and(|owed| !owed)
         };
         let owed: Vec<_> = store
             .owed()?

@@ -31,11 +31,15 @@ impl AccountDirectory for Directory {
             .map(|(_, a)| *a)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
-        self.0
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
+        Ok(self
+            .0
             .iter()
             .find(|(m, _)| m.fingerprint == Some(*fp))
-            .cloned()
+            .cloned())
     }
 }
 
@@ -2577,7 +2581,10 @@ impl AccountDirectory for Holding {
         self.0.mailbox_access(who)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
         self.1.at("account_by_key");
         self.0.account_by_key(fp)
     }

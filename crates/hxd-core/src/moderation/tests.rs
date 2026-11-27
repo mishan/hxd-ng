@@ -1382,8 +1382,12 @@ impl AccountDirectory for NoMail {
         })
     }
 
-    fn account_by_key(&self, key: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
-        self.0
+    fn account_by_key(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
+        Ok(self
+            .0
              .0
             .iter()
             .find(|(_, (fp, _))| fp.as_ref() == Some(key))
@@ -1395,7 +1399,7 @@ impl AccountDirectory for NoMail {
                     },
                     *access,
                 )
-            })
+            }))
     }
 }
 

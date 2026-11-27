@@ -1737,8 +1737,13 @@ impl AccountDirectory for FileAuth {
         Some(keyed(account))
     }
 
-    fn account_by_key(&self, fingerprint: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
-        Some(keyed(self.find_by_fingerprint(fingerprint).ok()??))
+    fn account_by_key(
+        &self,
+        fingerprint: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, hxd_core::inbox::StoreError> {
+        let found = self.find_by_fingerprint(fingerprint);
+        let found = found.map_err(|e| hxd_core::inbox::StoreError(e.to_string()))?;
+        Ok(found.map(keyed))
     }
 }
 
@@ -2835,11 +2840,11 @@ mod tests {
         let (mailbox, access) = auth.account("Boss").expect("by login");
         assert_eq!(mailbox, Mailbox::identified("boss", fp));
         assert!(access.has(bit::CANT_BE_DISCONNECTED));
-        let (mailbox, access) = auth.account_by_key(&fp).expect("by key");
+        let (mailbox, access) = auth.account_by_key(&fp).unwrap().expect("by key");
         assert_eq!(mailbox.login, "boss");
         assert!(access.has(bit::CANT_BE_DISCONNECTED));
         assert_eq!(auth.account("nobody"), None);
-        assert_eq!(auth.account_by_key(&[0x4fu8; 32]), None);
+        assert_eq!(auth.account_by_key(&[0x4fu8; 32]).unwrap(), None);
     }
 
     #[test]

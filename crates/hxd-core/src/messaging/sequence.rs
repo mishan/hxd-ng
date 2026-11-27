@@ -172,12 +172,15 @@ impl AccountDirectory for Directory {
             .map(|(_, a)| *a)
     }
 
-    fn account_by_key(&self, fp: &[u8; 32]) -> Option<(Mailbox, AccessBits)> {
+    fn account_by_key(
+        &self,
+        fp: &[u8; 32],
+    ) -> Result<Option<(Mailbox, AccessBits)>, crate::inbox::StoreError> {
         let accounts = self.0.lock().unwrap();
-        accounts
+        Ok(accounts
             .iter()
             .find(|(m, _)| m.fingerprint == Some(*fp))
-            .cloned()
+            .cloned())
     }
 }
 
@@ -826,6 +829,7 @@ impl Run {
         let fp = self.people[p].fp();
         self.dir
             .account_by_key(&fp)
+            .unwrap()
             .is_some_and(|(_, access)| access.has(bit::MESSAGING))
     }
 

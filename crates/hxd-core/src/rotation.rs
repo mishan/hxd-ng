@@ -81,7 +81,7 @@ impl Core {
         );
         // By the login the account link now gives it, so a friend with no
         // row of its own naming the successor is told too.
-        let account = (self.directory.as_ref()).and_then(|d| d.account_by_key(to));
+        let account = (self.directory.as_ref()).and_then(|d| d.account_by_key(to).ok().flatten());
         let linked = account.is_some();
         let successor = account.map_or_else(|| new.clone(), |(m, _)| m);
         if let Some(store) = self.inbox.as_ref() {
