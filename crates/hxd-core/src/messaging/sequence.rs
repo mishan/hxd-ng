@@ -2520,7 +2520,7 @@ fn try_attach(
     let linked = core
         .directory
         .as_ref()
-        .and_then(|dir| dir.account_by_key(&who.fp()))
+        .and_then(|dir| dir.account_by_key(&who.fp()).unwrap())
         .is_some();
     let cert = &who.devices[d].1;
     let (uid, mut rx) = core.attach(AttachInfo {
