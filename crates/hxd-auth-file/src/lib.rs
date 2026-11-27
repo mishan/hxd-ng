@@ -2302,6 +2302,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_that_cannot_be_read_leaves_a_key_lookup_unanswered() {
         use std::os::unix::fs::PermissionsExt;
@@ -2315,10 +2316,11 @@ mod tests {
         assert!(auth.account_by_key(&fp).unwrap().is_some());
         let path = td.path().join("alice.toml");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(
-            std::fs::read(&path).is_err(),
-            "the file must be unreadable to this user"
-        );
+        // A user file modes do not bind, as root, cannot be shown it.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
         // A server started on the directory, as one reading it after the
         // file was rewritten would.
         let fresh = FileAuth::new(td.path());
