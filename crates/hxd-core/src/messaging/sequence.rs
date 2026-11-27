@@ -302,7 +302,7 @@ impl Step {
     /// Whether the step can fold two rows of a pair into one, which the
     /// fold's settling may end as the act it stands for would.
     fn folds(&self) -> bool {
-        matches!(self, Step::Link | Step::Rotate { .. })
+        matches!(self, Step::Link | Step::Relink | Step::Rotate { .. })
     }
 
     fn of(n: u32) -> (Step, usize, usize, Failure) {
@@ -2601,6 +2601,7 @@ fn try_attach(
 /// and a floor and a rotation while the store fails, and an offer a
 /// rotation moved under an identity revoked while it fails.
 pub const FOUND: &[&[u32]] = &[
+    &[438445040, 1676041906, 1998886976, 2415919104, 2986571058],
     &[1073741952, 1073741843, 1073741988],
     &[1073742219, 1073741971, 1073742023],
     &[1073742123, 1073742016, 1073742052],
