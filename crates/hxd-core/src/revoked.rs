@@ -339,7 +339,7 @@ impl Core {
             false => self.end_revoked(|tag| list.refuses(tag), |_| Some(EndedBy::Revoked)),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.take_revoked(keys.chain(ids).collect());
+        let taken: Vec<_> = keys.chain(ids).collect();
         if !list.is_empty() {
             // The operator names a device alone: what it presented and the
             // offers it signed are found by it, under whichever identity.
@@ -366,6 +366,10 @@ impl Core {
                 &[],
             );
         }
+        // The push store's deletes touch no friendship, and wait on its
+        // own writes: not under the hold.
+        drop(writing);
+        self.take_revoked(taken);
         ended
     }
 
@@ -459,7 +463,7 @@ impl Core {
             ),
         };
         // Even an empty list: a key lifted is forgotten by a retry too.
-        self.take_revoked(keys.chain(ids).chain(floors).collect());
+        let taken: Vec<_> = keys.chain(ids).chain(floors).collect();
         if !list.is_empty() {
             let devices: Vec<_> = (devices.iter())
                 .filter_map(|(i, d)| Some((i.as_ref()?, d)))
@@ -492,6 +496,7 @@ impl Core {
             );
         }
         drop(writing);
+        self.take_revoked(taken);
         self.reconcile_due(list.floors.keys().copied());
         ended
     }
@@ -605,7 +610,8 @@ impl Core {
 
     /// The sessions `list` refuses, ended, each that `revoked` names a
     /// reason for as revoked. Run after the list is written, and with
-    /// nothing else held: an `attach` from then on is refused, and one
+    /// nothing held but the friendship hold: an `attach` from then on is
+    /// refused, and one
     /// that got in before is on the roster to be found here.
     fn end_revoked(
         &self,
