@@ -5484,6 +5484,80 @@ fn a_rotation_moves_no_link_while_an_unlinks_drop_cannot_be_judged() {
 }
 
 #[test]
+fn a_settling_the_directory_cannot_answer_for_is_tried_again() {
+    let (alice, bob) = (person(1), person(2));
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts.clone(), Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    let (a, _) = session(&s.core, "alice", &alice, 0, false, u64::MAX);
+    let (b, _) = session(&s.core, "bob", &bob, 0, false, u64::MAX);
+    s.core.friend_add(a, "bob", None).unwrap();
+    assert_eq!(
+        s.core.friend_answer(b, "alice", true, None),
+        Ok(RosterState::Accepted)
+    );
+    accounts.0.lock().unwrap()[0].0 = Mailbox::login("alice");
+    assert_eq!(
+        s.core.friend_add(b, "alice", None),
+        Ok(RosterState::PendingOut)
+    );
+    accounts.0.lock().unwrap()[0].0 = Mailbox::identified("alice", fp(&alice));
+    let asking = || {
+        let (ma, mb) = mailboxes(&alice, &bob);
+        let row = s.rel.relationship(&mb, &ma, s.core.clock().wall());
+        row.unwrap().unwrap().pending_out.is_some()
+    };
+    let settles = || {
+        let owed = s.rel.owed().unwrap();
+        owed.iter()
+            .filter(|o| matches!(o.work, Work::Settle(_)))
+            .count()
+    };
+    s.fail.fail_next("write");
+    s.core.inbox_claim("alice", &fp(&alice));
+    assert!(asking() && settles() == 1, "owed");
+
+    dir.1.store(true, Ordering::SeqCst);
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert!(asking(), "not settled under a guess");
+    assert_eq!(settles(), 1, "still owed");
+
+    dir.1.store(false, Ordering::SeqCst);
+    s.core.clock().advance(std::time::Duration::from_secs(3700));
+    s.core.owed_tick();
+    assert!(!asking(), "settled once the directory answers");
+    assert_eq!(settles(), 0);
+}
+
+#[test]
+fn a_presentation_the_directory_cannot_answer_for_is_the_servers_failure() {
+    let (alice, bob) = (person(1), person(2));
+    let s1 = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);
+    let (_, _, _, _, f) = made(&s1, &alice, &bob);
+    let accounts = Switch(Arc::new(std::sync::Mutex::new(vec![
+        (Mailbox::identified("alice", fp(&alice)), messaging_bits()),
+        (Mailbox::identified("bob", fp(&bob)), messaging_bits()),
+    ])));
+    let dir = Unreadable(accounts, Arc::new(AtomicBool::new(false)));
+    let s = server_of(dir.clone(), policy(), InboxPolicy::default(), None);
+    let (b, _) = device(&s.core, "bob", &bob, 1);
+    dir.1.store(true, Ordering::SeqCst);
+    let unread = s.core.friendships_present(b, vec![], vec![f.clone()]);
+    assert_eq!(
+        unread.map(|_| ()),
+        Err(MessagingError::ServerError),
+        "not nobody"
+    );
+    dir.1.store(false, Ordering::SeqCst);
+    let (_, presented) = s.core.friendships_present(b, vec![], vec![f]).unwrap();
+    assert!(ok_all(&presented), "{presented:?}");
+}
+
+#[test]
 fn a_link_made_again_keeps_its_presentations_while_a_rotation_moves_its_link() {
     let (alice, bob, s, accounts) = unlinked_owing();
     let successor = person(4);

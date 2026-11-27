@@ -1024,7 +1024,7 @@ impl Core {
             let below = floors.below(&o);
             floors.failed()?;
             if below {
-                let pair = self.mailbox_of(&other).zip(self.mailbox_of(&owner));
+                let pair = self.mailbox_of(&other)?.zip(self.mailbox_of(&owner)?);
                 let asked: Vec<_> = pair.iter().map(|(x, y)| (x, y)).collect();
                 let drop = Part::DropOffers(vec![(owner, other)]);
                 let (_, left) = self.write_left(store, &[drop], &asked, wall)?;
@@ -1127,10 +1127,18 @@ impl Core {
         self.reconciled.lock().unwrap().bump(keys);
     }
 
-    /// The account linked to `fp` that takes part, if there is one.
-    fn mailbox_of(&self, fp: &[u8; 32]) -> Option<Mailbox> {
-        let (m, access) = self.directory.as_ref()?.account_by_key(fp).ok()??;
-        takes_part(&m.login, access).then_some(m)
+    /// The account linked to `fp` that takes part, if there is one; an
+    /// error, logged, where the directory could not be read. A caller
+    /// does not guess past one: work is left to be tried again, and a
+    /// request is answered as the server's failure, never as nobody.
+    fn mailbox_of(&self, fp: &[u8; 32]) -> Result<Option<Mailbox>, StoreError> {
+        let Some(dir) = self.directory.as_ref() else {
+            return Ok(None);
+        };
+        let found = dir.account_by_key(fp).inspect_err(|e| {
+            warn!("relationships: looking up the account an identity links: {e}");
+        })?;
+        Ok(found.and_then(|(m, access)| takes_part(&m.login, access).then_some(m)))
     }
 
     /// The rotations this server applied from `fp` on, in chain order,
@@ -2037,7 +2045,12 @@ impl Core {
     /// A `Reset` record left `left`'s pair: both parties told their
     /// entries as the drop left them, where the directory names both.
     fn record_left(&self, left: &Left) {
-        let named = |m: &Mailbox| m.fingerprint.and_then(|fp| self.mailbox_of(&fp));
+        // The drop is written already: one the directory cannot answer
+        // for is told nothing rather than told on a guess.
+        let named = |m: &Mailbox| {
+            m.fingerprint
+                .and_then(|fp| self.mailbox_of(&fp).ok().flatten())
+        };
         if left.pair.iter().all(|m| named(m).is_some()) {
             self.tell_left(left, [true, true]);
         }
@@ -2180,7 +2193,7 @@ impl Core {
         if let Some(r) = store.relationship(&y, &x, wall)? {
             return Ok(Some((r.other, r.owner)));
         }
-        Ok(self.mailbox_of(a).zip(self.mailbox_of(b)))
+        Ok(self.mailbox_of(a)?.zip(self.mailbox_of(b)?))
     }
 
     /// Whether `p`, held by its own taking alone, no longer is, once the
@@ -2271,7 +2284,7 @@ impl Core {
         // shown as pending in carries: each from where it is kept.
         e.offer = match e.state {
             RosterState::Accepted => store.offer(&theirs, &mine, now).ok().flatten(),
-            RosterState::PendingIn => self.mailbox_of(&theirs).and_then(|them| {
+            RosterState::PendingIn => self.mailbox_of(&theirs).ok().flatten().and_then(|them| {
                 let row = store.relationship(&them, of, now).ok().flatten()?;
                 row.pending_out.filter(|p| !p.upgrade)?.offer
             }),
@@ -2292,6 +2305,7 @@ impl Core {
     ) -> Result<super::FoundUser, MessagingError> {
         let them = self
             .mailbox_of(fingerprint)
+            .map_err(|_| MessagingError::ServerError)?
             .ok_or(MessagingError::AccountNotFound)?;
         self.found(uid, &them.login, profile)
     }
@@ -2308,7 +2322,10 @@ impl Core {
     ) -> Result<(), MessagingError> {
         let me = self.messenger(uid)?;
         let store = self.friends_store()?;
-        if let Some(them) = self.mailbox_of(fingerprint) {
+        if let Some(them) = self
+            .mailbox_of(fingerprint)
+            .map_err(|_| MessagingError::ServerError)?
+        {
             let friends = store
                 .relationship(&me.mailbox, &them, self.clock.wall())
                 .map_err(store_failed)?
@@ -2713,7 +2730,10 @@ impl Core {
             None => record(None, None),
         };
         // Step 2: the other party.
-        let them = match self.mailbox_of(&theirs) {
+        let them = match self
+            .mailbox_of(&theirs)
+            .map_err(|_| MessagingError::ServerError)?
+        {
             Some(them)
                 if !store.is_blocked(&them, me).map_err(store_failed)?
                     && !store.is_blocked(me, &them).map_err(store_failed)? =>
@@ -3026,7 +3046,10 @@ impl Core {
             {
                 continue;
             }
-            let Some(them) = self.mailbox_of(&other) else {
+            let Some(them) = self
+                .mailbox_of(&other)
+                .map_err(|_| MessagingError::ServerError)?
+            else {
                 continue;
             };
             if store
@@ -3243,7 +3266,9 @@ impl Core {
                     self.drop_unlinked_presentations(store, &fp).map(|()| true)
                 }
                 Ok(Work::Judge(a, b)) => self.judge_pair(store, &a, &b).map(|()| true),
-                Ok(Work::Settle(fp)) => Ok(self.after_merge(writing, &self.settling(&fp))),
+                Ok(Work::Settle(fp)) => {
+                    (self.settling(&fp)).map(|me| self.after_merge(writing, &me))
+                }
             };
             match done {
                 Ok(true) => settled.extend(item.id),
@@ -3431,10 +3456,14 @@ impl Core {
     }
 
     /// The mailbox a key's pairs are settled under: its account's, or the
-    /// key's alone.
-    fn settling(&self, fp: &[u8; 32]) -> Mailbox {
-        let account = (self.directory.as_ref()).and_then(|d| d.account_by_key(fp).ok().flatten());
-        account.map_or_else(|| Mailbox::identified("", *fp), |(m, _)| m)
+    /// key's alone; an error where the directory could not say which, so
+    /// the settling is tried again rather than told under a guess.
+    fn settling(&self, fp: &[u8; 32]) -> Result<Mailbox, StoreError> {
+        let account = match self.directory.as_ref() {
+            Some(d) => d.account_by_key(fp)?,
+            None => None,
+        };
+        Ok(account.map_or_else(|| Mailbox::identified("", *fp), |(m, _)| m))
     }
 
     /// What judging the withdrawals tidied, written once the act it was
@@ -3606,7 +3635,7 @@ impl Core {
                     signed.push((identity, other));
                     // Named as the pair's rows keep them, as the other
                     // drops name theirs.
-                    if self.mailbox_of(&identity).is_some() && self.mailbox_of(&other).is_some() {
+                    if self.mailbox_of(&identity)?.is_some() && self.mailbox_of(&other)?.is_some() {
                         if let Some((a, b)) = self.pair_mailboxes(store, &identity, &other, wall)? {
                             named.push((a, b, [true, true]));
                         }
@@ -3616,7 +3645,7 @@ impl Core {
             }
             Work::DropOffersNaming(fp) => {
                 let to = match cause {
-                    Cause::Unlinked => [self.mailbox_of(&fp).is_some(), true],
+                    Cause::Unlinked => [self.mailbox_of(&fp)?.is_some(), true],
                     _ => [true, true],
                 };
                 let named = self.counterparts_of(store, &fp, wall)?;
