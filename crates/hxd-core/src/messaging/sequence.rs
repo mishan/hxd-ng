@@ -278,6 +278,12 @@ enum Failure {
 }
 
 impl Step {
+    /// Whether the step can fold two rows of a pair into one, which the
+    /// fold's settling may end as the act it stands for would.
+    fn folds(&self) -> bool {
+        matches!(self, Step::Link | Step::Rotate { .. })
+    }
+
     fn of(n: u32) -> (Step, usize, usize, Failure) {
         let (p, d, arg) = ((n >> 5) as usize & 1, (n >> 6) as usize & 1, n >> 7);
         // Weighted toward the acts on pending state and the endings that
@@ -1743,8 +1749,9 @@ impl Run {
         // Losing the messaging bit is read live, and a crowded rotation
         // merges state written by hand, which no act told.
         let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || self.crowded;
+        let folds = step.folds();
         self.upgrading = upgrading;
-        self.shown(&what, !lapsing, blocking);
+        self.shown(&what, !lapsing, blocking, folds);
     }
 
     /// Each piece of work owed before a step, matched by its id, and gone
@@ -2058,7 +2065,7 @@ impl Run {
     /// Every live session of each party shows what a fresh read of its
     /// roster would: checked where nothing could cost a tell, and taken
     /// as the store has it where something could.
-    fn shown(&mut self, what: &str, whole: bool, blocking: Option<usize>) {
+    fn shown(&mut self, what: &str, whole: bool, blocking: Option<usize>, folds: bool) {
         self.told();
         for q in 0..2 {
             let judged = whole && blocking != Some(q) && self.takes_part(q);
@@ -2067,8 +2074,12 @@ impl Run {
                     continue;
                 };
                 // A block drops the blocked party's request unsaid, as a
-                // missing account's would be.
-                let unsaid = blocking == Some(1 - q)
+                // missing account's would be, and so does the settling of
+                // a fold that left one standing.
+                let (me, them) = (self.mailbox(q), self.mailbox(1 - q));
+                let blocked =
+                    blocking == Some(1 - q) || folds && self.store.is_blocked(&them, &me).unwrap();
+                let unsaid = blocked
                     && !self.upgrading[q]
                     && self.views[q][slot].state == Some(RosterState::PendingOut)
                     && derived.state.is_none();
@@ -2452,7 +2463,7 @@ pub fn run_failing_each_call(
                 run.legal(&what);
                 let blocking = matches!(step, Step::Block | Step::BlockWithdrawal).then_some(p);
                 let lapsing = matches!(step, Step::Clock { .. } | Step::Messaging) || run.crowded;
-                run.shown(&what, !lapsing, blocking);
+                run.shown(&what, !lapsing, blocking, step.folds());
             }
         }
     }
