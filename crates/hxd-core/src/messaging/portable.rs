@@ -3165,9 +3165,8 @@ impl Core {
         let rows = match store.owed() {
             Ok(rows) => {
                 let mut index = self.owed.lock().unwrap();
-                index
-                    .backoff
-                    .retain(|id, _| rows.iter().any(|o| o.id == *id));
+                let ids: HashSet<OwedId> = rows.iter().map(|o| o.id).collect();
+                index.backoff.retain(|id, _| ids.contains(id));
                 let due = |id: &OwedId| {
                     first.contains(id) || index.backoff.get(id).is_none_or(|b| b.due <= now)
                 };
