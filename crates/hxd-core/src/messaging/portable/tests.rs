@@ -460,6 +460,26 @@ fn a_revoked_device_takes_its_presentations_with_it() {
 }
 
 #[test]
+fn a_revocation_lifted_while_its_drop_is_read_drops_nothing() {
+    let (alice, bob, s, _) = offered_by_alice();
+    let revoked = Fingerprint::of(&alice.devices[0].0.public()).0;
+    let parked = s.fail.park.arm("offers_from");
+    std::thread::scope(|t| {
+        let first = t.spawn(|| {
+            s.core.set_revocations(Revocations {
+                devices: [revoked].into(),
+                ..Default::default()
+            })
+        });
+        parked.arrived();
+        s.core.set_revocations(Revocations::default());
+        parked.release();
+        first.join().unwrap();
+    });
+    assert!(offering(&s, &alice, &bob), "the lifted device's offer");
+}
+
+#[test]
 fn a_revocation_lifted_before_its_sweep_runs_drops_nothing() {
     let (alice, bob) = (person(1), person(2));
     let s = linked(&[("alice", &fp(&alice)), ("bob", &fp(&bob))]);

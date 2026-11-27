@@ -3273,8 +3273,13 @@ impl Core {
         let (mut parts, mut pairs) = (Vec::new(), Vec::new());
         let mut items = Vec::new();
         for (part, named, item) in batch.drain(..) {
-            pairs.extend(named);
-            parts.push(part);
+            // Asked again just before the write: a list is installed
+            // without the hold, so one replaced while the batch was read
+            // makes the drop moot.
+            if self.still_owed(&item.work, &item.cause) {
+                pairs.extend(named);
+                parts.push(part);
+            }
             items.push(item);
         }
         let mut coalesced: Vec<(Mailbox, Mailbox, [bool; 2])> = Vec::new();
